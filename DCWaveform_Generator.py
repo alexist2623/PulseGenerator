@@ -452,7 +452,7 @@ class ControlPanel(QtWidgets.QWidget):
         layout.addWidget(v_splitter)
         self._refresh_table()
 
-        layout.addStretch(1)
+        layout.setStretch(0, 1)
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         row, col = item.row(), item.column()
