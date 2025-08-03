@@ -402,6 +402,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.idx            = ControlPanel.port_idx
         ControlPanel.port_idx += 1
 
+        v_splitter          = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
         layout              = QtWidgets.QVBoxLayout(self)
 
         form                = QtWidgets.QFormLayout()
@@ -414,23 +415,28 @@ class ControlPanel(QtWidgets.QWidget):
 
         form.addRow("Ramp [ns]:",  self.edit_ramp)
         form.addRow("Flat [ns]:",  self.edit_flat)
-        form.addRow("V [mV]:",  self.edit_v)
+        form.addRow("V [mV]:",     self.edit_v)
 
-        btn_add         = QtWidgets.QPushButton("Add segment")
+        btn_add             = QtWidgets.QPushButton("Add segment")
         btn_add.clicked.connect(self._on_add)
         form.addRow(btn_add)
 
-        btn_select_port  = QtWidgets.QPushButton("Select Port")
+        btn_select_port     = QtWidgets.QPushButton("Select Port")
         btn_select_port.clicked.connect(self._select_port)
         form.addRow(btn_select_port)
 
-        layout.addLayout(form)
+        form_widget         = QtWidgets.QWidget()
+        form_widget.setLayout(form)
 
-        self.table      = QtWidgets.QTableWidget(0, 4)
+        self.table          = QtWidgets.QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
             ["#", "Ramp [ns]", "Flat [ns]", "V [mV]"]
         )
-        header          = self.table.horizontalHeader()
+        self.table.setSizePolicy(
+            QtWidgets.QSizePolicy.Minimum,
+            QtWidgets.QSizePolicy.Expanding
+        )
+        header              = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
@@ -441,7 +447,9 @@ class ControlPanel(QtWidgets.QWidget):
         )
         self.table.itemChanged.connect(self._on_item_changed)
 
-        layout.addWidget(self.table)
+        v_splitter.addWidget(form_widget)
+        v_splitter.addWidget(self.table)
+        layout.addWidget(v_splitter)
         self._refresh_table()
 
         layout.addStretch(1)
@@ -504,11 +512,13 @@ class MultiControlPanel(QtWidgets.QWidget):
     def __init__(
             self,
             pulse: PulseSequence,
+            initial_color: str,
             add_port: Callable,
             parent=None
         ):
         super().__init__()
         self._ctrl_pannels: List[ControlPanel]  = [ControlPanel(pulse)]
+        self._color_map: List[str] = [initial_color]
         self.splitter                           = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
 
         # Port Add Button
@@ -524,16 +534,62 @@ class MultiControlPanel(QtWidgets.QWidget):
         btn_layout.addWidget(btn_add_port)
         btn_add_port.clicked.connect(add_port)
 
-        layout                                  = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
         self.splitter.addWidget(self._ctrl_pannels[0])
         self.splitter.addWidget(btn_widget)
-        layout.addWidget(self.splitter) 
+
+        # Control Panels list
+        self.panel_table                        = QtWidgets.QTableWidget(0, 4)
+        self.panel_table.setHorizontalHeaderLabels(["#", "Color", "set_x", "set_y"])
+        self.panel_table.verticalHeader().setVisible(False)
+        self.panel_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.panel_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        panel_table_header = self.panel_table.horizontalHeader()
+        panel_table_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        panel_table_header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        panel_table_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        panel_table_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+
+        control_panel_v_splitter                = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
+        control_panel_v_splitter.addWidget(self.splitter)
+        control_panel_v_splitter.addWidget(self.panel_table)
+
+        layout                                  = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(control_panel_v_splitter)
+
+        self._refresh_panel_table()
 
     def _refresh_table(self):
         """Refresh all control panels' tables."""
         for ctrl in self._ctrl_pannels:
             ctrl._refresh_table()
+        self._refresh_panel_table()
+
+    def _refresh_panel_table(self):
+        self.panel_table.setRowCount(len(self._ctrl_pannels))
+        for idx, ctrl in enumerate(self._ctrl_pannels):
+            item_idx = QtWidgets.QTableWidgetItem(str(idx + 1))
+            item_idx.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.panel_table.setItem(idx, 0, item_idx)
+
+            color = self._color_map[idx]
+            item_color = QtWidgets.QTableWidgetItem()
+            item_color.setBackground(QtGui.QColor(color))
+            self.panel_table.setItem(idx, 1, item_color)
+
+            btn_x = QtWidgets.QPushButton("set_x")
+            btn_x.clicked.connect(lambda _, i=idx: self._set_x(i))
+            self.panel_table.setCellWidget(idx, 2, btn_x)
+
+            btn_y = QtWidgets.QPushButton("set_y")
+            btn_y.clicked.connect(lambda _, i=idx: self._set_y(i))
+            self.panel_table.setCellWidget(idx, 3, btn_y)
+
+    def _set_x(self, idx):
+        QtWidgets.QMessageBox.information(self, "Set X", f"Set X for panel {idx+1}")
+
+    def _set_y(self, idx):
+        QtWidgets.QMessageBox.information(self, "Set Y", f"Set Y for panel {idx+1}")
 
 class MainWindow(QtWidgets.QMainWindow):
     """Main window for the DCWaveform generator application."""
@@ -544,15 +600,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._pulse: List[PulseSequence]    = [PulseSequence(0.0)]
         self._pulse[0].v_bounds             = (-2500, 2500)
-        self._selected_port_idx            = 0
+        self._plot                          = MatplotWidget(self._pulse[0])
+        self._selected_port_idx             = 0
         self._multi_ctrl: MultiControlPanel = MultiControlPanel(
             self._pulse[0],
+            self._plot._line[0].get_color(),
             self._add_port
         )
         self._multi_ctrl._ctrl_pannels[0].add_requested.connect(self._add_segment)
         self._multi_ctrl._ctrl_pannels[0].update_plot.connect(self._plot_refresh)
         self._multi_ctrl._ctrl_pannels[0].port_is_selected.connect(self._port_select)
-        self._plot                          = MatplotWidget(self._pulse[0])
 
         splitter                            = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
         splitter.addWidget(self._multi_ctrl)
@@ -650,6 +707,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Add a new control panel for a new PulseSequence."""
         new_pulse       = PulseSequence()
         self._plot.add_pulse(new_pulse)
+        self._multi_ctrl._color_map.append(self._plot._line[-1].get_color())
         self._pulse.append(new_pulse)
         new_ctrl        = ControlPanel(new_pulse)
         new_ctrl.add_requested.connect(self._add_segment)
@@ -672,7 +730,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
-    win.resize(1100, 650)
+    win.resize(1500, 650)
     win.show()
     sys.exit(app.exec_())
 
