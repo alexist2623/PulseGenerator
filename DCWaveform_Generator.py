@@ -4,13 +4,14 @@
 
 import json
 import sys
-from typing import Tuple, Optional, List, Any, Callable
-
+from typing import Tuple, Optional, List, Callable
 import numpy as np
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
+from matplotlib.lines import Line2D
 
 class PulseSequence:
     """Piece-wise-linear voltage waveform."""
@@ -159,6 +160,117 @@ class PulseSequence:
 
         return code_str
 
+class TracePlotWidget(Canvas):
+    """Scatter/line plot that traces Pulse-X vs Pulse-Y (voltage-voltage)."""
+    def __init__(self, parent=None):
+        fig = Figure(tight_layout=False)
+        super().__init__(fig)
+        self.ax = fig.add_subplot(111)
+        self.line: Line2D | None = None
+        self.x_idx: int | None = None
+        self.y_idx: int | None = None
+        self.ax.set_xlabel("Pulse-X [mV]")
+        self.ax.set_ylabel("Pulse-Y [mV]")
+        self.ax.grid(True)
+        self._pulse: List[PulseSequence] = []
+        self._pan_origin: Optional[Tuple[float, float]] = None
+
+        self.mpl_connect("motion_notify_event",  self._on_move)
+        self.mpl_connect("button_press_event",   self._on_press)
+        self.mpl_connect("button_release_event", self._on_release)
+        self.mpl_connect("scroll_event",         self._on_scroll)
+
+    def refresh_trace(self, pulses: list[PulseSequence]):
+        """Refresh the trace plot with the selected pulses."""
+        self._pulse = pulses
+        if self.x_idx is None or self.y_idx is None:
+            self.ax.cla()
+            self.draw_idle()
+            return
+        px, py = pulses[self.x_idx], pulses[self.y_idx]
+
+        # Build common time grid then interpolate
+        t_union = np.unique(np.concatenate((px.t, py.t)))
+        vx = np.interp(t_union, px.t, px.v)
+        vy = np.interp(t_union, py.t, py.v)
+
+        prev_x_lim = self.ax.get_xlim()
+        prev_y_lim = self.ax.get_ylim()
+        self.ax.cla()
+        self.ax.set_xlabel(f"Pulse {self.x_idx+1} [mV]")
+        self.ax.set_ylabel(f"Pulse {self.y_idx+1} [mV]")
+        self.ax.grid(True)
+        self.ax.plot(vx, vy, "-o")
+        self.ax.set_xlim(prev_x_lim)
+        self.ax.set_ylim(prev_y_lim)
+        self.draw_idle()
+
+    def fit_view(self):
+        """Fit the view to the pulse data."""
+        if self.x_idx is None or self.y_idx is None:
+            self.ax.cla()
+            self.draw_idle()
+            return
+        margin_x = 0.03 * (self._pulse[self.x_idx].v.ptp() + 1e-12) or 0.5
+        margin_y = 0.10 * (self._pulse[self.y_idx].v.ptp() + 1e-12) or 0.5
+        x_min = self._pulse[self.x_idx].v.min() - margin_x
+        x_max = self._pulse[self.x_idx].v.max() + margin_x
+        y_min = self._pulse[self.y_idx].v.min() - margin_y
+        y_max = self._pulse[self.y_idx].v.max() + margin_y
+
+        self.ax.set_xlim(
+            x_min,
+            x_max
+        )
+        self.ax.set_ylim(
+            y_min,
+            y_max
+        )
+        self.draw_idle()
+
+    def _on_scroll(self, event):
+        factor = -0.1 if event.step > 0 else +0.1
+        xmin, xmax = self.ax.get_xlim()
+        ymin, ymax = self.ax.get_ylim()
+
+        mods = set(event.modifiers) if hasattr(event, "modifiers") else (
+            {event.key} if event.key else set())
+
+        if "ctrl" in mods:                  # Ctrl + wheel  → horizontal zoom
+            new_w = (xmax - xmin) * factor
+            self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
+
+        elif "shift" in mods:                  # Shift + wheel → vertical zoom
+            new_h = (ymax - ymin) * factor
+            self.ax.set_ylim(ymin - 0.5*new_h, ymax + 0.5*new_h)
+
+        else:                                  # plain wheel    → isotropic zoom
+            new_w = (xmax - xmin) * factor
+            new_h = (ymax - ymin) * factor
+            self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
+            self.ax.set_ylim(ymin - 0.5*new_h, ymax + 0.5*new_h)
+
+        self.draw_idle()
+
+    def _on_press(self, event):
+        if (event.button != 1 or not event.inaxes):
+            return
+        self._pan_origin = (event.xdata, event.ydata)
+
+    def _on_move(self, event):
+        if self._pan_origin and event.xdata and event.ydata:
+            x0, y0 = self._pan_origin
+            dx = x0 - event.xdata
+            dy = y0 - event.ydata
+            xmin, xmax = self.ax.get_xlim()
+            ymin, ymax = self.ax.get_ylim()
+            self.ax.set_xlim(xmin + dx, xmax + dx)
+            self.ax.set_ylim(ymin + dy, ymax + dy)
+            self.draw_idle()
+
+    def _on_release(self, _event):
+        self._pan_origin = None
+
 class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
     """Matplotlib widget for displaying and editing a PulseSequence."""
     flat_moved = QtCore.pyqtSignal(int, int, float)   # i0, i1, new_v
@@ -239,7 +351,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         for i, pulse in enumerate(self._pulse):
             self._line[i].set_data(pulse.t, pulse.v)
         self.draw_idle()
-    
+
     def add_pulse(self, pulse: PulseSequence):
         """Add a new pulse to the plot."""
         self._pulse.append(pulse)
@@ -248,11 +360,13 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         self._selected_port_idx = len(self._pulse) - 1
         self.refresh()
         self.fit_view()
-    
+
     def get_selected_port_idx(self) -> int:
+        """Get the index of the currently selected port."""
         return self._selected_port_idx
-    
+
     def set_selected_port_idx(self, idx: int):
+        """Set the index of the currently selected port."""
         self._selected_port_idx = idx
 
     def _locate_flat_segment(self, event) -> Optional[Tuple[int, int]]:
@@ -397,7 +511,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
 
         self.draw_idle()
 
-class ControlPanel(QtWidgets.QWidget):
+class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     """Input boxes plus a live table of all segments."""
 
     add_requested       = QtCore.pyqtSignal(float, float, float)
@@ -463,7 +577,7 @@ class ControlPanel(QtWidgets.QWidget):
         v_splitter.addWidget(form_widget)
         v_splitter.addWidget(self.table)
         layout.addWidget(v_splitter)
-        self._refresh_table()
+        self.refresh_table()
 
         layout.setStretch(0, 1)
 
@@ -502,7 +616,7 @@ class ControlPanel(QtWidgets.QWidget):
             return
         self.add_requested.emit(ramp, flat, v)
 
-    def _refresh_table(self):
+    def refresh_table(self):
         with QtCore.QSignalBlocker(self.table):
             segs = self._pulse.flat_segments()
             self.table.setRowCount(len(segs))
@@ -514,12 +628,12 @@ class ControlPanel(QtWidgets.QWidget):
                     item = QtWidgets.QTableWidgetItem(f"{val:.6g}")
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     self.table.setItem(row, col, item)
-    
+
     def _select_port(self):
         """Emit signal to select this port."""
         self.port_is_selected.emit(self.idx)
 
-class MultiControlPanel(QtWidgets.QWidget):
+class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     """Multi waveform control panel"""
 
     def __init__(
@@ -569,42 +683,14 @@ class MultiControlPanel(QtWidgets.QWidget):
         layout                                  = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(control_panel_v_splitter)
+        self.refresh_table()
 
-        self._refresh_panel_table()
-
-    def _refresh_table(self):
+    def refresh_table(self):
         """Refresh all control panels' tables."""
         for ctrl in self._ctrl_pannels:
-            ctrl._refresh_table()
-        self._refresh_panel_table()
+            ctrl.refresh_table()
 
-    def _refresh_panel_table(self):
-        self.panel_table.setRowCount(len(self._ctrl_pannels))
-        for idx, ctrl in enumerate(self._ctrl_pannels):
-            item_idx = QtWidgets.QTableWidgetItem(str(idx + 1))
-            item_idx.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.panel_table.setItem(idx, 0, item_idx)
-
-            color = self._color_map[idx]
-            item_color = QtWidgets.QTableWidgetItem()
-            item_color.setBackground(QtGui.QColor(color))
-            self.panel_table.setItem(idx, 1, item_color)
-
-            btn_x = QtWidgets.QPushButton("set_x")
-            btn_x.clicked.connect(lambda _, i=idx: self._set_x(i))
-            self.panel_table.setCellWidget(idx, 2, btn_x)
-
-            btn_y = QtWidgets.QPushButton("set_y")
-            btn_y.clicked.connect(lambda _, i=idx: self._set_y(i))
-            self.panel_table.setCellWidget(idx, 3, btn_y)
-
-    def _set_x(self, idx):
-        QtWidgets.QMessageBox.information(self, "Set X", f"Set X for panel {idx+1}")
-
-    def _set_y(self, idx):
-        QtWidgets.QMessageBox.information(self, "Set Y", f"Set Y for panel {idx+1}")
-
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-methods
     """Main window for the DCWaveform generator application."""
 
     def __init__(self):
@@ -620,14 +706,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot._line[0].get_color(),
             self._add_port
         )
+        self.refresh_panel_table()
         self._multi_ctrl._ctrl_pannels[0].add_requested.connect(self._add_segment)
         self._multi_ctrl._ctrl_pannels[0].update_plot.connect(self._plot_refresh)
         self._multi_ctrl._ctrl_pannels[0].port_is_selected.connect(self._port_select)
 
+        self._trace = TracePlotWidget()
+
         splitter                            = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
         splitter.addWidget(self._multi_ctrl)
-
         splitter.addWidget(self._plot)
+        splitter.addWidget(self._trace)
         splitter.setStretchFactor(1, 3)
         self.setCentralWidget(splitter)
 
@@ -641,28 +730,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_toolbar()
 
     def _build_menu(self):
-        mb = self.menuBar()
+        mb          = self.menuBar()
 
         # File
-        m_file = mb.addMenu("&File")
+        m_file      = mb.addMenu("&File")
         m_file.addAction("Load JSON…",  self._load_json)
         m_file.addSeparator()
         m_file.addAction("E&xit",       self.close)
 
         # Pulse
-        m_pulse = mb.addMenu("&Pulse")
-        gen = m_pulse.addAction("&Generate QCS string…")
+        m_pulse     = mb.addMenu("&Pulse")
+        gen         = m_pulse.addAction("&Generate QCS string…")
         gen.setShortcut(QtGui.QKeySequence("Ctrl+G"))
         gen.triggered.connect(self._generate_pulse)
 
     def _build_toolbar(self):
-        tb = self.addToolBar("Tools")
-        btn_fit = QtWidgets.QAction("Fit", self)
+        tb          = self.addToolBar("Tools")
+        btn_fit     = QtWidgets.QAction("Fit", self)
         btn_fit.setToolTip("Show the full pulse (keyboard: F)")
-        btn_fit.triggered.connect(self._plot.fit_view)
+        btn_fit.triggered.connect(self._fit_view)
         tb.addAction(btn_fit)
         # keyboard shortcut
-        QtWidgets.QShortcut(QtGui.QKeySequence("F"), self, self._plot.fit_view)
+        QtWidgets.QShortcut(QtGui.QKeySequence("F"), self, self._fit_view)
+
+    def _fit_view(self):
+        """Fit the view to the pulse data."""
+        self._plot.fit_view()
+        self._trace.fit_view()
 
     def _add_segment(self, ramp: float, flat: float, v: float) -> None:
         try:
@@ -676,17 +770,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._plot.refresh()
         self._plot.fit_view()
-        self._multi_ctrl._refresh_table()
+        self._multi_ctrl.refresh_table()
+        self._trace.refresh_trace(self._pulse)
 
     def _flat_update(self, i0: int, i1: int, new_v: float) -> None:
         self.statusBar().showMessage(
             f"Flat {i0}-{i1} moved → {new_v:0.6g} V")
-        self._multi_ctrl._refresh_table()
+        self._multi_ctrl.refresh_table()
+        self._trace.refresh_trace(self._pulse)
 
     def _point_update(self, i0, i1, new_t):
         self.statusBar().showMessage(
             f"Point {i0}-{i1} moved → {new_t:0.6g} V")
-        self._multi_ctrl._refresh_table()
+        self._multi_ctrl.refresh_table()
+        self._trace.refresh_trace(self._pulse)
 
     def _load_json(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -695,14 +792,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             with open(path, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
+                data                    = json.load(fp)
             if "initial_voltage" in data:
-                self._pulse[0].v[0] = float(data["initial_voltage"])
+                self._pulse[0].v[0]     = float(data["initial_voltage"])
             if "voltage_bounds" in data and len(data["voltage_bounds"]) == 2:
                 self._pulse[0].v_bounds = tuple(map(float, data["voltage_bounds"]))
                 self._plot._pulse[0].v_bounds[0], self._plot._pulse[0].v_bounds[1] = self._pulse[0].v_bounds
             self._plot.refresh()
-            self.ctrl._refresh_table()
+            self.ctrl.refresh_table()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Load failed", f"Could not read JSON:\n{exc}"
@@ -718,7 +815,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.setText("Copy the grammar below:")
         dlg.setDetailedText(code_str)
         dlg.exec_()
-    
+
     def _generate_qcs_code(self) -> str:
         """Generate QCS code for the current pulse sequence."""
         code_str = (
@@ -758,7 +855,8 @@ class MainWindow(QtWidgets.QMainWindow):
         new_ctrl.port_is_selected.connect(self._port_select)
         self._multi_ctrl._ctrl_pannels.append(new_ctrl)
         self._multi_ctrl.splitter.insertWidget(len(self._multi_ctrl._ctrl_pannels) - 1, new_ctrl)
-        self._multi_ctrl._refresh_table()
+        self._multi_ctrl.refresh_table()
+        self.refresh_panel_table()
 
     def _port_select(self, idx: int) -> None:
         """Activate the selected control panel."""
@@ -768,6 +866,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _plot_refresh(self):
         self._plot.refresh()
+        self._trace.refresh_trace(self._pulse)
+
+    def refresh_panel_table(self):
+        """Refresh the control panel table with current pulse data."""
+        self._multi_ctrl.panel_table.setRowCount(len(self._multi_ctrl._ctrl_pannels))
+        for idx, _ in enumerate(self._multi_ctrl._ctrl_pannels):
+            item_idx = QtWidgets.QTableWidgetItem(str(idx + 1))
+            item_idx.setTextAlignment(QtCore.Qt.AlignCenter)
+            self._multi_ctrl.panel_table.setItem(idx, 0, item_idx)
+
+            color = self._multi_ctrl._color_map[idx]
+            item_color = QtWidgets.QTableWidgetItem()
+            item_color.setBackground(QtGui.QColor(color))
+            self._multi_ctrl.panel_table.setItem(idx, 1, item_color)
+
+            btn_x = QtWidgets.QPushButton("set_x")
+            btn_x.clicked.connect(lambda _, i=idx: self._set_x(i))
+            self._multi_ctrl.panel_table.setCellWidget(idx, 2, btn_x)
+
+            btn_y = QtWidgets.QPushButton("set_y")
+            btn_y.clicked.connect(lambda _, i=idx: self._set_y(i))
+            self._multi_ctrl.panel_table.setCellWidget(idx, 3, btn_y)
+
+    def _set_x(self, idx):
+        self._trace.x_idx = idx
+        self._trace.refresh_trace(self._pulse)
+
+    def _set_y(self, idx):
+        self._trace.y_idx = idx
+        self._trace.refresh_trace(self._pulse)
 
 
 def main():
