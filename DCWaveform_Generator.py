@@ -102,47 +102,60 @@ class PulseSequence:
             self.t[i] = self.t[i] + (new_t - self.t[i0])
         self.t[i0] = new_t
 
-    def to_qcs_dcwaveform(self) -> str:
+    def to_qcs_dcwaveform(self, ch_name: str) -> str:
         """Return QCS DCWaveform Generation Code"""
-        chan = "ch_0"
-        code_str = (
-            "import keysights.qcs as qcs\n"
-            "\n"
-            "ns              = 1e-9\n"
-            "V_max_M5301AWG  = 5\n"
-            "mV              = 1/(V_max_M5301AWG * 1000)\n"
-        )
+        code_str = ""
+        for i in range(len(self.t)-1):
+            code_str += (
+                f"    {ch_name}_dc_segment_duration_{i} = qcs.Scalar(\n"
+                f"        name  = \"{ch_name}_dc_segment_duration_{i}\",\n"
+                f"        value = {self.t[i+1] - self.t[i]} * ns,\n"
+                f"        dtype = float\n"
+                "    )\n"
+            )
         for i in range(len(self.t)-1):
             if i % 2 == 0:
                 code_str += (
-                    f"dc_segment_{i} = qcs.DCWaveform(\n"
-                    f"    duration    = {self.t[i+1] - self.t[i]} * ns,\n"
-                    f"    envelope    = qcs.ConstantEnvelope(),\n"
-                    f"    amplitude   = {self.v[i]} * mV\n"
-                    f")\n\n"
-                    f"program.add_waveform(dc_segment_{i}, {chan})\n"
+                    f"    {ch_name}_dc_segment_amplitude_{i} = qcs.Scalar(\n"
+                    f"        name  = \"{ch_name}_dc_segment_amplitude_{i}\",\n"
+                    f"        value = {self.v[i]} * mV,\n"
+                    f"        dtype = float\n"
+                    "    )\n"
+                )
+        for i in range(len(self.t)-1):
+            if i % 2 == 0:
+                code_str += (
+                    f"    {ch_name}_dc_segment_{i} = qcs.DCWaveform(\n"
+                    f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
+                    f"        envelope    = qcs.ConstantEnvelope(),\n"
+                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{i}\n"
+                    f"    )\n\n"
                 )
             else:
                 code_str += (
-                    f"dc_segment_{i}_p = qcs.DCWaveform(\n"
-                    f"    duration    = {self.t[i+1] - self.t[i]} * ns,\n"
-                    f"    envelope    = qcs.ArbitraryEnvelope(\n"
-                    f"        [0,1], [0,1]\n"
-                    f"    ),\n"
-                    f"    amplitude   = {self.v[i+1]} * mV\n"
-                    f")\n\n"
+                    f"    {ch_name}_dc_segment_{i}_p = qcs.DCWaveform(\n"
+                    f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
+                    f"        envelope    = qcs.ArbitraryEnvelope(\n"
+                    f"            [0,1], [0,1]\n"
+                    f"        ),\n"
+                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{(i >> 1) * 2 + 2}\n"
+                    f"    )\n\n"
                 )
                 code_str += (
-                    f"dc_segment_{i}_n = qcs.DCWaveform(\n"
-                    f"    duration    = {self.t[i+1] - self.t[i]} * ns,\n"
-                    f"    envelope    = qcs.ArbitraryEnvelope(\n"
-                    f"        [0,1], [1,0]\n"
-                    f"    ),\n"
-                    f"    amplitude   = {self.v[i]} * mV\n"
-                    f")\n\n"
-                    f"dc_segment_{i} = dc_segment_{i}_n + dc_segment_{i}_p\n"
-                    f"program.add_waveform(dc_segment_{i}, {chan})\n"
+                    f"    {ch_name}_dc_segment_{i}_n = qcs.DCWaveform(\n"
+                    f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
+                    f"        envelope    = qcs.ArbitraryEnvelope(\n"
+                    f"            [0,1], [1,0]\n"
+                    f"        ),\n"
+                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{(i >> 1) * 2}\n"
+                    f"    )\n\n"
+                    f"    {ch_name}_dc_segment_{i} ="
+                    f"    {ch_name}_dc_segment_{i}_n + {ch_name}_dc_segment_{i}_p\n"
                 )
+        for i in range(len(self.t)-1):
+            code_str += (
+                f"    program.add_waveform({ch_name}_dc_segment_{i}, {ch_name})\n"
+            )
 
         return code_str
 
@@ -696,12 +709,42 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _generate_pulse(self):
-        txt = self._pulse.to_qcs_dcwaveform()
+        code_str = self._generate_qcs_code()
+        with open("qcs_dc_waveforms.py", "w", encoding="utf-8") as f:
+            f.write(code_str)
+            f.close()
         dlg = QtWidgets.QMessageBox(self)
         dlg.setWindowTitle("Generated QCS pulse")
         dlg.setText("Copy the grammar below:")
-        dlg.setDetailedText(txt)
+        dlg.setDetailedText(code_str)
         dlg.exec_()
+    
+    def _generate_qcs_code(self) -> str:
+        """Generate QCS code for the current pulse sequence."""
+        code_str = (
+            "import keysight.qcs as qcs\n"
+            "\n"
+            "ns              = 1e-9\n"
+            "V_max_M5301AWG  = 5\n"
+            "mV              = 1/(V_max_M5301AWG * 1000)\n"
+            "\n"
+            "def generate_dc_waveforms(\n"
+            "    program: qcs.Program,\n"
+        )
+        for idx, pulse in enumerate(self._pulse):
+            code_str += (
+                f"    dc_ch_{idx+1}: qcs.Channels,\n"
+            )
+        code_str += (
+            ") -> qcs.Program:\n"
+        )
+        for idx, pulse in enumerate(self._pulse):
+            chan = f"dc_ch_{idx+1}"
+            code_str += pulse.to_qcs_dcwaveform(chan)
+        code_str += (
+            "    return program\n"
+        )
+        return code_str
 
     def _add_port(self):
         """Add a new control panel for a new PulseSequence."""
