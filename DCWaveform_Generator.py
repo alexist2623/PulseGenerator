@@ -117,41 +117,21 @@ class PulseSequence:
         for i in range(len(self.t)-1):
             if i % 2 == 0:
                 code_str += (
-                    f"    {ch_name}_dc_segment_amplitude_{i} = qcs.Scalar(\n"
-                    f"        name  = \"{ch_name}_dc_segment_amplitude_{i}\",\n"
-                    f"        value = {self.v[i]} * mV,\n"
-                    f"        dtype = float\n"
-                    "    )\n"
-                )
-        for i in range(len(self.t)-1):
-            if i % 2 == 0:
-                code_str += (
                     f"    {ch_name}_dc_segment_{i} = qcs.DCWaveform(\n"
                     f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
                     f"        envelope    = qcs.ConstantEnvelope(),\n"
-                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{i}\n"
+                    f"        amplitude   = {self.v[i]} * mV\n"
                     f"    )\n\n"
                 )
             else:
                 code_str += (
-                    f"    {ch_name}_dc_segment_{i}_p = qcs.DCWaveform(\n"
+                    f"    {ch_name}_dc_segment_{i} = qcs.DCWaveform(\n"
                     f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
                     f"        envelope    = qcs.ArbitraryEnvelope(\n"
-                    f"            [0,1], [0,1]\n"
+                    f"            [0,1], [{self.v[i]} * mV, {self.v[i+1]} * mV]\n"
                     f"        ),\n"
-                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{(i >> 1) * 2 + 2}\n"
-                    f"    )\n\n"
-                )
-                code_str += (
-                    f"    {ch_name}_dc_segment_{i}_n = qcs.DCWaveform(\n"
-                    f"        duration    = {ch_name}_dc_segment_duration_{i},\n"
-                    f"        envelope    = qcs.ArbitraryEnvelope(\n"
-                    f"            [0,1], [1,0]\n"
-                    f"        ),\n"
-                    f"        amplitude   = {ch_name}_dc_segment_amplitude_{(i >> 1) * 2}\n"
-                    f"    )\n\n"
-                    f"    {ch_name}_dc_segment_{i} ="
-                    f"    {ch_name}_dc_segment_{i}_n + {ch_name}_dc_segment_{i}_p\n"
+                    f"        amplitude   = {max(abs(self.v[i+1]),abs(self.v[i]))} * mV\n"
+                    f"    )\n\n"    
                 )
         for i in range(len(self.t)-1):
             code_str += (
