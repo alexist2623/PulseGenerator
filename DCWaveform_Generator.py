@@ -12,6 +12,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
+from matplotlib import colors
 
 class PulseSequence:
     """Piece-wise-linear voltage waveform."""
@@ -267,8 +268,15 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         self._line: List[Axes] = []
         self._selected_port_idx = 0
 
+        self._default_alpha   = 1.0
+        self._dim_alpha       = 0.95
+        self._default_lw      = 1.5
+        self._highlight_lw    = 2.5
+        self._orig_colors     = []
+
         self.ax             = fig.add_subplot(111)
         self._line,         = [self.ax.plot(self._pulse[0].t, self._pulse[0].v, "-o", picker=5)]
+        self._orig_colors.append(self._line[0].get_color())
         self.ax.set_xlabel("time [ns]")
         self.ax.set_ylabel("voltage [mV]")
         self.ax.grid(True)
@@ -337,9 +345,11 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         self._pulse.append(pulse)
         line,                   = self.ax.plot(pulse.t, pulse.v, "-o", picker=5)
         self._line.append(line)
+        self._orig_colors.append(line.get_color())
         self._selected_port_idx = len(self._pulse) - 1
         self.refresh()
         self.fit_view()
+        self._update_highlight()
 
     def get_selected_port_idx(self) -> int:
         """Get the index of the currently selected port."""
@@ -348,6 +358,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
     def set_selected_port_idx(self, idx: int):
         """Set the index of the currently selected port."""
         self._selected_port_idx = idx
+        self._update_highlight()
 
     def _locate_flat_segment(self, event) -> Optional[Tuple[int, int]]:
         """Return range (i0,i1) if click is on *flat* part, else None."""
@@ -396,8 +407,8 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         if (event.button != 1 or not event.inaxes):
             return
 
-        seg = self._locate_flat_segment(event)
-        point = self._locate_point_segment(event)
+        seg     = self._locate_flat_segment(event)
+        point   = self._locate_point_segment(event)
         if seg:
             self._drag_flat = seg
         elif point:
@@ -411,12 +422,12 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
 
         # drag flat
         if self._drag_flat and event.ydata is not None:
-            new_v = np.clip(
+            new_v       = np.clip(
                 event.ydata,
                 self._pulse[self._selected_port_idx].v_bounds[0],
                 self._pulse[self._selected_port_idx].v_bounds[1]
             )
-            i0, i1 = self._drag_flat
+            i0, i1      = self._drag_flat
             self._pulse[self._selected_port_idx].update_flat(self._drag_flat, new_v)
             self.flat_moved.emit(i0, i1, new_v)
             self.refresh()
@@ -432,9 +443,9 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
 
         # drag point
         if self._drag_point and event.ydata is not None:
-            xmin, xmax = self.ax.get_xlim()
-            new_t = np.clip(event.xdata, xmin, xmax)
-            i0, i1 = self._drag_point
+            xmin, xmax  = self.ax.get_xlim()
+            new_t       = np.clip(event.xdata, xmin, xmax)
+            i0, i1      = self._drag_point
             self._pulse[self._selected_port_idx].update_point(self._drag_point, new_t)
             self.point_moved.emit(i0, i1, new_t)
             self.refresh()
@@ -449,11 +460,11 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
             self._annot.set_visible(True)
         # pan
         if self._pan_origin and event.xdata and event.ydata:
-            x0, y0 = self._pan_origin
-            dx = x0 - event.xdata
-            dy = y0 - event.ydata
-            xmin, xmax = self.ax.get_xlim()
-            ymin, ymax = self.ax.get_ylim()
+            x0, y0      = self._pan_origin
+            dx          = x0 - event.xdata
+            dy          = y0 - event.ydata
+            xmin, xmax  = self.ax.get_xlim()
+            ymin, ymax  = self.ax.get_ylim()
             self.ax.set_xlim(xmin + dx, xmax + dx)
             self.ax.set_ylim(ymin + dy, ymax + dy)
             self.draw_idle()
@@ -489,6 +500,39 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
             self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
             self.ax.set_ylim(ymin - 0.5*new_h, ymax + 0.5*new_h)
 
+        self.draw_idle()
+
+    def _update_highlight(self):
+        for i, line in enumerate(self._line):
+            if i == self._selected_port_idx:
+                line.set_zorder(10)
+                line.set_alpha(self._default_alpha)
+                line.set_linewidth(self._highlight_lw)
+                line.set_color(self._orig_colors[i])
+            else:
+                line.set_zorder(1)
+                line.set_alpha(self._dim_alpha)
+                line.set_linewidth(self._default_lw)
+                line.set_color(self._lighten(self._orig_colors[i], 0.1))
+        self.draw_idle()
+
+    @staticmethod
+    def _lighten(c, amount: float = 0.5):
+        r, g, b, a = colors.to_rgba(c)
+        white      = 1.0
+        return (
+            r + (white - r)*amount,
+            g + (white - g)*amount,
+            b + (white - b)*amount,
+            a
+        )
+
+    def _restore_full_intensity(self):
+        for i, line in enumerate(self._line):
+            line.set_alpha(self._default_alpha)
+            line.set_linewidth(self._default_lw)
+            line.set_color(self._orig_colors[i])
+            line.set_zorder(1)
         self.draw_idle()
 
 class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
@@ -693,12 +737,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         self._trace = TracePlotWidget()
 
-        splitter                            = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
-        splitter.addWidget(self._multi_ctrl)
-        splitter.addWidget(self._plot)
-        splitter.addWidget(self._trace)
-        splitter.setStretchFactor(1, 3)
-        self.setCentralWidget(splitter)
+        self._dock_ctrl  = QtWidgets.QDockWidget("Control Panel", self)
+        self._dock_ctrl.setWidget(self._multi_ctrl)
+
+        self._dock_plot  = QtWidgets.QDockWidget("Waveform Plot", self)
+        self._dock_plot.setWidget(self._plot)
+
+        self._dock_trace = QtWidgets.QDockWidget("Trace Plot", self)
+        self._dock_trace.setWidget(self._trace)
+
+        for dock in (self._dock_ctrl, self._dock_plot, self._dock_trace):
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable |
+                             QtWidgets.QDockWidget.DockWidgetFloatable)
+
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self._dock_ctrl)
+        self.splitDockWidget(self._dock_ctrl, self._dock_plot, QtCore.Qt.Horizontal)
+        self.splitDockWidget(self._dock_plot, self._dock_trace, QtCore.Qt.Horizontal)
+        self.resizeDocks(
+            [self._dock_ctrl, self._dock_plot, self._dock_trace],
+            [200, 400, 300],
+            QtCore.Qt.Horizontal
+        )
+        self._dock_plot.raise_()
 
         # status bar
         self.statusBar().showMessage("Ready")
@@ -745,6 +805,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 flat,
                 v
             )
+            self._plot.set_selected_port_idx(self._selected_port_idx)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Invalid input", str(exc))
             return
@@ -842,6 +903,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         """Activate the selected control panel."""
         self._selected_port_idx         = idx
         self._plot._selected_port_idx   = idx
+        self._plot.set_selected_port_idx(idx)
         self._plot.refresh()
 
     def _plot_refresh(self):
@@ -876,7 +938,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _set_y(self, idx):
         self._trace.y_idx = idx
         self._trace.refresh_trace(self._pulse)
-
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
