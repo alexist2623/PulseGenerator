@@ -4,7 +4,7 @@
 
 import json
 import sys
-from typing import Tuple, Optional, List, Callable
+from typing import Tuple, Optional, List, Callable, Optional
 import numpy as np
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -30,9 +30,9 @@ class PulseSequence:
         if flat_idx == 0:
             return False
         delta    = new_ramp - (self.t[flat_idx] - self.t[flat_idx - 1])
-        if (self.t[flat_idx - 1] + new_ramp >= self.t[flat_idx + 1]):   # would cross neighbour
+        if self.t[flat_idx - 1] + new_ramp >= self.t[flat_idx + 1]: # would cross neighbour
             return False
-        self.t[flat_idx:] += delta                                      # move ramp end
+        self.t[flat_idx:] += delta  # move ramp end
         return True
 
     def edit_flat(self, flat_idx: int, new_flat: float) -> bool:
@@ -133,6 +133,45 @@ class PulseSequence:
 
         return code_str
 
+    def delete_flat_ramp(self, flat_idx: int) -> bool:
+        """
+        Remove the flat segment starting at even index flat_idx together
+        with its trailing point (two points in total) and time-compress
+        everything that follows so the waveform remains gap-free.
+        """
+        if flat_idx <= 0 or flat_idx + 1 >= len(self.t) or flat_idx % 2:
+            print("Error: flat_idx out of bounds or not even:", flat_idx)
+            return False
+        shrink = self.t[flat_idx + 1] - self.t[flat_idx - 1]
+        self.t = np.delete(self.t,  [flat_idx, flat_idx + 1])
+        self.v = np.delete(self.v,  [flat_idx, flat_idx + 1])
+        if flat_idx < len(self.t):
+            self.t[flat_idx:] -= shrink
+        return True
+
+    def insert_flat_ramp(
+            self,
+            flat_idx: int,
+        ) -> None:
+        """
+        Insert a *ramp + flat* segment so that the **flat** part starts
+        at index `flat_idx` (must be even).  By default we insert a 50-ns
+        ramp followed by a 100-ns flat at the same voltage as the point
+        immediately before the insertion.
+        """
+        ramp = 50e-9    # default ramp duration in seconds
+        flat = 100e-9   # default flat duration in seconds
+        target_v = self.v[flat_idx - 1]
+        t0 = self.t[flat_idx - 1]
+        # expand timeline
+        self.t[flat_idx:] += ramp + flat
+        self.t = np.insert(
+            self.t,
+            flat_idx,
+            [t0 + ramp, t0 + ramp + flat]
+        )
+        self.v = np.insert(self.v, flat_idx, [target_v, target_v])
+
 class TracePlotWidget(Canvas):
     """Scatter/line plot that traces Pulse-X vs Pulse-Y (voltage-voltage)."""
     def __init__(self, parent=None):
@@ -206,18 +245,20 @@ class TracePlotWidget(Canvas):
         xmin, xmax = self.ax.get_xlim()
         ymin, ymax = self.ax.get_ylim()
 
-        mods = set(event.modifiers) if hasattr(event, "modifiers") else (
-            {event.key} if event.key else set())
+        mods = (
+            set(event.modifiers) if hasattr(event, "modifiers")
+            else {event.key} if event.key else set()
+        )
 
-        if "ctrl" in mods:                  # Ctrl + wheel  → horizontal zoom
+        if "ctrl" in mods:      # Ctrl + wheel : horizontal zoom
             new_w = (xmax - xmin) * factor
             self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
 
-        elif "shift" in mods:                  # Shift + wheel → vertical zoom
+        elif "shift" in mods:   # Shift + wheel : vertical zoom
             new_h = (ymax - ymin) * factor
             self.ax.set_ylim(ymin - 0.5*new_h, ymax + 0.5*new_h)
 
-        else:                                  # plain wheel    → isotropic zoom
+        else:                   # plain wheel : isotropic zoom
             new_w = (xmax - xmin) * factor
             new_h = (ymax - ymin) * factor
             self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
@@ -357,6 +398,19 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         self._selected_port_idx = idx
         self._update_highlight()
 
+    def remove_pulse(self, idx: int) -> None:
+        """Remove the pulse/line at position `idx`."""
+        if idx >= len(self._pulse):
+            raise ValueError("Index out of bounds for pulse removal.")
+        ln = self._line.pop(idx)
+        ln.remove()
+        self._pulse.pop(idx)
+        self._orig_colors.pop(idx)
+        if self._selected_port_idx >= len(self._pulse):
+            self._selected_port_idx = max(0, len(self._pulse) - 1)
+        self._update_highlight()
+        self.draw_idle()
+
     def _locate_flat_segment(self, event) -> Optional[Tuple[int, int]]:
         """Return range (i0,i1) if click is on *flat* part, else None."""
         x, y = event.xdata, event.ydata
@@ -473,19 +527,23 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         xmin, xmax = self.ax.get_xlim()
         ymin, ymax = self.ax.get_ylim()
 
-        # Matplotlib ≥3.7: use event.modifiers; fall back to event.key otherwise
-        mods = set(event.modifiers) if hasattr(event, "modifiers") else (
-            {event.key} if event.key else set())
+        mods = (
+            set(event.modifiers) if hasattr(event, "modifiers")
+            else {event.key} if event.key else set()
+        )
 
-        if "ctrl" in mods:                  # Ctrl + wheel  → horizontal zoom
+        # Ctrl + wheel : horizontal zoom
+        if "ctrl" in mods:
             new_w = (xmax - xmin) * factor
             self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
 
-        elif "shift" in mods:                  # Shift + wheel → vertical zoom
+        # Shift + wheel : vertical zoom
+        elif "shift" in mods:
             new_h = (ymax - ymin) * factor
             self.ax.set_ylim(ymin - 0.5*new_h, ymax + 0.5*new_h)
 
-        else:                                  # plain wheel    → isotropic zoom
+        # plain wheel : isotropic zoom
+        else:
             new_w = (xmax - xmin) * factor
             new_h = (ymax - ymin) * factor
             self.ax.set_xlim(xmin - 0.5*new_w, xmax + 0.5*new_w)
@@ -599,6 +657,9 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             QtWidgets.QSizePolicy.Minimum,
             QtWidgets.QSizePolicy.Expanding
         )
+        self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
+
         header              = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -616,6 +677,35 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self.refresh_table()
 
         layout.setStretch(0, 1)
+
+    def _on_table_menu(self, pos: QtCore.QPoint) -> None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_ins_above = menu.addAction("Insert segment above")
+        act_ins_below = menu.addAction("Insert segment below")
+        menu.addSeparator()
+        act_del       = menu.addAction("Delete segment")
+
+        chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        if chosen == act_ins_above:
+            self._pulse.insert_flat_ramp(row * 2)
+        elif chosen == act_ins_below:
+            self._pulse.insert_flat_ramp(row * 2 + 2)
+        elif chosen == act_del:
+            ok = self._pulse.delete_flat_ramp(row * 2)
+            if not ok:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Delete failed",
+                    "Cannot delete this segment."
+                )
+        else:
+            return
+
+        self.refresh_table()
+        self.update_plot.emit()
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         row, col = item.row(), item.column()
@@ -681,7 +771,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         ):
         super().__init__()
         self._ctrl_pannels: List[ControlPanel]  = [ControlPanel(pulse)]
-        self._color_map: List[str] = [initial_color]
+        self._color_map: List[str]              = [initial_color]
         self.splitter                           = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
 
         # Port Add Button
@@ -712,9 +802,12 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         panel_table_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         panel_table_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
 
+        self.btn_reset = QtWidgets.QPushButton("Reset highlight")
+
         control_panel_v_splitter                = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
         control_panel_v_splitter.addWidget(self.splitter)
         control_panel_v_splitter.addWidget(self.panel_table)
+        control_panel_v_splitter.addWidget(self.btn_reset)
 
         layout                                  = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -746,6 +839,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl._ctrl_pannels[0].add_requested.connect(self._add_segment)
         self._multi_ctrl._ctrl_pannels[0].update_plot.connect(self._plot_refresh)
         self._multi_ctrl._ctrl_pannels[0].port_is_selected.connect(self._port_select)
+        self._multi_ctrl.panel_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self._multi_ctrl.panel_table.customContextMenuRequested.connect(self._on_port_menu)
 
         self._trace = TracePlotWidget()
 
@@ -759,8 +854,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_trace.setWidget(self._trace)
 
         for dock in (self._dock_ctrl, self._dock_plot, self._dock_trace):
-            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable |
-                             QtWidgets.QDockWidget.DockWidgetFloatable)
+            dock.setFeatures(
+                QtWidgets.QDockWidget.DockWidgetMovable |
+                QtWidgets.QDockWidget.DockWidgetFloatable
+            )
+        self._multi_ctrl.btn_reset.clicked.connect(self._plot._restore_full_intensity)
 
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self._dock_ctrl)
         self.splitDockWidget(self._dock_ctrl, self._dock_plot, QtCore.Qt.Horizontal)
@@ -780,6 +878,39 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         self._build_menu()
         self._build_toolbar()
+
+    def _on_port_menu(self, pos: QtCore.QPoint) -> None:
+        row = self._multi_ctrl.panel_table.rowAt(pos.y())
+        if row < 0:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_del = menu.addAction("Delete port")
+        if len(self._pulse) <= 1:
+            act_del.setEnabled(False)     # must keep at least one
+        if menu.exec_(
+            self._multi_ctrl.panel_table.viewport().mapToGlobal(pos)
+        ) == act_del:
+            self._delete_port(row)
+
+    def _delete_port(self, idx: int) -> None:
+        """Completely remove pulse, plot line and control panel at index idx."""
+        self._plot.remove_pulse(idx)
+        self._pulse.pop(idx)
+        ctrl = self._multi_ctrl._ctrl_pannels.pop(idx)
+        ctrl.deleteLater()
+        self._multi_ctrl._color_map.pop(idx)
+        self._multi_ctrl.splitter.widget(idx).deleteLater()
+        ControlPanel.port_idx -= 1  # decrement port index counter
+        for i, ctrl in enumerate(self._multi_ctrl._ctrl_pannels):
+            ctrl.idx = i
+
+        if self._selected_port_idx >= len(self._pulse):
+            self._selected_port_idx = len(self._pulse) - 1
+        self._plot.set_selected_port_idx(self._selected_port_idx)
+
+        self._multi_ctrl.refresh_table()
+        self.refresh_panel_table()
+        self._trace.refresh_trace(self._pulse)
 
     def _build_menu(self):
         mb          = self.menuBar()
@@ -850,7 +981,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse[0].v[0]     = float(data["initial_voltage"])
             if "voltage_bounds" in data and len(data["voltage_bounds"]) == 2:
                 self._pulse[0].v_bounds = tuple(map(float, data["voltage_bounds"]))
-                self._plot._pulse[0].v_bounds[0], self._plot._pulse[0].v_bounds[1] = self._pulse[0].v_bounds
             self._plot.refresh()
             self.ctrl.refresh_table()
         except Exception as exc:
