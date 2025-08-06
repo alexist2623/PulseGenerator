@@ -195,7 +195,12 @@ class TracePlotWidget(Canvas):
     def refresh_trace(self, pulses: list[PulseSequence]):
         """Refresh the trace plot with the selected pulses."""
         self._pulse = pulses
-        if self.x_idx is None or self.y_idx is None:
+        if (
+            self.x_idx is None or
+            self.y_idx is None or
+            self.x_idx >= len(self._pulse) or
+            self.y_idx >= len(self._pulse)
+        ):
             self.ax.cla()
             self.draw_idle()
             return
@@ -219,7 +224,12 @@ class TracePlotWidget(Canvas):
 
     def fit_view(self):
         """Fit the view to the pulse data."""
-        if self.x_idx is None or self.y_idx is None:
+        if (
+            self.x_idx is None or
+            self.y_idx is None or
+            self.x_idx >= len(self._pulse) or
+            self.y_idx >= len(self._pulse)
+        ):
             self.ax.cla()
             self.draw_idle()
             return
@@ -1052,6 +1062,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._plot.refresh()
         self._trace.refresh_trace(self._pulse)
 
+    def _make_row_slot(self, real_slot):
+        def wrapper(checked=False):
+            btn   = self.sender()
+            row   = self._multi_ctrl.panel_table.indexAt(btn.pos()).row()
+            real_slot(row)
+        return wrapper
     def refresh_panel_table(self):
         """Refresh the control panel table with current pulse data."""
         self._multi_ctrl.panel_table.setRowCount(len(self._multi_ctrl._ctrl_pannels))
@@ -1066,11 +1082,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._multi_ctrl.panel_table.setItem(idx, 1, item_color)
 
             btn_x = QtWidgets.QPushButton("set_x")
-            btn_x.clicked.connect(lambda _, i=idx: self._set_x(i))
+            btn_x.clicked.connect(self._make_row_slot(self._set_x))
             self._multi_ctrl.panel_table.setCellWidget(idx, 2, btn_x)
 
             btn_y = QtWidgets.QPushButton("set_y")
-            btn_y.clicked.connect(lambda _, i=idx: self._set_y(i))
+            btn_y.clicked.connect(self._make_row_slot(self._set_y))
             self._multi_ctrl.panel_table.setCellWidget(idx, 3, btn_y)
 
     def _set_x(self, idx):
