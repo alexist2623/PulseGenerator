@@ -29,29 +29,21 @@ class PulseSequence:
             return False
         if flat_idx == 0:
             return False
-        i_ramp   = flat_idx - 1
-        i_flat   = flat_idx + 1
-        if i_ramp is None:                      # first flat → ramp length is implicit
+        delta    = new_ramp - (self.t[flat_idx] - self.t[flat_idx - 1])
+        if (self.t[flat_idx - 1] + new_ramp >= self.t[flat_idx + 1]):   # would cross neighbour
             return False
-        t_left   = self.t[i_ramp]
-        t_right  = self.t[i_flat]               # start of flat
-        delta    = new_ramp - (self.t[flat_idx] - self.t[i_ramp])
-        if t_left + new_ramp >= t_right:        # would cross neighbour
-            return False
-        self.t[flat_idx:] += delta      # move ramp end
+        self.t[flat_idx:] += delta                                      # move ramp end
         return True
 
     def edit_flat(self, flat_idx: int, new_flat: float) -> bool:
         """Edit the flat segment at index flat_idx to have a new duration new_flat."""
         if new_flat < 0:
             return False
-        i_flat_end = flat_idx + 1
-        t_start    = self.t[flat_idx]
-        delta      = new_flat - (self.t[i_flat_end] - t_start)
+        delta = new_flat - (self.t[flat_idx + 1] - self.t[flat_idx])
         if delta == 0:
             return True
         # shift all subsequent points
-        self.t[i_flat_end:] += delta
+        self.t[flat_idx + 1:] += delta
         return True
 
     def edit_voltage(self, flat_idx: int, new_v: float) -> bool:
@@ -264,10 +256,12 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         ):
         fig                 = Figure(tight_layout=False)
         super().__init__(fig)
-        self._pulse: List[PulseSequence] = [pulse]
-        self._line: List[Axes] = []
-        self._selected_port_idx = 0
+        # Pulse and line settings
+        self._pulse: List[PulseSequence]    = [pulse]
+        self._line: List[Axes]              = []
+        self._selected_port_idx             = 0
 
+        # Color highlight settings
         self._default_alpha   = 1.0
         self._dim_alpha       = 0.95
         self._default_lw      = 1.5
@@ -277,13 +271,16 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         self.ax             = fig.add_subplot(111)
         self._line,         = [self.ax.plot(self._pulse[0].t, self._pulse[0].v, "-o", picker=5)]
         self._orig_colors.append(self._line[0].get_color())
+
+        # Graph settings
         self.ax.set_xlabel("time [ns]")
         self.ax.set_ylabel("voltage [mV]")
         self.ax.grid(True)
         self.ax.set_autoscale_on(False)
 
-        self._drag_flat: Optional[Tuple[int, int]] = None
-        self._drag_point: Optional[Tuple[int, int]] = None
+        # Dragging and panning settings
+        self._drag_flat: Optional[Tuple[int, int]]      = None
+        self._drag_point: Optional[Tuple[int, int]]     = None
         self._pan_origin: Optional[Tuple[float, float]] = None
         self._annot         = self.ax.annotate(
             "",
@@ -302,7 +299,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
 
         self.fit_view()
 
-    def fit_view(self):
+    def fit_view(self) -> None:
         """Fit the view to the pulse data."""
         margin_x = 0.03 * (self._pulse[0].t.max() - self._pulse[0].t.min() + 1e-12)
         margin_y = 0.10 * (self._pulse[0].v.ptp() + 1e-12) or 0.5
@@ -334,13 +331,13 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         )
         self.draw_idle()
 
-    def refresh(self):
+    def refresh(self) -> None:
         """Refresh plot"""
         for i, pulse in enumerate(self._pulse):
             self._line[i].set_data(pulse.t, pulse.v)
         self.draw_idle()
 
-    def add_pulse(self, pulse: PulseSequence):
+    def add_pulse(self, pulse: PulseSequence) -> None:
         """Add a new pulse to the plot."""
         self._pulse.append(pulse)
         line,                   = self.ax.plot(pulse.t, pulse.v, "-o", picker=5)
@@ -355,7 +352,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         """Get the index of the currently selected port."""
         return self._selected_port_idx
 
-    def set_selected_port_idx(self, idx: int):
+    def set_selected_port_idx(self, idx: int) -> None:
         """Set the index of the currently selected port."""
         self._selected_port_idx = idx
         self._update_highlight()
@@ -372,7 +369,6 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
                 continue
             if i0 == len(self._pulse[self._selected_port_idx].t) - 1:
                 break
-
             i1 = i0 + 1
             # mid-point of flat
             xm = 0.5 * (line_x[i0] + line_x[i1])
@@ -403,10 +399,9 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
                 return (i0, i0+1)
         return None
 
-    def _on_press(self, event):
+    def _on_press(self, event) -> None:
         if (event.button != 1 or not event.inaxes):
             return
-
         seg     = self._locate_flat_segment(event)
         point   = self._locate_point_segment(event)
         if seg:
@@ -416,7 +411,7 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
         else:
             self._pan_origin = (event.xdata, event.ydata)
 
-    def _on_move(self, event):
+    def _on_move(self, event) -> None:
         # tooltip
         self._annot.set_visible(False)
 
@@ -432,11 +427,9 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
             self.flat_moved.emit(i0, i1, new_v)
             self.refresh()
 
-            self._annot.xy = (
+            self._update_annot(
                 self._pulse[self._selected_port_idx].t[i0],
-                new_v
-            )
-            self._annot.set_text(
+                new_v,
                 f"{self._pulse[self._selected_port_idx].t[i0]:0.3g} ns\n{new_v:0.3g} mV"
             )
             self._annot.set_visible(True)
@@ -450,11 +443,9 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
             self.point_moved.emit(i0, i1, new_t)
             self.refresh()
 
-            self._annot.xy = (
+            self._update_annot(
                 new_t,
-                self._pulse[self._selected_port_idx].v[i0]
-            )
-            self._annot.set_text(
+                self._pulse[self._selected_port_idx].v[i0],
                 f"{new_t:0.3g} ns\n{self._pulse[self._selected_port_idx].v[i0]:0.3g} mV"
             )
             self._annot.set_visible(True)
@@ -534,6 +525,27 @@ class MatplotWidget(Canvas): # pylint: disable=too-many-instance-attributes
             line.set_color(self._orig_colors[i])
             line.set_zorder(1)
         self.draw_idle()
+
+    def _update_annot(self, x, y, text: str):
+        self._annot.xy = (x, y)
+        self._annot.set_text(text)
+
+        xmid = sum(self.ax.get_xlim()) / 2
+        ymid = sum(self.ax.get_ylim()) / 2
+
+        dx, dy =  +12, +12
+        ha,  va = "left", "bottom"
+
+        if x > xmid:
+            dx, ha = -dx, "right"
+        if y > ymid:
+            dy, va = -dy, "top"
+
+        self._annot.set_position((dx, dy))
+        self._annot.set_ha(ha)
+        self._annot.set_va(va)
+        self._annot.set_visible(True)
+        self.ax.figure.canvas.draw_idle()
 
 class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     """Input boxes plus a live table of all segments."""
