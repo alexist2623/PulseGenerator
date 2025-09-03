@@ -1,0 +1,37 @@
+{
+    "gate_mapping" : {
+        "G0" : "(1, 7 ,3)",
+        "G1" : "(1, 7, 1)",
+        "P0" : "(1, 7, 2)"
+    },
+    "dig_mapping" : {
+        "Dig0" : "(1, 18, 4)",
+        "Dig1" : "(1, 18, 2)" 
+    },
+    "gate_boundary" : {
+        "G0" : "(-2250, 2450)",
+        "G1" : "(-2250, 2450)",
+        "P0" : "(-20, 20)"
+    },
+    "rf_mapping" : {
+        "RF0" : "(1, 4, 4)"
+    },
+    "meas_setup" : {
+        "rf" : "RF0",
+        "dig" : "Dig0",
+        "frequency" : 200e6,
+        "gate_time" : 2e-6,
+        "acquisition_time" : 2e-6,
+        "n_shots" : 1,
+        "sweepparams" : {
+            "G0" : {
+                "range" : 200,
+                "resolution" : 100
+            },
+            "G1" : {
+                "range" : 200,
+                "resolution" : 100
+            }
+        }
+    }
+}
