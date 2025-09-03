@@ -2,7 +2,8 @@
     "gate_mapping" : {
         "G0" : "(1, 7 ,3)",
         "G1" : "(1, 7, 1)",
-        "P0" : "(1, 7, 2)"
+        "P0" : "(1, 7, 2)",
+        "P1" : "(1, 7, 4)"
     },
     "dig_mapping" : {
         "Dig0" : "(1, 18, 4)",
@@ -14,11 +15,20 @@
         "P0" : "(-20, 20)"
     },
     "rf_mapping" : {
-        "RF0" : "(1, 4, 4)"
+        "RF0" : "(1, 4, 4)",
+        "RF1" : "(1, 4, 3)"
     },
     "meas_setup" : {
-        "rf" : "RF0",
-        "dig" : "Dig0",
+        "meas_params" : {
+            "Gm0" : {
+                "rf" : "RF0",
+                "dig" : "Dig0"
+            },
+            "Gm1" : {
+                "rf" : "RF1",
+                "dig" : "Dig1"
+            }
+        },
         "frequency" : 200e6,
         "gate_time" : 2e-6,
         "acquisition_time" : 2e-6,

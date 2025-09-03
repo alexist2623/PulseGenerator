@@ -113,25 +113,6 @@ class QCSVideomodeProcessor(VideoModeProcessor):
             )
 
         meas = self.meas_setup
-        if hasattr(meas, "downconverter"):
-            self.qcs_mapper.add_downconverters(
-                self.dig_mapping[meas["dig"]],
-                ast.literal_eval(meas["downconverter"])
-            )
-            self.qcs_mapper.set_lo_frequencies(
-                [
-                    ast.literal_eval(meas["downconverter"]),
-                    self.rf_mapping[meas["rf"]]
-                ],
-                meas["frequency"] - 50e6
-            )
-        else:
-            self.qcs_mapper.set_lo_frequencies(
-                [
-                    self.rf_mapping[meas["rf"]]
-                ],
-                0
-            )
         for gate_name, _ in self.gate_mapping.items():
             # DC Waveform
             waveform = qcs.DCWaveform(
@@ -145,27 +126,47 @@ class QCSVideomodeProcessor(VideoModeProcessor):
                 self.qcs_gates[gate_name]
             )
         # RF Waveform
-        waveform = qcs.RFWaveform(
-            name = meas["rf"] + "_waveform",
-            duration = meas["acquisition_time"],
-            envelope = qcs.GaussianEnvelope(),
-            amplitude= 1.0,
-            rf_frequency= meas["frequency"]
-        )
-        self.qcs_program.add_waveform(
-            qcs.Delay(meas["gate_time"]),
-            self.qcs_rf[meas["rf"]]
-        )
-        self.qcs_program.add_waveform(
-            waveform,
-            self.qcs_rf[meas["rf"]]
-        )
-        self.qcs_program.add_acquisition(
-            integration_filter = waveform,
-            channels = self.qcs_dig[meas["dig"]],
-            pre_delay = meas["gate_time"]
-        )
-        self.channels.append(meas["dig"])
+        for meas_name, meas_param in meas["meas_params"].items():
+            if hasattr(meas_param, "downconverter"):
+                self.qcs_mapper.add_downconverters(
+                    self.dig_mapping[meas_param["dig"]],
+                    ast.literal_eval(meas_param["downconverter"])
+                )
+                self.qcs_mapper.set_lo_frequencies(
+                    [
+                        ast.literal_eval(meas_param["downconverter"]),
+                        self.rf_mapping[meas_param["rf"]]
+                    ],
+                    meas["frequency"] - 50e6
+                )
+            else:
+                self.qcs_mapper.set_lo_frequencies(
+                    [
+                        self.rf_mapping[meas_param["rf"]]
+                    ],
+                    0
+                )
+            waveform = qcs.RFWaveform(
+                name = meas_param["rf"] + "_waveform",
+                duration = meas["acquisition_time"],
+                envelope = qcs.GaussianEnvelope(),
+                amplitude= 1.0,
+                rf_frequency= meas["frequency"]
+            )
+            self.qcs_program.add_waveform(
+                qcs.Delay(meas["gate_time"]),
+                self.qcs_rf[meas_param["rf"]]
+            )
+            self.qcs_program.add_waveform(
+                waveform,
+                self.qcs_rf[meas_param["rf"]]
+            )
+            self.qcs_program.add_acquisition(
+                integration_filter = waveform,
+                channels = self.qcs_dig[meas_param["dig"]],
+                pre_delay = meas["gate_time"]
+            )
+            self.channels.append(meas_param["dig"])
         self.unique_channels = list(np.unique(self.channels))
 
         for gate_name, sweep_value in meas["sweepparams"].items():
@@ -290,13 +291,12 @@ class QCSVideomodeProcessor(VideoModeProcessor):
                     ]
                 )
         data = qcs.Executor(self.qcs_backend).execute(self.qcs_program)
-        data = np.abs(data.get_iq().to_numpy()).reshape(-1, self.n_shots).mean(axis=1)
-        data = [
-            data.reshape(
-                self.sweep_resolution[1],
-                self.sweep_resolution[0],
-            )
-        ]
+        data = np.abs(data.get_iq().to_numpy()).reshape(
+            len(self.channels),
+            self.n_shots,
+            self.sweep_resolution[1],
+            self.sweep_resolution[0]
+        ).mean(axis=1)
         if np.all(data == 0):
             raise Exception('data returned contained only zeros, aborting')
         return data
