@@ -1,23 +1,14 @@
-""" Dot array for QSTL
-
-There are virtual instruments for
-
-- DACs: several virtual IVVIs
-- A virtual gates object
- """
-
-
-# %% Load packages
+# -*- coding: utf-8 -*-
+""" Dot array for QSTL"""
 
 import logging
 import threading
 import json
 import ast
-from functools import partial
-from typing import Any, Dict, Mapping, Optional, Tuple
-
 import numpy as np
 import qcodes
+from functools import partial
+from typing import Dict, Optional, Tuple
 from qcodes import Instrument
 from qcodes.utils.validators import Numbers
 
@@ -25,12 +16,14 @@ from qtt.instrument_drivers.virtual_gates import VirtualGates
 
 logger = logging.getLogger(__name__)
 
-# %%
 class QSTLGate(Instrument):
+    """
+    Physical gate class. Note that setting voltage value does not update output voltage.
+    """
     def __init__(
             self,
-            name,
-            gate_mapping,
+            name: str,
+            gate_mapping: Dict[str, Tuple[int, int, int]], # Gate name : (chassis, slot, channel)
             **kwargs
         ):
         super().__init__(name, **kwargs)
@@ -51,10 +44,12 @@ class QSTLGate(Instrument):
         self._state[gate] = value
     
     def set_boundaries(self, boundaries : dict) -> None:
+        """Set boundaries of physical gate"""
         for gate, bd in boundaries.items():
             self.parameters[gate].vals = Numbers(bd[0], bd[1])
     
     def ask_raw(self, cmd: str) -> str:
+        """Dummy function"""
         if cmd == "*IDN?":
             return self.name
 
@@ -67,20 +62,17 @@ class QSTLGate(Instrument):
         return dict(vals)
 
 class QSTLDotModel(Instrument):
-    """ Simulation model for linear dot array
-
-    The model is intended for testing the code and learning. 
-    It does _not_ simulate any meaningful physics.
-
+    """ 
+    Quantum dot model
     """
 
     def __init__(
             self,
             name: str,
             verbose: int = 0,
-            dot_configuration: str = None,
+            dot_configuration: str = None, # path of dot configuration json file
             virtual_gate: bool = False,
-            crosscap_map: dict = None,
+            crosscap_map: Optional[Dict] = None,
             **kwargs
         ):
         """
@@ -90,38 +82,54 @@ class QSTLDotModel(Instrument):
                 name  name for the instrument
                 verbose : verbosity level
                 dot_configuration : dot configuration
+                example of dot configuration >>
                 {
                     "gate_mapping" : {
-                        "G0"  : "(1, 4, 1)", # Gate Name : (chassis, slot, channel)
-                        "G1"  : "(1, 4, 2)",
-                        "SD0" : "(1, 4, 3)"
+                        "G0" : "(1, 7 ,3)",      # Gate Name : (chassis, slot, channel)
+                        "G1" : "(1, 7, 1)",
+                        "P0" : "(1, 7, 2)",
+                        "P1" : "(1, 7, 4)"
                     },
                     "dig_mapping" : {
-                        "Dig0" : "(1, 13, 1)", # Digitizer Name : (chassis, slot, channel)
-                        "Dig1" : "(1, 13, 2)"
+                        "Dig1" : "(1, 18, 1)",   # Digitizer Name : (chassis, slot, channel)
+                        "Dig2" : "(1, 18, 2)" ,
+                        "Dig3" : "(1, 18, 3)",
+                        "Dig4" : "(1, 18, 4)"
                     },
                     "gate_boundary" : {
-                        "G0" : "(-300, 450)" # Gate name : (min, max) unit is mV
+                        "G0" : "(-2250, 2450)",  # Gate name : (min, max) unit is mV
+                        "G1" : "(-2250, 2450)",
+                        "P0" : "(-20, 20)"
                     },
                     "rf_mapping" : {
-                        "RF0" : "(1,3,1)"
+                        "RF1" : "(1, 4, 4)",     # RF name : (chassis, slot, channel)
+                        "RF2" : "(1, 4, 3)",
+                        "RF3" : "(1, 4, 2)",
+                        "RF4" : "(1, 4, 2)"
                     },
-                    "meas_setup" : {
-                        "rf" : "RF0",
-                        "dig" : "Dig0",
-                        "frequency" : 200e6,
-                        "gate_time" : 5e-6,
-                        "acquisition_time" : 5e-6,
-                        "sweepparams" : {
-                            "G0" : {
-                                "min" : -10,
-                                "max" : 15,
-                                "num" : 30
+                    "meas_setup" : {             # Measurement setup
+                        "meas_params" : {
+                            "Gm0" : {            # Measurement value. (Not important)
+                                "rf" : "RF1",    # RF signal generator.
+                                "dig" : "Dig1"   # Digitizer for reflected RF signal measurement
                             },
-                            "G1" : {
-                                "min" : -20,
-                                "max" : 5,
-                                "num" : 30
+                            "Gm1" : {
+                                "rf" : "RF4",
+                                "dig" : "Dig4"
+                            }
+                        },
+                        "frequency" : 200e6,     # RF frequency in MHz
+                        "gate_time" : 2e-6,      # DC settling time
+                        "acquisition_time" : 2e-6, # RF acquisition time
+                        "n_shots" : 1,           # repetition number
+                        "sweepparams" : {        # Sweep parameter setup
+                            "G0" : {             # Target physicla gate to sweep (X direction)
+                                "range" : 200,   # sweep range in mV
+                                "resolution" : 100 # number of points to sweep
+                            },
+                            "G1" : {             # Target physicla gate to sweep (Y direction)
+                                "range" : 200,
+                                "resolution" : 100
                             }
                         }
                     }
@@ -171,20 +179,23 @@ class QSTLDotModel(Instrument):
                             else:
                                 self.crosscap_map["V" + gate_name][pgate_name] = 0.0
 
-        print(self.crosscap_map)
         # dictionary to hold the data of the model
         self._data: Dict = {}
         self.lock = threading.Lock()
         self.virtual_gate = virtual_gate
+        # Physicla gate which contains voltage value of DAC. Setting this value does not 
+        # set output voltage of QCS directly.
         self.pgates = QSTLGate(
             name = "pgates",
             gate_mapping = self.gate_mapping,
         )
+        # Virtual gate instrument. This contains cross capacitance matrix.
         self.gates = VirtualGates(
             name = "gates",
             gates_instr = self.pgates,
             crosscap_map = self.crosscap_map,
         )
+        # Set minimum, maximum value of physical gate.
         self.pgates.set_boundaries(self.gate_boundary)
 
         station = qcodes.Station(
@@ -199,7 +210,6 @@ class QSTLDotModel(Instrument):
         station.calib_master = None
 
         self.station = station
-
         self._initialized = True
 
     def _data_get(self, param):
@@ -208,9 +218,3 @@ class QSTLDotModel(Instrument):
     def _data_set(self, param, value):
         self._data[param] = value
         return
-
-# %%
-
-
-if __name__ == '__main__' and 1:
-    pass
