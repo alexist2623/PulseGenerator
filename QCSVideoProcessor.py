@@ -37,6 +37,7 @@ class QCSVideomodeProcessor(VideoModeProcessor):
         ):
         self.station = station
         self.verbose = verbose
+
         self.sweepparams = []
         self.sweepranges = []
         self.sweep_resolution = []
@@ -105,11 +106,11 @@ class QCSVideomodeProcessor(VideoModeProcessor):
                 qcs.InstrumentEnum.M5200Digitizer
             )
         for gate_name, _ in self.gate_mapping.items():
-            v = self.station.gates.parameters[gate_name].get()
+            v = self.station.pgates.parameters[gate_name].get()
             self.qcs_gate_v_scalar[gate_name] = qcs.Scalar(
-                name = gate_name + "_amp",
-                dtype=float,
-                value = self.station.gates.parameters[gate_name].get() * mV
+                name  = gate_name + "_amp",
+                dtype = float,
+                value = self.station.pgates.parameters[gate_name].get() * mV
             )
 
         meas = self.meas_setup
@@ -126,7 +127,8 @@ class QCSVideomodeProcessor(VideoModeProcessor):
                 self.qcs_gates[gate_name]
             )
         # RF Waveform
-        for meas_name, meas_param in meas["meas_params"].items():
+        for _, meas_param in meas["meas_params"].items():
+            # Connect downconverter with digitizer if exist.
             if hasattr(meas_param, "downconverter"):
                 self.qcs_mapper.add_downconverters(
                     self.dig_mapping[meas_param["dig"]],
@@ -168,26 +170,38 @@ class QCSVideomodeProcessor(VideoModeProcessor):
             )
             self.channels.append(meas_param["dig"])
         self.unique_channels = list(np.unique(self.channels))
-
+        
+        # Calculate Physical gate voltages
         for gate_name, sweep_value in meas["sweepparams"].items():
             self.sweepparams.append(gate_name)
             self.sweepranges.append(sweep_value["range"])
-            sweep = qcs.Array(
-                name = gate_name + "_array",
-                value = np.array(
-                    [
-                        (
-                            self.station.gates.parameters[gate_name].get()
-                            + x * sweep_value["range"]/(sweep_value["resolution"]-1)
-                        ) * mV for x in range(sweep_value["resolution"])
-                    ]
+            self.sweep_resolution.append(sweep_value["resolution"])
+
+        qcs_pgates_sweep_arrays = []
+        for pgate_name, _ in self.gate_mapping.items():
+            a = (
+                self.station.gates.get_crosscap_map()["V" + self.sweepparams[0]][pgate_name] *
+                np.arange(self.sweep_resolution[0]) * self.sweepranges[0] /
+                (self.sweep_resolution[0]-1)
+            )
+            b = (
+                self.station.gates.get_crosscap_map()["V" + self.sweepparams[1]][pgate_name] *
+                np.arange(self.sweep_resolution[1]) * self.sweepranges[1] /
+                (self.sweep_resolution[1]-1)
+            )
+            qcs_pgates_sweep_arrays.append(
+                qcs.Array(
+                    name = pgate_name + "_array",
+                    value = (
+                        b[:, None] + a[None, :] +
+                        self.station.pgates.parameters[pgate_name].get()
+                    ).ravel() * mV
                 )
             )
-            self.qcs_program.sweep(
-                sweep,
-                self.qcs_gate_v_scalar[gate_name]
-            )
-            self.sweep_resolution.append(sweep_value["resolution"])
+        self.qcs_program.sweep(
+            qcs_pgates_sweep_arrays,
+            list(self.qcs_gate_v_scalar.values())
+        )
         self.qcs_program.n_shots(meas["n_shots"])
         self.n_shots = meas["n_shots"]
 
@@ -274,29 +288,34 @@ class QCSVideomodeProcessor(VideoModeProcessor):
     def measure(self, videomode):
         device_parameters = {}
         self._device_parameters = device_parameters
-        for gate_name, _ in self.gate_mapping.items():
-            if not gate_name in self.sweepparams:
-                amp_scalar = getattr(self.qcs_program.variables, gate_name + "_amp")
-                amp_scalar.value = self.station.gates[gate_name].get() * mV
-        
-        meas = self.meas_setup
-        for gate_name, sweep_value in meas["sweepparams"].items():
-            arr = getattr(self.qcs_program.variables, gate_name + "_array")
-            arr.value = np.array(
-                    [
-                        (
-                            self.station.gates.parameters[gate_name].get()
-                            + x * sweep_value["range"]/(sweep_value["resolution"]-1)
-                        ) * mV for x in range(sweep_value["resolution"])
-                    ]
-                )
-        data = qcs.Executor(self.qcs_backend).execute(self.qcs_program)
-        data = np.abs(data.get_iq().to_numpy()).reshape(
-            len(self.channels),
-            self.n_shots,
-            self.sweep_resolution[1],
-            self.sweep_resolution[0]
-        ).mean(axis=1)
+        for pgate_name, _ in self.gate_mapping.items():
+            a = (
+                self.station.gates.get_crosscap_map()["V" + self.sweepparams[0]][pgate_name] *
+                np.arange(self.sweep_resolution[0]) * self.sweepranges[0] /
+                (self.sweep_resolution[0]-1)
+            )
+            b = (
+                self.station.gates.get_crosscap_map()["V" + self.sweepparams[1]][pgate_name] *
+                np.arange(self.sweep_resolution[1]) * self.sweepranges[1] /
+                (self.sweep_resolution[1]-1)
+            )
+            arr = getattr(self.qcs_program.variables, pgate_name + "_array")
+            arr.value = (
+                b[:, None] + a[None, :] +
+                self.station.pgates.parameters[pgate_name].get()
+            ).ravel() * mV
+
+        result = qcs.Executor(self.qcs_backend).execute(self.qcs_program)
+        data = []
+        result = result.results.get_iq()
+        for _, meas_params in self.meas_setup["meas_params"].items():
+            data.append(
+                np.abs(result[self.qcs_dig[meas_params["dig"]]]).reshape(
+                    self.n_shots,
+                    self.sweep_resolution[1],
+                    self.sweep_resolution[0]
+                ).mean(axis=0)
+            )
         if np.all(data == 0):
             raise Exception('data returned contained only zeros, aborting')
         return data

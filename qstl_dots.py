@@ -65,7 +65,6 @@ class QSTLGate(Instrument):
         else:
             vals = [(gate, self.get(gate)) for gate in self.gates]
         return dict(vals)
-    
 
 class QSTLDotModel(Instrument):
     """ Simulation model for linear dot array
@@ -81,6 +80,7 @@ class QSTLDotModel(Instrument):
             verbose: int = 0,
             dot_configuration: str = None,
             virtual_gate: bool = False,
+            crosscap_map: dict = None,
             **kwargs
         ):
         """
@@ -155,30 +155,50 @@ class QSTLDotModel(Instrument):
                 
                 self.meas_setup = _config_data["meas_setup"]
 
+                if hasattr(_config_data, "crosscap_map"):
+                    self.crosscap_map = _config_data["crosscap_map"]
+                elif crosscap_map is not None:
+                    self.crosscap_map = crosscap_map
+                else:
+                    # Set virtual gate matrix as identity matrix
+                    self.crosscap_map = {}
+                    for gate_name, _ in self.gate_mapping.items():
+                        for pgate_name, _ in self.gate_mapping.items():
+                            if not ("V" + gate_name) in self.crosscap_map:
+                                self.crosscap_map["V" + gate_name] = {}
+                            if pgate_name == gate_name:
+                                self.crosscap_map["V" + gate_name][pgate_name] = 1.0
+                            else:
+                                self.crosscap_map["V" + gate_name][pgate_name] = 0.0
+
+        print(self.crosscap_map)
         # dictionary to hold the data of the model
         self._data: Dict = {}
         self.lock = threading.Lock()
         self.virtual_gate = virtual_gate
-
-        if not virtual_gate:
-            self.gates = QSTLGate(
-                "gates",
-                self.gate_mapping
-            )
-        else:
-            pass
-        self.gates.set_boundaries(self.gate_boundary)
+        self.pgates = QSTLGate(
+            name = "pgates",
+            gate_mapping = self.gate_mapping,
+        )
+        self.gates = VirtualGates(
+            name = "gates",
+            gates_instr = self.pgates,
+            crosscap_map = self.crosscap_map,
+        )
+        self.pgates.set_boundaries(self.gate_boundary)
 
         station = qcodes.Station(
+            self.pgates,
             self.gates,
             self,
             update_snapshot=False
         )
-        station.metadata['sample'] = 'virtual_dot'
         station.model = self
         station.gate_settle = lambda: 0
         station.jobmanager = None
         station.calib_master = None
+
+        self.station = station
 
         self._initialized = True
 
