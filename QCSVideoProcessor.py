@@ -208,13 +208,17 @@ class QCSVideomodeProcessor(VideoModeProcessor):
         for pgate_name, _ in self.gate_mapping.items():
             a = (
                 self.station.gates.get_crosscap_map()[self.sweepparams[0]][pgate_name] *
-                np.arange(self.resolution[0]) * self.sweepranges[0] /
-                (self.resolution[0]-1) - self.sweepranges[0]/2
+                (
+                    np.arange(self.resolution[0]) * self.sweepranges[0] /
+                    (self.resolution[0]-1) - self.sweepranges[0]/2
+                )
             )
             b = (
                 self.station.gates.get_crosscap_map()[self.sweepparams[1]][pgate_name] *
-                np.arange(self.resolution[1]) * self.sweepranges[1] /
-                (self.resolution[1]-1) - self.sweepranges[1]/2
+                (
+                    np.arange(self.resolution[1]) * self.sweepranges[1] /
+                    (self.resolution[1]-1) - self.sweepranges[1]/2
+                )
             )
             qcs_pgates_sweep_arrays.append(
                 qcs.Array(
@@ -327,13 +331,17 @@ class QCSVideomodeProcessor(VideoModeProcessor):
         for pgate_name, _ in self.gate_mapping.items():
             a = (
                 self.station.gates.get_crosscap_map()[self.sweepparams[0]][pgate_name] *
-                np.arange(self.resolution[0]) * self.sweepranges[0] /
-                (self.resolution[0]-1) - self.sweepranges[0]/2
+                (
+                    np.arange(self.resolution[0]) * self.sweepranges[0] /
+                    (self.resolution[0]-1) - self.sweepranges[0]/2
+                )
             )
             b = (
                 self.station.gates.get_crosscap_map()[self.sweepparams[1]][pgate_name] *
-                np.arange(self.resolution[1]) * self.sweepranges[1] /
-                (self.resolution[1]-1) - self.sweepranges[1]/2
+                (
+                    np.arange(self.resolution[1]) * self.sweepranges[1] /
+                    (self.resolution[1]-1) - self.sweepranges[1]/2
+                )
             )
             arr = getattr(self.qcs_program.variables, pgate_name + "_array")
             arr.value = (
