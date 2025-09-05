@@ -64,7 +64,6 @@ class Channels:
     def __getitem__(self, idx: int | slice) -> Channels:
         return self._channels[idx]
 
-
 @dataclass
 class InstrumentEnum:
     RF = "RF"
@@ -761,6 +760,8 @@ class Program:
         self.save_path = None
         self.variables = None
 
+        self.operations = []
+
     def add_acquisition(
         self,
         integration_filter: (
@@ -788,6 +789,7 @@ class Program:
         :param pre_delay: An optional delay in seconds to insert before the operation.
         """
         channels[0].last_time += pre_delay if pre_delay is not None else 0
+        self.operations[channels[0].last_time] = (integration_filter)
 
 
     def add_waveform(

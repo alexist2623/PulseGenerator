@@ -1,7 +1,10 @@
+"""Qick Pyro connection test"""
+import numpy as np
+import matplotlib.pyplot as plt
+
 from qick import *
 from qick.averager_program import QickSweep
 from qick.pyro import make_proxy
-import numpy as np
 
 class P1dBMeas_Exp(NDAveragerProgram):
     def initialize(self):
@@ -105,8 +108,6 @@ if __name__ == "__main__":
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
     expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True)
-
-    import matplotlib.pyplot as plt
 
     plt.figure()
     meas_pwr = np.sqrt(avg_di[0][0] * avg_di[0][0] + avg_dq[0][0] * avg_dq[0][0])
