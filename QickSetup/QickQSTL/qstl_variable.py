@@ -155,8 +155,8 @@ class Scalar(Variable):
         unit: str | UnitsEnum | None = None,
         read_only: bool = False,
     ) -> None:
-        if value is None and read_only:
-            raise ValueError("Tried to create a read-only variable with no value.")
+        if value is None:
+            raise ValueError("Cannot create a Scalar with no set value in QICK.")
         self.dtype = dtype or complex
         self.value = None if value is None else dtype(value)
 
@@ -174,3 +174,13 @@ class Scalar(Variable):
         No reason to use this in QICK
         """
         raise NotImplementedError
+    
+    def get_value(self) -> Any:
+        r"""
+        Get the value of the scalar.
+
+        :raises ValueError: If the scalar has no set value.
+        """
+        if self.value is None:
+            raise ValueError(f"The value of {self.name} has not been set.")
+        return self.value
