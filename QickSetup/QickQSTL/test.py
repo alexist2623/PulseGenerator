@@ -16,6 +16,12 @@ digitizer = qstl.Channels(
     name = "digitizer"
 )
 
+amp_scalar = qstl.Scalar(
+    name = "amp_scalar",
+    value = 0.6,
+    dtype = float,
+)
+
 mapper.add_channel_mapping(
     awg,
     0,
@@ -37,11 +43,21 @@ mapper.add_channel_mapping(
 rfwaveform = qstl.RFWaveform(
     duration = 100e-9,
     envelope = qstl.ConstantEnvelope(),
+    amplitude = amp_scalar,
+    rf_frequency = 1e9,
+    instantaneous_phase = 0.0,
+    name = "test_rf"
+)
+
+sweep_rfwaveform = qstl.RFWaveform(
+    duration = 300e-9,
+    envelope = qstl.ConstantEnvelope(),
     amplitude = 0.5,
     rf_frequency = 1e9,
     instantaneous_phase = 0.0,
     name = "test_rf"
 )
+
 program = qstl.Program()
 program.add_waveform(
     rfwaveform,
@@ -56,7 +72,7 @@ program.add_waveform(
     awg[0]
 )
 program.add_waveform(
-    rfwaveform,
+    sweep_rfwaveform,
     awg[0]
 )
 
