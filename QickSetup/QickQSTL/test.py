@@ -2,54 +2,80 @@ import qstl
 from typing import Iterable
 from pprint import pprint
 
-def test_qstl():
-    mapper = qstl.ChannelMapper()
-    awg = qstl.Channels(
-        0,
-        name = "awg"
-    )
-    digitizer = qstl.Channels(
-        range(4),
-        name = "digitizer"
-    )
+mapper = qstl.ChannelMapper()
+awg = qstl.Channels(
+    0,
+    name = "awg"
+)
+awg_measure = qstl.Channels(
+    range(3),
+    name = "awg_measure"
+)
+digitizer = qstl.Channels(
+    range(4),
+    name = "digitizer"
+)
 
-    mapper.add_channel_mapping(
-        awg,
-        0,
-        qstl.InstrumentEnum.RF
-    )
-    mapper.add_channel_mapping(
-        digitizer,
-        [0,1,2,3],
-        qstl.InstrumentEnum.Digitizer
-    )
+mapper.add_channel_mapping(
+    awg,
+    0,
+    qstl.InstrumentEnum.RF
+)
+mapper.add_channel_mapping(
+    awg_measure,
+    [1,2,3],
+    qstl.InstrumentEnum.RF
+)
+mapper.add_channel_mapping(
+    digitizer,
+    [0,1,2,3],
+    qstl.InstrumentEnum.Digitizer
+)
 
-    # pprint(mapper.in_channel_map)
+# pprint(mapper.in_channel_map)
 
-    rfwaveform = qstl.RFWaveform(
-        duration = 100e-9,
-        envelope = qstl.ConstantEnvelope(),
-        amplitude = 0.5,
-        rf_frequency = 1e9,
-        instantaneous_phase = 0.0,
-        name = "test_rf"
-    )
-    program = qstl.Program()
-    program.add_waveform(
-        rfwaveform,
-        awg[0]
-    )
-    program.add_waveform(
-        qstl.Delay(200e-9),
-        awg[0]
-    )
-    program.add_waveform(
-        rfwaveform,
-        awg[0],
-        new_layer = True
-    )
+rfwaveform = qstl.RFWaveform(
+    duration = 100e-9,
+    envelope = qstl.ConstantEnvelope(),
+    amplitude = 0.5,
+    rf_frequency = 1e9,
+    instantaneous_phase = 0.0,
+    name = "test_rf"
+)
+program = qstl.Program()
+program.add_waveform(
+    rfwaveform,
+    awg[0]
+)
+program.add_waveform(
+    qstl.Delay(200e-9),
+    awg[0]
+)
+program.add_waveform(
+    rfwaveform,
+    awg[0]
+)
+program.add_waveform(
+    rfwaveform,
+    awg[0]
+)
 
-    pprint(program.operations)
+program.add_waveform(
+    rfwaveform,
+    awg_measure[0]
+)
+program.add_waveform(
+    rfwaveform,
+    awg_measure[1]
+)
+# program.add_waveform(
+#     rfwaveform,
+#     awg[0],
+#     new_layer = True
+# )
 
-if __name__ == "__main__":
-    test_qstl()
+# pprint(program.operations)
+
+program = qstl.Executor(mapper).execute(program)
+pprint(program)
+
