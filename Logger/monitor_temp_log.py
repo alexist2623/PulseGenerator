@@ -21,10 +21,8 @@ Config JSON (minimal example):
     "smtp": {
       "host": "smtp.gmail.com",
       "port": 587,
-      "security": "starttls",            // "starttls" | "ssl" | "none"
       "username": "your@gmail.com",
-      "password_env_var": "SMTP_PASS"    // (recommended) read password from ENV
-      // OR use "password": "app_password" (less secure)
+      "password": "SMTP_PASS"    // google app password
     }
   },
   "poll_interval_seconds": 1.0,          // (optional) tail poll interval
@@ -65,6 +63,12 @@ def now_local_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def load_config(path: Path) -> dict:
+    r"""Setup configuration from JSON file.
+    Args:
+        path: Path to JSON config file.
+    Returns:
+        Configuration dictionary.
+    """
     with path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
     # minimal validation
@@ -82,12 +86,18 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("encoding", "utf-8")
     return cfg
 
-def open_mailer(smtp_cfg: dict):
+def open_mailer(smtp_cfg: dict) -> smtplib.SMTP:
+    r"""
+    Open and login to an SMTP server based on config.
+    Args:
+        smtp_cfg: SMTP configuration dictionary.
+    Returns:
+        An smtplib.SMTP or smtplib.SMTP_SSL instance.
+    """
     host = smtp_cfg.get("host")
     port = int(smtp_cfg.get("port", 587))
     username = smtp_cfg.get("username")
     password = smtp_cfg.get("password")
-    security = "starttls"
 
     if not host:
         raise ValueError("email.smtp.host is required in config")
@@ -95,11 +105,8 @@ def open_mailer(smtp_cfg: dict):
         raise ValueError("email.smtp.username is required in config")
     if not "password" in smtp_cfg:
         raise ValueError("email.smtp.password or password_env_var is required in config")
-    if security == "ssl":
-        server = smtplib.SMTP_SSL(host, port, timeout=30)
-    else:
-        server = smtplib.SMTP(host, port, timeout=30)
-        server.starttls()
+    server = smtplib.SMTP(host, port, timeout=30)
+    server.starttls()
     try:
         server.login(username, password or "")
     except smtplib.SMTPException as e:
@@ -109,6 +116,14 @@ def open_mailer(smtp_cfg: dict):
     return server
 
 def send_email_alert(cfg: dict, value: float, line: str, log_path: Path) -> None:
+    r"""
+    Send an email alert about threshold exceedance.
+    Args:
+        cfg: Configuration dictionary.
+        value: The numeric value that exceeded the threshold.
+        line: The full log line containing the value.
+        log_path: Path to the log file being monitored.
+    """
     email_cfg = cfg["email"]
     smtp_cfg = email_cfg["smtp"]
     sender = email_cfg.get("sender", "Temp Monitor <no-reply@example.com>")
@@ -116,9 +131,9 @@ def send_email_alert(cfg: dict, value: float, line: str, log_path: Path) -> None
     subject = subject_tpl.format(value=value, threshold=cfg["threshold"], file=str(log_path))
 
     body = (
-        f"Threshold exceeded at {now_local_str()}.\n\n"
-        f"Threshold: {cfg['threshold']}\n"
-        f"Value:     {value}\n"
+        f"Fridge1 threshold exceeded at {now_local_str()}.\n\n"
+        f"Threshold: {cfg['threshold']} K\n"
+        f"Value:     {value} K\n"
         f"File:      {log_path}\n"
         f"Line:      {line.strip()}\n"
     )
@@ -141,15 +156,17 @@ def send_email_alert(cfg: dict, value: float, line: str, log_path: Path) -> None
             except Exception:
                 pass
 
-# ----------------------------- Log parsing --------------------------------
-
 _FLOAT_RE = re.compile(r"[-+]?(?:\d*\.?\d+|\d+\.)(?:[eE][-+]?\d+)?")
 
 def extract_rightmost_float(line: str) -> Optional[float]:
-    """
+    r"""
     Try to parse the rightmost numeric token in a comma-separated line.
     Example line: "08-09-25, 00:00:02, 1.1613e-02"
     We split by comma and search from the end for a valid float string.
+    Args:
+        line: A single line of text.
+    Returns:
+        The parsed float value, or None if no valid float found.
     """
     if not line:
         return None
@@ -177,6 +194,13 @@ def extract_rightmost_float(line: str) -> Optional[float]:
 # ----------------------------- File handling ------------------------------
 
 def compute_log_path(cfg: dict) -> Path:
+    r"""
+    Compute the current log file path based on config and current date.
+    Args:
+        cfg: Configuration dictionary.
+    Returns:
+        Path to the log file to monitor.
+    """
     # If a specific file is provided, use it.
     if "log_file" in cfg and cfg["log_file"]:
         return Path(cfg["log_file"])
@@ -189,13 +213,19 @@ def compute_log_path(cfg: dict) -> Path:
     return Path(base_dir) / date_folder / cfg.get("log_filename", "TempLog.txt")
 
 def wait_for_file(path: Path, poll_interval: float) -> None:
+    r"""
+    Wait until the specified file exists.
+    Args:
+        path: Path to the file.
+        poll_interval: Seconds between existence checks.
+    """
     while not path.exists():
         logging.info("Waiting for log file to appear: %s", path)
         time.sleep(poll_interval)
 
 def tail_file(f, poll_interval: float):
     """
-    Generator that yields new lines appended to file f, similar to `tail -f`.
+    Generator that yields new lines appended to file f, similar to 'tail -f'.
     """
     while True:
         where = f.tell()
@@ -207,6 +237,11 @@ def tail_file(f, poll_interval: float):
             yield line
 
 def monitor(cfg: dict) -> None:
+    r"""
+    Main monitoring loop.
+    Args:
+        cfg: Configuration dictionary.
+    """
     threshold = float(cfg["threshold"])
     poll_interval = float(cfg.get("poll_interval_seconds", 1.0))
     start_from_beginning = bool(cfg.get("start_from_beginning", False))
@@ -230,7 +265,11 @@ def monitor(cfg: dict) -> None:
             with current_path.open("r", encoding=encoding, errors="replace") as f:
                 if not start_from_beginning:
                     f.seek(0, os.SEEK_END)
-                logging.info("Monitoring file: %s (start_from_beginning=%s)", current_path, start_from_beginning)
+                logging.info(
+                    "Monitoring file: %s (start_from_beginning=%s)",
+                    current_path,
+                    start_from_beginning
+                )
 
                 for line in tail_file(f, poll_interval):
                     # If date changed while tailing, break to reopen new file
@@ -257,8 +296,10 @@ def monitor(cfg: dict) -> None:
                             except Exception as e:
                                 logging.error("Failed to send alert email: %s", e)
                         else:
-                            logging.info("Threshold exceeded but within cooldown (%.1fs remaining).",
-                                         cooldown - (now_ts - last_alert_ts))
+                            logging.info(
+                                "Threshold exceeded but within cooldown (%.1fs remaining).",
+                                cooldown - (now_ts - last_alert_ts)
+                            )
         except FileNotFoundError:
             # If file vanished (rotation, cleanup), loop will try again
             logging.info("File not found (may be rotating). Will retry: %s", current_path)
@@ -270,10 +311,17 @@ def monitor(cfg: dict) -> None:
             logging.error("Unexpected error while monitoring: %s", e)
             time.sleep(poll_interval)
 
-# ----------------------------- CLI entry ----------------------------------
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Monitor TempLog and email on threshold exceedance.")
+def main(argv=None) -> int:
+    r"""
+    Main entry point.
+    Args:
+        argv: List of command line arguments (defaults to sys.argv).
+    Returns:
+        Exit code (0=success, 2=error).
+    """
+    parser = argparse.ArgumentParser(
+        description="Monitor TempLog and email on threshold exceedance."
+    )
     parser.add_argument("--config", required=True, help="Path to JSON config file.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args(argv)
@@ -297,6 +345,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         logging.info("Stopped by user.")
         return 0
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

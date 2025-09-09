@@ -4,17 +4,16 @@
     "threshold": 0.044,
     "recipients": ["alexist@snu.ac.kr"],
     "email": {
-        "subject": "[ALERT] Temp threshold exceeded: {value}",
-        "sender": "Temp Monitor <bot@example.com>",
+        "subject": "[ALERT] Temperature threshold exceeded: {value} K",
+        "sender": "Temperature Monitor <bot@example.com>",
         "smtp": {
             "host": "smtp.gmail.com",
             "port": 587,
-            "security": "starttls",
             "username": "qstldots@gmail.com",
             "password": "tvlx gumn yhir qxmy"
         }
     },
-    "poll_interval_seconds": 1.0,
+    "poll_interval_seconds": 5.0,
     "start_from_beginning": false,
     "resend_cooldown_seconds": 300
 }
