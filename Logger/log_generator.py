@@ -27,11 +27,11 @@ def load_config(path: Optional[Path]) -> dict:
     cfg.setdefault("interval_seconds", 1.0)
     cfg.setdefault("encoding", "utf-8")
     cfg.setdefault("append", True)
-    cfg.setdefault("mean", 0.01)           # 일반 값 평균
-    cfg.setdefault("std", 0.002)           # 일반 값 표준편차
-    cfg.setdefault("spike_prob", 0.1)      # 스파이크 발생 확률
-    cfg.setdefault("spike_mean", 0.08)     # 스파이크 평균
-    cfg.setdefault("spike_std", 0.01)      # 스파이크 표준편차
+    cfg.setdefault("mean", 0.01)
+    cfg.setdefault("std", 0.002)
+    cfg.setdefault("spike_prob", 0.1)
+    cfg.setdefault("spike_mean", 0.08)
+    cfg.setdefault("spike_std", 0.01)
     return cfg
 
 def compute_path(base_dir: Optional[str], log_file: Optional[str], log_filename: str) -> Path:
@@ -55,7 +55,7 @@ def sample_value(mean: float, std: float, spike_prob: float, spike_mean: float, 
         v = random.gauss(spike_mean, spike_std)
     else:
         v = random.gauss(mean, std)
-    return max(0.0, v)  # 음수 방지
+    return max(0.0, v)
 
 def format_line(ts: datetime, value: float) -> str:
     # DD-MM-YY, HH:MM:SS, 1.2345e-02
@@ -65,26 +65,26 @@ def format_line(ts: datetime, value: float) -> str:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Generate TempLog-style lines into YYYYMMDD/TempLog.txt")
-    p.add_argument("--config", help="JSON 설정 파일 경로")
-    p.add_argument("--base-dir", help="YYYYMMDD 하위 폴더들이 생성되는 루트 경로")
-    p.add_argument("--log-file", help="이 경로로만 기록 (base-dir 사용 안함)")
-    p.add_argument("--log-filename", help="파일명 (기본 TempLog.txt)")
-    p.add_argument("--interval", type=float, help="라인 기록 주기(sec). 기본 1.0")
-    p.add_argument("--lines", type=int, default=0, help="기록할 라인 수. 0이면 무한")
-    p.add_argument("--duration", type=float, default=0.0, help="초 단위로 실행 시간 제한. 0이면 무제한")
-    p.add_argument("--append", action="store_true", help="기존 파일에 이어서 기록 (기본 True)")
-    p.add_argument("--truncate", action="store_true", help="시작시 파일을 새로 씀 (append False)")
-    p.add_argument("--mean", type=float, help="일반 값 평균 (예: 0.01)")
-    p.add_argument("--std", type=float, help="일반 값 표준편차 (예: 0.002)")
-    p.add_argument("--spike-prob", type=float, help="스파이크 발생 확률 (0~1)")
-    p.add_argument("--spike-mean", type=float, help="스파이크 평균 (예: 0.08)")
-    p.add_argument("--spike-std", type=float, help="스파이크 표준편차 (예: 0.01)")
+    p.add_argument("--config", help="JSON Config file path")
+    p.add_argument("--base-dir", help="YYYYMMDD folder will be created under this path")
+    p.add_argument("--log-file", help="Full log file path (overrides base-dir)")
+    p.add_argument("--log-filename", help="Log filename (default TempLog.txt)")
+    p.add_argument("--interval", type=float, help="line write interval in seconds")
+    p.add_argument("--lines", type=int, default=0, help="number of lines to write before stopping. 0 means unlimited")
+    p.add_argument("--duration", type=float, default=0.0, help="maximum duration in seconds before stopping. 0 means unlimited")
+    p.add_argument("--append", action="store_true", help="Append to existing file (default)")
+    p.add_argument("--truncate", action="store_true", help="Make new file instead of appending")
+    p.add_argument("--mean", type=float, help="mean value (e.g. 0.01)")
+    p.add_argument("--std", type=float, help="standard deviation (e.g. 0.002)")
+    p.add_argument("--spike-prob", type=float, help="spike probability (0.0 to 1.0, e.g. 0.1)")
+    p.add_argument("--spike-mean", type=float, help="spike mean value (e.g. 0.08)")
+    p.add_argument("--spike-std", type=float, help="spike std (e.g. 0.01)")
 
     args = p.parse_args(argv)
 
     cfg = load_config(Path(args.config) if args.config else None)
 
-    # CLI가 있으면 config를 덮어씀
+    # override config with command line args if provided
     if args.base_dir: cfg["base_dir"] = args.base_dir
     if args.log_file: cfg["log_file"] = args.log_file
     if args.log_filename: cfg["log_filename"] = args.log_filename
@@ -97,7 +97,6 @@ def main(argv=None):
     if args.spike_mean is not None: cfg["spike_mean"] = args.spike_mean
     if args.spike_std is not None: cfg["spike_std"] = args.spike_std
 
-    # 필수 확인
     base_dir = cfg.get("base_dir")
     log_file = cfg.get("log_file")
     log_filename = cfg.get("log_filename", "TempLog.txt")
@@ -111,7 +110,6 @@ def main(argv=None):
     spike_mean = float(cfg.get("spike_mean", 0.08))
     spike_std = float(cfg.get("spike_std", 0.01))
 
-    # 종료 조건
     target_lines = int(args.lines or 0)
     max_duration = float(args.duration or 0.0)
     start_time = time.time()
@@ -125,7 +123,6 @@ def main(argv=None):
         while True:
             ts = datetime.now()
 
-            # 날짜 롤오버 체크 (base_dir 모드일 때만)
             new_path = compute_path(base_dir, log_file, log_filename)
             if new_path != current_path:
                 f.close()
@@ -137,7 +134,6 @@ def main(argv=None):
             line = format_line(ts, value)
             f.write(line)
             f.flush()
-            # 콘솔에도 보여줌
             sys.stdout.write(line)
             sys.stdout.flush()
 

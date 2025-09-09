@@ -53,8 +53,6 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional, Tuple
 
-# ----------------------------- Utilities ----------------------------------
-
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -84,45 +82,30 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("encoding", "utf-8")
     return cfg
 
-def resolve_password(smtp_cfg: dict) -> Optional[str]:
-    """Resolve SMTP password from config. Prefer environment variable if provided."""
-    pwd = smtp_cfg.get("password")
-    env_var = smtp_cfg.get("password_env_var")
-    if pwd:
-        return pwd
-    if env_var:
-        env_val = os.getenv(env_var)
-        if env_val:
-            return env_val
-        else:
-            logging.warning("Environment variable %s is not set; email may fail.", env_var)
-            return None
-    # Gracefully allow passwordless if server permits (e.g., localhost relay)
-    return None
-
 def open_mailer(smtp_cfg: dict):
     host = smtp_cfg.get("host")
     port = int(smtp_cfg.get("port", 587))
-    security = (smtp_cfg.get("security") or "starttls").lower()
     username = smtp_cfg.get("username")
-    password = resolve_password(smtp_cfg)
+    password = smtp_cfg.get("password")
+    security = "starttls"
 
     if not host:
         raise ValueError("email.smtp.host is required in config")
+    if not username:
+        raise ValueError("email.smtp.username is required in config")
+    if not "password" in smtp_cfg:
+        raise ValueError("email.smtp.password or password_env_var is required in config")
     if security == "ssl":
         server = smtplib.SMTP_SSL(host, port, timeout=30)
     else:
         server = smtplib.SMTP(host, port, timeout=30)
-        if security == "starttls":
-            server.starttls()
-
-    if username:
-        try:
-            server.login(username, password or "")
-        except smtplib.SMTPException as e:
-            logging.error("SMTP login failed: %s", e)
-            server.quit()
-            raise
+        server.starttls()
+    try:
+        server.login(username, password or "")
+    except smtplib.SMTPException as e:
+        logging.error("SMTP login failed: %s", e)
+        server.quit()
+        raise
     return server
 
 def send_email_alert(cfg: dict, value: float, line: str, log_path: Path) -> None:
