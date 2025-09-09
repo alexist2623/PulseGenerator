@@ -20,15 +20,26 @@ class P1dBMeas_Exp(NDAveragerProgram):
             ch      = 0,        # Channel
             length  = cfg["pulse_time"] + 100       # Readout length
         )
-        self.r_gain  = self.get_gen_reg(gen_ch = 0, name = "gain")
+        self.r_freq  = self.get_gen_reg(gen_ch = 0, name = "freq")
+        f_start     = self.freq2reg(
+            f       = 100,      # Frequency
+            gen_ch  = 0,        # Generator channel
+            ro_ch   = 0         # Readout channel for round up
+        )
+        f_stop      = self.freq2reg(
+            f       = 2000,      # Frequency
+            gen_ch  = 0,        # Generator channel
+            ro_ch   = 0         # Readout channel for round up
+        )
+        print(f_stop)
         self.add_sweep(
             QickSweep(
                 prog    = self,
-                reg     = self.r_gain,
-                start   = 300,
-                stop    = 3000,
-                expts   = 50,
-                label   = "gain_sweep"
+                reg     = self.r_freq,
+                start   = 100,
+                stop    = f_stop,
+                expts   = 500,
+                label   = "freq_sweep"
             )
         )
 
@@ -93,30 +104,23 @@ if __name__ == "__main__":
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
 
-    freq_rf = [
-        100 + 100 * x for x in range(10)
-    ]
-    cmap = plt.cm.get_cmap("tab10", len(freq_rf))
+    cfg = {
+        # Experiment Setup
+        "reps" : 100,
+        "expts" : 1,
+        "freq_sweep_num" : 100,
+        "duration_sweep_num" : 100,
+        # Parameter Setup
+        "freq_rf" : 1500,
+        "pulse_time" : 4000
+    }
+    prog = P1dBMeas_Exp(
+        soccfg, # Note that it should be QickSocConfig, not the QickSoc
+        cfg
+    )
+    expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True)
+    meas_pwr = np.sqrt(avg_di[0][0] * avg_di[0][0] + avg_dq[0][0] * avg_dq[0][0])
     plt.figure()
-    for i, f in enumerate(freq_rf):
-        cfg = {
-            # Experiment Setup
-            "reps" : 100,
-            "expts" : 1,
-            "freq_sweep_num" : 100,
-            "duration_sweep_num" : 100,
-            # Parameter Setup
-            "freq_rf" : f,
-            "pulse_time" : 4000
-        }
-        prog = P1dBMeas_Exp(
-            soccfg, # Note that it should be QickSocConfig, not the QickSoc
-            cfg
-        )
-        expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True)
-        meas_pwr = np.sqrt(avg_di[0][0] * avg_di[0][0] + avg_dq[0][0] * avg_dq[0][0])
-
-        plt.plot(expt_pts[0]/32768, meas_pwr, color=cmap(i))
+    plt.plot(expt_pts[0], meas_pwr)
     plt.tight_layout()
-    plt.legend([f"{f} MHz" for f in freq_rf])
     plt.show()

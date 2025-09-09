@@ -1,0 +1,11 @@
+{
+  "base_dir": "C:\\\\Your\\\\Logs\\\\Folder",
+  "log_filename": "TempLog.txt",
+  "interval_seconds": 0.5,
+  "append": true,
+  "mean": 0.01,
+  "std": 0.002,
+  "spike_prob": 0.2,
+  "spike_mean": 0.08,
+  "spike_std": 0.01
+}

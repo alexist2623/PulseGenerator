@@ -1,0 +1,20 @@
+{
+    "base_dir": "C:\\\\Logs",
+    "log_filename": "TempLog.txt",
+    "threshold": 0.05,
+    "recipients": ["alexist@snu.ac.kr"],
+    "email": {
+        "subject": "[ALERT] Temp threshold exceeded: {value}",
+        "sender": "Temp Monitor <bot@example.com>",
+        "smtp": {
+            "host": "smtp.gmail.com",
+            "port": 587,
+            "security": "starttls",
+            "username": "qstldots@gmail.com",
+            "password": "tvlx gumn yhir qxmy"
+        }
+    },
+    "poll_interval_seconds": 1.0,
+    "start_from_beginning": false,
+    "resend_cooldown_seconds": 300
+}
