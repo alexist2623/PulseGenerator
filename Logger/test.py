@@ -1,13 +1,14 @@
-from email.message import EmailMessage
-import smtplib, ssl
+import os
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
-username = "qstldots@gmail.com"
-password = "tvlx gumn yhir qxmy"
-host = "smtp.gmail.com"
-port = 587
+client = WebClient(token="")
 
-server = smtplib.SMTP(host, port, timeout=30)
-context = ssl.create_default_context()
-server.ehlo()
-server.starttls(context=context)
-server.login(username, password)
+try:
+    resp = client.chat_postMessage(
+        channel="",
+        text="Hello world"
+    )
+    print("sent ts:", resp["ts"])
+except SlackApiError as e:
+    print("error:", e.response.get("error"))
