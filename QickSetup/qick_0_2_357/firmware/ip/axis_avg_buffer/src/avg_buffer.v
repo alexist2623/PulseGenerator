@@ -100,7 +100,7 @@ output				m2_axis_tvalid;
 input				m2_axis_tready;
 output	[4*B-1:0]	m2_axis_tdata;
 
-input				AVG_START_REG;
+input	[31:0]		AVG_START_REG;
 input	[N_AVG-1:0]	AVG_ADDR_REG;
 input	[31:0]		AVG_LEN_REG;
 input               AVG_PHOTON_MODE_REG;

@@ -78,7 +78,7 @@ output				m1_axis_tvalid;
 input				m1_axis_tready;
 output	[4*B-1:0]	m1_axis_tdata;
 
-input				AVG_START_REG;
+input	[31:0]		AVG_START_REG;
 input	[N-1:0]		AVG_ADDR_REG;
 input	[31:0]		AVG_LEN_REG;
 input				DR_START_REG;
@@ -91,15 +91,30 @@ input   [B-1:0]     AVG_L_THRSH_REG;
 //////////////////////
 // Internal signals //
 //////////////////////
+wire				mem_we_avg, mem_we_trace;
+wire	[N-1:0]		mem_addr_avg, mem_addr_trace;
+wire	[4*B-1:0]	mem_di_avg, mem_di_trace;
+
 wire				mem_we_int;
 wire	[N-1:0]		mem_addra_int, mem_addrb_int;
 wire	[4*B-1:0]	mem_di_int, mem_do_int;
+wire	[4*B-1:0]	mem_doa_int;
 
-wire				AVG_START_REG_resync;
+wire	[1:0]		AVG_START_REG_resync;
+wire	[15:0]		avg_number_resync;
 wire				DR_START_REG_resync;
 
 wire				fifo_empty;
 
+wire                TRACE_MODE_REG;
+
+//////////////////////
+// BRAM Write Selection //
+//////////////////////
+assign TRACE_MODE_REG = AVG_START_REG[1];
+assign mem_we_int   = (TRACE_MODE_REG) ? mem_we_trace   : mem_we_avg;
+assign mem_addra_int= (TRACE_MODE_REG) ? mem_addr_trace : mem_addr_avg;
+assign mem_di_int   = (TRACE_MODE_REG) ? mem_di_trace   : mem_di_avg;
 //////////////////
 // Architecture //
 //////////////////
@@ -109,12 +124,42 @@ synchronizer_n
 	#(
 		.N	(2)
 	)
-	AVG_START_REG_resync_i (
+	AVG_START_REG_resync_i_0 (
 		.rstn	    (rstn					),
 		.clk 		(clk					),
-		.data_in	(AVG_START_REG			),
-		.data_out	(AVG_START_REG_resync	)
+		.data_in	(AVG_START_REG[0]		),
+		.data_out	(AVG_START_REG_resync[0])
 	);
+
+synchronizer_n
+	#(
+		.N	(2)
+	)
+	AVG_START_REG_resync_i_1 (
+		.rstn	    (rstn					),
+		.clk 		(clk					),
+		.data_in	(AVG_START_REG[1]		),
+		.data_out	(AVG_START_REG_resync[1])
+	);
+
+genvar avg_start_idx;
+
+generate
+	for (avg_start_idx = 0; avg_start_idx < 16; avg_start_idx = avg_start_idx + 1) begin : gen_avg_start_reg_resync
+		wire avg_start_reg_resync_wire;
+		synchronizer_n
+			#(
+				.N  (2)
+			)
+			AVG_START_REG_resync_i_x (
+				.rstn       (rstn                   ),
+				.clk        (clk                    ),
+				.data_in    (AVG_START_REG[16 + avg_start_idx] ),
+				.data_out   (avg_number_resync[avg_start_idx])
+			);
+	end
+endgenerate
+
 
 // DR_START_REG_resync
 synchronizer_n
@@ -148,17 +193,41 @@ avg
 		.din_i			(din_i					),
 
 		// Memory interface.
-		.mem_we_o		(mem_we_int				),
-		.mem_addr_o		(mem_addra_int			),
-		.mem_di_o		(mem_di_int				),
+		.mem_we_o		(mem_we_avg				),
+		.mem_addr_o		(mem_addr_avg			),
+		.mem_di_o		(mem_di_avg				),
 
 		// Registers.
-		.START_REG		(AVG_START_REG_resync	),
+		.START_REG		(AVG_START_REG_resync[0] & (~TRACE_MODE_REG)),
 		.ADDR_REG		(AVG_ADDR_REG			),
 		.LEN_REG		(AVG_LEN_REG			),
-		.PHOTON_MODE_REG (AVG_PHOTON_MODE_REG),
-		.H_THRSH_REG (AVG_H_THRSH_REG       ),
-		.L_THRSH_REG (AVG_L_THRSH_REG       )
+		.PHOTON_MODE_REG(AVG_PHOTON_MODE_REG	),
+		.H_THRSH_REG 	(AVG_H_THRSH_REG       	),
+		.L_THRSH_REG 	(AVG_L_THRSH_REG       	)
+	);
+
+trace_avg
+	#(
+		.N	(N),
+		.B	(B)
+	)
+	trace_avg_i
+	(
+		.rstn			(rstn					),
+		.clk			(clk					),
+		.trigger_i		(trigger_i				),
+
+		.din_valid_i	(din_valid_i			),
+		.din_i			(din_i					),
+
+		.mem_we_o		(mem_we_trace			),
+		.mem_addr_o		(mem_addr_trace			),
+		.mem_di_o		(mem_di_trace			),
+
+		.START_REG		(AVG_START_REG_resync[0] & TRACE_MODE_REG),
+		.AVG_NUMBER_REG (avg_number_resync		),
+		.ADDR_REG		(AVG_ADDR_REG			),
+		.LEN_REG		(AVG_LEN_REG			)
 	);
 
 // Dual port BRAM.
@@ -179,7 +248,7 @@ bram_dp
 		.addrb  (mem_addrb_int	),
 		.dia    (mem_di_int		),
 		.dib    ({4*B{1'b0}}	),
-		.doa    (				),
+		.doa    (mem_doa_int	),
 		.dob    (mem_do_int		)
     );
 

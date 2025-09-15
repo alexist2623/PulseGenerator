@@ -138,7 +138,7 @@ output	[4*B-1:0]	m2_axis_tdata;
 /* Internal signals */
 /********************/
 // Registers.
-wire				AVG_START_REG;
+wire	[31:0]		AVG_START_REG;
 wire	[N_AVG-1:0]	AVG_ADDR_REG;
 wire	[31:0]		AVG_LEN_REG;
 wire                AVG_PHOTON_MODE_REG;

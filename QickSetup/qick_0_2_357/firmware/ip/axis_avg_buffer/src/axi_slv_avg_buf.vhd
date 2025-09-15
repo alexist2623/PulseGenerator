@@ -46,7 +46,11 @@ entity axi_slv_avg_buf is
 		rready			: in std_logic;
 
 		-- Registers.
-		AVG_START_REG	: out std_logic;
+	-- AVG_START_REG[0] 	: 1 - Start Trigger
+    -- AVG_START_REG[1] 	: 0 - IQ Average Mode, 1 - Trace Averaging Mode
+	-- AVG_START_REG[15:2] 	: Reserved
+	-- AVG_START_REG[31:16] : Number of Averages (1 to 65536)
+		AVG_START_REG	: out std_logic_vector (31 downto 0);
 		AVG_ADDR_REG	: out std_logic_vector (31 downto 0);
 		AVG_LEN_REG		: out std_logic_vector (31 downto 0);
 		AVG_PHOTON_MODE_REG : out std_logic;
@@ -523,7 +527,7 @@ begin
 	-- Register Map.
 
 	-- Output Registers.
-	AVG_START_REG		<= slv_reg0(0);
+	AVG_START_REG		<= slv_reg0(31 downto 0);
 	AVG_ADDR_REG		<= slv_reg1;
 	AVG_LEN_REG			<= slv_reg2;
 	AVG_DR_START_REG	<= slv_reg3(0);
