@@ -3,13 +3,13 @@ module tb();
 // =============================================================================
 // Parameters
 // =============================================================================
-parameter N_AVG = 10;   // AVG memory depth: 2^10 = 1024
-parameter N_BUF = 10;   // RAW buffer depth
+parameter N_AVG = 16;   // AVG memory depth: 2^10 = 1024
+parameter N_BUF = 16;   // RAW buffer depth
 parameter B     = 16;   // per-channel width
 
 // ---- Trace/Stimulus setup ----
-localparam int LEN          = 128;     // samples per trace (AVG_LEN_REG)
-localparam int REPS         = 100;      // number of shots (triggers)
+localparam int LEN          = 1280;     // samples per trace (AVG_LEN_REG)
+localparam int REPS         = 1000;      // number of shots (triggers)
 localparam int BASE_ADDR    = 32;      // AVG_ADDR_REG
 localparam int AMP_LSB      = 12000;   // sine amplitude in LSBs (safe margin)
 localparam int NOISE_LSB    = 1000;    // uniform noise range: [-NOISE_LSB, +NOISE_LSB]

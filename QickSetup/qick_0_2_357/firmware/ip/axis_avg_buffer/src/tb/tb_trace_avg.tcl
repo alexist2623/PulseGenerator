@@ -13,7 +13,6 @@ create_project sim_trace_avg $PROJ -part $PART -force
 set_property target_language Verilog [current_project]
 set_property default_lib xil_defaultlib [current_project]
 
-# 소스 추가: (필요한 RTL/패키지들)
 set SRC_LIST [list \
   "$ROOT/avg_buffer.v" \
   "$ROOT/avg_top.v" \
