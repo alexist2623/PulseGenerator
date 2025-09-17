@@ -1221,6 +1221,33 @@ class QickSoc(Overlay, QickConfig):
         else:
             avg_buf.config_avg(address, length)
 
+    def config_trace_avg(
+        self,
+        ch:int,
+        address:int = 0,
+        length:int = 1,
+        number_of_trace_average:int = 1,
+    ) -> None:
+        """Configure trace average; must then enable using enable_buf()
+
+        Parameters
+        ----------
+        ch : int
+            Readout channel to configure
+        address : int
+            Starting address of buffer
+        length : int
+            length of buffer (how many samples to integrate)
+        number_of_trace_average : int
+            number of averages to perform
+        """
+        avg_buf = self.avg_bufs[ch]
+        if not isinstance(avg_buf, AxisAvgBuffer):
+            raise ValueError(
+                "Trace averaging is only supported on AxisAvgBuffer blocks"
+            )
+        avg_buf.config_trace_avg(address, length, number_of_trace_average)
+
     def config_buf(self, ch, address=0, length=1):
         """Configure decimated buffer; must then enable using enable_buf()
 

@@ -1101,9 +1101,19 @@ class AbsQickProgram(ABC):
         soc.start_tproc()
 
     def declare_readout(
-        self, ch, length, freq=None, phase=0, sel='product', gen_ch=None,
-        edge_counting=False, high_threshold=0, low_threshold=0,
-        weights=None):
+        self,
+        ch,
+        length,
+        freq=None,
+        phase=0,
+        sel='product',
+        gen_ch=None,
+        edge_counting=False,
+        high_threshold=0,
+        low_threshold=0,
+        weights=None,
+        number_of_trace_average=1
+    ) -> None:
         """Add a channel to the program's list of readouts.
         Duration units depend on the program type: tProc v1 programs use integer number of samples, tProc v2 programs use float us.
 
@@ -1177,6 +1187,7 @@ class AbsQickProgram(ABC):
         else:
             if weights is not None:
                 raise RuntimeError("readout %d was declared with weights, but this channel doesn't have a weighted buffer"%(ch))
+        cfg['number_of_trace_average'] = number_of_trace_average
         self.ro_chs[ch] = cfg
 
     def config_readouts(self, soc):
@@ -1218,7 +1229,13 @@ class AbsQickProgram(ABC):
                 raise RuntimeError("all declared readouts on a muxed readout must have the same 'sel' setting, you have %s" % (sels))
             soc.config_mux_readout(pfbpath, pfb_regs, sels[0])
 
-    def config_bufs(self, soc, enable_avg=True, enable_buf=True):
+    def config_bufs(
+        self,
+        soc,
+        enable_avg:bool = True,
+        enable_buf:bool = True,
+        enable_trace_avg:bool = False
+    ) -> None:
         """Configure the readout buffers specified in this program.
         This is usually called as part of an acquire() method.
 
@@ -1237,10 +1254,29 @@ class AbsQickProgram(ABC):
                     ch, length=cfg['length'],
                     edge_counting=cfg['edge_counting'],
                     high_threshold=cfg['high_threshold'],
-                    low_threshold=cfg['low_threshold'])
+                    low_threshold=cfg['low_threshold']
+                )
             if enable_buf:
                 soc.config_buf(ch, length=cfg['length'])
-            soc.enable_buf(ch, enable_avg=enable_avg, enable_buf=enable_buf)
+
+            if enable_trace_avg:
+                soc.config_trace_avg(
+                    ch,
+                    length = cfg['length'],
+                    number_of_trace_average = cfg['number_of_trace_average']
+                )
+            if enable_avg and enable_trace_avg:
+                raise ValueError(
+                    "Cannot enable both average buffer and trace average buffer"
+                    "on the same readout channel"
+                )
+
+            soc.enable_buf(
+                ch,
+                enable_avg = enable_avg,
+                enable_buf = enable_buf,
+                enable_trace_avg = enable_trace_avg
+            )
 
     def declare_gen(self, ch, nqz=1, mixer_freq=None, mux_freqs=None, mux_gains=None, mux_phases=None, ro_ch=None):
         """Add a channel to the program's list of signal generators.
@@ -1901,6 +1937,113 @@ class AcquireMixin:
 
         return self.finish_acquire()
 
+    def acquire_trace_avg(
+        self,
+        soc,
+        rounds:int = 1,
+        load_envelopes:bool = True,
+        start_src:str = "internal",
+        threshold:int = None,
+        angle:float =None,
+        progress:bool = True,
+        remove_offset:bool = True,
+        step_rounds:bool = False,
+        number_of_average:int = 1,
+        extra_args:dict = None
+    ) -> np.ndarray:
+        """Acquire data using the accumulated readout.
+
+        Parameters
+        ----------
+        soc : QickSoc
+            Qick object
+        rounds : int
+            number of times to rerun the program, averaging results in software (aka "soft averages")
+        load_envelopes : bool
+            if True, load pulse envelopes
+        start_src: str
+            "internal" (tProc starts immediately) or "external" (each round waits for an external trigger)
+        threshold : float or list of float
+            The threshold(s) to apply to the I values after rotation.
+            Length-normalized units (same units as the output of acquire()).
+            If scalar, the same threshold will be applied to all readout channels.
+            A list must have length equal to the number of declared readout channels.
+        angle : float or list of float
+            The angle to rotate the I/Q values by before applying the threshold.
+            Units of radians.
+            If scalar, the same angle will be applied to all readout channels.
+            A list must have length equal to the number of declared readout channels.
+        progress: bool
+            if true, displays progress bar
+        remove_offset: bool
+            Some readouts (muxed and tProc-configured) introduce a small fixed offset to the I and Q values of every decimated sample.
+            This subtracts that offset, if any, before returning the averaged IQ values or rotating to apply software thresholding.
+        step_rounds: bool
+            Return after setting up the acquisition and preparing the first round.
+            You will need to step through and complete the acquisition with prepare_round(), finish_round(), and finish_acquire().
+        extra_args: dict or None
+            If the data-processing methods have been overriden and need extra arguments, those are supplied here and will be added to acquire_params.
+
+        Returns
+        -------
+        numpy.ndarray
+            averaged IQ values (float)
+            divided by the length of the RO window, and averaged over reps and rounds
+            if threshold is defined, the I values will be the fraction of points over threshold
+            dimensions for a simple averaging program: (n_ch, n_reads, 2)
+            dimensions for a program with multiple expts/steps: (n_ch, n_reads, n_expts, 2)
+        """
+        self.acquire_params = {
+            'type': 'trace_avg',
+            'soc': soc,
+            'start_src': start_src,
+            'rounds_remaining': rounds,
+            'remove_offset': remove_offset,
+            'hidereps': True,
+            'threshold': threshold,
+            'angle': angle,
+        }
+        if extra_args is not None:
+            self.acquire_params.update(extra_args)
+
+        if any([x is None for x in [self.counter_addr, self.loop_dims, self.avg_level]]):
+            raise RuntimeError(
+                "data dimensions need to be defined with setup_acquire() before calling acquire()"
+            )
+
+        reads_per_shot = [ro['trigs'] for ro in self.ro_chs.values()]
+
+        self.acc_buf = [
+            np.zeros((*self.loop_dims, nreads, 2), dtype=np.int64)
+            for nreads in reads_per_shot
+        ]
+        # data from all rounds, averaged over reps but not over rounds
+        self.rounds_buf = []
+        self.stats = []
+
+        # select which tqdm progress bar to show
+        hiderounds = True
+        if progress:
+            if rounds>1:
+                hiderounds = False
+            else:
+                self.acquire_params['hidereps'] = False
+
+        # load the program - don't load data memory now, we'll do that later
+        self.config_all(soc, load_envelopes=load_envelopes, load_mem=False)
+
+        self.rounds_pbar = tqdm(total=rounds, disable=hiderounds)
+        self.prepare_round()
+
+        # if user code is going to step through the rounds, this is where we stop
+        if step_rounds: return
+
+        # for each round, run and acquire data
+        while self.finish_round():
+            self.prepare_round()
+
+        return self.finish_acquire()
+
     def _process_accumulated(self, acc_buf):
         if self.acquire_params['threshold'] is None:
             d_reps = acc_buf
@@ -2189,6 +2332,13 @@ class AcquireMixin:
             self.config_bufs(soc, enable_avg=True, enable_buf=True)
         elif self.acquire_params['type'] == 'run_rounds':
             pass
+        elif self.acquire_params['type'] == 'trace_avg':
+            self.config_bufs(
+                soc,
+                enable_avg = False,
+                enable_buf = False,
+                enable_trace_avg = True
+            )
         else: # accumulated
             # initialize the raw data buffer
             for b in self.acc_buf:
@@ -2242,6 +2392,30 @@ class AcquireMixin:
                     pbar.update(new_count-count)
                     count = new_count
             soc.start_src("internal")
+        # TODO
+        elif self.acquire_params['type'] == 'trace_avg':
+            with tqdm(total=total_count, disable=self.acquire_params['hidereps']) as pbar:
+                soc.start_readout(
+                    total_count,
+                    counter_addr=self.counter_addr,
+                    ch_list=list(self.ro_chs),
+                    reads_per_shot=reads_per_shot
+                )
+                while count<total_count:
+                    new_data = obtain(soc.poll_data())
+                    for new_points, (d, s) in new_data:
+                        for ii, nreads in enumerate(reads_per_shot):
+                            #print(count, new_points, nreads, d[ii].shape, total_count)
+                            if new_points != d[ii].shape[0]:
+                                logger.error("data size mismatch: new_points=%d, nreads=%d, data shape %s"%(new_points, nreads, d[ii].shape))
+                            if count+new_points > total_count:
+                                logger.error("got too much data: count=%d, new_points=%d, total_count=%d"%(count, new_points, total_count))
+                            # use reshape to view the acc_buf array in a shape that matches the raw data
+                            self.acc_buf[ii].reshape((-1,2))[count*nreads:(count+new_points)*nreads] = d[ii]
+                        count += new_points
+                        self.stats.append(s)
+                        pbar.update(new_points)
+            self.rounds_buf.append(self.acc_buf)
         else: # accumulated
             with tqdm(total=total_count, disable=self.acquire_params['hidereps']) as pbar:
                 soc.start_readout(total_count, counter_addr=self.counter_addr,
@@ -2281,5 +2455,8 @@ class AcquireMixin:
             return self._summarize_decimated(self.rounds_buf)
         elif self.acquire_params['type'] == 'run_rounds':
             pass
+        # TODO
+        elif self.acquire_params['type'] == 'trace_avg':
+            return self.rounds_buf
         else: # accumulated
             return self._summarize_accumulated(self.rounds_buf)

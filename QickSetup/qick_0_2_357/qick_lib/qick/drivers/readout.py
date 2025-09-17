@@ -581,6 +581,7 @@ class AxisAvgBuffer(SocIP):
         self.cfg['buf_maxlen'] = 2**self.N_BUF
         self.cfg['has_edge_counter'] = self.EDGE_COUNTER
         self.cfg['has_weights'] = self.WEIGHTS
+        self.cfg['number_of_trace_average'] = 1
 
         self.avg_buff = allocate(shape=self['avg_maxlen'], dtype=np.int64)
         self.buf_buff = allocate(shape=self['buf_maxlen'], dtype=np.int32)
@@ -657,7 +658,12 @@ class AxisAvgBuffer(SocIP):
         else:
             self.readout.set_freq(f, gen_ch=gen_ch)
 
-    def enable(self, avg=True, buf=True):
+    def enable(
+        self,
+        avg:bool = True,
+        buf:bool = True,
+        trace_avg:bool = False
+    ) -> None:
         """
         Enable both acculumated and decimated buffers
 
@@ -670,7 +676,19 @@ class AxisAvgBuffer(SocIP):
         """
         if avg: self.avg_start_reg = 1
         if buf: self.buf_start_reg = 1
-
+        if (avg and trace_avg):
+            raise ValueError(
+                "IQ averaging with trace trigger not supported"
+            )
+        if trace_avg:
+            if self.cfg["number_of_trace_average"] > 0xffff:
+                raise ValueError(
+                    f"number_of_trace_average too large ({self.cfg['number_of_trace_average']} > 0xffff)"
+                )
+            self.avg_start_reg = (
+                0b11 |
+                ((self.cfg["number_of_trace_average"] & 0xffff) << 16)
+            )
     def disable(self):
         """
         Disable both acculumated and decimated buffers
@@ -717,6 +735,28 @@ class AxisAvgBuffer(SocIP):
         self.avg_addr_reg = address
         self.avg_len_reg = length
 
+    def config_trace_avg(
+        self,
+        address = 0,
+        length = 100,
+        number_of_trace_average = 1
+    ) -> None:
+        """
+        Configure trace average buffer
+
+        :param addr: Start address of first capture
+        :type addr: int
+        :param length: window size
+        :type length: int
+        """
+        # Disable averaging.
+        self.disable()
+
+        # Set registers.
+        self.avg_addr_reg = address
+        self.avg_len_reg = length
+        self.cfg["number_of_trace_average"] = number_of_trace_average
+
     def transfer_avg(self, address=0, length=100):
         """
         Transfer data from accumulated buffer
@@ -743,6 +783,81 @@ class AxisAvgBuffer(SocIP):
         if (not self.FIRST_OUT_SAMPLE_BUG_FIX):
             # there is a bug which causes the first sample of a transfer to always be the sample at address 0
             # we work around this by requesting an extra 2 samples at the beginning
+            address = (address-2) % self['avg_maxlen']
+            transferlen = transferlen + 2
+
+        # Set averager data reader address and length.
+        self.avg_dr_addr_reg = address
+        self.avg_dr_len_reg = transferlen
+
+        # Start send data mode.
+        self._start_transfer('avg')
+
+        # DMA data.
+        buff = self.avg_buff
+        # nbytes has to be a Python int (it gets passed to mmio.write, which requires int or bytes)
+        self.dma_avg.recvchannel.transfer(buff, nbytes=int(transferlen*8))
+        self.dma_avg.recvchannel.wait()
+
+        # Stop send data mode.
+        self._stop_transfer()
+
+        if self.dma_avg.recvchannel.transferred != transferlen*8:
+            raise RuntimeError("Requested %d samples but only got %d from DMA" % (
+                transferlen, self.dma_avg.recvchannel.transferred//8))
+
+        # Format:
+        # -> lower 32 bits: I value.
+        # -> higher 32 bits: Q value.
+        data = np.frombuffer(buff[:transferlen], dtype=np.int32).reshape((-1,2))
+
+        # realign returned data with true request
+        if (not self.FIRST_OUT_SAMPLE_BUG_FIX):
+            data = data[2:length+2]
+        else:
+            data = data[:length]
+
+        # data is a view into the data buffer, so copy it before returning
+        return data.copy()
+
+    def transfer_trace_avg(
+        self,
+        address:int = 0,
+        length:int = 100
+    ) -> list:
+        """
+        Transfer data from accumulated buffer (averaged trace)
+
+        Parameters
+        ----------
+        address : int
+            starting reading address
+        length : int
+            number of samples
+
+        Returns
+        -------
+        list
+            Averaged trace (IQ values)
+        """
+
+        if length >= self['avg_maxlen']:
+            raise RuntimeError(
+                "length=%d longer than %d" %
+                (length, self['avg_maxlen'])
+            )
+
+        # pad the transfer size to an even number (odd lengths seem to break the DMA)
+        transferlen = length + (length % 2)
+
+        # Route switch to channel.
+        if self.switch_avg is not None:
+            self.switch_avg.sel(slv=self.switch_ch)
+
+        if (not self.FIRST_OUT_SAMPLE_BUG_FIX):
+            # there is a bug which causes the first sample of a transfer to always
+            # be the sample at address 0. we work around this by requesting an extra
+            # 2 samples at the beginning
             address = (address-2) % self['avg_maxlen']
             transferlen = transferlen + 2
 
