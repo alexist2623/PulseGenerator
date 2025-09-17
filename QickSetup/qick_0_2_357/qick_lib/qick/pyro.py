@@ -2,6 +2,7 @@ import psutil, socket
 import Pyro4
 import Pyro4.naming
 from .qick_asm import QickConfig
+from qick.rfboard import *
 # QickSoc is needed for the server but not the client
 # the client needs it to be defined because it's in the start_server definition
 # but it doesn't need to be anything, so we use None as a dummy value
@@ -27,7 +28,7 @@ def start_nameserver(ns_host='0.0.0.0', ns_port=8888):
     Pyro4.config.PICKLE_PROTOCOL_VERSION=4
     Pyro4.naming.startNSloop(host=ns_host, port=ns_port)
 
-def start_server(ns_host, ns_port=8888, proxy_name='myqick', soc_class=QickSoc, iface='eth0', **kwargs):
+def start_server(ns_host, ns_port=8888, proxy_name='myqick', soc_class=RFQickSoc216V1, iface='eth0', **kwargs):
     """Initializes the QickSoc and starts a Pyro4 proxy server.
 
     Parameters

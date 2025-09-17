@@ -1263,7 +1263,7 @@ class QickSoc(Overlay, QickConfig):
         avg_buf = self.avg_bufs[ch]
         avg_buf.config_buf(address, length)
 
-    def enable_buf(self, ch, enable_avg=True, enable_buf=True):
+    def enable_buf(self, ch, enable_avg=True, enable_buf=True, enable_trace_avg=False):
         """Enable capture of accumulated and/or decimated data for a buffer
 
         Parameters
@@ -1276,7 +1276,7 @@ class QickSoc(Overlay, QickConfig):
             Enable decimated data capture
         """
         avg_buf = self.avg_bufs[ch]
-        avg_buf.enable(avg=enable_avg, buf=enable_buf)
+        avg_buf.enable(avg=enable_avg, buf=enable_buf, trace_avg=enable_trace_avg)
 
     def load_weights(self, ch, data, addr=0):
         """Load weights array to a weighted buffer.

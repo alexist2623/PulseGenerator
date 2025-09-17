@@ -118,6 +118,8 @@ class ReadoutManager(AbsRegisterManager):
         self.ch = ro_ch
         self.rocfg = prog.soccfg['readouts'][self.ch]
         tproc_ch = self.rocfg['tproc_ctrl']
+        # CODE WE ADDED
+        self.tmux_ch = self.rocfg.get('tmux_ch') # default to None if undefined
         super().__init__(prog, tproc_ch, "readout %d"%(self.ch))
 
     def check_params(self, params):
@@ -144,7 +146,7 @@ class ReadoutManager(AbsRegisterManager):
             phrst, mode, outsel = [params.get(x) for x in ['phrst', 'mode', 'outsel']]
             mc = self.get_mode_code(phrst=phrst, mode=mode, outsel=outsel, length=params['length'])
             self.set_reg('mode', mc, f'mode | outsel = 0b{mc//2**16:>05b} | length = {mc % 2**16} ')
-            self.next_pulse['regs'].append([self.regmap[(self.ch, x)][1] for x in ['freq', '0', 'mode', '0', '0']])
+            self.next_pulse['regs'].append([self.regmap[(self.ch, x)][1] for x in ['freq', '0', 'mode', '0', 'mode']])
 
     def get_mode_code(self, length, outsel=None, mode=None, phrst=None):
         """Creates mode code for the mode register in the set command, by setting flags and adding the pulse length.
@@ -179,7 +181,10 @@ class ReadoutManager(AbsRegisterManager):
 
         """
         if length >= 2**16 or length < 3:
-            raise RuntimeError("Pulse length of %d is out of range (exceeds 16 bits, or less than 3) - use multiple pulses, or zero-pad the waveform" % (length))
+            raise RuntimeError(
+                "Pulse length of %d is out of range (exceeds 16 bits, or less than 3) "
+                "- use multiple pulses, or zero-pad the waveform" % (length)
+            )
         if outsel is None: outsel = "product"
         if mode is None: mode = "oneshot"
         if phrst is None: phrst = 0
@@ -187,8 +192,12 @@ class ReadoutManager(AbsRegisterManager):
         outsel_reg = {"product": 0, "dds": 1, "input": 2, "zero": 3}[outsel]
         mode_reg = {"oneshot": 0, "periodic": 1}[mode]
         mc = phrst*0b01000+mode_reg*0b00100+outsel_reg
-        return mc << 16 | int(np.uint16(length))
-
+        # Code we added >>
+        if hasattr(self, "tmux_ch") and self.tmux_ch is not None:
+            return mc << 16 | int(np.uint16(length)) | ((self.tmux_ch & 0xff) << 24)
+        # <<
+        else:
+            return mc << 16 | int(np.uint16(length))
 
 class AbsGenManager(AbsRegisterManager):
     """Manages the envelope and pulse information for a signal generator channel.

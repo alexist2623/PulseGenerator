@@ -2013,10 +2013,7 @@ class AcquireMixin:
 
         reads_per_shot = [ro['trigs'] for ro in self.ro_chs.values()]
 
-        self.acc_buf = [
-            np.zeros((*self.loop_dims, nreads, 2), dtype=np.int64)
-            for nreads in reads_per_shot
-        ]
+        self.acc_buf = []
         # data from all rounds, averaged over reps but not over rounds
         self.rounds_buf = []
         self.stats = []
@@ -2394,27 +2391,13 @@ class AcquireMixin:
             soc.start_src("internal")
         # TODO
         elif self.acquire_params['type'] == 'trace_avg':
-            with tqdm(total=total_count, disable=self.acquire_params['hidereps']) as pbar:
-                soc.start_readout(
-                    total_count,
-                    counter_addr=self.counter_addr,
-                    ch_list=list(self.ro_chs),
-                    reads_per_shot=reads_per_shot
-                )
-                while count<total_count:
-                    new_data = obtain(soc.poll_data())
-                    for new_points, (d, s) in new_data:
-                        for ii, nreads in enumerate(reads_per_shot):
-                            #print(count, new_points, nreads, d[ii].shape, total_count)
-                            if new_points != d[ii].shape[0]:
-                                logger.error("data size mismatch: new_points=%d, nreads=%d, data shape %s"%(new_points, nreads, d[ii].shape))
-                            if count+new_points > total_count:
-                                logger.error("got too much data: count=%d, new_points=%d, total_count=%d"%(count, new_points, total_count))
-                            # use reshape to view the acc_buf array in a shape that matches the raw data
-                            self.acc_buf[ii].reshape((-1,2))[count*nreads:(count+new_points)*nreads] = d[ii]
-                        count += new_points
-                        self.stats.append(s)
-                        pbar.update(new_points)
+            soc.start_tproc()
+            while count < total_count:
+                count = soc.get_tproc_counter(addr=self.counter_addr)
+            soc.start_src("internal")
+
+            for ii, (ch, ro) in enumerate(self.ro_chs.items()):
+                self.acc_buf.append(obtain(soc.get_accumulated(ch=ch, address=0, length=ro['length'])))
             self.rounds_buf.append(self.acc_buf)
         else: # accumulated
             with tqdm(total=total_count, disable=self.acquire_params['hidereps']) as pbar:
