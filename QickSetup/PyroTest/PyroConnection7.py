@@ -1,4 +1,4 @@
-"""Qick Hardware Trace Average Test"""
+"""Qick Software Average test"""
 import numpy as np
 import math
 import matplotlib.pyplot as plt
@@ -21,6 +21,7 @@ class MultiPulseAveragerExample(AveragerProgram):
         self.declare_readout(
             ch      = 0,        # Channel
             length  = (cfg["pulse_time"] + 100) * 12,       # Readout length
+            number_of_trace_average = cfg["reps"]
         )
         # Convert RF frequency to DAC DDS register value
         self.freq_dac = self.freq2reg(
@@ -60,8 +61,7 @@ class MultiPulseAveragerExample(AveragerProgram):
         )
         self.trigger(
             adcs    = [0],      # Readout channels
-            adc_trig_offset = 150, # Readout will capture the data @ sync_t + 50
-            ddr4    = True
+            adc_trig_offset = 150 # Readout will capture the data @ sync_t + 50
         )
         for i in range(10):
             self.setup_and_pulse(
@@ -75,8 +75,7 @@ class MultiPulseAveragerExample(AveragerProgram):
                 waveform= "gauss",  # Set envelope to be multiplied
                 t       = (cfg["pulse_time"] + 100) * (i+1) + 100
             )
-        self.sync_all(10)
-
+        self.sync_all()
 
 if __name__ == "__main__":
     # Qick version : 0.2.357
@@ -92,37 +91,26 @@ if __name__ == "__main__":
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
 
+    start_time = time.time()
     cfg = {
         # Experiment Setup
-        "reps"          : 50000,
+        "reps" : 50000,
+        "expts" : 1,
         # Parameter Setup
-        "freq_rf"       : 1100,
-        "pulse_time"    : 100,
-        "soft_avgs"     : 1
+        "freq_rf" : 1540,
+        "pulse_time" : 200
     }
     prog = MultiPulseAveragerExample(
         soccfg,
         cfg
     )
-    LEN = int(3360 / 4 * 3)
-    nt = int(LEN  * cfg["reps"] / 128)
-    start_time = time.time()
-    soc.clear_ddr4()
-    soc.arm_ddr4(ch = 0, nt = nt, )
-    print(prog)
-    prog.run_rounds(soc = soc)
-    data = soc.get_ddr4(nt = nt, start = 0)
-    mean_start_time = time.time()
-    data = np.array([data[i][0] for i in range(len(data))])
-    print(len(data))
-    data = data[:(len(data) // LEN) * LEN]
-    data = data.reshape(-1,LEN).mean(axis=0)
-    mean_end_time = time.time()
+    LEN = 20
+    data = (prog.acquire_trace_avg(soc = soc, progress = True))[0][0]
+    for i in range(LEN):
+        data += (prog.acquire_trace_avg(soc = soc, progress = True))[0][0]
+    end_time = time.time()
 
+    print(f"Acquisition time for {cfg['reps']*LEN} averages: {end_time - start_time} s")
     plt.figure()
     plt.plot(data)
     plt.show()
-
-    print("Acquisition Time: %.3f s, Mean Time: %.3f s"%(
-        mean_start_time - start_time, mean_end_time - mean_start_time
-    ))

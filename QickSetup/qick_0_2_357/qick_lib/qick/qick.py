@@ -790,6 +790,7 @@ class QickSoc(Overlay, QickConfig):
 
         # Initialize the configuration
         self._cfg = {}
+        self.external_trigger = False
         QickConfig.__init__(self)
 
         self['board'] = os.environ["BOARD"]
@@ -1490,6 +1491,12 @@ class QickSoc(Overlay, QickConfig):
         :param src: start source "internal" or "external"
         :type src: str
         """
+        if src == "internal":
+            self.external_trigger = False
+        elif src == "external":
+            self.external_trigger = True
+        else:
+            raise Exception("Unknown start trigger...")
         self.tproc.start_src(src)
 
     def start_tproc(self):
@@ -1499,7 +1506,8 @@ class QickSoc(Overlay, QickConfig):
         If the tProc is configured for external start, this does nothing (the tProc will start on the first start signal it sees after external start is enabled).
         """
         if self.TPROC_VERSION == 1:
-            self.tproc.start()
+            if not self.external_trigger:
+                self.tproc.start()
         elif self.TPROC_VERSION == 2:
             if self.tproc.get_start_src() == 'internal':
                 self.tproc.start()

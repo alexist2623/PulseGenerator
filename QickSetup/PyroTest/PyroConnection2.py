@@ -105,17 +105,23 @@ if __name__ == "__main__":
     # Set DAC Channel 0 attenuation 20 dB and 20 dB, and turn on DAC channel
     soc.rfb_set_gen_rf(0,31,31)
     # Set DAC Channel filter as bypass mode
-    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "bypass")
+    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
 
     # Set ADC Channel attenuation 20 dB, and turn on ADC channel
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
-    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
-    expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True)
+    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
+    expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True, start_src = "external")
+
+    c_x = 0
+    c_y = 0
 
     plt.figure()
     for j, phase in enumerate(expt_pts[1]):
         plt.scatter(avg_di[0][0][j], avg_dq[0][0][j], label=f"{int(phase)}")
+        c_x = c_x + np.sum(avg_di[0][0][j])
+        c_y = c_y + np.sum(avg_dq[0][0][j])
+    plt.scatter(c_x,c_y, label="Center", color='k', marker='+')
     # for j, phase in enumerate(expt_pts[0]):
     #     plt.scatter(avg_di[0][0][j], avg_dq[0][0][j])
     plt.title("IQ Loopback")

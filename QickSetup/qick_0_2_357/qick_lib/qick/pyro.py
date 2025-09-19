@@ -2,7 +2,10 @@ import psutil, socket
 import Pyro4
 import Pyro4.naming
 from .qick_asm import QickConfig
-from qick.rfboard import *
+try:
+    from qick.rfboard import *
+except:
+    RFQickSoc216V1 = None
 # QickSoc is needed for the server but not the client
 # the client needs it to be defined because it's in the start_server definition
 # but it doesn't need to be anything, so we use None as a dummy value
