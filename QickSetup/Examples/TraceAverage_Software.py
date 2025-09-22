@@ -1,4 +1,12 @@
-"""Qick Hardware Trace Average Test"""
+"""
+Qick Software Average test
+Signal -> Demodulator -> FIR & x8 decimation -> Average Buffer 
+We get trace data from Average Buffer and save it in PC for each round, and at
+the end of experiment software averages all the traces.
+It is really slow due to data transaction among PL buffer, Linux running on RFSoC,
+and Windows running on PC, so it is not recommended to average large number of traces.
+Note that typically data transaction is quite fast, however operating system limits its speed.
+"""
 import numpy as np
 import math
 import matplotlib.pyplot as plt
@@ -7,7 +15,7 @@ import time
 from qick import *
 from qick.pyro import make_proxy
 
-class MultiPulseAveragerExample(AveragerProgram):
+class MultiPulseLoopBackExample(AveragerProgram):
     def initialize(self):
         # set the nyquist zone
         cfg = self.cfg
@@ -20,7 +28,7 @@ class MultiPulseAveragerExample(AveragerProgram):
         # Declare RF input channel
         self.declare_readout(
             ch      = 0,        # Channel
-            length  = (cfg["pulse_time"] + 100) * 12,       # Readout length
+            length  = cfg["pulse_time"] * 20 + 200       # Readout length
         )
         # Convert RF frequency to DAC DDS register value
         self.freq_dac = self.freq2reg(
@@ -47,7 +55,7 @@ class MultiPulseAveragerExample(AveragerProgram):
         self.set_readout_registers(
             ch      = 0,        # Readout channel
             freq    = freq_adc, # Readout DDS frequency
-            length  = (cfg["pulse_time"] + 100) * 12, # Readout DDS multiplication length
+            length  = cfg["pulse_time"] * 11, # Readout DDS multiplication length
             phrst   = 0         # Readout DDS phase reset
         )
         self.synci(100)
@@ -60,22 +68,21 @@ class MultiPulseAveragerExample(AveragerProgram):
         )
         self.trigger(
             adcs    = [0],      # Readout channels
-            adc_trig_offset = 150, # Readout will capture the data @ sync_t + 50
-            ddr4    = True
+            adc_trig_offset = 150 # Readout will capture the data @ sync_t + 50
         )
         for i in range(10):
             self.setup_and_pulse(
                 ch      = 0,        # Generator channel
                 style   = "arb",    # Output is envelope * gain * DDS output
                 freq    = self.freq_dac, # Generator DDS frequency
-                phase   = self.deg2reg(90, gen_ch = 0),        # Generator DDS phase
-                gain    = 2000 // (i+1), # Generator amplitude
+                phase   = 0,        # Generator DDS phase
+                gain    = 32000 // (i+1), # Generator amplitude
                 phrst   = 0,        # Generator DDS phase reset
                 outsel  = "product",# Output is envelope * gain * DDS output
                 waveform= "gauss",  # Set envelope to be multiplied
-                t       = (cfg["pulse_time"] + 100) * (i+1) + 100
+                t       = cfg["pulse_time"] * (i+1) + 100
             )
-        self.sync_all(10)
+        self.sync_all()
 
 
 if __name__ == "__main__":
@@ -92,37 +99,23 @@ if __name__ == "__main__":
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
 
+    start_time = time.time()
+
     cfg = {
         # Experiment Setup
-        "reps"          : 50000,
+        "reps"          : 1,
         # Parameter Setup
         "freq_rf"       : 1100,
         "pulse_time"    : 100,
-        "soft_avgs"     : 1
+        "soft_avgs"     : 1000
     }
-    prog = MultiPulseAveragerExample(
+    prog = MultiPulseLoopBackExample(
         soccfg,
         cfg
     )
-    LEN = int(3360 / 4 * 3)
-    nt = int(LEN  * cfg["reps"] / 128)
-    start_time = time.time()
-    soc.clear_ddr4()
-    soc.arm_ddr4(ch = 0, nt = nt, )
-    print(prog)
-    prog.run_rounds(soc = soc)
-    data = soc.get_ddr4(nt = nt, start = 0)
-    mean_start_time = time.time()
-    data = np.array([data[i][0] for i in range(len(data))])
-    print(len(data))
-    data = data[:(len(data) // LEN) * LEN]
-    data = data.reshape(-1,LEN).mean(axis=0)
-    mean_end_time = time.time()
-
+    data = prog.acquire_decimated(soc = soc, progress = True)
+    end_time = time.time()
+    print(f"Acquisition time : %f", end_time - start_time)
     plt.figure()
-    plt.plot(data)
+    plt.plot(data[0][0])
     plt.show()
-
-    print("Acquisition Time: %.3f s, Mean Time: %.3f s"%(
-        mean_start_time - start_time, mean_end_time - mean_start_time
-    ))

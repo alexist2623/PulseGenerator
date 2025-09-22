@@ -1,4 +1,7 @@
-"""Qick Hardware Loop test"""
+"""
+Qick Hardware Sweep Example
+This program runs frequency, and pulse time sweep on FPGA.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -108,7 +111,7 @@ if __name__ == "__main__":
 
     cfg = {
         # Experiment Setup
-        "reps" : 1000,
+        "reps" : 100,
         "duration_sweep_num" : 10,
         "start" : 1000,
         "inner_loop" : 100,

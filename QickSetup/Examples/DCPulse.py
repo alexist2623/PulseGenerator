@@ -1,4 +1,6 @@
-"""Qick Hardware Loop test"""
+"""
+Qick DC Pulse Generation Example
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 

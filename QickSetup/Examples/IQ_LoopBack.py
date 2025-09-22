@@ -1,4 +1,6 @@
-"""Qick Pyro connection test"""
+"""
+Qick IQ Loop Back Example
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -111,7 +113,7 @@ if __name__ == "__main__":
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
-    expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True, start_src = "external")
+    expt_pts, avg_di, avg_dq = prog.acquire(soc, progress=True, start_src = "internal")
 
     c_x = 0
     c_y = 0

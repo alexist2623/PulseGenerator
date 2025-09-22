@@ -7,7 +7,7 @@ import time
 from qick import *
 from qick.pyro import make_proxy
 
-class MultiPulseAveragerExample(AveragerProgram):
+class LongDurationPulseExample(AveragerProgram):
     def initialize(self):
         # set the nyquist zone
         cfg = self.cfg
@@ -24,7 +24,7 @@ class MultiPulseAveragerExample(AveragerProgram):
         # Declare RF input channel
         self.declare_readout(
             ch      = 0,        # Channel
-            length  = int(cfg["pulse_time"] * 3/4) - 10,       # Readout length
+            length  = cfg["pulse_time"],       # Readout length
         )
         # Convert RF frequency to DAC DDS register value
         self.freq_dac = self.freq2reg(
@@ -54,6 +54,10 @@ class MultiPulseAveragerExample(AveragerProgram):
             t       = 100       # Readout DDS will start multiplication
                                 # @ sync_t + 100
         )
+        self.trigger(
+            adcs    = [0],      # Readout channels
+            adc_trig_offset = 0 # Readout will capture the data @ sync_t + 50
+        )
         self.setup_and_pulse(
             ch      = 0,        # Generator channel
             style   = "const",    # Output is envelope * gain * DDS output
@@ -70,19 +74,13 @@ class MultiPulseAveragerExample(AveragerProgram):
             style   = "const",    # Output is envelope * gain * DDS output
             freq    = self.freq_dac, # Generator DDS frequency
             phase   = self.deg2reg(180, gen_ch = 0),        # Generator DDS phase
-            gain    = 2000, # Generator amplitude
+            gain    = 12000, # Generator amplitude
             phrst   = 0,        # Generator DDS phase reset
             length  = 113,       # Total length of envelope.
             mode    = "periodic", # Set pulse mode to periodic
             t       = 100
         )
-        for i in range(cfg["number_of_pulse"]):
-            self.trigger(
-                adcs    = [0],      # Readout channels
-                adc_trig_offset = 150 + i * cfg["pulse_time"] # Readout will capture the data @ sync_t + 50
-            )
-
-        self.sync_all(100)
+        self.sync_all(cfg["long_duration"])
         self.setup_and_pulse(
             ch      = 0,        # Generator channel
             style   = "const",    # Output is envelope * gain * DDS output
@@ -105,7 +103,6 @@ class MultiPulseAveragerExample(AveragerProgram):
             mode    = "oneshot", # Set pulse mode to periodic
             t       = 100
         )
-        self.sync_all(10000)
 
 if __name__ == "__main__":
     # Qick version : 0.2.357
@@ -113,16 +110,16 @@ if __name__ == "__main__":
     # print(soccfg)
 
     # Set DAC Channel 0 attenuation 31 dB and 31 dB, and turn on DAC channel
-    soc.rfb_set_gen_rf(0,10,10)
-    soc.rfb_set_gen_rf(2,31,31)
+    soc.rfb_set_gen_rf(0,31,31)
+    soc.rfb_set_gen_rf(2,10,10)
     # Set DAC Channel filter as bypass mode
-    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
-    soc.rfb_set_gen_filter(2,fc = 2.5, ftype = "lowpass")
+    soc.rfb_set_gen_filter(0,fc = 1.0, ftype = "bypass")
+    soc.rfb_set_gen_filter(2,fc = 2.5, ftype = "bypass")
 
     # Set ADC Channel attenuation 31 dB, and turn on ADC channel
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
-    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
+    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
 
     start_time = time.time()
     cfg = {
@@ -131,20 +128,19 @@ if __name__ == "__main__":
         "expts" : 1,
         # Parameter Setup
         "freq_rf" : 520,
-        "pulse_time" : 4000,
-        "number_of_pulse" : 80,
+        "pulse_time" : 300,
+        "number_of_pulse" : 10,
+        "long_duration" : int(0.1 * 400e6)
     }
-    prog = MultiPulseAveragerExample(
+    prog = LongDurationPulseExample(
         soccfg,
         cfg,
     )
-    # print(prog)
-    data = (prog.acquire(soc = soc, progress = True, start_src = "internal"))
+    print(prog)
+    data = prog.acquire(soc = soc, progress = True, start_src = "external")[0][0]
     end_time = time.time()
 
     print(f"Acquisition time for : {end_time - start_time} s")
     plt.figure()
-    plt.scatter(data[0][0], data[1][0])
-    plt.xlim([-1500, 1500])
-    plt.ylim([-1500, 1500])
+    plt.plot(data)
     plt.show()

@@ -1,4 +1,10 @@
-"""Qick Software Average test"""
+"""
+Qick Custom IP based Trace Average test.
+Signal -> Demodulation -> FIR x8 decimation -> Average Buffer (add signal itself)
+In this program trace is averaged in Average Buffer on FPGA. Note that number of
+average cannot exceed 2 ** 16, since each register for sample has size of 32 bits
+(incomming sample has 16 bits each).
+"""
 import numpy as np
 import math
 import matplotlib.pyplot as plt
@@ -7,7 +13,7 @@ import time
 from qick import *
 from qick.pyro import make_proxy
 
-class MultiPulseAveragerExample(AveragerProgram):
+class MultiPulseLoopBackExample(AveragerProgram):
     def initialize(self):
         # set the nyquist zone
         cfg = self.cfg
@@ -139,7 +145,7 @@ if __name__ == "__main__":
         "pulse_time" : 300,
         "number_of_pulse" : 10
     }
-    prog = MultiPulseAveragerExample(
+    prog = MultiPulseLoopBackExample(
         soccfg,
         cfg
     )
