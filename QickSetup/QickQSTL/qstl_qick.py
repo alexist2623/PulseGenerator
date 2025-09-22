@@ -20,7 +20,7 @@ from qstl_waveform import (
     GaussianEnvelope,
     DCWaveform,
     RFWaveform,
-    Synchronize
+    Synchronize,
 )
 from qstl_variable import (
     Scalar,
@@ -40,11 +40,14 @@ class Executor:
         self,
         channel_mapper: ChannelMapper,
         soc: Optional[QickConfig] = None,
+        hw_demod:bool = False,
     ):
         # QICK SoC object
         self._soc = soc
         # Virtual to physical channel mapper
         self._channel_mapper = channel_mapper
+        # Hardware demodulation flag
+        self._hw_demod = hw_demod
         # QICK program object
         self._qick_program: QickProgram = None
         # QSTL program object
@@ -54,7 +57,7 @@ class Executor:
         # Temporal register to control output generators
         self._temporal_reg_scalar: dict[SingleVirtualChannel, Scalar] = {}
         # Map which converts Scalar variables to QICK register values
-        self._scalar_eval_map: dict[Scalar, function] = {}
+        self._scalar_eval_map: dict[Scalar, Callable] = {}
         self._scalar_treg_map: dict[Scalar, tuple[int, int]] = {}
         self._scalar_vreg_map: dict[Scalar, tuple[int, int]] = {}
 
@@ -68,6 +71,11 @@ class Executor:
 
         if self._soc is None:
             return self._qick_program
+        else:
+            if self._hw_demod is True:
+                return self._qick_program.acquire()
+            else:
+                return self._qick_program.acquire_trace()
 
     def add_vreg(self, ch:int, scalar: Scalar) -> None:
         r"""
