@@ -90,20 +90,20 @@ if __name__ == "__main__":
     (soc, soccfg) = make_proxy("192.168.2.99")
 
     # Set DAC Channel 0 attenuation 31 dB and 31 dB, and turn on DAC channel
-    soc.rfb_set_gen_rf(0,31,31)
+    soc.rfb_set_gen_rf(0,10,10)
     # Set DAC Channel filter as bypass mode
-    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "bypass")
+    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "highpass")
 
     # Set ADC Channel attenuation 31 dB, and turn on ADC channel
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
-    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "bypass")
+    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "highpass")
 
     cfg = {
         # Experiment Setup
-        "reps"          : 50000,
+        "reps"          : 5000,
         # Parameter Setup
-        "freq_rf"       : 1100,
+        "freq_rf"       : 5100,
         "pulse_time"    : 100,
         "soft_avgs"     : 1
     }

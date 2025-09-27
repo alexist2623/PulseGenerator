@@ -28,7 +28,7 @@ class P1dBMeas_Exp(NDAveragerProgram):
                 prog    = self,
                 reg     = self.r_gain,
                 start   = 300,
-                stop    = 4000,
+                stop    = 35000,
                 expts   = 50,
                 label   = "gain_sweep"
             )
@@ -91,12 +91,12 @@ if __name__ == "__main__":
     soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
 
     # Set ADC Channel attenuation 20 dB, and turn on ADC channel
-    soc.rfb_set_ro_rf(0,20)
+    soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
     soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
 
     freq_rf = [
-        200 + 50 * x for x in range(10)
+        540
     ]
     cmap = plt.cm.get_cmap("tab10", len(freq_rf))
     plt.figure()

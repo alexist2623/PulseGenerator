@@ -127,13 +127,13 @@ if __name__ == "__main__":
     soc.rfb_set_gen_rf(0,31,31)
     soc.rfb_set_gen_rf(2,31,31)
     # Set DAC Channel filter as bypass mode
-    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
+    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "highpass")
     soc.rfb_set_gen_filter(2,fc = 2.5, ftype = "lowpass")
 
     # Set ADC Channel attenuation 31 dB, and turn on ADC channel
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
-    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
+    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "highpass")
 
     start_time = time.time()
     cfg = {
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         "reps" : 50000,
         "expts" : 1,
         # Parameter Setup
-        "freq_rf" : 1540,
+        "freq_rf" : 5540,
         "pulse_time" : 300,
         "number_of_pulse" : 10
     }
