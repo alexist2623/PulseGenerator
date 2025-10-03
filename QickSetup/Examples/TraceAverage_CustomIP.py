@@ -89,7 +89,7 @@ class MultiPulseLoopBackExample(AveragerProgram):
                 style   = "arb",    # Output is envelope * gain * DDS output
                 freq    = self.freq_dac, # Generator DDS frequency
                 phase   = self.deg2reg(0, gen_ch = 0),        # Generator DDS phase
-                gain    = int(10000), # Generator amplitude
+                gain    = int(1000), # Generator amplitude
                 phrst   = 0,        # Generator DDS phase reset
                 outsel  = "product",# Output is envelope * gain * DDS output
                 waveform= "gauss",  # Set envelope to be multiplied
@@ -100,23 +100,12 @@ class MultiPulseLoopBackExample(AveragerProgram):
                 style   = "arb",    # Output is envelope * gain * DDS output
                 freq    = self.freq_dac, # Generator DDS frequency
                 phase   = self.deg2reg(0, gen_ch = 2),        # Generator DDS phase
-                gain    = int(32000 // (i + 1)), # Generator amplitude
+                gain    = int(1000), # Generator amplitude
                 phrst   = 0,        # Generator DDS phase reset
                 outsel  = "product",# Output is envelope * gain * DDS output
                 waveform= "gauss",  # Set envelope to be multiplied
                 t       = (cfg["pulse_time"] + 100) * i + 100
             )
-        
-        self.setup_and_pulse(
-            ch      = 0,        # Generator channel
-            style   = "const",    # Output is envelope * gain * DDS output
-            freq    = self.freq_dac, # Generator DDS frequency
-            phase   = self.deg2reg(0, gen_ch = 0),        # Generator DDS phase
-            gain    = int(2000), # Generator amplitude
-            phrst   = 0,        # Generator DDS phase reset
-            length  = cfg["pulse_time"],
-            t       = (cfg["pulse_time"] + 100) * cfg["number_of_pulse"] + 100
-        )
         self.sync_all(1000)
 
 if __name__ == "__main__":
@@ -127,13 +116,13 @@ if __name__ == "__main__":
     soc.rfb_set_gen_rf(0,31,31)
     soc.rfb_set_gen_rf(2,31,31)
     # Set DAC Channel filter as bypass mode
-    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "highpass")
+    soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
     soc.rfb_set_gen_filter(2,fc = 2.5, ftype = "lowpass")
 
     # Set ADC Channel attenuation 31 dB, and turn on ADC channel
     soc.rfb_set_ro_rf(0,31)
     # Set ADC Channel filter as bypass mode
-    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "highpass")
+    soc.rfb_set_ro_filter(0, fc = 2.5, ftype = "lowpass")
 
     start_time = time.time()
     cfg = {
@@ -141,7 +130,7 @@ if __name__ == "__main__":
         "reps" : 50000,
         "expts" : 1,
         # Parameter Setup
-        "freq_rf" : 5540,
+        "freq_rf" : 501.01,
         "pulse_time" : 300,
         "number_of_pulse" : 10
     }

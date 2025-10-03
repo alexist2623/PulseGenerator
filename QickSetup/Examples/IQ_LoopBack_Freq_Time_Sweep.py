@@ -45,7 +45,7 @@ class Sweep_Freq_Time_Exp(RAveragerProgram):
             style   = "const",  # Output is gain * DDS output
             freq    = freq_dac, # Generator DDS frequency
             phase   = 0,        # Generator DDS phase
-            gain    = 5000,     # Generator amplitude
+            gain    = 1000,     # Generator amplitude
             length  = self.cfg["duration_start"], # Pulse length
             phrst   = 0         # Generator DDS phase reset
         )
@@ -113,11 +113,11 @@ if __name__ == "__main__":
         # Experiment Setup
         "reps" : 100,
         "duration_sweep_num" : 10,
-        "start" : 1000,
+        "start" : 500,
         "inner_loop" : 100,
-        "step" : 40,
+        "step" : 1,
         "duration_start" : 1000,
-        "duration_step" : 20,
+        "duration_step" : 200,
         "expts" : 5000,
         # Parameter Setup
         "pulse_time" : 2800

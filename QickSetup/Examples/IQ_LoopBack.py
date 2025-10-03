@@ -10,7 +10,7 @@ from qick.pyro import make_proxy
 
 class IQ_LoopBackTest(NDAveragerProgram):
     def initialize(self):
-        freq_rf     = 1000
+        freq_rf     = 540
         # Declare RF generation channel
         self.declare_gen(
             ch      = 0,        # Channel
