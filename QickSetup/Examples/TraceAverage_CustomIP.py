@@ -81,7 +81,7 @@ class MultiPulseLoopBackExample(AveragerProgram):
         )
         self.trigger(
             adcs    = [0],      # Readout channels
-            adc_trig_offset = 0 # Readout will capture the data @ sync_t + 50
+            adc_trig_offset = 100 # Readout will capture the data @ sync_t + 50
         )
         for i in range(cfg["number_of_pulse"]):
             self.setup_and_pulse(
@@ -95,17 +95,6 @@ class MultiPulseLoopBackExample(AveragerProgram):
                 waveform= "gauss",  # Set envelope to be multiplied
                 t       = (cfg["pulse_time"] + 100) * i + 100
             )
-            self.setup_and_pulse(
-                ch      = 2,        # Generator channel
-                style   = "arb",    # Output is envelope * gain * DDS output
-                freq    = self.freq_dac, # Generator DDS frequency
-                phase   = self.deg2reg(0, gen_ch = 2),        # Generator DDS phase
-                gain    = int(1000), # Generator amplitude
-                phrst   = 0,        # Generator DDS phase reset
-                outsel  = "product",# Output is envelope * gain * DDS output
-                waveform= "gauss",  # Set envelope to be multiplied
-                t       = (cfg["pulse_time"] + 100) * i + 100
-            )
         self.sync_all(1000)
 
 if __name__ == "__main__":
@@ -113,7 +102,7 @@ if __name__ == "__main__":
     (soc, soccfg) = make_proxy("192.168.2.99")
 
     # Set DAC Channel 0 attenuation 31 dB and 31 dB, and turn on DAC channel
-    soc.rfb_set_gen_rf(0,31,31)
+    soc.rfb_set_gen_rf(0,10,10)
     soc.rfb_set_gen_rf(2,31,31)
     # Set DAC Channel filter as bypass mode
     soc.rfb_set_gen_filter(0,fc = 2.5, ftype = "lowpass")
@@ -130,7 +119,7 @@ if __name__ == "__main__":
         "reps" : 50000,
         "expts" : 1,
         # Parameter Setup
-        "freq_rf" : 501.01,
+        "freq_rf" : 501.00000,
         "pulse_time" : 300,
         "number_of_pulse" : 10
     }
@@ -138,7 +127,7 @@ if __name__ == "__main__":
         soccfg,
         cfg
     )
-    LEN = 20
+    LEN = 5
     data = (prog.acquire_trace_avg(soc = soc, progress = True))[0][0]
     for i in range(LEN):
         data += (prog.acquire_trace_avg(soc = soc, progress = True))[0][0]
