@@ -49,7 +49,6 @@ module TraceTrig
 );
 localparam  IDLE        = 2'b00,
             INIT        = 2'b01;
-localparam  LEN_WIDTH   = 10;
 
 
 reg [LEN_WIDTH - 1:0]   length_cnt;
