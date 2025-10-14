@@ -1,4 +1,5 @@
 # Copyright 2014-2021 Keysight Technologies
+# Copyright 2025-2025 University of British Columbia QSTL
 #!/usr/bin/env python
 import sys
 sys.path.append('C:\Program Files\Keysight\SD1\Libraries\Python')
@@ -39,9 +40,9 @@ class Lock(filelock.FileLock):
 class Driver(LabberDriver):
     """ This class implements the Keysight PXI digitizer"""
     qstl_pxi_digitizer_k7z = os.path.join(os.path.dirname(__file__), 'bitstreams',
-                             'ch4_test.k7z')
+                             'qstl_digitizer.k7z')
     factory_k7z = os.path.join(os.path.dirname(__file__), 'bitstreams',
-                               'default_M3202A_ch4_clf_k41_BSP_04_02_11.k7z')
+                               'default_M3102A_ch4_clf_k41_BSP_02_02_06.k7z')
 
     def get_lock(self, chassis, slot, **kwargs):
         # return a lock file name for that module
@@ -123,6 +124,51 @@ class Driver(LabberDriver):
 
         self.log('Loading QSTL PXI Digitizer bitstream')
         self.load_sandbox()
+
+        self.log('Get accum_init register')   
+        self.accum_init_reg = self.dig.FPGAgetSandBoxRegister('HostRegBank_accum_init')
+        if isinstance(self.accum_init_reg, int):
+            message = keysightSD1.SD_Error.getErrorMessage(self.accum_init_reg)
+            raise Error(f'Error in opening a register HostRegBank_accum_init: {message}')
+        self.accum_init()
+
+        self.log('Get accum_num register')
+        self.accum_num_reg = self.dig.FPGAgetSandBoxRegister('HostRegBank_accum_num')
+        if isinstance(self.accum_num_reg, int):
+            message = keysightSD1.SD_Error.getErrorMessage(self.accum_num_reg)
+            raise Error(f'Error in opening a register HostRegBank_accum_num: {message}')
+
+        self.log('Get accum_length register')
+        self.accum_length_reg = self.dig.FPGAgetSandBoxRegister('HostRegBank_accum_length')
+        if isinstance(self.accum_length_reg, int):
+            message = keysightSD1.SD_Error.getErrorMessage(self.accum_length_reg)
+            raise Error(f'Error in opening a register HostRegBank_accum_length: {message}')
+    
+    def accum_init(self) -> None:
+        self.log('Initialize TraceAccum')   
+        error = self.accum_init_reg.writeRegisterInt32(1)
+        if error < 0:
+            message = keysightSD1.SD_Error.getErrorMessage(error)
+            raise Error(f'Error in initiating TraceAccum HostRegBank_accum_init: {message}')
+        
+        error = self.accum_init_reg.writeRegisterInt32(0)
+        if error < 0:
+            message = keysightSD1.SD_Error.getErrorMessage(error)
+            raise Error(f'Error in initiating TraceAccum HostRegBank_accum_init: {message}')
+
+    def accum_num(self, num: int) -> None:
+        self.log('Initialize TraceAccum')   
+        error = self.accum_num_reg.writeRegisterInt32(num)
+        if error < 0:
+            message = keysightSD1.SD_Error.getErrorMessage(error)
+            raise Error(f'Error in initiating TraceAccum HostRegBank_accum_num: {message}')
+    
+    def accum_length(self, samples: int) -> None:
+        self.log('Initialize TraceAccum')   
+        error = self.accum_length_reg.writeRegisterInt32(samples)
+        if error < 0:
+            message = keysightSD1.SD_Error.getErrorMessage(error)
+            raise Error(f'Error in initiating TraceAccum HostRegBank_accum_num: {message}')
 
     def getHwCh(self, n):
         """Get hardware channel number for channel n. n starts at 0"""
@@ -223,49 +269,51 @@ class Driver(LabberDriver):
             # in hardware looping, number of records is set by the hw loop
             (seq_no, n_seq) = self.getHardwareLoopIndex(options)
             nSample = int(self.getValue('Number of samples'))
-            n_records = int(self.getValue('Number of records'))
+            n_accum = int(self.getValue('Number of accumulation'))
+            self.accum_init()
+            self.accum_length(nSample)
+            self.accum_num(n_accum)
+            self.accum_init()
+
             # arm instrument, then report completed to allow client to continue
             self.reportStatus('Digitizer - Waiting for signal')
-            self.getTraces(bArm=True, bMeasure=False, n_seq=n_seq)
+            # Setup DAQ
+            self.getTraces(bArm=True, bMeasure=False, n_seq = n_seq)
+            # Report Arm is done
             self.report_arm_completed()
+
             # directly start collecting data (digitizer buffer is limited)
-            self.getTraces(bArm=False, bMeasure=True, n_seq=n_seq)
+            self.getTraces(bArm=False, bMeasure=True)
+
             # re-shape data and place in trace buffer
             self.reshaped_traces = []
             for trace in self.lTrace:
                 if len(trace) > 0:
-                    trace = trace.reshape((n_seq, n_records*nSample))
+                    trace = trace.reshape((n_seq, nSample))
                 self.reshaped_traces.append(trace)
 
         else:
-            self.getTraces(bArm=True, bMeasure=False)
+            raise Error('Only Hardware loop is supported')
 
 
-    def getTraces(self, bArm=True, bMeasure=True, n_seq=0):
+    def getTraces(self, bArm=True, bMeasure=True, n_seq=1):
         """Get all active traces"""
-        # # test timing
-        # import time
-        # t0 = time.perf_counter()
-        # lT = []
-
         # find out which traces to get
         lCh = []
         iChMask = 0
-        n_records = int(self.getValue('Number of records'))
+        # get current settings
+        nPts = int(self.getValue('Number of samples'))
+        nCyclePerCall = int(self.getValue('Records per Buffer'))
+        n_accum = int(self.getValue('Number of accumulation'))
+        n_reps = int(self.getValue('Number of repetition'))
+
+        nSeg = n_seq * n_reps
+
         for n in range(self.nCh):
             if self.getValue('Ch%d - Enabled' % (n + 1)):
                 lCh.append(n)
                 iChMask += 2**n
-        # get current settings
-        nPts = int(self.getValue('Number of samples'))
-        nCyclePerCall = int(self.getValue('Records per Buffer'))
-        # in hardware loop mode, ignore records and use number of sequences
-        if n_seq > 0:
-            nSeg = n_seq*n_records
-        else:
-            nSeg = n_records
 
-        nAv = int(self.getValue('Number of averages'))
         # trigger delay is in 1/sample rate
         # adding 20 ns to match demod latency
         nTrigDelay = int(round( ( self.getValue('Trig Delay') + 20e-9 ) / self.dt)) 
@@ -273,140 +321,67 @@ class Driver(LabberDriver):
         if bArm:
             with self.lock:
                 # clear old data
+                self.accum_init()
                 self.dig.DAQflushMultiple(iChMask)
                 self.lTrace = [np.array([])] * self.nCh
                 # configure trigger for all active channels
                 for nCh in lCh:
-                    # init data
-                    self.lTrace[nCh] = np.zeros((nSeg * nPts))
+                    # init data. Get repetition * number of samples of data
+                    self.lTrace[nCh] = np.zeros(nPts)
                     # channel number depens on hardware version
                     ch = self.getHwCh(nCh)
                     # extra config for trig mode
                     if self.getValue('Trig Mode') == 'Digital trigger':
-                        extSource = int(self.getCmdStringFromValue('External Trig Source'))
-                        trigBehavior = int(self.getCmdStringFromValue('External Trig Config'))
-                        sync = int(self.getCmdStringFromValue('Trig Sync Mode'))
+                        (extSource, trigBehavior, sync) = (
+                            int(self.getCmdStringFromValue('External Trig Source')),
+                            int(self.getCmdStringFromValue('External Trig Config')),
+                            int(self.getCmdStringFromValue('Trig Sync Mode'))
+                        )
                         self.dig.DAQtriggerExternalConfig(ch, extSource, trigBehavior, sync)
                         self.dig.DAQdigitalTriggerConfig(ch, extSource, trigBehavior)
+
                     elif self.getValue('Trig Mode') == 'Analog channel':
                         digitalTriggerMode= 0
                         digitalTriggerSource = 0
                         trigCh = self.getValueIndex('Analog Trig Channel')
                         analogTriggerMask = 2**trigCh
                         self.dig.DAQtriggerConfig(ch, digitalTriggerMode, digitalTriggerSource, analogTriggerMask)
+
                     # config daq and trig mode
                     trigMode = int(self.getCmdStringFromValue('Trig Mode'))
-                    self.dig.DAQconfig(ch, nPts, nSeg*nAv, nTrigDelay, trigMode)
-                # starz acquiring data
+                    self.dig.DAQconfig(ch, nPts, nSeg, nTrigDelay, trigMode)
+                # start acquiring data
                 self.dig.DAQstartMultiple(iChMask)
-        # lT.append('Start %.1f ms' % (1000*(time.perf_counter()-t0)))
-        #
+
         # return if not measure
         if not bMeasure:
             return
-        # define number of cycles to read at a time
-        nCycleTotal = nSeg * nAv
-        nCall = int(np.ceil(nCycleTotal / nCyclePerCall))
+        # Calculate scale value for each channel
         lScale = [(self.getRange(ch) / self.bitRange) for ch in range(self.nCh)]
-        # keep track of progress in percent
-        old_percent = 0
+        # capture traces one by one
+        for nCh in lCh:
+            # channel number depens on hardware version
+            ch = self.getHwCh(nCh)
+            self.reportStatus(f'Digitizer {nCh} getting traces...')
+            data = self.DAQread(
+                self.dig,
+                ch,
+                nPts * nSeg,
+                10000
+            )
+            data = data.reshape(n_seq, n_reps, -1).mean(axis = 1)
+            data = data.reshape(-1)
+            self.log(f'Data = {data}',level=20)
+            # stop if no data
+            if data.size == 0:
+                return
+            # adjust scaling to account for summing averages
+            scale = lScale[nCh] * (1 / n_accum)
+            data = np.repeat(data, 5)
+            # convert to voltage, add to total average
+            self.lTrace[nCh] += data * scale
 
-        # proceed depending on segment or not segment
-        if nSeg <= 1 or n_seq and nSeg//n_records <= 1:
-            # non-segmented acquisiton
-            for n in range(nCall):
-                # number of cycles for this call, could be fewer for last call
-                nCycle = min(nCyclePerCall, nCycleTotal - (n * nCyclePerCall))
-
-                # report progress, only report integer percent
-                if nCall > 100:
-                    new_percent = int(100 * n / nCall)
-                    if new_percent > old_percent:
-                        old_percent = new_percent
-                        self.reportStatus(
-                            'Acquiring traces ({}%)'.format(new_percent))
-
-                # capture traces one by one
-                for nCh in lCh:
-                    # channel number depens on hardware version
-                    ch = self.getHwCh(nCh)
-                    data = self.DAQread(self.dig, ch, nPts * nCycle,
-                                        int(1000 + self.timeout_ms / nCall))
-                    self.log(f'Data = {data}',level=20)
-                    # stop if no data
-                    if data.size == 0:
-                        return
-
-                    # average
-                    data = data.reshape((nCycle, nPts)).mean(0)
-                    # adjust scaling to account for summing averages
-                    scale = lScale[nCh] * (nCycle / nAv)
-                    # convert to voltage, add to total average
-                    self.lTrace[nCh] += data * scale
-
-                # break if stopped from outside
-                if self.isStopped():
-                    break
-                # lT.append('N: %d, Tot %.1f ms' % (n, 1000 * (time.perf_counter() - t0)))
-
-        else:
-            # segmented acquisition, get caLls per segment
-            (nCallSeg, extra_call) = divmod(nSeg, nCyclePerCall)
-            # pre-calculate list of cycles/call, last call may have more cycles
-            if nCallSeg == 0:
-                nCallSeg = 1
-                lCyclesSeg = [nSeg]
-            else:
-                lCyclesSeg = [nCyclePerCall] * nCallSeg
-                lCyclesSeg[-1] = nCyclePerCall + extra_call
-            # pre-calculate scale, should include scaling for averaging
-            lScale = np.array(lScale, dtype=float) / nAv
-
-
-            for n in range(nAv):
-                # report progress, only report integer percent
-                if nAv > 1:
-                    new_percent = int(100 * n / nAv)
-                    if new_percent > old_percent:
-                        old_percent = new_percent
-                        self.reportStatus(
-                            'Acquiring traces ({}%)'.format(new_percent))
-
-                count = 0
-                started_read = False
-                # loop over number of calls per segment
-                for m, nCycle in enumerate(lCyclesSeg):
-
-                    # capture traces one by one
-                    for nCh in lCh:
-                        # channel number depens on hardware version
-                        ch = self.getHwCh(nCh)
-                        if not started_read:
-                            # for first acquisition, allow the full timeout
-                            read_timeout = int(self.timeout_ms)
-                        else:
-                            read_timeout = int(1000 + self.timeout_ms / nCall)
-                        data = self.DAQread(self.dig, ch, nPts * nCycle,
-                                            read_timeout)
-                        self.log('data = {}, shape= {}'.format(data, np.shape(data)))
-                        # stop if no data
-                        if data.size == 0:
-                            return
-                        # store all data in one long vector
-                        self.lTrace[nCh][count:(count + data.size)] += \
-                            data * lScale[nCh]
-                        started_read = True
-                    count += data.size
-
-                # break if stopped from outside
-                if self.isStopped():
-                    break
-
-                # lT.append('N: %d, Tot %.1f ms' % (n, 1000 * (time.perf_counter() - t0)))
-
-        # # log timing info
-        # self.log(': '.join(lT))
-
+        # lT.append('N: %d, Tot %.1f ms' % (n, 1000 * (time.perf_counter() - t0)))
 
     def getRange(self, ch):
         """Get channel range, as voltage.  Index start at 0"""
@@ -427,9 +402,15 @@ class Driver(LabberDriver):
                 data = (keysightSD1.c_short * nPoints)()
                 nPointsOut = dig._SD_Object__core_dll.SD_AIN_DAQread(dig._SD_Object__handle, nDAQ, data, nPoints, timeOut)
                 if nPointsOut > 0:
-                    return np.frombuffer(data, dtype=np.int16, count=nPoints)
+                    data = np.frombuffer(data, dtype=np.uint16, count=nPoints)
+                    step = 5
+                    n = len(data) // step
+                    high = data[1::step]
+                    low = data[::step]
+                    x = ((high.astype(np.uint32) << 16) | low.astype(np.uint32)).astype(np.int32)
+                    return x
                 else:
-                    return np.array([], dtype=np.int16)
+                    return np.array([], dtype=np.int32)
             else:
                 return keysightSD1.SD_Error.INVALID_VALUE
         else:

@@ -48,7 +48,8 @@ module TraceTrig
     output reg [4:0]                daq_trigger
 );
 localparam  IDLE        = 2'b00,
-            INIT        = 2'b01;
+            INIT        = 2'b01,
+            LAST        = 2'b10;
 
 
 reg [LEN_WIDTH - 1:0]   length_cnt;
@@ -86,6 +87,11 @@ always @(posedge clk) begin
                 else begin
                     abort       <= 1'b0;
                 end
+                if ((|trigger_in) && accum_num == accum_num_set) begin
+                    state       <= LAST;
+                    daq_trigger <= trigger_in;
+                    length_cnt  <= length;
+                end
             end
             INIT: begin
                 abort           <= 1'b0;
@@ -94,23 +100,20 @@ always @(posedge clk) begin
                     state       <= IDLE;
                 end
             end
+            LAST: begin
+                length_cnt      <= length_cnt - 5;
+                if (init) begin
+                    state       <= INIT;
+                    abort       <= 1'b1;
+                    start       <= 1'b0;
+                end
+                if (length_cnt <= 5) begin
+                    state       <= IDLE;
+                    start       <= 1'b1;
+                end
+            end
             default: state      <= IDLE;
         endcase
-
-        if (|trigger_in) begin
-            length_cnt      <= length;
-            length_valid    <= 1'b1;
-            if (accum_num == accum_num_set) begin
-                daq_trigger <= trigger_in;
-            end
-        end
-        if (length_valid) begin
-            length_cnt     <= length_cnt - 1;
-        end
-        if (length_cnt == 1) begin
-            length_valid   <= 1'b0;
-            length_cnt     <= {LEN_WIDTH{1'b0}};
-        end
     end
 end
 

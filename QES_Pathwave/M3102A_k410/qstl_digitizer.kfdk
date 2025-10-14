@@ -19,7 +19,7 @@
         <value>7k410</value>
       </hwOption>
     </hwOptions>
-    <version>02.01.40</version>
+    <version>02.02.06</version>
   </hwTarget>
 
   <fpgaBasic>
@@ -28,28 +28,28 @@
     <ports/>
     <registerInfoManagers>
       <registerInfoManager>
-        <interfaceName>MainEngine_Memory</interfaceName>
+        <interfaceName>Host</interfaceName>
         <registerInfoGroup>
           <interfaceName></interfaceName>
           <registerInfo>
             <name>accum_num</name>
             <addressBase>0</addressBase>
-            <addressWidth>1</addressWidth>
+            <addressWidth>4</addressWidth>
             <type>RW</type>
           </registerInfo>
           <registerInfo>
             <name>accum_length</name>
-            <addressBase>1</addressBase>
-            <addressWidth>1</addressWidth>
+            <addressBase>4</addressBase>
+            <addressWidth>4</addressWidth>
             <type>RW</type>
           </registerInfo>
           <registerInfo>
             <name>accum_init</name>
-            <addressBase>2</addressBase>
-            <addressWidth>1</addressWidth>
+            <addressBase>8</addressBase>
+            <addressWidth>4</addressWidth>
             <type>RW</type>
           </registerInfo>
-          <Name>Register_Bank</Name>
+          <Name>HostRegBank</Name>
           <BaseAddress>0</BaseAddress>
         </registerInfoGroup>
       </registerInfoManager>
@@ -67,18 +67,18 @@
           </attribute>
           <attribute>
             <name>interfaceName</name>
-            <value>MainEngine_Memory</value>
+            <value>Host</value>
           </attribute>
           <attribute>
             <name>registerName</name>
-            <value>Register_Bank</value>
+            <value>HostRegBank</value>
           </attribute>
           <attribute>
             <name>visualName</name>
-            <value>Register_Entity</value>
+            <value>Register_Entity_1</value>
           </attribute>
         </attributes>
-        <entityName>Register_Entity</entityName>
+        <entityName>Register_Entity_1</entityName>
         <ports>
           <port>
             <attributes/>
@@ -278,7 +278,7 @@
         <absoluteFilepath></absoluteFilepath>
         <parameters/>
         <vlnv>
-          <name>Register_Entity</name>
+          <name>Register_Entity_1</name>
         </vlnv>
       </component>
       <component componentTypeName="userfunction">
@@ -711,8 +711,8 @@
           </port>
         </ports>
         <instanceName>AnalogTrigger_1</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -868,8 +868,8 @@
           </port>
         </ports>
         <instanceName>AnalogTrigger_2</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -1025,8 +1025,8 @@
           </port>
         </ports>
         <instanceName>AnalogTrigger_3</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -1182,8 +1182,8 @@
           </port>
         </ports>
         <instanceName>AnalogTrigger_4</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/AnalogTrigger/AnalogTrigger.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -2804,18 +2804,18 @@
           </attribute>
           <attribute>
             <name>interfaceName</name>
-            <value>MainEngine_Memory</value>
+            <value>Host</value>
           </attribute>
           <attribute>
             <name>registerName</name>
-            <value>Register_Bank</value>
+            <value>HostRegBank</value>
           </attribute>
           <attribute>
             <name>visualName</name>
-            <value>Register_Entity</value>
+            <value>Register_Entity_1</value>
           </attribute>
         </attributes>
-        <entityName>Register_Entity</entityName>
+        <entityName>Register_Entity_1</entityName>
         <ports>
           <port>
             <attributes/>
@@ -3010,12 +3010,12 @@
             <defaultValue>0</defaultValue>
           </port>
         </ports>
-        <instanceName>Register_Bank</instanceName>
+        <instanceName>HostRegBank</instanceName>
         <filepath></filepath>
         <absoluteFilepath></absoluteFilepath>
         <parameters/>
         <vlnv>
-          <name>Register_Entity</name>
+          <name>Register_Entity_1</name>
         </vlnv>
       </component>
       <component componentTypeName="LibraryFunction">
@@ -3157,7 +3157,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>159</left>
+                <left>319</left>
                 <right>0</right>
                 <leftExpression>tsize-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3206,7 +3206,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>15</left>
+                <left>47</left>
                 <right>0</right>
                 <leftExpression>csize-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3223,7 +3223,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>10</left>
+                <left>20</left>
                 <right>0</right>
                 <leftExpression>msize</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3240,7 +3240,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>15</left>
+                <left>47</left>
                 <right>0</right>
                 <leftExpression>csize-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3295,11 +3295,884 @@
           </parameter>
           <parameter>
             <parameterId>asize</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>msize</parameterId>
-            <parameterValue>10</parameterValue>
+            <parameterValue>20</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>DSP</library>
+          <name>TraceAccum</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>DSP/Trace Math</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Accumlate arbitrary number of arbitrary length waveform traces based on a trigger</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceAccum</value>
+          </attribute>
+        </attributes>
+        <entityName>traceAccum</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>supersample*dsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tuser</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>tsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>numAccum</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>msize</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accumCount</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>done</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>state</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>1</left>
+                <right>0</right>
+                <leftExpression>1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceAccum_2</instanceName>
+        <filepath>Dsp/Trace/Rev1.0/traceAccum.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Dsp/Trace/Rev1.0/traceAccum.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>dsize</parameterId>
+            <parameterValue>16</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>5</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>asize</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>msize</parameterId>
+            <parameterValue>20</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>DSP</library>
+          <name>TraceAccum</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>DSP/Trace Math</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Accumlate arbitrary number of arbitrary length waveform traces based on a trigger</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceAccum</value>
+          </attribute>
+        </attributes>
+        <entityName>traceAccum</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>supersample*dsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tuser</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>tsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>numAccum</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>msize</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accumCount</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>done</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>state</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>1</left>
+                <right>0</right>
+                <leftExpression>1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceAccum_3</instanceName>
+        <filepath>Dsp/Trace/Rev1.0/traceAccum.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Dsp/Trace/Rev1.0/traceAccum.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>dsize</parameterId>
+            <parameterValue>16</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>5</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>asize</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>msize</parameterId>
+            <parameterValue>20</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>DSP</library>
+          <name>TraceAccum</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>DSP/Trace Math</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Accumlate arbitrary number of arbitrary length waveform traces based on a trigger</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceAccum</value>
+          </attribute>
+        </attributes>
+        <entityName>traceAccum</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>supersample*dsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tuser</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>x_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>tsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>supersample-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>sum_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>numAccum</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>msize</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accumCount</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>csize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>done</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>state</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>1</left>
+                <right>0</right>
+                <leftExpression>1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceAccum_4</instanceName>
+        <filepath>Dsp/Trace/Rev1.0/traceAccum.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Dsp/Trace/Rev1.0/traceAccum.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>dsize</parameterId>
+            <parameterValue>16</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>5</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>asize</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>msize</parameterId>
+            <parameterValue>20</parameterValue>
           </parameter>
         </parameters>
         <vlnv>
@@ -3465,7 +4338,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>15</left>
+                <left>47</left>
                 <right>0</right>
                 <leftExpression>ACCUM_WIDTH-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3482,7 +4355,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>15</left>
+                <left>47</left>
                 <right>0</right>
                 <leftExpression>ACCUM_WIDTH-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3499,7 +4372,7 @@
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>10</left>
+                <left>20</left>
                 <right>0</right>
                 <leftExpression>LEN_WIDTH-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -3578,11 +4451,854 @@
         <parameters>
           <parameter>
             <parameterId>LEN_WIDTH</parameterId>
-            <parameterValue>11</parameterValue>
+            <parameterValue>21</parameterValue>
           </parameter>
           <parameter>
             <parameterId>ACCUM_WIDTH</parameterId>
-            <parameterValue>16</parameterValue>
+            <parameterValue>48</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <library>Verilog Files</library>
+          <name>TraceTrig</name>
+        </vlnv>
+      </component>
+      <component componentTypeName="userfunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Verilog Files</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>IP imported from a Verilog file</value>
+          </attribute>
+          <attribute>
+            <name>inferInterfaces</name>
+            <value>1</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceTrig</value>
+          </attribute>
+        </attributes>
+        <entityName>TraceTrig</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>rst_n</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>init</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num_set</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>LEN_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>trigger_in</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>daq_trigger</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceTrig_2</instanceName>
+        <filepath>../../../../../GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</filepath>
+        <absoluteFilepath>C:/GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>LEN_WIDTH</parameterId>
+            <parameterValue>21</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>ACCUM_WIDTH</parameterId>
+            <parameterValue>48</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <library>Verilog Files</library>
+          <name>TraceTrig</name>
+        </vlnv>
+      </component>
+      <component componentTypeName="userfunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Verilog Files</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>IP imported from a Verilog file</value>
+          </attribute>
+          <attribute>
+            <name>inferInterfaces</name>
+            <value>1</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceTrig</value>
+          </attribute>
+        </attributes>
+        <entityName>TraceTrig</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>rst_n</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>init</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num_set</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>LEN_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>trigger_in</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>daq_trigger</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceTrig_3</instanceName>
+        <filepath>../../../../../GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</filepath>
+        <absoluteFilepath>C:/GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>LEN_WIDTH</parameterId>
+            <parameterValue>21</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>ACCUM_WIDTH</parameterId>
+            <parameterValue>48</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <library>Verilog Files</library>
+          <name>TraceTrig</name>
+        </vlnv>
+      </component>
+      <component componentTypeName="userfunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Verilog Files</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>IP imported from a Verilog file</value>
+          </attribute>
+          <attribute>
+            <name>inferInterfaces</name>
+            <value>1</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>TraceTrig</value>
+          </attribute>
+        </attributes>
+        <entityName>TraceTrig</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>clk</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tuser</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>maxis_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>79</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>saxis_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>rst_n</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>init</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num_set</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>accum_num</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>47</left>
+                <right>0</right>
+                <leftExpression>ACCUM_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>length</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>20</left>
+                <right>0</right>
+                <leftExpression>LEN_WIDTH-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>trigger_in</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>start</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>abort</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>daq_trigger</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>4</left>
+                <right>0</right>
+                <leftExpression>4</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+        </ports>
+        <instanceName>TraceTrig_4</instanceName>
+        <filepath>../../../../../GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</filepath>
+        <absoluteFilepath>C:/GIT/PulseGenerator/QES_Pathwave/IP/TraceTrig/TraceTrig.v</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>LEN_WIDTH</parameterId>
+            <parameterValue>21</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>ACCUM_WIDTH</parameterId>
+            <parameterValue>48</parameterValue>
           </parameter>
         </parameters>
         <vlnv>
@@ -3620,21 +5336,6 @@
         <entityName>Trigger_Selector</entityName>
         <ports>
           <port>
-            <attributes/>
-            <members/>
-            <name>nRst</name>
-            <direction>in</direction>
-            <type>
-              <name>std_logic</name>
-              <range>
-                <direction>none</direction>
-                <left>-1</left>
-                <right>-1</right>
-              </range>
-            </type>
-            <defaultValue>1</defaultValue>
-          </port>
-          <port>
             <attributes>
               <attribute>
                 <name>visualName</name>
@@ -3653,6 +5354,21 @@
               </range>
             </type>
             <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
           </port>
           <port>
             <attributes/>
@@ -3805,8 +5521,8 @@
           </port>
         </ports>
         <instanceName>TriggerSelector_1</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -3845,21 +5561,6 @@
         <entityName>Trigger_Selector</entityName>
         <ports>
           <port>
-            <attributes/>
-            <members/>
-            <name>nRst</name>
-            <direction>in</direction>
-            <type>
-              <name>std_logic</name>
-              <range>
-                <direction>none</direction>
-                <left>-1</left>
-                <right>-1</right>
-              </range>
-            </type>
-            <defaultValue>1</defaultValue>
-          </port>
-          <port>
             <attributes>
               <attribute>
                 <name>visualName</name>
@@ -3878,6 +5579,21 @@
               </range>
             </type>
             <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
           </port>
           <port>
             <attributes/>
@@ -4030,8 +5746,8 @@
           </port>
         </ports>
         <instanceName>TriggerSelector_2</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -4070,21 +5786,6 @@
         <entityName>Trigger_Selector</entityName>
         <ports>
           <port>
-            <attributes/>
-            <members/>
-            <name>nRst</name>
-            <direction>in</direction>
-            <type>
-              <name>std_logic</name>
-              <range>
-                <direction>none</direction>
-                <left>-1</left>
-                <right>-1</right>
-              </range>
-            </type>
-            <defaultValue>1</defaultValue>
-          </port>
-          <port>
             <attributes>
               <attribute>
                 <name>visualName</name>
@@ -4103,6 +5804,21 @@
               </range>
             </type>
             <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
           </port>
           <port>
             <attributes/>
@@ -4255,8 +5971,8 @@
           </port>
         </ports>
         <instanceName>TriggerSelector_3</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -4295,21 +6011,6 @@
         <entityName>Trigger_Selector</entityName>
         <ports>
           <port>
-            <attributes/>
-            <members/>
-            <name>nRst</name>
-            <direction>in</direction>
-            <type>
-              <name>std_logic</name>
-              <range>
-                <direction>none</direction>
-                <left>-1</left>
-                <right>-1</right>
-              </range>
-            </type>
-            <defaultValue>1</defaultValue>
-          </port>
-          <port>
             <attributes>
               <attribute>
                 <name>visualName</name>
@@ -4328,6 +6029,21 @@
               </range>
             </type>
             <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>nRst</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
           </port>
           <port>
             <attributes/>
@@ -4480,8 +6196,8 @@
           </port>
         </ports>
         <instanceName>TriggerSelector_4</instanceName>
-        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</filepath>
-        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020140/bsp/ip/7k410/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
+        <filepath>../../../../../Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/M3102A BSP/R020206/bsp/ip/TriggerSelector/TriggerSelector.1.0.xml</absoluteFilepath>
         <parameters/>
         <vlnv>
           <vendor>keysight.com</vendor>
@@ -5099,7 +6815,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size1-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5131,7 +6847,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>15</left>
                 <right>0</right>
                 <leftExpression>supersample*size2-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5163,7 +6879,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>63</left>
+                <left>79</left>
                 <right>0</right>
                 <leftExpression>supersample*doutsize-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5187,17 +6903,17 @@ This does not introduce extra delay.</value>
             <defaultValue>1</defaultValue>
           </port>
         </ports>
-        <instanceName>concat2_stream_1</instanceName>
+        <instanceName>concat2_stream_2</instanceName>
         <filepath>Basic/Concat/concat2_stream.1.0.xml</filepath>
         <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Concat/concat2_stream.1.0.xml</absoluteFilepath>
         <parameters>
           <parameter>
             <parameterId>size1</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>size2</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>16</parameterValue>
           </parameter>
           <parameter>
             <parameterId>supersample</parameterId>
@@ -5332,7 +7048,297 @@ This does not introduce extra delay.</value>
             <defaultValue>1</defaultValue>
           </port>
         </ports>
-        <instanceName>concat2_stream_2</instanceName>
+        <instanceName>concat2_stream_4</instanceName>
+        <filepath>Basic/Concat/concat2_stream.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Concat/concat2_stream.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>size1</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size2</parameterId>
+            <parameterValue>16</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>1</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>Basic</library>
+          <name>concat2_stream</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Basic/ConcatN</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Concatenates two input axi streams into one output axi stream. 
+Output stream data size is the sum of the input stream data sizes.
+This does not support reverse flow control (TREADY).
+This does not introduce extra delay.</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>concat2_stream</value>
+          </attribute>
+        </attributes>
+        <entityName>concat2_stream</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din1_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size1-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din1_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din2_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>15</left>
+                <right>0</right>
+                <leftExpression>supersample*size2-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din2_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>supersample*doutsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+        </ports>
+        <instanceName>concat2_stream_6</instanceName>
+        <filepath>Basic/Concat/concat2_stream.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Concat/concat2_stream.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>size1</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size2</parameterId>
+            <parameterValue>16</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>1</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>Basic</library>
+          <name>concat2_stream</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Basic/ConcatN</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Concatenates two input axi streams into one output axi stream. 
+Output stream data size is the sum of the input stream data sizes.
+This does not support reverse flow control (TREADY).
+This does not introduce extra delay.</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>concat2_stream</value>
+          </attribute>
+        </attributes>
+        <entityName>concat2_stream</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din1_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size1-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din1_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din2_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>15</left>
+                <right>0</right>
+                <leftExpression>supersample*size2-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din2_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>79</left>
+                <right>0</right>
+                <leftExpression>supersample*doutsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+        </ports>
+        <instanceName>concat2_stream_8</instanceName>
         <filepath>Basic/Concat/concat2_stream.1.0.xml</filepath>
         <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Concat/concat2_stream.1.0.xml</absoluteFilepath>
         <parameters>
@@ -5685,7 +7691,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>159</left>
+                <left>319</left>
                 <right>0</right>
                 <leftExpression>supersample*dinsize-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5717,7 +7723,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size1-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5749,7 +7755,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size2-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5781,7 +7787,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size3-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5813,7 +7819,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size4-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5845,7 +7851,7 @@ This does not introduce extra delay.</value>
               <name>std_logic_vector</name>
               <range>
                 <direction>downto</direction>
-                <left>31</left>
+                <left>63</left>
                 <right>0</right>
                 <leftExpression>supersample*size5-1</leftExpression>
                 <rightExpression>0</rightExpression>
@@ -5875,23 +7881,782 @@ This does not introduce extra delay.</value>
         <parameters>
           <parameter>
             <parameterId>size1</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>size2</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>size3</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>size4</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>size5</parameterId>
-            <parameterValue>32</parameterValue>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>1</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>Basic</library>
+          <name>slice5_stream</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Basic/SliceN</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Slices an input axi stream into five output axi streams. 
+Input stream data size is the sum of the output stream data sizes.
+This does not support reverse flow control (TREADY)
+This does not introduce extra delay.</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>slice5_stream</value>
+          </attribute>
+        </attributes>
+        <entityName>slice5_stream</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>supersample*dinsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size1-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size2-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size3-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size4-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size5-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+        </ports>
+        <instanceName>slice5_stream_2</instanceName>
+        <filepath>Basic/Slice/slice5_stream.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Slice/slice5_stream.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>size1</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size2</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size3</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size4</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size5</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>1</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>Basic</library>
+          <name>slice5_stream</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Basic/SliceN</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Slices an input axi stream into five output axi streams. 
+Input stream data size is the sum of the output stream data sizes.
+This does not support reverse flow control (TREADY)
+This does not introduce extra delay.</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>slice5_stream</value>
+          </attribute>
+        </attributes>
+        <entityName>slice5_stream</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>supersample*dinsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size1-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size2-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size3-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size4-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size5-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+        </ports>
+        <instanceName>slice5_stream_3</instanceName>
+        <filepath>Basic/Slice/slice5_stream.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Slice/slice5_stream.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>size1</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size2</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size3</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size4</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size5</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>supersample</parameterId>
+            <parameterValue>1</parameterValue>
+          </parameter>
+        </parameters>
+        <vlnv>
+          <vendor>keysight.com</vendor>
+          <library>Basic</library>
+          <name>slice5_stream</name>
+          <version>1.0</version>
+        </vlnv>
+      </component>
+      <component componentTypeName="LibraryFunction">
+        <attributes>
+          <attribute>
+            <name>category</name>
+            <value>Basic/SliceN</value>
+          </attribute>
+          <attribute>
+            <name>description</name>
+            <value>Slices an input axi stream into five output axi streams. 
+Input stream data size is the sum of the output stream data sizes.
+This does not support reverse flow control (TREADY)
+This does not introduce extra delay.</value>
+          </attribute>
+          <attribute>
+            <name>loadType</name>
+            <value>0</value>
+          </attribute>
+          <attribute>
+            <name>visualName</name>
+            <value>slice5_stream</value>
+          </attribute>
+        </attributes>
+        <entityName>slice5_stream</entityName>
+        <ports>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tdata</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>319</left>
+                <right>0</right>
+                <leftExpression>supersample*dinsize-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>din_tvalid</name>
+            <direction>in</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size1-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout1_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size2-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout2_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size3-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout3_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size4-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout4_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tdata</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic_vector</name>
+              <range>
+                <direction>downto</direction>
+                <left>63</left>
+                <right>0</right>
+                <leftExpression>supersample*size5-1</leftExpression>
+                <rightExpression>0</rightExpression>
+              </range>
+            </type>
+            <defaultValue>0</defaultValue>
+          </port>
+          <port>
+            <attributes/>
+            <members/>
+            <name>dout5_tvalid</name>
+            <direction>out</direction>
+            <type>
+              <name>std_logic</name>
+              <range>
+                <direction>none</direction>
+                <left>-1</left>
+                <right>-1</right>
+              </range>
+            </type>
+            <defaultValue>1</defaultValue>
+          </port>
+        </ports>
+        <instanceName>slice5_stream_4</instanceName>
+        <filepath>Basic/Slice/slice5_stream.1.0.xml</filepath>
+        <absoluteFilepath>C:/Program Files/Keysight/PathWave FPGA 2022 Update 1.0/config/BASE IP/Basic/Slice/slice5_stream.1.0.xml</absoluteFilepath>
+        <parameters>
+          <parameter>
+            <parameterId>size1</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size2</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size3</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size4</parameterId>
+            <parameterValue>64</parameterValue>
+          </parameter>
+          <parameter>
+            <parameterId>size5</parameterId>
+            <parameterValue>64</parameterValue>
           </parameter>
           <parameter>
             <parameterId>supersample</parameterId>
@@ -6004,7 +8769,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Interface</type>
-          <name>Analog_Channel_2.#I#Ain2_out</name>
+          <name>concat2_stream_4.#I#dout</name>
         </target>
       </connection>
       <connection>
@@ -6014,7 +8779,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Interface</type>
-          <name>Analog_Channel_3.#I#Ain3_out</name>
+          <name>concat2_stream_6.#I#dout</name>
         </target>
       </connection>
       <connection>
@@ -6024,7 +8789,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Interface</type>
-          <name>Analog_Channel_4.#I#Ain4_out</name>
+          <name>concat2_stream_8.#I#dout</name>
         </target>
       </connection>
       <connection>
@@ -6040,6 +8805,36 @@ This does not introduce extra delay.</value>
       <connection>
         <source>
           <type>Interface</type>
+          <name>TraceAccum_2.#I#x</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceTrig_2.#I#maxis</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>TraceAccum_3.#I#x</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceTrig_3.#I#maxis</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>TraceAccum_4.#I#x</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceTrig_4.#I#maxis</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
           <name>TraceTrig_1.#I#saxis</name>
         </source>
         <target>
@@ -6050,21 +8845,31 @@ This does not introduce extra delay.</value>
       <connection>
         <source>
           <type>Interface</type>
-          <name>concat2_stream_1.#I#din1</name>
+          <name>TraceTrig_2.#I#saxis</name>
         </source>
         <target>
           <type>Interface</type>
-          <name>slice5_stream_1.#I#dout1</name>
+          <name>Analog_Channel_2.#I#Ain2_out</name>
         </target>
       </connection>
       <connection>
         <source>
           <type>Interface</type>
-          <name>concat2_stream_1.#I#din2</name>
+          <name>TraceTrig_3.#I#saxis</name>
         </source>
         <target>
           <type>Interface</type>
-          <name>slice5_stream_1.#I#dout2</name>
+          <name>Analog_Channel_3.#I#Ain3_out</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>TraceTrig_4.#I#saxis</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>Analog_Channel_4.#I#Ain4_out</name>
         </target>
       </connection>
       <connection>
@@ -6074,7 +8879,37 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Interface</type>
-          <name>concat2_stream_1.#I#dout</name>
+          <name>slice5_stream_1.#I#dout1</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>concat2_stream_4.#I#din1</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>slice5_stream_2.#I#dout1</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>concat2_stream_6.#I#din1</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>slice5_stream_3.#I#dout1</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>concat2_stream_8.#I#din1</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>slice5_stream_4.#I#dout1</name>
         </target>
       </connection>
       <connection>
@@ -6085,6 +8920,36 @@ This does not introduce extra delay.</value>
         <target>
           <type>Interface</type>
           <name>TraceAccum_1.#I#sum</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>slice5_stream_2.#I#din</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceAccum_2.#I#sum</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>slice5_stream_3.#I#din</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceAccum_3.#I#sum</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Interface</type>
+          <name>slice5_stream_4.#I#din</name>
+        </source>
+        <target>
+          <type>Interface</type>
+          <name>TraceAccum_4.#I#sum</name>
         </target>
       </connection>
       <connection>
@@ -6234,7 +9099,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>Register_Bank.accum_length_Dout</name>
+          <name>HostRegBank.accum_length_Dout</name>
         </target>
       </connection>
       <connection>
@@ -6254,7 +9119,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>Register_Bank.accum_num_Dout</name>
+          <name>HostRegBank.accum_num_Dout</name>
         </target>
       </connection>
       <connection>
@@ -6265,6 +9130,186 @@ This does not introduce extra delay.</value>
         <target>
           <type>Port</type>
           <name>TraceTrig_1.start</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.abort</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_2.abort</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.nRst</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.numAccum</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_2.start</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_2.start</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.abort</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_3.abort</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock_3.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.nRst</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst_3.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.numAccum</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_3.start</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_3.start</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.abort</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_4.abort</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock_2.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.nRst</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst_2.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.numAccum</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceAccum_4.start</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceTrig_4.start</name>
         </target>
       </connection>
       <connection>
@@ -6284,7 +9329,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>Register_Bank.accum_num_Dout</name>
+          <name>HostRegBank.accum_num_Dout</name>
         </target>
       </connection>
       <connection>
@@ -6304,7 +9349,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>Register_Bank.accum_init_Dout</name>
+          <name>HostRegBank.accum_init_Dout</name>
         </target>
       </connection>
       <connection>
@@ -6314,7 +9359,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>Register_Bank.accum_length_Dout</name>
+          <name>HostRegBank.accum_length_Dout</name>
         </target>
       </connection>
       <connection>
@@ -6335,6 +9380,216 @@ This does not introduce extra delay.</value>
         <target>
           <type>Port</type>
           <name>TriggerSelector_1.trigger_o</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.accum_num</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceAccum_2.accumCount</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.accum_num_set</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.init</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_init_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.rst_n</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_2.trigger_in</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TriggerSelector_2.trigger_o</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.accum_num</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceAccum_3.accumCount</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.accum_num_set</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock_3.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.init</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_init_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.rst_n</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst_3.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_3.trigger_in</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TriggerSelector_3.trigger_o</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.accum_num</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TraceAccum_4.accumCount</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.accum_num_set</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_num_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.clk</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>clock_2.Clock</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.init</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_init_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.length</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>HostRegBank.accum_length_Dout</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.rst_n</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>nRst_2.nRst</name>
+        </target>
+      </connection>
+      <connection>
+        <source>
+          <type>Port</type>
+          <name>TraceTrig_4.trigger_in</name>
+        </source>
+        <target>
+          <type>Port</type>
+          <name>TriggerSelector_4.trigger_o</name>
         </target>
       </connection>
       <connection>
@@ -6754,7 +10009,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>TriggerSelector_2.trigger_o</name>
+          <name>TraceTrig_2.daq_trigger</name>
         </target>
       </connection>
       <connection>
@@ -6764,7 +10019,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>TriggerSelector_3.trigger_o</name>
+          <name>TraceTrig_3.daq_trigger</name>
         </target>
       </connection>
       <connection>
@@ -6774,7 +10029,7 @@ This does not introduce extra delay.</value>
         </source>
         <target>
           <type>Port</type>
-          <name>TriggerSelector_4.trigger_o</name>
+          <name>TraceTrig_4.daq_trigger</name>
         </target>
       </connection>
     </connections>
@@ -6787,8 +10042,8 @@ This does not introduce extra delay.</value>
         <instanceName>AnalogTrigger_1</instanceName>
         <visualName>AnalogTrigger_1</visualName>
         <currentPosition>
-          <x>335</x>
-          <y>-515</y>
+          <x>275</x>
+          <y>-410</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6807,8 +10062,8 @@ This does not introduce extra delay.</value>
         <instanceName>AnalogTrigger_2</instanceName>
         <visualName>AnalogTrigger_2</visualName>
         <currentPosition>
-          <x>335</x>
-          <y>-255</y>
+          <x>270</x>
+          <y>-155</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6827,8 +10082,8 @@ This does not introduce extra delay.</value>
         <instanceName>AnalogTrigger_3</instanceName>
         <visualName>AnalogTrigger_3</visualName>
         <currentPosition>
-          <x>335</x>
-          <y>-40</y>
+          <x>270</x>
+          <y>95</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6847,8 +10102,8 @@ This does not introduce extra delay.</value>
         <instanceName>AnalogTrigger_4</instanceName>
         <visualName>AnalogTrigger_4</visualName>
         <currentPosition>
-          <x>335</x>
-          <y>170</y>
+          <x>270</x>
+          <y>345</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6867,8 +10122,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_1</instanceName>
         <visualName>Analog_Channel_1</visualName>
         <currentPosition>
-          <x>45</x>
-          <y>-390</y>
+          <x>-15</x>
+          <y>-475</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6883,8 +10138,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_2</instanceName>
         <visualName>Analog_Channel_2</visualName>
         <currentPosition>
-          <x>45</x>
-          <y>-160</y>
+          <x>-15</x>
+          <y>-205</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6899,8 +10154,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_3</instanceName>
         <visualName>Analog_Channel_3</visualName>
         <currentPosition>
-          <x>40</x>
-          <y>50</y>
+          <x>-15</x>
+          <y>35</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6915,8 +10170,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_4</instanceName>
         <visualName>Analog_Channel_4</visualName>
         <currentPosition>
-          <x>35</x>
-          <y>260</y>
+          <x>-15</x>
+          <y>290</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6931,8 +10186,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_Control_1</instanceName>
         <visualName>Analog_Channel_Control_1</visualName>
         <currentPosition>
-          <x>50</x>
-          <y>-515</y>
+          <x>-10</x>
+          <y>-410</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6947,8 +10202,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_Control_2</instanceName>
         <visualName>Analog_Channel_Control_2</visualName>
         <currentPosition>
-          <x>50</x>
-          <y>-250</y>
+          <x>-15</x>
+          <y>-150</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6963,8 +10218,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_Control_3</instanceName>
         <visualName>Analog_Channel_Control_3</visualName>
         <currentPosition>
-          <x>50</x>
-          <y>-40</y>
+          <x>-15</x>
+          <y>95</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6979,8 +10234,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Channel_Control_4</instanceName>
         <visualName>Analog_Channel_Control_4</visualName>
         <currentPosition>
-          <x>50</x>
-          <y>170</y>
+          <x>-15</x>
+          <y>345</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -6995,8 +10250,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Trigger_1</instanceName>
         <visualName>Analog_Trigger_1</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-610</y>
+          <x>1475</x>
+          <y>-495</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7006,8 +10261,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Trigger_2</instanceName>
         <visualName>Analog_Trigger_2</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-345</y>
+          <x>1470</x>
+          <y>-235</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7017,8 +10272,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Trigger_3</instanceName>
         <visualName>Analog_Trigger_3</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-120</y>
+          <x>1470</x>
+          <y>20</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7028,8 +10283,8 @@ This does not introduce extra delay.</value>
         <instanceName>Analog_Trigger_4</instanceName>
         <visualName>Analog_Trigger_4</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>90</y>
+          <x>1485</x>
+          <y>275</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7039,8 +10294,8 @@ This does not introduce extra delay.</value>
         <instanceName>Daq1</instanceName>
         <visualName>Daq1</visualName>
         <currentPosition>
-          <x>830</x>
-          <y>-390</y>
+          <x>1470</x>
+          <y>-575</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7055,8 +10310,8 @@ This does not introduce extra delay.</value>
         <instanceName>Daq2</instanceName>
         <visualName>Daq2</visualName>
         <currentPosition>
-          <x>830</x>
-          <y>-160</y>
+          <x>1465</x>
+          <y>-325</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7071,8 +10326,8 @@ This does not introduce extra delay.</value>
         <instanceName>Daq3</instanceName>
         <visualName>Daq3</visualName>
         <currentPosition>
-          <x>830</x>
-          <y>50</y>
+          <x>1470</x>
+          <y>-75</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7087,8 +10342,8 @@ This does not introduce extra delay.</value>
         <instanceName>Daq4</instanceName>
         <visualName>Daq4</visualName>
         <currentPosition>
-          <x>830</x>
-          <y>260</y>
+          <x>1470</x>
+          <y>175</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7103,8 +10358,8 @@ This does not introduce extra delay.</value>
         <instanceName>TriggerSelector_1</instanceName>
         <visualName>TriggerSelector_1</visualName>
         <currentPosition>
-          <x>630</x>
-          <y>-520</y>
+          <x>740</x>
+          <y>-410</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7114,8 +10369,8 @@ This does not introduce extra delay.</value>
         <instanceName>TriggerSelector_2</instanceName>
         <visualName>TriggerSelector_2</visualName>
         <currentPosition>
-          <x>630</x>
-          <y>-260</y>
+          <x>740</x>
+          <y>-155</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7125,8 +10380,8 @@ This does not introduce extra delay.</value>
         <instanceName>TriggerSelector_3</instanceName>
         <visualName>TriggerSelector_3</visualName>
         <currentPosition>
-          <x>630</x>
-          <y>-40</y>
+          <x>740</x>
+          <y>95</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7136,8 +10391,8 @@ This does not introduce extra delay.</value>
         <instanceName>TriggerSelector_4</instanceName>
         <visualName>TriggerSelector_4</visualName>
         <currentPosition>
-          <x>630</x>
-          <y>170</y>
+          <x>740</x>
+          <y>345</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7147,8 +10402,8 @@ This does not introduce extra delay.</value>
         <instanceName>Trigger_Output_1</instanceName>
         <visualName>Trigger_Output_1</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-525</y>
+          <x>1475</x>
+          <y>-415</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7158,8 +10413,8 @@ This does not introduce extra delay.</value>
         <instanceName>Trigger_Output_2</instanceName>
         <visualName>Trigger_Output_2</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-265</y>
+          <x>1470</x>
+          <y>-160</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7169,8 +10424,8 @@ This does not introduce extra delay.</value>
         <instanceName>Trigger_Output_3</instanceName>
         <visualName>Trigger_Output_3</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>-45</y>
+          <x>1470</x>
+          <y>95</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7180,8 +10435,8 @@ This does not introduce extra delay.</value>
         <instanceName>Trigger_Output_4</instanceName>
         <visualName>Trigger_Output_4</visualName>
         <currentPosition>
-          <x>870</x>
-          <y>165</y>
+          <x>1485</x>
+          <y>350</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7191,8 +10446,8 @@ This does not introduce extra delay.</value>
         <instanceName>TraceAccum_1</instanceName>
         <visualName>TraceAccum_1</visualName>
         <currentPosition>
-          <x>630</x>
-          <y>-740</y>
+          <x>740</x>
+          <y>-535</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7207,12 +10462,228 @@ This does not introduce extra delay.</value>
         </interfaces>
       </blockGraphicItem>
       <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_10</name>
+        <instanceName>slice5_stream_2</instanceName>
+        <visualName>slice5_stream_2</visualName>
+        <currentPosition>
+          <x>930</x>
+          <y>-300</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_10.#I#din</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_10.#I#dout1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_10.#I#dout2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_10.#I#dout3</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_10.#I#dout4</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_10.#I#dout5</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_11</name>
+        <instanceName>TraceTrig_2</instanceName>
+        <visualName>TraceTrig_2</visualName>
+        <currentPosition>
+          <x>270</x>
+          <y>-255</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_11.#I#maxis</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_11.#I#saxis</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_13</name>
+        <instanceName>concat2_stream_6</instanceName>
+        <visualName>concat2_stream_6</visualName>
+        <currentPosition>
+          <x>1255</x>
+          <y>-70</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_13.#I#din1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_13.#I#din2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_13.#I#dout</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_14</name>
+        <instanceName>slice5_stream_3</instanceName>
+        <visualName>slice5_stream_3</visualName>
+        <currentPosition>
+          <x>930</x>
+          <y>-50</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_14.#I#din</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_14.#I#dout1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_14.#I#dout2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_14.#I#dout3</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_14.#I#dout4</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_14.#I#dout5</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_15</name>
+        <instanceName>TraceAccum_3</instanceName>
+        <visualName>TraceAccum_3</visualName>
+        <currentPosition>
+          <x>735</x>
+          <y>-30</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_15.#I#x</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_15.#I#sum</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_16</name>
+        <instanceName>TraceTrig_3</instanceName>
+        <visualName>TraceTrig_3</visualName>
+        <currentPosition>
+          <x>270</x>
+          <y>-5</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_16.#I#maxis</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_16.#I#saxis</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_18</name>
+        <instanceName>concat2_stream_8</instanceName>
+        <visualName>concat2_stream_8</visualName>
+        <currentPosition>
+          <x>1245</x>
+          <y>180</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_18.#I#din1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_18.#I#din2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_18.#I#dout</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_19</name>
+        <instanceName>slice5_stream_4</instanceName>
+        <visualName>slice5_stream_4</visualName>
+        <currentPosition>
+          <x>920</x>
+          <y>200</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_19.#I#din</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_19.#I#dout1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_19.#I#dout2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_19.#I#dout3</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_19.#I#dout4</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_19.#I#dout5</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
         <name>block_2</name>
         <instanceName>TraceTrig_1</instanceName>
         <visualName>TraceTrig_1</visualName>
         <currentPosition>
-          <x>335</x>
-          <y>-865</y>
+          <x>275</x>
+          <y>-510</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7227,12 +10698,63 @@ This does not introduce extra delay.</value>
         </interfaces>
       </blockGraphicItem>
       <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_20</name>
+        <instanceName>TraceAccum_4</instanceName>
+        <visualName>TraceAccum_4</visualName>
+        <currentPosition>
+          <x>735</x>
+          <y>220</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_20.#I#x</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_20.#I#sum</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_21</name>
+        <instanceName>TraceTrig_4</instanceName>
+        <visualName>TraceTrig_4</visualName>
+        <currentPosition>
+          <x>270</x>
+          <y>245</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_21.#I#maxis</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_21.#I#saxis</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="RegisterBlock">
+        <name>block_22</name>
+        <instanceName>HostRegBank</instanceName>
+        <visualName>HostRegBank</visualName>
+        <currentPosition>
+          <x>-15</x>
+          <y>-670</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces/>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
         <name>block_3</name>
         <instanceName>slice5_stream_1</instanceName>
         <visualName>slice5_stream_1</visualName>
         <currentPosition>
-          <x>815</x>
-          <y>-775</y>
+          <x>940</x>
+          <y>-555</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7263,36 +10785,12 @@ This does not introduce extra delay.</value>
         </interfaces>
       </blockGraphicItem>
       <blockGraphicItem blockGraphicItemTypeName="Block">
-        <name>block_4</name>
-        <instanceName>concat2_stream_1</instanceName>
-        <visualName>concat2_stream_1</visualName>
-        <currentPosition>
-          <x>970</x>
-          <y>-790</y>
-        </currentPosition>
-        <flippedPorts>false</flippedPorts>
-        <interfaces>
-          <interface>
-            <name>block_4.#I#din1</name>
-            <expanded>false</expanded>
-          </interface>
-          <interface>
-            <name>block_4.#I#din2</name>
-            <expanded>false</expanded>
-          </interface>
-          <interface>
-            <name>block_4.#I#dout</name>
-            <expanded>false</expanded>
-          </interface>
-        </interfaces>
-      </blockGraphicItem>
-      <blockGraphicItem blockGraphicItemTypeName="Block">
         <name>block_5</name>
         <instanceName>concat2_stream_2</instanceName>
         <visualName>concat2_stream_2</visualName>
         <currentPosition>
-          <x>1120</x>
-          <y>-790</y>
+          <x>1275</x>
+          <y>-570</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces>
@@ -7310,24 +10808,57 @@ This does not introduce extra delay.</value>
           </interface>
         </interfaces>
       </blockGraphicItem>
-      <blockGraphicItem blockGraphicItemTypeName="RegisterBlock">
-        <name>block_6</name>
-        <instanceName>Register_Bank</instanceName>
-        <visualName>Register_Bank</visualName>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_7</name>
+        <instanceName>TraceAccum_2</instanceName>
+        <visualName>TraceAccum_2</visualName>
         <currentPosition>
-          <x>50</x>
-          <y>-865</y>
+          <x>740</x>
+          <y>-280</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
-        <interfaces/>
+        <interfaces>
+          <interface>
+            <name>block_7.#I#x</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_7.#I#sum</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
+      </blockGraphicItem>
+      <blockGraphicItem blockGraphicItemTypeName="Block">
+        <name>block_9</name>
+        <instanceName>concat2_stream_4</instanceName>
+        <visualName>concat2_stream_4</visualName>
+        <currentPosition>
+          <x>1265</x>
+          <y>-320</y>
+        </currentPosition>
+        <flippedPorts>false</flippedPorts>
+        <interfaces>
+          <interface>
+            <name>block_9.#I#din1</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_9.#I#din2</name>
+            <expanded>false</expanded>
+          </interface>
+          <interface>
+            <name>block_9.#I#dout</name>
+            <expanded>false</expanded>
+          </interface>
+        </interfaces>
       </blockGraphicItem>
       <blockGraphicItem blockGraphicItemTypeName="Block">
         <name>clock</name>
         <instanceName>clock</instanceName>
         <visualName>Clock</visualName>
         <currentPosition>
-          <x>155</x>
-          <y>-345</y>
+          <x>-15</x>
+          <y>-250</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7337,8 +10868,8 @@ This does not introduce extra delay.</value>
         <instanceName>clock_1</instanceName>
         <visualName>Clock</visualName>
         <currentPosition>
-          <x>155</x>
-          <y>-625</y>
+          <x>-10</x>
+          <y>-520</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7348,8 +10879,8 @@ This does not introduce extra delay.</value>
         <instanceName>clock_2</instanceName>
         <visualName>Clock</visualName>
         <currentPosition>
-          <x>160</x>
-          <y>75</y>
+          <x>-15</x>
+          <y>250</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7359,8 +10890,8 @@ This does not introduce extra delay.</value>
         <instanceName>clock_3</instanceName>
         <visualName>Clock</visualName>
         <currentPosition>
-          <x>160</x>
-          <y>-125</y>
+          <x>-15</x>
+          <y>-5</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7370,8 +10901,8 @@ This does not introduce extra delay.</value>
         <instanceName>nRst</instanceName>
         <visualName>nRst</visualName>
         <currentPosition>
-          <x>160</x>
-          <y>-325</y>
+          <x>-15</x>
+          <y>-225</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7381,8 +10912,8 @@ This does not introduce extra delay.</value>
         <instanceName>nRst_1</instanceName>
         <visualName>nRst</visualName>
         <currentPosition>
-          <x>160</x>
-          <y>-600</y>
+          <x>-10</x>
+          <y>-495</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7392,8 +10923,8 @@ This does not introduce extra delay.</value>
         <instanceName>nRst_2</instanceName>
         <visualName>nRst</visualName>
         <currentPosition>
-          <x>165</x>
-          <y>95</y>
+          <x>-15</x>
+          <y>270</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7403,8 +10934,8 @@ This does not introduce extra delay.</value>
         <instanceName>nRst_3</instanceName>
         <visualName>nRst</visualName>
         <currentPosition>
-          <x>165</x>
-          <y>-105</y>
+          <x>-15</x>
+          <y>15</y>
         </currentPosition>
         <flippedPorts>false</flippedPorts>
         <interfaces/>
@@ -7429,7 +10960,7 @@ This does not introduce extra delay.</value>
     <issueFilter>
       <showErrors>true</showErrors>
       <showCriticalWarnings>true</showCriticalWarnings>
-      <showWarnings>true</showWarnings>
+      <showWarnings>false</showWarnings>
       <showInfos>false</showInfos>
     </issueFilter>
   </buildOptions>
