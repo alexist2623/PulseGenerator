@@ -24,18 +24,19 @@ except ImportError:
     from matplotlib.axes import Axes
     from matplotlib.lines import Line2D
     from matplotlib import colors
-    from matplotlib.ticker import MultipleLocator
+    from matplotlib.ticker import FuncFormatter, MultipleLocator
     _USE_PYQTGRAPH = False
 else:
     # Names below are referenced only by the legacy fallback class bodies.
     Canvas = QtWidgets.QWidget
     Figure = Axes = Line2D = object
     colors = None
-    MultipleLocator = None
+    FuncFormatter = MultipleLocator = None
     _USE_PYQTGRAPH = True
 
 try:
     from .dc_waveform_core import (
+        DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
@@ -50,6 +51,7 @@ try:
     )
 except ImportError:
     from dc_waveform_core import (
+        DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
@@ -65,6 +67,22 @@ except ImportError:
 
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
+DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
+TIME_UNIT_NS = {"ns": 1.0, "us": 1000.0, "ms": 1_000_000.0}
+DEFAULT_TIME_UNIT = "us"
+DEFAULT_GUI_DURATION_NS = 1000.0
+DEFAULT_GUI_RAMP_NS = 1000.0
+DEFAULT_GUI_FLAT_NS = 1000.0
+SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
+SETTINGS_VERSION = 1
+
+
+def _time_from_ns(value_ns: float, unit: str) -> float:
+    return float(value_ns) / TIME_UNIT_NS[unit]
+
+
+def _time_to_ns(value: float, unit: str) -> float:
+    return float(value) * TIME_UNIT_NS[unit]
 
 
 def rf_pulse_absolute_times_us(
@@ -220,6 +238,7 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
     def __init__(
             self,
             pulse: PulseSequence,
+            time_unit: str = DEFAULT_TIME_UNIT,
             parent=None
         ):
         fig                 = Figure(tight_layout=False)
@@ -251,6 +270,7 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
         self._physical_time_ns = self._pulse[0].t.copy()
         self._physical_values_mv = np.asarray([self._pulse[0].v.copy()])
         self._voltage_view = "both"
+        self._time_unit = time_unit
 
         # Graph settings
         self.ax.set_xlabel("time [ns]")
@@ -293,6 +313,17 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             visible=self._grid_visible,
         )
         self.fit_view()
+
+    def set_time_unit(self, unit: str) -> None:
+        if unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        self._time_unit = unit
+        scale = 1.0 / TIME_UNIT_NS[unit]
+        self.ax.set_xlabel(f"time [{unit}]")
+        self.ax.xaxis.set_major_formatter(
+            FuncFormatter(lambda value, _position: f"{value * scale:.6g}")
+        )
+        self.draw_idle()
 
     @staticmethod
     def _nearest_grid_value(value: float, step: float) -> float:
@@ -596,7 +627,8 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             self._update_annot(
                 self._pulse[self._selected_port_idx].t[i0],
                 new_v,
-                f"{self._pulse[self._selected_port_idx].t[i0]:0.3g} ns\n{new_v:0.3g} mV"
+                f"{_time_from_ns(self._pulse[self._selected_port_idx].t[i0], self._time_unit):0.3g} "
+                f"{self._time_unit}\n{new_v:0.3g} mV"
             )
             self._annot.set_visible(True)
 
@@ -621,7 +653,8 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             self._update_annot(
                 actual_t,
                 self._pulse[self._selected_port_idx].v[i0],
-                f"{actual_t:0.3g} ns\n{self._pulse[self._selected_port_idx].v[i0]:0.3g} mV"
+                f"{_time_from_ns(actual_t, self._time_unit):0.3g} {self._time_unit}\n"
+                f"{self._pulse[self._selected_port_idx].v[i0]:0.3g} mV"
             )
             self._annot.set_visible(True)
         # pan
@@ -774,6 +807,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     def __init__(
             self,
             pulse: PulseSequence,
+            time_unit: str = DEFAULT_TIME_UNIT,
             parent=None
         ):
         super().__init__(parent)
@@ -783,20 +817,27 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self._sweep_row: Optional[int] = None
         self._sweep_rows = set()
         self._sweep_color: Optional[QtGui.QColor] = None
+        self._time_unit = time_unit
 
         v_splitter          = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
         layout              = QtWidgets.QVBoxLayout(self)
 
         form                = QtWidgets.QFormLayout()
-        self.edit_ramp      = QtWidgets.QLineEdit("50")
-        self.edit_flat      = QtWidgets.QLineEdit("200")
-        self.edit_v         = QtWidgets.QLineEdit("10")
+        self.edit_ramp = QtWidgets.QLineEdit(
+            f"{_time_from_ns(DEFAULT_GUI_RAMP_NS, self._time_unit):.6g}"
+        )
+        self.edit_flat = QtWidgets.QLineEdit(
+            f"{_time_from_ns(DEFAULT_GUI_FLAT_NS, self._time_unit):.6g}"
+        )
+        self.edit_v = QtWidgets.QLineEdit(f"{DEFAULT_INITIAL_VOLTAGE_MV:.6g}")
 
         for w in (self.edit_ramp, self.edit_flat, self.edit_v):
             w.setValidator(QtGui.QDoubleValidator(decimals=9))
 
-        form.addRow("Ramp [ns]:",  self.edit_ramp)
-        form.addRow("Flat [ns]:",  self.edit_flat)
+        self._ramp_label = QtWidgets.QLabel()
+        self._flat_label = QtWidgets.QLabel()
+        form.addRow(self._ramp_label, self.edit_ramp)
+        form.addRow(self._flat_label, self.edit_flat)
         form.addRow("Virtual V [mV]:", self.edit_v)
 
         btn_add             = QtWidgets.QPushButton("Add segment")
@@ -831,6 +872,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             | QtWidgets.QAbstractItemView.SelectedClicked
         )
         self.table.itemChanged.connect(self._on_item_changed)
+        self._refresh_time_labels()
 
         v_splitter.addWidget(form_widget)
         v_splitter.addWidget(self.table)
@@ -912,9 +954,9 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         # Map table row
         flat_idx = row * 2              # because every table row is (i,i+1) with i even
         if col == 1:
-            ok = self._pulse.edit_ramp(flat_idx, val)
+            ok = self._pulse.edit_ramp(flat_idx, _time_to_ns(val, self._time_unit))
         elif col == 2:
-            ok = self._pulse.edit_flat(flat_idx, val)
+            ok = self._pulse.edit_flat(flat_idx, _time_to_ns(val, self._time_unit))
         elif col == 3:
             ok = self._pulse.edit_voltage(flat_idx, val)
         else:
@@ -943,7 +985,39 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                 "Please enter valid numbers."
             )
             return
-        self.add_requested.emit(ramp, flat, v)
+        self.add_requested.emit(
+            _time_to_ns(ramp, self._time_unit),
+            _time_to_ns(flat, self._time_unit),
+            v,
+        )
+
+    def _refresh_time_labels(self) -> None:
+        self._ramp_label.setText(f"Ramp [{self._time_unit}]:")
+        self._flat_label.setText(f"Flat [{self._time_unit}]:")
+        self.table.setHorizontalHeaderLabels(
+            [
+                "#",
+                f"Ramp [{self._time_unit}]",
+                f"Flat [{self._time_unit}]",
+                "Virtual V [mV]",
+            ]
+        )
+
+    def set_time_unit(self, unit: str) -> None:
+        if unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        if unit == self._time_unit:
+            return
+        old_unit = self._time_unit
+        for editor in (self.edit_ramp, self.edit_flat):
+            try:
+                value_ns = _time_to_ns(float(editor.text()), old_unit)
+            except ValueError:
+                continue
+            editor.setText(f"{_time_from_ns(value_ns, unit):.6g}")
+        self._time_unit = unit
+        self._refresh_time_labels()
+        self.refresh_table()
 
     def refresh_table(self):
         with QtCore.QSignalBlocker(self.table):
@@ -953,7 +1027,14 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                 ramp  = self._pulse.t[i0] - self._pulse.t[i0 - 1] if i0 > 0 else 0
                 flat  = self._pulse.t[i1] - self._pulse.t[i0]
                 v     = self._pulse.v[i0]
-                for col, val in enumerate([row + 1, ramp, flat, v]):
+                for col, val in enumerate(
+                    [
+                        row + 1,
+                        _time_from_ns(ramp, self._time_unit),
+                        _time_from_ns(flat, self._time_unit),
+                        v,
+                    ]
+                ):
                     item = QtWidgets.QTableWidgetItem(f"{val:.6g}")
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     if row in self._sweep_rows:
@@ -979,10 +1060,14 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             pulse: PulseSequence,
             initial_color: str,
             add_port: Callable,
+            time_unit: str = DEFAULT_TIME_UNIT,
             parent=None
         ):
         super().__init__()
-        self._ctrl_pannels: List[ControlPanel]  = [ControlPanel(pulse)]
+        self._time_unit = time_unit
+        self._ctrl_pannels: List[ControlPanel] = [
+            ControlPanel(pulse, time_unit=time_unit)
+        ]
         self._color_map: List[str]              = [initial_color]
         self.splitter                           = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
 
@@ -1031,6 +1116,11 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         for ctrl in self._ctrl_pannels:
             ctrl.refresh_table()
 
+    def set_time_unit(self, unit: str) -> None:
+        self._time_unit = unit
+        for control in self._ctrl_pannels:
+            control.set_time_unit(unit)
+
 
 class GridSettingsDialog(QtWidgets.QDialog):
     """Configure fixed waveform-grid spacing and drag snapping."""
@@ -1042,17 +1132,19 @@ class GridSettingsDialog(QtWidgets.QDialog):
         voltage_step_mv: float,
         snap_enabled: bool,
         visible: bool,
+        time_unit: str = DEFAULT_TIME_UNIT,
         parent=None,
     ):
         super().__init__(parent)
+        self._time_unit = time_unit
         self.setWindowTitle("Waveform grid settings")
         form = QtWidgets.QFormLayout(self)
 
         self.time_step_ns = QtWidgets.QDoubleSpinBox()
         self.time_step_ns.setRange(1.0e-6, 1.0e12)
         self.time_step_ns.setDecimals(6)
-        self.time_step_ns.setValue(time_step_ns)
-        self.time_step_ns.setSuffix(" ns")
+        self.time_step_ns.setValue(_time_from_ns(time_step_ns, time_unit))
+        self.time_step_ns.setSuffix(f" {time_unit}")
 
         self.voltage_step_mv = QtWidgets.QDoubleSpinBox()
         self.voltage_step_mv.setRange(1.0e-6, 1.0e9)
@@ -1065,7 +1157,7 @@ class GridSettingsDialog(QtWidgets.QDialog):
         self.visible = QtWidgets.QCheckBox("Show fixed grid lines")
         self.visible.setChecked(visible)
         origin_note = QtWidgets.QLabel(
-            "Time and voltage grids are anchored at 0 ns and 0 mV."
+            f"Time and voltage grids are anchored at 0 {time_unit} and 0 mV."
         )
         origin_note.setWordWrap(True)
 
@@ -1084,7 +1176,7 @@ class GridSettingsDialog(QtWidgets.QDialog):
 
     def values(self) -> Tuple[float, float, bool, bool]:
         return (
-            self.time_step_ns.value(),
+            _time_to_ns(self.time_step_ns.value(), self._time_unit),
             self.voltage_step_mv.value(),
             self.snap_enabled.isChecked(),
             self.visible.isChecked(),
@@ -1466,6 +1558,552 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         self._preview_current()
 
 
+class RfPulsePortPanel(QtWidgets.QGroupBox):
+    """Compact, always-available editor for one RF output generator."""
+
+    changed = QtCore.pyqtSignal()
+    remove_requested = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        pulse: PulseSequence,
+        index: int,
+        *,
+        default_gen_ch: Optional[int] = None,
+        time_unit: str = DEFAULT_TIME_UNIT,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._pulse = pulse
+        self._index = index
+        self._time_unit = time_unit
+        self.setCheckable(True)
+        self.setChecked(False)
+        form = QtWidgets.QFormLayout(self)
+
+        self.gen_ch = QtWidgets.QSpinBox()
+        self.gen_ch.setRange(0, 255)
+        self.gen_ch.setValue(index if default_gen_ch is None else default_gen_ch)
+        self.segment = QtWidgets.QComboBox()
+        self.delay = QtWidgets.QDoubleSpinBox()
+        self.duration = QtWidgets.QDoubleSpinBox()
+        for editor in (self.delay, self.duration):
+            editor.setRange(0.0, 1.0e12)
+            editor.setDecimals(9)
+        self.duration.setMinimum(1.0e-9)
+        self.duration.setValue(_time_from_ns(1000.0, time_unit))
+        self.frequency_mhz = QtWidgets.QDoubleSpinBox()
+        self.frequency_mhz.setRange(-10000.0, 10000.0)
+        self.frequency_mhz.setDecimals(6)
+        self.frequency_mhz.setValue(50.0)
+        self.frequency_mhz.setSuffix(" MHz")
+        self.gain = QtWidgets.QSpinBox()
+        self.gain.setRange(-32768, 32767)
+        self.gain.setValue(20000)
+        self.att1_db = QtWidgets.QDoubleSpinBox()
+        self.att2_db = QtWidgets.QDoubleSpinBox()
+        for attenuator in (self.att1_db, self.att2_db):
+            attenuator.setRange(0.0, 31.75)
+            attenuator.setDecimals(2)
+            attenuator.setSingleStep(0.25)
+            attenuator.setSuffix(" dB")
+        self.phase_degrees = QtWidgets.QDoubleSpinBox()
+        self.phase_degrees.setRange(-360.0, 360.0)
+        self.phase_degrees.setDecimals(6)
+        self.phase_degrees.setSuffix(" deg")
+        self.nqz = QtWidgets.QSpinBox()
+        self.nqz.setRange(1, 3)
+        self.nqz.setValue(1)
+        self.require_within = QtWidgets.QCheckBox("Keep pulse inside anchor SET")
+        self.require_within.setChecked(True)
+
+        form.addRow("Generator index:", self.gen_ch)
+        form.addRow("Anchor SET:", self.segment)
+        self._delay_label = QtWidgets.QLabel()
+        self._duration_label = QtWidgets.QLabel()
+        form.addRow(self._delay_label, self.delay)
+        form.addRow(self._duration_label, self.duration)
+        form.addRow("Frequency:", self.frequency_mhz)
+        form.addRow("Gain:", self.gain)
+        form.addRow("Output ATT1:", self.att1_db)
+        form.addRow("Output ATT2:", self.att2_db)
+        form.addRow("Phase:", self.phase_degrees)
+        form.addRow("Nyquist zone:", self.nqz)
+        form.addRow(self.require_within)
+        remove_button = QtWidgets.QPushButton("Remove RF Port")
+        remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
+        form.addRow(remove_button)
+
+        self.refresh_segments(pulse)
+        self.set_time_unit(time_unit, force=True)
+        for widget in (
+            self.gen_ch,
+            self.segment,
+            self.delay,
+            self.duration,
+            self.frequency_mhz,
+            self.gain,
+            self.att1_db,
+            self.att2_db,
+            self.phase_degrees,
+            self.nqz,
+            self.require_within,
+        ):
+            signal = getattr(widget, "valueChanged", None)
+            if signal is None:
+                signal = getattr(widget, "currentIndexChanged", None)
+            if signal is None:
+                signal = getattr(widget, "toggled", None)
+            signal.connect(self.changed.emit)
+        self.toggled.connect(self.changed.emit)
+        self.set_index(index)
+
+    def set_index(self, index: int) -> None:
+        self._index = index
+        self.setTitle(f"RF Output {index + 1}")
+
+    def set_time_unit(self, unit: str, *, force: bool = False) -> None:
+        if unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        if not force and unit == self._time_unit:
+            return
+        old_unit = self._time_unit
+        delay_ns = _time_to_ns(self.delay.value(), old_unit)
+        duration_ns = _time_to_ns(self.duration.value(), old_unit)
+        self._time_unit = unit
+        with QtCore.QSignalBlocker(self.delay), QtCore.QSignalBlocker(self.duration):
+            self.delay.setValue(_time_from_ns(delay_ns, unit))
+            self.duration.setValue(_time_from_ns(duration_ns, unit))
+            self.delay.setSuffix(f" {unit}")
+            self.duration.setSuffix(f" {unit}")
+        self._delay_label.setText(f"Delay [{unit}]:")
+        self._duration_label.setText(f"Duration [{unit}]:")
+
+    def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
+        if pulse is not None:
+            self._pulse = pulse
+        previous = self.segment.currentData()
+        with QtCore.QSignalBlocker(self.segment):
+            self.segment.clear()
+            for index, (start, end) in enumerate(self._pulse.flat_segments()):
+                name = f"set_{index}"
+                self.segment.addItem(name, name)
+            match = self.segment.findData(previous)
+            if match >= 0:
+                self.segment.setCurrentIndex(match)
+
+    def configured_spec(self) -> QickRfPulseSpec:
+        """Return the editor values even when this output is disabled."""
+        return QickRfPulseSpec(
+            gen_ch=self.gen_ch.value(),
+            segment_name=str(self.segment.currentData()),
+            delay_us=_time_to_ns(self.delay.value(), self._time_unit) / 1000.0,
+            duration_us=_time_to_ns(self.duration.value(), self._time_unit) / 1000.0,
+            frequency_mhz=self.frequency_mhz.value(),
+            gain=self.gain.value(),
+            att1_db=self.att1_db.value(),
+            att2_db=self.att2_db.value(),
+            phase_degrees=self.phase_degrees.value(),
+            nqz=self.nqz.value(),
+            require_within_segment=self.require_within.isChecked(),
+        )
+
+    def spec(self) -> Optional[QickRfPulseSpec]:
+        if not self.isChecked():
+            return None
+        return self.configured_spec()
+
+    def settings_dict(self) -> dict:
+        spec = self.configured_spec()
+        return {
+            "enabled": self.isChecked(),
+            "gen_ch": spec.gen_ch,
+            "segment_name": spec.segment_name,
+            "delay_us": spec.delay_us,
+            "duration_us": spec.duration_us,
+            "frequency_mhz": spec.frequency_mhz,
+            "gain": spec.gain,
+            "att1_db": spec.att1_db,
+            "att2_db": spec.att2_db,
+            "phase_degrees": spec.phase_degrees,
+            "nqz": spec.nqz,
+            "require_within_segment": spec.require_within_segment,
+        }
+
+    def load_settings(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            raise TypeError("each RF output setting must be a JSON object")
+        enabled = data.get("enabled", True)
+        require_within = data.get("require_within_segment", True)
+        if not isinstance(enabled, bool):
+            raise TypeError("RF output enabled must be boolean")
+        if not isinstance(require_within, bool):
+            raise TypeError("RF require_within_segment must be boolean")
+        spec = QickRfPulseSpec(
+            gen_ch=int(data["gen_ch"]),
+            segment_name=str(data["segment_name"]),
+            delay_us=float(data["delay_us"]),
+            duration_us=float(data["duration_us"]),
+            frequency_mhz=float(data["frequency_mhz"]),
+            gain=int(data["gain"]),
+            att1_db=float(data["att1_db"]),
+            att2_db=float(data["att2_db"]),
+            phase_degrees=float(data.get("phase_degrees", 0.0)),
+            nqz=int(data.get("nqz", 1)),
+            require_within_segment=require_within,
+        )
+        segment = self.segment.findData(spec.segment_name)
+        if segment < 0:
+            raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
+        self.gen_ch.setValue(spec.gen_ch)
+        self.segment.setCurrentIndex(segment)
+        self.delay.setValue(_time_from_ns(spec.delay_us * 1000.0, self._time_unit))
+        self.duration.setValue(
+            _time_from_ns(spec.duration_us * 1000.0, self._time_unit)
+        )
+        self.frequency_mhz.setValue(spec.frequency_mhz)
+        self.gain.setValue(spec.gain)
+        self.att1_db.setValue(spec.att1_db)
+        self.att2_db.setValue(spec.att2_db)
+        self.phase_degrees.setValue(spec.phase_degrees)
+        self.nqz.setValue(spec.nqz)
+        self.require_within.setChecked(spec.require_within_segment)
+        self.setChecked(enabled)
+
+
+class RfPortsPanel(QtWidgets.QWidget):
+    """Add/remove editor for up to eight normal QICK RF outputs."""
+
+    specs_changed = QtCore.pyqtSignal(object)
+    MAX_PORTS = 8
+
+    def __init__(self, pulse: PulseSequence, *, time_unit: str, parent=None):
+        super().__init__(parent)
+        self._pulse = pulse
+        self._time_unit = time_unit
+        self._panels: List[RfPulsePortPanel] = []
+        layout = QtWidgets.QVBoxLayout(self)
+        self._scroll = QtWidgets.QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._content = QtWidgets.QWidget(self._scroll)
+        self._content_layout = QtWidgets.QVBoxLayout(self._content)
+        self._content_layout.addStretch(1)
+        self._scroll.setWidget(self._content)
+        layout.addWidget(self._scroll)
+        self.add_button = QtWidgets.QPushButton("Add RF Port")
+        self.add_button.clicked.connect(lambda: self.add_port())
+        layout.addWidget(self.add_button)
+        self.add_port()
+
+    def add_port(
+        self,
+        spec: Optional[QickRfPulseSpec] = None,
+        *,
+        settings: Optional[dict] = None,
+    ) -> None:
+        if len(self._panels) >= self.MAX_PORTS:
+            return
+        if spec is not None and settings is not None:
+            raise ValueError("use either RF spec or RF settings, not both")
+        panel = RfPulsePortPanel(
+            self._pulse,
+            len(self._panels),
+            default_gen_ch=DEFAULT_QSTL_RF_CHANNELS[len(self._panels)],
+            time_unit=self._time_unit,
+            parent=self._content,
+        )
+        panel.changed.connect(self._emit_specs)
+        panel.remove_requested.connect(self.remove_port)
+        self._content_layout.insertWidget(self._content_layout.count() - 1, panel)
+        self._panels.append(panel)
+        if spec is not None:
+            self._load_spec(panel, spec)
+        elif settings is not None:
+            panel.load_settings(settings)
+        self.add_button.setEnabled(len(self._panels) < self.MAX_PORTS)
+        self._emit_specs()
+
+    def remove_port(self, panel: RfPulsePortPanel) -> None:
+        if panel not in self._panels:
+            return
+        self._panels.remove(panel)
+        panel.deleteLater()
+        for index, current in enumerate(self._panels):
+            current.set_index(index)
+        self.add_button.setEnabled(True)
+        self._emit_specs()
+
+    def _load_spec(self, panel: RfPulsePortPanel, spec: QickRfPulseSpec) -> None:
+        panel.setChecked(True)
+        panel.gen_ch.setValue(spec.gen_ch)
+        segment = panel.segment.findData(spec.segment_name)
+        if segment >= 0:
+            panel.segment.setCurrentIndex(segment)
+        panel.delay.setValue(
+            _time_from_ns(spec.delay_us * 1000.0, panel._time_unit)
+        )
+        panel.duration.setValue(
+            _time_from_ns(spec.duration_us * 1000.0, panel._time_unit)
+        )
+        panel.frequency_mhz.setValue(spec.frequency_mhz)
+        panel.gain.setValue(spec.gain)
+        panel.att1_db.setValue(spec.att1_db)
+        panel.att2_db.setValue(spec.att2_db)
+        panel.phase_degrees.setValue(spec.phase_degrees)
+        panel.nqz.setValue(spec.nqz)
+        panel.require_within.setChecked(spec.require_within_segment)
+
+    def specs(self) -> Tuple[QickRfPulseSpec, ...]:
+        specs = tuple(spec for panel in self._panels if (spec := panel.spec()) is not None)
+        channels = tuple(spec.gen_ch for spec in specs)
+        if len(set(channels)) != len(channels):
+            raise ValueError("enabled RF output ports must use unique generator indices")
+        return specs
+
+    def settings(self) -> Tuple[dict, ...]:
+        return tuple(panel.settings_dict() for panel in self._panels)
+
+    def load_settings(self, entries: Sequence[dict]) -> None:
+        entries = tuple(entries)
+        if len(entries) > self.MAX_PORTS:
+            raise ValueError(f"at most {self.MAX_PORTS} RF output ports are supported")
+        with QtCore.QSignalBlocker(self):
+            for panel in self._panels:
+                self._content_layout.removeWidget(panel)
+                panel.setParent(None)
+                panel.deleteLater()
+            self._panels.clear()
+            for entry in entries:
+                self.add_port(settings=entry)
+            self.add_button.setEnabled(len(self._panels) < self.MAX_PORTS)
+        self._emit_specs()
+
+    def _emit_specs(self, *_args) -> None:
+        try:
+            specs = self.specs()
+        except (TypeError, ValueError):
+            return
+        self.specs_changed.emit(specs)
+
+    def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
+        if pulse is not None:
+            self._pulse = pulse
+        for panel in self._panels:
+            panel.refresh_segments(self._pulse)
+        self._emit_specs()
+
+    def set_time_unit(self, unit: str) -> None:
+        self._time_unit = unit
+        for panel in self._panels:
+            panel.set_time_unit(unit)
+
+
+class RfReadoutPanel(QtWidgets.QGroupBox):
+    """RF input and FIR-decimated DDR capture configuration."""
+
+    spec_changed = QtCore.pyqtSignal(object)
+
+    def __init__(self, pulse: PulseSequence, *, time_unit: str, parent=None):
+        super().__init__("RF Readout 1", parent)
+        self._pulse = pulse
+        self._time_unit = time_unit
+        self.setCheckable(True)
+        self.setChecked(False)
+        form = QtWidgets.QFormLayout(self)
+        self.ro_ch = QtWidgets.QSpinBox()
+        self.ro_ch.setRange(0, 255)
+        self.segment = QtWidgets.QComboBox()
+        self.delay = QtWidgets.QDoubleSpinBox()
+        self.delay.setRange(0.0, 1.0e12)
+        self.delay.setDecimals(9)
+        self.samples = QtWidgets.QSpinBox()
+        self.samples.setRange(1, 10_000_000)
+        self.samples.setValue(64)
+        self.frequency_mhz = QtWidgets.QDoubleSpinBox()
+        self.frequency_mhz.setRange(-10000.0, 10000.0)
+        self.frequency_mhz.setDecimals(6)
+        self.frequency_mhz.setValue(50.0)
+        self.frequency_mhz.setSuffix(" MHz")
+        self.attenuation_db = QtWidgets.QDoubleSpinBox()
+        self.attenuation_db.setRange(0.0, 31.75)
+        self.attenuation_db.setDecimals(2)
+        self.attenuation_db.setSingleStep(0.25)
+        self.attenuation_db.setValue(20.0)
+        self.attenuation_db.setSuffix(" dB")
+        self.filter_type = QtWidgets.QComboBox()
+        self.filter_type.addItems(["bypass", "lowpass", "highpass", "bandpass"])
+        self.filter_cutoff = QtWidgets.QDoubleSpinBox()
+        self.filter_cutoff.setRange(0.0, 100.0)
+        self.filter_cutoff.setDecimals(6)
+        self.filter_cutoff.setValue(2.5)
+        self.filter_cutoff.setSuffix(" GHz")
+        self.filter_bandwidth = QtWidgets.QDoubleSpinBox()
+        self.filter_bandwidth.setRange(0.001, 100.0)
+        self.filter_bandwidth.setDecimals(6)
+        self.filter_bandwidth.setValue(1.0)
+        self.filter_bandwidth.setSuffix(" GHz")
+        self.margin_samples = QtWidgets.QSpinBox()
+        self.margin_samples.setRange(0, 10_000_000)
+        self.margin_samples.setValue(1024)
+        self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
+
+        form.addRow("Readout index:", self.ro_ch)
+        form.addRow("Anchor SET:", self.segment)
+        self._delay_label = QtWidgets.QLabel()
+        form.addRow(self._delay_label, self.delay)
+        form.addRow("Stored 1 MSPS samples:", self.samples)
+        form.addRow("Readout/DDC frequency:", self.frequency_mhz)
+        form.addRow("Input attenuation:", self.attenuation_db)
+        form.addRow("Input filter:", self.filter_type)
+        form.addRow("Filter cutoff/center:", self.filter_cutoff)
+        form.addRow("Filter bandwidth:", self.filter_bandwidth)
+        form.addRow("FIR input margin:", self.margin_samples)
+        form.addRow(self.force_overwrite)
+        note = QtWidgets.QLabel(
+            "The qstl_awg_tuning_fir path stores post-FIR samples at 1 MSPS."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        self.refresh_segments(pulse)
+        self.set_time_unit(time_unit, force=True)
+        for widget in (
+            self.ro_ch,
+            self.segment,
+            self.delay,
+            self.samples,
+            self.frequency_mhz,
+            self.attenuation_db,
+            self.filter_type,
+            self.filter_cutoff,
+            self.filter_bandwidth,
+            self.margin_samples,
+            self.force_overwrite,
+        ):
+            signal = getattr(widget, "valueChanged", None)
+            if signal is None:
+                signal = getattr(widget, "currentIndexChanged", None)
+            if signal is None:
+                signal = getattr(widget, "toggled", None)
+            signal.connect(self._emit_spec)
+        self.toggled.connect(self._emit_spec)
+
+    def set_time_unit(self, unit: str, *, force: bool = False) -> None:
+        if unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        if not force and unit == self._time_unit:
+            return
+        delay_ns = _time_to_ns(self.delay.value(), self._time_unit)
+        self._time_unit = unit
+        with QtCore.QSignalBlocker(self.delay):
+            self.delay.setValue(_time_from_ns(delay_ns, unit))
+            self.delay.setSuffix(f" {unit}")
+        self._delay_label.setText(f"Trigger delay [{unit}]:")
+
+    def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
+        if pulse is not None:
+            self._pulse = pulse
+        previous = self.segment.currentData()
+        with QtCore.QSignalBlocker(self.segment):
+            self.segment.clear()
+            for index, _segment in enumerate(self._pulse.flat_segments()):
+                name = f"set_{index}"
+                self.segment.addItem(name, name)
+            match = self.segment.findData(previous)
+            if match >= 0:
+                self.segment.setCurrentIndex(match)
+
+    def configured_spec(self) -> QickDdrReadoutSpec:
+        """Return the editor values even when capture is disabled."""
+        return QickDdrReadoutSpec(
+            ro_ch=self.ro_ch.value(),
+            segment_name=str(self.segment.currentData()),
+            delay_us=_time_to_ns(self.delay.value(), self._time_unit) / 1000.0,
+            samples_per_trigger=self.samples.value(),
+            readout_frequency_mhz=self.frequency_mhz.value(),
+            margin_input_samples=self.margin_samples.value(),
+            force_overwrite=self.force_overwrite.isChecked(),
+            attenuation_db=self.attenuation_db.value(),
+            filter_type=self.filter_type.currentText(),
+            filter_cutoff=self.filter_cutoff.value(),
+            filter_bandwidth=self.filter_bandwidth.value(),
+        )
+
+    def spec(self) -> Optional[QickDdrReadoutSpec]:
+        if not self.isChecked():
+            return None
+        return self.configured_spec()
+
+    def settings_dict(self) -> dict:
+        spec = self.configured_spec()
+        return {
+            "enabled": self.isChecked(),
+            "ro_ch": spec.ro_ch,
+            "segment_name": spec.segment_name,
+            "delay_us": spec.delay_us,
+            "samples_per_trigger": spec.samples_per_trigger,
+            "readout_frequency_mhz": spec.readout_frequency_mhz,
+            "margin_input_samples": spec.margin_input_samples,
+            "force_overwrite": spec.force_overwrite,
+            "attenuation_db": spec.attenuation_db,
+            "filter_type": spec.filter_type,
+            "filter_cutoff": spec.filter_cutoff,
+            "filter_bandwidth": spec.filter_bandwidth,
+        }
+
+    def load_settings(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            raise TypeError("RF readout setting must be a JSON object")
+        enabled = data.get("enabled", False)
+        force_overwrite = data.get("force_overwrite", False)
+        if not isinstance(enabled, bool):
+            raise TypeError("RF readout enabled must be boolean")
+        if not isinstance(force_overwrite, bool):
+            raise TypeError("RF readout force_overwrite must be boolean")
+        spec = QickDdrReadoutSpec(
+            ro_ch=int(data["ro_ch"]),
+            segment_name=str(data["segment_name"]),
+            delay_us=float(data["delay_us"]),
+            samples_per_trigger=int(data["samples_per_trigger"]),
+            readout_frequency_mhz=float(data.get("readout_frequency_mhz", 0.0)),
+            margin_input_samples=int(data.get("margin_input_samples", 1024)),
+            force_overwrite=force_overwrite,
+            attenuation_db=float(data.get("attenuation_db", 20.0)),
+            filter_type=str(data.get("filter_type", "bypass")),
+            filter_cutoff=float(data.get("filter_cutoff", 2.5)),
+            filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
+        )
+        segment = self.segment.findData(spec.segment_name)
+        if segment < 0:
+            raise ValueError(f"unknown RF readout anchor {spec.segment_name!r}")
+        filter_index = self.filter_type.findText(spec.filter_type)
+        if filter_index < 0:
+            raise ValueError(f"unknown RF input filter {spec.filter_type!r}")
+        with QtCore.QSignalBlocker(self):
+            self.ro_ch.setValue(spec.ro_ch)
+            self.segment.setCurrentIndex(segment)
+            self.delay.setValue(
+                _time_from_ns(spec.delay_us * 1000.0, self._time_unit)
+            )
+            self.samples.setValue(spec.samples_per_trigger)
+            self.frequency_mhz.setValue(spec.readout_frequency_mhz)
+            self.margin_samples.setValue(spec.margin_input_samples)
+            self.force_overwrite.setChecked(spec.force_overwrite)
+            self.attenuation_db.setValue(spec.attenuation_db)
+            self.filter_type.setCurrentIndex(filter_index)
+            self.filter_cutoff.setValue(spec.filter_cutoff)
+            self.filter_bandwidth.setValue(spec.filter_bandwidth)
+            self.setChecked(enabled)
+        self._emit_spec()
+
+    def _emit_spec(self, *_args) -> None:
+        try:
+            spec = self.spec()
+        except (TypeError, ValueError):
+            return
+        self.spec_changed.emit(spec)
+
+
 class QickExportDialog(QtWidgets.QDialog):
     """Collect QICK timing, channel-map, repetition, and sweep settings."""
 
@@ -1476,14 +2114,28 @@ class QickExportDialog(QtWidgets.QDialog):
         parent=None,
         default_set_index: int = 0,
         initial_rf_spec: Optional[QickRfPulseSpec] = None,
+        initial_rf_specs: Optional[Sequence[QickRfPulseSpec]] = None,
+        initial_ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
         initial_sweep: Optional[QickSweepSpec] = None,
         initial_sweeps: Optional[Sequence[QickSweepSpec]] = None,
         initial_cross_capacitance=None,
+        initial_fabric_mhz: float = DEFAULT_QICK_FABRIC_MHZ,
+        initial_full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV,
+        initial_awg_channels: Optional[Sequence[int]] = None,
+        initial_repetitions: int = 1,
     ):
         super().__init__(parent)
         self.setWindowTitle("QICK export settings")
         self.resize(660, 780)
         self._pulse_count = pulse_count
+        if initial_rf_spec is not None and initial_rf_specs is not None:
+            raise ValueError("use either initial_rf_spec or initial_rf_specs, not both")
+        self._rf_pulse_specs = tuple(
+            initial_rf_specs
+            if initial_rf_specs is not None
+            else (() if initial_rf_spec is None else (initial_rf_spec,))
+        )
+        self._ddr_readout_spec = initial_ddr_readout_spec
         if initial_sweep is not None and initial_sweeps is not None:
             raise ValueError("use either initial_sweep or initial_sweeps, not both")
         self._dialog_sweep_specs = list(
@@ -1511,21 +2163,23 @@ class QickExportDialog(QtWidgets.QDialog):
         self.fabric_mhz = QtWidgets.QDoubleSpinBox()
         self.fabric_mhz.setRange(1.0, 5000.0)
         self.fabric_mhz.setDecimals(6)
-        self.fabric_mhz.setValue(DEFAULT_QICK_FABRIC_MHZ)
+        self.fabric_mhz.setValue(float(initial_fabric_mhz))
         self.fabric_mhz.setSuffix(" MHz")
 
         self.full_scale_mv = QtWidgets.QDoubleSpinBox()
         self.full_scale_mv.setRange(1.0, 1.0e6)
         self.full_scale_mv.setDecimals(6)
-        self.full_scale_mv.setValue(DEFAULT_QICK_FULL_SCALE_MV)
+        self.full_scale_mv.setValue(float(initial_full_scale_mv))
         self.full_scale_mv.setSuffix(" mV")
 
+        if initial_awg_channels is None:
+            initial_awg_channels = DEFAULT_QSTL_AWG_CHANNELS[:pulse_count]
         self.awg_channels = QtWidgets.QLineEdit(
-            ", ".join(str(index) for index in DEFAULT_QSTL_AWG_CHANNELS[:pulse_count])
+            ", ".join(str(index) for index in initial_awg_channels)
         )
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
-        self.repetitions.setValue(1)
+        self.repetitions.setValue(int(initial_repetitions))
 
         form.addRow("AWG fabric clock:", self.fabric_mhz)
         form.addRow("QICK full scale (+/-):", self.full_scale_mv)
@@ -1598,122 +2252,10 @@ class QickExportDialog(QtWidgets.QDialog):
         form.addRow("Virtual-to-physical matrix:", cross_row)
         self._refresh_cross_capacitance_summary()
 
-        self.rf_group = QtWidgets.QGroupBox("RF pulse and output attenuation")
-        self.rf_group.setCheckable(True)
-        self.rf_group.setChecked(True)
-        rf_form = QtWidgets.QFormLayout(self.rf_group)
-        self.rf_gen_ch = QtWidgets.QSpinBox()
-        self.rf_gen_ch.setRange(0, 255)
-        self.rf_gen_ch.setValue(0)
-        self.rf_segment = QtWidgets.QComboBox()
-        self.rf_segment.addItems(list(set_names))
-        self.rf_segment.setCurrentIndex(min(default_set_index, len(set_names) - 1))
-        self.rf_delay_us = QtWidgets.QDoubleSpinBox()
-        self.rf_delay_us.setRange(0.0, 1.0e9)
-        self.rf_delay_us.setDecimals(6)
-        self.rf_delay_us.setSuffix(" us")
-        self.rf_duration_us = QtWidgets.QDoubleSpinBox()
-        self.rf_duration_us.setRange(0.001, 1.0e9)
-        self.rf_duration_us.setDecimals(6)
-        self.rf_duration_us.setValue(0.05)
-        self.rf_duration_us.setSuffix(" us")
-        self.rf_frequency_mhz = QtWidgets.QDoubleSpinBox()
-        self.rf_frequency_mhz.setRange(-10000.0, 10000.0)
-        self.rf_frequency_mhz.setDecimals(6)
-        self.rf_frequency_mhz.setValue(50.0)
-        self.rf_frequency_mhz.setSuffix(" MHz")
-        self.rf_gain = QtWidgets.QSpinBox()
-        self.rf_gain.setRange(-32768, 32767)
-        self.rf_gain.setValue(20000)
-        self.rf_att1_db = QtWidgets.QDoubleSpinBox()
-        self.rf_att2_db = QtWidgets.QDoubleSpinBox()
-        for attenuator in (self.rf_att1_db, self.rf_att2_db):
-            attenuator.setRange(0.0, 31.75)
-            attenuator.setDecimals(2)
-            attenuator.setSingleStep(0.25)
-            attenuator.setSuffix(" dB")
-        self.rf_phase_degrees = QtWidgets.QDoubleSpinBox()
-        self.rf_phase_degrees.setRange(-360.0, 360.0)
-        self.rf_phase_degrees.setDecimals(6)
-        self.rf_phase_degrees.setSuffix(" deg")
-        self.rf_nqz = QtWidgets.QSpinBox()
-        self.rf_nqz.setRange(1, 3)
-        self.rf_nqz.setValue(1)
-        self.rf_require_within = QtWidgets.QCheckBox("Require pulse to finish inside SET")
-        self.rf_require_within.setChecked(True)
-        rf_form.addRow("RF generator index:", self.rf_gen_ch)
-        rf_form.addRow("Anchor SET segment:", self.rf_segment)
-        rf_form.addRow("Start delay from SET:", self.rf_delay_us)
-        rf_form.addRow("RF duration:", self.rf_duration_us)
-        rf_form.addRow("RF frequency:", self.rf_frequency_mhz)
-        rf_form.addRow("RF gain:", self.rf_gain)
-        rf_form.addRow("Output ATT1:", self.rf_att1_db)
-        rf_form.addRow("Output ATT2:", self.rf_att2_db)
-        rf_form.addRow("RF phase:", self.rf_phase_degrees)
-        rf_form.addRow("Nyquist zone:", self.rf_nqz)
-        rf_form.addRow(self.rf_require_within)
-        form.addRow(self.rf_group)
-
-        self.ddr_group = QtWidgets.QGroupBox("FIR DDR input capture (fixed 1 MSPS)")
-        self.ddr_group.setCheckable(True)
-        self.ddr_group.setChecked(True)
-        ddr_form = QtWidgets.QFormLayout(self.ddr_group)
-        self.ddr_ro_ch = QtWidgets.QSpinBox()
-        self.ddr_ro_ch.setRange(0, 255)
-        self.ddr_segment = QtWidgets.QComboBox()
-        self.ddr_segment.addItems(list(set_names))
-        self.ddr_segment.setCurrentIndex(min(default_set_index, len(set_names) - 1))
-        self.ddr_delay_us = QtWidgets.QDoubleSpinBox()
-        self.ddr_delay_us.setRange(0.0, 1.0e9)
-        self.ddr_delay_us.setDecimals(6)
-        self.ddr_delay_us.setSuffix(" us")
-        self.ddr_samples = QtWidgets.QSpinBox()
-        self.ddr_samples.setRange(1, 10_000_000)
-        self.ddr_samples.setValue(64)
-        self.ddr_samples.setSuffix(" samples")
-        self.ddr_readout_frequency_mhz = QtWidgets.QDoubleSpinBox()
-        self.ddr_readout_frequency_mhz.setRange(-10000.0, 10000.0)
-        self.ddr_readout_frequency_mhz.setDecimals(6)
-        self.ddr_readout_frequency_mhz.setValue(50.0)
-        self.ddr_readout_frequency_mhz.setSuffix(" MHz")
-        self.ddr_margin_samples = QtWidgets.QSpinBox()
-        self.ddr_margin_samples.setRange(0, 10_000_000)
-        self.ddr_margin_samples.setValue(1024)
-        self.ddr_force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
-        ddr_form.addRow("Readout channel index:", self.ddr_ro_ch)
-        ddr_form.addRow("Trigger SET segment:", self.ddr_segment)
-        ddr_form.addRow("Trigger delay from SET:", self.ddr_delay_us)
-        ddr_form.addRow("Stored 1 MSPS samples:", self.ddr_samples)
-        ddr_form.addRow("Readout/DDC frequency:", self.ddr_readout_frequency_mhz)
-        ddr_form.addRow("FIR input margin:", self.ddr_margin_samples)
-        ddr_form.addRow(self.ddr_force_overwrite)
-        ddr_note = QtWidgets.QLabel(
-            "At 1 MSPS, N stored samples represent N microseconds. "
-            "FIR warmup and 300:1 decimation are handled automatically."
-        )
-        ddr_note.setWordWrap(True)
-        ddr_form.addRow(ddr_note)
-        form.addRow(self.ddr_group)
-
-        if initial_rf_spec is not None:
-            self.rf_group.setChecked(True)
-            self.rf_gen_ch.setValue(initial_rf_spec.gen_ch)
-            segment_index = self.rf_segment.findText(initial_rf_spec.segment_name)
-            if segment_index >= 0:
-                self.rf_segment.setCurrentIndex(segment_index)
-            self.rf_delay_us.setValue(initial_rf_spec.delay_us)
-            self.rf_duration_us.setValue(initial_rf_spec.duration_us)
-            self.rf_frequency_mhz.setValue(initial_rf_spec.frequency_mhz)
-            self.rf_gain.setValue(initial_rf_spec.gain)
-            self.rf_att1_db.setValue(initial_rf_spec.att1_db)
-            self.rf_att2_db.setValue(initial_rf_spec.att2_db)
-            self.rf_phase_degrees.setValue(initial_rf_spec.phase_degrees)
-            self.rf_nqz.setValue(initial_rf_spec.nqz)
-            self.rf_require_within.setChecked(initial_rf_spec.require_within_segment)
-
         note = QtWidgets.QLabel(
             "All exported ports must have identical SET/RAMP timing. "
-            "Voltages are normalized by the configured full scale."
+            "Voltages are normalized by the configured full scale. RF output "
+            "and readout settings come from the main-window RF tabs."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -1850,7 +2392,7 @@ class QickExportDialog(QtWidgets.QDialog):
             raise ValueError("AWG generator indices must be comma-separated integers")
         try:
             channels = tuple(int(field) for field in fields)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError("AWG generator indices must be integers") from exc
         if len(channels) != self._pulse_count:
             raise ValueError(f"exactly {self._pulse_count} AWG generator indices are required")
@@ -1863,34 +2405,11 @@ class QickExportDialog(QtWidgets.QDialog):
         sweep_specs = self._effective_sweeps()
         sweep = sweep_specs[0] if len(sweep_specs) == 1 else None
         sweeps = sweep_specs if len(sweep_specs) > 1 else None
-        rf_pulse_spec = None
-        if self.rf_group.isChecked():
-            if self.rf_gen_ch.value() in awg_channels:
-                raise ValueError("RF generator index must differ from all AWG tuning indices")
-            rf_pulse_spec = QickRfPulseSpec(
-                gen_ch=self.rf_gen_ch.value(),
-                segment_name=self.rf_segment.currentText(),
-                delay_us=self.rf_delay_us.value(),
-                duration_us=self.rf_duration_us.value(),
-                frequency_mhz=self.rf_frequency_mhz.value(),
-                gain=self.rf_gain.value(),
-                att1_db=self.rf_att1_db.value(),
-                att2_db=self.rf_att2_db.value(),
-                phase_degrees=self.rf_phase_degrees.value(),
-                nqz=self.rf_nqz.value(),
-                require_within_segment=self.rf_require_within.isChecked(),
-            )
-        ddr_readout_spec = None
-        if self.ddr_group.isChecked():
-            ddr_readout_spec = QickDdrReadoutSpec(
-                ro_ch=self.ddr_ro_ch.value(),
-                segment_name=self.ddr_segment.currentText(),
-                delay_us=self.ddr_delay_us.value(),
-                samples_per_trigger=self.ddr_samples.value(),
-                readout_frequency_mhz=self.ddr_readout_frequency_mhz.value(),
-                margin_input_samples=self.ddr_margin_samples.value(),
-                force_overwrite=self.ddr_force_overwrite.isChecked(),
-            )
+        rf_channels = tuple(spec.gen_ch for spec in self._rf_pulse_specs)
+        if any(channel in awg_channels for channel in rf_channels):
+            raise ValueError("RF generator indices must differ from all AWG tuning indices")
+        if len(set(rf_channels)) != len(rf_channels):
+            raise ValueError("RF generator indices must be unique")
         return {
             "fabric_mhz": self.fabric_mhz.value(),
             "full_scale_mv": self.full_scale_mv.value(),
@@ -1902,8 +2421,11 @@ class QickExportDialog(QtWidgets.QDialog):
                 tuple(float(value) for value in row)
                 for row in self._cross_capacitance
             ),
-            "rf_pulse_spec": rf_pulse_spec,
-            "ddr_readout_spec": ddr_readout_spec,
+            "rf_pulse_spec": (
+                self._rf_pulse_specs[0] if len(self._rf_pulse_specs) == 1 else None
+            ),
+            "rf_pulse_specs": self._rf_pulse_specs,
+            "ddr_readout_spec": self._ddr_readout_spec,
         }
 
     def accept(self) -> None:
@@ -1931,16 +2453,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         super().__init__()
         self.setWindowTitle("DC Waveform Generator - QCS and QICK")
 
-        self._pulse: List[PulseSequence]    = [PulseSequence(0.0)]
+        self._settings_path: Optional[Path] = None
+        self._time_unit = DEFAULT_TIME_UNIT
+        self._pulse: List[PulseSequence] = [
+            PulseSequence(
+                DEFAULT_INITIAL_VOLTAGE_MV,
+                initial_duration_ns=DEFAULT_GUI_DURATION_NS,
+            )
+        ]
         self._pulse[0].v_bounds             = (-2500, 2500)
         self._rf_pulse_spec: Optional[QickRfPulseSpec] = None
+        self._rf_pulse_specs: List[QickRfPulseSpec] = []
+        self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
         self._rf_panel: Optional[RfPulseEditorPanel] = None
         self._dock_rf: Optional[QtWidgets.QDockWidget] = None
         self._sweep_specs: List[QickSweepSpec] = []
         self._cross_capacitance = np.eye(1, dtype=float)
+        self._qick_fabric_mhz = float(DEFAULT_QICK_FABRIC_MHZ)
         self._qick_full_scale_mv = float(DEFAULT_QICK_FULL_SCALE_MV)
-        self._grid_time_ns = 10.0
-        self._grid_voltage_mv = 10.0
+        self._qick_awg_channels = (DEFAULT_QSTL_AWG_CHANNELS[0],)
+        self._qick_repetitions_per_sweep = 1
+        self._grid_time_ns = 1000.0
+        self._grid_voltage_mv = 100.0
         self._grid_snap_enabled = False
         self._grid_visible = True
         self._grid_configured = False
@@ -1955,8 +2489,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl: MultiControlPanel = MultiControlPanel(
             self._pulse[0],
             initial_color,
-            self._add_port
+            self._add_port,
+            time_unit=self._time_unit,
         )
+        self._rf_ports_panel = RfPortsPanel(
+            self._pulse[0], time_unit=self._time_unit, parent=self
+        )
+        self._rf_readout_panel = RfReadoutPanel(
+            self._pulse[0], time_unit=self._time_unit, parent=self
+        )
+        self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
+        self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
+
+        self._time_unit_combo = QtWidgets.QComboBox()
+        self._time_unit_combo.addItems(tuple(TIME_UNIT_NS))
+        self._time_unit_combo.setCurrentText(self._time_unit)
+        self._time_unit_combo.currentTextChanged.connect(self._set_time_unit)
+        unit_row = QtWidgets.QHBoxLayout()
+        unit_row.addWidget(QtWidgets.QLabel("Time unit:"))
+        unit_row.addWidget(self._time_unit_combo)
+        unit_row.addStretch(1)
+        self._control_tabs = QtWidgets.QTabWidget()
+        self._control_tabs.addTab(self._multi_ctrl, "AWG Outputs")
+        self._control_tabs.addTab(self._rf_ports_panel, "RF Outputs")
+        self._control_tabs.addTab(self._rf_readout_panel, "RF Readout")
+        control_container = QtWidgets.QWidget(self)
+        control_layout = QtWidgets.QVBoxLayout(control_container)
+        control_layout.setContentsMargins(4, 4, 4, 4)
+        control_layout.addLayout(unit_row)
+        control_layout.addWidget(self._control_tabs)
         self.refresh_panel_table()
         self._wire_control_panel(self._multi_ctrl._ctrl_pannels[0])
         self._multi_ctrl.panel_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -1970,26 +2531,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._trace_placeholder.setAlignment(QtCore.Qt.AlignCenter)
         self._trace_placeholder.setWordWrap(True)
 
-        self._rf_timeline = (
-            RfPulseTimelineWidget(self)
-            if RfPulseTimelineWidget is not None
-            else None
-        )
+        self._rf_timelines = []
+        self._rf_timeline = None
+        self._rf_timeline_container = QtWidgets.QWidget(self)
+        self._rf_timeline_layout = QtWidgets.QVBoxLayout(self._rf_timeline_container)
+        self._rf_timeline_layout.setContentsMargins(0, 0, 0, 0)
+        self._rf_timeline_layout.setSpacing(2)
         self._waveform_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
         self._waveform_splitter.addWidget(self._plot)
         self._waveform_splitter.setCollapsible(0, False)
         self._waveform_splitter.setStretchFactor(0, 4)
-        if self._rf_timeline is not None:
-            self._waveform_splitter.addWidget(self._rf_timeline)
+        if RfPulseTimelineWidget is not None:
+            self._waveform_splitter.addWidget(self._rf_timeline_container)
             self._waveform_splitter.setCollapsible(1, True)
             self._waveform_splitter.setStretchFactor(1, 1)
-            self._rf_timeline.getPlotItem().getViewBox().setXLink(
-                self._plot.getPlotItem().getViewBox()
-            )
-            self._rf_timeline.hide()
+            self._rf_timeline_container.hide()
 
         self._dock_ctrl  = QtWidgets.QDockWidget("Control Panel", self)
-        self._dock_ctrl.setWidget(self._multi_ctrl)
+        self._dock_ctrl.setWidget(control_container)
 
         self._dock_plot = QtWidgets.QDockWidget(
             "Waveform Plot - Virtual (solid) / Physical (dashed)",
@@ -2036,6 +2595,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         self._build_menu()
         self._build_toolbar()
+        self._set_grid_settings(
+            time_step_ns=self._grid_time_ns,
+            voltage_step_mv=self._grid_voltage_mv,
+            snap_enabled=self._grid_snap_enabled,
+            visible=self._grid_visible,
+        )
+        self._set_time_unit(self._time_unit)
         self._refresh_sweep_overlay()
 
     def _wire_control_panel(self, control: ControlPanel) -> None:
@@ -2066,6 +2632,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._plot.remove_pulse(idx)
         self._pulse.pop(idx)
+        self._qick_awg_channels = tuple(
+            channel
+            for channel_index, channel in enumerate(self._qick_awg_channels)
+            if channel_index != idx
+        )
         self._cross_capacitance = np.delete(
             np.delete(self._cross_capacitance, idx, axis=0),
             idx,
@@ -2115,7 +2686,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         # File
         m_file      = mb.addMenu("&File")
-        m_file.addAction("Load JSON…",  self._load_json)
+        save_settings = m_file.addAction("Save Settings JSON...")
+        save_settings.setShortcut(QtGui.QKeySequence.Save)
+        save_settings.triggered.connect(self._save_json)
+        load_settings = m_file.addAction("Load Settings JSON...")
+        load_settings.setShortcut(QtGui.QKeySequence.Open)
+        load_settings.triggered.connect(self._load_json)
         m_file.addSeparator()
         m_file.addAction("E&xit",       self.close)
 
@@ -2125,9 +2701,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         gen.setShortcut(QtGui.QKeySequence("Ctrl+G"))
         gen.triggered.connect(self._generate_pulse)
         m_pulse.addSeparator()
-        edit_rf = m_pulse.addAction("Create/Edit RF pulse...")
-        edit_rf.setShortcut(QtGui.QKeySequence("Ctrl+R"))
-        edit_rf.triggered.connect(self._show_rf_editor)
         gen_qick = m_pulse.addAction("Generate QICK program...")
         gen_qick.setShortcut(QtGui.QKeySequence("Ctrl+Shift+G"))
         gen_qick.triggered.connect(self._generate_qick_pulse)
@@ -2209,12 +2782,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             with QtCore.QSignalBlocker(self._grid_visible_action):
                 self._grid_visible_action.setChecked(self._grid_visible)
 
+    def _set_time_unit(self, unit: str) -> None:
+        if unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        self._time_unit = unit
+        self._multi_ctrl.set_time_unit(unit)
+        self._rf_ports_panel.set_time_unit(unit)
+        self._rf_readout_panel.set_time_unit(unit)
+        if hasattr(self._plot, "set_time_unit"):
+            self._plot.set_time_unit(unit)
+        for timeline in self._rf_timelines:
+            if hasattr(timeline, "set_time_unit"):
+                timeline.set_time_unit(unit)
+        self.statusBar().showMessage(f"Time display unit: {unit}")
+
     def _configure_grid(self) -> None:
         dialog = GridSettingsDialog(
             time_step_ns=self._grid_time_ns,
             voltage_step_mv=self._grid_voltage_mv,
             snap_enabled=(self._grid_snap_enabled if self._grid_configured else True),
             visible=self._grid_visible,
+            time_unit=self._time_unit,
             parent=self,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
@@ -2228,7 +2816,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             visible=visible,
         )
         self.statusBar().showMessage(
-            f"Grid: {time_step_ns:.6g} ns x {voltage_step_mv:.6g} mV; "
+            f"Grid: {_time_from_ns(time_step_ns, self._time_unit):.6g} "
+            f"{self._time_unit} x {voltage_step_mv:.6g} mV; "
             f"snap {'on' if snap_enabled else 'off'}"
         )
 
@@ -2491,58 +3080,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         btn_fit.setToolTip("Show the full pulse (keyboard: F)")
         btn_fit.triggered.connect(self._fit_view)
         tb.addAction(btn_fit)
-        rf_action = QtWidgets.QAction(
-            self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay),
-            "RF Pulse",
-            self,
-        )
-        rf_action.setToolTip("Create or edit the QICK RF pulse")
-        rf_action.triggered.connect(self._show_rf_editor)
-        tb.addAction(rf_action)
         # keyboard shortcut
         QtWidgets.QShortcut(QtGui.QKeySequence("F"), self, self._fit_view)
 
     def _fit_view(self):
         """Fit the view to the pulse data."""
         self._plot.fit_view()
-        if self._rf_pulse_spec is not None and self._rf_timeline is not None:
+        rf_ranges = []
+        for spec in self._rf_pulse_specs:
             try:
-                start_us, end_us, _ = rf_pulse_absolute_times_us(
-                    self._pulse[0],
-                    self._rf_pulse_spec,
-                )
+                start_us, end_us, _ = rf_pulse_absolute_times_us(self._pulse[0], spec)
             except ValueError:
-                pass
-            else:
-                start_ns = start_us * 1000.0
-                end_ns = end_us * 1000.0
-                x_range = self._plot.getPlotItem().vb.viewRange()[0]
-                x_min = min(float(x_range[0]), start_ns)
-                x_max = max(float(x_range[1]), end_ns)
-                margin = max(1.0, 0.03 * max(1.0, x_max - x_min))
-                self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
+                continue
+            rf_ranges.append((start_us * 1000.0, end_us * 1000.0))
+        if rf_ranges:
+            x_range = self._plot.getPlotItem().vb.viewRange()[0]
+            x_min = min(float(x_range[0]), *(start for start, _end in rf_ranges))
+            x_max = max(float(x_range[1]), *(end for _start, end in rf_ranges))
+            margin = max(1.0, 0.03 * max(1.0, x_max - x_min))
+            self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
         if self._trace is not None:
             self._trace.fit_view()
 
     def _show_rf_editor(self) -> None:
-        if self._rf_panel is None:
-            self._rf_panel = RfPulseEditorPanel(self._pulse[0], self)
-            self._rf_panel.spec_applied.connect(self._apply_rf_spec)
-            self._rf_panel.spec_removed.connect(self._remove_rf_spec)
-            self._dock_rf = QtWidgets.QDockWidget("RF Pulse", self)
-            self._dock_rf.setWidget(self._rf_panel)
-            self._dock_rf.setFeatures(
-                QtWidgets.QDockWidget.DockWidgetMovable
-                | QtWidgets.QDockWidget.DockWidgetFloatable
-                | QtWidgets.QDockWidget.DockWidgetClosable
-            )
-            self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._dock_rf)
-            if self._rf_pulse_spec is not None:
-                self._rf_panel.load_spec(self._rf_pulse_spec)
-        self._dock_rf.show()
-        self._dock_rf.raise_()
+        """Compatibility helper: reveal the always-present RF Outputs tab."""
+        self._control_tabs.setCurrentWidget(self._rf_ports_panel)
+        self._dock_ctrl.show()
+        self._dock_ctrl.raise_()
 
     def _apply_rf_spec(self, spec: QickRfPulseSpec) -> None:
+        self._rf_pulse_specs = [spec]
         self._rf_pulse_spec = spec
         self._refresh_rf_timeline(fit_view=True)
         self.statusBar().showMessage(
@@ -2551,44 +3118,79 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _remove_rf_spec(self) -> None:
+        self._rf_pulse_specs = []
         self._rf_pulse_spec = None
         self._refresh_rf_timeline()
         self.statusBar().showMessage("RF pulse disabled")
 
-    def _refresh_rf_timeline(self, *, fit_view: bool = False) -> None:
-        if self._rf_timeline is None:
-            return
-        if self._rf_pulse_spec is None:
-            self._rf_timeline.clear_pulse()
-            self._rf_timeline.hide()
-            return
-        try:
-            start_us, end_us, _ = rf_pulse_absolute_times_us(
-                self._pulse[0],
-                self._rf_pulse_spec,
+    def _on_rf_specs_changed(self, specs) -> None:
+        self._rf_pulse_specs = list(specs)
+        self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._refresh_rf_timeline()
+
+    def _on_readout_spec_changed(self, spec) -> None:
+        self._ddr_readout_spec = spec
+        if spec is None:
+            self.statusBar().showMessage("RF readout disabled")
+        else:
+            self.statusBar().showMessage(
+                f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
             )
-        except ValueError:
-            self._rf_timeline.clear_pulse()
-            self._rf_timeline.hide()
+
+    def _refresh_rf_timeline(self, *, fit_view: bool = False) -> None:
+        if RfPulseTimelineWidget is None:
             return
-        self._rf_timeline.set_pulse(
-            gen_ch=self._rf_pulse_spec.gen_ch,
-            start_ns=start_us * 1000.0,
-            duration_ns=(end_us - start_us) * 1000.0,
-            frequency_mhz=self._rf_pulse_spec.frequency_mhz,
-            gain=self._rf_pulse_spec.gain,
-            phase_degrees=self._rf_pulse_spec.phase_degrees,
-            att1_db=self._rf_pulse_spec.att1_db,
-            att2_db=self._rf_pulse_spec.att2_db,
-        )
-        self._rf_timeline.show()
+        valid_specs = []
+        valid_ranges = []
+        for spec in self._rf_pulse_specs:
+            try:
+                start_us, end_us, _ = rf_pulse_absolute_times_us(self._pulse[0], spec)
+            except ValueError:
+                continue
+            valid_specs.append(spec)
+            valid_ranges.append((start_us, end_us))
+        while len(self._rf_timelines) < len(valid_specs):
+            timeline = RfPulseTimelineWidget(self._rf_timeline_container)
+            if hasattr(timeline, "set_time_unit"):
+                timeline.set_time_unit(self._time_unit)
+            timeline.getPlotItem().getViewBox().setXLink(
+                self._plot.getPlotItem().getViewBox()
+            )
+            self._rf_timeline_layout.addWidget(timeline)
+            self._rf_timelines.append(timeline)
+        while len(self._rf_timelines) > len(valid_specs):
+            timeline = self._rf_timelines.pop()
+            self._rf_timeline_layout.removeWidget(timeline)
+            timeline.deleteLater()
+        self._rf_timeline = self._rf_timelines[0] if self._rf_timelines else None
+        if not valid_specs:
+            self._rf_timeline_container.hide()
+            return
+        for timeline, spec, (start_us, end_us) in zip(
+            self._rf_timelines, valid_specs, valid_ranges
+        ):
+            timeline.set_pulse(
+                gen_ch=spec.gen_ch,
+                start_ns=start_us * 1000.0,
+                duration_ns=(end_us - start_us) * 1000.0,
+                frequency_mhz=spec.frequency_mhz,
+                gain=spec.gain,
+                phase_degrees=spec.phase_degrees,
+                att1_db=spec.att1_db,
+                att2_db=spec.att2_db,
+            )
+            timeline.show()
+        self._rf_timeline_container.show()
         total_height = max(360, self._waveform_splitter.height())
-        self._waveform_splitter.setSizes([max(220, total_height - 150), 150])
+        rf_height = min(520, max(130, 130 * len(valid_specs)))
+        self._waveform_splitter.setSizes([max(220, total_height - rf_height), rf_height])
         if fit_view:
             self._fit_view()
 
     def _refresh_rf_editor(self) -> None:
         self._refresh_rf_timeline()
+        self._rf_ports_panel.refresh_segments(self._pulse[0])
+        self._rf_readout_panel.refresh_segments(self._pulse[0])
         if self._rf_panel is None:
             return
         self._rf_panel.refresh_segments(self._pulse[0])
@@ -2619,7 +3221,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._schedule_deferred_refresh()
 
     def _point_update(self, i0, i1, new_t):
-        self.statusBar().showMessage(f"Point {i0}-{i1} moved to {new_t:.6g} ns")
+        self.statusBar().showMessage(
+            f"Point {i0}-{i1} moved to "
+            f"{_time_from_ns(new_t, self._time_unit):.6g} {self._time_unit}"
+        )
         self._schedule_deferred_refresh(timing_changed=True)
 
     def _schedule_deferred_refresh(self, *, timing_changed: bool = False) -> None:
@@ -2670,33 +3275,450 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if force or self._trace.uses_port(self._selected_port_idx):
             self._trace.refresh_trace(self._pulse)
 
-    def _load_json(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open settings JSON", "", "JSON files (*.json)")
+    def _settings_to_dict(self) -> dict:
+        """Return every user-editable experiment setting in canonical units."""
+        return {
+            "schema": SETTINGS_SCHEMA,
+            "version": SETTINGS_VERSION,
+            "display": {
+                "time_unit": self._time_unit,
+                "voltage_view": self._plot.voltage_view,
+                "selected_awg_output": self._selected_port_idx,
+                "selected_control_tab": self._control_tabs.currentIndex(),
+            },
+            "grid": {
+                "time_step_ns": self._grid_time_ns,
+                "voltage_step_mv": self._grid_voltage_mv,
+                "snap_enabled": self._grid_snap_enabled,
+                "visible": self._grid_visible,
+                "configured": self._grid_configured,
+            },
+            "awg": {
+                "outputs": [pulse.to_dict() for pulse in self._pulse],
+                "cross_capacitance": self._cross_capacitance.tolist(),
+                "sweeps": [
+                    {
+                        "segment_name": spec.segment_name,
+                        "output_name": spec.output_name,
+                        "start": spec.start,
+                        "stop": spec.stop,
+                        "count": spec.count,
+                    }
+                    for spec in self._sweep_specs
+                ],
+            },
+            "qick": {
+                "fabric_mhz": self._qick_fabric_mhz,
+                "full_scale_mv": self._qick_full_scale_mv,
+                "awg_channels": list(self._qick_awg_channels),
+                "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+            },
+            "rf_outputs": list(self._rf_ports_panel.settings()),
+            "rf_readout": self._rf_readout_panel.settings_dict(),
+        }
+
+    @staticmethod
+    def _json_bool(value, name: str) -> bool:
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be boolean")
+        return value
+
+    @staticmethod
+    def _json_finite_float(value, name: str, *, positive: bool = False) -> float:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be numeric")
+        result = float(value)
+        if not np.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        if positive and result <= 0.0:
+            raise ValueError(f"{name} must be positive")
+        return result
+
+    @staticmethod
+    def _json_int(value, name: str, *, minimum: int = 0) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{name} must be an integer")
+        result = int(value)
+        if result < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+        return result
+
+    def _decode_settings(self, data: dict) -> dict:
+        """Validate a versioned settings document without changing the GUI."""
+        if not isinstance(data, dict):
+            raise TypeError("settings JSON root must be an object")
+        if data.get("schema") != SETTINGS_SCHEMA:
+            raise ValueError(f"unsupported settings schema {data.get('schema')!r}")
+        if data.get("version") != SETTINGS_VERSION:
+            raise ValueError(
+                f"unsupported settings version {data.get('version')!r}; "
+                f"expected {SETTINGS_VERSION}"
+            )
+
+        display = data.get("display", {})
+        grid = data.get("grid", {})
+        awg = data.get("awg")
+        qick = data.get("qick", {})
+        if not all(isinstance(item, dict) for item in (display, grid, awg, qick)):
+            raise TypeError("display, grid, awg, and qick must be JSON objects")
+
+        time_unit = str(display.get("time_unit", DEFAULT_TIME_UNIT))
+        if time_unit not in TIME_UNIT_NS:
+            raise ValueError(f"unsupported time unit {time_unit!r}")
+        voltage_view = str(display.get("voltage_view", "both"))
+        if voltage_view not in {"both", "virtual", "physical"}:
+            raise ValueError(f"unsupported voltage view {voltage_view!r}")
+
+        raw_outputs = awg.get("outputs")
+        if not isinstance(raw_outputs, list) or not 1 <= len(raw_outputs) <= 8:
+            raise ValueError("AWG outputs must contain between one and eight waveforms")
+        pulses = tuple(PulseSequence.from_dict(entry) for entry in raw_outputs)
+        selected_output = self._json_int(
+            display.get("selected_awg_output", 0),
+            "selected AWG output",
+        )
+        if selected_output >= len(pulses):
+            raise ValueError("selected AWG output is out of range")
+        selected_tab = self._json_int(
+            display.get("selected_control_tab", 0),
+            "selected control tab",
+        )
+        if selected_tab >= self._control_tabs.count():
+            raise ValueError("selected control tab is out of range")
+
+        matrix = np.asarray(awg.get("cross_capacitance"), dtype=float)
+        expected_shape = (len(pulses), len(pulses))
+        if matrix.shape != expected_shape or not np.all(np.isfinite(matrix)):
+            raise ValueError(
+                f"cross-capacitance matrix must be a finite {expected_shape} array"
+            )
+        if not np.allclose(np.diag(matrix), 1.0, rtol=0.0, atol=1.0e-12):
+            raise ValueError("cross-capacitance diagonal entries must equal 1")
+
+        raw_sweeps = awg.get("sweeps", [])
+        if not isinstance(raw_sweeps, list):
+            raise TypeError("AWG sweeps must be a JSON array")
+        sweeps = tuple(
+            QickSweepSpec(
+                segment_name=str(entry["segment_name"]),
+                output_name=str(entry["output_name"]),
+                start=float(entry["start"]),
+                stop=float(entry["stop"]),
+                count=self._json_int(entry["count"], "sweep count", minimum=1),
+            )
+            for entry in raw_sweeps
+        )
+        sweep_targets = set()
+        for spec in sweeps:
+            target = (spec.output_name, spec.segment_name)
+            if target in sweep_targets:
+                raise ValueError("each AWG output/SET may have only one sweep")
+            sweep_targets.add(target)
+            try:
+                output_index = int(spec.output_name.rsplit("_", 1)[1])
+                segment_index = int(spec.segment_name.rsplit("_", 1)[1])
+            except (IndexError, ValueError) as exc:
+                raise ValueError(f"invalid sweep target {target!r}") from exc
+            if spec.output_name != f"awg_{output_index}":
+                raise ValueError(f"invalid sweep output {spec.output_name!r}")
+            if not 0 <= output_index < len(pulses):
+                raise ValueError(f"unknown sweep output {spec.output_name!r}")
+            if not 0 <= segment_index < pulses[output_index].set_count:
+                raise ValueError(f"unknown sweep SET {spec.segment_name!r}")
+
+        fabric_mhz = self._json_finite_float(
+            qick.get("fabric_mhz", DEFAULT_QICK_FABRIC_MHZ),
+            "QICK fabric_mhz",
+            positive=True,
+        )
+        full_scale_mv = self._json_finite_float(
+            qick.get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV),
+            "QICK full_scale_mv",
+            positive=True,
+        )
+        repetitions = self._json_int(
+            qick.get("repetitions_per_sweep", 1),
+            "QICK repetitions_per_sweep",
+            minimum=1,
+        )
+        raw_channels = qick.get(
+            "awg_channels", list(DEFAULT_QSTL_AWG_CHANNELS[:len(pulses)])
+        )
+        if not isinstance(raw_channels, list) or len(raw_channels) != len(pulses):
+            raise ValueError("QICK awg_channels must match the AWG output count")
+        awg_channels = tuple(
+            self._json_int(channel, "QICK AWG channel") for channel in raw_channels
+        )
+        if len(set(awg_channels)) != len(awg_channels):
+            raise ValueError("QICK AWG channels must be unique")
+
+        set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
+        raw_rf_outputs = data.get("rf_outputs", [])
+        if not isinstance(raw_rf_outputs, list) or len(raw_rf_outputs) > 8:
+            raise ValueError("rf_outputs must contain at most eight entries")
+        rf_outputs = []
+        for entry in raw_rf_outputs:
+            if not isinstance(entry, dict):
+                raise TypeError("each RF output setting must be a JSON object")
+            enabled = self._json_bool(entry.get("enabled", True), "RF output enabled")
+            require_within = self._json_bool(
+                entry.get("require_within_segment", True),
+                "RF require_within_segment",
+            )
+            spec = QickRfPulseSpec(
+                gen_ch=self._json_int(entry["gen_ch"], "RF generator channel"),
+                segment_name=str(entry["segment_name"]),
+                delay_us=float(entry["delay_us"]),
+                duration_us=float(entry["duration_us"]),
+                frequency_mhz=float(entry["frequency_mhz"]),
+                gain=int(entry["gain"]),
+                att1_db=float(entry["att1_db"]),
+                att2_db=float(entry["att2_db"]),
+                phase_degrees=float(entry.get("phase_degrees", 0.0)),
+                nqz=int(entry.get("nqz", 1)),
+                require_within_segment=require_within,
+            )
+            if spec.segment_name not in set_names:
+                raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
+            rf_outputs.append({"enabled": enabled, **{
+                "gen_ch": spec.gen_ch,
+                "segment_name": spec.segment_name,
+                "delay_us": spec.delay_us,
+                "duration_us": spec.duration_us,
+                "frequency_mhz": spec.frequency_mhz,
+                "gain": spec.gain,
+                "att1_db": spec.att1_db,
+                "att2_db": spec.att2_db,
+                "phase_degrees": spec.phase_degrees,
+                "nqz": spec.nqz,
+                "require_within_segment": spec.require_within_segment,
+            }})
+
+        raw_readout = data.get("rf_readout")
+        if raw_readout is None:
+            raw_readout = self._rf_readout_panel.settings_dict()
+            raw_readout["enabled"] = False
+        if not isinstance(raw_readout, dict):
+            raise TypeError("rf_readout must be a JSON object")
+        readout_enabled = self._json_bool(
+            raw_readout.get("enabled", False), "RF readout enabled"
+        )
+        force_overwrite = self._json_bool(
+            raw_readout.get("force_overwrite", False),
+            "RF readout force_overwrite",
+        )
+        readout_spec = QickDdrReadoutSpec(
+            ro_ch=self._json_int(raw_readout["ro_ch"], "RF readout channel"),
+            segment_name=str(raw_readout["segment_name"]),
+            delay_us=float(raw_readout["delay_us"]),
+            samples_per_trigger=self._json_int(
+                raw_readout["samples_per_trigger"],
+                "RF readout samples_per_trigger",
+                minimum=1,
+            ),
+            readout_frequency_mhz=float(
+                raw_readout.get("readout_frequency_mhz", 0.0)
+            ),
+            margin_input_samples=self._json_int(
+                raw_readout.get("margin_input_samples", 1024),
+                "RF readout margin_input_samples",
+            ),
+            force_overwrite=force_overwrite,
+            attenuation_db=float(raw_readout.get("attenuation_db", 20.0)),
+            filter_type=str(raw_readout.get("filter_type", "bypass")),
+            filter_cutoff=float(raw_readout.get("filter_cutoff", 2.5)),
+            filter_bandwidth=float(raw_readout.get("filter_bandwidth", 1.0)),
+        )
+        if readout_spec.segment_name not in set_names:
+            raise ValueError(
+                f"unknown RF readout anchor {readout_spec.segment_name!r}"
+            )
+        rf_readout = {
+            "enabled": readout_enabled,
+            "ro_ch": readout_spec.ro_ch,
+            "segment_name": readout_spec.segment_name,
+            "delay_us": readout_spec.delay_us,
+            "samples_per_trigger": readout_spec.samples_per_trigger,
+            "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
+            "margin_input_samples": readout_spec.margin_input_samples,
+            "force_overwrite": readout_spec.force_overwrite,
+            "attenuation_db": readout_spec.attenuation_db,
+            "filter_type": readout_spec.filter_type,
+            "filter_cutoff": readout_spec.filter_cutoff,
+            "filter_bandwidth": readout_spec.filter_bandwidth,
+        }
+
+        return {
+            "pulses": pulses,
+            "cross_capacitance": matrix,
+            "sweeps": sweeps,
+            "time_unit": time_unit,
+            "voltage_view": voltage_view,
+            "selected_output": selected_output,
+            "selected_tab": selected_tab,
+            "grid_time_ns": self._json_finite_float(
+                grid.get("time_step_ns", 1000.0),
+                "grid time_step_ns",
+                positive=True,
+            ),
+            "grid_voltage_mv": self._json_finite_float(
+                grid.get("voltage_step_mv", 100.0),
+                "grid voltage_step_mv",
+                positive=True,
+            ),
+            "grid_snap": self._json_bool(
+                grid.get("snap_enabled", False), "grid snap_enabled"
+            ),
+            "grid_visible": self._json_bool(
+                grid.get("visible", True), "grid visible"
+            ),
+            "grid_configured": self._json_bool(
+                grid.get("configured", False), "grid configured"
+            ),
+            "fabric_mhz": fabric_mhz,
+            "full_scale_mv": full_scale_mv,
+            "awg_channels": awg_channels,
+            "repetitions": repetitions,
+            "rf_outputs": tuple(rf_outputs),
+            "rf_readout": rf_readout,
+        }
+
+    def _apply_decoded_settings(self, settings: dict) -> None:
+        """Apply a fully validated settings object to all GUI panels."""
+        pulses = settings["pulses"]
+        self._sweep_specs = []
+        while len(self._pulse) > len(pulses):
+            self._delete_port(len(self._pulse) - 1)
+        while len(self._pulse) < len(pulses):
+            self._add_port()
+        for target, source in zip(self._pulse, pulses):
+            target.t = source.t.copy()
+            target.v = source.v.copy()
+            target.v_bounds = tuple(source.v_bounds)
+
+        self._cross_capacitance = settings["cross_capacitance"].copy()
+        self._sweep_specs = list(settings["sweeps"])
+        self._qick_fabric_mhz = settings["fabric_mhz"]
+        self._qick_full_scale_mv = settings["full_scale_mv"]
+        self._qick_awg_channels = tuple(settings["awg_channels"])
+        self._qick_repetitions_per_sweep = settings["repetitions"]
+
+        with QtCore.QSignalBlocker(self._time_unit_combo):
+            self._time_unit_combo.setCurrentText(settings["time_unit"])
+        self._set_time_unit(settings["time_unit"])
+        self._grid_configured = settings["grid_configured"]
+        self._set_grid_settings(
+            time_step_ns=settings["grid_time_ns"],
+            voltage_step_mv=settings["grid_voltage_mv"],
+            snap_enabled=settings["grid_snap"],
+            visible=settings["grid_visible"],
+        )
+
+        self._rf_ports_panel.refresh_segments(self._pulse[0])
+        self._rf_ports_panel.load_settings(settings["rf_outputs"])
+        self._rf_readout_panel.refresh_segments(self._pulse[0])
+        self._rf_readout_panel.load_settings(settings["rf_readout"])
+        self._rf_pulse_specs = list(self._rf_ports_panel.specs())
+        self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._ddr_readout_spec = self._rf_readout_panel.spec()
+
+        self._selected_port_idx = settings["selected_output"]
+        self._plot.set_selected_port_idx(self._selected_port_idx)
+        self._control_tabs.setCurrentIndex(settings["selected_tab"])
+        with QtCore.QSignalBlocker(self._voltage_view_actions[settings["voltage_view"]]):
+            self._voltage_view_actions[settings["voltage_view"]].setChecked(True)
+        self._set_voltage_view(settings["voltage_view"])
+
+        self._plot.refresh()
+        self._multi_ctrl.refresh_table()
+        self.refresh_panel_table()
+        self._refresh_trace_if_needed(force=True)
+        self._refresh_rf_timeline(fit_view=True)
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+
+    def _apply_legacy_settings(self, data: dict) -> None:
+        """Read the original single-waveform JSON format."""
+        loaded = self._pulse[0].copy()
+        if "initial_voltage" in data:
+            loaded.v[0:2] = float(data["initial_voltage"])
+        if "voltage_bounds" in data and len(data["voltage_bounds"]) == 2:
+            loaded.v_bounds = tuple(map(float, data["voltage_bounds"]))
+        if "time_ns" in data and "voltage_mv" in data:
+            loaded = PulseSequence.from_dict(data)
+        loaded.validate()
+        self._pulse[0].t = loaded.t.copy()
+        self._pulse[0].v = loaded.v.copy()
+        self._pulse[0].v_bounds = tuple(loaded.v_bounds)
+        self._plot.refresh()
+        self._multi_ctrl.refresh_table()
+        self._refresh_trace_if_needed(force=True)
+        self._refresh_rf_editor()
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+
+    def _save_settings_json(self, path) -> Path:
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".json":
+            output_path = output_path.with_suffix(".json")
+        text = json.dumps(
+            self._settings_to_dict(),
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        output_path.write_text(text + "\n", encoding="utf-8")
+        self._settings_path = output_path
+        return output_path
+
+    def _load_settings_json(self, path) -> Path:
+        input_path = Path(path)
+        data = json.loads(input_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("schema") == SETTINGS_SCHEMA:
+            self._apply_decoded_settings(self._decode_settings(data))
+        else:
+            if not isinstance(data, dict):
+                raise TypeError("legacy settings JSON root must be an object")
+            self._apply_legacy_settings(data)
+        self._settings_path = input_path
+        return input_path
+
+    def _save_json(self) -> None:
+        default_path = self._settings_path or (
+            Path(__file__).resolve().parent / "pulse_generator_settings.json"
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save settings JSON",
+            str(default_path),
+            "JSON files (*.json)",
+        )
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as fp:
-                data                    = json.load(fp)
-            if "initial_voltage" in data:
-                self._pulse[0].v[0:2]   = float(data["initial_voltage"])
-            if "voltage_bounds" in data and len(data["voltage_bounds"]) == 2:
-                self._pulse[0].v_bounds = tuple(map(float, data["voltage_bounds"]))
-            if "time_ns" in data and "voltage_mv" in data:
-                loaded = PulseSequence.from_dict(data)
-                self._pulse[0].t = loaded.t
-                self._pulse[0].v = loaded.v
-                self._pulse[0].v_bounds = loaded.v_bounds
-            self._plot.refresh()
-            self._plot.fit_view()
-            self._multi_ctrl.refresh_table()
-            self._refresh_trace_if_needed(force=True)
-            self._refresh_rf_editor()
-            self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+            saved_path = self._save_settings_json(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Save failed", f"Could not write JSON:\n{exc}"
+            )
+            return
+        self.statusBar().showMessage(f"Saved settings to {saved_path}")
+
+    def _load_json(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open settings JSON",
+            str(self._settings_path.parent if self._settings_path else ""),
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            loaded_path = self._load_settings_json(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Load failed", f"Could not read JSON:\n{exc}"
             )
+            return
+        self.statusBar().showMessage(f"Loaded settings from {loaded_path}")
 
     def _generate_pulse(self):
         try:
@@ -2725,6 +3747,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _qick_output_names(self) -> Tuple[str, ...]:
         return tuple(f"awg_{index}" for index in range(len(self._pulse)))
 
+    def _next_qick_awg_channel(self) -> int:
+        used = set(self._qick_awg_channels)
+        for channel in DEFAULT_QSTL_AWG_CHANNELS:
+            if channel not in used:
+                return channel
+        channel = 0
+        while channel in used:
+            channel += 1
+        return channel
+
     def _qick_export_settings(self) -> Optional[dict]:
         if len(self._pulse) > 8:
             QtWidgets.QMessageBox.warning(
@@ -2735,7 +3767,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return None
         try:
             set_names = qick_set_segment_names(self._pulse[0])
-        except ValueError as exc:
+            self._rf_pulse_specs = list(self._rf_ports_panel.specs())
+            self._rf_pulse_spec = (
+                self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+            )
+            self._ddr_readout_spec = self._rf_readout_panel.spec()
+        except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "Invalid waveform", str(exc))
             return None
         flat_durations = [
@@ -2748,26 +3785,34 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             set_names,
             self,
             default_set_index=default_set_index,
-            initial_rf_spec=self._rf_pulse_spec,
+            initial_rf_specs=tuple(self._rf_pulse_specs),
+            initial_ddr_readout_spec=self._ddr_readout_spec,
             initial_sweeps=tuple(self._sweep_specs),
             initial_cross_capacitance=self._cross_capacitance,
+            initial_fabric_mhz=self._qick_fabric_mhz,
+            initial_full_scale_mv=self._qick_full_scale_mv,
+            initial_awg_channels=self._qick_awg_channels,
+            initial_repetitions=self._qick_repetitions_per_sweep,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
         settings = dialog.values()
-        self._rf_pulse_spec = settings["rf_pulse_spec"]
+        self._rf_pulse_specs = list(settings["rf_pulse_specs"])
+        self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._ddr_readout_spec = settings["ddr_readout_spec"]
         if settings["sweeps"] is not None:
             self._sweep_specs = list(settings["sweeps"])
         elif settings["sweep"] is not None:
             self._sweep_specs = [settings["sweep"]]
         else:
             self._sweep_specs = []
+        self._qick_fabric_mhz = settings["fabric_mhz"]
         self._qick_full_scale_mv = settings["full_scale_mv"]
+        self._qick_awg_channels = tuple(settings["awg_channels"])
+        self._qick_repetitions_per_sweep = settings["repetitions_per_sweep"]
         self._cross_capacitance = np.asarray(
             settings["cross_capacitance"], dtype=float
         )
-        if self._rf_panel is not None:
-            self._rf_panel.load_spec(self._rf_pulse_spec)
         self._refresh_rf_timeline(fit_view=True)
         self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
         return settings
@@ -2855,7 +3900,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         # Start with the existing timing grid so multi-output QICK export is
         # immediately valid; levels remain independently editable per port.
         new_pulse       = self._pulse[0].copy()
-        new_pulse.v[:]  = 0.0
+        new_pulse.v[:]  = DEFAULT_INITIAL_VOLTAGE_MV
         self._plot.add_pulse(new_pulse)
         color = (
             self._plot.line_color(len(self._plot._line) - 1)
@@ -2864,11 +3909,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._multi_ctrl._color_map.append(color)
         self._pulse.append(new_pulse)
+        self._qick_awg_channels = (
+            *self._qick_awg_channels,
+            self._next_qick_awg_channel(),
+        )
         old_count = self._cross_capacitance.shape[0]
         expanded_coupling = np.eye(old_count + 1, dtype=float)
         expanded_coupling[:old_count, :old_count] = self._cross_capacitance
         self._cross_capacitance = expanded_coupling
-        new_ctrl        = ControlPanel(new_pulse)
+        new_ctrl = ControlPanel(new_pulse, time_unit=self._time_unit)
         self._wire_control_panel(new_ctrl)
         self._multi_ctrl._ctrl_pannels.append(new_ctrl)
         self._multi_ctrl.splitter.insertWidget(len(self._multi_ctrl._ctrl_pannels) - 1, new_ctrl)

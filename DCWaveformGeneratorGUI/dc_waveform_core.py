@@ -20,6 +20,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 import numpy as np
 
 
+DEFAULT_INITIAL_VOLTAGE_MV = 100.0
 DEFAULT_INITIAL_DURATION_NS = 100.0
 DEFAULT_INSERT_RAMP_NS = 50.0
 DEFAULT_INSERT_FLAT_NS = 100.0
@@ -223,6 +224,10 @@ class QickDdrReadoutSpec:
     margin_input_samples: int = 1024
     address: int = 0
     force_overwrite: bool = False
+    attenuation_db: float = 20.0
+    filter_type: str = "bypass"
+    filter_cutoff: float = 2.5
+    filter_bandwidth: float = 1.0
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -235,6 +240,15 @@ class QickDdrReadoutSpec:
         _bounded_int(self.address, "DDR address", 0, (1 << 63) - 1)
         if not isinstance(self.force_overwrite, bool):
             raise TypeError("force_overwrite must be bool")
+        attenuation = _finite_real(self.attenuation_db, "RF input attenuation_db")
+        if attenuation < 0.0 or attenuation > 31.75:
+            raise ValueError("RF input attenuation_db must be in [0, 31.75] dB")
+        if self.filter_type not in {"bypass", "lowpass", "highpass", "bandpass"}:
+            raise ValueError(
+                "RF input filter_type must be bypass, lowpass, highpass, or bandpass"
+            )
+        _nonnegative_real(self.filter_cutoff, "RF input filter_cutoff")
+        _positive_real(self.filter_bandwidth, "RF input filter_bandwidth")
 
 
 @dataclass(frozen=True)
@@ -713,6 +727,7 @@ def generate_qick_program_code(
     sweeps: Optional[Sequence[QickSweepSpec]] = None,
     cross_capacitance=None,
     rf_pulse_spec: Optional[QickRfPulseSpec] = None,
+    rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
 ) -> str:
     """Generate a QICK builder/execution module.
@@ -736,6 +751,20 @@ def generate_qick_program_code(
         raise ValueError("AWG channels must be unique nonnegative integers")
     repetitions_per_sweep = _positive_int(repetitions_per_sweep, "repetitions_per_sweep")
     sweep_specs = _coerce_sweep_specs(sweep, sweeps)
+    if rf_pulse_spec is not None and rf_pulse_specs is not None:
+        if tuple(rf_pulse_specs) != (rf_pulse_spec,):
+            raise ValueError("use either rf_pulse_spec or rf_pulse_specs, not both")
+        rf_pulse_spec = None
+    normalized_rf_specs = tuple(
+        rf_pulse_specs
+        if rf_pulse_specs is not None
+        else (() if rf_pulse_spec is None else (rf_pulse_spec,))
+    )
+    if any(not isinstance(spec, QickRfPulseSpec) for spec in normalized_rf_specs):
+        raise TypeError("every RF pulse entry must be a QickRfPulseSpec")
+    rf_channels = tuple(spec.gen_ch for spec in normalized_rf_specs)
+    if len(set(rf_channels)) != len(rf_channels):
+        raise ValueError("each RF pulse must use a unique generator channel")
     cross_capacitance = _coerce_cross_capacitance(
         cross_capacitance, len(output_names)
     )
@@ -748,11 +777,11 @@ def generate_qick_program_code(
             raise ValueError(f"unknown QICK SET segment {sweep_spec.segment_name!r}")
         if sweep_spec.output_name not in output_names:
             raise ValueError(f"unknown QICK output {sweep_spec.output_name!r}")
-    if rf_pulse_spec is not None:
-        if rf_pulse_spec.segment_name not in valid_set_names:
-            raise ValueError(f"unknown RF SET segment {rf_pulse_spec.segment_name!r}")
-        if rf_pulse_spec.gen_ch in awg_channels:
-            raise ValueError("RF generator channel must be separate from AWG tuning channels")
+    for rf_spec in normalized_rf_specs:
+        if rf_spec.segment_name not in valid_set_names:
+            raise ValueError(f"unknown RF SET segment {rf_spec.segment_name!r}")
+        if rf_spec.gen_ch in awg_channels:
+            raise ValueError("RF generator channels must be separate from AWG tuning channels")
     if ddr_readout_spec is not None:
         if ddr_readout_spec.segment_name not in valid_set_names:
             raise ValueError(f"unknown DDR SET segment {ddr_readout_spec.segment_name!r}")
@@ -768,19 +797,22 @@ def generate_qick_program_code(
         )
         for item in sweep_specs
     )
-    rf_config = None if rf_pulse_spec is None else {
-        "gen_ch": int(rf_pulse_spec.gen_ch),
-        "segment_name": str(rf_pulse_spec.segment_name),
-        "delay_us": float(rf_pulse_spec.delay_us),
-        "duration_us": float(rf_pulse_spec.duration_us),
-        "frequency_mhz": float(rf_pulse_spec.frequency_mhz),
-        "gain": int(rf_pulse_spec.gain),
-        "att1_db": float(rf_pulse_spec.att1_db),
-        "att2_db": float(rf_pulse_spec.att2_db),
-        "phase_degrees": float(rf_pulse_spec.phase_degrees),
-        "nqz": int(rf_pulse_spec.nqz),
-        "require_within_segment": bool(rf_pulse_spec.require_within_segment),
-    }
+    rf_configs = tuple(
+        {
+            "gen_ch": int(spec.gen_ch),
+            "segment_name": str(spec.segment_name),
+            "delay_us": float(spec.delay_us),
+            "duration_us": float(spec.duration_us),
+            "frequency_mhz": float(spec.frequency_mhz),
+            "gain": int(spec.gain),
+            "att1_db": float(spec.att1_db),
+            "att2_db": float(spec.att2_db),
+            "phase_degrees": float(spec.phase_degrees),
+            "nqz": int(spec.nqz),
+            "require_within_segment": bool(spec.require_within_segment),
+        }
+        for spec in normalized_rf_specs
+    )
     ddr_config = None if ddr_readout_spec is None else {
         "ro_ch": int(ddr_readout_spec.ro_ch),
         "segment_name": str(ddr_readout_spec.segment_name),
@@ -790,6 +822,10 @@ def generate_qick_program_code(
         "margin_input_samples": int(ddr_readout_spec.margin_input_samples),
         "address": int(ddr_readout_spec.address),
         "force_overwrite": bool(ddr_readout_spec.force_overwrite),
+        "attenuation_db": float(ddr_readout_spec.attenuation_db),
+        "filter_type": str(ddr_readout_spec.filter_type),
+        "filter_cutoff": float(ddr_readout_spec.filter_cutoff),
+        "filter_bandwidth": float(ddr_readout_spec.filter_bandwidth),
     }
     lines = [
         '"""Generated QICK AWG-tuning, RF pulse, and 1 MSPS DDR program."""',
@@ -808,7 +844,8 @@ def generate_qick_program_code(
         f"REPETITIONS_PER_SWEEP = {repetitions_per_sweep}",
         f"SWEEP_SPECS = {sweep_config!r}",
         f"CROSS_CAPACITANCE = {cross_capacitance!r}",
-        f"RF_CONFIG = {rf_config!r}",
+        f"RF_CONFIGS = {rf_configs!r}",
+        "RF_CONFIG = RF_CONFIGS[0] if len(RF_CONFIGS) == 1 else None",
         f"DDR_1MSPS_CONFIG = {ddr_config!r}",
         "",
         "",
@@ -847,24 +884,31 @@ def generate_qick_program_code(
             "    return 0 if duration_us <= 0 else cycles_from_us(duration_us, clock_mhz)",
             "",
             "",
+            "def build_rf_pulses(soccfg):",
+            "    pulses = []",
+            "    for cfg in RF_CONFIGS:",
+            "        gen_cfg = soccfg['gens'][cfg['gen_ch']]",
+            "        pulses.append(RfPulseConfig(",
+            "            gen_ch=cfg['gen_ch'],",
+            "            at_segment=cfg['segment_name'],",
+            "            length_cycles=cycles_from_us(",
+            "                cfg['duration_us'], gen_cfg['f_fabric']",
+            "            ),",
+            "            gain=cfg['gain'],",
+            "            freq_mhz=cfg['frequency_mhz'],",
+            "            phase_degrees=cfg['phase_degrees'],",
+            "            nqz=cfg['nqz'],",
+            "            delay_tproc_cycles=_delay_cycles(",
+            "                cfg['delay_us'], soccfg['tprocs'][0]['f_time']",
+            "            ),",
+            "            require_within_segment=cfg['require_within_segment'],",
+            "        ))",
+            "    return tuple(pulses)",
+            "",
+            "",
             "def build_rf_pulse(soccfg):",
-            "    if RF_CONFIG is None:",
-            "        return None",
-            "    cfg = RF_CONFIG",
-            "    gen_cfg = soccfg['gens'][cfg['gen_ch']]",
-            "    return RfPulseConfig(",
-            "        gen_ch=cfg['gen_ch'],",
-            "        at_segment=cfg['segment_name'],",
-            "        length_cycles=cycles_from_us(cfg['duration_us'], gen_cfg['f_fabric']),",
-            "        gain=cfg['gain'],",
-            "        freq_mhz=cfg['frequency_mhz'],",
-            "        phase_degrees=cfg['phase_degrees'],",
-            "        nqz=cfg['nqz'],",
-            "        delay_tproc_cycles=_delay_cycles(",
-            "            cfg['delay_us'], soccfg['tprocs'][0]['f_time']",
-            "        ),",
-            "        require_within_segment=cfg['require_within_segment'],",
-            "    )",
+            "    pulses = build_rf_pulses(soccfg)",
+            "    return pulses[0] if len(pulses) == 1 else None",
             "",
             "",
             "def build_ddr_readout(soccfg):",
@@ -892,12 +936,13 @@ def generate_qick_program_code(
             "    repetitions_per_sweep=REPETITIONS_PER_SWEEP,",
             "    readout=None,",
             "    rf_pulse=None,",
+            "    rf_pulses=None,",
             "    ddr_readout=None,",
             "    use_generated_aux=True,",
             "):",
             "    if use_generated_aux:",
-            "        if rf_pulse is None:",
-            "            rf_pulse = build_rf_pulse(soccfg)",
+            "        if rf_pulse is None and rf_pulses is None:",
+            "            rf_pulses = build_rf_pulses(soccfg)",
             "        if ddr_readout is None:",
             "            ddr_readout = build_ddr_readout(soccfg)",
             "    return build_sequence().make_program(",
@@ -906,19 +951,38 @@ def generate_qick_program_code(
             "        repetitions_per_sweep=repetitions_per_sweep,",
             "        readout=readout,",
             "        rf_pulse=rf_pulse,",
+            "        rf_pulses=rf_pulses,",
             "        ddr_readout=ddr_readout,",
             "    )",
             "",
             "",
             "def configure_rf_chain(soc):",
-            "    if RF_CONFIG is None:",
+            "    if not RF_CONFIGS:",
             "        return None",
-            "    cfg = RF_CONFIG",
-            "    return soc.rfb_set_gen_rf(cfg['gen_ch'], cfg['att1_db'], cfg['att2_db'])",
+            "    actual = tuple(",
+            "        soc.rfb_set_gen_rf(cfg['gen_ch'], cfg['att1_db'], cfg['att2_db'])",
+            "        for cfg in RF_CONFIGS",
+            "    )",
+            "    return actual[0] if len(actual) == 1 else actual",
+            "",
+            "",
+            "def configure_readout_chain(soc):",
+            "    if DDR_1MSPS_CONFIG is None:",
+            "        return None",
+            "    cfg = DDR_1MSPS_CONFIG",
+            "    actual_att = soc.rfb_set_ro_rf(cfg['ro_ch'], cfg['attenuation_db'])",
+            "    soc.rfb_set_ro_filter(",
+            "        cfg['ro_ch'],",
+            "        fc=cfg['filter_cutoff'],",
+            "        bw=cfg['filter_bandwidth'],",
+            "        ftype=cfg['filter_type'],",
+            "    )",
+            "    return actual_att",
             "",
             "",
             "def run_experiment(soc, soccfg, *, progress=True, configure_rf=True, **run_kwargs):",
-            "    actual_attenuations = configure_rf_chain(soc) if configure_rf else None",
+            "    actual_outputs = configure_rf_chain(soc) if configure_rf else None",
+            "    actual_input = configure_readout_chain(soc) if configure_rf else None",
             "    program = build_program(soccfg)",
             "    if DDR_1MSPS_CONFIG is not None:",
             "        ddr_result = program.acquire_fir_ddr(",
@@ -927,7 +991,8 @@ def generate_qick_program_code(
             "    else:",
             "        program.run_rounds(soc, progress=progress, **run_kwargs)",
             "        ddr_result = None",
-            "    return program, ddr_result, actual_attenuations",
+            "    rf_settings = {'outputs': actual_outputs, 'readout': actual_input}",
+            "    return program, ddr_result, rf_settings",
             "",
         ]
     )
@@ -935,6 +1000,10 @@ def generate_qick_program_code(
 
 
 __all__ = [
+    "DEFAULT_INITIAL_DURATION_NS",
+    "DEFAULT_INITIAL_VOLTAGE_MV",
+    "DEFAULT_INSERT_FLAT_NS",
+    "DEFAULT_INSERT_RAMP_NS",
     "DEFAULT_QCS_FULL_SCALE_V",
     "DEFAULT_QICK_FABRIC_MHZ",
     "DEFAULT_QICK_FULL_SCALE_MV",

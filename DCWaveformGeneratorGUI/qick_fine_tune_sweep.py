@@ -17,8 +17,8 @@ An optional cross-capacitance matrix maps all virtual SET/RAMP waveforms to
 the physical AWG outputs with ``physical = matrix @ virtual``.  It therefore
 applies to fixed pulses as well as swept coordinates.
 
-An optional normal RF generator pulse and FIR-decimated DDR readout can be
-attached to a named SET segment.  Each sweep point may be repeated N times;
+Optional normal RF generator pulses and a FIR-decimated DDR readout can be
+attached to named SET segments.  Each sweep point may be repeated N times;
 the returned DDR array is grouped as ``(point, repetition, sample, I/Q)`` and
 ``iq_grid`` restores the original Cartesian sweep dimensions.
 
@@ -774,6 +774,7 @@ class FineTuneSequence:
         reps: Optional[int] = None,
         readout: Optional[ReadoutConfig] = None,
         rf_pulse: Optional[RfPulseConfig] = None,
+        rf_pulses: Optional[Sequence[RfPulseConfig]] = None,
         ddr_readout: Optional[DdrFirReadoutConfig] = None,
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
@@ -787,6 +788,7 @@ class FineTuneSequence:
             reps=reps,
             readout=readout,
             rf_pulse=rf_pulse,
+            rf_pulses=rf_pulses,
             ddr_readout=ddr_readout,
             command_lead_tproc_cycles=command_lead_tproc_cycles,
             command_spacing_tproc_cycles=command_spacing_tproc_cycles,
@@ -955,6 +957,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         reps: Optional[int] = None,
         readout: Optional[ReadoutConfig] = None,
         rf_pulse: Optional[RfPulseConfig] = None,
+        rf_pulses: Optional[Sequence[RfPulseConfig]] = None,
         ddr_readout: Optional[DdrFirReadoutConfig] = None,
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
@@ -964,7 +967,22 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.sequence = sequence
         self.awg_channel_spec = awg_channels
         self.readout_config = readout
-        self.rf_pulse_config = rf_pulse
+        if rf_pulse is not None and rf_pulses is not None:
+            raise ValueError("use either rf_pulse or rf_pulses, not both")
+        self.rf_pulse_configs = tuple(
+            rf_pulses
+            if rf_pulses is not None
+            else (() if rf_pulse is None else (rf_pulse,))
+        )
+        if any(not isinstance(item, RfPulseConfig) for item in self.rf_pulse_configs):
+            raise TypeError("every RF pulse entry must be an RfPulseConfig")
+        rf_channels = tuple(item.gen_ch for item in self.rf_pulse_configs)
+        if len(set(rf_channels)) != len(rf_channels):
+            raise ValueError("each RF pulse must use a unique generator channel")
+        # Retain the singular attribute for older callers which inspect it.
+        self.rf_pulse_config = (
+            self.rf_pulse_configs[0] if len(self.rf_pulse_configs) == 1 else None
+        )
         self.ddr_readout_config = ddr_readout
         if readout is not None and ddr_readout is not None:
             raise ValueError("readout and ddr_readout cannot be enabled together")
@@ -1014,11 +1032,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.timing = self._build_timing()
         self.aux_timing = {}
 
-        if self.rf_pulse_config is not None:
-            self._configure_rf_pulse()
+        for rf_config in self.rf_pulse_configs:
+            self._configure_rf_pulse(rf_config)
         if self.ddr_readout_config is not None:
             self._configure_ddr_readout()
-        if self.rf_pulse_config is not None or self.ddr_readout_config is not None:
+        if self.rf_pulse_configs or self.ddr_readout_config is not None:
             self._build_aux_timing()
 
         if self.readout_config is not None:
@@ -1232,8 +1250,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             raise ValueError(f"segment {name!r} must be a SET segment")
         return index
 
-    def _configure_rf_pulse(self):
-        rf = self.rf_pulse_config
+    def _configure_rf_pulse(self, rf: RfPulseConfig):
         if rf.gen_ch in self.awg_channels:
             raise ValueError("RF generator channel must be separate from AWG tuning channels")
         if rf.gen_ch >= len(self.soccfg["gens"]):
@@ -1291,7 +1308,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             int(ro_cfg.get("buf_maxlen", ddr.samples_per_trigger)),
         )
         self.declare_readout(ch=ddr.ro_ch, length=max(1, monitor_length))
-        gen_ch = self.rf_pulse_config.gen_ch if self.rf_pulse_config is not None else None
+        gen_ch = self.rf_pulse_configs[0].gen_ch if self.rf_pulse_configs else None
         try:
             freq_word = self.freq2reg_adc(
                 ddr.readout_freq_mhz,
@@ -1373,39 +1390,62 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             })
             self.timing["point_end"] = max(self.timing["point_end"], capture_end)
 
-        if self.rf_pulse_config is not None:
-            rf = self.rf_pulse_config
+        rf_timings = []
+        occupied_by_port = {}
+        for (_awg_segment, output_index), command_time in self.timing["command_times"].items():
+            awg_ch = self.awg_channels[output_index]
+            awg_port = int(self.soccfg["gens"][awg_ch]["tproc_ch"])
+            occupied_by_port.setdefault(awg_port, set()).add(int(command_time))
+        if self.ddr_readout_config is not None:
+            ro_cfg = self.soccfg["readouts"][self.ddr_readout_config.ro_ch]
+            occupied_by_port.setdefault(int(ro_cfg["tproc_ctrl"]), set()).add(
+                int(self.aux_timing["ddr_readout_start"])
+            )
+
+        for rf_index, rf in enumerate(self.rf_pulse_configs):
             segment_index = self._segment_index(rf.at_segment, require_set=True)
             requested_start = (
                 self.timing["segment_starts"][segment_index] + rf.delay_tproc_cycles
             )
             rf_port = int(self.soccfg["gens"][rf.gen_ch]["tproc_ch"])
-            occupied = set()
-            for (awg_segment, output_index), command_time in self.timing["command_times"].items():
-                awg_ch = self.awg_channels[output_index]
-                awg_port = int(self.soccfg["gens"][awg_ch]["tproc_ch"])
-                if awg_port == rf_port:
-                    occupied.add(int(command_time))
-            if self.ddr_readout_config is not None:
-                ro_cfg = self.soccfg["readouts"][self.ddr_readout_config.ro_ch]
-                if int(ro_cfg["tproc_ctrl"]) == rf_port:
-                    occupied.add(int(self.aux_timing["ddr_readout_start"]))
+            occupied = occupied_by_port.setdefault(rf_port, set())
             rf_start = int(requested_start)
             while rf_start in occupied:
                 rf_start += self.command_spacing_tproc_cycles
+            occupied.add(rf_start)
             rf_end = rf_start + self._fabric_to_tproc(rf.gen_ch, rf.length_cycles)
             if rf.require_within_segment and rf_end > self.timing["segment_ends"][segment_index]:
                 raise ValueError(
                     f"RF pulse ends at t={rf_end}, after SET segment {rf.at_segment!r} "
                     f"ends at t={self.timing['segment_ends'][segment_index]}"
                 )
+            timing = {
+                "index": rf_index,
+                "gen_ch": rf.gen_ch,
+                "requested_start": int(requested_start),
+                "start": int(rf_start),
+                "end": int(rf_end),
+                "command_skew_tproc_cycles": int(rf_start - requested_start),
+            }
+            rf_timings.append(timing)
             self.aux_timing.update({
-                "rf_requested_start": int(requested_start),
-                "rf_start": int(rf_start),
-                "rf_end": int(rf_end),
-                "rf_command_skew_tproc_cycles": int(rf_start - requested_start),
+                f"rf_{rf_index}_requested_start": timing["requested_start"],
+                f"rf_{rf_index}_start": timing["start"],
+                f"rf_{rf_index}_end": timing["end"],
+                f"rf_{rf_index}_command_skew_tproc_cycles": (
+                    timing["command_skew_tproc_cycles"]
+                ),
             })
             self.timing["point_end"] = max(self.timing["point_end"], rf_end)
+        self.aux_timing["rf_pulses"] = tuple(rf_timings)
+        if len(rf_timings) == 1:
+            timing = rf_timings[0]
+            self.aux_timing.update({
+                "rf_requested_start": timing["requested_start"],
+                "rf_start": timing["start"],
+                "rf_end": timing["end"],
+                "rf_command_skew_tproc_cycles": timing["command_skew_tproc_cycles"],
+            })
 
     def _build_channel_slots(self) -> Dict[int, int]:
         next_slot: Dict[int, int] = {}
@@ -1555,10 +1595,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 width=ddr.trigger_width_tproc_cycles,
             )
 
-        if self.rf_pulse_config is not None:
+        for rf_index, rf_config in enumerate(self.rf_pulse_configs):
             self.pulse(
-                ch=self.rf_pulse_config.gen_ch,
-                t=self.aux_timing["rf_start"],
+                ch=rf_config.gen_ch,
+                t=self.aux_timing[f"rf_{rf_index}_start"],
             )
 
         point_end = int(self.timing["point_end"])
@@ -1746,7 +1786,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
             "point_end_tproc_cycles": self.timing["point_end"],
             "program_instructions": len(self.prog_list),
-            "rf_pulse": self.rf_pulse_config is not None,
+            "rf_pulse": bool(self.rf_pulse_configs),
+            "rf_pulse_count": len(self.rf_pulse_configs),
             "fir_ddr_readout": self.ddr_readout_config is not None,
             "total_ddr_triggers": (
                 self.sequence.sweep_point_count * self.cfg["reps"]

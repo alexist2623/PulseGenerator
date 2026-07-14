@@ -23,6 +23,8 @@ except ImportError:
 
 pg.setConfigOptions(antialias=False)
 
+TIME_UNIT_SCALE = {"ns": 1.0, "us": 1.0e-3, "ms": 1.0e-6}
+
 
 def _plot_color(index: int) -> QtGui.QColor:
     return QtGui.QColor(pg.intColor(index, hues=8, values=1, minValue=110, maxValue=220))
@@ -237,9 +239,19 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         self.addItem(self._start_line)
         self.addItem(self._end_line)
         self.preview_mode = "empty"
+        self._time_unit = "ns"
         self.start_ns = 0.0
         self.end_ns = 0.0
         self.clear_pulse()
+
+    def set_time_unit(self, unit: str) -> None:
+        if unit not in TIME_UNIT_SCALE:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        self._time_unit = unit
+        axis = self.getPlotItem().getAxis("bottom")
+        axis.enableAutoSIPrefix(False)
+        axis.setScale(TIME_UNIT_SCALE[unit])
+        axis.setLabel(f"sequence time [{unit}]")
 
     def clear_pulse(self) -> None:
         self._carrier_curve.setData([], [])
@@ -350,6 +362,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._highlight_width = 2.8
         self._physical_width = 1.6
         self._voltage_view = "both"
+        self._time_unit = "ns"
         self._physical_time_ns = np.asarray([], dtype=float)
         self._physical_values_mv = np.empty((0, 0), dtype=float)
         self._drag_flat: Optional[Tuple[int, int]] = None
@@ -414,6 +427,16 @@ class WaveformPlotWidget(pg.PlotWidget):
             visible=self._grid_visible,
         )
         self.fit_view()
+
+    def set_time_unit(self, unit: str) -> None:
+        """Change time-axis labels while preserving internal nanosecond data."""
+        if unit not in TIME_UNIT_SCALE:
+            raise ValueError(f"unsupported time unit {unit!r}")
+        self._time_unit = unit
+        axis = self.getPlotItem().getAxis("bottom")
+        axis.enableAutoSIPrefix(False)
+        axis.setScale(TIME_UNIT_SCALE[unit])
+        axis.setLabel(f"time [{unit}]")
 
     @staticmethod
     def _nearest_grid_value(value: float, step: float) -> float:
@@ -864,7 +887,8 @@ class WaveformPlotWidget(pg.PlotWidget):
             self._show_annotation(
                 float(pulse.t[start_index]),
                 new_voltage,
-                f"{pulse.t[start_index]:.6g} ns\n{new_voltage:.6g} mV",
+                f"{pulse.t[start_index] * TIME_UNIT_SCALE[self._time_unit]:.6g} "
+                f"{self._time_unit}\n{new_voltage:.6g} mV",
             )
             event.accept()
             return
@@ -882,7 +906,8 @@ class WaveformPlotWidget(pg.PlotWidget):
             self._show_annotation(
                 actual_time,
                 float(pulse.v[start_index]),
-                f"{actual_time:.6g} ns\n{pulse.v[start_index]:.6g} mV",
+                f"{actual_time * TIME_UNIT_SCALE[self._time_unit]:.6g} "
+                f"{self._time_unit}\n{pulse.v[start_index]:.6g} mV",
             )
             event.accept()
             return
