@@ -11,6 +11,7 @@ The application was validated with this exact profile:
 | PyQt5 | 5.15.11 |
 | PyQtGraph | 0.14.0 |
 | Matplotlib | 3.11.0 |
+| QCoDeS | 0.58.0 |
 | pytest (development only) | 9.0.3 |
 
 PyQtGraph is the primary interactive plotting backend. Matplotlib is kept for
@@ -51,10 +52,23 @@ Keysight QCS is a separate vendor package and is not installed by these public
 requirements. Install it in the Keysight-supported environment when generated
 QCS programs need to be executed.
 
+## Direct QICK experiment runs
+
+The **Experiment** tab connects to the configured QICK Pyro nameserver, runs
+the AWG/RF/FIR-DDR sequence, and writes the returned 1 MSPS IQ traces to the
+selected QCoDeS SQLite database. The QICK server must already be running and
+reachable from this PC.
+
+Each database run stores `I`, `Q`, magnitude, and phase against Cartesian sweep
+point, sweep amplitudes, repetition, sample index, and time in microseconds.
+The run metadata includes the complete GUI settings, virtual and physical
+output waveforms, cross-capacitance matrix, RF output/readout settings, QICK
+connection settings, and the compiled program summary.
+
 ## Verification
 
 ```powershell
-python -c "import numpy, PyQt5, pyqtgraph, matplotlib; print('GUI dependencies OK')"
+python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes; print('GUI dependencies OK')"
 python DCWaveform_Generator.py
 ```
 

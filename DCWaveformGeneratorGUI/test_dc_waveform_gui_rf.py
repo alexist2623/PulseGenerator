@@ -69,10 +69,11 @@ def test_gui_defaults_and_time_unit_round_trip():
 def test_rf_controls_are_left_tabs_and_support_multiple_ports():
     app = _application()
     window = gui.MainWindow()
-    assert [window._control_tabs.tabText(i) for i in range(3)] == [
+    assert [window._control_tabs.tabText(i) for i in range(4)] == [
         "AWG Outputs",
         "RF Outputs",
         "RF Readout",
+        "Experiment",
     ]
     toolbar_labels = [action.text() for bar in window.findChildren(QtWidgets.QToolBar)
                       for action in bar.actions()]
@@ -240,6 +241,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     readout.filter_bandwidth.setValue(0.5)
     readout.margin_samples.setValue(2048)
     readout.force_overwrite.setChecked(True)
+    experiment = window._experiment_panel
+    experiment.qick_host.setText("192.0.2.44")
+    experiment.ns_port.setValue(9999)
+    experiment.proxy_name.setText("labqick")
+    experiment.database_path.setText(str(tmp_path / "experiment.db"))
+    experiment.experiment_name.setText("Fine tune sweep")
+    experiment.sample_name.setText("device A")
+    experiment.notes.setPlainText("JSON round-trip notes")
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -257,8 +266,32 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._settings_to_dict() == expected
     assert restored._ddr_readout_spec == readout.spec()
     assert len(restored._rf_pulse_specs) == 1
+    assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
+    assert restored._experiment_panel.database_path.text().endswith("experiment.db")
     window.close()
     restored.close()
+
+
+def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.database_path.setText(str(tmp_path / "run.db"))
+    window._experiment_panel.experiment_name.setText("GUI run")
+    window._experiment_panel.sample_name.setText("sample 1")
+    window._rf_readout_panel.setChecked(True)
+    window._rf_readout_panel.samples.setValue(32)
+
+    arguments = window._experiment_run_arguments()
+    assert arguments["connection_config"].host == gui.DEFAULT_QICK_HOST
+    assert arguments["run_config"].resolved_database_path == (tmp_path / "run.db")
+    assert arguments["awg_channels"] == (1,)
+    assert arguments["readout_spec"].samples_per_trigger == 32
+    assert arguments["gui_settings"]["waveforms"]["time_ns"] == [0.0, 1000.0]
+    assert arguments["gui_settings"]["waveforms"]["physical_mv"] == [
+        [100.0, 100.0]
+    ]
+    app.processEvents()
+    window.close()
 
 
 def test_legacy_single_waveform_json_remains_loadable(tmp_path):

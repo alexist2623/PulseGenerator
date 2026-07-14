@@ -9,6 +9,7 @@ import json
 from math import prod
 from pathlib import Path
 import sys
+import traceback
 from typing import Tuple, Optional, List, Callable, Sequence
 import numpy as np
 
@@ -49,6 +50,7 @@ try:
         qick_set_segment_names,
         transform_virtual_waveforms,
     )
+
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_INITIAL_VOLTAGE_MV,
@@ -65,6 +67,19 @@ except ImportError:
         transform_virtual_waveforms,
     )
 
+try:
+    from .qick_qcodes_experiment import (
+        QcodesRunConfig,
+        QickConnectionConfig,
+        run_qick_qcodes_experiment,
+    )
+except ImportError:
+    from qick_qcodes_experiment import (
+        QcodesRunConfig,
+        QickConnectionConfig,
+        run_qick_qcodes_experiment,
+    )
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -74,7 +89,11 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
+DEFAULT_QICK_HOST = "192.168.2.99"
+DEFAULT_QICK_NS_PORT = 8888
+DEFAULT_QICK_PROXY_NAME = "myqick"
+DEFAULT_QCODES_DB_PATH = str(Path.home() / "qick_experiments.db")
 
 
 def _time_from_ns(value_ns: float, unit: str) -> float:
@@ -2104,6 +2123,229 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.spec_changed.emit(spec)
 
 
+class ExperimentPanel(QtWidgets.QWidget):
+    """QICK connection, QCoDeS database, and direct-run controls."""
+
+    run_requested = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        fabric_mhz: float,
+        full_scale_mv: float,
+        awg_channels: Sequence[int],
+        repetitions: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        outer = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        content = QtWidgets.QWidget(scroll)
+        form = QtWidgets.QFormLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        self.qick_host = QtWidgets.QLineEdit(DEFAULT_QICK_HOST)
+        self.ns_port = QtWidgets.QSpinBox()
+        self.ns_port.setRange(1, 65535)
+        self.ns_port.setValue(DEFAULT_QICK_NS_PORT)
+        self.proxy_name = QtWidgets.QLineEdit(DEFAULT_QICK_PROXY_NAME)
+
+        self.database_path = QtWidgets.QLineEdit(DEFAULT_QCODES_DB_PATH)
+        browse_database = QtWidgets.QToolButton()
+        browse_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        browse_database.setToolTip("Choose QCoDeS SQLite database")
+        browse_database.clicked.connect(self._browse_database)
+        database_row = QtWidgets.QHBoxLayout()
+        database_row.addWidget(self.database_path, 1)
+        database_row.addWidget(browse_database)
+
+        self.experiment_name = QtWidgets.QLineEdit("QICK pulse experiment")
+        self.sample_name = QtWidgets.QLineEdit("PulseGenerator")
+        self.notes = QtWidgets.QPlainTextEdit()
+        self.notes.setPlaceholderText("Optional experiment notes")
+        self.notes.setMaximumHeight(90)
+
+        self.fabric_mhz = QtWidgets.QDoubleSpinBox()
+        self.fabric_mhz.setRange(1.0, 5000.0)
+        self.fabric_mhz.setDecimals(6)
+        self.fabric_mhz.setSuffix(" MHz")
+        self.full_scale_mv = QtWidgets.QDoubleSpinBox()
+        self.full_scale_mv.setRange(1.0, 1.0e6)
+        self.full_scale_mv.setDecimals(6)
+        self.full_scale_mv.setSuffix(" mV")
+        self.awg_channels = QtWidgets.QLineEdit()
+        self.repetitions = QtWidgets.QSpinBox()
+        self.repetitions.setRange(1, 1_000_000)
+        self.set_qick_values(
+            fabric_mhz=fabric_mhz,
+            full_scale_mv=full_scale_mv,
+            awg_channels=awg_channels,
+            repetitions=repetitions,
+        )
+
+        form.addRow("QICK IP/host:", self.qick_host)
+        form.addRow("Pyro nameserver port:", self.ns_port)
+        form.addRow("Pyro proxy name:", self.proxy_name)
+        form.addRow("QCoDeS DB file:", database_row)
+        form.addRow("Experiment name:", self.experiment_name)
+        form.addRow("Sample name:", self.sample_name)
+        form.addRow("AWG fabric clock:", self.fabric_mhz)
+        form.addRow("AWG full scale (+/-):", self.full_scale_mv)
+        form.addRow("AWG generator indices:", self.awg_channels)
+        form.addRow("Repetitions per sweep:", self.repetitions)
+        form.addRow("Notes:", self.notes)
+
+        self.run_button = QtWidgets.QPushButton("Run QICK Experiment")
+        self.run_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        )
+        self.run_button.clicked.connect(self.run_requested.emit)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        self.run_status = QtWidgets.QLabel("Ready")
+        self.run_status.setWordWrap(True)
+        form.addRow(self.run_button)
+        form.addRow(self.progress)
+        form.addRow("Last run:", self.run_status)
+
+    def _browse_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Choose QCoDeS database",
+            self.database_path.text().strip() or DEFAULT_QCODES_DB_PATH,
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            if Path(path).suffix.lower() != ".db":
+                path = str(Path(path).with_suffix(".db"))
+            self.database_path.setText(path)
+
+    def _parse_awg_channels(self, output_count: int) -> Tuple[int, ...]:
+        fields = [field.strip() for field in self.awg_channels.text().split(",")]
+        if any(not field for field in fields):
+            raise ValueError("AWG generator indices must be comma-separated integers")
+        try:
+            channels = tuple(int(field) for field in fields)
+        except ValueError as exc:
+            raise ValueError("AWG generator indices must be integers") from exc
+        if len(channels) != output_count:
+            raise ValueError(
+                f"exactly {output_count} AWG generator indices are required"
+            )
+        if any(channel < 0 for channel in channels) or len(set(channels)) != len(channels):
+            raise ValueError("AWG generator indices must be unique and nonnegative")
+        return channels
+
+    def values(self, output_count: int) -> dict:
+        connection = QickConnectionConfig(
+            host=self.qick_host.text().strip(),
+            ns_port=self.ns_port.value(),
+            proxy_name=self.proxy_name.text().strip(),
+        )
+        run = QcodesRunConfig(
+            database_path=self.database_path.text().strip(),
+            experiment_name=self.experiment_name.text().strip(),
+            sample_name=self.sample_name.text().strip(),
+            notes=self.notes.toPlainText(),
+        )
+        return {
+            "connection": connection,
+            "run": run,
+            "fabric_mhz": self.fabric_mhz.value(),
+            "full_scale_mv": self.full_scale_mv.value(),
+            "awg_channels": self._parse_awg_channels(output_count),
+            "repetitions_per_sweep": self.repetitions.value(),
+        }
+
+    def settings_dict(self, output_count: int) -> dict:
+        values = self.values(output_count)
+        connection = values["connection"]
+        run = values["run"]
+        return {
+            "qick_host": connection.host,
+            "ns_port": connection.ns_port,
+            "proxy_name": connection.proxy_name,
+            "database_path": run.database_path,
+            "experiment_name": run.experiment_name,
+            "sample_name": run.sample_name,
+            "notes": run.notes,
+        }
+
+    def set_qick_values(
+        self,
+        *,
+        fabric_mhz: float,
+        full_scale_mv: float,
+        awg_channels: Sequence[int],
+        repetitions: int,
+    ) -> None:
+        self.fabric_mhz.setValue(float(fabric_mhz))
+        self.full_scale_mv.setValue(float(full_scale_mv))
+        self.awg_channels.setText(", ".join(str(value) for value in awg_channels))
+        self.repetitions.setValue(int(repetitions))
+
+    def load_settings(
+        self,
+        connection: QickConnectionConfig,
+        run: QcodesRunConfig,
+        *,
+        fabric_mhz: float,
+        full_scale_mv: float,
+        awg_channels: Sequence[int],
+        repetitions: int,
+    ) -> None:
+        self.qick_host.setText(connection.host)
+        self.ns_port.setValue(connection.ns_port)
+        self.proxy_name.setText(connection.proxy_name)
+        self.database_path.setText(run.database_path)
+        self.experiment_name.setText(run.experiment_name)
+        self.sample_name.setText(run.sample_name)
+        self.notes.setPlainText(run.notes)
+        self.set_qick_values(
+            fabric_mhz=fabric_mhz,
+            full_scale_mv=full_scale_mv,
+            awg_channels=awg_channels,
+            repetitions=repetitions,
+        )
+
+    def set_running(self, running: bool, message: str) -> None:
+        self.run_button.setEnabled(not running)
+        self.progress.setVisible(running)
+        self.run_status.setText(message)
+
+    def show_result(self, result) -> None:
+        self.set_running(
+            False,
+            f"Run {result.run_id}, {result.row_count} IQ rows\n"
+            f"{result.database_path}",
+        )
+
+
+class QickExperimentWorker(QtCore.QObject):
+    """Run blocking Pyro/QICK/QCoDeS work outside the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, kwargs: dict, parent=None):
+        super().__init__(parent)
+        self._kwargs = kwargs
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = run_qick_qcodes_experiment(**self._kwargs)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
 class QickExportDialog(QtWidgets.QDialog):
     """Collect QICK timing, channel-map, repetition, and sweep settings."""
 
@@ -2473,6 +2715,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_full_scale_mv = float(DEFAULT_QICK_FULL_SCALE_MV)
         self._qick_awg_channels = (DEFAULT_QSTL_AWG_CHANNELS[0],)
         self._qick_repetitions_per_sweep = 1
+        self._experiment_thread: Optional[QtCore.QThread] = None
+        self._experiment_worker: Optional[QickExperimentWorker] = None
         self._grid_time_ns = 1000.0
         self._grid_voltage_mv = 100.0
         self._grid_snap_enabled = False
@@ -2498,8 +2742,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_readout_panel = RfReadoutPanel(
             self._pulse[0], time_unit=self._time_unit, parent=self
         )
+        self._experiment_panel = ExperimentPanel(
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            awg_channels=self._qick_awg_channels,
+            repetitions=self._qick_repetitions_per_sweep,
+            parent=self,
+        )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
+        self._experiment_panel.run_requested.connect(self._run_qick_experiment)
 
         self._time_unit_combo = QtWidgets.QComboBox()
         self._time_unit_combo.addItems(tuple(TIME_UNIT_NS))
@@ -2513,6 +2765,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._multi_ctrl, "AWG Outputs")
         self._control_tabs.addTab(self._rf_ports_panel, "RF Outputs")
         self._control_tabs.addTab(self._rf_readout_panel, "RF Readout")
+        self._control_tabs.addTab(self._experiment_panel, "Experiment")
         control_container = QtWidgets.QWidget(self)
         control_layout = QtWidgets.QVBoxLayout(control_container)
         control_layout.setContentsMargins(4, 4, 4, 4)
@@ -2637,6 +2890,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             for channel_index, channel in enumerate(self._qick_awg_channels)
             if channel_index != idx
         )
+        if hasattr(self, "_experiment_panel"):
+            self._experiment_panel.set_qick_values(
+                fabric_mhz=self._qick_fabric_mhz,
+                full_scale_mv=self._qick_full_scale_mv,
+                awg_channels=self._qick_awg_channels,
+                repetitions=self._qick_repetitions_per_sweep,
+            )
         self._cross_capacitance = np.delete(
             np.delete(self._cross_capacitance, idx, axis=0),
             idx,
@@ -3137,6 +3397,117 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
             )
 
+    def _experiment_run_arguments(self) -> dict:
+        values = self._experiment_panel.values(len(self._pulse))
+        self._qick_fabric_mhz = values["fabric_mhz"]
+        self._qick_full_scale_mv = values["full_scale_mv"]
+        self._qick_awg_channels = values["awg_channels"]
+        self._qick_repetitions_per_sweep = values["repetitions_per_sweep"]
+        rf_specs = self._rf_ports_panel.specs()
+        readout_spec = self._rf_readout_panel.spec()
+        if readout_spec is None:
+            raise ValueError(
+                "enable RF Readout before running so the 1 MSPS IQ trace can be saved"
+            )
+        rf_channels = {spec.gen_ch for spec in rf_specs}
+        overlap = rf_channels.intersection(self._qick_awg_channels)
+        if overlap:
+            raise ValueError(
+                "RF and AWG generator indices overlap: "
+                + ", ".join(str(channel) for channel in sorted(overlap))
+            )
+
+        sweep = self._sweep_specs[0] if len(self._sweep_specs) == 1 else None
+        sweeps = tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None
+        sequence = build_qick_sequence(
+            tuple(pulse.copy() for pulse in self._pulse),
+            output_names=self._qick_output_names(),
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            sweep=sweep,
+            sweeps=sweeps,
+            cross_capacitance=self._cross_capacitance.copy(),
+        )
+        time_ns, virtual_mv, physical_mv = transform_virtual_waveforms(
+            self._pulse,
+            self._cross_capacitance,
+        )
+        gui_settings = self._settings_to_dict()
+        gui_settings["waveforms"] = {
+            "time_ns": time_ns.tolist(),
+            "virtual_mv": virtual_mv.tolist(),
+            "physical_mv": physical_mv.tolist(),
+            "output_names": list(self._qick_output_names()),
+        }
+        return {
+            "connection_config": values["connection"],
+            "run_config": values["run"],
+            "sequence": sequence,
+            "awg_channels": self._qick_awg_channels,
+            "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+            "rf_specs": rf_specs,
+            "readout_spec": readout_spec,
+            "gui_settings": gui_settings,
+            "progress": False,
+        }
+
+    def _run_qick_experiment(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Experiment running",
+                "Wait for the current QICK experiment to finish.",
+            )
+            return
+        try:
+            arguments = self._experiment_run_arguments()
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot run experiment", str(exc))
+            return
+
+        self._experiment_panel.set_running(
+            True,
+            f"Connecting to {arguments['connection_config'].host} and running...",
+        )
+        self.statusBar().showMessage("QICK experiment running")
+        thread = QtCore.QThread(self)
+        worker = QickExperimentWorker(arguments)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_experiment_finished)
+        worker.failed.connect(self._on_experiment_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_experiment_finished(self, result) -> None:
+        self._experiment_panel.show_result(result)
+        self.statusBar().showMessage(
+            f"QCoDeS run {result.run_id} saved to {result.database_path}"
+        )
+
+    def _on_experiment_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown QICK experiment error"
+        self._experiment_panel.set_running(False, f"Failed: {summary}")
+        self.statusBar().showMessage("QICK experiment failed")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        dialog.setWindowTitle("QICK experiment failed")
+        dialog.setText(summary)
+        dialog.setDetailedText(details)
+        dialog.exec_()
+
+    def _clear_experiment_thread(self) -> None:
+        self._experiment_thread = None
+        self._experiment_worker = None
+
     def _refresh_rf_timeline(self, *, fit_view: bool = False) -> None:
         if RfPulseTimelineWidget is None:
             return
@@ -3277,6 +3648,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _settings_to_dict(self) -> dict:
         """Return every user-editable experiment setting in canonical units."""
+        experiment_values = self._experiment_panel.values(len(self._pulse))
+        connection = experiment_values["connection"]
+        run = experiment_values["run"]
+        self._qick_fabric_mhz = experiment_values["fabric_mhz"]
+        self._qick_full_scale_mv = experiment_values["full_scale_mv"]
+        self._qick_awg_channels = experiment_values["awg_channels"]
+        self._qick_repetitions_per_sweep = experiment_values[
+            "repetitions_per_sweep"
+        ]
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
@@ -3312,6 +3692,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "full_scale_mv": self._qick_full_scale_mv,
                 "awg_channels": list(self._qick_awg_channels),
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+            },
+            "experiment": {
+                "qick_host": connection.host,
+                "ns_port": connection.ns_port,
+                "proxy_name": connection.proxy_name,
+                "database_path": run.database_path,
+                "experiment_name": run.experiment_name,
+                "sample_name": run.sample_name,
+                "notes": run.notes,
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
@@ -3349,10 +3738,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise TypeError("settings JSON root must be an object")
         if data.get("schema") != SETTINGS_SCHEMA:
             raise ValueError(f"unsupported settings schema {data.get('schema')!r}")
-        if data.get("version") != SETTINGS_VERSION:
+        settings_version = data.get("version")
+        if settings_version not in {1, SETTINGS_VERSION}:
             raise ValueError(
-                f"unsupported settings version {data.get('version')!r}; "
-                f"expected {SETTINGS_VERSION}"
+                f"unsupported settings version {settings_version!r}; "
+                f"expected 1 or {SETTINGS_VERSION}"
             )
 
         display = data.get("display", {})
@@ -3451,6 +3841,31 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if len(set(awg_channels)) != len(awg_channels):
             raise ValueError("QICK AWG channels must be unique")
+
+        experiment = data.get("experiment", {})
+        if not isinstance(experiment, dict):
+            raise TypeError("experiment must be a JSON object")
+        connection_config = QickConnectionConfig(
+            host=str(experiment.get("qick_host", DEFAULT_QICK_HOST)),
+            ns_port=self._json_int(
+                experiment.get("ns_port", DEFAULT_QICK_NS_PORT),
+                "QICK nameserver port",
+                minimum=1,
+            ),
+            proxy_name=str(
+                experiment.get("proxy_name", DEFAULT_QICK_PROXY_NAME)
+            ),
+        )
+        run_config = QcodesRunConfig(
+            database_path=str(
+                experiment.get("database_path", DEFAULT_QCODES_DB_PATH)
+            ),
+            experiment_name=str(
+                experiment.get("experiment_name", "QICK pulse experiment")
+            ),
+            sample_name=str(experiment.get("sample_name", "PulseGenerator")),
+            notes=str(experiment.get("notes", "")),
+        )
 
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
         raw_rf_outputs = data.get("rf_outputs", [])
@@ -3579,6 +3994,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "full_scale_mv": full_scale_mv,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
+            "connection_config": connection_config,
+            "run_config": run_config,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
         }
@@ -3602,6 +4019,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_full_scale_mv = settings["full_scale_mv"]
         self._qick_awg_channels = tuple(settings["awg_channels"])
         self._qick_repetitions_per_sweep = settings["repetitions"]
+        self._experiment_panel.load_settings(
+            settings["connection_config"],
+            settings["run_config"],
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            awg_channels=self._qick_awg_channels,
+            repetitions=self._qick_repetitions_per_sweep,
+        )
 
         with QtCore.QSignalBlocker(self._time_unit_combo):
             self._time_unit_combo.setCurrentText(settings["time_unit"])
@@ -3766,6 +4191,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             return None
         try:
+            experiment_values = self._experiment_panel.values(len(self._pulse))
+            self._qick_fabric_mhz = experiment_values["fabric_mhz"]
+            self._qick_full_scale_mv = experiment_values["full_scale_mv"]
+            self._qick_awg_channels = experiment_values["awg_channels"]
+            self._qick_repetitions_per_sweep = experiment_values[
+                "repetitions_per_sweep"
+            ]
             set_names = qick_set_segment_names(self._pulse[0])
             self._rf_pulse_specs = list(self._rf_ports_panel.specs())
             self._rf_pulse_spec = (
@@ -3810,6 +4242,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_full_scale_mv = settings["full_scale_mv"]
         self._qick_awg_channels = tuple(settings["awg_channels"])
         self._qick_repetitions_per_sweep = settings["repetitions_per_sweep"]
+        self._experiment_panel.set_qick_values(
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            awg_channels=self._qick_awg_channels,
+            repetitions=self._qick_repetitions_per_sweep,
+        )
         self._cross_capacitance = np.asarray(
             settings["cross_capacitance"], dtype=float
         )
@@ -3913,6 +4351,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             *self._qick_awg_channels,
             self._next_qick_awg_channel(),
         )
+        if hasattr(self, "_experiment_panel"):
+            self._experiment_panel.set_qick_values(
+                fabric_mhz=self._qick_fabric_mhz,
+                full_scale_mv=self._qick_full_scale_mv,
+                awg_channels=self._qick_awg_channels,
+                repetitions=self._qick_repetitions_per_sweep,
+            )
         old_count = self._cross_capacitance.shape[0]
         expanded_coupling = np.eye(old_count + 1, dtype=float)
         expanded_coupling[:old_count, :old_count] = self._cross_capacitance
@@ -3991,6 +4436,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         trace.y_idx = idx
         trace.refresh_trace(self._pulse)
         trace.fit_view()
+
+    def closeEvent(self, event) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Experiment running",
+                "The QICK experiment is still running. Wait for it to finish before closing.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
