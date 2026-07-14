@@ -65,6 +65,22 @@ The run metadata includes the complete GUI settings, virtual and physical
 output waveforms, cross-capacitance matrix, RF output/readout settings, QICK
 connection settings, and the compiled program summary.
 
+AWG waveforms are stored as compact ordered vertices for every Cartesian sweep
+point, separately in `awg_virtual_vertices_json` and
+`awg_physical_vertices_json`. Connecting adjacent vertices reconstructs each
+complete SET/RAMP pulse; repeated times represent instantaneous SET changes.
+The full per-clock AWG trace is not duplicated in metadata.
+
+`point_index` is the zero-based flattened Cartesian sweep index, with the last
+sweep axis varying fastest. `time_us` is time within each triggered IQ trace
+and resets to zero for every repetition. At 1 MSPS it equals `sample_index` in
+microseconds.
+
+The Experiment tab reports real progress. The hardware interval follows the
+tProcessor completion counter, and the database interval follows the number of
+IQ sample rows flushed to SQLite. IQ rows are inserted in bounded batches to
+avoid the long post-pulse delay caused by one `add_result()` call per sample.
+
 ## Verification
 
 ```powershell

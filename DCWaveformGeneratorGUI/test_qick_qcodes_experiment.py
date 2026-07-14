@@ -10,10 +10,15 @@ import json
 import numpy as np
 
 from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
-from qick_fine_tune_sweep import AmplitudeSweep, FineTuneDdrResult
+from qick_fine_tune_sweep import (
+    AmplitudeSweep,
+    FineTuneDdrResult,
+    FineTuneSequence,
+)
 from qick_qcodes_experiment import (
     QcodesRunConfig,
     QickConnectionConfig,
+    build_awg_vertex_metadata,
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
     connect_qick,
@@ -53,6 +58,7 @@ def _gui_metadata():
             "physical_mv": [[100.0, 100.0]],
         },
         "awg": {"cross_capacitance": [[1.0]]},
+        "qick": {"fabric_mhz": 300.0, "full_scale_mv": 100.0},
         "rf_outputs": [{"frequency_mhz": 50.0, "gain": 12000}],
         "rf_readout": {"readout_frequency_mhz": 25.0},
     }
@@ -60,6 +66,15 @@ def _gui_metadata():
 
 def test_store_qick_result_writes_trace_rows_and_metadata(tmp_path):
     database_path = tmp_path / "qick_trace.db"
+    progress_updates = []
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 10)
+    gui_metadata = _gui_metadata()
+    gui_metadata["awg_waveform_vertices"] = build_awg_vertex_metadata(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+    )
     dataset, row_count = store_qick_result(
         _ddr_result(),
         run_config=QcodesRunConfig(
@@ -70,8 +85,12 @@ def test_store_qick_result_writes_trace_rows_and_metadata(tmp_path):
         ),
         connection_config=QickConnectionConfig("192.0.2.10", 8888, "myqick"),
         program_summary={"program_instructions": 42},
-        gui_settings=_gui_metadata(),
+        gui_settings=gui_metadata,
         rf_settings={"outputs": [[10.0, 12.0]], "readout": 20.0},
+        progress_callback=lambda percent, message: progress_updates.append(
+            (percent, message)
+        ),
+        batch_rows=5,
     )
 
     assert database_path.exists()
@@ -88,7 +107,43 @@ def test_store_qick_result_writes_trace_rows_and_metadata(tmp_path):
     metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
     assert metadata["qick_connection"]["host"] == "192.0.2.10"
     assert metadata["measurement_layout"]["iq_shape"] == [2, 2, 3, 2]
+    assert "flattened Cartesian sweep index" in metadata["measurement_layout"][
+        "setpoint_meanings"
+    ]["point_index"]
     assert json.loads(dataset.get_metadata("cross_capacitance_json")) == [[1.0]]
+    assert json.loads(dataset.get_metadata("awg_virtual_vertices_json"))[
+        "values_mv"
+    ] == [[[0.0, 0.0]]]
+    assert json.loads(dataset.get_metadata("awg_physical_vertices_json"))[
+        "values_mv"
+    ] == [[[0.0, 0.0]]]
+    assert progress_updates[0][0] == 65
+    assert progress_updates[-1][0] == 99
+    assert [item[0] for item in progress_updates] == sorted(
+        item[0] for item in progress_updates
+    )
+
+
+def test_awg_vertex_metadata_stores_all_sweep_points_in_both_spaces():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.set_cross_capacitance(((1.0, 0.0), (0.5, 1.0)))
+    sequence.add_set("start", (0.0, 0.0), 10)
+    sequence.add_ramp("to_gate", 5)
+    sequence.add_set("gate", (0.2, -0.1), 15)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.2, 0.2, 3)
+
+    metadata = build_awg_vertex_metadata(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+    )
+    virtual = metadata["virtual"]
+    physical = metadata["physical"]
+    assert virtual["time_cycles"] == [0.0, 10.0, 15.0, 30.0]
+    assert virtual["time_us"] == [0.0, 10 / 300, 15 / 300, 30 / 300]
+    assert virtual["value_shape"] == [3, 2, 4]
+    assert virtual["values_mv"][0][0] == [0.0, 0.0, -20.0, -20.0]
+    assert physical["values_mv"][0][1] == [0.0, 0.0, -20.0, -20.0]
 
 
 def test_runtime_configs_use_actual_qick_clocks():
@@ -112,6 +167,7 @@ def test_runtime_configs_use_actual_qick_clocks():
 def test_connect_and_run_support_injected_qick_server(tmp_path):
     ddr_result = _ddr_result()
     calls = []
+    progress_updates = []
 
     class FakeSoc:
         def rfb_set_gen_rf(self, gen_ch, att1, att2):
@@ -126,8 +182,12 @@ def test_connect_and_run_support_injected_qick_server(tmp_path):
             calls.append(("filter", ro_ch, kwargs))
 
     class FakeProgram:
-        def acquire_fir_ddr(self, soc, progress=False):
+        def acquire_fir_ddr(self, soc, progress=False, counter_progress=None):
             calls.append(("acquire", soc, progress))
+            if counter_progress is not None:
+                counter_progress(0, 4)
+                counter_progress(2, 4)
+                counter_progress(4, 4)
             return ddr_result
 
         def summary(self):
@@ -166,9 +226,17 @@ def test_connect_and_run_support_injected_qick_server(tmp_path):
         readout_spec=QickDdrReadoutSpec(0, "set_0", 0.0, 3),
         gui_settings=_gui_metadata(),
         connector=connector,
+        progress_callback=lambda percent, message: progress_updates.append(
+            (percent, message)
+        ),
     )
 
     assert result.row_count == 12
     assert result.database_path.exists()
     assert calls.count(("gen", 0, 5.0, 6.0)) == 1
     assert any(call[0] == "acquire" for call in calls)
+    assert progress_updates[0][0] == 0
+    assert progress_updates[-1] == (100, "Experiment saved")
+    assert any(percent == 32 for percent, _ in progress_updates)
+    assert any(percent == 55 for percent, _ in progress_updates)
+    assert any(percent == 60 for percent, _ in progress_updates)

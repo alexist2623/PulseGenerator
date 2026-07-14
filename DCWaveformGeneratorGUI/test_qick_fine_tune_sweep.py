@@ -196,3 +196,71 @@ def test_set_duration_excludes_startup_lead_and_hides_ramp_pipeline():
     assert command_cycles[commands_per_point] - command_cycles[0] == (
         program.timing["point_end"] + program.recovery_tproc_cycles
     )
+
+
+def test_waveform_vertices_reconstruct_swept_virtual_and_physical_pulses():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.set_cross_capacitance(((1.0, 0.0), (0.5, 1.0)))
+    sequence.add_set("start", (0.0, 0.0), 10)
+    sequence.add_ramp("to_gate", 5)
+    sequence.add_set("gate", (0.4, -0.2), 8)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.4, 0.4, 3)
+
+    virtual_t, virtual, _ = sequence.waveform_vertices(0, space="virtual")
+    physical_t, physical, _ = sequence.waveform_vertices(0, space="physical")
+    assert virtual_t.tolist() == [0.0, 10.0, 15.0, 23.0]
+    assert physical_t.tolist() == virtual_t.tolist()
+    assert virtual["awg_0"].tolist() == [0.0, 0.0, -0.4, -0.4]
+    assert virtual["awg_1"].tolist() == [0.0, 0.0, -0.2, -0.2]
+    assert physical["awg_0"].tolist() == [0.0, 0.0, -0.4, -0.4]
+    assert physical["awg_1"].tolist() == [0.0, 0.0, -0.4, -0.4]
+
+    jump = FineTuneSequence(("awg_0",))
+    jump.add_set("low", (0.0,), 10)
+    jump.add_set("high", (1.0,), 5)
+    jump_t, jump_values, _ = jump.waveform_vertices(space="virtual")
+    assert jump_t.tolist() == [0.0, 10.0, 10.0, 15.0]
+    assert jump_values["awg_0"].tolist() == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_counter_progress_tracks_hardware_sweep_and_repetition_count():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 10)
+    sequence.set_amplitude_sweep("start", "awg_0", -0.2, 0.2, 3)
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        repetitions_per_sweep=2,
+    )
+    calls = []
+
+    class FakeSoc:
+        counts = iter((0, 2, 6))
+
+        def reload_mem(self):
+            calls.append("reload")
+
+        def clear_tproc_counter(self, addr):
+            calls.append(("clear", addr))
+
+        def start_src(self, source):
+            calls.append(("source", source))
+
+        def start_tproc(self):
+            calls.append("start")
+
+        def get_tproc_counter(self, addr):
+            calls.append(("counter", addr))
+            return next(self.counts)
+
+    program.config_all = lambda *args, **kwargs: calls.append("config")
+    progress = []
+    program._run_rounds_with_counter_progress(
+        FakeSoc(),
+        lambda completed, total: progress.append((completed, total)),
+        poll_interval_seconds=0.0,
+    )
+
+    assert progress == [(0, 6), (0, 6), (2, 6), (6, 6)]
+    assert calls.count("start") == 1
+    assert calls[-1] == ("source", "internal")

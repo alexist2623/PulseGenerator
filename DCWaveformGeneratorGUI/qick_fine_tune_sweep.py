@@ -663,6 +663,73 @@ class FineTuneSequence:
             return self._set_amplitudes_at(point_index, segment_index + 1)
         return self._set_amplitudes_at(point_index, segment_index)
 
+    def waveform_vertices(
+        self,
+        point_index: int = 0,
+        *,
+        space: str = "physical",
+    ):
+        """Return the minimum ordered vertices needed to reconstruct a pulse.
+
+        Adjacent vertices are joined by straight lines. Equal adjacent times
+        with different values represent an instantaneous SET transition.
+        RAMP interiors are intentionally omitted because their two endpoints
+        fully define the linear segment.
+        """
+        self._validate()
+        if space == "physical":
+            amplitude_getter = self.amplitudes_at
+        elif space == "virtual":
+            amplitude_getter = self.virtual_amplitudes_at
+        else:
+            raise ValueError("space must be 'physical' or 'virtual'")
+
+        current = np.asarray(amplitude_getter(point_index, 0), dtype=float)
+        times = []
+        vertices = []
+        boundaries = []
+
+        def append_vertex(time_value: float) -> None:
+            if (
+                times
+                and time_value == times[-1]
+                and np.array_equal(current, vertices[-1])
+            ):
+                return
+            times.append(float(time_value))
+            vertices.append(current.copy())
+
+        time_now = 0.0
+        append_vertex(time_now)
+        for segment_index, segment in enumerate(self.segments):
+            start_time = time_now
+            targets = amplitude_getter(point_index, segment_index)
+            if segment.kind == "set":
+                if segment_index != 0:
+                    for output_index, target in enumerate(targets):
+                        if target is not None:
+                            current[output_index] = float(target)
+                    append_vertex(time_now)
+                time_now += segment.duration_cycles
+                append_vertex(time_now)
+            else:
+                for output_index, target in enumerate(targets):
+                    if target is not None:
+                        current[output_index] = float(target)
+                time_now += segment.duration_cycles
+                append_vertex(time_now)
+            boundaries.append((segment.name, start_time, time_now))
+
+        vertex_matrix = np.asarray(vertices, dtype=float).T
+        return (
+            np.asarray(times, dtype=float),
+            {
+                name: vertex_matrix[index]
+                for index, name in enumerate(self.output_names)
+            },
+            tuple(boundaries),
+        )
+
     def sample_waveforms(
         self,
         point_index: int = 0,
@@ -1711,7 +1778,49 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def update(self):
         pass
 
-    def acquire_fir_ddr(self, soc, *, progress: bool = True, **run_kwargs):
+    def _run_rounds_with_counter_progress(
+        self,
+        soc,
+        progress_callback,
+        *,
+        poll_interval_seconds: float = 0.02,
+    ) -> None:
+        """Run without readout streaming and report the real tProc loop count."""
+        import time
+
+        total_per_round = int(np.prod(self.loop_dims, dtype=np.int64))
+        rounds = int(self.rounds)
+        total = total_per_round * rounds
+        self.config_all(soc, load_envelopes=True, load_mem=False)
+        progress_callback(0, total)
+        completed_rounds = 0
+        try:
+            for _round_index in range(rounds):
+                soc.reload_mem()
+                soc.clear_tproc_counter(addr=self.counter_addr)
+                soc.start_src("internal")
+                soc.start_tproc()
+                count = 0
+                while count < total_per_round:
+                    count = min(
+                        total_per_round,
+                        int(soc.get_tproc_counter(addr=self.counter_addr)),
+                    )
+                    progress_callback(completed_rounds + count, total)
+                    if count < total_per_round:
+                        time.sleep(poll_interval_seconds)
+                completed_rounds += total_per_round
+        finally:
+            soc.start_src("internal")
+
+    def acquire_fir_ddr(
+        self,
+        soc,
+        *,
+        progress: bool = True,
+        counter_progress=None,
+        **run_kwargs,
+    ):
         """Arm DDR, execute all sweep repetitions, and return grouped 1 MSPS IQ.
 
         The nested hardware loops run Cartesian-point-major and
@@ -1735,7 +1844,16 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             stride_bytes=ddr.stride_bytes,
             force_overwrite=ddr.force_overwrite,
         )
-        self.run_rounds(soc, progress=progress, **run_kwargs)
+        if counter_progress is None:
+            self.run_rounds(soc, progress=progress, **run_kwargs)
+        else:
+            if run_kwargs:
+                unexpected = ", ".join(sorted(run_kwargs))
+                raise TypeError(
+                    "counter-progress execution does not support extra run "
+                    f"arguments: {unexpected}"
+                )
+            self._run_rounds_with_counter_progress(soc, counter_progress)
         if ddr.settle_seconds:
             time.sleep(float(ddr.settle_seconds))
         raw = np.asarray(soc.get_ddr4_fir_samples(

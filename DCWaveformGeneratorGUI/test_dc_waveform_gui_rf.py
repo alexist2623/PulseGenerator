@@ -286,10 +286,17 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert arguments["run_config"].resolved_database_path == (tmp_path / "run.db")
     assert arguments["awg_channels"] == (1,)
     assert arguments["readout_spec"].samples_per_trigger == 32
-    assert arguments["gui_settings"]["waveforms"]["time_ns"] == [0.0, 1000.0]
-    assert arguments["gui_settings"]["waveforms"]["physical_mv"] == [
-        [100.0, 100.0]
+    assert "waveforms" not in arguments["gui_settings"]
+    assert arguments["gui_settings"]["awg"]["outputs"][0]["time_ns"] == [
+        0.0,
+        1000.0,
     ]
+    window._experiment_panel.set_running(True, "Starting")
+    window._experiment_panel.update_progress(47, "Saving QCoDeS IQ rows")
+    assert window._experiment_panel.progress.minimum() == 0
+    assert window._experiment_panel.progress.maximum() == 100
+    assert window._experiment_panel.progress.value() == 47
+    assert "47%" in window._experiment_panel.run_status.text()
     app.processEvents()
     window.close()
 

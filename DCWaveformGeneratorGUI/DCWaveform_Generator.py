@@ -2205,7 +2205,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         self.run_button.clicked.connect(self.run_requested.emit)
         self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("%p%")
         self.progress.hide()
         self.run_status = QtWidgets.QLabel("Ready")
         self.run_status.setWordWrap(True)
@@ -2315,8 +2317,15 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
+        if running:
+            self.progress.setValue(0)
         self.progress.setVisible(running)
         self.run_status.setText(message)
+
+    def update_progress(self, percent: int, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        self.progress.setValue(percent)
+        self.run_status.setText(f"{percent}% - {message}")
 
     def show_result(self, result) -> None:
         self.set_running(
@@ -2331,6 +2340,7 @@ class QickExperimentWorker(QtCore.QObject):
 
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
 
     def __init__(self, kwargs: dict, parent=None):
         super().__init__(parent)
@@ -2339,7 +2349,9 @@ class QickExperimentWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            result = run_qick_qcodes_experiment(**self._kwargs)
+            kwargs = dict(self._kwargs)
+            kwargs["progress_callback"] = self.progress_changed.emit
+            result = run_qick_qcodes_experiment(**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -3428,17 +3440,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             sweeps=sweeps,
             cross_capacitance=self._cross_capacitance.copy(),
         )
-        time_ns, virtual_mv, physical_mv = transform_virtual_waveforms(
-            self._pulse,
-            self._cross_capacitance,
-        )
         gui_settings = self._settings_to_dict()
-        gui_settings["waveforms"] = {
-            "time_ns": time_ns.tolist(),
-            "virtual_mv": virtual_mv.tolist(),
-            "physical_mv": physical_mv.tolist(),
-            "output_names": list(self._qick_output_names()),
-        }
         return {
             "connection_config": values["connection"],
             "run_config": values["run"],
@@ -3465,9 +3467,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             QtWidgets.QMessageBox.warning(self, "Cannot run experiment", str(exc))
             return
 
+        expected_rows = (
+            arguments["sequence"].sweep_point_count
+            * arguments["repetitions_per_sweep"]
+            * arguments["readout_spec"].samples_per_trigger
+        )
         self._experiment_panel.set_running(
             True,
-            f"Connecting to {arguments['connection_config'].host} and running...",
+            f"0% - Preparing {expected_rows:,} IQ sample rows",
         )
         self.statusBar().showMessage("QICK experiment running")
         thread = QtCore.QThread(self)
@@ -3476,6 +3483,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_experiment_finished)
         worker.failed.connect(self._on_experiment_failed)
+        worker.progress_changed.connect(self._on_experiment_progress)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -3485,6 +3493,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _on_experiment_progress(self, percent: int, message: str) -> None:
+        self._experiment_panel.update_progress(percent, message)
+        self.statusBar().showMessage(f"QICK experiment {percent}%: {message}")
 
     def _on_experiment_finished(self, result) -> None:
         self._experiment_panel.show_result(result)
