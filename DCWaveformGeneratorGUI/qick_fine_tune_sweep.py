@@ -8,9 +8,10 @@ automatically targets the following SET level.  ``None`` on a SET means that
 an output holds its previous value.
 
 Independent sweep axes are expanded as a Cartesian product, with the last
-axis varying fastest.  The sweep program is deliberately unrolled over those
-combinations.  This keeps requested float endpoints exact after DAC
-quantization and recalculates every dependent RAMP for every coordinate.
+axis varying fastest.  Sweep points and repetitions execute as nested
+tProcessor hardware loops.  SET target and dependent RAMP target/step values
+are held in tProcessor registers and advanced directly with add instructions;
+there is no point table and no sweep-point PMEM unrolling.
 
 An optional cross-capacitance matrix maps all virtual SET/RAMP waveforms to
 the physical AWG outputs with ``physical = matrix @ virtual``.  It therefore
@@ -26,7 +27,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from math import ceil, isfinite
 from numbers import Integral, Real
@@ -122,6 +123,14 @@ def _div_trunc_zero(numerator: int, denominator: int) -> int:
         raise ZeroDivisionError("division by zero")
     sign = -1 if (numerator < 0) ^ (denominator < 0) else 1
     return sign * (abs(numerator) // abs(denominator))
+
+
+def _round_div_nearest(numerator: int, denominator: int) -> int:
+    """Round an integer ratio to nearest, with ties away from zero."""
+    if denominator <= 0:
+        raise ValueError("denominator must be positive")
+    sign = -1 if numerator < 0 else 1
+    return sign * ((abs(int(numerator)) + denominator // 2) // denominator)
 
 
 @dataclass(frozen=True)
@@ -927,10 +936,13 @@ def compile_sequence(
 class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     """ASM v1 program generated from :class:`FineTuneSequence`.
 
-    Sweep points are unrolled in PMEM while repetitions remain a hardware
-    loop.  Commands sharing one tProcessor AXIS port are separated by the
-    configured number of tProcessor cycles, which supports TMUX fanout to as
-    many as eight AWG tuning outputs without same-port/same-cycle collisions.
+    Sweep points and repetitions are both hardware loops.  Variable SET
+    targets and dependent RAMP target/step fields live in tProcessor
+    registers.  Nested Cartesian loops advance and reset those fields with
+    register adds; no per-point command or delta table is stored.
+    Commands sharing one tProcessor AXIS port are separated by the configured
+    number of tProcessor cycles, which supports TMUX fanout to as many as
+    eight AWG tuning outputs without same-port/same-cycle collisions.
     """
 
     def __init__(
@@ -997,6 +1009,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.awg_channels, self.compiled_points = compile_sequence(
             self.sequence, self.soccfg, self.awg_channel_spec
         )
+        self._build_sweep_register_plan()
         self._channel_slots = self._build_channel_slots()
         self.timing = self._build_timing()
         self.aux_timing = {}
@@ -1017,6 +1030,198 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 length=ro.length,
                 phrst=ro.phrst,
             )
+
+    @staticmethod
+    def _command_key(command: CompiledCommand) -> Tuple[int, int]:
+        return command.segment_index, command.output_index
+
+    def _build_sweep_register_plan(self):
+        """Map Cartesian sweep axes to tProcessor register increments."""
+        command_maps = []
+        command_order = []
+        for point_index, point in enumerate(self.compiled_points):
+            point_map = {}
+            for commands in point.segment_commands:
+                for command in commands:
+                    key = self._command_key(command)
+                    if key in point_map:
+                        raise RuntimeError(f"duplicate compiled command key {key}")
+                    point_map[key] = command
+                    if point_index == 0:
+                        command_order.append(key)
+            command_maps.append(point_map)
+
+        expected_keys = set(command_order)
+        for point_index, point_map in enumerate(command_maps[1:], start=1):
+            if set(point_map) != expected_keys:
+                raise RuntimeError(
+                    f"sweep point {point_index} changes the active AWG command set"
+                )
+
+        sweep_axes = self.sequence.sweep_axes
+        sweep_shape = tuple(axis.count for axis in sweep_axes)
+        models = {}
+        for key in command_order:
+            first_command = command_maps[0][key]
+            for register_name, word_index in (("target", 0), ("step", 3)):
+                if register_name == "target":
+                    base = int(first_command.target_code)
+                    quantum = 1 << int(
+                        self.soccfg["gens"][first_command.gen_ch].get(
+                            "dac_invalid_lsb", 2
+                        )
+                    )
+                else:
+                    base = int(first_command.step)
+                    quantum = 1
+
+                axis_deltas = []
+                for axis_index, axis in enumerate(sweep_axes):
+                    if axis.count <= 1:
+                        axis_deltas.append(0)
+                        continue
+                    indices = [0] * len(sweep_axes)
+                    indices[axis_index] = axis.count - 1
+                    endpoint_index = int(
+                        np.ravel_multi_index(tuple(indices), sweep_shape, order="C")
+                    )
+                    endpoint_command = command_maps[endpoint_index][key]
+                    endpoint = int(
+                        endpoint_command.target_code
+                        if register_name == "target"
+                        else endpoint_command.step
+                    )
+                    units = _round_div_nearest(
+                        endpoint - base,
+                        (axis.count - 1) * quantum,
+                    )
+                    axis_deltas.append(units * quantum)
+                models[(key[0], key[1], register_name)] = {
+                    "key": (key[0], key[1], register_name),
+                    "command_key": key,
+                    "register_name": register_name,
+                    "word_index": word_index,
+                    "base": base,
+                    "axis_deltas": tuple(axis_deltas),
+                }
+
+        requested_points = self.compiled_points
+        actual_points = []
+        max_target_error = 0
+        max_step_error = 0
+        for point_index, requested_point in enumerate(requested_points):
+            if sweep_axes:
+                indices = np.unravel_index(point_index, sweep_shape, order="C")
+            else:
+                indices = ()
+            actual_segments = []
+            for commands in requested_point.segment_commands:
+                actual_commands = []
+                for command in commands:
+                    target_model = models[
+                        (command.segment_index, command.output_index, "target")
+                    ]
+                    step_model = models[
+                        (command.segment_index, command.output_index, "step")
+                    ]
+                    target = int(target_model["base"]) + sum(
+                        int(index) * int(delta)
+                        for index, delta in zip(indices, target_model["axis_deltas"])
+                    )
+                    step = int(step_model["base"]) + sum(
+                        int(index) * int(delta)
+                        for index, delta in zip(indices, step_model["axis_deltas"])
+                    )
+                    gen_cfg = self.soccfg["gens"][command.gen_ch]
+                    opcode = OP_SET if command.kind == "set" else OP_RAMP
+                    words = _pack_command_words(
+                        gen_cfg,
+                        target,
+                        command.duration_samples,
+                        step,
+                        opcode,
+                    )
+                    actual_commands.append(
+                        replace(command, target_code=target, step=step, words=words)
+                    )
+                    max_target_error = max(
+                        max_target_error, abs(target - int(command.target_code))
+                    )
+                    max_step_error = max(max_step_error, abs(step - int(command.step)))
+                actual_segments.append(tuple(actual_commands))
+            actual_points.append(
+                replace(requested_point, segment_commands=tuple(actual_segments))
+            )
+
+        self.requested_compiled_points = requested_points
+        self.compiled_points = tuple(actual_points)
+
+        fields = []
+        for model in models.values():
+            if not any(model["axis_deltas"]):
+                continue
+            first_command = command_maps[0][model["command_key"]]
+            page, command_register = self._gen_regmap[
+                (first_command.gen_ch, model["register_name"])
+            ]
+            field = dict(model)
+            field.update({
+                "page": int(page),
+                "command_register": int(command_register),
+            })
+            fields.append(field)
+
+        occupied = {page: {0} for page in range(8)}
+        for register_map in (self._gen_regmap, self._ro_regmap):
+            for page, register in register_map.values():
+                occupied[int(page)].add(int(register))
+        # These are used below for the shot count, repetition loop, and trigger.
+        occupied[0].update((13, 15, 16))
+
+        for field in fields:
+            page = field["page"]
+            available = [
+                register for register in range(1, 32) if register not in occupied[page]
+            ]
+            if not available:
+                raise RuntimeError(
+                    f"register page {page} has no room for direct sweep state "
+                    f"{field['key']}"
+                )
+            field["state_register"] = available[0]
+            occupied[page].add(available[0])
+
+        axis_runtime = {}
+        for axis_index, axis in enumerate(sweep_axes):
+            if axis.count <= 1:
+                continue
+            allocated = None
+            for page in range(8):
+                available = [
+                    register
+                    for register in range(1, 32)
+                    if register not in occupied[page]
+                ]
+                if available:
+                    allocated = (page, available[0])
+                    occupied[page].add(available[0])
+                    break
+            if allocated is None:
+                raise RuntimeError(
+                    f"no tProcessor register is available for sweep axis {axis_index}"
+                )
+            axis_runtime[axis_index] = {
+                "counter_page": allocated[0],
+                "counter_register": allocated[1],
+                "count": int(axis.count),
+            }
+
+        self._sweep_models = models
+        self._sweep_fields = tuple(fields)
+        self._sweep_field_by_key = {field["key"]: field for field in fields}
+        self._sweep_axis_runtime = axis_runtime
+        self._sweep_max_target_error = int(max_target_error)
+        self._sweep_max_step_error = int(max_step_error)
 
     def _segment_index(self, name: str, *, require_set: bool = False) -> int:
         names = [segment.name for segment in self.sequence.segments]
@@ -1146,8 +1351,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             group_delay = self._fir_cfg["group_delay_input_samples"]
             warmup_cycles = int(ceil(group_delay * f_time / input_fs))
             readout_start = trigger_time - warmup_cycles
-            if readout_start < self.command_lead_tproc_cycles:
-                shift = self.command_lead_tproc_cycles - readout_start
+            if readout_start < 0:
+                shift = -readout_start
                 self._shift_timing(shift)
                 trigger_time += shift
                 readout_start += shift
@@ -1224,7 +1429,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         command_times = {}
         segment_starts = []
         segment_ends = []
-        time_now = self.command_lead_tproc_cycles
+        # Command timestamps are point-relative. The startup lead is applied
+        # once with synci before entering the hardware sweep loops, rather than
+        # being inserted again before every SET at every point/repetition.
+        time_now = 0
         for segment_index, segment in enumerate(self.sequence.segments):
             segment_starts.append(time_now)
             active = {
@@ -1239,17 +1447,35 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         time_now + self._fabric_to_tproc(gen_ch, segment.duration_cycles)
                     )
                     continue
-                command_time = time_now + self._channel_slots[gen_ch]
-                command_times[(segment_index, output_index)] = command_time
                 if segment.kind == "ramp":
                     gen_cfg = self.soccfg["gens"][gen_ch]
+                    startup_cycles = int(
+                        gen_cfg.get("ramp_startup_latency_cycles", 5)
+                    )
+                    startup_tproc = self._fabric_to_tproc(
+                        gen_ch, startup_cycles
+                    )
+                    # Dispatch the RAMP before the logical segment boundary.
+                    # Its pipeline then starts changing the DAC at the end of
+                    # the preceding SET instead of extending that SET.
+                    command_time = (
+                        time_now
+                        - startup_tproc
+                        + self._channel_slots[gen_ch]
+                    )
+                    if command_time < 0:
+                        raise ValueError(
+                            "the first SET is too short to hide AWG RAMP startup latency"
+                        )
                     occupancy = (
                         segment.duration_cycles
-                        + int(gen_cfg.get("ramp_startup_latency_cycles", 5))
+                        + startup_cycles
                         + int(gen_cfg.get("ramp_guard_cycles", 1))
                     )
                 else:
+                    command_time = time_now + self._channel_slots[gen_ch]
                     occupancy = segment.duration_cycles
+                command_times[(segment_index, output_index)] = command_time
                 output_end_times.append(
                     command_time + self._fabric_to_tproc(gen_ch, occupancy)
                 )
@@ -1264,6 +1490,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         }
 
     def _emit_command(self, command: CompiledCommand, tproc_time: int):
+        """Emit one command, copying swept fields from tProcessor state regs."""
         gen_ch = command.gen_ch
         page = self._gen_regmap[(gen_ch, "target")][0]
         regs = []
@@ -1271,12 +1498,30 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             reg_page, reg = self._gen_regmap[(gen_ch, register_name)]
             if reg_page != page:
                 raise RuntimeError("AWG command registers must share one register page")
-            self.safe_regwi(
-                page,
-                reg,
-                int(word),
-                f"{command.output_name}:{command.segment_name}:{register_name}",
+            field = self._sweep_field_by_key.get(
+                (command.segment_index, command.output_index, register_name)
             )
+            comment = f"{command.output_name}:{command.segment_name}:{register_name}"
+            if field is None:
+                self.safe_regwi(page, reg, int(word), comment)
+            elif register_name == "step":
+                self.bitwi(
+                    page,
+                    reg,
+                    int(field["state_register"]),
+                    "&",
+                    0xFFFFFF,
+                    comment,
+                )
+            else:
+                self.mathi(
+                    page,
+                    reg,
+                    int(field["state_register"]),
+                    "+",
+                    0,
+                    comment,
+                )
             regs.append(reg)
         _, time_reg = self._gen_regmap[(gen_ch, "t")]
         self.safe_regwi(page, time_reg, int(tproc_time), f"{command.segment_name} t")
@@ -1288,8 +1533,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             f"{command.output_name}:{command.segment_name}",
         )
 
-    def _emit_point(self, point_index: int):
-        point = self.compiled_points[point_index]
+    def _emit_point(self):
+        # The instruction body is point-independent. Swept SET/RAMP fields are
+        # copied from state registers immediately before each command.
+        point = self.compiled_points[0]
         for segment_index, commands in enumerate(point.segment_commands):
             for command in commands:
                 command_time = self.timing["command_times"][(
@@ -1340,24 +1587,86 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         self.sync_all(self.recovery_tproc_cycles)
 
+    def _emit_axis_adds(self, axis_index: int, *, reset: bool = False):
+        """Advance or reset one Cartesian axis using register-immediate adds."""
+        axis = self.sequence.sweep_axes[axis_index]
+        multiplier = -(axis.count - 1) if reset else 1
+        action = "reset" if reset else "advance"
+        for field in self._sweep_fields:
+            amount = int(field["axis_deltas"][axis_index]) * multiplier
+            if amount == 0:
+                continue
+            page = int(field["page"])
+            state_register = int(field["state_register"])
+            self.mathi(
+                page,
+                state_register,
+                state_register,
+                "+",
+                amount,
+                f"{action} axis {axis_index} {field['key']}",
+            )
+
     def make_program(self):
-        """Unroll exact sweep points and retain a hardware repetition loop."""
+        """Emit nested point/repetition loops and register-add sweep updates."""
         rcount = 13
         rrep = 15
         self.initialize()
         self.regwi(0, rcount, 0)
-        for point_index in range(self.sequence.sweep_point_count):
-            label = f"FINE_TUNE_REP_{point_index}"
-            self.regwi(0, rrep, self.cfg["reps"] - 1)
-            self.label(label)
-            self._emit_point(point_index)
-            self.mathi(0, rcount, rcount, "+", 1)
-            self.memwi(0, rcount, self.COUNTER_ADDR)
-            self.loopnz(0, rrep, label)
+        for field in self._sweep_fields:
+            self.safe_regwi(
+                int(field["page"]),
+                int(field["state_register"]),
+                int(field["base"]),
+                f"initialize direct sweep state {field['key']}",
+            )
+        active_axes = tuple(sorted(self._sweep_axis_runtime))
+        for axis_index in active_axes:
+            runtime = self._sweep_axis_runtime[axis_index]
+            self.safe_regwi(
+                int(runtime["counter_page"]),
+                int(runtime["counter_register"]),
+                int(runtime["count"]) - 1,
+                f"initialize sweep axis {axis_index} counter",
+            )
+        if self.command_lead_tproc_cycles:
+            self.synci(self.command_lead_tproc_cycles)
+
+        self.label("FINE_TUNE_POINT")
+        self.regwi(0, rrep, self.cfg["reps"] - 1)
+        self.label("FINE_TUNE_REP")
+        self._emit_point()
+        self.mathi(0, rcount, rcount, "+", 1)
+        self.memwi(0, rcount, self.COUNTER_ADDR)
+        self.loopnz(0, rrep, "FINE_TUNE_REP")
+
+        # The last axis varies fastest. A finished inner loop is reset before
+        # the next outer axis is advanced, matching itertools.product order.
+        for position in range(len(active_axes) - 1, -1, -1):
+            axis_index = active_axes[position]
+            runtime = self._sweep_axis_runtime[axis_index]
+            page = int(runtime["counter_page"])
+            register = int(runtime["counter_register"])
+            self.loopnz(page, register, f"FINE_TUNE_ADVANCE_{axis_index}")
+            if position > 0:
+                self.safe_regwi(
+                    page,
+                    register,
+                    int(runtime["count"]) - 1,
+                    f"reload sweep axis {axis_index} counter",
+                )
+                self._emit_axis_adds(axis_index, reset=True)
         self.end()
 
+        for axis_index in active_axes:
+            self.label(f"FINE_TUNE_ADVANCE_{axis_index}")
+            self._emit_axis_adds(axis_index)
+            self.condj(0, 0, "==", 0, "FINE_TUNE_POINT")
+
     def body(self):
-        raise RuntimeError("FineTuneAmplitudeSweepProgram uses an unrolled make_program()")
+        raise RuntimeError(
+            "FineTuneAmplitudeSweepProgram uses nested hardware loops in make_program()"
+        )
 
     def update(self):
         pass
@@ -1365,7 +1674,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def acquire_fir_ddr(self, soc, *, progress: bool = True, **run_kwargs):
         """Arm DDR, execute all sweep repetitions, and return grouped 1 MSPS IQ.
 
-        The trigger order in PMEM is Cartesian-point-major and
+        The nested hardware loops run Cartesian-point-major and
         repetition-minor, so the flat DDR stream is reshaped to
         ``(point_count, N, samples, I/Q)``.  ``result.iq_grid`` restores the
         independent sweep axes before the repetition dimension.
@@ -1429,6 +1738,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "commands_per_point": sum(
                 len(commands) for commands in self.compiled_points[0].segment_commands
             ),
+            "sweep_execution": "tproc_loop_and_add",
+            "sweep_dynamic_register_fields": len(self._sweep_fields),
+            "sweep_uses_point_table": False,
+            "sweep_max_target_quantization_error": self._sweep_max_target_error,
+            "sweep_max_step_quantization_error": self._sweep_max_step_error,
+            "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
             "point_end_tproc_cycles": self.timing["point_end"],
             "program_instructions": len(self.prog_list),
             "rf_pulse": self.rf_pulse_config is not None,
