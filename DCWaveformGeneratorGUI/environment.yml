@@ -1,0 +1,12 @@
+name: pulse_generator_gui
+channels:
+  - defaults
+dependencies:
+  - python=3.11.15
+  - pip
+  - pip:
+      - numpy==2.4.6
+      - PyQt5==5.15.11
+      - pyqtgraph==0.14.0
+      - matplotlib==3.11.0
+      - pytest==9.0.3

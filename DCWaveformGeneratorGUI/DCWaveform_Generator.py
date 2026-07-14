@@ -150,8 +150,8 @@ class _MatplotlibTracePlotWidget(Canvas):
             self.ax.cla()
             self.draw_idle()
             return
-        margin_x = 0.03 * (np.ptp(self._pulse[self.x_idx].v) + 1e-12) or 0.5
-        margin_y = 0.10 * (np.ptp(self._pulse[self.y_idx].v) + 1e-12) or 0.5
+        margin_x = max(0.5, 0.03 * float(np.ptp(self._pulse[self.x_idx].v)))
+        margin_y = max(0.5, 0.10 * float(np.ptp(self._pulse[self.y_idx].v)))
         x_min = self._pulse[self.x_idx].v.min() - margin_x
         x_max = self._pulse[self.x_idx].v.max() + margin_x
         y_min = self._pulse[self.y_idx].v.min() - margin_y
@@ -448,12 +448,12 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             y_min = min(y_min, float(np.min(self._sweep_lower_mv)) - margin_y)
             y_max = max(y_max, float(np.max(self._sweep_upper_mv)) + margin_y)
         self.ax.set_xlim(
-            x_min,
-            x_max
+            x_min - margin_x,
+            x_max + margin_x
         )
         self.ax.set_ylim(
-            y_min,
-            y_max
+            y_min - margin_y,
+            y_max + margin_y
         )
         self.draw_idle()
 
@@ -2881,10 +2881,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._selected_port_idx         = idx
         self._plot._selected_port_idx   = idx
         self._plot.set_selected_port_idx(idx)
-        self._plot.refresh(idx if _USE_PYQTGRAPH else None)
+        self._refresh_waveform_plot(idx)
+
+    def _refresh_waveform_plot(self, index: Optional[int] = None) -> None:
+        """Refresh either plot backend without mixing their call signatures."""
+        if _USE_PYQTGRAPH:
+            self._plot.refresh(index)
+        else:
+            self._plot.refresh()
 
     def _plot_refresh(self):
-        self._plot.refresh(self._selected_port_idx if _USE_PYQTGRAPH else None)
+        self._refresh_waveform_plot(self._selected_port_idx)
         self._refresh_trace_if_needed()
         self._refresh_sweep_overlay()
         if self._selected_port_idx == 0:
