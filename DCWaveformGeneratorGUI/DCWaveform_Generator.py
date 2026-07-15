@@ -75,12 +75,16 @@ try:
     from .qick_qcodes_experiment import (
         QcodesRunConfig,
         QickConnectionConfig,
+        build_qick_program,
+        connect_qick,
         run_qick_qcodes_experiment,
     )
 except ImportError:
     from qick_qcodes_experiment import (
         QcodesRunConfig,
         QickConnectionConfig,
+        build_qick_program,
+        connect_qick,
         run_qick_qcodes_experiment,
     )
 
@@ -2164,6 +2168,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     """QICK connection, QCoDeS database, and direct-run controls."""
 
     run_requested = QtCore.pyqtSignal()
+    show_program_requested = QtCore.pyqtSignal()
     bias_t_changed = QtCore.pyqtSignal(bool, float)
 
     def __init__(
@@ -2272,6 +2277,17 @@ class ExperimentPanel(QtWidgets.QWidget):
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
         self.run_button.clicked.connect(self.run_requested.emit)
+        self.show_program_button = QtWidgets.QPushButton("Show QICK Program")
+        self.show_program_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView)
+        )
+        self.show_program_button.setToolTip(
+            "Compile the current settings and show the tProcessor assembly"
+        )
+        self.show_program_button.clicked.connect(self.show_program_requested.emit)
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addWidget(self.run_button)
+        action_row.addWidget(self.show_program_button)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -2279,9 +2295,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.progress.hide()
         self.run_status = QtWidgets.QLabel("Ready")
         self.run_status.setWordWrap(True)
-        form.addRow(self.run_button)
+        form.addRow(action_row)
         form.addRow(self.progress)
-        form.addRow("Last run:", self.run_status)
+        form.addRow("Status:", self.run_status)
 
     def _update_bias_t_range(self, full_scale_mv: float) -> None:
         self.bias_t_compensation_mv.setMaximum(max(0.001, float(full_scale_mv)))
@@ -2320,17 +2336,21 @@ class ExperimentPanel(QtWidgets.QWidget):
             raise ValueError("AWG generator indices must be unique and nonnegative")
         return channels
 
-    def values(self, output_count: int) -> dict:
+    def values(self, output_count: int, *, require_run_config: bool = True) -> dict:
         connection = QickConnectionConfig(
             host=self.qick_host.text().strip(),
             ns_port=self.ns_port.value(),
             proxy_name=self.proxy_name.text().strip(),
         )
-        run = QcodesRunConfig(
-            database_path=self.database_path.text().strip(),
-            experiment_name=self.experiment_name.text().strip(),
-            sample_name=self.sample_name.text().strip(),
-            notes=self.notes.toPlainText(),
+        run = (
+            QcodesRunConfig(
+                database_path=self.database_path.text().strip(),
+                experiment_name=self.experiment_name.text().strip(),
+                sample_name=self.sample_name.text().strip(),
+                notes=self.notes.toPlainText(),
+            )
+            if require_run_config
+            else None
         )
         return {
             "connection": connection,
@@ -2413,11 +2433,14 @@ class ExperimentPanel(QtWidgets.QWidget):
             compensation_mv=bias_t_compensation_mv,
         )
 
-    def set_running(self, running: bool, message: str) -> None:
+    def set_running(
+        self, running: bool, message: str, *, show_progress: bool = True
+    ) -> None:
         self.run_button.setEnabled(not running)
+        self.show_program_button.setEnabled(not running)
         if running:
             self.progress.setValue(0)
-        self.progress.setVisible(running)
+        self.progress.setVisible(running and show_progress)
         self.run_status.setText(message)
 
     def update_progress(self, percent: int, message: str) -> None:
@@ -2454,6 +2477,101 @@ class QickExperimentWorker(QtCore.QObject):
             self.failed.emit(traceback.format_exc())
             return
         self.finished.emit(result)
+
+
+class QickProgramWorker(QtCore.QObject):
+    """Compile a QICK program from live HWH metadata without running it."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, connection_config, program_kwargs: dict, parent=None):
+        super().__init__(parent)
+        self._connection_config = connection_config
+        self._program_kwargs = dict(program_kwargs)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            _soc, soccfg = connect_qick(self._connection_config)
+            program = build_qick_program(soccfg, **self._program_kwargs)
+            program.compile()
+            summary = program.summary() if hasattr(program, "summary") else {}
+            result = {
+                "assembly": program.asm(),
+                "instruction_count": len(program.prog_list),
+                "machine_word_count": len(program.binprog),
+                "summary": summary,
+                "program": program,
+            }
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
+class QickAssemblyDialog(QtWidgets.QDialog):
+    """Read-only tProcessor assembly viewer with copy and save actions."""
+
+    def __init__(self, result: dict, parent=None):
+        super().__init__(parent)
+        self._assembly = str(result["assembly"])
+        self.setWindowTitle("QICK tProcessor Assembly")
+        self.resize(1000, 760)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        instruction_count = int(result.get("instruction_count", 0))
+        machine_word_count = int(result.get("machine_word_count", 0))
+        self.summary_label = QtWidgets.QLabel(
+            f"{instruction_count:,} assembly instructions, "
+            f"{machine_word_count:,} compiled machine words"
+        )
+        layout.addWidget(self.summary_label)
+
+        self.assembly_text = QtWidgets.QPlainTextEdit(self)
+        self.assembly_text.setReadOnly(True)
+        self.assembly_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.assembly_text.setFont(
+            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        )
+        self.assembly_text.setPlainText(self._assembly)
+        layout.addWidget(self.assembly_text, 1)
+
+        self.status_label = QtWidgets.QLabel(
+            "Compiled from the current GUI settings and connected QICK HWH."
+        )
+        layout.addWidget(self.status_label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        self.copy_button = buttons.addButton(
+            "Copy", QtWidgets.QDialogButtonBox.ActionRole
+        )
+        self.save_button = buttons.addButton(
+            "Save As...", QtWidgets.QDialogButtonBox.ActionRole
+        )
+        self.copy_button.clicked.connect(self._copy_assembly)
+        self.save_button.clicked.connect(self._save_assembly)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _copy_assembly(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self._assembly)
+        self.status_label.setText("Assembly copied to the clipboard.")
+
+    def _save_assembly(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save QICK tProcessor assembly",
+            "qick_program.asm",
+            "QICK assembly (*.asm);;Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".asm")
+        output_path.write_text(self._assembly, encoding="utf-8")
+        self.status_label.setText(f"Saved to {output_path}")
 
 
 class QickExportDialog(QtWidgets.QDialog):
@@ -2895,7 +3013,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             DEFAULT_BIAS_T_COMPENSATION_MV
         )
         self._experiment_thread: Optional[QtCore.QThread] = None
-        self._experiment_worker: Optional[QickExperimentWorker] = None
+        self._experiment_worker: Optional[QtCore.QObject] = None
         self._grid_time_ns = 1000.0
         self._grid_voltage_mv = 100.0
         self._grid_snap_enabled = False
@@ -2934,6 +3052,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
+        self._experiment_panel.show_program_requested.connect(
+            self._show_qick_program
+        )
         self._experiment_panel.bias_t_changed.connect(self._on_bias_t_changed)
 
         self._time_unit_combo = QtWidgets.QComboBox()
@@ -3619,8 +3740,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         else:
             self.statusBar().showMessage("Bias-T compensation disabled")
 
-    def _experiment_run_arguments(self) -> dict:
-        values = self._experiment_panel.values(len(self._pulse))
+    def _experiment_run_arguments(
+        self,
+        *,
+        require_readout: bool = True,
+        require_run_config: bool = True,
+    ) -> dict:
+        values = self._experiment_panel.values(
+            len(self._pulse), require_run_config=require_run_config
+        )
         self._qick_fabric_mhz = values["fabric_mhz"]
         self._qick_tproc_mhz = values["tproc_mhz"]
         self._qick_full_scale_mv = values["full_scale_mv"]
@@ -3634,7 +3762,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         rf_specs = self._rf_ports_panel.specs()
         readout_spec = self._rf_readout_panel.spec()
-        if readout_spec is None:
+        if require_readout and readout_spec is None:
             raise ValueError(
                 "enable RF Readout before running so the 1 MSPS IQ trace can be saved"
             )
@@ -3659,7 +3787,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
         )
-        gui_settings = self._settings_to_dict()
+        gui_settings = self._settings_to_dict() if require_run_config else None
         return {
             "connection_config": values["connection"],
             "run_config": values["run"],
@@ -3719,6 +3847,78 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _show_qick_program(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            arguments = self._experiment_run_arguments(
+                require_readout=False, require_run_config=False
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot show QICK program", str(exc))
+            return
+
+        program_kwargs = {
+            "sequence": arguments["sequence"],
+            "awg_channels": arguments["awg_channels"],
+            "repetitions_per_sweep": arguments["repetitions_per_sweep"],
+            "tproc_mhz": self._qick_tproc_mhz,
+            "rf_specs": arguments["rf_specs"],
+            "readout_spec": arguments["readout_spec"],
+        }
+        self._experiment_panel.set_running(
+            True,
+            "Connecting to QICK and compiling tProcessor assembly...",
+            show_progress=False,
+        )
+        self.statusBar().showMessage("Compiling QICK tProcessor assembly")
+        thread = QtCore.QThread(self)
+        worker = QickProgramWorker(
+            arguments["connection_config"], program_kwargs
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_qick_program_ready)
+        worker.failed.connect(self._on_qick_program_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_qick_program_ready(self, result: dict) -> None:
+        instruction_count = int(result.get("instruction_count", 0))
+        self._experiment_panel.set_running(
+            False,
+            f"QICK program compiled: {instruction_count:,} instructions",
+        )
+        self.statusBar().showMessage(
+            f"QICK tProcessor program compiled ({instruction_count:,} instructions)"
+        )
+        dialog = QickAssemblyDialog(result, self)
+        dialog.exec_()
+
+    def _on_qick_program_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown QICK program compilation error"
+        self._experiment_panel.set_running(False, f"Failed: {summary}")
+        self.statusBar().showMessage("QICK program compilation failed")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        dialog.setWindowTitle("Cannot show QICK program")
+        dialog.setText(summary)
+        dialog.setDetailedText(details)
+        dialog.exec_()
 
     def _on_experiment_progress(self, percent: int, message: str) -> None:
         self._experiment_panel.update_progress(percent, message)
@@ -4762,8 +4962,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.warning(
                 self,
-                "Experiment running",
-                "The QICK experiment is still running. Wait for it to finish before closing.",
+                "QICK task running",
+                "The QICK task is still running. Wait for it to finish before closing.",
             )
             event.ignore()
             return

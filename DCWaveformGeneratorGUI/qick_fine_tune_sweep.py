@@ -23,10 +23,10 @@ the returned DDR array is grouped as ``(point, repetition, sample, I/Q)`` and
 ``iq_grid`` restores the original Cartesian sweep dimensions.
 
 Optional Bias-T compensation appends an opposite-polarity physical-AWG SET
-after each shot. Its signed fixed-point duration advances with the same
-tProcessor sweep-register adds as the pulse fields; the tProcessor resolves
-the sign, rounds to whole cycles, and applies the dynamic duration with
-``sync`` without expanding sweep points in PMEM.
+after each shot. Its signed fixed-point duration is kept in tProcessor DMEM
+and advanced by the same hardware sweep loops as the pulse fields; the
+tProcessor resolves the sign, rounds to whole cycles, and applies the dynamic
+duration with ``sync`` without expanding sweep points in PMEM.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -1646,30 +1646,51 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         # These are used below for the shot count, repetition loop, and trigger.
         occupied[0].update((13, 15, 16))
 
+        dmem_size = int(self.tproccfg.get("dmem_size", 0))
+        next_dmem_addr = dmem_size - 1
+
+        def assign_dmem(field, work_register):
+            nonlocal next_dmem_addr
+            # DMEM address 1 is owned by the acquisition counter. Allocate
+            # sweep backing words downward from the end of memory.
+            if next_dmem_addr <= 1:
+                raise RuntimeError(
+                    "tProcessor DMEM has no room for spilled sweep state"
+                )
+            field["storage"] = "dmem"
+            field["dmem_addr"] = next_dmem_addr
+            field["work_register"] = int(work_register)
+            next_dmem_addr -= 1
+
         for field in fields:
             page = field["page"]
+            if field.get("register_name") == "bias_t_duration_q":
+                work_page, work_register = self._gen_regmap[
+                    (int(field["gen_ch"]), "duration")
+                ]
+                if int(work_page) != page:
+                    raise RuntimeError(
+                        "AWG duration and Bias-T state registers must share one page"
+                    )
+                # Compensation uses OP_SET, whose duration field is ignored by
+                # the AWG RTL. It is therefore a safe calculation scratch reg.
+                assign_dmem(field, work_register)
+                field["work_register_source"] = "awg_duration_command"
+                continue
+
             available = [
                 register for register in range(1, 32) if register not in occupied[page]
             ]
             if not available:
-                raise RuntimeError(
-                    f"register page {page} has no room for direct sweep state "
-                    f"{field['key']}"
-                )
+                # Arithmetic cannot operate on DMEM directly, so use the
+                # destination command register as a temporary load/add/store
+                # register when this state is consumed or advanced.
+                assign_dmem(field, int(field["command_register"]))
+                field["work_register_source"] = "awg_command"
+                continue
+            field["storage"] = "register"
             field["state_register"] = available[0]
             occupied[page].add(available[0])
-            if field.get("register_name") == "bias_t_duration_q":
-                available = [
-                    register
-                    for register in range(1, 32)
-                    if register not in occupied[page]
-                ]
-                if not available:
-                    raise RuntimeError(
-                        f"register page {page} has no Bias-T duration work register"
-                    )
-                field["work_register"] = available[0]
-                occupied[page].add(available[0])
 
         axis_runtime = {}
         for axis_index, axis in enumerate(sweep_axes):
@@ -2009,6 +2030,22 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             comment = f"{command.output_name}:{command.segment_name}:{register_name}"
             if field is None:
                 self.safe_regwi(page, reg, int(word), comment)
+            elif field.get("storage") == "dmem":
+                self.memri(
+                    page,
+                    reg,
+                    int(field["dmem_addr"]),
+                    f"load spilled {comment}",
+                )
+                if register_name == "step":
+                    self.bitwi(
+                        page,
+                        reg,
+                        reg,
+                        "&",
+                        0xFFFFFF,
+                        comment,
+                    )
             elif register_name == "step":
                 self.bitwi(
                     page,
@@ -2078,7 +2115,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             output_name = self.sequence.output_names[output_index]
             gen_ch = int(field["gen_ch"])
             page = int(field["page"])
-            state_register = int(field["state_register"])
             work_register = int(field["work_register"])
             target_register = self._gen_regmap[(gen_ch, "target")][1]
             register_names = COMMAND_REGISTER_NAMES[1:]
@@ -2101,29 +2137,27 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 )
             _, time_register = self._gen_regmap[(gen_ch, "t")]
             self.safe_regwi(page, time_register, 0, f"{output_name} Bias-T t=0")
+            self.memri(
+                page,
+                work_register,
+                int(field["dmem_addr"]),
+                f"load signed Bias-T duration for {output_name}",
+            )
 
             negative_label = f"BIAS_T_NEGATIVE_AREA_{output_index}"
             ready_label = f"BIAS_T_DURATION_READY_{output_index}"
             done_label = f"BIAS_T_DONE_{output_index}"
             self.condj(
                 page,
-                state_register,
+                work_register,
                 "==",
                 0,
                 done_label,
                 f"skip zero-area Bias-T output {output_name}",
             )
-            self.mathi(
-                page,
-                work_register,
-                state_register,
-                "+",
-                0,
-                f"copy signed Bias-T duration for {output_name}",
-            )
             self.condj(
                 page,
-                state_register,
+                work_register,
                 "<",
                 0,
                 negative_label,
@@ -2144,7 +2178,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 work_register,
                 0,
                 "-",
-                state_register,
+                work_register,
                 f"absolute Bias-T duration for {output_name}",
             )
             self.safe_regwi(
@@ -2385,6 +2419,30 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if amount == 0:
                 continue
             page = int(field["page"])
+            if field.get("storage") == "dmem":
+                work_register = int(field["work_register"])
+                dmem_addr = int(field["dmem_addr"])
+                self.memri(
+                    page,
+                    work_register,
+                    dmem_addr,
+                    f"load {action} axis {axis_index} {field['key']}",
+                )
+                self.mathi(
+                    page,
+                    work_register,
+                    work_register,
+                    "+",
+                    amount,
+                    f"{action} axis {axis_index} {field['key']}",
+                )
+                self.memwi(
+                    page,
+                    work_register,
+                    dmem_addr,
+                    f"store {action} axis {axis_index} {field['key']}",
+                )
+                continue
             state_register = int(field["state_register"])
             self.mathi(
                 page,
@@ -2402,12 +2460,28 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.initialize()
         self.regwi(0, rcount, 0)
         for field in self._sweep_fields:
-            self.safe_regwi(
-                int(field["page"]),
-                int(field["state_register"]),
-                int(field["base"]),
-                f"initialize direct sweep state {field['key']}",
-            )
+            page = int(field["page"])
+            if field.get("storage") == "dmem":
+                work_register = int(field["work_register"])
+                self.safe_regwi(
+                    page,
+                    work_register,
+                    int(field["base"]),
+                    f"initialize DMEM sweep state {field['key']}",
+                )
+                self.memwi(
+                    page,
+                    work_register,
+                    int(field["dmem_addr"]),
+                    f"store initial DMEM sweep state {field['key']}",
+                )
+            else:
+                self.safe_regwi(
+                    page,
+                    int(field["state_register"]),
+                    int(field["base"]),
+                    f"initialize direct sweep state {field['key']}",
+                )
         active_axes = tuple(sorted(self._sweep_axis_runtime))
         for axis_index in active_axes:
             runtime = self._sweep_axis_runtime[axis_index]
@@ -2582,7 +2656,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 len(commands) for commands in self.compiled_points[0].segment_commands
             ),
             "sweep_execution": "tproc_loop_and_add",
-            "sweep_dynamic_register_fields": len(self._sweep_fields),
+            "sweep_dynamic_register_fields": sum(
+                field.get("storage") != "dmem" for field in self._sweep_fields
+            ),
+            "sweep_dynamic_dmem_fields": sum(
+                field.get("storage") == "dmem" for field in self._sweep_fields
+            ),
             "sweep_uses_point_table": False,
             "sweep_max_target_quantization_error": self._sweep_max_target_error,
             "sweep_max_step_quantization_error": self._sweep_max_step_error,
@@ -2593,7 +2672,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 if self.sequence.bias_t_compensation is not None
                 else None
             ),
-            "bias_t_dynamic_register_fields": len(self._bias_t_fields),
+            "bias_t_dynamic_register_fields": 0,
+            "bias_t_dynamic_dmem_fields": len(self._bias_t_fields),
+            "bias_t_dmem_addresses": tuple(
+                int(field["dmem_addr"]) for field in self._bias_t_fields
+            ),
             "bias_t_max_duration_q_error": self._bias_t_max_duration_q_error,
             "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
             "tproc_mhz": self.tproc_mhz,

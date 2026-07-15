@@ -27,6 +27,7 @@ from qick_qcodes_experiment import (
     QickConnectionConfig,
     _sweep_parameter_names,
     build_awg_vertex_metadata,
+    build_qick_program,
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
     connect_qick,
@@ -555,6 +556,42 @@ def test_runtime_configs_accept_manual_tproc_clock_override():
     assert build_runtime_ddr_readout(
         soccfg, ddr
     ).trigger_delay_tproc_cycles == 100
+
+
+def test_build_qick_program_reuses_runtime_conversion_without_hardware():
+    calls = []
+
+    class FakeSequence:
+        def make_program(self, soccfg, **kwargs):
+            calls.append((soccfg, kwargs))
+            return "program"
+
+    soccfg = {
+        "tprocs": [{"f_time": 400.0}],
+        "gens": [{"f_fabric": 250.0}],
+    }
+    rf = QickRfPulseSpec(
+        0, "set_0", 0.2, 0.4, 43.5, 10000, 6.0, 7.0
+    )
+
+    program = build_qick_program(
+        soccfg,
+        FakeSequence(),
+        awg_channels=(3, 5),
+        repetitions_per_sweep=7,
+        tproc_mhz=300.0,
+        rf_specs=(rf,),
+        readout_spec=None,
+    )
+
+    assert program == "program"
+    kwargs = calls[0][1]
+    assert kwargs["awg_channels"] == (3, 5)
+    assert kwargs["repetitions_per_sweep"] == 7
+    assert kwargs["tproc_mhz"] == 300.0
+    assert kwargs["rf_pulses"][0].delay_tproc_cycles == 60
+    assert kwargs["rf_pulses"][0].length_cycles == 100
+    assert "ddr_readout" not in kwargs
 
 
 def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):

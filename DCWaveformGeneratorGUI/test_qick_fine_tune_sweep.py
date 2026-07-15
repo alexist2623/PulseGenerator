@@ -416,7 +416,8 @@ def test_bias_t_duration_is_swept_and_applied_by_tprocessor_sync():
     assert program.summary()["bias_t_duration_execution"] == (
         "tproc_signed_fixed_point_sync"
     )
-    assert program.summary()["bias_t_dynamic_register_fields"] == 1
+    assert program.summary()["bias_t_dynamic_register_fields"] == 0
+    assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
     assert program._bias_t_duration_q_actual[:, 0].tolist() == sorted(
         program._bias_t_duration_q_actual[:, 0].tolist()
     )
@@ -447,7 +448,7 @@ def test_bias_t_duration_is_swept_and_applied_by_tprocessor_sync():
         assert following_zero.cycle - event.cycle == duration
 
 
-def test_bias_t_compensation_registers_fit_eight_outputs():
+def test_bias_t_compensation_dmem_state_fits_eight_outputs():
     names = tuple(f"awg_{index}" for index in range(8))
     sequence = FineTuneSequence(names)
     sequence.add_set("hold", tuple(0.05 * (index + 1) for index in range(8)), 20)
@@ -459,14 +460,88 @@ def test_bias_t_compensation_registers_fit_eight_outputs():
     program.compile()
     assert len(program._bias_t_fields) == 8
     assert len({
-        (field["page"], field["state_register"])
+        field["dmem_addr"]
         for field in program._bias_t_fields
     }) == 8
+    assert all("state_register" not in field for field in program._bias_t_fields)
+    assert all(
+        field["work_register"]
+        == program._gen_regmap[(field["gen_ch"], "duration")][1]
+        for field in program._bias_t_fields
+    )
     tproc = TProcV1BehaviorModel(strict=True).run(
         program.prog_list,
         max_steps=1_000_000,
     )
     assert tproc.timing_conflicts == []
+
+
+def test_bias_t_dmem_state_avoids_full_register_page_failure():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("initial", (0.0,), 16)
+    for index in range(8):
+        sequence.add_ramp(f"ramp_{index}", 16)
+        segment_name = f"set_{index}"
+        sequence.add_set(segment_name, (0.01 * (index + 1),), 16)
+        sequence.add_amplitude_sweep(
+            segment_name,
+            "awg_0",
+            0.01 * (index + 1),
+            0.01 * (index + 2),
+            2,
+        )
+    sequence.set_bias_t_compensation(0.1)
+
+    # Generator 1 uses register page 1. Its eight swept SETs and dependent
+    # RAMPs consume 24 direct target/step state registers, reproducing the
+    # page-pressure case which previously left no Bias-T work register.
+    program = sequence.make_program(_mock_soccfg(2), awg_channels=(1,))
+    program.compile()
+
+    direct_fields = [
+        field
+        for field in program._sweep_fields
+        if field.get("storage") != "dmem" and field["page"] == 1
+    ]
+    assert len(direct_fields) == 24
+    assert program._bias_t_fields[0]["page"] == 1
+    assert program._bias_t_fields[0]["dmem_addr"] == 4095
+    assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
+    assert any(inst["name"] == "memri" for inst in program.prog_list)
+    assert any(inst["name"] == "memwi" for inst in program.prog_list)
+
+
+def test_sweep_state_spills_to_dmem_after_register_page_is_full():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("initial", (0.0,), 16)
+    for index in range(9):
+        sequence.add_ramp(f"ramp_{index}", 16)
+        segment_name = f"set_{index}"
+        sequence.add_set(segment_name, (0.01 * (index + 1),), 16)
+        sequence.add_amplitude_sweep(
+            segment_name,
+            "awg_0",
+            0.01 * (index + 1),
+            0.01 * (index + 2),
+            2,
+        )
+    sequence.set_bias_t_compensation(0.1)
+
+    program = sequence.make_program(_mock_soccfg(2), awg_channels=(1,))
+    program.compile()
+
+    register_fields = [
+        field for field in program._sweep_fields
+        if field.get("storage") == "register"
+    ]
+    dmem_fields = [
+        field for field in program._sweep_fields
+        if field.get("storage") == "dmem"
+    ]
+    assert len(register_fields) == 25
+    assert len(dmem_fields) == 3
+    assert len({field["dmem_addr"] for field in dmem_fields}) == 3
+    assert all(field["dmem_addr"] > program.COUNTER_ADDR for field in dmem_fields)
 
 
 def test_bias_t_tprocessor_selects_opposite_polarity_across_zero_area():

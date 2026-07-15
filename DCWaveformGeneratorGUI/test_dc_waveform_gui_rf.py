@@ -387,6 +387,117 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     window.close()
 
 
+def test_experiment_panel_exposes_show_program_action():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+    emitted = []
+    panel.show_program_requested.connect(lambda: emitted.append(True))
+
+    assert panel.show_program_button.text() == "Show QICK Program"
+    panel.show_program_button.click()
+    app.processEvents()
+    assert emitted == [True]
+
+    panel.set_running(True, "Compiling", show_progress=False)
+    assert panel.run_button.isEnabled() is False
+    assert panel.show_program_button.isEnabled() is False
+    assert panel.progress.isVisible() is False
+    panel.close()
+
+
+def test_show_program_snapshot_allows_disabled_readout():
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.database_path.clear()
+    window._experiment_panel.experiment_name.clear()
+    window._experiment_panel.sample_name.clear()
+
+    assert window._rf_readout_panel.spec() is None
+    arguments = window._experiment_run_arguments(
+        require_readout=False, require_run_config=False
+    )
+
+    assert arguments["readout_spec"] is None
+    assert arguments["run_config"] is None
+    assert arguments["sequence"].n_outputs == 1
+    app.processEvents()
+    window.close()
+
+
+def test_qick_program_worker_compiles_and_returns_assembly(monkeypatch):
+    app = _application()
+    calls = []
+
+    class FakeProgram:
+        prog_list = [{"name": "regwi"}, {"name": "end"}]
+
+        def compile(self):
+            calls.append("compile")
+            self.binprog = [1, 2]
+
+        def asm(self):
+            return "// Program\nregwi 0, 1, 2;\nend;"
+
+        def summary(self):
+            return {"sweep_points": 3}
+
+    fake_program = FakeProgram()
+    monkeypatch.setattr(
+        gui, "connect_qick", lambda config: (object(), {"gens": []})
+    )
+    monkeypatch.setattr(
+        gui,
+        "build_qick_program",
+        lambda soccfg, **kwargs: fake_program,
+    )
+    results = []
+    failures = []
+    worker = gui.QickProgramWorker(
+        object(),
+        {
+            "sequence": object(),
+            "awg_channels": (1,),
+            "repetitions_per_sweep": 1,
+        },
+    )
+    worker.finished.connect(results.append)
+    worker.failed.connect(failures.append)
+    worker.run()
+    app.processEvents()
+
+    assert failures == []
+    assert calls == ["compile"]
+    assert results[0]["instruction_count"] == 2
+    assert results[0]["machine_word_count"] == 2
+    assert "regwi" in results[0]["assembly"]
+
+
+def test_qick_assembly_dialog_is_read_only_and_copyable():
+    app = _application()
+    assembly = "// Program\nregwi 0, 1, 2;\nend;"
+    dialog = gui.QickAssemblyDialog(
+        {
+            "assembly": assembly,
+            "instruction_count": 2,
+            "machine_word_count": 2,
+        }
+    )
+
+    assert dialog.assembly_text.isReadOnly() is True
+    assert dialog.assembly_text.toPlainText() == assembly
+    assert "2 assembly instructions" in dialog.summary_label.text()
+    dialog.copy_button.click()
+    app.processEvents()
+    assert QtWidgets.QApplication.clipboard().text() == assembly
+    dialog.close()
+
+
 def test_legacy_single_waveform_json_remains_loadable(tmp_path):
     app = _application()
     pulse = PulseSequence(-125.0, initial_duration_ns=750.0)

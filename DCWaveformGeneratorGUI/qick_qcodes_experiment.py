@@ -366,6 +366,33 @@ def build_runtime_ddr_readout(
     )
 
 
+def build_qick_program(
+    soccfg,
+    sequence,
+    *,
+    awg_channels: Sequence[int],
+    repetitions_per_sweep: int,
+    tproc_mhz: Optional[float] = None,
+    rf_specs: Sequence[QickRfPulseSpec] = (),
+    readout_spec: Optional[QickDdrReadoutSpec] = None,
+):
+    """Build the tProcessor program without configuring or running hardware."""
+    effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
+    program_kwargs = {
+        "awg_channels": tuple(int(channel) for channel in awg_channels),
+        "tproc_mhz": effective_tproc_mhz,
+        "repetitions_per_sweep": int(repetitions_per_sweep),
+        "rf_pulses": build_runtime_rf_pulses(
+            soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
+        ),
+    }
+    if readout_spec is not None:
+        program_kwargs["ddr_readout"] = build_runtime_ddr_readout(
+            soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
+        )
+    return sequence.make_program(soccfg, **program_kwargs)
+
+
 def configure_rf_board(
     soc,
     rf_specs: Sequence[QickRfPulseSpec],
@@ -408,18 +435,14 @@ def execute_qick_sequence(
     _emit_progress(progress_callback, 5, "Configuring RF hardware")
     rf_settings = configure_rf_board(soc, rf_specs, readout_spec)
     _emit_progress(progress_callback, 8, "Compiling the tProcessor program")
-    effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
-    program = sequence.make_program(
+    program = build_qick_program(
         soccfg,
+        sequence,
         awg_channels=tuple(int(channel) for channel in awg_channels),
-        tproc_mhz=effective_tproc_mhz,
+        tproc_mhz=tproc_mhz,
         repetitions_per_sweep=int(repetitions_per_sweep),
-        rf_pulses=build_runtime_rf_pulses(
-            soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
-        ),
-        ddr_readout=build_runtime_ddr_readout(
-            soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
-        ),
+        rf_specs=rf_specs,
+        readout_spec=readout_spec,
     )
     sweep_point_count = int(getattr(
         sequence,
@@ -1163,6 +1186,7 @@ __all__ = [
     "QickConnectionConfig",
     "StoredQickExperiment",
     "build_awg_vertex_metadata",
+    "build_qick_program",
     "build_runtime_ddr_readout",
     "build_runtime_rf_pulses",
     "configure_rf_board",
