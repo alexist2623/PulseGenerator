@@ -29,6 +29,7 @@ QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
 IQ_TRACE_PARAMETER = "iq_trace"
 I_TRACE_PARAMETER = "i_trace"
 Q_TRACE_PARAMETER = "q_trace"
+SAMPLE_INDEX_PARAMETER = "sample_index"
 
 try:
     from .dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
@@ -594,7 +595,24 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
 
     i_values = iq[..., 0]
     q_values = iq[..., 1]
-    sample_index = np.arange(expected_shape[2], dtype=np.int64)
+    sample_index_parameter = layout.get(
+        "sample_index_parameter",
+        SAMPLE_INDEX_PARAMETER,
+    )
+    if sample_index_parameter in trace_data:
+        flat_sample_index = np.asarray(trace_data[sample_index_parameter])
+        expected_index_shape = (trace_count, expected_shape[2])
+        if flat_sample_index.shape != expected_index_shape:
+            raise ValueError(
+                f"stored sample-index arrays have shape {flat_sample_index.shape}, "
+                f"expected {expected_index_shape}"
+            )
+        sample_index = flat_sample_index[0].astype(np.int64, copy=False)
+        if not np.all(flat_sample_index == sample_index[None, :]):
+            raise ValueError("stored sample-index axes are inconsistent between traces")
+    else:
+        # Compatibility with v1/v2 datasets, which omitted the array axis.
+        sample_index = np.arange(expected_shape[2], dtype=np.int64)
     sample_period_us = float(layout["sample_period_us"])
 
     sweep_coordinates_mv = {}
@@ -693,6 +711,11 @@ def store_qick_result(
     measurement = Measurement(exp=experiment, station=Station())
 
     repetition_index = Parameter("repetition_index", label="Repetition", unit="")
+    sample_index = Parameter(
+        SAMPLE_INDEX_PARAMETER,
+        label="Sample index",
+        unit="",
+    )
     setpoint_parameters = []
     sweep_parameters = []
     sweep_parameter_names = _sweep_parameter_names(sweep_axes)
@@ -707,6 +730,7 @@ def store_qick_result(
     setpoint_parameters.append(repetition_index)
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
+    measurement.register_parameter(sample_index, paramtype="array")
 
     i_trace = Parameter(
         I_TRACE_PARAMETER,
@@ -721,7 +745,8 @@ def store_qick_result(
     for parameter in (i_trace, q_trace):
         measurement.register_parameter(
             parameter,
-            setpoints=tuple(setpoint_parameters),
+            # Plottr assigns the final dimension to the x-axis by default.
+            setpoints=(*setpoint_parameters, sample_index),
             paramtype="array",
         )
 
@@ -746,7 +771,8 @@ def store_qick_result(
                 time_parameter,
                 paramtype="array",
             )
-            vertex_setpoints = tuple([time_parameter] + sweep_parameters)
+            # Keep time last so Plottr opens a waveform against time.
+            vertex_setpoints = (*sweep_parameters, time_parameter)
             virtual_parameter = Parameter(
                 f"{prefix}_virtual_vertices_mv",
                 label=f"{output_name} virtual AWG waveform vertices",
@@ -797,8 +823,13 @@ def store_qick_result(
         for axis, parameter in zip(sweep_axes, sweep_parameters)
     }
     setpoint_meanings.update({
+        SAMPLE_INDEX_PARAMETER: (
+            "Zero-based index of each sample within the captured I/Q trace."
+        ),
         "repetition_index": "Zero-based repetition within one sweep coordinate.",
     })
+    sample_period_us = 1_000_000.0 / run_config.sample_rate_hz
+    sample_index_values = np.arange(sample_count, dtype=np.int32)
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "qick_connection": asdict(connection_config),
@@ -821,12 +852,13 @@ def store_qick_result(
                 "i": str(iq[..., 0].dtype),
                 "q": str(iq[..., 1].dtype),
             },
-            "storage_format": "qcodes_split_array_per_trace_v2",
+            "storage_format": "qcodes_split_array_per_trace_v3",
             "trace_count": point_count * repetition_count,
             "sql_rows_per_trace": 2,
             "cartesian_point_count": point_count,
             "sample_rate_hz": run_config.sample_rate_hz,
-            "sample_period_us": 1_000_000.0 / run_config.sample_rate_hz,
+            "sample_period_us": sample_period_us,
+            "sample_index_parameter": SAMPLE_INDEX_PARAMETER,
             "row_order": (
                 "sweep_axes,repetition"
                 if sweep_axes
@@ -835,9 +867,8 @@ def store_qick_result(
             "sweep_axes": sweep_axis_metadata,
             "setpoint_meanings": setpoint_meanings,
             "time_reconstruction": (
-                "sample_index = arange(iq_trace_shape[0]); time_us = "
-                "sample_index * sample_period_us. Neither is stored as a "
-                "QCoDeS parameter."
+                f"{SAMPLE_INDEX_PARAMETER} is stored as the array setpoint for "
+                "every I/Q trace; time_us = sample_index * sample_period_us."
             ),
             "derived_quantities": {
                 "magnitude": "hypot(i_trace, q_trace)",
@@ -967,6 +998,7 @@ def store_qick_result(
                 datasaver.add_result(
                     *coordinate_results,
                     (repetition_index, repetition),
+                    (sample_index, sample_index_values),
                     (
                         i_trace,
                         np.ascontiguousarray(

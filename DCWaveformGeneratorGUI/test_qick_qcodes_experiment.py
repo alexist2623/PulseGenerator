@@ -21,6 +21,7 @@ from qick_qcodes_experiment import (
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
     Q_TRACE_PARAMETER,
+    SAMPLE_INDEX_PARAMETER,
     QCODES_STAGING_ENV,
     QcodesRunConfig,
     QickConnectionConfig,
@@ -130,13 +131,13 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     }
     assert I_TRACE_PARAMETER in dataset_parameters
     assert Q_TRACE_PARAMETER in dataset_parameters
+    assert SAMPLE_INDEX_PARAMETER in dataset_parameters
     assert IQ_TRACE_PARAMETER not in dataset_parameters
     assert sweep_parameter in dataset_parameters
     assert "awg_0_vertex_time_us" in dataset_parameters
     assert "awg_1_vertex_time_us" in dataset_parameters
     for removed_parameter in (
         "point_index",
-        "sample_index",
         "time_us",
         "i",
         "q",
@@ -175,6 +176,10 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     np.testing.assert_array_equal(
         i_trace_data["repetition_index"][:, 0],
         [0, 1, 0, 1],
+    )
+    np.testing.assert_allclose(
+        i_trace_data[SAMPLE_INDEX_PARAMETER],
+        np.tile([0, 1, 2], (4, 1)),
     )
 
     loaded = load_qick_iq_arrays(dataset)
@@ -240,18 +245,23 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert plottr_data[I_TRACE_PARAMETER].axes(I_TRACE_PARAMETER) == [
         sweep_parameter,
         "repetition_index",
+        SAMPLE_INDEX_PARAMETER,
     ]
     assert plottr_data[Q_TRACE_PARAMETER].axes(Q_TRACE_PARAMETER) == [
         sweep_parameter,
         "repetition_index",
+        SAMPLE_INDEX_PARAMETER,
     ]
+    assert plottr_data[I_TRACE_PARAMETER].data_vals(
+        SAMPLE_INDEX_PARAMETER
+    ).shape == (4, 3)
     for channel in ("awg_0", "awg_1"):
         time_parameter = f"{channel}_vertex_time_us"
         for space in ("virtual", "physical"):
             voltage_parameter = f"{channel}_{space}_vertices_mv"
             assert plottr_data[voltage_parameter].axes(voltage_parameter) == [
-                time_parameter,
                 sweep_parameter,
+                time_parameter,
             ]
             assert plottr_data[voltage_parameter].data_vals(
                 time_parameter
@@ -263,14 +273,15 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert "awg_waveform_vertices" not in metadata["gui_settings"]
     layout = metadata["measurement_layout"]
     assert layout["sample_period_us"] == 1.0
-    assert layout["storage_format"] == "qcodes_split_array_per_trace_v2"
+    assert layout["storage_format"] == "qcodes_split_array_per_trace_v3"
     assert layout["iq_trace_parameters"] == {
         "i": I_TRACE_PARAMETER,
         "q": Q_TRACE_PARAMETER,
     }
     assert layout["iq_trace_shape"] == [3]
     assert layout["sql_rows_per_trace"] == 2
-    assert layout["time_reconstruction"].startswith("sample_index = arange")
+    assert layout["sample_index_parameter"] == SAMPLE_INDEX_PARAMETER
+    assert layout["time_reconstruction"].startswith(SAMPLE_INDEX_PARAMETER)
     assert layout["sweep_axes"][0]["parameter"] == sweep_parameter
     assert layout["sweep_axes"][0]["voltage_start_mv"] == -50.0
     assert layout["sweep_axes"][0]["voltage_stop_mv"] == 50.0
@@ -354,6 +365,7 @@ def test_store_qick_result_keeps_cartesian_sweeps_and_repetitions_grouped(
     ]
     assert i_trace_data[I_TRACE_PARAMETER].shape == (50, 128)
     assert q_trace_data[Q_TRACE_PARAMETER].shape == (50, 128)
+    assert i_trace_data[SAMPLE_INDEX_PARAMETER].shape == (50, 128)
     np.testing.assert_array_equal(
         i_trace_data[I_TRACE_PARAMETER],
         iq[..., 0].reshape(50, 128),
@@ -374,14 +386,24 @@ def test_store_qick_result_keeps_cartesian_sweeps_and_repetitions_grouped(
         i_trace_data["repetition_index"][:, 0],
         np.tile([0, 1], 25),
     )
+    np.testing.assert_allclose(
+        i_trace_data[SAMPLE_INDEX_PARAMETER][0],
+        np.arange(128, dtype=np.int32),
+    )
     loaded = load_qick_iq_arrays(dataset)
     np.testing.assert_array_equal(loaded["iq"], iq)
     assert loaded["iq"].shape == (25, 2, 128, 2)
+    plottr_data = ds_to_datadicts(dataset)
+    assert plottr_data[I_TRACE_PARAMETER].axes(I_TRACE_PARAMETER) == [
+        "awg_0_set_1_voltage_mv",
+        "awg_1_set_1_voltage_mv",
+        "repetition_index",
+        SAMPLE_INDEX_PARAMETER,
+    ]
     dataset_parameters = {
         parameter.strip() for parameter in dataset.parameters.split(",")
     }
     for unstored_parameter in (
-        "sample_index",
         "time_us",
         "i",
         "q",
@@ -435,8 +457,8 @@ def test_plottr_vertex_traces_keep_cartesian_sweeps_and_channel_time(
             voltage_parameter = f"{channel}_{space}_vertices_mv"
             trace = plottr_data[voltage_parameter]
             assert trace.axes(voltage_parameter) == [
-                time_parameter,
                 *sweep_parameters,
+                time_parameter,
             ]
             assert trace.data_vals(voltage_parameter).shape == (
                 point_count,
