@@ -6,13 +6,14 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 # Desktop imports need the PYNQ stubs installed before regular QICK modules.
 from qick.sim import QickSim  # noqa: F401
 from qick.awg_tuning import TProcV1BehaviorModel
 from qick.qick_asm import QickConfig
 
-from qick_fine_tune_sweep import FineTuneSequence, RfPulseConfig
+from qick_fine_tune_sweep import FineTuneSequence, ReadoutConfig, RfPulseConfig
 
 
 def _mock_soccfg(n_outputs=2):
@@ -55,6 +56,13 @@ def _mock_soccfg(n_outputs=2):
         "gens": gens,
         "readouts": [],
     })
+
+
+def _independent_awg_soccfg(n_outputs=2):
+    cfg = _mock_soccfg(n_outputs)
+    for index, gen in enumerate(cfg["gens"]):
+        gen["tproc_ch"] = index
+    return cfg
 
 
 def _shared_tmux_soccfg():
@@ -289,6 +297,7 @@ def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
 
     tmux_channels = [(event.word >> 152) & 0xFF for event in port_zero_events]
     rf_index = tmux_channels.index(0)
+    assert ((port_zero_events[rf_index].word >> 148) & 1) == 0
     assert port_zero_events[rf_index].cycle == (
         program.command_lead_tproc_cycles + program.aux_timing["rf_start"]
     )
@@ -297,6 +306,29 @@ def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
         and tmux_channel == 1
         for event, tmux_channel in zip(port_zero_events, tmux_channels)
     )
+
+
+def test_rf_and_readout_phase_reset_are_fixed_off():
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="gate",
+        length_cycles=30,
+        gain=10000,
+    )
+    readout = ReadoutConfig(ro_ch=0, length=16)
+    assert rf.phrst == 0
+    assert readout.phrst == 0
+
+    with pytest.raises(ValueError, match="RF output phrst is fixed to 0"):
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=30,
+            gain=10000,
+            phrst=1,
+        )
+    with pytest.raises(ValueError, match="readout phrst is fixed to 0"):
+        ReadoutConfig(ro_ch=0, length=16, phrst=1)
 
 
 def test_waveform_vertices_reconstruct_swept_virtual_and_physical_pulses():
@@ -385,9 +417,19 @@ def test_bias_t_preview_cancels_positive_and_negative_physical_area():
     assert previews[1].residual_area == 0.0
 
     times, values, boundaries = sequence.compensated_waveform_vertices()
-    assert times[-1] == 42.0
+    assert times[-1] == 95.0
     assert values["awg_0"][-1] == 0.0
     assert values["awg_1"][-1] == 0.0
+    starts = {name: start for name, start, _end in boundaries[-2:]}
+    ends = {name: end for name, _start, end in boundaries[-2:]}
+    assert starts == {
+        "bias_t_comp_awg_0": 75.0,
+        "bias_t_comp_awg_1": 75.0,
+    }
+    assert ends == {
+        "bias_t_comp_awg_0": 95.0,
+        "bias_t_comp_awg_1": 85.0,
+    }
     assert [name for name, _start, _end in boundaries[-2:]] == [
         "bias_t_comp_awg_0",
         "bias_t_comp_awg_1",
@@ -414,7 +456,7 @@ def test_bias_t_duration_is_swept_and_applied_by_tprocessor_sync():
         for inst in program.prog_list
     )
     assert program.summary()["bias_t_duration_execution"] == (
-        "tproc_signed_fixed_point_sync"
+        "tproc_simultaneous_set_and_max_sync"
     )
     assert program.summary()["bias_t_dynamic_register_fields"] == 0
     assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
@@ -454,7 +496,7 @@ def test_bias_t_compensation_dmem_state_fits_eight_outputs():
     sequence.add_set("hold", tuple(0.05 * (index + 1) for index in range(8)), 20)
     sequence.set_bias_t_compensation(0.1)
     program = sequence.make_program(
-        _mock_soccfg(8),
+        _independent_awg_soccfg(8),
         awg_channels=tuple(range(8)),
     )
     program.compile()
@@ -474,6 +516,59 @@ def test_bias_t_compensation_dmem_state_fits_eight_outputs():
         max_steps=1_000_000,
     )
     assert tproc.timing_conflicts == []
+
+
+def test_bias_t_independent_outputs_start_together_and_stop_independently():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("hold", (0.2, -0.1), 10)
+    sequence.set_bias_t_compensation(0.1)
+    program = sequence.make_program(
+        _independent_awg_soccfg(2),
+        awg_channels=(0, 1),
+        recovery_tproc_cycles=0,
+    )
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+
+    compensation_codes = {
+        int(field["gen_ch"]): (
+            int(field["negative_code"])
+            if int(field["base"]) > 0
+            else int(field["positive_code"])
+        ) & 0xFFFFFFFF
+        for field in program._bias_t_fields
+    }
+    starts = {}
+    stops = {}
+    for event in tproc.output_events:
+        target = event.word & 0xFFFFFFFF
+        if target == compensation_codes.get(event.tproc_ch):
+            starts[event.tproc_ch] = event.cycle
+        elif (
+            event.tproc_ch in starts
+            and target == 0
+            and event.cycle > starts[event.tproc_ch]
+        ):
+            stops.setdefault(event.tproc_ch, event.cycle)
+
+    assert starts[0] == starts[1]
+    assert stops[0] - starts[0] == 20
+    assert stops[1] - starts[1] == 10
+    assert tproc.timing_conflicts == []
+    assert program.summary()["bias_t_simultaneous_start"] is True
+    assert program.summary()["bias_t_simultaneous_start_lead_cycles"] == 64
+
+
+def test_bias_t_rejects_awgs_sharing_one_tprocessor_output():
+    soccfg = _mock_soccfg(2)
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("hold", (0.2, -0.1), 10)
+    sequence.set_bias_t_compensation(0.1)
+
+    with pytest.raises(ValueError, match="independent tProcessor output"):
+        sequence.make_program(soccfg, awg_channels=(0, 1))
 
 
 def test_bias_t_dmem_state_avoids_full_register_page_failure():
@@ -506,6 +601,7 @@ def test_bias_t_dmem_state_avoids_full_register_page_failure():
     assert len(direct_fields) == 24
     assert program._bias_t_fields[0]["page"] == 1
     assert program._bias_t_fields[0]["dmem_addr"] == 4095
+    assert program._bias_t_max_duration_dmem_addr == 4094
     assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
     assert any(inst["name"] == "memri" for inst in program.prog_list)
     assert any(inst["name"] == "memwi" for inst in program.prog_list)

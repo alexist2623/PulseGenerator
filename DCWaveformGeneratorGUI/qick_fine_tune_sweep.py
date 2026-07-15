@@ -56,6 +56,7 @@ COMMAND_REGISTER_NAMES = (
     "control",
 )
 DEFAULT_BIAS_T_DURATION_FRAC_BITS = 8
+BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
 
 
 def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -186,11 +187,14 @@ class BiasTCompensationConfig:
     ``amplitude`` is a positive normalized physical-AWG voltage. The
     tProcessor stores the signed compensation duration with
     ``duration_frac_bits`` fractional bits, resolves its sign, rounds the
-    magnitude to whole tProcessor cycles, and advances time with ``sync``.
+    magnitude to whole tProcessor cycles, schedules every independent output
+    at one common start time, and advances time to the latest channel stop.
     """
 
     amplitude: float
     duration_frac_bits: int = DEFAULT_BIAS_T_DURATION_FRAC_BITS
+    # Legacy API name: this is now one common pre-compensation guard, not a
+    # delay inserted between outputs.
     inter_output_gap_cycles: int = 1
 
     def __post_init__(self):
@@ -206,7 +210,7 @@ class BiasTCompensationConfig:
             raise ValueError("Bias-T duration fractional bits must be <= 24")
         _require_int(
             self.inter_output_gap_cycles,
-            "Bias-T inter-output gap cycles",
+            "Bias-T common guard cycles",
             0,
         )
 
@@ -239,6 +243,8 @@ class ReadoutConfig:
     def __post_init__(self):
         _require_int(self.ro_ch, "ro_ch", 0)
         _require_int(self.length, "length", 1)
+        if _require_int(self.phrst, "readout phrst", 0) != 0:
+            raise ValueError("readout phrst is fixed to 0")
         _require_int(self.measure_delay_tproc_cycles, "measure_delay_tproc_cycles", 0)
         _require_int(self.trigger_width_tproc_cycles, "trigger_width_tproc_cycles", 1)
 
@@ -255,7 +261,7 @@ class RfPulseConfig:
     phase_degrees: float = 0.0
     nqz: int = 1
     delay_tproc_cycles: int = 0
-    phrst: int = 1
+    phrst: int = 0
     stdysel: str = "zero"
     require_within_segment: bool = True
 
@@ -265,6 +271,8 @@ class RfPulseConfig:
         _require_int(self.gain, "gain")
         _require_int(self.nqz, "nqz", 1)
         _require_int(self.delay_tproc_cycles, "delay_tproc_cycles", 0)
+        if _require_int(self.phrst, "RF output phrst", 0) != 0:
+            raise ValueError("RF output phrst is fixed to 0")
         if not str(self.at_segment):
             raise ValueError("at_segment must not be empty")
         if not isfinite(float(self.freq_mhz)):
@@ -874,12 +882,12 @@ class FineTuneSequence:
         return tuple(previews)
 
     def compensated_waveform_vertices(self, point_index: int = 0):
-        """Return physical pulse vertices with sequential Bias-T compensation.
+        """Return physical pulse vertices with simultaneous Bias-T starts.
 
-        Physical outputs are first returned to zero at the end of the user
-        pulse. Each nonzero-area output then receives its own opposite-polarity
-        compensation SET, followed by a return to zero. Sequential execution
-        keeps commands behind a shared tProcessor/TMUX port FIFO ordered.
+        Physical outputs first return to zero at the end of the user pulse.
+        Every active output then receives its opposite-polarity SET at one
+        common start time. Each output independently returns to zero after its
+        own compensation duration.
         """
         times, waveforms, boundaries = self.waveform_vertices(
             point_index,
@@ -913,25 +921,31 @@ class FineTuneSequence:
         append_vertex(time_now)
         active = [preview for preview in previews if preview.duration_cycles > 0]
         gap = int(self.bias_t_compensation.inter_output_gap_cycles)
-        if active and gap:
-            time_now += gap
+        lead = BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * self.n_outputs
+        if active and (gap or lead):
+            time_now += gap + lead
             append_vertex(time_now)
-        for active_index, preview in enumerate(active):
+
+        start_time = time_now
+        for preview in active:
             current[preview.output_index] = preview.target_amplitude
+        if active:
+            append_vertex(start_time, force=True)
+
+        for duration in sorted({preview.duration_cycles for preview in active}):
+            time_now = start_time + duration
             append_vertex(time_now)
-            start_time = time_now
-            time_now += preview.duration_cycles
-            append_vertex(time_now)
-            current[preview.output_index] = 0.0
-            append_vertex(time_now)
+            for preview in active:
+                if preview.duration_cycles == duration:
+                    current[preview.output_index] = 0.0
+            append_vertex(time_now, force=True)
+
+        for preview in active:
             boundary_values.append((
                 f"bias_t_comp_{preview.output_name}",
                 start_time,
-                time_now,
+                start_time + preview.duration_cycles,
             ))
-            if gap and active_index + 1 < len(active):
-                time_now += gap
-                append_vertex(time_now)
 
         matrix = np.asarray(columns, dtype=float).T
         return (
@@ -1329,6 +1343,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.awg_channels, self.compiled_points = compile_sequence(
             self.sequence, self.soccfg, self.awg_channel_spec
         )
+        self._validate_bias_t_tproc_ports()
+        self.bias_t_simultaneous_start_lead_cycles = (
+            BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * len(self.awg_channels)
+            if self.sequence.bias_t_compensation is not None
+            else 0
+        )
         self._build_sweep_register_plan()
         self._channel_slots = self._build_channel_slots()
         self.timing = self._build_timing()
@@ -1348,12 +1368,36 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 ch=ro.ro_ch,
                 freq=ro.freq,
                 length=ro.length,
-                phrst=ro.phrst,
+                phrst=0,
             )
 
     @staticmethod
     def _command_key(command: CompiledCommand) -> Tuple[int, int]:
         return command.segment_index, command.output_index
+
+    def _validate_bias_t_tproc_ports(self):
+        """Require independent tProcessor outputs for exact simultaneous SETs."""
+        if self.sequence.bias_t_compensation is None:
+            return
+        channels_by_port = {}
+        for output_name, gen_ch in zip(self.sequence.output_names, self.awg_channels):
+            port = int(self.soccfg["gens"][gen_ch]["tproc_ch"])
+            channels_by_port.setdefault(port, []).append((output_name, gen_ch))
+        conflicts = {
+            port: channels
+            for port, channels in channels_by_port.items()
+            if len(channels) > 1
+        }
+        if conflicts:
+            details = "; ".join(
+                f"tproc_ch {port}: "
+                + ", ".join(f"{name} (gen {gen_ch})" for name, gen_ch in channels)
+                for port, channels in sorted(conflicts.items())
+            )
+            raise ValueError(
+                "simultaneous Bias-T compensation requires one independent "
+                f"tProcessor output per AWG; shared TMUX ports found: {details}"
+            )
 
     def _compiled_point_area2(self, point: CompiledPoint) -> Tuple[int, ...]:
         """Return twice the ideal pulse area in DAC-code fabric cycles."""
@@ -1692,6 +1736,16 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             field["state_register"] = available[0]
             occupied[page].add(available[0])
 
+        if bias_t_models:
+            if next_dmem_addr <= 1:
+                raise RuntimeError(
+                    "tProcessor DMEM has no room for the Bias-T maximum duration"
+                )
+            self._bias_t_max_duration_dmem_addr = next_dmem_addr
+            next_dmem_addr -= 1
+        else:
+            self._bias_t_max_duration_dmem_addr = None
+
         axis_runtime = {}
         for axis_index, axis in enumerate(sweep_axes):
             if axis.count <= 1:
@@ -1766,7 +1820,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             phase=phase_word,
             gain=rf.gain,
             length=rf.length_cycles,
-            phrst=rf.phrst,
+            phrst=0,
             stdysel=rf.stdysel,
             mode="oneshot",
         )
@@ -1816,6 +1870,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             freq=freq_word,
             length=ddr.readout_period_cycles,
             mode="periodic",
+            phrst=0,
         )
         self._fir_cfg = {
             "decimation": int(ddr_cfg.get("fir_decimation", 300)),
@@ -2105,10 +2160,28 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         )
 
     def _emit_bias_t_compensation(self):
-        """Emit tProcessor sign/abs/round/sync compensation instructions."""
-        config = self.sequence.bias_t_compensation
-        if config is None:
+        """Schedule simultaneous SET starts and per-channel SET-zero stops."""
+        if self.sequence.bias_t_compensation is None:
             return
+
+        max_duration_addr = int(self._bias_t_max_duration_dmem_addr)
+        first_field = self._bias_t_fields[0]
+        first_page = int(first_field["page"])
+        first_target_register = self._gen_regmap[
+            (int(first_field["gen_ch"]), "target")
+        ][1]
+        self.safe_regwi(
+            first_page,
+            first_target_register,
+            0,
+            "clear maximum Bias-T duration",
+        )
+        self.memwi(
+            first_page,
+            first_target_register,
+            max_duration_addr,
+            "store cleared maximum Bias-T duration",
+        )
 
         for field in self._bias_t_fields:
             output_index = int(field["output_index"])
@@ -2136,7 +2209,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     f"{output_name} Bias-T {register_name}",
                 )
             _, time_register = self._gen_regmap[(gen_ch, "t")]
-            self.safe_regwi(page, time_register, 0, f"{output_name} Bias-T t=0")
+            self.safe_regwi(
+                page,
+                time_register,
+                self.bias_t_simultaneous_start_lead_cycles,
+                f"{output_name} common Bias-T start offset",
+            )
             self.memri(
                 page,
                 work_register,
@@ -2146,6 +2224,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
             negative_label = f"BIAS_T_NEGATIVE_AREA_{output_index}"
             ready_label = f"BIAS_T_DURATION_READY_{output_index}"
+            max_ready_label = f"BIAS_T_MAX_READY_{output_index}"
             done_label = f"BIAS_T_DONE_{output_index}"
             self.condj(
                 page,
@@ -2225,17 +2304,19 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 time_register,
                 f"start Bias-T compensation on {output_name}",
             )
-            # RTL sync is additive: t_ref_next = t_ref + duration register.
-            self.sync(
-                page,
-                work_register,
-                f"advance by Bias-T duration for {output_name}",
-            )
             self.safe_regwi(
                 page,
                 target_register,
                 0,
                 f"{output_name} return to zero after Bias-T compensation",
+            )
+            self.mathi(
+                page,
+                time_register,
+                work_register,
+                "+",
+                self.bias_t_simultaneous_start_lead_cycles,
+                f"{output_name} Bias-T stop offset",
             )
             self.set(
                 int(self.soccfg["gens"][gen_ch]["tproc_ch"]),
@@ -2243,6 +2324,38 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 *command_registers,
                 time_register,
                 f"finish Bias-T compensation on {output_name}",
+            )
+
+            # The target word is no longer needed after both commands have
+            # been queued, so reuse its register for the running maximum.
+            self.memri(
+                page,
+                target_register,
+                max_duration_addr,
+                f"load maximum Bias-T duration for {output_name}",
+            )
+            self.condj(
+                page,
+                work_register,
+                "<=",
+                target_register,
+                max_ready_label,
+                f"keep maximum Bias-T duration after {output_name}",
+            )
+            self.memwi(
+                page,
+                work_register,
+                max_duration_addr,
+                f"update maximum Bias-T duration from {output_name}",
+            )
+            self.label(max_ready_label)
+            self.mathi(
+                page,
+                work_register,
+                work_register,
+                "+",
+                0,
+                f"maximum Bias-T duration checked for {output_name}",
             )
 
             self.label(done_label)
@@ -2254,11 +2367,47 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 0,
                 f"Bias-T output {output_name} complete",
             )
-            if config.inter_output_gap_cycles:
-                self.synci(
-                    int(config.inter_output_gap_cycles),
-                    f"Bias-T TMUX gap after {output_name}",
-                )
+
+        final_page = int(first_field["page"])
+        final_register = int(first_field["work_register"])
+        no_compensation_label = "BIAS_T_NO_ACTIVE_OUTPUT"
+        self.memri(
+            final_page,
+            final_register,
+            max_duration_addr,
+            "load maximum Bias-T duration",
+        )
+        self.condj(
+            final_page,
+            final_register,
+            "==",
+            0,
+            no_compensation_label,
+            "skip Bias-T timing advance when all areas are zero",
+        )
+        self.mathi(
+            final_page,
+            final_register,
+            final_register,
+            "+",
+            self.bias_t_simultaneous_start_lead_cycles,
+            "include common Bias-T command lead",
+        )
+        # RTL sync is additive: advance once to the latest channel stop.
+        self.sync(
+            final_page,
+            final_register,
+            "advance to latest simultaneous Bias-T stop",
+        )
+        self.label(no_compensation_label)
+        self.mathi(
+            final_page,
+            final_register,
+            final_register,
+            "+",
+            0,
+            "simultaneous Bias-T compensation complete",
+        )
 
     def _emit_point(self):
         # Timed-output queues are FIFO ordered. Generators behind the same TMUX
@@ -2392,15 +2541,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             self.sync_all(self.recovery_tproc_cycles)
         else:
             # Move the reference beyond all statically timed AWG/RF/readout
-            # events. Dynamic compensation then advances that reference by a
-            # tProcessor-computed duration for each physical output.
+            # events. Dynamic compensation uses one common start timestamp,
+            # channel-specific stop timestamps, and one final max-duration sync.
             self.sync_all(0)
             if self.sequence.bias_t_compensation.inter_output_gap_cycles:
                 self.synci(
                     int(
                         self.sequence.bias_t_compensation.inter_output_gap_cycles
                     ),
-                    "Bias-T gap after pre-compensation zero",
+                    "common Bias-T guard after pre-compensation zero",
                 )
             self._emit_bias_t_compensation()
             if self.recovery_tproc_cycles:
@@ -2668,7 +2817,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "bias_t_compensation": self.sequence.bias_t_compensation is not None,
             "bias_t_compensation_config": self.sequence.bias_t_compensation,
             "bias_t_duration_execution": (
-                "tproc_signed_fixed_point_sync"
+                "tproc_simultaneous_set_and_max_sync"
                 if self.sequence.bias_t_compensation is not None
                 else None
             ),
@@ -2678,6 +2827,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 int(field["dmem_addr"]) for field in self._bias_t_fields
             ),
             "bias_t_max_duration_q_error": self._bias_t_max_duration_q_error,
+            "bias_t_simultaneous_start": (
+                self.sequence.bias_t_compensation is not None
+            ),
+            "bias_t_simultaneous_start_lead_cycles": (
+                self.bias_t_simultaneous_start_lead_cycles
+            ),
+            "bias_t_max_duration_dmem_address": (
+                self._bias_t_max_duration_dmem_addr
+            ),
             "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
             "tproc_mhz": self.tproc_mhz,
             "hwh_tproc_mhz": self.hwh_tproc_mhz,
