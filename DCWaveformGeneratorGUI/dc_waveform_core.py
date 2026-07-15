@@ -29,6 +29,7 @@ DEFAULT_QCS_FULL_SCALE_V = 5.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 2500.0
+DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
 MAX_QICK_OUTPUTS = 8
 
 
@@ -553,6 +554,8 @@ def build_qick_sequence(
     sweep: Optional[QickSweepSpec] = None,
     sweeps: Optional[Sequence[QickSweepSpec]] = None,
     cross_capacitance=None,
+    bias_t_compensation_enabled: bool = False,
+    bias_t_compensation_voltage_mv: Optional[Real] = None,
 ):
     """Build a real qick_fine_tune_sweep.FineTuneSequence instance."""
     pulses = tuple(pulses)
@@ -561,6 +564,7 @@ def build_qick_sequence(
     output_names = _unique_names(tuple(output_names), "awg")
     if len(output_names) != len(pulses):
         raise ValueError("output_names length must match the pulse count")
+    full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
     specs = make_qick_segment_specs(
         pulses, fabric_mhz=fabric_mhz, full_scale_mv=full_scale_mv
     )
@@ -570,6 +574,22 @@ def build_qick_sequence(
     sequence = FineTuneSequence(output_names)
     sequence.set_cross_capacitance(
         _coerce_cross_capacitance(cross_capacitance, len(output_names))
+    )
+    if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
+        raise TypeError("bias_t_compensation_enabled must be boolean")
+    if bias_t_compensation_voltage_mv is None:
+        bias_t_compensation_voltage_mv = (
+            full_scale_mv * DEFAULT_BIAS_T_COMPENSATION_FRACTION
+        )
+    compensation_mv = _positive_real(
+        bias_t_compensation_voltage_mv,
+        "bias_t_compensation_voltage_mv",
+    )
+    if compensation_mv > full_scale_mv:
+        raise ValueError("Bias-T compensation voltage exceeds QICK full scale")
+    sequence.set_bias_t_compensation(
+        compensation_mv / full_scale_mv,
+        enabled=bool(bias_t_compensation_enabled),
     )
     for spec in specs:
         if spec.kind == "set":
@@ -731,6 +751,8 @@ def generate_qick_program_code(
     rf_pulse_spec: Optional[QickRfPulseSpec] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
+    bias_t_compensation_enabled: bool = False,
+    bias_t_compensation_voltage_mv: Optional[Real] = None,
 ) -> str:
     """Generate a QICK builder/execution module.
 
@@ -752,6 +774,19 @@ def generate_qick_program_code(
     if len(set(awg_channels)) != len(awg_channels) or any(channel < 0 for channel in awg_channels):
         raise ValueError("AWG channels must be unique nonnegative integers")
     tproc_mhz = _positive_real(tproc_mhz, "tproc_mhz")
+    full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
+    if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
+        raise TypeError("bias_t_compensation_enabled must be boolean")
+    if bias_t_compensation_voltage_mv is None:
+        bias_t_compensation_voltage_mv = (
+            full_scale_mv * DEFAULT_BIAS_T_COMPENSATION_FRACTION
+        )
+    bias_t_compensation_voltage_mv = _positive_real(
+        bias_t_compensation_voltage_mv,
+        "bias_t_compensation_voltage_mv",
+    )
+    if bias_t_compensation_voltage_mv > full_scale_mv:
+        raise ValueError("Bias-T compensation voltage exceeds QICK full scale")
     repetitions_per_sweep = _positive_int(repetitions_per_sweep, "repetitions_per_sweep")
     sweep_specs = _coerce_sweep_specs(sweep, sweeps)
     if rf_pulse_spec is not None and rf_pulse_specs is not None:
@@ -845,6 +880,8 @@ def generate_qick_program_code(
         f"FABRIC_MHZ = {float(fabric_mhz)!r}",
         f"TPROC_MHZ = {tproc_mhz!r}",
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
+        f"BIAS_T_COMPENSATION_ENABLED = {bool(bias_t_compensation_enabled)!r}",
+        f"BIAS_T_COMPENSATION_VOLTAGE_MV = {float(bias_t_compensation_voltage_mv)!r}",
         f"REPETITIONS_PER_SWEEP = {repetitions_per_sweep}",
         f"SWEEP_SPECS = {sweep_config!r}",
         f"CROSS_CAPACITANCE = {cross_capacitance!r}",
@@ -856,6 +893,10 @@ def generate_qick_program_code(
         "def build_sequence() -> FineTuneSequence:",
         "    sequence = FineTuneSequence(OUTPUT_NAMES)",
         "    sequence.set_cross_capacitance(CROSS_CAPACITANCE)",
+        "    sequence.set_bias_t_compensation(",
+        "        BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
+        "        enabled=BIAS_T_COMPENSATION_ENABLED,",
+        "    )",
     ]
     for spec in specs:
         if spec.kind == "set":
@@ -1005,6 +1046,7 @@ def generate_qick_program_code(
 
 
 __all__ = [
+    "DEFAULT_BIAS_T_COMPENSATION_FRACTION",
     "DEFAULT_INITIAL_DURATION_NS",
     "DEFAULT_INITIAL_VOLTAGE_MV",
     "DEFAULT_INSERT_FLAT_NS",

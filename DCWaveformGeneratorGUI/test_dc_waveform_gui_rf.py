@@ -36,6 +36,8 @@ def test_gui_defaults_and_time_unit_round_trip():
     assert window._time_unit == "us"
     assert window._experiment_panel.fabric_mhz.value() == 300.0
     assert window._experiment_panel.tproc_mhz.value() == 300.0
+    assert window._experiment_panel.bias_t_group.isChecked() is False
+    assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
     assert window._pulse[0].t.tolist() == [0.0, 1000.0]
     assert window._pulse[0].v.tolist() == [100.0, 100.0]
     assert control.edit_ramp.text() == "1"
@@ -204,11 +206,16 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
         tproc_mhz=300.0,
         rf_pulse_specs=rf_specs,
         ddr_readout_spec=readout,
+        bias_t_compensation_enabled=True,
+        bias_t_compensation_voltage_mv=125.0,
     )
     ast.parse(code)
     namespace = {}
     exec(compile(code, "<multi-rf-generated>", "exec"), namespace)
     assert namespace["TPROC_MHZ"] == 300.0
+    assert namespace["BIAS_T_COMPENSATION_ENABLED"] is True
+    assert namespace["BIAS_T_COMPENSATION_VOLTAGE_MV"] == 125.0
+    assert namespace["build_sequence"]().bias_t_compensation.amplitude == 0.05
     stale_hwh_soccfg = {
         "tprocs": [{"f_time": 400.0}],
         "gens": [
@@ -314,6 +321,8 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     experiment.sample_name.setText("device A")
     experiment.notes.setPlainText("JSON round-trip notes")
     experiment.tproc_mhz.setValue(275.0)
+    experiment.bias_t_group.setChecked(True)
+    experiment.bias_t_compensation_mv.setValue(125.0)
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -323,6 +332,10 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["schema"] == gui.SETTINGS_SCHEMA
     assert document["version"] == gui.SETTINGS_VERSION
     assert document["qick"]["tproc_mhz"] == 275.0
+    assert document["qick"]["bias_t_compensation"] == {
+        "enabled": True,
+        "voltage_mv": 125.0,
+    }
     assert len(document["awg"]["outputs"]) == 2
     assert len(document["rf_outputs"]) == 2
 
@@ -334,6 +347,8 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert len(restored._rf_pulse_specs) == 1
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
     assert restored._experiment_panel.tproc_mhz.value() == 275.0
+    assert restored._experiment_panel.bias_t_group.isChecked() is True
+    assert restored._experiment_panel.bias_t_compensation_mv.value() == 125.0
     assert restored._experiment_panel.database_path.text().endswith("experiment.db")
     window.close()
     restored.close()
@@ -347,6 +362,8 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     window._experiment_panel.sample_name.setText("sample 1")
     window._rf_readout_panel.setChecked(True)
     window._rf_readout_panel.samples.setValue(32)
+    window._experiment_panel.bias_t_group.setChecked(True)
+    window._experiment_panel.bias_t_compensation_mv.setValue(200.0)
 
     arguments = window._experiment_run_arguments()
     assert arguments["connection_config"].host == gui.DEFAULT_QICK_HOST
@@ -354,6 +371,7 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert arguments["awg_channels"] == (1,)
     assert arguments["readout_spec"].samples_per_trigger == 32
     assert arguments["gui_settings"]["qick"]["tproc_mhz"] == 300.0
+    assert arguments["sequence"].bias_t_compensation.amplitude == 0.08
     assert "waveforms" not in arguments["gui_settings"]
     assert arguments["gui_settings"]["awg"]["outputs"][0]["time_ns"] == [
         0.0,
@@ -408,6 +426,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     document["awg"].pop("sweeps")
     document["qick"].pop("tproc_mhz")
     document["qick"].pop("repetitions_per_sweep")
+    document["qick"].pop("bias_t_compensation")
     document["experiment"].pop("notes")
     document.pop("rf_outputs")
     document["rf_readout"] = {"enabled": False}
@@ -422,6 +441,8 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert window._grid_snap_enabled is False
     assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._experiment_panel.repetitions.value() == 1
+    assert window._experiment_panel.bias_t_group.isChecked() is False
+    assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
     assert len(window._rf_ports_panel._panels) == 1
     assert window._rf_ports_panel.settings()[0] == gui.DEFAULT_RF_OUTPUT_SETTINGS
     assert (
@@ -431,16 +452,35 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 3
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 4
     assert upgraded["display"]["voltage_view"] == "both"
     assert upgraded["grid"]["snap_enabled"] is False
     assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
     assert upgraded["awg"]["sweeps"] == []
     assert upgraded["qick"]["tproc_mhz"] == 300.0
     assert upgraded["qick"]["repetitions_per_sweep"] == 1
+    assert upgraded["qick"]["bias_t_compensation"] == {
+        "enabled": False,
+        "voltage_mv": 250.0,
+    }
     assert upgraded["experiment"]["notes"] == ""
     assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
     assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
+    window.close()
+
+
+def test_bias_t_gui_extends_and_plots_the_physical_awg_trace():
+    app = _application()
+    window = gui.MainWindow()
+    original_end_ns = float(window._plot._physical_time_ns[-1])
+    window._experiment_panel.bias_t_compensation_mv.setValue(100.0)
+    window._experiment_panel.bias_t_group.setChecked(True)
+    app.processEvents()
+
+    assert window._bias_t_compensation_enabled is True
+    assert window._plot._physical_time_ns[-1] > original_end_ns
+    assert np.min(window._plot._physical_values_mv[0]) == -100.0
+    assert window._plot._physical_values_mv[0, -1] == 0.0
     window.close()
 
 

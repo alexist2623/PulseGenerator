@@ -367,3 +367,136 @@ def test_counter_progress_tracks_hardware_sweep_and_repetition_count():
     assert program.summary()["total_acquisitions"] == 6
     assert calls.count("start") == 1
     assert calls[-1] == ("source", "internal")
+
+
+def test_bias_t_preview_cancels_positive_and_negative_physical_area():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("hold", (0.2, -0.1), 10)
+    sequence.set_bias_t_compensation(0.1)
+
+    previews = sequence.bias_t_compensation_preview()
+    assert previews[0].pulse_area == 2.0
+    assert previews[0].target_amplitude == -0.1
+    assert previews[0].duration_cycles == 20
+    assert previews[0].residual_area == 0.0
+    assert previews[1].pulse_area == -1.0
+    assert previews[1].target_amplitude == 0.1
+    assert previews[1].duration_cycles == 10
+    assert previews[1].residual_area == 0.0
+
+    times, values, boundaries = sequence.compensated_waveform_vertices()
+    assert times[-1] == 42.0
+    assert values["awg_0"][-1] == 0.0
+    assert values["awg_1"][-1] == 0.0
+    assert [name for name, _start, _end in boundaries[-2:]] == [
+        "bias_t_comp_awg_0",
+        "bias_t_comp_awg_1",
+    ]
+
+
+def test_bias_t_duration_is_swept_and_applied_by_tprocessor_sync():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.1,), 20)
+    sequence.add_ramp("to_gate", 100)
+    sequence.add_set("gate", (0.2,), 20)
+    sequence.set_amplitude_sweep("gate", "awg_0", 0.2, 0.4, 3)
+    sequence.set_bias_t_compensation(0.1)
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        repetitions_per_sweep=2,
+    )
+    program.compile()
+
+    assert any(inst["name"] == "sync" for inst in program.prog_list)
+    assert any(
+        inst["name"] == "bitwi" and inst["args"][3:] == (">>", 8)
+        for inst in program.prog_list
+    )
+    assert program.summary()["bias_t_duration_execution"] == (
+        "tproc_signed_fixed_point_sync"
+    )
+    assert program.summary()["bias_t_dynamic_register_fields"] == 1
+    assert program._bias_t_duration_q_actual[:, 0].tolist() == sorted(
+        program._bias_t_duration_q_actual[:, 0].tolist()
+    )
+
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+    compensation_code = program._bias_t_fields[0]["negative_code"] & 0xFFFFFFFF
+    expected_durations = [
+        (abs(int(value)) + (1 << 7)) >> 8
+        for value in program._bias_t_duration_q_actual[:, 0]
+        for _rep in range(program.cfg["reps"])
+    ]
+    compensation_events = [
+        event
+        for event in tproc.output_events
+        if (event.word & 0xFFFFFFFF) == compensation_code
+    ]
+    assert len(compensation_events) == len(expected_durations)
+    for event, duration in zip(compensation_events, expected_durations):
+        following_zero = next(
+            candidate
+            for candidate in tproc.output_events
+            if candidate.cycle > event.cycle
+            and (candidate.word & 0xFFFFFFFF) == 0
+        )
+        assert following_zero.cycle - event.cycle == duration
+
+
+def test_bias_t_compensation_registers_fit_eight_outputs():
+    names = tuple(f"awg_{index}" for index in range(8))
+    sequence = FineTuneSequence(names)
+    sequence.add_set("hold", tuple(0.05 * (index + 1) for index in range(8)), 20)
+    sequence.set_bias_t_compensation(0.1)
+    program = sequence.make_program(
+        _mock_soccfg(8),
+        awg_channels=tuple(range(8)),
+    )
+    program.compile()
+    assert len(program._bias_t_fields) == 8
+    assert len({
+        (field["page"], field["state_register"])
+        for field in program._bias_t_fields
+    }) == 8
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+    assert tproc.timing_conflicts == []
+
+
+def test_bias_t_tprocessor_selects_opposite_polarity_across_zero_area():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (0.0,), 20)
+    sequence.set_amplitude_sweep("hold", "awg_0", -0.2, 0.2, 3)
+    sequence.set_bias_t_compensation(0.1)
+    program = sequence.make_program(_mock_soccfg(1), awg_channels=(0,))
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+
+    positive = int(program._bias_t_fields[0]["positive_code"])
+    negative = int(program._bias_t_fields[0]["negative_code"])
+    compensation_targets = []
+    for event in tproc.output_events:
+        target = event.word & 0xFFFFFFFF
+        target = target - (1 << 32) if target & (1 << 31) else target
+        if target in {positive, negative}:
+            compensation_targets.append(target)
+    assert compensation_targets == [positive, negative]
+
+
+def test_bias_t_fixed_point_range_supports_100us_full_scale_pulse():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (1.0,), 30_000)
+    sequence.set_bias_t_compensation(0.1)
+    program = sequence.make_program(_mock_soccfg(1), awg_channels=(0,))
+    duration_cycles = (
+        abs(int(program._bias_t_duration_q_actual[0, 0])) + (1 << 7)
+    ) >> 8
+    assert 299_900 <= duration_cycles <= 300_100
