@@ -59,6 +59,15 @@ def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
     return value
 
 
+def _require_positive_real(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    value = float(value)
+    if not isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return value
+
+
 def _require_amplitude(value, name: str = "amplitude") -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a real number")
@@ -837,6 +846,7 @@ class FineTuneSequence:
         soccfg,
         awg_channels: Union[Sequence[int], Mapping[str, int]],
         *,
+        tproc_mhz: Optional[Real] = None,
         repetitions_per_sweep: int = 1,
         reps: Optional[int] = None,
         readout: Optional[ReadoutConfig] = None,
@@ -851,6 +861,7 @@ class FineTuneSequence:
             soccfg,
             self,
             awg_channels,
+            tproc_mhz=tproc_mhz,
             repetitions_per_sweep=repetitions_per_sweep,
             reps=reps,
             readout=readout,
@@ -1020,6 +1031,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         sequence: FineTuneSequence,
         awg_channels,
         *,
+        tproc_mhz: Optional[Real] = None,
         repetitions_per_sweep: int = 1,
         reps: Optional[int] = None,
         readout: Optional[ReadoutConfig] = None,
@@ -1033,6 +1045,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         sequence._validate()
         self.sequence = sequence
         self.awg_channel_spec = awg_channels
+        self.hwh_tproc_mhz = _require_positive_real(
+            soccfg["tprocs"][0]["f_time"], "HWH tProcessor clock"
+        )
+        self.tproc_mhz = (
+            self.hwh_tproc_mhz
+            if tproc_mhz is None
+            else _require_positive_real(tproc_mhz, "tproc_mhz")
+        )
+        self.tproc_clock_is_manual = tproc_mhz is not None
         self.readout_config = readout
         if rf_pulse is not None and rf_pulses is not None:
             raise ValueError("use either rf_pulse or rf_pulses, not both")
@@ -1091,6 +1112,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         return self.sequence.sweep_points.copy()
 
     def initialize(self):
+        # QICK's pulse/readout helpers use self.tproccfg for timestamp math.
+        # Keep the hardware description intact and override only this program's
+        # local timing view when the caller supplied a manual clock.
+        self.tproccfg = dict(self.tproccfg)
+        self.tproccfg["f_time"] = self.tproc_mhz
         self.awg_channels, self.compiled_points = compile_sequence(
             self.sequence, self.soccfg, self.awg_channel_spec
         )
@@ -1420,9 +1446,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.timing["point_end"] += delta
 
     def _build_aux_timing(self):
-        f_time = float(self.soccfg["tprocs"][0]["f_time"])
-        if f_time <= 0:
-            raise ValueError("tProcessor clock must be positive")
+        f_time = self.tproc_mhz
 
         if self.ddr_readout_config is not None:
             ddr = self.ddr_readout_config
@@ -1525,7 +1549,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         return slots
 
     def _fabric_to_tproc(self, gen_ch: int, fabric_cycles: int) -> int:
-        f_time = float(self.soccfg["tprocs"][0]["f_time"])
+        f_time = self.tproc_mhz
         f_fabric = float(self.soccfg["gens"][gen_ch]["f_fabric"])
         if f_time <= 0 or f_fabric <= 0:
             raise ValueError("tProcessor and AWG fabric clocks must be positive")
@@ -1961,6 +1985,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "sweep_max_target_quantization_error": self._sweep_max_target_error,
             "sweep_max_step_quantization_error": self._sweep_max_step_error,
             "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
+            "tproc_mhz": self.tproc_mhz,
+            "hwh_tproc_mhz": self.hwh_tproc_mhz,
+            "tproc_clock_is_manual": self.tproc_clock_is_manual,
             "point_end_tproc_cycles": self.timing["point_end"],
             "program_instructions": len(self.prog_list),
             "rf_pulse": bool(self.rf_pulse_configs),

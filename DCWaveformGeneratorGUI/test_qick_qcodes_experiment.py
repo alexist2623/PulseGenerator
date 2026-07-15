@@ -79,7 +79,11 @@ def _gui_metadata():
             "physical_mv": [[100.0, 100.0]],
         },
         "awg": {"cross_capacitance": [[1.0]]},
-        "qick": {"fabric_mhz": 300.0, "full_scale_mv": 100.0},
+        "qick": {
+            "fabric_mhz": 300.0,
+            "tproc_mhz": 300.0,
+            "full_scale_mv": 100.0,
+        },
         "rf_outputs": [{"frequency_mhz": 50.0, "gain": 12000}],
         "rf_readout": {"readout_frequency_mhz": 25.0},
     }
@@ -523,22 +527,34 @@ def test_awg_vertex_metadata_stores_all_sweep_points_in_both_spaces():
     assert physical["values_mv"][0][1] == [0.0, 0.0, -20.0, -20.0]
 
 
-def test_runtime_configs_use_actual_qick_clocks():
+def test_runtime_configs_accept_manual_tproc_clock_override():
     soccfg = {
-        "tprocs": [{"f_time": 300.0}],
+        "tprocs": [{"f_time": 400.0}],
         "gens": [{"f_fabric": 250.0}],
     }
     rf = QickRfPulseSpec(
         0, "set_0", 0.2, 0.4, 43.5, 10000, 6.0, 7.0
     )
     ddr = QickDdrReadoutSpec(0, "set_0", 0.25, 16, 12.5)
-    runtime_rf = build_runtime_rf_pulses(soccfg, (rf,))[0]
-    runtime_ddr = build_runtime_ddr_readout(soccfg, ddr)
+    runtime_rf = build_runtime_rf_pulses(
+        soccfg, (rf,), tproc_mhz=300.0
+    )[0]
+    runtime_ddr = build_runtime_ddr_readout(
+        soccfg, ddr, tproc_mhz=300.0
+    )
 
     assert runtime_rf.length_cycles == 100
     assert runtime_rf.delay_tproc_cycles == 60
     assert runtime_ddr.trigger_delay_tproc_cycles == 75
     assert runtime_ddr.samples_per_trigger == 16
+
+    # Direct callers retain the HWH fallback when no override is supplied.
+    assert build_runtime_rf_pulses(
+        soccfg, (rf,)
+    )[0].delay_tproc_cycles == 80
+    assert build_runtime_ddr_readout(
+        soccfg, ddr
+    ).trigger_delay_tproc_cycles == 100
 
 
 def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
@@ -578,7 +594,7 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
 
     soc = FakeSoc()
     soccfg = {
-        "tprocs": [{"f_time": 300.0}],
+        "tprocs": [{"f_time": 400.0}],
         "gens": [{"f_fabric": 300.0}],
     }
 
@@ -612,6 +628,9 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert result.row_count == 12
     assert result.database_path.exists()
     assert calls.count(("gen", 0, 5.0, 6.0)) == 1
+    program_call = next(call for call in calls if call[0] == "program")
+    assert program_call[2]["tproc_mhz"] == 300.0
+    assert program_call[2]["rf_pulses"][0].delay_tproc_cycles == 0
     assert any(call[0] == "acquire" for call in calls)
     assert progress_updates[0][0] == 0
     assert progress_updates[-1] == (100, "Experiment saved")

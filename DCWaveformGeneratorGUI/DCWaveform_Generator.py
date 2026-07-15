@@ -39,6 +39,7 @@ try:
     from .dc_waveform_core import (
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
+        DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
         QickDdrReadoutSpec,
@@ -55,6 +56,7 @@ except ImportError:
     from dc_waveform_core import (
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
+        DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
         QickDdrReadoutSpec,
@@ -89,11 +91,42 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
 DEFAULT_QCODES_DB_PATH = str(Path.home() / "qick_experiments.db")
+
+DEFAULT_RF_OUTPUT_SETTINGS = {
+    "enabled": False,
+    "gen_ch": DEFAULT_QSTL_RF_CHANNELS[0],
+    "segment_name": "set_0",
+    "delay_us": 0.0,
+    "duration_us": 1.0,
+    "frequency_mhz": 50.0,
+    "gain": 20000,
+    "att1_db": 0.0,
+    "att2_db": 0.0,
+    "phase_degrees": 0.0,
+    "nqz": 1,
+    "require_within_segment": True,
+}
+
+DEFAULT_RF_READOUT_SETTINGS = {
+    "enabled": False,
+    "ro_ch": 0,
+    "segment_name": "set_0",
+    "delay_us": 0.0,
+    "samples_per_trigger": 64,
+    "readout_frequency_mhz": 50.0,
+    "margin_input_samples": 1024,
+    "force_overwrite": False,
+    "attenuation_db": 20.0,
+    "filter_type": "bypass",
+    "filter_cutoff": 2.5,
+    "filter_bandwidth": 1.0,
+}
 
 
 def _time_from_ns(value_ns: float, unit: str) -> float:
@@ -2131,6 +2164,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self,
         *,
         fabric_mhz: float,
+        tproc_mhz: float,
         full_scale_mv: float,
         awg_channels: Sequence[int],
         repetitions: int,
@@ -2172,6 +2206,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.fabric_mhz.setRange(1.0, 5000.0)
         self.fabric_mhz.setDecimals(6)
         self.fabric_mhz.setSuffix(" MHz")
+        self.tproc_mhz = QtWidgets.QDoubleSpinBox()
+        self.tproc_mhz.setRange(1.0, 5000.0)
+        self.tproc_mhz.setDecimals(6)
+        self.tproc_mhz.setSuffix(" MHz")
         self.full_scale_mv = QtWidgets.QDoubleSpinBox()
         self.full_scale_mv.setRange(1.0, 1.0e6)
         self.full_scale_mv.setDecimals(6)
@@ -2181,6 +2219,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.repetitions.setRange(1, 1_000_000)
         self.set_qick_values(
             fabric_mhz=fabric_mhz,
+            tproc_mhz=tproc_mhz,
             full_scale_mv=full_scale_mv,
             awg_channels=awg_channels,
             repetitions=repetitions,
@@ -2193,6 +2232,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("Experiment name:", self.experiment_name)
         form.addRow("Sample name:", self.sample_name)
         form.addRow("AWG fabric clock:", self.fabric_mhz)
+        form.addRow("tProcessor clock:", self.tproc_mhz)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("AWG generator indices:", self.awg_channels)
         form.addRow("Repetitions per sweep point:", self.repetitions)
@@ -2258,6 +2298,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             "connection": connection,
             "run": run,
             "fabric_mhz": self.fabric_mhz.value(),
+            "tproc_mhz": self.tproc_mhz.value(),
             "full_scale_mv": self.full_scale_mv.value(),
             "awg_channels": self._parse_awg_channels(output_count),
             "repetitions_per_sweep": self.repetitions.value(),
@@ -2281,11 +2322,13 @@ class ExperimentPanel(QtWidgets.QWidget):
         self,
         *,
         fabric_mhz: float,
+        tproc_mhz: float,
         full_scale_mv: float,
         awg_channels: Sequence[int],
         repetitions: int,
     ) -> None:
         self.fabric_mhz.setValue(float(fabric_mhz))
+        self.tproc_mhz.setValue(float(tproc_mhz))
         self.full_scale_mv.setValue(float(full_scale_mv))
         self.awg_channels.setText(", ".join(str(value) for value in awg_channels))
         self.repetitions.setValue(int(repetitions))
@@ -2296,6 +2339,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         run: QcodesRunConfig,
         *,
         fabric_mhz: float,
+        tproc_mhz: float,
         full_scale_mv: float,
         awg_channels: Sequence[int],
         repetitions: int,
@@ -2309,6 +2353,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.notes.setPlainText(run.notes)
         self.set_qick_values(
             fabric_mhz=fabric_mhz,
+            tproc_mhz=tproc_mhz,
             full_scale_mv=full_scale_mv,
             awg_channels=awg_channels,
             repetitions=repetitions,
@@ -2373,6 +2418,7 @@ class QickExportDialog(QtWidgets.QDialog):
         initial_sweeps: Optional[Sequence[QickSweepSpec]] = None,
         initial_cross_capacitance=None,
         initial_fabric_mhz: float = DEFAULT_QICK_FABRIC_MHZ,
+        initial_tproc_mhz: float = DEFAULT_QICK_TPROC_MHZ,
         initial_full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV,
         initial_awg_channels: Optional[Sequence[int]] = None,
         initial_repetitions: int = 1,
@@ -2419,6 +2465,12 @@ class QickExportDialog(QtWidgets.QDialog):
         self.fabric_mhz.setValue(float(initial_fabric_mhz))
         self.fabric_mhz.setSuffix(" MHz")
 
+        self.tproc_mhz = QtWidgets.QDoubleSpinBox()
+        self.tproc_mhz.setRange(1.0, 5000.0)
+        self.tproc_mhz.setDecimals(6)
+        self.tproc_mhz.setValue(float(initial_tproc_mhz))
+        self.tproc_mhz.setSuffix(" MHz")
+
         self.full_scale_mv = QtWidgets.QDoubleSpinBox()
         self.full_scale_mv.setRange(1.0, 1.0e6)
         self.full_scale_mv.setDecimals(6)
@@ -2436,6 +2488,7 @@ class QickExportDialog(QtWidgets.QDialog):
         self.repetitions.setValue(int(initial_repetitions))
 
         form.addRow("AWG fabric clock:", self.fabric_mhz)
+        form.addRow("tProcessor clock:", self.tproc_mhz)
         form.addRow("QICK full scale (+/-):", self.full_scale_mv)
         form.addRow("AWG generator indices:", self.awg_channels)
         form.addRow("Repetitions per sweep point:", self.repetitions)
@@ -2696,6 +2749,7 @@ class QickExportDialog(QtWidgets.QDialog):
             raise ValueError("RF generator indices must be unique")
         return {
             "fabric_mhz": self.fabric_mhz.value(),
+            "tproc_mhz": self.tproc_mhz.value(),
             "full_scale_mv": self.full_scale_mv.value(),
             "awg_channels": awg_channels,
             "repetitions_per_sweep": self.repetitions.value(),
@@ -2754,6 +2808,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._sweep_specs: List[QickSweepSpec] = []
         self._cross_capacitance = np.eye(1, dtype=float)
         self._qick_fabric_mhz = float(DEFAULT_QICK_FABRIC_MHZ)
+        self._qick_tproc_mhz = float(DEFAULT_QICK_TPROC_MHZ)
         self._qick_full_scale_mv = float(DEFAULT_QICK_FULL_SCALE_MV)
         self._qick_awg_channels = (DEFAULT_QSTL_AWG_CHANNELS[0],)
         self._qick_repetitions_per_sweep = 1
@@ -2786,6 +2841,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._experiment_panel = ExperimentPanel(
             fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
             full_scale_mv=self._qick_full_scale_mv,
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
@@ -2935,6 +2991,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_qick_values(
                 fabric_mhz=self._qick_fabric_mhz,
+                tproc_mhz=self._qick_tproc_mhz,
                 full_scale_mv=self._qick_full_scale_mv,
                 awg_channels=self._qick_awg_channels,
                 repetitions=self._qick_repetitions_per_sweep,
@@ -3443,6 +3500,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _experiment_run_arguments(self) -> dict:
         values = self._experiment_panel.values(len(self._pulse))
         self._qick_fabric_mhz = values["fabric_mhz"]
+        self._qick_tproc_mhz = values["tproc_mhz"]
         self._qick_full_scale_mv = values["full_scale_mv"]
         self._qick_awg_channels = values["awg_channels"]
         self._qick_repetitions_per_sweep = values["repetitions_per_sweep"]
@@ -3702,6 +3760,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         connection = experiment_values["connection"]
         run = experiment_values["run"]
         self._qick_fabric_mhz = experiment_values["fabric_mhz"]
+        self._qick_tproc_mhz = experiment_values["tproc_mhz"]
         self._qick_full_scale_mv = experiment_values["full_scale_mv"]
         self._qick_awg_channels = experiment_values["awg_channels"]
         self._qick_repetitions_per_sweep = experiment_values[
@@ -3739,6 +3798,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
             "qick": {
                 "fabric_mhz": self._qick_fabric_mhz,
+                "tproc_mhz": self._qick_tproc_mhz,
                 "full_scale_mv": self._qick_full_scale_mv,
                 "awg_channels": list(self._qick_awg_channels),
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
@@ -3788,11 +3848,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise TypeError("settings JSON root must be an object")
         if data.get("schema") != SETTINGS_SCHEMA:
             raise ValueError(f"unsupported settings schema {data.get('schema')!r}")
-        settings_version = data.get("version")
-        if settings_version not in {1, SETTINGS_VERSION}:
+        settings_version = data.get("version", 1)
+        if settings_version not in SUPPORTED_SETTINGS_VERSIONS:
+            supported = ", ".join(map(str, SUPPORTED_SETTINGS_VERSIONS))
             raise ValueError(
                 f"unsupported settings version {settings_version!r}; "
-                f"expected 1 or {SETTINGS_VERSION}"
+                f"expected one of {supported}"
             )
 
         display = data.get("display", {})
@@ -3826,8 +3887,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if selected_tab >= self._control_tabs.count():
             raise ValueError("selected control tab is out of range")
 
-        matrix = np.asarray(awg.get("cross_capacitance"), dtype=float)
         expected_shape = (len(pulses), len(pulses))
+        if "cross_capacitance" in awg:
+            matrix = np.asarray(awg["cross_capacitance"], dtype=float)
+        else:
+            matrix = np.eye(len(pulses), dtype=float)
         if matrix.shape != expected_shape or not np.all(np.isfinite(matrix)):
             raise ValueError(
                 f"cross-capacitance matrix must be a finite {expected_shape} array"
@@ -3869,6 +3933,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         fabric_mhz = self._json_finite_float(
             qick.get("fabric_mhz", DEFAULT_QICK_FABRIC_MHZ),
             "QICK fabric_mhz",
+            positive=True,
+        )
+        tproc_mhz = self._json_finite_float(
+            qick.get("tproc_mhz", DEFAULT_QICK_TPROC_MHZ),
+            "QICK tproc_mhz",
             positive=True,
         )
         full_scale_mv = self._json_finite_float(
@@ -3918,16 +3987,23 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
-        raw_rf_outputs = data.get("rf_outputs", [])
+        if "rf_outputs" in data:
+            raw_rf_outputs = data["rf_outputs"]
+        else:
+            raw_rf_outputs = [dict(DEFAULT_RF_OUTPUT_SETTINGS)]
         if not isinstance(raw_rf_outputs, list) or len(raw_rf_outputs) > 8:
             raise ValueError("rf_outputs must contain at most eight entries")
         rf_outputs = []
-        for entry in raw_rf_outputs:
+        for index, entry in enumerate(raw_rf_outputs):
             if not isinstance(entry, dict):
                 raise TypeError("each RF output setting must be a JSON object")
-            enabled = self._json_bool(entry.get("enabled", True), "RF output enabled")
+            defaults = dict(DEFAULT_RF_OUTPUT_SETTINGS)
+            defaults["enabled"] = True
+            defaults["gen_ch"] = DEFAULT_QSTL_RF_CHANNELS[index]
+            entry = {**defaults, **entry}
+            enabled = self._json_bool(entry["enabled"], "RF output enabled")
             require_within = self._json_bool(
-                entry.get("require_within_segment", True),
+                entry["require_within_segment"],
                 "RF require_within_segment",
             )
             spec = QickRfPulseSpec(
@@ -3939,8 +4015,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 gain=int(entry["gain"]),
                 att1_db=float(entry["att1_db"]),
                 att2_db=float(entry["att2_db"]),
-                phase_degrees=float(entry.get("phase_degrees", 0.0)),
-                nqz=int(entry.get("nqz", 1)),
+                phase_degrees=float(entry["phase_degrees"]),
+                nqz=int(entry["nqz"]),
                 require_within_segment=require_within,
             )
             if spec.segment_name not in set_names:
@@ -3959,17 +4035,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "require_within_segment": spec.require_within_segment,
             }})
 
-        raw_readout = data.get("rf_readout")
+        raw_readout = data.get("rf_readout", {})
         if raw_readout is None:
-            raw_readout = self._rf_readout_panel.settings_dict()
-            raw_readout["enabled"] = False
+            raw_readout = {}
         if not isinstance(raw_readout, dict):
             raise TypeError("rf_readout must be a JSON object")
+        raw_readout = {**DEFAULT_RF_READOUT_SETTINGS, **raw_readout}
         readout_enabled = self._json_bool(
-            raw_readout.get("enabled", False), "RF readout enabled"
+            raw_readout["enabled"], "RF readout enabled"
         )
         force_overwrite = self._json_bool(
-            raw_readout.get("force_overwrite", False),
+            raw_readout["force_overwrite"],
             "RF readout force_overwrite",
         )
         readout_spec = QickDdrReadoutSpec(
@@ -3981,18 +4057,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "RF readout samples_per_trigger",
                 minimum=1,
             ),
-            readout_frequency_mhz=float(
-                raw_readout.get("readout_frequency_mhz", 0.0)
-            ),
+            readout_frequency_mhz=float(raw_readout["readout_frequency_mhz"]),
             margin_input_samples=self._json_int(
-                raw_readout.get("margin_input_samples", 1024),
+                raw_readout["margin_input_samples"],
                 "RF readout margin_input_samples",
             ),
             force_overwrite=force_overwrite,
-            attenuation_db=float(raw_readout.get("attenuation_db", 20.0)),
-            filter_type=str(raw_readout.get("filter_type", "bypass")),
-            filter_cutoff=float(raw_readout.get("filter_cutoff", 2.5)),
-            filter_bandwidth=float(raw_readout.get("filter_bandwidth", 1.0)),
+            attenuation_db=float(raw_readout["attenuation_db"]),
+            filter_type=str(raw_readout["filter_type"]),
+            filter_cutoff=float(raw_readout["filter_cutoff"]),
+            filter_bandwidth=float(raw_readout["filter_bandwidth"]),
         )
         if readout_spec.segment_name not in set_names:
             raise ValueError(
@@ -4041,6 +4115,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 grid.get("configured", False), "grid configured"
             ),
             "fabric_mhz": fabric_mhz,
+            "tproc_mhz": tproc_mhz,
             "full_scale_mv": full_scale_mv,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
@@ -4066,6 +4141,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._cross_capacitance = settings["cross_capacitance"].copy()
         self._sweep_specs = list(settings["sweeps"])
         self._qick_fabric_mhz = settings["fabric_mhz"]
+        self._qick_tproc_mhz = settings["tproc_mhz"]
         self._qick_full_scale_mv = settings["full_scale_mv"]
         self._qick_awg_channels = tuple(settings["awg_channels"])
         self._qick_repetitions_per_sweep = settings["repetitions"]
@@ -4073,6 +4149,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             settings["connection_config"],
             settings["run_config"],
             fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
             full_scale_mv=self._qick_full_scale_mv,
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
@@ -4243,6 +4320,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         try:
             experiment_values = self._experiment_panel.values(len(self._pulse))
             self._qick_fabric_mhz = experiment_values["fabric_mhz"]
+            self._qick_tproc_mhz = experiment_values["tproc_mhz"]
             self._qick_full_scale_mv = experiment_values["full_scale_mv"]
             self._qick_awg_channels = experiment_values["awg_channels"]
             self._qick_repetitions_per_sweep = experiment_values[
@@ -4272,6 +4350,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             initial_sweeps=tuple(self._sweep_specs),
             initial_cross_capacitance=self._cross_capacitance,
             initial_fabric_mhz=self._qick_fabric_mhz,
+            initial_tproc_mhz=self._qick_tproc_mhz,
             initial_full_scale_mv=self._qick_full_scale_mv,
             initial_awg_channels=self._qick_awg_channels,
             initial_repetitions=self._qick_repetitions_per_sweep,
@@ -4289,11 +4368,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         else:
             self._sweep_specs = []
         self._qick_fabric_mhz = settings["fabric_mhz"]
+        self._qick_tproc_mhz = settings["tproc_mhz"]
         self._qick_full_scale_mv = settings["full_scale_mv"]
         self._qick_awg_channels = tuple(settings["awg_channels"])
         self._qick_repetitions_per_sweep = settings["repetitions_per_sweep"]
         self._experiment_panel.set_qick_values(
             fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
             full_scale_mv=self._qick_full_scale_mv,
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
@@ -4404,6 +4485,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_qick_values(
                 fabric_mhz=self._qick_fabric_mhz,
+                tproc_mhz=self._qick_tproc_mhz,
                 full_scale_mv=self._qick_full_scale_mv,
                 awg_channels=self._qick_awg_channels,
                 repetitions=self._qick_repetitions_per_sweep,

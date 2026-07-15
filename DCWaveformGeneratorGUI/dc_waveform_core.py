@@ -27,6 +27,7 @@ DEFAULT_INSERT_FLAT_NS = 100.0
 DEFAULT_MIN_DURATION_NS = 1.0e-6
 DEFAULT_QCS_FULL_SCALE_V = 5.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
+DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 2500.0
 MAX_QICK_OUTPUTS = 8
 
@@ -721,6 +722,7 @@ def generate_qick_program_code(
     output_names: Optional[Sequence[str]] = None,
     awg_channels: Optional[Sequence[int]] = None,
     fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ,
+    tproc_mhz: Real = DEFAULT_QICK_TPROC_MHZ,
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
     repetitions_per_sweep: Integral = 1,
     sweep: Optional[QickSweepSpec] = None,
@@ -749,6 +751,7 @@ def generate_qick_program_code(
         raise ValueError("awg_channels length must match the pulse count")
     if len(set(awg_channels)) != len(awg_channels) or any(channel < 0 for channel in awg_channels):
         raise ValueError("AWG channels must be unique nonnegative integers")
+    tproc_mhz = _positive_real(tproc_mhz, "tproc_mhz")
     repetitions_per_sweep = _positive_int(repetitions_per_sweep, "repetitions_per_sweep")
     sweep_specs = _coerce_sweep_specs(sweep, sweeps)
     if rf_pulse_spec is not None and rf_pulse_specs is not None:
@@ -840,6 +843,7 @@ def generate_qick_program_code(
         f"OUTPUT_NAMES = {output_names!r}",
         f"AWG_CHANNELS = {channel_map!r}",
         f"FABRIC_MHZ = {float(fabric_mhz)!r}",
+        f"TPROC_MHZ = {tproc_mhz!r}",
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
         f"REPETITIONS_PER_SWEEP = {repetitions_per_sweep}",
         f"SWEEP_SPECS = {sweep_config!r}",
@@ -899,7 +903,7 @@ def generate_qick_program_code(
             "            phase_degrees=cfg['phase_degrees'],",
             "            nqz=cfg['nqz'],",
             "            delay_tproc_cycles=_delay_cycles(",
-            "                cfg['delay_us'], soccfg['tprocs'][0]['f_time']",
+            "                cfg['delay_us'], TPROC_MHZ",
             "            ),",
             "            require_within_segment=cfg['require_within_segment'],",
             "        ))",
@@ -921,7 +925,7 @@ def generate_qick_program_code(
             "        at_segment=cfg['segment_name'],",
             "        readout_freq_mhz=cfg['readout_frequency_mhz'],",
             "        trigger_delay_tproc_cycles=_delay_cycles(",
-            "            cfg['delay_us'], soccfg['tprocs'][0]['f_time']",
+            "            cfg['delay_us'], TPROC_MHZ",
             "        ),",
             "        margin_input_samples=cfg['margin_input_samples'],",
             "        address=cfg['address'],",
@@ -948,6 +952,7 @@ def generate_qick_program_code(
             "    return build_sequence().make_program(",
             "        soccfg,",
             "        awg_channels=awg_channels,",
+            "        tproc_mhz=TPROC_MHZ,",
             "        repetitions_per_sweep=repetitions_per_sweep,",
             "        readout=readout,",
             "        rf_pulse=rf_pulse,",
@@ -1006,6 +1011,7 @@ __all__ = [
     "DEFAULT_INSERT_RAMP_NS",
     "DEFAULT_QCS_FULL_SCALE_V",
     "DEFAULT_QICK_FABRIC_MHZ",
+    "DEFAULT_QICK_TPROC_MHZ",
     "DEFAULT_QICK_FULL_SCALE_MV",
     "PulseSequence",
     "QickDdrReadoutSpec",

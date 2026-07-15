@@ -229,6 +229,34 @@ def test_set_duration_excludes_startup_lead_and_hides_ramp_pipeline():
     )
 
 
+def test_manual_tproc_clock_overrides_stale_hwh_for_all_program_timing():
+    soccfg = _mock_soccfg(1)
+    soccfg["tprocs"][0]["f_time"] = 400.0
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 300)
+    sequence.add_ramp("to_gate", 300)
+    sequence.add_set("gate", (0.5,), 300)
+
+    program = sequence.make_program(
+        soccfg,
+        awg_channels=(0,),
+        tproc_mhz=300.0,
+    )
+    program.compile()
+
+    assert soccfg["tprocs"][0]["f_time"] == 400.0
+    assert program.tproccfg["f_time"] == 300.0
+    assert program.timing["segment_ends"][0] == 300
+    assert program.summary()["tproc_mhz"] == 300.0
+    assert program.summary()["hwh_tproc_mhz"] == 400.0
+    assert program.summary()["tproc_clock_is_manual"] is True
+
+    fallback = sequence.make_program(soccfg, awg_channels=(0,))
+    fallback.compile()
+    assert fallback.timing["segment_ends"][0] == 400
+    assert fallback.summary()["tproc_clock_is_manual"] is False
+
+
 def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("start", (0.0,), 100)

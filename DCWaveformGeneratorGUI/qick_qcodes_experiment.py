@@ -32,9 +32,17 @@ Q_TRACE_PARAMETER = "q_trace"
 SAMPLE_INDEX_PARAMETER = "sample_index"
 
 try:
-    from .dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
+    from .dc_waveform_core import (
+        DEFAULT_QICK_TPROC_MHZ,
+        QickDdrReadoutSpec,
+        QickRfPulseSpec,
+    )
 except ImportError:
-    from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
+    from dc_waveform_core import (
+        DEFAULT_QICK_TPROC_MHZ,
+        QickDdrReadoutSpec,
+        QickRfPulseSpec,
+    )
 
 
 def _runtime_types():
@@ -51,6 +59,18 @@ def _runtime_types():
             cycles_from_us,
         )
     return DdrFirReadoutConfig, RfPulseConfig, cycles_from_us
+
+
+def _resolve_tproc_mhz(soccfg, tproc_mhz: Optional[float]) -> float:
+    value = (
+        soccfg["tprocs"][0]["f_time"]
+        if tproc_mhz is None
+        else tproc_mhz
+    )
+    value = float(value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("tProcessor clock must be positive and finite")
+    return value
 
 
 @dataclass(frozen=True)
@@ -290,10 +310,12 @@ def connect_qick(
 def build_runtime_rf_pulses(
     soccfg,
     specs: Sequence[QickRfPulseSpec],
+    *,
+    tproc_mhz: Optional[float] = None,
 ) -> Tuple[Any, ...]:
     """Convert GUI RF timing in microseconds to actual QICK clock cycles."""
     _ddr_type, rf_type, cycles_from_us = _runtime_types()
-    tproc_mhz = float(soccfg["tprocs"][0]["f_time"])
+    tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     pulses = []
     for spec in specs:
         gen_cfg = soccfg["gens"][spec.gen_ch]
@@ -321,10 +343,12 @@ def build_runtime_rf_pulses(
 def build_runtime_ddr_readout(
     soccfg,
     spec: QickDdrReadoutSpec,
+    *,
+    tproc_mhz: Optional[float] = None,
 ) -> Any:
     """Convert the GUI's FIR DDR readout settings to program timing."""
     ddr_type, _rf_type, cycles_from_us = _runtime_types()
-    tproc_mhz = float(soccfg["tprocs"][0]["f_time"])
+    tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     delay_cycles = (
         0
         if spec.delay_us <= 0.0
@@ -374,6 +398,7 @@ def execute_qick_sequence(
     *,
     awg_channels: Sequence[int],
     repetitions_per_sweep: int,
+    tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     progress: bool = False,
@@ -383,12 +408,18 @@ def execute_qick_sequence(
     _emit_progress(progress_callback, 5, "Configuring RF hardware")
     rf_settings = configure_rf_board(soc, rf_specs, readout_spec)
     _emit_progress(progress_callback, 8, "Compiling the tProcessor program")
+    effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     program = sequence.make_program(
         soccfg,
         awg_channels=tuple(int(channel) for channel in awg_channels),
+        tproc_mhz=effective_tproc_mhz,
         repetitions_per_sweep=int(repetitions_per_sweep),
-        rf_pulses=build_runtime_rf_pulses(soccfg, rf_specs),
-        ddr_readout=build_runtime_ddr_readout(soccfg, readout_spec),
+        rf_pulses=build_runtime_rf_pulses(
+            soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
+        ),
+        ddr_readout=build_runtime_ddr_readout(
+            soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
+        ),
     )
     sweep_point_count = int(getattr(
         sequence,
@@ -1074,8 +1105,13 @@ def run_qick_qcodes_experiment(
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
     soc, soccfg = connect_qick(connection_config, connector=connector)
     stored_gui_settings = dict(gui_settings)
+    qick_settings = gui_settings.get("qick", {})
+    if not isinstance(qick_settings, Mapping):
+        raise TypeError("gui_settings['qick'] must be a mapping")
+    tproc_mhz = float(
+        qick_settings.get("tproc_mhz", DEFAULT_QICK_TPROC_MHZ)
+    )
     if hasattr(sequence, "waveform_vertices"):
-        qick_settings = gui_settings.get("qick", {})
         _emit_progress(progress_callback, 4, "Building compact AWG vertices")
         stored_gui_settings["awg_waveform_vertices"] = build_awg_vertex_metadata(
             sequence,
@@ -1088,6 +1124,7 @@ def run_qick_qcodes_experiment(
         sequence,
         awg_channels=awg_channels,
         repetitions_per_sweep=repetitions_per_sweep,
+        tproc_mhz=tproc_mhz,
         rf_specs=rf_specs,
         readout_spec=readout_spec,
         progress=progress,

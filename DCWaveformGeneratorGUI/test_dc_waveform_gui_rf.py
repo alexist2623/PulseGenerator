@@ -34,6 +34,8 @@ def test_gui_defaults_and_time_unit_round_trip():
     control = window._multi_ctrl._ctrl_pannels[0]
 
     assert window._time_unit == "us"
+    assert window._experiment_panel.fabric_mhz.value() == 300.0
+    assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._pulse[0].t.tolist() == [0.0, 1000.0]
     assert window._pulse[0].v.tolist() == [100.0, 100.0]
     assert control.edit_ramp.text() == "1"
@@ -199,12 +201,24 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
         (pulse,),
         output_names=("awg_0",),
         awg_channels=(1,),
+        tproc_mhz=300.0,
         rf_pulse_specs=rf_specs,
         ddr_readout_spec=readout,
     )
     ast.parse(code)
     namespace = {}
     exec(compile(code, "<multi-rf-generated>", "exec"), namespace)
+    assert namespace["TPROC_MHZ"] == 300.0
+    stale_hwh_soccfg = {
+        "tprocs": [{"f_time": 400.0}],
+        "gens": [
+            {"f_fabric": 300.0},
+            {"f_fabric": 300.0},
+            {"f_fabric": 300.0},
+        ],
+    }
+    generated_rf = namespace["build_rf_pulses"](stale_hwh_soccfg)
+    assert generated_rf[1].delay_tproc_cycles == 300
 
     class FakeSoc:
         def __init__(self):
@@ -299,6 +313,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     experiment.experiment_name.setText("Fine tune sweep")
     experiment.sample_name.setText("device A")
     experiment.notes.setPlainText("JSON round-trip notes")
+    experiment.tproc_mhz.setValue(275.0)
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -307,6 +322,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     document = json.loads(saved_path.read_text(encoding="utf-8"))
     assert document["schema"] == gui.SETTINGS_SCHEMA
     assert document["version"] == gui.SETTINGS_VERSION
+    assert document["qick"]["tproc_mhz"] == 275.0
     assert len(document["awg"]["outputs"]) == 2
     assert len(document["rf_outputs"]) == 2
 
@@ -317,6 +333,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._ddr_readout_spec == readout.spec()
     assert len(restored._rf_pulse_specs) == 1
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
+    assert restored._experiment_panel.tproc_mhz.value() == 275.0
     assert restored._experiment_panel.database_path.text().endswith("experiment.db")
     window.close()
     restored.close()
@@ -336,6 +353,7 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert arguments["run_config"].resolved_database_path == (tmp_path / "run.db")
     assert arguments["awg_channels"] == (1,)
     assert arguments["readout_spec"].samples_per_trigger == 32
+    assert arguments["gui_settings"]["qick"]["tproc_mhz"] == 300.0
     assert "waveforms" not in arguments["gui_settings"]
     assert arguments["gui_settings"]["awg"]["outputs"][0]["time_ns"] == [
         0.0,
@@ -362,4 +380,88 @@ def test_legacy_single_waveform_json_remains_loadable(tmp_path):
     window._load_settings_json(path)
     app.processEvents()
     assert window._pulse[0].to_dict() == pulse.to_dict()
+    window.close()
+
+
+def test_settings_without_tproc_clock_use_300_mhz_default():
+    app = _application()
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["qick"].pop("tproc_mhz")
+
+    decoded = window._decode_settings(document)
+    assert decoded["tproc_mhz"] == 300.0
+    window._apply_decoded_settings(decoded)
+    assert window._experiment_panel.tproc_mhz.value() == 300.0
+    app.processEvents()
+    window.close()
+
+
+def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["version"] = 2
+    document["display"].pop("voltage_view")
+    document["grid"].pop("snap_enabled")
+    document["awg"].pop("cross_capacitance")
+    document["awg"].pop("sweeps")
+    document["qick"].pop("tproc_mhz")
+    document["qick"].pop("repetitions_per_sweep")
+    document["experiment"].pop("notes")
+    document.pop("rf_outputs")
+    document["rf_readout"] = {"enabled": False}
+
+    old_path = tmp_path / "settings_v2.json"
+    old_path.write_text(json.dumps(document), encoding="utf-8")
+    window._load_settings_json(old_path)
+    app.processEvents()
+
+    assert np.array_equal(window._cross_capacitance, np.eye(1))
+    assert window._plot.voltage_view == "both"
+    assert window._grid_snap_enabled is False
+    assert window._experiment_panel.tproc_mhz.value() == 300.0
+    assert window._experiment_panel.repetitions.value() == 1
+    assert len(window._rf_ports_panel._panels) == 1
+    assert window._rf_ports_panel.settings()[0] == gui.DEFAULT_RF_OUTPUT_SETTINGS
+    assert (
+        window._rf_readout_panel.settings_dict()
+        == gui.DEFAULT_RF_READOUT_SETTINGS
+    )
+
+    upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
+    upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 3
+    assert upgraded["display"]["voltage_view"] == "both"
+    assert upgraded["grid"]["snap_enabled"] is False
+    assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
+    assert upgraded["awg"]["sweeps"] == []
+    assert upgraded["qick"]["tproc_mhz"] == 300.0
+    assert upgraded["qick"]["repetitions_per_sweep"] == 1
+    assert upgraded["experiment"]["notes"] == ""
+    assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
+    assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
+    window.close()
+
+
+def test_partial_legacy_rf_settings_fill_nested_defaults():
+    app = _application()
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["version"] = 1
+    document["rf_outputs"] = [{"gen_ch": 4, "segment_name": "set_0"}]
+    document["rf_readout"] = {"ro_ch": 2, "segment_name": "set_0"}
+
+    decoded = window._decode_settings(document)
+    rf_output = decoded["rf_outputs"][0]
+    assert rf_output["enabled"] is True
+    assert rf_output["gen_ch"] == 4
+    assert rf_output["duration_us"] == 1.0
+    assert rf_output["frequency_mhz"] == 50.0
+    assert rf_output["gain"] == 20000
+    assert decoded["rf_readout"] == {
+        **gui.DEFAULT_RF_READOUT_SETTINGS,
+        "ro_ch": 2,
+    }
+    app.processEvents()
     window.close()
