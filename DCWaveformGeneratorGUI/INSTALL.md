@@ -59,9 +59,10 @@ the AWG/RF/FIR-DDR sequence, and writes the returned 1 MSPS IQ traces to the
 selected QCoDeS SQLite database. The QICK server must already be running and
 reachable from this PC.
 
-Each sweep-point/repetition acquisition is stored as one QCoDeS array result
-named `iq_trace`, shaped `[sample, component]`, where component 0 is I and
-component 1 is Q. Sweep axes use names such as
+Each sweep-point/repetition acquisition is stored as two QCoDeS array results:
+`i_trace[sample]` and `q_trace[sample]`. This keeps I and Q independently
+selectable in Plottr while retaining one compact array per channel and trace.
+Sweep axes use names such as
 `awg_0_set_1_voltage_mv` and values are stored in mV, so Plottr exposes the
 actual output/segment sweep controls instead of a flattened point index. The run
 metadata includes the GUI settings, cross-capacitance matrix, RF output/readout
@@ -70,21 +71,24 @@ settings, QICK connection settings, and compiled program summary.
 AWG waveforms are stored as compact ordered vertex arrays for every Cartesian
 sweep point and for every channel. Query channel-specific parameters such as
 `awg_0_virtual_vertices_mv`, `awg_0_physical_vertices_mv`,
-`awg_1_virtual_vertices_mv`, and `awg_1_physical_vertices_mv`. There is no
-`awg_vertex_time_us` QCoDeS parameter. The ordered vertex times are kept in the
-channel entry under `measurement_layout.awg_vertex_channels` metadata so the
-complete SET/RAMP pulse can be reconstructed without exposing a redundant plot
-axis. Repeated times represent instantaneous SET changes. The full per-clock AWG
-trace is not duplicated in the database.
+`awg_1_virtual_vertices_mv`, and `awg_1_physical_vertices_mv`. Each dependent
+uses its own channel-specific array time axis, for example
+`awg_0_vertex_time_us`. The generic `awg_vertex_time_us` parameter is not used.
+In Plottr's Dimension assignment panel, select the channel's vertex-time
+parameter as X and the physical or virtual voltage as the dependent value.
+Sweep-voltage axes remain attached, so one time trace is available for every
+Cartesian sweep coordinate. Repeated times represent instantaneous SET changes.
+The full per-clock AWG trace is not duplicated in the database.
 
 `point_index`, `sample_index`, and IQ `time_us` are intentionally not registered
 as QCoDeS parameters, so they do not appear as misleading x/y selectors. The
-sample index is reconstructed from the `iq_trace` array length, and trace time is
-`arange(sample_count) * sample_period_us`. `sample_period_us` and the sample rate
-are stored in `qick_experiment_json` metadata. At 1 MSPS one sample step is one
-microsecond. Magnitude and phase are also derived when reading instead of being
-duplicated in SQLite. Use `load_qick_iq_arrays(dataset)` to reconstruct I, Q,
-magnitude, phase, sample index, and time arrays.
+sample index is reconstructed from the `i_trace`/`q_trace` array length, and
+trace time is `arange(sample_count) * sample_period_us`. `sample_period_us` and
+the sample rate are stored in `qick_experiment_json` metadata. At 1 MSPS one
+sample step is one microsecond. Magnitude and phase are also derived when reading
+instead of being duplicated in SQLite. Use `load_qick_iq_arrays(dataset)` to
+reconstruct I, Q, magnitude, phase, sample index, and time arrays. The loader
+also accepts older packed `iq_trace[sample, component]` runs.
 
 Repetition is counted within each Cartesian sweep point. For example, two
 independent two-point sweep axes produce four sweep points; two repetitions
@@ -100,7 +104,7 @@ SQL row per sample and slow network-synchronized writes during acquisition.
 ## Verification
 
 ```powershell
-python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes; print('GUI dependencies OK')"
+python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes, plottr; print('GUI dependencies OK')"
 python DCWaveform_Generator.py
 ```
 

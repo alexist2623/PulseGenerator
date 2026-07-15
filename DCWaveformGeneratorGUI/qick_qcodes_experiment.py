@@ -25,7 +25,10 @@ import numpy as np
 ProgressCallback = Callable[[int, str], None]
 DEFAULT_QCODES_BATCH_ROWS = 8192
 QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
+# Legacy packed-IQ parameter used by runs written before split trace storage.
 IQ_TRACE_PARAMETER = "iq_trace"
+I_TRACE_PARAMETER = "i_trace"
+Q_TRACE_PARAMETER = "q_trace"
 
 try:
     from .dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
@@ -547,26 +550,48 @@ def _first_value_per_trace(values: Any, trace_count: int) -> np.ndarray:
 
 
 def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
-    """Load array-per-trace IQ and derive sample/time/magnitude/phase arrays."""
+    """Load split or legacy packed IQ trace arrays and derived quantities."""
     metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
     layout = metadata["measurement_layout"]
     expected_shape = tuple(int(value) for value in layout["iq_shape"])
     if len(expected_shape) != 4 or expected_shape[-1] != 2:
         raise ValueError("stored IQ shape must be (point, repetition, sample, 2)")
 
-    parameter_data = dataset.get_parameter_data(IQ_TRACE_PARAMETER)
-    if IQ_TRACE_PARAMETER not in parameter_data:
-        raise ValueError("dataset does not contain array-per-trace IQ storage")
-    trace_data = parameter_data[IQ_TRACE_PARAMETER]
-    flat_iq = np.asarray(trace_data[IQ_TRACE_PARAMETER])
     trace_count = expected_shape[0] * expected_shape[1]
-    expected_flat_shape = (trace_count, expected_shape[2], 2)
-    if flat_iq.shape != expected_flat_shape:
-        raise ValueError(
-            f"stored IQ arrays have shape {flat_iq.shape}, expected "
-            f"{expected_flat_shape}"
+    parameter_names = {parameter.name for parameter in dataset.get_parameters()}
+    if {I_TRACE_PARAMETER, Q_TRACE_PARAMETER}.issubset(parameter_names):
+        i_parameter_data = dataset.get_parameter_data(I_TRACE_PARAMETER)
+        q_parameter_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)
+        trace_data = i_parameter_data[I_TRACE_PARAMETER]
+        flat_i = np.asarray(trace_data[I_TRACE_PARAMETER])
+        flat_q = np.asarray(
+            q_parameter_data[Q_TRACE_PARAMETER][Q_TRACE_PARAMETER]
         )
-    iq = flat_iq.reshape(expected_shape)
+        expected_flat_shape = (trace_count, expected_shape[2])
+        if (
+            flat_i.shape != expected_flat_shape
+            or flat_q.shape != expected_flat_shape
+        ):
+            raise ValueError(
+                "stored split IQ arrays have shapes "
+                f"{flat_i.shape} and {flat_q.shape}, expected "
+                f"{expected_flat_shape}"
+            )
+        iq = np.stack((flat_i, flat_q), axis=-1).reshape(expected_shape)
+    elif IQ_TRACE_PARAMETER in parameter_names:
+        parameter_data = dataset.get_parameter_data(IQ_TRACE_PARAMETER)
+        trace_data = parameter_data[IQ_TRACE_PARAMETER]
+        flat_iq = np.asarray(trace_data[IQ_TRACE_PARAMETER])
+        expected_flat_shape = (trace_count, expected_shape[2], 2)
+        if flat_iq.shape != expected_flat_shape:
+            raise ValueError(
+                f"stored IQ arrays have shape {flat_iq.shape}, expected "
+                f"{expected_flat_shape}"
+            )
+        iq = flat_iq.reshape(expected_shape)
+    else:
+        raise ValueError("dataset does not contain supported IQ trace storage")
+
     i_values = iq[..., 0]
     q_values = iq[..., 1]
     sample_index = np.arange(expected_shape[2], dtype=np.int64)
@@ -611,7 +636,7 @@ def store_qick_result(
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
 ) -> Tuple[Any, int]:
-    """Store one packed IQ array per sweep-point/repetition acquisition."""
+    """Store one I array and one Q array per point/repetition acquisition."""
     try:
         from qcodes import (
             Measurement,
@@ -683,22 +708,27 @@ def store_qick_result(
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
 
-    iq_trace = Parameter(
-        IQ_TRACE_PARAMETER,
-        label="Packed I/Q trace; component 0 is I and component 1 is Q",
+    i_trace = Parameter(
+        I_TRACE_PARAMETER,
+        label="I trace",
         unit="ADC units",
     )
-    measurement.register_parameter(
-        iq_trace,
-        setpoints=tuple(setpoint_parameters),
-        paramtype="array",
+    q_trace = Parameter(
+        Q_TRACE_PARAMETER,
+        label="Q trace",
+        unit="ADC units",
     )
+    for parameter in (i_trace, q_trace):
+        measurement.register_parameter(
+            parameter,
+            setpoints=tuple(setpoint_parameters),
+            paramtype="array",
+        )
 
     vertex_parameters = []
     if vertex_data is not None:
-        output_names, _vertex_time_us, _virtual_mv, _physical_mv = vertex_data
+        output_names, vertex_time_us, _virtual_mv, _physical_mv = vertex_data
         used_prefixes = set()
-        vertex_setpoints = tuple(sweep_parameters) or None
         for output_index, output_name in enumerate(output_names):
             base_prefix = _qcodes_identifier(output_name)
             prefix = base_prefix
@@ -707,6 +737,16 @@ def store_qick_result(
                 prefix = f"{base_prefix}_{suffix}"
                 suffix += 1
             used_prefixes.add(prefix)
+            time_parameter = Parameter(
+                f"{prefix}_vertex_time_us",
+                label=f"{output_name} AWG vertex time",
+                unit="us",
+            )
+            measurement.register_parameter(
+                time_parameter,
+                paramtype="array",
+            )
+            vertex_setpoints = tuple([time_parameter] + sweep_parameters)
             virtual_parameter = Parameter(
                 f"{prefix}_virtual_vertices_mv",
                 label=f"{output_name} virtual AWG waveform vertices",
@@ -726,8 +766,13 @@ def store_qick_result(
             vertex_parameters.append({
                 "output_index": output_index,
                 "output_name": output_name,
+                "time": time_parameter,
                 "virtual": virtual_parameter,
                 "physical": physical_parameter,
+                "time_values": np.ascontiguousarray(
+                    vertex_time_us,
+                    dtype=float,
+                ),
             })
 
     sweep_axis_metadata = [
@@ -767,13 +812,18 @@ def store_qick_result(
         "rf_settings_actual": rf_settings,
         "measurement_layout": {
             "iq_shape": list(iq.shape),
-            "iq_trace_parameter": IQ_TRACE_PARAMETER,
-            "iq_trace_shape": [sample_count, 2],
-            "iq_trace_dtype": str(iq.dtype),
-            "iq_components": {"i": 0, "q": 1},
-            "storage_format": "qcodes_array_per_trace_v1",
+            "iq_trace_parameters": {
+                "i": I_TRACE_PARAMETER,
+                "q": Q_TRACE_PARAMETER,
+            },
+            "iq_trace_shape": [sample_count],
+            "iq_trace_dtypes": {
+                "i": str(iq[..., 0].dtype),
+                "q": str(iq[..., 1].dtype),
+            },
+            "storage_format": "qcodes_split_array_per_trace_v2",
             "trace_count": point_count * repetition_count,
-            "sql_rows_per_trace": 1,
+            "sql_rows_per_trace": 2,
             "cartesian_point_count": point_count,
             "sample_rate_hz": run_config.sample_rate_hz,
             "sample_period_us": 1_000_000.0 / run_config.sample_rate_hz,
@@ -790,9 +840,9 @@ def store_qick_result(
                 "QCoDeS parameter."
             ),
             "derived_quantities": {
-                "magnitude": "hypot(iq_trace[..., 0], iq_trace[..., 1])",
+                "magnitude": "hypot(i_trace, q_trace)",
                 "phase_deg": (
-                    "degrees(arctan2(iq_trace[..., 1], iq_trace[..., 0]))"
+                    "degrees(arctan2(q_trace, i_trace))"
                 ),
             },
         },
@@ -804,12 +854,15 @@ def store_qick_result(
         }
         metadata["measurement_layout"].update({
             "awg_vertex_shape": list(virtual_mv.shape),
-            "awg_vertex_storage": "per_channel_qcodes_array_v1",
+            "awg_vertex_storage": "per_channel_timed_qcodes_array_v2",
             "awg_vertex_row_order": "one array per sweep point and channel",
             "awg_output_names": list(output_names),
             "awg_vertex_time_reference": "start of each pulse sequence repetition",
             "awg_vertex_channels": {
                 output_name: {
+                    "time_parameter": parameter_by_output[output_name][
+                        "time"
+                    ].name,
                     "virtual_parameter": parameter_by_output[output_name][
                         "virtual"
                     ].name,
@@ -868,6 +921,10 @@ def store_qick_result(
                     output_index = entry["output_index"]
                     channel_results.extend((
                         (
+                            entry["time"],
+                            entry["time_values"],
+                        ),
+                        (
                             entry["virtual"],
                             np.ascontiguousarray(
                                 virtual_mv[point_index, output_index],
@@ -911,8 +968,16 @@ def store_qick_result(
                     *coordinate_results,
                     (repetition_index, repetition),
                     (
-                        iq_trace,
-                        np.ascontiguousarray(iq[point_index, repetition]),
+                        i_trace,
+                        np.ascontiguousarray(
+                            iq[point_index, repetition, :, 0]
+                        ),
+                    ),
+                    (
+                        q_trace,
+                        np.ascontiguousarray(
+                            iq[point_index, repetition, :, 1]
+                        ),
                     ),
                 )
                 traces_written += 1
@@ -929,7 +994,7 @@ def store_qick_result(
                     _emit_progress(
                         progress_callback,
                         percent,
-                        f"Saving IQ trace arrays {traces_written:,}/"
+                        f"Saving split I/Q trace arrays {traces_written:,}/"
                         f"{trace_count:,} ({row_count:,}/{total_rows:,} samples)",
                     )
 
@@ -1020,7 +1085,9 @@ def run_qick_qcodes_experiment(
 
 __all__ = [
     "DEFAULT_QCODES_BATCH_ROWS",
+    "I_TRACE_PARAMETER",
     "IQ_TRACE_PARAMETER",
+    "Q_TRACE_PARAMETER",
     "QCODES_STAGING_ENV",
     "ProgressCallback",
     "QcodesRunConfig",

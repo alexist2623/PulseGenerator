@@ -9,6 +9,7 @@ import json
 import sqlite3
 
 import numpy as np
+from plottr.data.qcodes_dataset import ds_to_datadicts
 
 from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
 from qick_fine_tune_sweep import (
@@ -17,7 +18,9 @@ from qick_fine_tune_sweep import (
     FineTuneSequence,
 )
 from qick_qcodes_experiment import (
+    I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
+    Q_TRACE_PARAMETER,
     QCODES_STAGING_ENV,
     QcodesRunConfig,
     QickConnectionConfig,
@@ -118,15 +121,19 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
 
     assert database_path.exists()
     assert row_count == 12
-    # Four IQ traces plus virtual/physical vertex arrays for two outputs at
-    # two sweep points. Each dependent array occupies one QCoDeS result row.
-    assert dataset.number_of_results == 12
+    # Four traces produce eight split I/Q arrays. Virtual/physical vertex
+    # arrays add eight more dependent results across two points and channels.
+    assert dataset.number_of_results == 16
     sweep_parameter = "awg_0_set_1_voltage_mv"
     dataset_parameters = {
         parameter.strip() for parameter in dataset.parameters.split(",")
     }
-    assert IQ_TRACE_PARAMETER in dataset_parameters
+    assert I_TRACE_PARAMETER in dataset_parameters
+    assert Q_TRACE_PARAMETER in dataset_parameters
+    assert IQ_TRACE_PARAMETER not in dataset_parameters
     assert sweep_parameter in dataset_parameters
+    assert "awg_0_vertex_time_us" in dataset_parameters
+    assert "awg_1_vertex_time_us" in dataset_parameters
     for removed_parameter in (
         "point_index",
         "sample_index",
@@ -143,21 +150,30 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     ):
         assert removed_parameter not in dataset_parameters
 
-    trace_data = dataset.get_parameter_data(IQ_TRACE_PARAMETER)[
-        IQ_TRACE_PARAMETER
+    i_trace_data = dataset.get_parameter_data(I_TRACE_PARAMETER)[
+        I_TRACE_PARAMETER
     ]
-    expected_flat_iq = _ddr_result().iq.reshape(4, 3, 2)
-    assert trace_data[IQ_TRACE_PARAMETER].shape == (4, 3, 2)
+    q_trace_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)[
+        Q_TRACE_PARAMETER
+    ]
+    expected_flat_i = _ddr_result().iq[..., 0].reshape(4, 3)
+    expected_flat_q = _ddr_result().iq[..., 1].reshape(4, 3)
+    assert i_trace_data[I_TRACE_PARAMETER].shape == (4, 3)
+    assert q_trace_data[Q_TRACE_PARAMETER].shape == (4, 3)
     np.testing.assert_array_equal(
-        trace_data[IQ_TRACE_PARAMETER],
-        expected_flat_iq,
+        i_trace_data[I_TRACE_PARAMETER],
+        expected_flat_i,
+    )
+    np.testing.assert_array_equal(
+        q_trace_data[Q_TRACE_PARAMETER],
+        expected_flat_q,
     )
     np.testing.assert_allclose(
-        trace_data[sweep_parameter][:, 0, 0],
+        i_trace_data[sweep_parameter][:, 0],
         [-50.0, -50.0, 50.0, 50.0],
     )
     np.testing.assert_array_equal(
-        trace_data["repetition_index"][:, 0, 0],
+        i_trace_data["repetition_index"][:, 0],
         [0, 1, 0, 1],
     )
 
@@ -204,6 +220,42 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
         awg_0_virtual[sweep_parameter][:, 0],
         [-50.0, 50.0],
     )
+    np.testing.assert_allclose(
+        awg_0_virtual["awg_0_vertex_time_us"],
+        [[0.0, 10 / 300], [0.0, 10 / 300]],
+    )
+    np.testing.assert_allclose(
+        awg_0_physical["awg_0_vertex_time_us"],
+        [[0.0, 10 / 300], [0.0, 10 / 300]],
+    )
+    np.testing.assert_allclose(
+        awg_1_virtual["awg_1_vertex_time_us"],
+        [[0.0, 10 / 300], [0.0, 10 / 300]],
+    )
+    np.testing.assert_allclose(
+        awg_1_physical["awg_1_vertex_time_us"],
+        [[0.0, 10 / 300], [0.0, 10 / 300]],
+    )
+    plottr_data = ds_to_datadicts(dataset)
+    assert plottr_data[I_TRACE_PARAMETER].axes(I_TRACE_PARAMETER) == [
+        sweep_parameter,
+        "repetition_index",
+    ]
+    assert plottr_data[Q_TRACE_PARAMETER].axes(Q_TRACE_PARAMETER) == [
+        sweep_parameter,
+        "repetition_index",
+    ]
+    for channel in ("awg_0", "awg_1"):
+        time_parameter = f"{channel}_vertex_time_us"
+        for space in ("virtual", "physical"):
+            voltage_parameter = f"{channel}_{space}_vertices_mv"
+            assert plottr_data[voltage_parameter].axes(voltage_parameter) == [
+                time_parameter,
+                sweep_parameter,
+            ]
+            assert plottr_data[voltage_parameter].data_vals(
+                time_parameter
+            ).shape == (2, 2)
     metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
     assert metadata["qick_connection"]["host"] == "192.0.2.10"
     assert metadata["measurement_layout"]["iq_shape"] == [2, 2, 3, 2]
@@ -211,8 +263,13 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert "awg_waveform_vertices" not in metadata["gui_settings"]
     layout = metadata["measurement_layout"]
     assert layout["sample_period_us"] == 1.0
-    assert layout["storage_format"] == "qcodes_array_per_trace_v1"
-    assert layout["sql_rows_per_trace"] == 1
+    assert layout["storage_format"] == "qcodes_split_array_per_trace_v2"
+    assert layout["iq_trace_parameters"] == {
+        "i": I_TRACE_PARAMETER,
+        "q": Q_TRACE_PARAMETER,
+    }
+    assert layout["iq_trace_shape"] == [3]
+    assert layout["sql_rows_per_trace"] == 2
     assert layout["time_reconstruction"].startswith("sample_index = arange")
     assert layout["sweep_axes"][0]["parameter"] == sweep_parameter
     assert layout["sweep_axes"][0]["voltage_start_mv"] == -50.0
@@ -221,12 +278,14 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert "time_us" not in layout["setpoint_meanings"]
     assert layout["awg_vertex_channels"] == {
         "awg_0": {
+            "time_parameter": "awg_0_vertex_time_us",
             "virtual_parameter": "awg_0_virtual_vertices_mv",
             "physical_parameter": "awg_0_physical_vertices_mv",
             "time_us": [0.0, 10 / 300],
             "vertex_count": 2,
         },
         "awg_1": {
+            "time_parameter": "awg_1_vertex_time_us",
             "virtual_parameter": "awg_1_virtual_vertices_mv",
             "physical_parameter": "awg_1_physical_vertices_mv",
             "time_us": [0.0, 10 / 300],
@@ -280,31 +339,39 @@ def test_store_qick_result_keeps_cartesian_sweeps_and_repetitions_grouped(
     )
 
     assert row_count == 25 * 2 * 128
-    assert dataset.number_of_results == 50
+    assert dataset.number_of_results == 100
     with sqlite3.connect(database_path) as connection:
         sql_row_count = connection.execute(
             f'SELECT COUNT(*) FROM "{dataset.table_name}"'
         ).fetchone()[0]
-    assert sql_row_count == 50
+    assert sql_row_count == 100
 
-    trace_data = dataset.get_parameter_data(IQ_TRACE_PARAMETER)[
-        IQ_TRACE_PARAMETER
+    i_trace_data = dataset.get_parameter_data(I_TRACE_PARAMETER)[
+        I_TRACE_PARAMETER
     ]
-    assert trace_data[IQ_TRACE_PARAMETER].shape == (50, 128, 2)
+    q_trace_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)[
+        Q_TRACE_PARAMETER
+    ]
+    assert i_trace_data[I_TRACE_PARAMETER].shape == (50, 128)
+    assert q_trace_data[Q_TRACE_PARAMETER].shape == (50, 128)
     np.testing.assert_array_equal(
-        trace_data[IQ_TRACE_PARAMETER],
-        iq.reshape(50, 128, 2),
+        i_trace_data[I_TRACE_PARAMETER],
+        iq[..., 0].reshape(50, 128),
+    )
+    np.testing.assert_array_equal(
+        q_trace_data[Q_TRACE_PARAMETER],
+        iq[..., 1].reshape(50, 128),
     )
     np.testing.assert_allclose(
-        trace_data["awg_0_set_1_voltage_mv"][:, 0, 0],
+        i_trace_data["awg_0_set_1_voltage_mv"][:, 0],
         np.repeat(coordinates[:, 0] * 800.0, 2),
     )
     np.testing.assert_allclose(
-        trace_data["awg_1_set_1_voltage_mv"][:, 0, 0],
+        i_trace_data["awg_1_set_1_voltage_mv"][:, 0],
         np.repeat(coordinates[:, 1] * 800.0, 2),
     )
     np.testing.assert_array_equal(
-        trace_data["repetition_index"][:, 0, 0],
+        i_trace_data["repetition_index"][:, 0],
         np.tile([0, 1], 25),
     )
     loaded = load_qick_iq_arrays(dataset)
@@ -321,8 +388,61 @@ def test_store_qick_result_keeps_cartesian_sweeps_and_repetitions_grouped(
         "magnitude",
         "phase_deg",
         "awg_vertex_time_us",
+        IQ_TRACE_PARAMETER,
     ):
         assert unstored_parameter not in dataset_parameters
+
+
+def test_plottr_vertex_traces_keep_cartesian_sweeps_and_channel_time(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("start", (0.0, 0.0), 10)
+    sequence.set_amplitude_sweep("start", "awg_0", -0.5, 0.5, 2)
+    sequence.set_amplitude_sweep("start", "awg_1", -0.25, 0.25, 2)
+    point_count = sequence.sweep_point_count
+    result = FineTuneDdrResult(
+        sweep_points=np.asarray(sequence.sweep_coordinates),
+        iq=np.zeros((point_count, 1, 4, 2), dtype=np.int16),
+        sweep_axes=tuple(sequence.sweep_axes),
+        sweep_shape=tuple(sequence.sweep_shape),
+        cross_capacitance=np.eye(2),
+    )
+    gui_metadata = {
+        "qick": {"fabric_mhz": 300.0, "full_scale_mv": 100.0},
+        "awg_waveform_vertices": build_awg_vertex_metadata(
+            sequence,
+            fabric_mhz=300.0,
+            full_scale_mv=100.0,
+        ),
+    }
+    dataset, _ = store_qick_result(
+        result,
+        run_config=QcodesRunConfig(str(tmp_path / "plottr_vertices.db")),
+        connection_config=QickConnectionConfig("192.0.2.10", 8888, "myqick"),
+        program_summary={},
+        gui_settings=gui_metadata,
+        rf_settings={},
+    )
+
+    sweep_parameters = list(_sweep_parameter_names(sequence.sweep_axes))
+    plottr_data = ds_to_datadicts(dataset)
+    for channel in ("awg_0", "awg_1"):
+        time_parameter = f"{channel}_vertex_time_us"
+        for space in ("virtual", "physical"):
+            voltage_parameter = f"{channel}_{space}_vertices_mv"
+            trace = plottr_data[voltage_parameter]
+            assert trace.axes(voltage_parameter) == [
+                time_parameter,
+                *sweep_parameters,
+            ]
+            assert trace.data_vals(voltage_parameter).shape == (
+                point_count,
+                2,
+            )
+            assert trace.data_vals(time_parameter).shape == (point_count, 2)
 
 
 def test_local_staging_preserves_existing_database_runs(tmp_path, monkeypatch):
