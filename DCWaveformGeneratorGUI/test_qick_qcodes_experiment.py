@@ -605,6 +605,9 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
             calls.append(("gen", gen_ch, att1, att2))
             return att1, att2
 
+        def rfb_set_gen_filter(self, gen_ch, **kwargs):
+            calls.append(("gen_filter", gen_ch, kwargs))
+
         def rfb_set_ro_rf(self, ro_ch, attenuation):
             calls.append(("ro", ro_ch, attenuation))
             return attenuation
@@ -665,6 +668,19 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert result.row_count == 12
     assert result.database_path.exists()
     assert calls.count(("gen", 0, 5.0, 6.0)) == 1
+    assert calls.count(("gen_filter", 0, {
+        "fc": 2.5, "bw": 1.0, "ftype": "bypass"
+    })) == 1
+    assert result.rf_settings["output_details"] == ({
+        "gen_ch": 0,
+        "requested_att1_db": 5.0,
+        "requested_att2_db": 6.0,
+        "commanded_att1_db": 5.0,
+        "commanded_att2_db": 6.0,
+        "filter_type": "bypass",
+        "filter_cutoff_ghz": 2.5,
+        "filter_bandwidth_ghz": 1.0,
+    },)
     program_call = next(call for call in calls if call[0] == "program")
     assert program_call[2]["tproc_mhz"] == 300.0
     assert program_call[2]["rf_pulses"][0].delay_tproc_cycles == 0

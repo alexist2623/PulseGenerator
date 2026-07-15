@@ -135,6 +135,9 @@ def test_rf_controls_are_left_tabs_and_support_multiple_ports():
 
     first = window._rf_ports_panel._panels[0]
     first.setChecked(True)
+    first.filter_type.setCurrentText("lowpass")
+    first.filter_cutoff.setValue(2.25)
+    first.filter_bandwidth.setValue(0.75)
     window._rf_ports_panel.add_port()
     second = window._rf_ports_panel._panels[1]
     second.setChecked(True)
@@ -142,6 +145,9 @@ def test_rf_controls_are_left_tabs_and_support_multiple_ports():
     specs = window._rf_ports_panel.specs()
     assert [spec.gen_ch for spec in specs] == [0, 2]
     assert all(spec.duration_us == 1.0 for spec in specs)
+    assert specs[0].filter_type == "lowpass"
+    assert specs[0].filter_cutoff == 2.25
+    assert specs[0].filter_bandwidth == 0.75
     assert len(window._rf_timelines) == 2
 
     window._rf_ports_panel.remove_port(second)
@@ -186,7 +192,10 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
     pulse = PulseSequence(100.0, initial_duration_ns=1000.0)
     pulse.add_flat_ramp(1000.0, 5000.0, 200.0)
     rf_specs = (
-        QickRfPulseSpec(0, "set_1", 0.0, 1.0, 50.0, 12000, 10.0, 12.0),
+        QickRfPulseSpec(
+            0, "set_1", 0.0, 1.0, 50.0, 12000, 10.0, 12.0,
+            filter_type="lowpass", filter_cutoff=2.25, filter_bandwidth=0.75,
+        ),
         QickRfPulseSpec(2, "set_1", 1.0, 1.0, 75.0, 8000, 8.0, 9.0),
     )
     readout = QickDdrReadoutSpec(
@@ -235,6 +244,9 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
             self.calls.append(("output", gen_ch, att1, att2))
             return att1, att2
 
+        def rfb_set_gen_filter(self, gen_ch, **kwargs):
+            self.calls.append(("output_filter", gen_ch, kwargs))
+
         def rfb_set_ro_rf(self, ro_ch, attenuation):
             self.calls.append(("readout", ro_ch, attenuation))
             return attenuation
@@ -247,6 +259,12 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
         (10.0, 12.0),
         (8.0, 9.0),
     )
+    assert ("output_filter", 0, {
+        "fc": 2.25, "bw": 0.75, "ftype": "lowpass"
+    }) in soc.calls
+    assert ("output_filter", 2, {
+        "fc": 2.5, "bw": 1.0, "ftype": "bypass"
+    }) in soc.calls
     assert namespace["configure_readout_chain"](soc) == 21.0
     assert soc.calls[-1] == (
         "filter",
@@ -294,6 +312,9 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     rf_panel.gain.setValue(12345)
     rf_panel.att1_db.setValue(7.25)
     rf_panel.att2_db.setValue(8.5)
+    rf_panel.filter_type.setCurrentText("highpass")
+    rf_panel.filter_cutoff.setValue(1.75)
+    rf_panel.filter_bandwidth.setValue(0.625)
     window._rf_ports_panel.add_port()
     disabled_rf_panel = window._rf_ports_panel._panels[1]
     disabled_rf_panel.gen_ch.setValue(4)
@@ -338,6 +359,9 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     }
     assert len(document["awg"]["outputs"]) == 2
     assert len(document["rf_outputs"]) == 2
+    assert document["rf_outputs"][0]["filter_type"] == "highpass"
+    assert document["rf_outputs"][0]["filter_cutoff"] == 1.75
+    assert document["rf_outputs"][0]["filter_bandwidth"] == 0.625
 
     restored = gui.MainWindow()
     restored._load_settings_json(saved_path)
@@ -563,7 +587,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 4
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 5
     assert upgraded["display"]["voltage_view"] == "both"
     assert upgraded["grid"]["snap_enabled"] is False
     assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
@@ -610,6 +634,9 @@ def test_partial_legacy_rf_settings_fill_nested_defaults():
     assert rf_output["duration_us"] == 1.0
     assert rf_output["frequency_mhz"] == 50.0
     assert rf_output["gain"] == 20000
+    assert rf_output["filter_type"] == "bypass"
+    assert rf_output["filter_cutoff"] == 2.5
+    assert rf_output["filter_bandwidth"] == 1.0
     assert decoded["rf_readout"] == {
         **gui.DEFAULT_RF_READOUT_SETTINGS,
         "ro_ch": 2,

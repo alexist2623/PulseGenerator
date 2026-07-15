@@ -398,11 +398,41 @@ def configure_rf_board(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
 ) -> Mapping[str, Any]:
-    """Apply RF-board output attenuation and input attenuation/filter."""
-    outputs = tuple(
-        soc.rfb_set_gen_rf(spec.gen_ch, spec.att1_db, spec.att2_db)
-        for spec in rf_specs
-    )
+    """Apply RF-board output/input attenuation and programmable filters."""
+    outputs = []
+    output_details = []
+    for spec in rf_specs:
+        actual_attenuation = soc.rfb_set_gen_rf(
+            spec.gen_ch, spec.att1_db, spec.att2_db
+        )
+        try:
+            actual_att1, actual_att2 = (
+                float(actual_attenuation[0]),
+                float(actual_attenuation[1]),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"RF generator {spec.gen_ch} returned an invalid attenuation result: "
+                f"{actual_attenuation!r}"
+            ) from exc
+        outputs.append((actual_att1, actual_att2))
+
+        soc.rfb_set_gen_filter(
+            spec.gen_ch,
+            fc=spec.filter_cutoff,
+            bw=spec.filter_bandwidth,
+            ftype=spec.filter_type,
+        )
+        output_details.append({
+            "gen_ch": int(spec.gen_ch),
+            "requested_att1_db": float(spec.att1_db),
+            "requested_att2_db": float(spec.att2_db),
+            "commanded_att1_db": actual_att1,
+            "commanded_att2_db": actual_att2,
+            "filter_type": str(spec.filter_type),
+            "filter_cutoff_ghz": float(spec.filter_cutoff),
+            "filter_bandwidth_ghz": float(spec.filter_bandwidth),
+        })
     readout_attenuation = soc.rfb_set_ro_rf(
         readout_spec.ro_ch, readout_spec.attenuation_db
     )
@@ -413,7 +443,8 @@ def configure_rf_board(
         ftype=readout_spec.filter_type,
     )
     return {
-        "outputs": outputs,
+        "outputs": tuple(outputs),
+        "output_details": tuple(output_details),
         "readout": readout_attenuation,
     }
 

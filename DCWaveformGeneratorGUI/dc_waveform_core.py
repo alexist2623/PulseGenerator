@@ -177,7 +177,7 @@ def _coerce_cross_capacitance(matrix, output_count: int) -> Tuple[Tuple[float, .
 
 @dataclass(frozen=True)
 class QickRfPulseSpec:
-    """RF pulse and RF-board output attenuation settings.
+    """RF pulse and RF-board output attenuation/filter settings.
 
     ``delay_us`` is relative to the start of ``segment_name``.  Pulse duration
     is converted to the selected RF generator's fabric clock when the generated
@@ -195,6 +195,9 @@ class QickRfPulseSpec:
     phase_degrees: float = 0.0
     nqz: int = 1
     require_within_segment: bool = True
+    filter_type: str = "bypass"
+    filter_cutoff: float = 2.5
+    filter_bandwidth: float = 1.0
 
     def __post_init__(self) -> None:
         _bounded_int(self.gen_ch, "RF generator channel", 0, 1_000_000)
@@ -212,6 +215,12 @@ class QickRfPulseSpec:
         _bounded_int(self.nqz, "RF nqz", 1, 3)
         if not isinstance(self.require_within_segment, bool):
             raise TypeError("require_within_segment must be bool")
+        if self.filter_type not in {"bypass", "lowpass", "highpass", "bandpass"}:
+            raise ValueError(
+                "RF output filter_type must be bypass, lowpass, highpass, or bandpass"
+            )
+        _nonnegative_real(self.filter_cutoff, "RF output filter_cutoff")
+        _positive_real(self.filter_bandwidth, "RF output filter_bandwidth")
 
 
 @dataclass(frozen=True)
@@ -848,6 +857,9 @@ def generate_qick_program_code(
             "phase_degrees": float(spec.phase_degrees),
             "nqz": int(spec.nqz),
             "require_within_segment": bool(spec.require_within_segment),
+            "filter_type": str(spec.filter_type),
+            "filter_cutoff": float(spec.filter_cutoff),
+            "filter_bandwidth": float(spec.filter_bandwidth),
         }
         for spec in normalized_rf_specs
     )
@@ -1005,10 +1017,18 @@ def generate_qick_program_code(
             "def configure_rf_chain(soc):",
             "    if not RF_CONFIGS:",
             "        return None",
-            "    actual = tuple(",
-            "        soc.rfb_set_gen_rf(cfg['gen_ch'], cfg['att1_db'], cfg['att2_db'])",
-            "        for cfg in RF_CONFIGS",
-            "    )",
+            "    actual = []",
+            "    for cfg in RF_CONFIGS:",
+            "        actual.append(soc.rfb_set_gen_rf(",
+            "            cfg['gen_ch'], cfg['att1_db'], cfg['att2_db']",
+            "        ))",
+            "        soc.rfb_set_gen_filter(",
+            "            cfg['gen_ch'],",
+            "            fc=cfg['filter_cutoff'],",
+            "            bw=cfg['filter_bandwidth'],",
+            "            ftype=cfg['filter_type'],",
+            "        )",
+            "    actual = tuple(actual)",
             "    return actual[0] if len(actual) == 1 else actual",
             "",
             "",

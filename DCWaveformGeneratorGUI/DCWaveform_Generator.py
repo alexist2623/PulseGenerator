@@ -97,8 +97,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 4
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, SETTINGS_VERSION)
+SETTINGS_VERSION = 5
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -117,6 +117,9 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "gain": 20000,
     "att1_db": 0.0,
     "att2_db": 0.0,
+    "filter_type": "bypass",
+    "filter_cutoff": 2.5,
+    "filter_bandwidth": 1.0,
     "phase_degrees": 0.0,
     "nqz": 1,
     "require_within_segment": True,
@@ -1453,6 +1456,18 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
             attenuator.setDecimals(2)
             attenuator.setSingleStep(0.25)
             attenuator.setSuffix(" dB")
+        self.filter_type = QtWidgets.QComboBox()
+        self.filter_type.addItems(["bypass", "lowpass", "highpass", "bandpass"])
+        self.filter_cutoff = QtWidgets.QDoubleSpinBox()
+        self.filter_cutoff.setRange(0.0, 100.0)
+        self.filter_cutoff.setDecimals(6)
+        self.filter_cutoff.setValue(2.5)
+        self.filter_cutoff.setSuffix(" GHz")
+        self.filter_bandwidth = QtWidgets.QDoubleSpinBox()
+        self.filter_bandwidth.setRange(0.001, 100.0)
+        self.filter_bandwidth.setDecimals(6)
+        self.filter_bandwidth.setValue(1.0)
+        self.filter_bandwidth.setSuffix(" GHz")
         self.phase_degrees = QtWidgets.QDoubleSpinBox()
         self.phase_degrees.setRange(-360.0, 360.0)
         self.phase_degrees.setDecimals(6)
@@ -1472,6 +1487,9 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         form.addRow("Gain:", self.gain)
         form.addRow("ATT1:", self.att1_db)
         form.addRow("ATT2:", self.att2_db)
+        form.addRow("Output filter:", self.filter_type)
+        form.addRow("Filter cutoff/center:", self.filter_cutoff)
+        form.addRow("Filter bandwidth:", self.filter_bandwidth)
         form.addRow("Phase:", self.phase_degrees)
         form.addRow("Nyquist zone:", self.nqz)
         form.addRow(self.require_within)
@@ -1508,6 +1526,9 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
             self.gain,
             self.att1_db,
             self.att2_db,
+            self.filter_type,
+            self.filter_cutoff,
+            self.filter_bandwidth,
             self.phase_degrees,
             self.nqz,
             self.require_within,
@@ -1555,6 +1576,9 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
             phase_degrees=self.phase_degrees.value(),
             nqz=self.nqz.value(),
             require_within_segment=self.require_within.isChecked(),
+            filter_type=self.filter_type.currentText(),
+            filter_cutoff=self.filter_cutoff.value(),
+            filter_bandwidth=self.filter_bandwidth.value(),
         )
 
     def _absolute_times(self, spec: QickRfPulseSpec) -> Tuple[float, float, float]:
@@ -1612,6 +1636,9 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         self.gain.setValue(spec.gain)
         self.att1_db.setValue(spec.att1_db)
         self.att2_db.setValue(spec.att2_db)
+        self.filter_type.setCurrentText(spec.filter_type)
+        self.filter_cutoff.setValue(spec.filter_cutoff)
+        self.filter_bandwidth.setValue(spec.filter_bandwidth)
         self.phase_degrees.setValue(spec.phase_degrees)
         self.nqz.setValue(spec.nqz)
         self.require_within.setChecked(spec.require_within_segment)
@@ -1667,6 +1694,18 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             attenuator.setDecimals(2)
             attenuator.setSingleStep(0.25)
             attenuator.setSuffix(" dB")
+        self.filter_type = QtWidgets.QComboBox()
+        self.filter_type.addItems(["bypass", "lowpass", "highpass", "bandpass"])
+        self.filter_cutoff = QtWidgets.QDoubleSpinBox()
+        self.filter_cutoff.setRange(0.0, 100.0)
+        self.filter_cutoff.setDecimals(6)
+        self.filter_cutoff.setValue(2.5)
+        self.filter_cutoff.setSuffix(" GHz")
+        self.filter_bandwidth = QtWidgets.QDoubleSpinBox()
+        self.filter_bandwidth.setRange(0.001, 100.0)
+        self.filter_bandwidth.setDecimals(6)
+        self.filter_bandwidth.setValue(1.0)
+        self.filter_bandwidth.setSuffix(" GHz")
         self.phase_degrees = QtWidgets.QDoubleSpinBox()
         self.phase_degrees.setRange(-360.0, 360.0)
         self.phase_degrees.setDecimals(6)
@@ -1687,6 +1726,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow("Gain:", self.gain)
         form.addRow("Output ATT1:", self.att1_db)
         form.addRow("Output ATT2:", self.att2_db)
+        form.addRow("Output filter:", self.filter_type)
+        form.addRow("Filter cutoff/center:", self.filter_cutoff)
+        form.addRow("Filter bandwidth:", self.filter_bandwidth)
         form.addRow("Phase:", self.phase_degrees)
         form.addRow("Nyquist zone:", self.nqz)
         form.addRow(self.require_within)
@@ -1705,6 +1747,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.gain,
             self.att1_db,
             self.att2_db,
+            self.filter_type,
+            self.filter_cutoff,
+            self.filter_bandwidth,
             self.phase_degrees,
             self.nqz,
             self.require_within,
@@ -1766,6 +1811,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             phase_degrees=self.phase_degrees.value(),
             nqz=self.nqz.value(),
             require_within_segment=self.require_within.isChecked(),
+            filter_type=self.filter_type.currentText(),
+            filter_cutoff=self.filter_cutoff.value(),
+            filter_bandwidth=self.filter_bandwidth.value(),
         )
 
     def spec(self) -> Optional[QickRfPulseSpec]:
@@ -1785,6 +1833,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "gain": spec.gain,
             "att1_db": spec.att1_db,
             "att2_db": spec.att2_db,
+            "filter_type": spec.filter_type,
+            "filter_cutoff": spec.filter_cutoff,
+            "filter_bandwidth": spec.filter_bandwidth,
             "phase_degrees": spec.phase_degrees,
             "nqz": spec.nqz,
             "require_within_segment": spec.require_within_segment,
@@ -1811,6 +1862,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             phase_degrees=float(data.get("phase_degrees", 0.0)),
             nqz=int(data.get("nqz", 1)),
             require_within_segment=require_within,
+            filter_type=str(data.get("filter_type", "bypass")),
+            filter_cutoff=float(data.get("filter_cutoff", 2.5)),
+            filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -1825,6 +1879,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.gain.setValue(spec.gain)
         self.att1_db.setValue(spec.att1_db)
         self.att2_db.setValue(spec.att2_db)
+        self.filter_type.setCurrentText(spec.filter_type)
+        self.filter_cutoff.setValue(spec.filter_cutoff)
+        self.filter_bandwidth.setValue(spec.filter_bandwidth)
         self.phase_degrees.setValue(spec.phase_degrees)
         self.nqz.setValue(spec.nqz)
         self.require_within.setChecked(spec.require_within_segment)
@@ -2449,10 +2506,22 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.run_status.setText(f"{percent}% - {message}")
 
     def show_result(self, result) -> None:
+        output_details = tuple(result.rf_settings.get("output_details", ()))
+        rf_summary = ""
+        if output_details:
+            entries = [
+                (
+                    f"gen {item['gen_ch']}: ATT1/ATT2 "
+                    f"{item['commanded_att1_db']:.2f}/{item['commanded_att2_db']:.2f} dB, "
+                    f"{item['filter_type']} filter"
+                )
+                for item in output_details
+            ]
+            rf_summary = "\nRF applied: " + "; ".join(entries)
         self.set_running(
             False,
             f"Run {result.run_id}, {result.row_count} IQ samples\n"
-            f"{result.database_path}",
+            f"{result.database_path}{rf_summary}",
         )
 
 
@@ -3702,7 +3771,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_rf_timeline(fit_view=True)
         self.statusBar().showMessage(
             f"RF pulse applied: {spec.frequency_mhz:.6g} MHz, gain {spec.gain}, "
-            f"ATT1/ATT2 {spec.att1_db:.2f}/{spec.att2_db:.2f} dB"
+            f"ATT1/ATT2 {spec.att1_db:.2f}/{spec.att2_db:.2f} dB, "
+            f"{spec.filter_type} filter"
         )
 
     def _remove_rf_spec(self) -> None:
@@ -4379,6 +4449,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 phase_degrees=float(entry["phase_degrees"]),
                 nqz=int(entry["nqz"]),
                 require_within_segment=require_within,
+                filter_type=str(entry["filter_type"]),
+                filter_cutoff=float(entry["filter_cutoff"]),
+                filter_bandwidth=float(entry["filter_bandwidth"]),
             )
             if spec.segment_name not in set_names:
                 raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
@@ -4391,6 +4464,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "gain": spec.gain,
                 "att1_db": spec.att1_db,
                 "att2_db": spec.att2_db,
+                "filter_type": spec.filter_type,
+                "filter_cutoff": spec.filter_cutoff,
+                "filter_bandwidth": spec.filter_bandwidth,
                 "phase_degrees": spec.phase_degrees,
                 "nqz": spec.nqz,
                 "require_within_segment": spec.require_within_segment,
