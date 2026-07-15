@@ -66,6 +66,56 @@ def test_gui_defaults_and_time_unit_round_trip():
     window.close()
 
 
+def test_segment_sweep_dialog_uses_voltage_values_but_returns_normalized_spec():
+    app = _application()
+    dialog = gui.SweepSettingsDialog(
+        output_name="awg_2",
+        segment_name="gate",
+        current_amplitude=0.25,
+        full_scale_mv=200.0,
+        initial=QickSweepSpec("gate", "awg_2", -0.5, 0.75, 7),
+    )
+
+    assert dialog.start.suffix() == " mV"
+    assert dialog.start.value() == -100.0
+    assert dialog.stop.value() == 150.0
+    dialog.start.setValue(-40.0)
+    dialog.stop.setValue(80.0)
+    spec = dialog.value()
+    assert spec.start == -0.2
+    assert spec.stop == 0.4
+    assert spec.count == 7
+    app.processEvents()
+    dialog.close()
+
+
+def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
+    app = _application()
+    dialog = gui.QickExportDialog(
+        pulse_count=1,
+        set_names=("set_0", "set_1"),
+        initial_full_scale_mv=200.0,
+        initial_sweeps=(QickSweepSpec("set_1", "awg_0", -0.5, 0.5, 5),),
+    )
+    app.processEvents()
+
+    assert dialog.sweep_table.horizontalHeaderItem(2).text() == "Start (mV)"
+    assert dialog.sweep_start.value() == -100.0
+    assert dialog.sweep_stop.value() == 100.0
+    dialog.sweep_start.setValue(-40.0)
+    dialog.sweep_stop.setValue(60.0)
+    assert dialog._current_sweep_spec().start == -0.2
+    assert dialog._current_sweep_spec().stop == 0.3
+
+    dialog.full_scale_mv.setValue(400.0)
+    app.processEvents()
+    assert dialog.sweep_start.value() == -80.0
+    assert dialog.sweep_stop.value() == 120.0
+    assert dialog._current_sweep_spec().start == -0.2
+    assert dialog._current_sweep_spec().stop == 0.3
+    dialog.close()
+
+
 def test_rf_controls_are_left_tabs_and_support_multiple_ports():
     app = _application()
     window = gui.MainWindow()

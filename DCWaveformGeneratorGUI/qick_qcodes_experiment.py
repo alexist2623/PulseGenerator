@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -215,6 +216,46 @@ def build_awg_vertex_metadata(
     }
 
 
+def _coerce_awg_vertex_data(
+    awg_vertices: Mapping[str, Any],
+    *,
+    point_count: int,
+):
+    """Validate compact AWG vertices and return arrays for QCoDeS storage."""
+    if not awg_vertices:
+        return None
+    try:
+        virtual = awg_vertices["virtual"]
+        physical = awg_vertices["physical"]
+        output_names = tuple(str(name) for name in virtual["output_names"])
+        time_us = np.asarray(virtual["time_us"], dtype=float)
+        virtual_mv = np.asarray(virtual["values_mv"], dtype=float)
+        physical_mv = np.asarray(physical["values_mv"], dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid AWG waveform vertex data") from exc
+
+    if not output_names or time_us.ndim != 1 or time_us.size < 1:
+        raise ValueError("AWG vertex output names and times must not be empty")
+    expected_shape = (point_count, len(output_names), time_us.size)
+    if virtual_mv.shape != expected_shape or physical_mv.shape != expected_shape:
+        raise ValueError(
+            "AWG vertex arrays must have shape "
+            f"{expected_shape}, received {virtual_mv.shape} and {physical_mv.shape}"
+        )
+    if tuple(str(name) for name in physical.get("output_names", ())) != output_names:
+        raise ValueError("virtual and physical AWG output names differ")
+    physical_time_us = np.asarray(physical.get("time_us", ()), dtype=float)
+    if not np.array_equal(time_us, physical_time_us):
+        raise ValueError("virtual and physical AWG vertex times differ")
+    if not all(np.all(np.isfinite(values)) for values in (
+        time_us,
+        virtual_mv,
+        physical_mv,
+    )):
+        raise ValueError("AWG vertex times and voltages must be finite")
+    return output_names, time_us, virtual_mv, physical_mv
+
+
 def connect_qick(
     config: QickConnectionConfig,
     *,
@@ -339,10 +380,19 @@ def execute_qick_sequence(
         rf_pulses=build_runtime_rf_pulses(soccfg, rf_specs),
         ddr_readout=build_runtime_ddr_readout(soccfg, readout_spec),
     )
+    sweep_point_count = int(getattr(
+        sequence,
+        "sweep_point_count",
+        getattr(program, "cfg", {}).get("expts", 1),
+    ))
     _emit_progress(
         progress_callback,
         10,
-        "Running pulse sequence and acquiring FIR DDR data",
+        (
+            "Running pulse sequence: "
+            f"{sweep_point_count:,} sweep points x "
+            f"{int(repetitions_per_sweep):,} repetitions"
+        ),
     )
 
     def counter_progress(completed: int, total: int) -> None:
@@ -351,7 +401,11 @@ def execute_qick_sequence(
         _emit_progress(
             progress_callback,
             percent,
-            f"Running sweep/repetitions {completed:,}/{total:,}",
+            (
+                f"Running acquisitions {completed:,}/{total:,} "
+                f"({sweep_point_count:,} sweep points x "
+                f"{int(repetitions_per_sweep):,} repetitions)"
+            ),
         )
 
     ddr_result = program.acquire_fir_ddr(
@@ -376,6 +430,45 @@ def _sweep_coordinates(ddr_result: Any) -> np.ndarray:
             "sweep coordinate shape does not match DDR point/axis counts"
         )
     return coordinates
+
+
+def _qcodes_identifier(value: Any) -> str:
+    """Convert a user-facing output/segment label to a QCoDeS-safe name."""
+    identifier = re.sub(r"[^0-9A-Za-z_]+", "_", str(value)).strip("_").lower()
+    if not identifier:
+        identifier = "unnamed"
+    if identifier[0].isdigit():
+        identifier = f"p_{identifier}"
+    return identifier
+
+
+def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
+    """Name sweep axes by their physical output and segment target."""
+    used = set()
+    names = []
+    for axis in axes:
+        base = (
+            f"{_qcodes_identifier(axis.output_name)}_"
+            f"{_qcodes_identifier(axis.segment_name)}_voltage_mv"
+        )
+        name = base
+        suffix = 2
+        while name in used:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used.add(name)
+        names.append(name)
+    return tuple(names)
+
+
+def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
+    qick_settings = gui_settings.get("qick", {})
+    if not isinstance(qick_settings, Mapping):
+        raise ValueError("GUI qick settings must be a mapping")
+    value = float(qick_settings.get("full_scale_mv", 100.0))
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("QICK full_scale_mv must be finite and positive")
+    return value
 
 
 def store_qick_result(
@@ -420,8 +513,22 @@ def store_qick_result(
     if total_rows < 1:
         raise ValueError("DDR IQ result contains no samples")
 
+    stored_gui_settings = dict(gui_settings)
+    awg_vertices = stored_gui_settings.pop("awg_waveform_vertices", {})
+    vertex_data = _coerce_awg_vertex_data(
+        awg_vertices,
+        point_count=point_count,
+    )
+
     _emit_progress(progress_callback, progress_start, "Preparing QCoDeS database")
+    sweep_axes = tuple(ddr_result.sweep_axes)
     coordinates = _sweep_coordinates(ddr_result)
+    if not sweep_axes and point_count != 1:
+        raise ValueError(
+            "multiple DDR sweep points require at least one named sweep axis"
+        )
+    full_scale_mv = _full_scale_mv(stored_gui_settings)
+    coordinates_mv = coordinates * full_scale_mv
     database_path = run_config.resolved_database_path
     database_path.parent.mkdir(parents=True, exist_ok=True)
     initialise_or_create_database_at(str(database_path))
@@ -431,29 +538,20 @@ def store_qick_result(
     )
     measurement = Measurement(exp=experiment, station=Station())
 
-    point_index = Parameter(
-        "point_index",
-        label="Flattened Cartesian sweep point (zero-based)",
-        unit="",
-    )
     repetition_index = Parameter("repetition_index", label="Repetition", unit="")
     sample_index = Parameter("sample_index", label="Trace sample", unit="")
-    time_us = Parameter(
-        "time_us",
-        label="Time within each acquired IQ trace",
-        unit="us",
-    )
-    setpoint_parameters = [point_index]
+    setpoint_parameters = []
     sweep_parameters = []
-    for axis_index, axis in enumerate(tuple(ddr_result.sweep_axes)):
+    sweep_parameter_names = _sweep_parameter_names(sweep_axes)
+    for axis, parameter_name in zip(sweep_axes, sweep_parameter_names):
         parameter = Parameter(
-            f"sweep_{axis_index}",
-            label=f"{axis.output_name} {axis.segment_name} amplitude",
-            unit="normalized",
+            parameter_name,
+            label=f"{axis.output_name} / {axis.segment_name} voltage",
+            unit="mV",
         )
         sweep_parameters.append(parameter)
         setpoint_parameters.append(parameter)
-    setpoint_parameters.extend((repetition_index, sample_index, time_us))
+    setpoint_parameters.extend((repetition_index, sample_index))
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
 
@@ -465,6 +563,81 @@ def store_qick_result(
     for parameter in (i_value, q_value, magnitude, phase_deg):
         measurement.register_parameter(parameter, setpoints=dependencies)
 
+    vertex_parameters = None
+    if vertex_data is not None:
+        awg_output_index = Parameter(
+            "awg_output_index",
+            label="AWG output index",
+            unit="",
+        )
+        awg_vertex_index = Parameter(
+            "awg_vertex_index",
+            label="AWG waveform vertex index",
+            unit="",
+        )
+        awg_vertex_time_us = Parameter(
+            "awg_vertex_time_us",
+            label="AWG waveform vertex time",
+            unit="us",
+        )
+        for parameter in (
+            awg_output_index,
+            awg_vertex_index,
+            awg_vertex_time_us,
+        ):
+            measurement.register_parameter(parameter)
+        vertex_dependencies = tuple(
+            sweep_parameters
+            + [awg_output_index, awg_vertex_index, awg_vertex_time_us]
+        )
+        awg_virtual_vertex_mv = Parameter(
+            "awg_virtual_vertex_mv",
+            label="Virtual AWG waveform vertex",
+            unit="mV",
+        )
+        awg_physical_vertex_mv = Parameter(
+            "awg_physical_vertex_mv",
+            label="Physical AWG waveform vertex",
+            unit="mV",
+        )
+        for parameter in (awg_virtual_vertex_mv, awg_physical_vertex_mv):
+            measurement.register_parameter(parameter, setpoints=vertex_dependencies)
+        vertex_parameters = {
+            "output_index": awg_output_index,
+            "vertex_index": awg_vertex_index,
+            "time_us": awg_vertex_time_us,
+            "virtual_mv": awg_virtual_vertex_mv,
+            "physical_mv": awg_physical_vertex_mv,
+        }
+
+    sweep_axis_metadata = [
+        {
+            "parameter": parameter.name,
+            "output_name": axis.output_name,
+            "segment_name": axis.segment_name,
+            "unit": "mV",
+            "normalized_start": float(axis.start),
+            "normalized_stop": float(axis.stop),
+            "voltage_start_mv": float(axis.start) * full_scale_mv,
+            "voltage_stop_mv": float(axis.stop) * full_scale_mv,
+            "count": int(axis.count),
+        }
+        for axis, parameter in zip(sweep_axes, sweep_parameters)
+    ]
+    setpoint_meanings = {
+        parameter.name: (
+            f"Voltage applied to {axis.output_name}/{axis.segment_name}; "
+            "this is a directly selectable Cartesian sweep axis."
+        )
+        for axis, parameter in zip(sweep_axes, sweep_parameters)
+    }
+    setpoint_meanings.update({
+        "repetition_index": "Zero-based repetition within one sweep coordinate.",
+        "sample_index": (
+            "Zero-based sample within one triggered IQ trace. Physical time is "
+            "sample_index multiplied by sample_period_us from this metadata."
+        ),
+    })
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "qick_connection": asdict(connection_config),
@@ -472,32 +645,41 @@ def store_qick_result(
             **asdict(run_config),
             "database_path": str(database_path),
         },
-        "gui_settings": gui_settings,
+        "gui_settings": stored_gui_settings,
         "program_summary": program_summary,
         "rf_settings_actual": rf_settings,
         "measurement_layout": {
             "iq_shape": list(iq.shape),
+            "cartesian_point_count": point_count,
             "sample_rate_hz": run_config.sample_rate_hz,
             "sample_period_us": 1_000_000.0 / run_config.sample_rate_hz,
-            "row_order": "point,repetition,sample",
-            "setpoint_meanings": {
-                "point_index": (
-                    "Zero-based flattened Cartesian sweep index; the last "
-                    "configured sweep axis varies fastest."
-                ),
-                "repetition_index": "Zero-based repetition within one sweep point.",
-                "sample_index": "Zero-based sample within one triggered IQ trace.",
-                "time_us": (
-                    "Physical time within each IQ trace, reset to zero for every "
-                    "trigger; time_us = sample_index / sample_rate_hz."
-                ),
-            },
+            "row_order": (
+                "sweep_axes,repetition,sample"
+                if sweep_axes
+                else "repetition,sample"
+            ),
+            "sweep_axes": sweep_axis_metadata,
+            "setpoint_meanings": setpoint_meanings,
+            "time_reconstruction": (
+                "time_us = sample_index * sample_period_us; time_us is metadata, "
+                "not a registered QCoDeS axis."
+            ),
         },
     }
+    if vertex_data is not None:
+        output_names, vertex_time_us, virtual_mv, _physical_mv = vertex_data
+        metadata["measurement_layout"].update({
+            "awg_vertex_shape": list(virtual_mv.shape),
+            "awg_vertex_row_order": (
+                "sweep_axes,output,vertex"
+                if sweep_axes
+                else "output,vertex"
+            ),
+            "awg_output_names": list(output_names),
+            "awg_vertex_time_reference": "start of each pulse sequence repetition",
+        })
 
     row_count = 0
-    sample_period_us = 1_000_000.0 / run_config.sample_rate_hz
-    awg_vertices = gui_settings.get("awg_waveform_vertices", {})
     with measurement.run(
         write_in_background=False,
         in_memory_cache=False,
@@ -506,29 +688,64 @@ def store_qick_result(
         dataset.add_metadata("qick_experiment_json", _json_text(metadata))
         dataset.add_metadata(
             "output_waveforms_json",
-            _json_text(awg_vertices or gui_settings.get("waveforms", {})),
-        )
-        dataset.add_metadata(
-            "awg_virtual_vertices_json",
-            _json_text(awg_vertices.get("virtual", {})),
-        )
-        dataset.add_metadata(
-            "awg_physical_vertices_json",
-            _json_text(awg_vertices.get("physical", {})),
+            _json_text(
+                stored_gui_settings.get("waveforms")
+                or stored_gui_settings.get("awg", {}).get("outputs", [])
+            ),
         )
         dataset.add_metadata(
             "cross_capacitance_json",
-            _json_text(gui_settings.get("awg", {}).get("cross_capacitance", [])),
+            _json_text(
+                stored_gui_settings.get("awg", {}).get("cross_capacitance", [])
+            ),
         )
         dataset.add_metadata(
             "rf_configuration_json",
             _json_text({
-                "outputs": gui_settings.get("rf_outputs", []),
-                "readout": gui_settings.get("rf_readout", {}),
+                "outputs": stored_gui_settings.get("rf_outputs", []),
+                "readout": stored_gui_settings.get("rf_readout", {}),
             }),
         )
         if run_config.notes:
             dataset.add_metadata("experiment_notes", run_config.notes)
+
+        if vertex_data is not None:
+            output_names, vertex_time_us, virtual_mv, physical_mv = vertex_data
+            output_count = len(output_names)
+            vertex_count = vertex_time_us.size
+            vertex_rows_per_point = output_count * vertex_count
+            vertex_total_rows = point_count * vertex_rows_per_point
+            flat_virtual_mv = virtual_mv.reshape(vertex_total_rows)
+            flat_physical_mv = physical_mv.reshape(vertex_total_rows)
+            for offset in range(0, vertex_total_rows, batch_rows):
+                end = min(offset + batch_rows, vertex_total_rows)
+                linear_index = np.arange(offset, end, dtype=np.int64)
+                vertex_values = linear_index % vertex_count
+                output_values = (
+                    linear_index // vertex_count
+                ) % output_count
+                vertex_point_values = linear_index // vertex_rows_per_point
+                coordinate_results = [
+                    (
+                        parameter,
+                        coordinates_mv[vertex_point_values, axis_index],
+                    )
+                    for axis_index, parameter in enumerate(sweep_parameters)
+                ]
+                datasaver.add_result(
+                    *coordinate_results,
+                    (vertex_parameters["output_index"], output_values),
+                    (vertex_parameters["vertex_index"], vertex_values),
+                    (vertex_parameters["time_us"], vertex_time_us[vertex_values]),
+                    (vertex_parameters["virtual_mv"], flat_virtual_mv[offset:end]),
+                    (vertex_parameters["physical_mv"], flat_physical_mv[offset:end]),
+                )
+            datasaver.flush_data_to_database()
+            _emit_progress(
+                progress_callback,
+                progress_start,
+                f"Saved {vertex_total_rows:,} AWG vertex rows",
+            )
 
         flat_iq = iq.reshape(total_rows, 2)
         rows_per_point = repetition_count * sample_count
@@ -543,15 +760,13 @@ def store_qick_result(
             i_values = flat_iq[offset:end, 0].astype(float, copy=False)
             q_values = flat_iq[offset:end, 1].astype(float, copy=False)
             coordinate_results = [
-                (parameter, coordinates[point_values, axis_index])
+                (parameter, coordinates_mv[point_values, axis_index])
                 for axis_index, parameter in enumerate(sweep_parameters)
             ]
             datasaver.add_result(
-                (point_index, point_values),
                 *coordinate_results,
                 (repetition_index, repetition_values),
                 (sample_index, sample_values),
-                (time_us, sample_values * sample_period_us),
                 (i_value, i_values),
                 (q_value, q_values),
                 (magnitude, np.hypot(i_values, q_values)),

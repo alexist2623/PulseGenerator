@@ -910,7 +910,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         act_ins_above = menu.addAction("Insert segment above")
         act_ins_below = menu.addAction("Insert segment below")
         act_ins_above.setEnabled(row > 0)
-        sweep_menu = menu.addMenu("Amplitude sweep")
+        sweep_menu = menu.addMenu("Voltage sweep")
         act_sweep = sweep_menu.addAction("Configure sweep...")
         act_remove_sweep = sweep_menu.addAction("Remove sweep")
         act_remove_sweep.setEnabled(row in self._sweep_rows)
@@ -1062,7 +1062,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                         )
                         highlight.setAlpha(42)
                         item.setBackground(QtGui.QBrush(highlight))
-                        item.setToolTip("Amplitude sweep target")
+                        item.setToolTip("Voltage sweep target")
                     if col == 0 or (col == 1 and row == 0):
                         item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                     self.table.setItem(row, col, item)
@@ -1282,7 +1282,7 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
 
 
 class SweepSettingsDialog(QtWidgets.QDialog):
-    """Configure the amplitude sweep attached to one SET/output pair."""
+    """Configure the voltage sweep attached to one SET/output pair."""
 
     def __init__(
         self,
@@ -1296,7 +1296,7 @@ class SweepSettingsDialog(QtWidgets.QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Amplitude sweep settings")
+        self.setWindowTitle("Voltage sweep settings")
         self._output_name = output_name
         self._segment_name = segment_name
         self._full_scale_mv = float(full_scale_mv)
@@ -1308,23 +1308,23 @@ class SweepSettingsDialog(QtWidgets.QDialog):
         form.addRow(
             "Current level:",
             QtWidgets.QLabel(
-                f"{current_amplitude:.6g} normalized "
-                f"({current_amplitude * self._full_scale_mv:.6g} mV)"
+                f"{current_amplitude * self._full_scale_mv:.6g} mV"
             ),
         )
 
-        default_start = max(-1.0, current_amplitude - 0.2)
-        default_stop = min(1.0, current_amplitude + 0.2)
+        default_start = max(-1.0, current_amplitude - 0.2) * self._full_scale_mv
+        default_stop = min(1.0, current_amplitude + 0.2) * self._full_scale_mv
         if initial is not None:
-            default_start = initial.start
-            default_stop = initial.stop
+            default_start = initial.start * self._full_scale_mv
+            default_stop = initial.stop * self._full_scale_mv
 
         self.start = QtWidgets.QDoubleSpinBox()
         self.stop = QtWidgets.QDoubleSpinBox()
         for widget, value in ((self.start, default_start), (self.stop, default_stop)):
-            widget.setRange(-1.0, 1.0)
+            widget.setRange(-self._full_scale_mv, self._full_scale_mv)
             widget.setDecimals(6)
-            widget.setSingleStep(0.05)
+            widget.setSingleStep(max(0.001, self._full_scale_mv / 100.0))
+            widget.setSuffix(" mV")
             widget.setValue(value)
         self.count = QtWidgets.QSpinBox()
         self.count.setRange(1, 1_000_000)
@@ -1332,8 +1332,8 @@ class SweepSettingsDialog(QtWidgets.QDialog):
         self.endpoint_summary = QtWidgets.QLabel()
         self.cartesian_summary = QtWidgets.QLabel()
 
-        form.addRow("Start [-1, 1]:", self.start)
-        form.addRow("Stop [-1, 1]:", self.stop)
+        form.addRow("Start voltage:", self.start)
+        form.addRow("Stop voltage:", self.stop)
         form.addRow("Sweep point count:", self.count)
         form.addRow("Endpoint levels:", self.endpoint_summary)
         form.addRow("Cartesian total:", self.cartesian_summary)
@@ -1351,8 +1351,7 @@ class SweepSettingsDialog(QtWidgets.QDialog):
 
     def _refresh_summary(self, *_args) -> None:
         self.endpoint_summary.setText(
-            f"{self.start.value() * self._full_scale_mv:.6g} mV to "
-            f"{self.stop.value() * self._full_scale_mv:.6g} mV"
+            f"{self.start.value():.6g} mV to {self.stop.value():.6g} mV"
         )
         self.cartesian_summary.setText(
             f"{self._cartesian_base_count} x {self.count.value()} = "
@@ -1363,8 +1362,8 @@ class SweepSettingsDialog(QtWidgets.QDialog):
         return QickSweepSpec(
             segment_name=self._segment_name,
             output_name=self._output_name,
-            start=self.start.value(),
-            stop=self.stop.value(),
+            start=self.start.value() / self._full_scale_mv,
+            stop=self.stop.value() / self._full_scale_mv,
             count=self.count.value(),
         )
 
@@ -2196,7 +2195,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("AWG fabric clock:", self.fabric_mhz)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("AWG generator indices:", self.awg_channels)
-        form.addRow("Repetitions per sweep:", self.repetitions)
+        form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow("Notes:", self.notes)
 
         self.run_button = QtWidgets.QPushButton("Run QICK Experiment")
@@ -2425,6 +2424,7 @@ class QickExportDialog(QtWidgets.QDialog):
         self.full_scale_mv.setDecimals(6)
         self.full_scale_mv.setValue(float(initial_full_scale_mv))
         self.full_scale_mv.setSuffix(" mV")
+        self._sweep_display_scale_mv = float(initial_full_scale_mv)
 
         if initial_awg_channels is None:
             initial_awg_channels = DEFAULT_QSTL_AWG_CHANNELS[:pulse_count]
@@ -2438,9 +2438,9 @@ class QickExportDialog(QtWidgets.QDialog):
         form.addRow("AWG fabric clock:", self.fabric_mhz)
         form.addRow("QICK full scale (+/-):", self.full_scale_mv)
         form.addRow("AWG generator indices:", self.awg_channels)
-        form.addRow("Repetitions per sweep:", self.repetitions)
+        form.addRow("Repetitions per sweep point:", self.repetitions)
 
-        sweep_group = QtWidgets.QGroupBox("Independent Cartesian amplitude sweeps")
+        sweep_group = QtWidgets.QGroupBox("Independent Cartesian voltage sweeps")
         sweep_group.setCheckable(True)
         sweep_group.setChecked(False)
         sweep_form = QtWidgets.QFormLayout(sweep_group)
@@ -2451,22 +2451,29 @@ class QickExportDialog(QtWidgets.QDialog):
         self.sweep_segment.addItems(list(set_names))
         self.sweep_start = QtWidgets.QDoubleSpinBox()
         self.sweep_stop = QtWidgets.QDoubleSpinBox()
-        for widget, value in ((self.sweep_start, -0.2), (self.sweep_stop, 0.8)):
-            widget.setRange(-1.0, 1.0)
+        for widget, value in (
+            (self.sweep_start, -0.2 * self._sweep_display_scale_mv),
+            (self.sweep_stop, 0.8 * self._sweep_display_scale_mv),
+        ):
+            widget.setRange(
+                -self._sweep_display_scale_mv,
+                self._sweep_display_scale_mv,
+            )
             widget.setDecimals(6)
-            widget.setSingleStep(0.05)
+            widget.setSingleStep(max(0.001, self._sweep_display_scale_mv / 100.0))
+            widget.setSuffix(" mV")
             widget.setValue(value)
         self.sweep_count = QtWidgets.QSpinBox()
         self.sweep_count.setRange(1, 1_000_000)
         self.sweep_count.setValue(9)
         sweep_form.addRow("Output:", self.sweep_output)
         sweep_form.addRow("SET segment:", self.sweep_segment)
-        sweep_form.addRow("Start [-1, 1]:", self.sweep_start)
-        sweep_form.addRow("Stop [-1, 1]:", self.sweep_stop)
+        sweep_form.addRow("Start voltage:", self.sweep_start)
+        sweep_form.addRow("Stop voltage:", self.sweep_stop)
         sweep_form.addRow("Point count:", self.sweep_count)
         self.sweep_table = QtWidgets.QTableWidget(0, 5)
         self.sweep_table.setHorizontalHeaderLabels(
-            ["Output", "SET", "Start", "Stop", "Count"]
+            ["Output", "SET", "Start (mV)", "Stop (mV)", "Count"]
         )
         self.sweep_table.verticalHeader().setVisible(False)
         self.sweep_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -2492,6 +2499,9 @@ class QickExportDialog(QtWidgets.QDialog):
         self.sweep_table.itemSelectionChanged.connect(self._load_selected_sweep)
         self.sweep_count.valueChanged.connect(self._refresh_sweep_total)
         self.sweep_group.toggled.connect(self._refresh_sweep_total)
+        self.full_scale_mv.valueChanged.connect(
+            self._rescale_sweep_voltage_controls
+        )
         if self._dialog_sweep_specs:
             self.sweep_group.setChecked(True)
         self._refresh_sweep_table(select_row=0 if self._dialog_sweep_specs else None)
@@ -2508,8 +2518,9 @@ class QickExportDialog(QtWidgets.QDialog):
 
         note = QtWidgets.QLabel(
             "All exported ports must have identical SET/RAMP timing. "
-            "Voltages are normalized by the configured full scale. RF output "
-            "and readout settings come from the main-window RF tabs."
+            "Sweep endpoints are entered and displayed in mV; command generation "
+            "normalizes them using the configured full scale. RF output and "
+            "readout settings come from the main-window RF tabs."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -2522,13 +2533,32 @@ class QickExportDialog(QtWidgets.QDialog):
         form.addRow(buttons)
 
     def _current_sweep_spec(self) -> QickSweepSpec:
+        full_scale_mv = self.full_scale_mv.value()
         return QickSweepSpec(
             segment_name=self.sweep_segment.currentText(),
             output_name=self.sweep_output.currentText(),
-            start=self.sweep_start.value(),
-            stop=self.sweep_stop.value(),
+            start=self.sweep_start.value() / full_scale_mv,
+            stop=self.sweep_stop.value() / full_scale_mv,
             count=self.sweep_count.value(),
         )
+
+    def _rescale_sweep_voltage_controls(self, value: float) -> None:
+        new_scale_mv = float(value)
+        old_scale_mv = self._sweep_display_scale_mv
+        if old_scale_mv <= 0.0 or new_scale_mv <= 0.0:
+            return
+        for widget in (self.sweep_start, self.sweep_stop):
+            with QtCore.QSignalBlocker(widget):
+                normalized_value = widget.value() / old_scale_mv
+                widget.setRange(-new_scale_mv, new_scale_mv)
+                widget.setSingleStep(max(0.001, new_scale_mv / 100.0))
+                widget.setValue(normalized_value * new_scale_mv)
+        self._sweep_display_scale_mv = new_scale_mv
+        selected_row = self.sweep_table.currentRow()
+        self._refresh_sweep_table()
+        if 0 <= selected_row < self.sweep_table.rowCount():
+            with QtCore.QSignalBlocker(self.sweep_table):
+                self.sweep_table.selectRow(selected_row)
 
     def _refresh_sweep_table(self, select_row: Optional[int] = None) -> None:
         with QtCore.QSignalBlocker(self.sweep_table):
@@ -2537,8 +2567,8 @@ class QickExportDialog(QtWidgets.QDialog):
                 values = (
                     spec.output_name,
                     spec.segment_name,
-                    f"{spec.start:.6g}",
-                    f"{spec.stop:.6g}",
+                    f"{spec.start * self.full_scale_mv.value():.6g}",
+                    f"{spec.stop * self.full_scale_mv.value():.6g}",
                     str(spec.count),
                 )
                 for column, value in enumerate(values):
@@ -2564,8 +2594,8 @@ class QickExportDialog(QtWidgets.QDialog):
             self.sweep_output.setCurrentIndex(output_index)
         if segment_index >= 0:
             self.sweep_segment.setCurrentIndex(segment_index)
-        self.sweep_start.setValue(spec.start)
-        self.sweep_stop.setValue(spec.stop)
+        self.sweep_start.setValue(spec.start * self.full_scale_mv.value())
+        self.sweep_stop.setValue(spec.stop * self.full_scale_mv.value())
         self.sweep_count.setValue(spec.count)
 
     def _upsert_current_sweep(self) -> None:
@@ -2603,7 +2633,7 @@ class QickExportDialog(QtWidgets.QDialog):
             specs[row] = self._current_sweep_spec()
         targets = [(spec.segment_name, spec.output_name) for spec in specs]
         if len(set(targets)) != len(targets):
-            raise ValueError("each Cartesian sweep axis must target a unique output/SET")
+            raise ValueError("each Cartesian voltage sweep must target a unique output/SET")
         return tuple(specs)
 
     def _refresh_sweep_total(self, *_args) -> None:
@@ -3314,7 +3344,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
         self.statusBar().showMessage(
             f"Sweep applied to {output_name}/{segment_name}: "
-            f"{new_spec.start:.6g} to {new_spec.stop:.6g}, "
+            f"{new_spec.start * self._qick_full_scale_mv:.6g} mV to "
+            f"{new_spec.stop * self._qick_full_scale_mv:.6g} mV, "
             f"{new_spec.count} axis points; "
             f"{self._sweep_cartesian_count()} Cartesian combinations"
         )
@@ -3329,7 +3360,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._sweep_specs = remaining
             self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
             self.statusBar().showMessage(
-                f"Amplitude sweep removed; {self._sweep_cartesian_count()} "
+                f"Voltage sweep removed; {self._sweep_cartesian_count()} "
                 "Cartesian combinations remain"
             )
 
@@ -3472,9 +3503,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             * arguments["repetitions_per_sweep"]
             * arguments["readout_spec"].samples_per_trigger
         )
+        sweep_points = arguments["sequence"].sweep_point_count
+        repetitions = arguments["repetitions_per_sweep"]
         self._experiment_panel.set_running(
             True,
-            f"0% - Preparing {expected_rows:,} IQ sample rows",
+            (
+                f"0% - Preparing {sweep_points:,} sweep points x "
+                f"{repetitions:,} repetitions "
+                f"({sweep_points * repetitions:,} acquisitions, "
+                f"{expected_rows:,} IQ sample rows)"
+            ),
         )
         self.statusBar().showMessage("QICK experiment running")
         thread = QtCore.QThread(self)

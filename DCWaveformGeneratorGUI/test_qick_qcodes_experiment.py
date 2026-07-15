@@ -18,6 +18,7 @@ from qick_fine_tune_sweep import (
 from qick_qcodes_experiment import (
     QcodesRunConfig,
     QickConnectionConfig,
+    _sweep_parameter_names,
     build_awg_vertex_metadata,
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
@@ -25,6 +26,18 @@ from qick_qcodes_experiment import (
     run_qick_qcodes_experiment,
     store_qick_result,
 )
+
+
+def test_sweep_parameter_names_identify_output_segment_and_voltage_unit():
+    axes = (
+        AmplitudeSweep("set_1", "awg_0", -0.5, 0.5, 3),
+        AmplitudeSweep("gate hold", "awg-3", -0.25, 0.25, 5),
+    )
+
+    assert _sweep_parameter_names(axes) == (
+        "awg_0_set_1_voltage_mv",
+        "awg_3_gate_hold_voltage_mv",
+    )
 
 
 def _ddr_result():
@@ -64,11 +77,12 @@ def _gui_metadata():
     }
 
 
-def test_store_qick_result_writes_trace_rows_and_metadata(tmp_path):
+def test_store_qick_result_writes_iq_and_awg_vertices_as_data(tmp_path):
     database_path = tmp_path / "qick_trace.db"
     progress_updates = []
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("start", (0.0,), 10)
+    sequence.set_amplitude_sweep("start", "awg_0", -0.5, 0.5, 2)
     gui_metadata = _gui_metadata()
     gui_metadata["awg_waveform_vertices"] = build_awg_vertex_metadata(
         sequence,
@@ -95,28 +109,58 @@ def test_store_qick_result_writes_trace_rows_and_metadata(tmp_path):
 
     assert database_path.exists()
     assert row_count == 12
-    # QCoDeS counts one result per dependent parameter, while row_count is
-    # the number of acquired time samples written to each I/Q quantity.
-    assert dataset.number_of_results == 4 * row_count
+    # QCoDeS counts one result per dependent parameter. row_count remains the
+    # number of acquired time samples written to each I/Q quantity.
+    vertex_row_count = 2 * 1 * 2
+    assert dataset.number_of_results == 4 * row_count + 2 * vertex_row_count
     data = dataset.get_parameter_data("i")["i"]
     assert data["i"].tolist() == [
         1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
         10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
     ]
-    assert data["time_us"].tolist() == [0.0, 1.0, 2.0] * 4
+    sweep_parameter = "awg_0_set_1_voltage_mv"
+    assert data[sweep_parameter].tolist() == [-50.0] * 6 + [50.0] * 6
+    assert data["sample_index"].tolist() == [0, 1, 2] * 4
+    dataset_parameters = {
+        parameter.strip() for parameter in dataset.parameters.split(",")
+    }
+    assert "point_index" not in dataset_parameters
+    assert "time_us" not in dataset_parameters
+    assert sweep_parameter in dataset_parameters
+    virtual_vertices = dataset.get_parameter_data("awg_virtual_vertex_mv")[
+        "awg_virtual_vertex_mv"
+    ]
+    physical_vertices = dataset.get_parameter_data("awg_physical_vertex_mv")[
+        "awg_physical_vertex_mv"
+    ]
+    assert virtual_vertices["awg_virtual_vertex_mv"].tolist() == [
+        -50.0, -50.0, 50.0, 50.0,
+    ]
+    assert physical_vertices["awg_physical_vertex_mv"].tolist() == [
+        -50.0, -50.0, 50.0, 50.0,
+    ]
+    assert virtual_vertices["awg_vertex_time_us"].tolist() == [
+        0.0, 10 / 300, 0.0, 10 / 300,
+    ]
+    assert virtual_vertices["awg_output_index"].tolist() == [0, 0, 0, 0]
+    assert virtual_vertices["awg_vertex_index"].tolist() == [0, 1, 0, 1]
+    assert virtual_vertices[sweep_parameter].tolist() == [
+        -50.0, -50.0, 50.0, 50.0,
+    ]
     metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
     assert metadata["qick_connection"]["host"] == "192.0.2.10"
     assert metadata["measurement_layout"]["iq_shape"] == [2, 2, 3, 2]
-    assert "flattened Cartesian sweep index" in metadata["measurement_layout"][
-        "setpoint_meanings"
-    ]["point_index"]
+    assert metadata["measurement_layout"]["awg_vertex_shape"] == [2, 1, 2]
+    assert "awg_waveform_vertices" not in metadata["gui_settings"]
+    layout = metadata["measurement_layout"]
+    assert layout["sample_period_us"] == 1.0
+    assert layout["time_reconstruction"].startswith("time_us = sample_index")
+    assert layout["sweep_axes"][0]["parameter"] == sweep_parameter
+    assert layout["sweep_axes"][0]["voltage_start_mv"] == -50.0
+    assert layout["sweep_axes"][0]["voltage_stop_mv"] == 50.0
+    assert "point_index" not in layout["setpoint_meanings"]
+    assert "time_us" not in layout["setpoint_meanings"]
     assert json.loads(dataset.get_metadata("cross_capacitance_json")) == [[1.0]]
-    assert json.loads(dataset.get_metadata("awg_virtual_vertices_json"))[
-        "values_mv"
-    ] == [[[0.0, 0.0]]]
-    assert json.loads(dataset.get_metadata("awg_physical_vertices_json"))[
-        "values_mv"
-    ] == [[[0.0, 0.0]]]
     assert progress_updates[0][0] == 65
     assert progress_updates[-1][0] == 99
     assert [item[0] for item in progress_updates] == sorted(

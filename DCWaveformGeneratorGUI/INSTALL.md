@@ -59,22 +59,30 @@ the AWG/RF/FIR-DDR sequence, and writes the returned 1 MSPS IQ traces to the
 selected QCoDeS SQLite database. The QICK server must already be running and
 reachable from this PC.
 
-Each database run stores `I`, `Q`, magnitude, and phase against Cartesian sweep
-point, sweep amplitudes, repetition, sample index, and time in microseconds.
-The run metadata includes the complete GUI settings, virtual and physical
-output waveforms, cross-capacitance matrix, RF output/readout settings, QICK
-connection settings, and the compiled program summary.
+Each database run stores `I`, `Q`, magnitude, and phase against descriptive
+voltage sweep axes, repetition, and sample index. Sweep axes use names such as
+`awg_0_set_1_voltage_mv` and values are stored in mV, so Plottr exposes the
+actual output/segment sweep controls instead of a flattened point index. The run
+metadata includes the GUI settings, cross-capacitance matrix, RF output/readout
+settings, QICK connection settings, and compiled program summary.
 
 AWG waveforms are stored as compact ordered vertices for every Cartesian sweep
-point, separately in `awg_virtual_vertices_json` and
-`awg_physical_vertices_json`. Connecting adjacent vertices reconstructs each
-complete SET/RAMP pulse; repeated times represent instantaneous SET changes.
-The full per-clock AWG trace is not duplicated in metadata.
+point as QCoDeS experiment parameters, not as JSON-only metadata. Query
+`awg_virtual_vertex_mv` and `awg_physical_vertex_mv`; their setpoints are
+the descriptive mV sweep coordinates, `awg_output_index`, `awg_vertex_index`,
+and `awg_vertex_time_us`. Connecting adjacent vertices reconstructs each complete
+SET/RAMP pulse; repeated times represent instantaneous SET changes. The full
+per-clock AWG trace is not duplicated in the database.
 
-`point_index` is the zero-based flattened Cartesian sweep index, with the last
-sweep axis varying fastest. `time_us` is time within each triggered IQ trace
-and resets to zero for every repetition. At 1 MSPS it equals `sample_index` in
-microseconds.
+`point_index` and IQ `time_us` are intentionally not registered as QCoDeS
+parameters, so they do not appear as misleading x/y selectors. Trace time is
+reconstructed as `sample_index * sample_period_us`; `sample_period_us` and the
+sample rate are stored in `qick_experiment_json` metadata. At 1 MSPS one sample
+index step is one microsecond.
+
+Repetition is counted within each Cartesian sweep point. For example, two
+independent two-point sweep axes produce four sweep points; two repetitions
+produce eight acquisitions total, while `repetition_index` remains only 0 or 1.
 
 The Experiment tab reports real progress. The hardware interval follows the
 tProcessor completion counter, and the database interval follows the number of

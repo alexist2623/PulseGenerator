@@ -12,7 +12,7 @@ from qick.sim import QickSim  # noqa: F401
 from qick.awg_tuning import TProcV1BehaviorModel
 from qick.qick_asm import QickConfig
 
-from qick_fine_tune_sweep import FineTuneSequence
+from qick_fine_tune_sweep import FineTuneSequence, RfPulseConfig
 
 
 def _mock_soccfg(n_outputs=2):
@@ -55,6 +55,37 @@ def _mock_soccfg(n_outputs=2):
         "gens": gens,
         "readouts": [],
     })
+
+
+def _shared_tmux_soccfg():
+    """Normal RF gen and AWG tuning share tProc port 0 through a TMUX."""
+    cfg = _mock_soccfg(1)._cfg
+    awg = dict(cfg["gens"][0])
+    awg.update({"tmux_ch": 1, "dac": "10"})
+    signal_gen = {
+        "type": "axis_signal_gen_v6",
+        "tproc_ch": 0,
+        "tmux_ch": 0,
+        "f_fabric": 300.0,
+        "f_dds": 300.0,
+        "fs_mult": 1,
+        "fs_div": 1,
+        "fdds_div": 1,
+        "samps_per_clk": 16,
+        "maxlen": 16384,
+        "maxv": 32766,
+        "maxv_scale": 1.0,
+        "complex_env": True,
+        "has_mixer": False,
+        "has_dds": True,
+        "b_dds": 32,
+        "b_phase": 32,
+        "dac": "00",
+        "interpolation": 1,
+    }
+    cfg["gens"] = [signal_gen, awg]
+    cfg["refclk_freq"] = 300.0
+    return QickConfig(cfg)
 
 
 def _command_word(command):
@@ -198,6 +229,48 @@ def test_set_duration_excludes_startup_lead_and_hides_ramp_pipeline():
     )
 
 
+def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 100)
+    sequence.add_ramp("to_gate", 100)
+    sequence.add_set("gate", (0.4,), 400)
+    sequence.add_ramp("to_end", 100)
+    sequence.add_set("end", (0.0,), 100)
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="gate",
+        length_cycles=30,
+        gain=10000,
+        freq_mhz=0.0,
+        delay_tproc_cycles=20,
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulse=rf,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    tproc.run(program.prog_list, max_steps=100_000)
+    port_zero_events = [
+        event for event in tproc.output_events if event.tproc_ch == 0
+    ]
+    event_cycles = [event.cycle for event in port_zero_events]
+    assert event_cycles == sorted(event_cycles)
+
+    tmux_channels = [(event.word >> 152) & 0xFF for event in port_zero_events]
+    rf_index = tmux_channels.index(0)
+    assert port_zero_events[rf_index].cycle == (
+        program.command_lead_tproc_cycles + program.aux_timing["rf_start"]
+    )
+    assert any(
+        event.cycle > port_zero_events[rf_index].cycle
+        and tmux_channel == 1
+        for event, tmux_channel in zip(port_zero_events, tmux_channels)
+    )
+
+
 def test_waveform_vertices_reconstruct_swept_virtual_and_physical_pulses():
     sequence = FineTuneSequence(("awg_0", "awg_1"))
     sequence.set_cross_capacitance(((1.0, 0.0), (0.5, 1.0)))
@@ -262,5 +335,7 @@ def test_counter_progress_tracks_hardware_sweep_and_repetition_count():
     )
 
     assert progress == [(0, 6), (0, 6), (2, 6), (6, 6)]
+    assert program.summary()["repetitions_per_sweep_point"] == 2
+    assert program.summary()["total_acquisitions"] == 6
     assert calls.count("start") == 1
     assert calls[-1] == ("source", "internal")

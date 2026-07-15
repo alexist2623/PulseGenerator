@@ -1641,6 +1641,23 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         )
 
     def _emit_point(self):
+        # Timed-output queues are FIFO ordered. Generators behind the same TMUX
+        # therefore must be enqueued in timestamp order, even when their
+        # commands target different downstream IPs.
+        scheduled_events = []
+        insertion_order = 0
+
+        def schedule(time, priority, kind, payload):
+            nonlocal insertion_order
+            scheduled_events.append((
+                int(time),
+                int(priority),
+                insertion_order,
+                kind,
+                payload,
+            ))
+            insertion_order += 1
+
         # The instruction body is point-independent. Swept SET/RAMP fields are
         # copied from state registers immediately before each command.
         point = self.compiled_points[0]
@@ -1650,27 +1667,32 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     segment_index,
                     command.output_index,
                 )]
-                self._emit_command(command, command_time)
+                schedule(command_time, 10, "awg", command)
 
         if self.ddr_readout_config is not None:
             ddr = self.ddr_readout_config
-            self.readout(ch=ddr.ro_ch, t=self.aux_timing["ddr_readout_start"])
-            self.trigger(
-                ddr4=True,
-                adc_trig_offset=0,
-                t=self.aux_timing["ddr_trigger_time"],
-                width=ddr.trigger_width_tproc_cycles,
+            schedule(
+                self.aux_timing["ddr_readout_start"],
+                0,
+                "readout",
+                ddr.ro_ch,
+            )
+            schedule(
+                self.aux_timing["ddr_trigger_time"],
+                20,
+                "ddr_trigger",
+                ddr,
             )
 
         for rf_index, rf_config in enumerate(self.rf_pulse_configs):
-            self.pulse(
-                ch=rf_config.gen_ch,
-                t=self.aux_timing[f"rf_{rf_index}_start"],
+            schedule(
+                self.aux_timing[f"rf_{rf_index}_start"],
+                10,
+                "rf",
+                rf_config,
             )
 
         point_end = int(self.timing["point_end"])
-        for gen_ch in self.awg_channels:
-            self.set_timestamp(point_end, gen_ch=gen_ch)
 
         if self.readout_config is not None:
             ro = self.readout_config
@@ -1682,13 +1704,46 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     raise KeyError(f"unknown readout segment {ro.at_segment!r}")
                 measure_time = self.timing["segment_ends"][names.index(ro.at_segment)]
             measure_time += ro.measure_delay_tproc_cycles
-            self.readout(ch=ro.ro_ch, t=int(measure_time))
-            self.trigger(
-                adcs=[ro.ro_ch],
-                adc_trig_offset=int(measure_time),
-                t=0,
-                width=ro.trigger_width_tproc_cycles,
+            schedule(measure_time, 0, "readout", ro.ro_ch)
+            schedule(
+                measure_time,
+                20,
+                "adc_trigger",
+                ro,
             )
+
+        for event_time, _priority, _order, kind, payload in sorted(
+            scheduled_events,
+            key=lambda item: item[:3],
+        ):
+            if kind == "awg":
+                self._emit_command(payload, event_time)
+            elif kind == "readout":
+                self.readout(ch=payload, t=event_time)
+            elif kind == "rf":
+                self.pulse(ch=payload.gen_ch, t=event_time)
+            elif kind == "ddr_trigger":
+                self.trigger(
+                    ddr4=True,
+                    adc_trig_offset=0,
+                    t=event_time,
+                    width=payload.trigger_width_tproc_cycles,
+                )
+            elif kind == "adc_trigger":
+                self.trigger(
+                    adcs=[payload.ro_ch],
+                    adc_trig_offset=event_time,
+                    t=0,
+                    width=payload.trigger_width_tproc_cycles,
+                )
+            else:
+                raise RuntimeError(f"unknown scheduled event kind {kind!r}")
+
+        for gen_ch in self.awg_channels:
+            self.set_timestamp(point_end, gen_ch=gen_ch)
+
+        if self.readout_config is not None:
+            ro = self.readout_config
             if ro.wait:
                 self.wait_all()
 
@@ -1893,6 +1948,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "cross_capacitance": self.sequence.cross_capacitance.copy(),
             "segments": tuple(segment.name for segment in self.sequence.segments),
             "repetitions_per_sweep": self.cfg["reps"],
+            "repetitions_per_sweep_point": self.cfg["reps"],
+            "total_acquisitions": (
+                self.sequence.sweep_point_count * self.cfg["reps"]
+            ),
             "commands_per_point": sum(
                 len(commands) for commands in self.compiled_points[0].segment_commands
             ),
