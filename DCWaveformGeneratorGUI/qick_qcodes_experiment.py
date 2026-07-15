@@ -11,8 +11,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+import sqlite3
+import tempfile
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -20,6 +24,8 @@ import numpy as np
 
 ProgressCallback = Callable[[int, str], None]
 DEFAULT_QCODES_BATCH_ROWS = 8192
+QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
+IQ_TRACE_PARAMETER = "iq_trace"
 
 try:
     from .dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
@@ -471,6 +477,127 @@ def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
     return value
 
 
+def _qcodes_staging_root() -> Path:
+    configured = os.environ.get(QCODES_STAGING_ENV)
+    if configured:
+        root = Path(configured).expanduser().resolve()
+    else:
+        local_root = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        root = Path(local_root) / "QSTL_PulseGenerator" / "qcodes_staging"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _backup_sqlite_database(source: Path, destination: Path) -> None:
+    """Copy a live SQLite database, including committed WAL content."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_uri = source.resolve().as_uri() + "?mode=ro"
+    source_connection = sqlite3.connect(source_uri, uri=True, timeout=60.0)
+    destination_connection = sqlite3.connect(str(destination), timeout=60.0)
+    try:
+        source_connection.backup(destination_connection, pages=4096, sleep=0.01)
+        destination_connection.commit()
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+def _prepare_local_database(database_path: Path) -> Tuple[Path, Path]:
+    staging_directory = Path(tempfile.mkdtemp(
+        prefix="qick_qcodes_",
+        dir=str(_qcodes_staging_root()),
+    ))
+    local_database_path = staging_directory / database_path.name
+    if database_path.exists() and database_path.stat().st_size > 0:
+        _backup_sqlite_database(database_path, local_database_path)
+    return staging_directory, local_database_path
+
+
+def _checkpoint_sqlite_database(database_path: Path) -> None:
+    connection = sqlite3.connect(str(database_path), timeout=60.0)
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _publish_local_database(local_path: Path, database_path: Path) -> None:
+    """Publish the completed local database with SQLite's backup API."""
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    source_uri = local_path.resolve().as_uri() + "?mode=ro"
+    source_connection = sqlite3.connect(source_uri, uri=True, timeout=60.0)
+    destination_connection = sqlite3.connect(str(database_path), timeout=60.0)
+    try:
+        destination_connection.execute("PRAGMA busy_timeout=60000")
+        source_connection.backup(destination_connection, pages=4096, sleep=0.01)
+        destination_connection.commit()
+        destination_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        destination_connection.commit()
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+def _first_value_per_trace(values: Any, trace_count: int) -> np.ndarray:
+    array = np.asarray(values)
+    if array.shape[0] != trace_count:
+        raise ValueError("QCoDeS trace setpoint count does not match IQ traces")
+    return array.reshape(trace_count, -1)[:, 0]
+
+
+def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
+    """Load array-per-trace IQ and derive sample/time/magnitude/phase arrays."""
+    metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
+    layout = metadata["measurement_layout"]
+    expected_shape = tuple(int(value) for value in layout["iq_shape"])
+    if len(expected_shape) != 4 or expected_shape[-1] != 2:
+        raise ValueError("stored IQ shape must be (point, repetition, sample, 2)")
+
+    parameter_data = dataset.get_parameter_data(IQ_TRACE_PARAMETER)
+    if IQ_TRACE_PARAMETER not in parameter_data:
+        raise ValueError("dataset does not contain array-per-trace IQ storage")
+    trace_data = parameter_data[IQ_TRACE_PARAMETER]
+    flat_iq = np.asarray(trace_data[IQ_TRACE_PARAMETER])
+    trace_count = expected_shape[0] * expected_shape[1]
+    expected_flat_shape = (trace_count, expected_shape[2], 2)
+    if flat_iq.shape != expected_flat_shape:
+        raise ValueError(
+            f"stored IQ arrays have shape {flat_iq.shape}, expected "
+            f"{expected_flat_shape}"
+        )
+    iq = flat_iq.reshape(expected_shape)
+    i_values = iq[..., 0]
+    q_values = iq[..., 1]
+    sample_index = np.arange(expected_shape[2], dtype=np.int64)
+    sample_period_us = float(layout["sample_period_us"])
+
+    sweep_coordinates_mv = {}
+    for axis in layout.get("sweep_axes", []):
+        parameter_name = axis["parameter"]
+        sweep_coordinates_mv[parameter_name] = _first_value_per_trace(
+            trace_data[parameter_name],
+            trace_count,
+        ).reshape(expected_shape[0], expected_shape[1])
+    repetitions = _first_value_per_trace(
+        trace_data["repetition_index"],
+        trace_count,
+    ).astype(np.int64).reshape(expected_shape[0], expected_shape[1])
+
+    return {
+        "iq": iq,
+        "i": i_values,
+        "q": q_values,
+        "magnitude": np.hypot(i_values.astype(float), q_values.astype(float)),
+        "phase_deg": np.degrees(np.arctan2(q_values, i_values)),
+        "sample_index": sample_index,
+        "time_us": sample_index * sample_period_us,
+        "repetition_index": repetitions,
+        "sweep_coordinates_mv": sweep_coordinates_mv,
+        "metadata": metadata,
+    }
+
+
 def store_qick_result(
     ddr_result: Any,
     *,
@@ -484,13 +611,14 @@ def store_qick_result(
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
 ) -> Tuple[Any, int]:
-    """Write grouped DDR IQ and metadata to QCoDeS in bounded batches."""
+    """Store one packed IQ array per sweep-point/repetition acquisition."""
     try:
         from qcodes import (
             Measurement,
             Parameter,
             Station,
             initialise_or_create_database_at,
+            load_by_guid,
             load_or_create_experiment,
         )
     except ImportError as exc:
@@ -531,7 +659,8 @@ def store_qick_result(
     coordinates_mv = coordinates * full_scale_mv
     database_path = run_config.resolved_database_path
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    initialise_or_create_database_at(str(database_path))
+    staging_directory, local_database_path = _prepare_local_database(database_path)
+    initialise_or_create_database_at(str(local_database_path))
     experiment = load_or_create_experiment(
         run_config.experiment_name,
         run_config.sample_name,
@@ -539,7 +668,6 @@ def store_qick_result(
     measurement = Measurement(exp=experiment, station=Station())
 
     repetition_index = Parameter("repetition_index", label="Repetition", unit="")
-    sample_index = Parameter("sample_index", label="Trace sample", unit="")
     setpoint_parameters = []
     sweep_parameters = []
     sweep_parameter_names = _sweep_parameter_names(sweep_axes)
@@ -551,64 +679,56 @@ def store_qick_result(
         )
         sweep_parameters.append(parameter)
         setpoint_parameters.append(parameter)
-    setpoint_parameters.extend((repetition_index, sample_index))
+    setpoint_parameters.append(repetition_index)
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
 
-    i_value = Parameter("i", label="I", unit="ADC units")
-    q_value = Parameter("q", label="Q", unit="ADC units")
-    magnitude = Parameter("magnitude", label="IQ magnitude", unit="ADC units")
-    phase_deg = Parameter("phase_deg", label="IQ phase", unit="deg")
-    dependencies = tuple(setpoint_parameters)
-    for parameter in (i_value, q_value, magnitude, phase_deg):
-        measurement.register_parameter(parameter, setpoints=dependencies)
+    iq_trace = Parameter(
+        IQ_TRACE_PARAMETER,
+        label="Packed I/Q trace; component 0 is I and component 1 is Q",
+        unit="ADC units",
+    )
+    measurement.register_parameter(
+        iq_trace,
+        setpoints=tuple(setpoint_parameters),
+        paramtype="array",
+    )
 
-    vertex_parameters = None
+    vertex_parameters = []
     if vertex_data is not None:
-        awg_output_index = Parameter(
-            "awg_output_index",
-            label="AWG output index",
-            unit="",
-        )
-        awg_vertex_index = Parameter(
-            "awg_vertex_index",
-            label="AWG waveform vertex index",
-            unit="",
-        )
-        awg_vertex_time_us = Parameter(
-            "awg_vertex_time_us",
-            label="AWG waveform vertex time",
-            unit="us",
-        )
-        for parameter in (
-            awg_output_index,
-            awg_vertex_index,
-            awg_vertex_time_us,
-        ):
-            measurement.register_parameter(parameter)
-        vertex_dependencies = tuple(
-            sweep_parameters
-            + [awg_output_index, awg_vertex_index, awg_vertex_time_us]
-        )
-        awg_virtual_vertex_mv = Parameter(
-            "awg_virtual_vertex_mv",
-            label="Virtual AWG waveform vertex",
-            unit="mV",
-        )
-        awg_physical_vertex_mv = Parameter(
-            "awg_physical_vertex_mv",
-            label="Physical AWG waveform vertex",
-            unit="mV",
-        )
-        for parameter in (awg_virtual_vertex_mv, awg_physical_vertex_mv):
-            measurement.register_parameter(parameter, setpoints=vertex_dependencies)
-        vertex_parameters = {
-            "output_index": awg_output_index,
-            "vertex_index": awg_vertex_index,
-            "time_us": awg_vertex_time_us,
-            "virtual_mv": awg_virtual_vertex_mv,
-            "physical_mv": awg_physical_vertex_mv,
-        }
+        output_names, _vertex_time_us, _virtual_mv, _physical_mv = vertex_data
+        used_prefixes = set()
+        vertex_setpoints = tuple(sweep_parameters) or None
+        for output_index, output_name in enumerate(output_names):
+            base_prefix = _qcodes_identifier(output_name)
+            prefix = base_prefix
+            suffix = 2
+            while prefix in used_prefixes:
+                prefix = f"{base_prefix}_{suffix}"
+                suffix += 1
+            used_prefixes.add(prefix)
+            virtual_parameter = Parameter(
+                f"{prefix}_virtual_vertices_mv",
+                label=f"{output_name} virtual AWG waveform vertices",
+                unit="mV",
+            )
+            physical_parameter = Parameter(
+                f"{prefix}_physical_vertices_mv",
+                label=f"{output_name} physical AWG waveform vertices",
+                unit="mV",
+            )
+            for parameter in (virtual_parameter, physical_parameter):
+                measurement.register_parameter(
+                    parameter,
+                    setpoints=vertex_setpoints,
+                    paramtype="array",
+                )
+            vertex_parameters.append({
+                "output_index": output_index,
+                "output_name": output_name,
+                "virtual": virtual_parameter,
+                "physical": physical_parameter,
+            })
 
     sweep_axis_metadata = [
         {
@@ -633,10 +753,6 @@ def store_qick_result(
     }
     setpoint_meanings.update({
         "repetition_index": "Zero-based repetition within one sweep coordinate.",
-        "sample_index": (
-            "Zero-based sample within one triggered IQ trace. Physical time is "
-            "sample_index multiplied by sample_period_us from this metadata."
-        ),
     })
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -644,39 +760,67 @@ def store_qick_result(
         "qcodes_run": {
             **asdict(run_config),
             "database_path": str(database_path),
+            "write_mode": "local_staging_then_sqlite_backup",
         },
         "gui_settings": stored_gui_settings,
         "program_summary": program_summary,
         "rf_settings_actual": rf_settings,
         "measurement_layout": {
             "iq_shape": list(iq.shape),
+            "iq_trace_parameter": IQ_TRACE_PARAMETER,
+            "iq_trace_shape": [sample_count, 2],
+            "iq_trace_dtype": str(iq.dtype),
+            "iq_components": {"i": 0, "q": 1},
+            "storage_format": "qcodes_array_per_trace_v1",
+            "trace_count": point_count * repetition_count,
+            "sql_rows_per_trace": 1,
             "cartesian_point_count": point_count,
             "sample_rate_hz": run_config.sample_rate_hz,
             "sample_period_us": 1_000_000.0 / run_config.sample_rate_hz,
             "row_order": (
-                "sweep_axes,repetition,sample"
+                "sweep_axes,repetition"
                 if sweep_axes
-                else "repetition,sample"
+                else "repetition"
             ),
             "sweep_axes": sweep_axis_metadata,
             "setpoint_meanings": setpoint_meanings,
             "time_reconstruction": (
-                "time_us = sample_index * sample_period_us; time_us is metadata, "
-                "not a registered QCoDeS axis."
+                "sample_index = arange(iq_trace_shape[0]); time_us = "
+                "sample_index * sample_period_us. Neither is stored as a "
+                "QCoDeS parameter."
             ),
+            "derived_quantities": {
+                "magnitude": "hypot(iq_trace[..., 0], iq_trace[..., 1])",
+                "phase_deg": (
+                    "degrees(arctan2(iq_trace[..., 1], iq_trace[..., 0]))"
+                ),
+            },
         },
     }
     if vertex_data is not None:
         output_names, vertex_time_us, virtual_mv, _physical_mv = vertex_data
+        parameter_by_output = {
+            entry["output_name"]: entry for entry in vertex_parameters
+        }
         metadata["measurement_layout"].update({
             "awg_vertex_shape": list(virtual_mv.shape),
-            "awg_vertex_row_order": (
-                "sweep_axes,output,vertex"
-                if sweep_axes
-                else "output,vertex"
-            ),
+            "awg_vertex_storage": "per_channel_qcodes_array_v1",
+            "awg_vertex_row_order": "one array per sweep point and channel",
             "awg_output_names": list(output_names),
             "awg_vertex_time_reference": "start of each pulse sequence repetition",
+            "awg_vertex_channels": {
+                output_name: {
+                    "virtual_parameter": parameter_by_output[output_name][
+                        "virtual"
+                    ].name,
+                    "physical_parameter": parameter_by_output[output_name][
+                        "physical"
+                    ].name,
+                    "time_us": vertex_time_us.tolist(),
+                    "vertex_count": int(vertex_time_us.size),
+                }
+                for output_name in output_names
+            },
         })
 
     row_count = 0
@@ -710,79 +854,107 @@ def store_qick_result(
             dataset.add_metadata("experiment_notes", run_config.notes)
 
         if vertex_data is not None:
-            output_names, vertex_time_us, virtual_mv, physical_mv = vertex_data
-            output_count = len(output_names)
-            vertex_count = vertex_time_us.size
-            vertex_rows_per_point = output_count * vertex_count
-            vertex_total_rows = point_count * vertex_rows_per_point
-            flat_virtual_mv = virtual_mv.reshape(vertex_total_rows)
-            flat_physical_mv = physical_mv.reshape(vertex_total_rows)
-            for offset in range(0, vertex_total_rows, batch_rows):
-                end = min(offset + batch_rows, vertex_total_rows)
-                linear_index = np.arange(offset, end, dtype=np.int64)
-                vertex_values = linear_index % vertex_count
-                output_values = (
-                    linear_index // vertex_count
-                ) % output_count
-                vertex_point_values = linear_index // vertex_rows_per_point
+            output_names, _vertex_time_us, virtual_mv, physical_mv = vertex_data
+            for point_index in range(point_count):
                 coordinate_results = [
                     (
                         parameter,
-                        coordinates_mv[vertex_point_values, axis_index],
+                        float(coordinates_mv[point_index, axis_index]),
                     )
                     for axis_index, parameter in enumerate(sweep_parameters)
                 ]
+                channel_results = []
+                for entry in vertex_parameters:
+                    output_index = entry["output_index"]
+                    channel_results.extend((
+                        (
+                            entry["virtual"],
+                            np.ascontiguousarray(
+                                virtual_mv[point_index, output_index],
+                                dtype=float,
+                            ),
+                        ),
+                        (
+                            entry["physical"],
+                            np.ascontiguousarray(
+                                physical_mv[point_index, output_index],
+                                dtype=float,
+                            ),
+                        ),
+                    ))
                 datasaver.add_result(
                     *coordinate_results,
-                    (vertex_parameters["output_index"], output_values),
-                    (vertex_parameters["vertex_index"], vertex_values),
-                    (vertex_parameters["time_us"], vertex_time_us[vertex_values]),
-                    (vertex_parameters["virtual_mv"], flat_virtual_mv[offset:end]),
-                    (vertex_parameters["physical_mv"], flat_physical_mv[offset:end]),
+                    *channel_results,
                 )
             datasaver.flush_data_to_database()
             _emit_progress(
                 progress_callback,
                 progress_start,
-                f"Saved {vertex_total_rows:,} AWG vertex rows",
+                f"Saved per-channel AWG vertex arrays for "
+                f"{point_count:,} sweep points",
             )
 
-        flat_iq = iq.reshape(total_rows, 2)
-        rows_per_point = repetition_count * sample_count
-        for offset in range(0, total_rows, batch_rows):
-            end = min(offset + batch_rows, total_rows)
-            linear_index = np.arange(offset, end, dtype=np.int64)
-            sample_values = linear_index % sample_count
-            repetition_values = (
-                linear_index // sample_count
-            ) % repetition_count
-            point_values = linear_index // rows_per_point
-            i_values = flat_iq[offset:end, 0].astype(float, copy=False)
-            q_values = flat_iq[offset:end, 1].astype(float, copy=False)
+        trace_count = point_count * repetition_count
+        traces_per_flush = max(1, batch_rows // sample_count)
+        traces_written = 0
+        data_progress_end = max(progress_start, progress_end - 4)
+        for point_index in range(point_count):
             coordinate_results = [
-                (parameter, coordinates_mv[point_values, axis_index])
+                (
+                    parameter,
+                    float(coordinates_mv[point_index, axis_index]),
+                )
                 for axis_index, parameter in enumerate(sweep_parameters)
             ]
-            datasaver.add_result(
-                *coordinate_results,
-                (repetition_index, repetition_values),
-                (sample_index, sample_values),
-                (i_value, i_values),
-                (q_value, q_values),
-                (magnitude, np.hypot(i_values, q_values)),
-                (phase_deg, np.degrees(np.arctan2(q_values, i_values))),
-            )
-            datasaver.flush_data_to_database()
-            row_count = end
-            fraction = row_count / total_rows
-            percent = progress_start + round(
-                fraction * (progress_end - progress_start)
-            )
-            _emit_progress(
-                progress_callback,
-                percent,
-                f"Saving QCoDeS IQ rows {row_count:,}/{total_rows:,}",
-            )
+            for repetition in range(repetition_count):
+                datasaver.add_result(
+                    *coordinate_results,
+                    (repetition_index, repetition),
+                    (
+                        iq_trace,
+                        np.ascontiguousarray(iq[point_index, repetition]),
+                    ),
+                )
+                traces_written += 1
+                row_count += sample_count
+                if (
+                    traces_written % traces_per_flush == 0
+                    or traces_written == trace_count
+                ):
+                    datasaver.flush_data_to_database()
+                    fraction = traces_written / trace_count
+                    percent = progress_start + round(
+                        fraction * (data_progress_end - progress_start)
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        percent,
+                        f"Saving IQ trace arrays {traces_written:,}/"
+                        f"{trace_count:,} ({row_count:,}/{total_rows:,} samples)",
+                    )
+
+    local_guid = str(dataset.guid)
+    dataset.conn.close()
+    _emit_progress(
+        progress_callback,
+        max(progress_start, progress_end - 3),
+        "Checkpointing local QCoDeS database",
+    )
+    _checkpoint_sqlite_database(local_database_path)
+    _emit_progress(
+        progress_callback,
+        max(progress_start, progress_end - 2),
+        "Copying completed QCoDeS database to the configured path",
+    )
+    _publish_local_database(local_database_path, database_path)
+    initialise_or_create_database_at(str(database_path))
+    dataset = load_by_guid(local_guid)
+    shutil.rmtree(staging_directory)
+    _emit_progress(
+        progress_callback,
+        progress_end,
+        "QCoDeS database copied and WAL checkpoint completed",
+    )
     return dataset, row_count
 
 
@@ -848,6 +1020,8 @@ def run_qick_qcodes_experiment(
 
 __all__ = [
     "DEFAULT_QCODES_BATCH_ROWS",
+    "IQ_TRACE_PARAMETER",
+    "QCODES_STAGING_ENV",
     "ProgressCallback",
     "QcodesRunConfig",
     "QickConnectionConfig",
@@ -858,6 +1032,7 @@ __all__ = [
     "configure_rf_board",
     "connect_qick",
     "execute_qick_sequence",
+    "load_qick_iq_arrays",
     "run_qick_qcodes_experiment",
     "store_qick_result",
 ]

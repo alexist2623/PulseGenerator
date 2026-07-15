@@ -59,35 +59,43 @@ the AWG/RF/FIR-DDR sequence, and writes the returned 1 MSPS IQ traces to the
 selected QCoDeS SQLite database. The QICK server must already be running and
 reachable from this PC.
 
-Each database run stores `I`, `Q`, magnitude, and phase against descriptive
-voltage sweep axes, repetition, and sample index. Sweep axes use names such as
+Each sweep-point/repetition acquisition is stored as one QCoDeS array result
+named `iq_trace`, shaped `[sample, component]`, where component 0 is I and
+component 1 is Q. Sweep axes use names such as
 `awg_0_set_1_voltage_mv` and values are stored in mV, so Plottr exposes the
 actual output/segment sweep controls instead of a flattened point index. The run
 metadata includes the GUI settings, cross-capacitance matrix, RF output/readout
 settings, QICK connection settings, and compiled program summary.
 
-AWG waveforms are stored as compact ordered vertices for every Cartesian sweep
-point as QCoDeS experiment parameters, not as JSON-only metadata. Query
-`awg_virtual_vertex_mv` and `awg_physical_vertex_mv`; their setpoints are
-the descriptive mV sweep coordinates, `awg_output_index`, `awg_vertex_index`,
-and `awg_vertex_time_us`. Connecting adjacent vertices reconstructs each complete
-SET/RAMP pulse; repeated times represent instantaneous SET changes. The full
-per-clock AWG trace is not duplicated in the database.
+AWG waveforms are stored as compact ordered vertex arrays for every Cartesian
+sweep point and for every channel. Query channel-specific parameters such as
+`awg_0_virtual_vertices_mv`, `awg_0_physical_vertices_mv`,
+`awg_1_virtual_vertices_mv`, and `awg_1_physical_vertices_mv`. There is no
+`awg_vertex_time_us` QCoDeS parameter. The ordered vertex times are kept in the
+channel entry under `measurement_layout.awg_vertex_channels` metadata so the
+complete SET/RAMP pulse can be reconstructed without exposing a redundant plot
+axis. Repeated times represent instantaneous SET changes. The full per-clock AWG
+trace is not duplicated in the database.
 
-`point_index` and IQ `time_us` are intentionally not registered as QCoDeS
-parameters, so they do not appear as misleading x/y selectors. Trace time is
-reconstructed as `sample_index * sample_period_us`; `sample_period_us` and the
-sample rate are stored in `qick_experiment_json` metadata. At 1 MSPS one sample
-index step is one microsecond.
+`point_index`, `sample_index`, and IQ `time_us` are intentionally not registered
+as QCoDeS parameters, so they do not appear as misleading x/y selectors. The
+sample index is reconstructed from the `iq_trace` array length, and trace time is
+`arange(sample_count) * sample_period_us`. `sample_period_us` and the sample rate
+are stored in `qick_experiment_json` metadata. At 1 MSPS one sample step is one
+microsecond. Magnitude and phase are also derived when reading instead of being
+duplicated in SQLite. Use `load_qick_iq_arrays(dataset)` to reconstruct I, Q,
+magnitude, phase, sample index, and time arrays.
 
 Repetition is counted within each Cartesian sweep point. For example, two
 independent two-point sweep axes produce four sweep points; two repetitions
 produce eight acquisitions total, while `repetition_index` remains only 0 or 1.
 
 The Experiment tab reports real progress. The hardware interval follows the
-tProcessor completion counter, and the database interval follows the number of
-IQ sample rows flushed to SQLite. IQ rows are inserted in bounded batches to
-avoid the long post-pulse delay caused by one `add_result()` call per sample.
+tProcessor completion counter, and the database interval follows completed IQ
+trace arrays. The database is written to a local SSD staging directory first.
+After the run it performs a WAL checkpoint and copies the completed SQLite
+database to the configured location, including Nextcloud paths. This avoids one
+SQL row per sample and slow network-synchronized writes during acquisition.
 
 ## Verification
 

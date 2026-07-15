@@ -2329,7 +2329,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     def show_result(self, result) -> None:
         self.set_running(
             False,
-            f"Run {result.run_id}, {result.row_count} IQ rows\n"
+            f"Run {result.run_id}, {result.row_count} IQ samples\n"
             f"{result.database_path}",
         )
 
