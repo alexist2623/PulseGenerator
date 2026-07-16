@@ -251,3 +251,27 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
         calibrated.magnitude_db,
         expected_input - expected_output,
     )
+
+    deembedded = apply_power_calibration(
+        raw_result,
+        output_calibration=output_calibration,
+        input_calibration=input_calibration,
+        output_att1_db=0.0,
+        output_att2_db=0.0,
+        input_attenuation_db=0.0,
+        loss1_db=2.0,
+        loss2_db=3.0,
+        amplifier_gain_db=10.0,
+    )
+    np.testing.assert_allclose(
+        deembedded.dut_input_powers_dbm,
+        expected_output - 2.0,
+    )
+    np.testing.assert_allclose(
+        deembedded.dut_output_powers_dbm,
+        expected_input + 3.0 - 10.0,
+    )
+    np.testing.assert_allclose(
+        deembedded.magnitude_db,
+        expected_input - expected_output - 5.0,
+    )

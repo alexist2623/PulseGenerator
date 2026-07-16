@@ -233,6 +233,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.run_output_button.clicked.connect(self.output_requested.emit)
         vertical.insertWidget(2, self.run_output_button)
+        self.output_board.currentTextChanged.connect(self._update_board_controls)
         return scroll
 
     def _build_input_tab(self) -> QtWidgets.QWidget:
@@ -260,6 +261,12 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_output_att1 = self._attenuation(0.0)
         self.input_output_att2 = self._attenuation(0.0)
         self.input_attenuation = self._attenuation(0.0)
+        self.input_dc_gain = QtWidgets.QDoubleSpinBox()
+        self.input_dc_gain.setRange(-6.0, 26.0)
+        self.input_dc_gain.setDecimals(1)
+        self.input_dc_gain.setSingleStep(1.0)
+        self.input_dc_gain.setValue(0.0)
+        self.input_dc_gain.setSuffix(" dB")
         self.input_path_loss = QtWidgets.QDoubleSpinBox()
         self.input_path_loss.setRange(-200.0, 200.0)
         self.input_path_loss.setDecimals(6)
@@ -295,6 +302,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Output ATT1:", self.input_output_att1),
             ("Output ATT2:", self.input_output_att2),
             ("Input attenuation:", self.input_attenuation),
+            ("DC input gain:", self.input_dc_gain),
             ("External path loss:", self.input_path_loss),
             ("Output filter:", self.input_output_filter),
             ("Output cutoff/center:", self.input_output_cutoff),
@@ -314,7 +322,21 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.run_input_button.clicked.connect(self.input_requested.emit)
         vertical.insertWidget(1, self.run_input_button)
+        self.input_output_board.currentTextChanged.connect(self._update_board_controls)
+        self.input_board.currentTextChanged.connect(self._update_board_controls)
+        self._update_board_controls()
         return scroll
+
+    def _update_board_controls(self, *_args) -> None:
+        output_rf = self.output_board.currentText() == "RF_Out"
+        self.output_att1.setEnabled(output_rf)
+        self.output_att2.setEnabled(output_rf)
+        input_output_rf = self.input_output_board.currentText() == "RF_Out"
+        self.input_output_att1.setEnabled(input_output_rf)
+        self.input_output_att2.setEnabled(input_output_rf)
+        input_rf = self.input_board.currentText() == "RF_In"
+        self.input_attenuation.setEnabled(input_rf)
+        self.input_dc_gain.setEnabled(not input_rf)
 
     def _browse_database(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
@@ -350,8 +372,16 @@ class CalibrationPanel(QtWidgets.QWidget):
             gain_end=self.output_gain_end.value(),
             gain_points=self.output_gain_points.value(),
             gain_scale=str(self.output_gain_scale.currentData()),
-            output_att1_db=self.output_att1.value(),
-            output_att2_db=self.output_att2.value(),
+            output_att1_db=(
+                self.output_att1.value()
+                if self.output_board.currentText() == "RF_Out"
+                else 0.0
+            ),
+            output_att2_db=(
+                self.output_att2.value()
+                if self.output_board.currentText() == "RF_Out"
+                else 0.0
+            ),
             output_filter_type=self.output_filter_type.currentText(),
             output_filter_cutoff_ghz=self.output_filter_cutoff.value(),
             output_filter_bandwidth_ghz=self.output_filter_bandwidth.value(),
@@ -382,9 +412,26 @@ class CalibrationPanel(QtWidgets.QWidget):
             gain_points=self.input_gain_points.value(),
             gain_scale=str(self.input_gain_scale.currentData()),
             scan_time_us=self.input_scan_time.value(),
-            output_att1_db=self.input_output_att1.value(),
-            output_att2_db=self.input_output_att2.value(),
-            input_attenuation_db=self.input_attenuation.value(),
+            output_att1_db=(
+                self.input_output_att1.value()
+                if self.input_output_board.currentText() == "RF_Out"
+                else 0.0
+            ),
+            output_att2_db=(
+                self.input_output_att2.value()
+                if self.input_output_board.currentText() == "RF_Out"
+                else 0.0
+            ),
+            input_attenuation_db=(
+                self.input_attenuation.value()
+                if self.input_board.currentText() == "RF_In"
+                else 0.0
+            ),
+            input_dc_gain_db=(
+                self.input_dc_gain.value()
+                if self.input_board.currentText() == "DC_In"
+                else 0.0
+            ),
             path_loss_db=self.input_path_loss.value(),
             output_filter_type=self.input_output_filter.currentText(),
             output_filter_cutoff_ghz=self.input_output_cutoff.value(),
@@ -412,9 +459,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         settings = dict(settings)
-        database_path = str(
-            settings.get("database_path", DEFAULT_CALIBRATION_DB_PATH)
-        )
+        database_path = str(settings.get("database_path", DEFAULT_CALIBRATION_DB_PATH))
         output_values = dict(settings.get("output", {}))
         input_values = dict(settings.get("input", {}))
         scope_values = dict(output_values.pop("oscilloscope", {}))
@@ -457,6 +502,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             (self.input_output_att1, input_config.output_att1_db),
             (self.input_output_att2, input_config.output_att2_db),
             (self.input_attenuation, input_config.input_attenuation_db),
+            (self.input_dc_gain, input_config.input_dc_gain_db),
             (self.input_path_loss, input_config.path_loss_db),
             (self.input_output_cutoff, input_config.output_filter_cutoff_ghz),
             (self.input_output_bandwidth, input_config.output_filter_bandwidth_ghz),
@@ -484,6 +530,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_readout_filter.setCurrentText(input_config.readout_filter_type)
         self.input_experiment_name.setText(input_config.experiment_name)
         self.input_sample_name.setText(input_config.sample_name)
+        self._update_board_controls()
         self.tabs.setCurrentIndex(max(0, min(1, int(settings.get("selected_tab", 0)))))
 
     def set_running(self, running: bool, message: str) -> None:

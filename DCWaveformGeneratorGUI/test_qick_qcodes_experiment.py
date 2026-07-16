@@ -30,6 +30,7 @@ from qick_qcodes_experiment import (
     build_qick_program,
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
+    configure_rf_board,
     connect_qick,
     load_qick_iq_arrays,
     run_qick_qcodes_experiment,
@@ -673,6 +674,8 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     })) == 1
     assert result.rf_settings["output_details"] == ({
         "gen_ch": 0,
+        "board_type": "RF_Out",
+        "attenuators_present": True,
         "requested_att1_db": 5.0,
         "requested_att2_db": 6.0,
         "commanded_att1_db": 5.0,
@@ -690,3 +693,52 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert any(percent == 32 for percent, _ in progress_updates)
     assert any(percent == 55 for percent, _ in progress_updates)
     assert any(percent == 60 for percent, _ in progress_updates)
+
+
+def test_configure_rf_board_uses_zcu216_dc_chain_apis():
+    calls = []
+
+    class FakeSoc:
+        def rfb_set_gen_dc(self, gen_ch):
+            calls.append(("gen_dc", gen_ch))
+
+        def rfb_set_gen_filter(self, gen_ch, **kwargs):
+            calls.append(("gen_filter", gen_ch, kwargs))
+
+        def rfb_set_ro_dc(self, ro_ch, gain):
+            calls.append(("ro_dc", ro_ch, gain))
+            return gain
+
+        def rfb_set_ro_filter(self, ro_ch, **kwargs):
+            calls.append(("ro_filter", ro_ch, kwargs))
+
+    rf = QickRfPulseSpec(
+        4,
+        "set_0",
+        0.0,
+        1.0,
+        100.0,
+        10000,
+        7.0,
+        8.0,
+        output_board_type="DC_Out",
+    )
+    readout = QickDdrReadoutSpec(
+        2,
+        "set_0",
+        0.0,
+        8,
+        input_board_type="DC_In",
+        dc_gain_db=12.0,
+    )
+
+    configured = configure_rf_board(FakeSoc(), (rf,), readout)
+
+    assert ("gen_dc", 4) in calls
+    assert ("ro_dc", 2, 12.0) in calls
+    assert configured["outputs"] == ((0.0, 0.0),)
+    assert configured["readout"] == 12.0
+    assert configured["output_details"][0]["board_type"] == "DC_Out"
+    assert configured["output_details"][0]["attenuators_present"] is False
+    assert configured["readout_details"]["board_type"] == "DC_In"
+    assert configured["readout_details"]["commanded_dc_gain_db"] == 12.0

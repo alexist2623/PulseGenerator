@@ -171,10 +171,13 @@ class OscilloscopeConfig:
         _integer(self.average_count, "scope average_count", 1)
         if _finite(self.settle_seconds, "scope settle_seconds") < 0.0:
             raise ValueError("scope settle_seconds must be nonnegative")
-        if _finite(
-            self.sample_interval_seconds,
-            "scope sample_interval_seconds",
-        ) < 0.0:
+        if (
+            _finite(
+                self.sample_interval_seconds,
+                "scope sample_interval_seconds",
+            )
+            < 0.0
+        ):
             raise ValueError("scope sample_interval_seconds must be nonnegative")
         _integer(self.timeout_ms, "scope timeout_ms", 1)
 
@@ -251,6 +254,14 @@ class OutputPowerCalibrationConfig:
             self.gain_scale,
         )
 
+    @property
+    def effective_output_att1_db(self) -> float:
+        return float(self.output_att1_db) if self.output_board_type == "RF_Out" else 0.0
+
+    @property
+    def effective_output_att2_db(self) -> float:
+        return float(self.output_att2_db) if self.output_board_type == "RF_Out" else 0.0
+
 
 @dataclass(frozen=True)
 class InputPowerCalibrationConfig:
@@ -272,6 +283,7 @@ class InputPowerCalibrationConfig:
     output_att1_db: float = 0.0
     output_att2_db: float = 0.0
     input_attenuation_db: float = 0.0
+    input_dc_gain_db: float = 0.0
     output_filter_type: str = "bypass"
     output_filter_cutoff_ghz: float = 2.5
     output_filter_bandwidth_ghz: float = 1.0
@@ -304,6 +316,9 @@ class InputPowerCalibrationConfig:
         _attenuation(self.output_att1_db, "output_att1_db")
         _attenuation(self.output_att2_db, "output_att2_db")
         _attenuation(self.input_attenuation_db, "input_attenuation_db")
+        input_dc_gain = _finite(self.input_dc_gain_db, "input_dc_gain_db")
+        if not -6.0 <= input_dc_gain <= 26.0:
+            raise ValueError("input_dc_gain_db must be in [-6, 26] dB")
         for value, name in (
             (self.output_filter_type, "output_filter_type"),
             (self.readout_filter_type, "readout_filter_type"),
@@ -359,10 +374,13 @@ class InputPowerCalibrationConfig:
             scan_time_us=self.scan_time_us,
             output_att1_db=self.output_att1_db,
             output_att2_db=self.output_att2_db,
+            output_board_type=self.output_board_type,
+            input_board_type=self.input_board_type,
             output_filter_type=self.output_filter_type,
             output_filter_cutoff_ghz=self.output_filter_cutoff_ghz,
             output_filter_bandwidth_ghz=self.output_filter_bandwidth_ghz,
             readout_attenuation_db=self.input_attenuation_db,
+            readout_dc_gain_db=self.input_dc_gain_db,
             readout_filter_type=self.readout_filter_type,
             readout_filter_cutoff_ghz=self.readout_filter_cutoff_ghz,
             readout_filter_bandwidth_ghz=self.readout_filter_bandwidth_ghz,
@@ -404,9 +422,7 @@ class KeysightFftPowerMeter:
                 "install PyVISA==1.16.2"
             ) from exc
         self.resource_manager = pyvisa.ResourceManager()
-        self.instrument = self.resource_manager.open_resource(
-            self.config.visa_resource
-        )
+        self.instrument = self.resource_manager.open_resource(self.config.visa_resource)
         self.instrument.timeout = int(self.config.timeout_ms)
         self.instrument.write_termination = "\n"
         self.instrument.read_termination = "\n"
@@ -498,12 +514,19 @@ def _run_tone_program(
         return float(frequency_mhz)
 
 
-def _configure_output_chain(soc: Any, config: OutputPowerCalibrationConfig) -> Mapping[str, Any]:
-    actual_att1, actual_att2 = soc.rfb_set_gen_rf(
-        config.output_ch,
-        config.output_att1_db,
-        config.output_att2_db,
-    )
+def _configure_output_chain(
+    soc: Any, config: OutputPowerCalibrationConfig
+) -> Mapping[str, Any]:
+    if config.output_board_type == "RF_Out":
+        actual_att1, actual_att2 = soc.rfb_set_gen_rf(
+            config.output_ch,
+            config.output_att1_db,
+            config.output_att2_db,
+        )
+    else:
+        soc.rfb_set_gen_dc(config.output_ch)
+        actual_att1 = 0.0
+        actual_att2 = 0.0
     soc.rfb_set_gen_filter(
         config.output_ch,
         fc=config.output_filter_cutoff_ghz,
@@ -512,8 +535,10 @@ def _configure_output_chain(soc: Any, config: OutputPowerCalibrationConfig) -> M
     )
     return {
         "output_ch": config.output_ch,
+        "board_type": config.output_board_type,
         "att1_db": float(actual_att1),
         "att2_db": float(actual_att2),
+        "attenuators_present": config.output_board_type == "RF_Out",
         "filter_type": config.output_filter_type,
         "filter_cutoff_ghz": config.output_filter_cutoff_ghz,
         "filter_bandwidth_ghz": config.output_filter_bandwidth_ghz,
@@ -539,7 +564,9 @@ def _store_output_calibration(
             load_or_create_experiment,
         )
     except ImportError as exc:
-        raise RuntimeError("QCoDeS==0.58.0 is required for calibration storage") from exc
+        raise RuntimeError(
+            "QCoDeS==0.58.0 is required for calibration storage"
+        ) from exc
     database_path = Path(config.database_path).expanduser().resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
     staging, local_path = _prepare_local_database(database_path)
@@ -580,10 +607,12 @@ def _store_output_calibration(
             dataset = datasaver.dataset
             dataset.add_metadata(
                 "Attenuation",
-                _json_text({
-                    "att1": float(rf_settings["att1_db"]),
-                    "att2": float(rf_settings["att2_db"]),
-                }),
+                _json_text(
+                    {
+                        "att1": float(rf_settings["att1_db"]),
+                        "att2": float(rf_settings["att2_db"]),
+                    }
+                ),
             )
             dataset.add_metadata("Calibration_Config", _json_text(metadata))
             if config.notes:
@@ -593,7 +622,10 @@ def _store_output_calibration(
                     datasaver.add_result(
                         (gain_parameter, int(gain)),
                         (frequency_parameter, float(frequency)),
-                        (power_parameter, float(powers_dbm[gain_index, frequency_index])),
+                        (
+                            power_parameter,
+                            float(powers_dbm[gain_index, frequency_index]),
+                        ),
                     )
             datasaver.flush_data_to_database()
         guid = str(dataset.guid)
@@ -630,7 +662,10 @@ def run_output_power_calibration(
     progress_callback: Optional[ProgressCallback] = None,
 ) -> StoredCalibrationRun:
     """Measure QICK output power over gain and frequency and save one run."""
-    if not calibration_config.oscilloscope.visa_resource.strip() and power_meter_factory is None:
+    if (
+        not calibration_config.oscilloscope.visa_resource.strip()
+        and power_meter_factory is None
+    ):
         raise ValueError("oscilloscope VISA resource must not be empty")
     tone_runner = tone_runner or _run_tone_program
     power_meter_factory = power_meter_factory or KeysightFftPowerMeter
@@ -695,7 +730,9 @@ def run_output_power_calibration(
         rf_settings=rf_settings,
         scope_identity=scope_identity,
     )
-    _emit_progress(progress_callback, 100, f"Output calibration Run {stored.run_id} saved")
+    _emit_progress(
+        progress_callback, 100, f"Output calibration Run {stored.run_id} saved"
+    )
     return stored
 
 
@@ -721,7 +758,9 @@ def _store_input_calibration(
             load_or_create_experiment,
         )
     except ImportError as exc:
-        raise RuntimeError("QCoDeS==0.58.0 is required for calibration storage") from exc
+        raise RuntimeError(
+            "QCoDeS==0.58.0 is required for calibration storage"
+        ) from exc
     database_path = Path(config.database_path).expanduser().resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
     staging, local_path = _prepare_local_database(database_path)
@@ -762,7 +801,9 @@ def _store_input_calibration(
             input_power_parameter,
             setpoints=(gain_parameter, frequency_parameter),
         )
-        measurement.register_parameter(slope_parameter, setpoints=(frequency_parameter,))
+        measurement.register_parameter(
+            slope_parameter, setpoints=(frequency_parameter,)
+        )
         measurement.register_parameter(
             intercept_parameter,
             setpoints=(frequency_parameter,),
@@ -787,6 +828,7 @@ def _store_input_calibration(
             "output_att1_db": float(config.output_att1_db),
             "output_att2_db": float(config.output_att2_db),
             "input_attenuation_db": float(config.input_attenuation_db),
+            "input_dc_gain_db": float(config.input_dc_gain_db),
             "path_loss_db": float(config.path_loss_db),
             "fit_trim_low": int(config.fit_trim_low),
             "fit_trim_high": int(config.fit_trim_high),
@@ -806,10 +848,12 @@ def _store_input_calibration(
             dataset.add_metadata("Calibration_Config", _json_text(config_metadata))
             dataset.add_metadata(
                 "Attenuation",
-                _json_text({
-                    "att1": float(config.output_att1_db),
-                    "att2": float(config.output_att2_db),
-                }),
+                _json_text(
+                    {
+                        "att1": float(config.output_att1_db),
+                        "att2": float(config.output_att2_db),
+                    }
+                ),
             )
             if config.notes:
                 dataset.add_metadata("calibration_notes", config.notes)
@@ -912,7 +956,21 @@ def run_input_power_calibration(
     input_attenuation = float(
         actual_input.get(
             "commanded_attenuation_db",
-            calibration_config.input_attenuation_db,
+            (
+                calibration_config.input_attenuation_db
+                if calibration_config.input_board_type == "RF_In"
+                else 0.0
+            ),
+        )
+    )
+    input_dc_gain = float(
+        actual_input.get(
+            "commanded_dc_gain_db",
+            (
+                calibration_config.input_dc_gain_db
+                if calibration_config.input_board_type == "DC_In"
+                else 0.0
+            ),
         )
     )
     measured_db = np.empty((gains.size, frequencies.size), dtype=float)
@@ -926,15 +984,12 @@ def run_input_power_calibration(
         if not np.array_equal(result.frequencies_mhz, frequencies):
             raise RuntimeError("acquired input-calibration frequency grid changed")
         measured_db[gain_index] = np.asarray(result.magnitude_db, dtype=float)
-        known_input_dbm[gain_index] = (
-            output_calibration.output_power_dbm(
-                frequencies,
-                int(gain),
-                output_att1_db=output_att1,
-                output_att2_db=output_att2,
-            )
-            - float(calibration_config.path_loss_db)
-        )
+        known_input_dbm[gain_index] = output_calibration.output_power_dbm(
+            frequencies,
+            int(gain),
+            output_att1_db=output_att1,
+            output_att2_db=output_att2,
+        ) - float(calibration_config.path_loss_db)
         _emit_progress(
             progress_callback,
             7 + round(76 * (gain_index + 1) / gains.size),
@@ -962,6 +1017,7 @@ def run_input_power_calibration(
     adjusted_config = replace(
         calibration_config,
         input_attenuation_db=input_attenuation,
+        input_dc_gain_db=input_dc_gain,
         output_att1_db=output_att1,
         output_att2_db=output_att2,
     )
@@ -977,7 +1033,9 @@ def run_input_power_calibration(
         output_run_id=output_calibration.summary.run_id,
         rf_settings=rf_settings,
     )
-    _emit_progress(progress_callback, 100, f"Input calibration Run {stored.run_id} saved")
+    _emit_progress(
+        progress_callback, 100, f"Input calibration Run {stored.run_id} saved"
+    )
     return stored
 
 

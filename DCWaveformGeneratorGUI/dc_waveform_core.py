@@ -15,7 +15,7 @@ from math import ceil, isfinite
 from numbers import Integral, Real
 import keyword
 import re
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,6 +31,8 @@ DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 2500.0
 DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
 MAX_QICK_OUTPUTS = 8
+QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
+QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
 
 
 def _finite_real(value: Real, name: str) -> float:
@@ -198,6 +200,7 @@ class QickRfPulseSpec:
     filter_type: str = "bypass"
     filter_cutoff: float = 2.5
     filter_bandwidth: float = 1.0
+    output_board_type: str = "RF_Out"
 
     def __post_init__(self) -> None:
         _bounded_int(self.gen_ch, "RF generator channel", 0, 1_000_000)
@@ -221,6 +224,18 @@ class QickRfPulseSpec:
             )
         _nonnegative_real(self.filter_cutoff, "RF output filter_cutoff")
         _positive_real(self.filter_bandwidth, "RF output filter_bandwidth")
+        if self.output_board_type not in QICK_OUTPUT_BOARD_TYPES:
+            raise ValueError(
+                f"output_board_type must be one of {QICK_OUTPUT_BOARD_TYPES}"
+            )
+
+    @property
+    def effective_att1_db(self) -> float:
+        return float(self.att1_db) if self.output_board_type == "RF_Out" else 0.0
+
+    @property
+    def effective_att2_db(self) -> float:
+        return float(self.att2_db) if self.output_board_type == "RF_Out" else 0.0
 
 
 @dataclass(frozen=True)
@@ -239,6 +254,8 @@ class QickDdrReadoutSpec:
     filter_type: str = "bypass"
     filter_cutoff: float = 2.5
     filter_bandwidth: float = 1.0
+    input_board_type: str = "RF_In"
+    dc_gain_db: float = 0.0
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -260,6 +277,21 @@ class QickDdrReadoutSpec:
             )
         _nonnegative_real(self.filter_cutoff, "RF input filter_cutoff")
         _positive_real(self.filter_bandwidth, "RF input filter_bandwidth")
+        if self.input_board_type not in QICK_INPUT_BOARD_TYPES:
+            raise ValueError(
+                f"input_board_type must be one of {QICK_INPUT_BOARD_TYPES}"
+            )
+        dc_gain = _finite_real(self.dc_gain_db, "DC input dc_gain_db")
+        if dc_gain < -6.0 or dc_gain > 26.0:
+            raise ValueError("DC input dc_gain_db must be in [-6, 26] dB")
+
+    @property
+    def effective_attenuation_db(self) -> float:
+        return float(self.attenuation_db) if self.input_board_type == "RF_In" else 0.0
+
+    @property
+    def effective_dc_gain_db(self) -> float:
+        return float(self.dc_gain_db) if self.input_board_type == "DC_In" else 0.0
 
 
 @dataclass(frozen=True)
@@ -860,6 +892,7 @@ def generate_qick_program_code(
             "filter_type": str(spec.filter_type),
             "filter_cutoff": float(spec.filter_cutoff),
             "filter_bandwidth": float(spec.filter_bandwidth),
+            "output_board_type": str(spec.output_board_type),
         }
         for spec in normalized_rf_specs
     )
@@ -876,6 +909,8 @@ def generate_qick_program_code(
         "filter_type": str(ddr_readout_spec.filter_type),
         "filter_cutoff": float(ddr_readout_spec.filter_cutoff),
         "filter_bandwidth": float(ddr_readout_spec.filter_bandwidth),
+        "input_board_type": str(ddr_readout_spec.input_board_type),
+        "dc_gain_db": float(ddr_readout_spec.dc_gain_db),
     }
     lines = [
         '"""Generated QICK AWG-tuning, RF pulse, and 1 MSPS DDR program."""',
@@ -1019,9 +1054,14 @@ def generate_qick_program_code(
             "        return None",
             "    actual = []",
             "    for cfg in RF_CONFIGS:",
-            "        actual.append(soc.rfb_set_gen_rf(",
-            "            cfg['gen_ch'], cfg['att1_db'], cfg['att2_db']",
-            "        ))",
+            "        if cfg['output_board_type'] == 'RF_Out':",
+            "            configured = soc.rfb_set_gen_rf(",
+            "                cfg['gen_ch'], cfg['att1_db'], cfg['att2_db']",
+            "            )",
+            "        else:",
+            "            soc.rfb_set_gen_dc(cfg['gen_ch'])",
+            "            configured = (0.0, 0.0)",
+            "        actual.append(configured)",
             "        soc.rfb_set_gen_filter(",
             "            cfg['gen_ch'],",
             "            fc=cfg['filter_cutoff'],",
@@ -1036,14 +1076,17 @@ def generate_qick_program_code(
             "    if DDR_1MSPS_CONFIG is None:",
             "        return None",
             "    cfg = DDR_1MSPS_CONFIG",
-            "    actual_att = soc.rfb_set_ro_rf(cfg['ro_ch'], cfg['attenuation_db'])",
+            "    if cfg['input_board_type'] == 'RF_In':",
+            "        configured = soc.rfb_set_ro_rf(cfg['ro_ch'], cfg['attenuation_db'])",
+            "    else:",
+            "        configured = soc.rfb_set_ro_dc(cfg['ro_ch'], cfg['dc_gain_db'])",
             "    soc.rfb_set_ro_filter(",
             "        cfg['ro_ch'],",
             "        fc=cfg['filter_cutoff'],",
             "        bw=cfg['filter_bandwidth'],",
             "        ftype=cfg['filter_type'],",
             "    )",
-            "    return actual_att",
+            "    return configured",
             "",
             "",
             "def run_experiment(soc, soccfg, *, progress=True, configure_rf=True, **run_kwargs):",

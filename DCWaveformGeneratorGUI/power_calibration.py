@@ -19,7 +19,6 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 import numpy as np
 
-
 OUTPUT_BOARD_TYPES = ("DC_Out", "RF_Out")
 INPUT_BOARD_TYPES = ("DC_In", "RF_In")
 BOARD_TYPES = OUTPUT_BOARD_TYPES + INPUT_BOARD_TYPES
@@ -88,6 +87,7 @@ class CalibrationRunSummary:
     calibration_att1_db: float = 0.0
     calibration_att2_db: float = 0.0
     input_attenuation_db: float = 0.0
+    input_gain_db: float = 0.0
     source_output_run_id: int = 0
     path_loss_db: float = 0.0
     purpose: str = "output_power"
@@ -107,6 +107,7 @@ class CalibrationRunSummary:
             "calibration_att1_db": self.calibration_att1_db,
             "calibration_att2_db": self.calibration_att2_db,
             "input_attenuation_db": self.input_attenuation_db,
+            "input_gain_db": self.input_gain_db,
             "source_output_run_id": self.source_output_run_id,
             "path_loss_db": self.path_loss_db,
             "purpose": self.purpose,
@@ -132,7 +133,9 @@ class GainSchedule:
         frequencies = np.asarray(
             self.representative_frequencies_mhz, dtype=float
         ).reshape(-1)
-        indices = np.asarray(self.representative_point_indices, dtype=np.int64).reshape(-1)
+        indices = np.asarray(self.representative_point_indices, dtype=np.int64).reshape(
+            -1
+        )
         corrections = np.asarray(self.correction_db, dtype=float).reshape(-1)
         if gains.size < 1 or gains.size > MAX_DMEM_GAIN_ENTRIES:
             raise ValueError(
@@ -242,10 +245,13 @@ class GainPowerCalibration:
         }
         self.frequencies_mhz = np.asarray(sorted(self._curves), dtype=float)
         self.reference_gain = MAX_QICK_GAIN
-        self.frequency_response_levels_dbm = np.asarray([
-            self._estimate_frequency_response_dbm(*self._curves[float(frequency)])
-            for frequency in self.frequencies_mhz
-        ], dtype=float)
+        self.frequency_response_levels_dbm = np.asarray(
+            [
+                self._estimate_frequency_response_dbm(*self._curves[float(frequency)])
+                for frequency in self.frequencies_mhz
+            ],
+            dtype=float,
+        )
 
     def _estimate_frequency_response_dbm(
         self, gains: np.ndarray, measured_powers_dbm: np.ndarray
@@ -268,7 +274,7 @@ class GainPowerCalibration:
         if np.count_nonzero(high_gain) < min(3, gains.size):
             order = np.argsort(gains)
             high_gain = np.zeros(gains.size, dtype=bool)
-            high_gain[order[-min(8, gains.size):]] = True
+            high_gain[order[-min(8, gains.size) :]] = True
         normalized = powers[high_gain] - 20.0 * np.log10(
             gains[high_gain] / float(self.reference_gain)
         )
@@ -296,11 +302,14 @@ class GainPowerCalibration:
                 f"{self.summary.run_id} coverage {minimum:.9g}..{maximum:.9g} MHz"
             )
         frequencies = np.clip(frequencies, minimum, maximum)
-        return np.asarray(np.interp(
-            frequencies,
-            self.frequencies_mhz,
-            self.frequency_response_levels_dbm,
-        ), dtype=float)
+        return np.asarray(
+            np.interp(
+                frequencies,
+                self.frequencies_mhz,
+                self.frequency_response_levels_dbm,
+            ),
+            dtype=float,
+        )
 
     def nominal_gain_for_power(
         self,
@@ -332,10 +341,12 @@ class GainPowerCalibration:
                 f"is outside linear gain range {minimum_output_power:.6g}.."
                 f"{full_scale_output_power:.6g} dBm (Run {self.summary.run_id})"
             )
-        mapped = int(np.rint(
-            self.reference_gain
-            * 10.0 ** ((target - full_scale_output_power) / 20.0)
-        ))
+        mapped = int(
+            np.rint(
+                self.reference_gain
+                * 10.0 ** ((target - full_scale_output_power) / 20.0)
+            )
+        )
         return max(0, min(MAX_QICK_GAIN, mapped))
 
     def output_power_dbm(
@@ -384,9 +395,7 @@ class GainPowerCalibration:
             raise ValueError("sweep frequencies must be finite")
         max_entries = int(max_entries)
         if not 1 <= max_entries <= MAX_DMEM_GAIN_ENTRIES:
-            raise ValueError(
-                f"max_entries must be in 1..{MAX_DMEM_GAIN_ENTRIES}"
-            )
+            raise ValueError(f"max_entries must be in 1..{MAX_DMEM_GAIN_ENTRIES}")
         table_count = min(int(frequencies.size), max_entries)
         starts = (
             np.arange(table_count, dtype=np.int64) * frequencies.size
@@ -409,9 +418,9 @@ class GainPowerCalibration:
             representative_frequencies
         )
         correction_db = reference_response - representative_responses
-        gains = np.rint(
-            nominal_gain * np.power(10.0, correction_db / 20.0)
-        ).astype(np.int32)
+        gains = np.rint(nominal_gain * np.power(10.0, correction_db / 20.0)).astype(
+            np.int32
+        )
         gains = np.clip(gains, 1, MAX_QICK_GAIN)
         return GainSchedule(
             gain_codes=gains,
@@ -442,15 +451,17 @@ class InputPowerCalibration:
         slopes = np.asarray(slopes, dtype=float).reshape(-1)
         intercepts = np.asarray(intercepts_dbm, dtype=float).reshape(-1)
         if not (
-            frequencies.size >= 1
-            and frequencies.size == slopes.size == intercepts.size
+            frequencies.size >= 1 and frequencies.size == slopes.size == intercepts.size
         ):
             raise ValueError("input calibration arrays must have equal nonzero length")
-        if not all(np.all(np.isfinite(values)) for values in (
-            frequencies,
-            slopes,
-            intercepts,
-        )):
+        if not all(
+            np.all(np.isfinite(values))
+            for values in (
+                frequencies,
+                slopes,
+                intercepts,
+            )
+        ):
             raise ValueError("input calibration values must be finite")
         order = np.argsort(frequencies)
         frequencies = frequencies[order]
@@ -497,6 +508,7 @@ class InputPowerCalibration:
         adc_magnitude_db: Any,
         *,
         input_attenuation_db: float = 0.0,
+        input_gain_db: float = 0.0,
     ) -> np.ndarray:
         """Convert ``20*log10(hypot(I,Q))`` to power at the input connector."""
         frequencies, measured = np.broadcast_arrays(
@@ -506,11 +518,13 @@ class InputPowerCalibration:
         if not np.all(np.isfinite(measured)):
             raise ValueError("ADC magnitudes must be finite")
         slopes, intercepts = self.coefficients(frequencies)
-        attenuation_correction = (
-            float(input_attenuation_db) - self.summary.input_attenuation_db
+        front_end_correction = (
+            float(input_attenuation_db)
+            - self.summary.input_attenuation_db
+            - (float(input_gain_db) - self.summary.input_gain_db)
         )
         return np.asarray(
-            slopes * (measured + attenuation_correction) + intercepts,
+            slopes * (measured + front_end_correction) + intercepts,
             dtype=float,
         )
 
@@ -543,9 +557,7 @@ class CalibrationDatabase:
         )
 
     @staticmethod
-    def _frequency_unit(
-        connection: sqlite3.Connection, run_id: int
-    ) -> str:
+    def _frequency_unit(connection: sqlite3.Connection, run_id: int) -> str:
         try:
             row = connection.execute(
                 "SELECT unit FROM layouts WHERE run_id = ? AND parameter = 'freq' "
@@ -572,7 +584,9 @@ class CalibrationDatabase:
     @staticmethod
     def _attenuation(row: sqlite3.Row) -> Tuple[float, float]:
         fields = set(row.keys())
-        metadata = _json_mapping(row["Attenuation"] if "Attenuation" in fields else None)
+        metadata = _json_mapping(
+            row["Attenuation"] if "Attenuation" in fields else None
+        )
         return float(metadata.get("att1", 0.0)), float(metadata.get("att2", 0.0))
 
     @staticmethod
@@ -630,17 +644,19 @@ class CalibrationDatabase:
                     and requested_max <= frequency_max + frequency_tolerance_mhz
                 )
                 att1, att2 = self._attenuation(row)
-                candidates.append((
-                    full_coverage,
-                    overlap,
-                    int(row["run_id"]),
-                    row,
-                    raw[:, 0],
-                    frequencies,
-                    raw[:, 2],
-                    att1,
-                    att2,
-                ))
+                candidates.append(
+                    (
+                        full_coverage,
+                        overlap,
+                        int(row["run_id"]),
+                        row,
+                        raw[:, 0],
+                        frequencies,
+                        raw[:, 2],
+                        att1,
+                        att2,
+                    )
+                )
         if not candidates:
             raise LookupError(
                 f"no gain/frequency/power calibration run exists for {board_type} "
@@ -665,9 +681,12 @@ class CalibrationDatabase:
             group_gain = gains[mask]
             group_power = powers[mask]
             unique_gain = np.unique(group_gain)
-            averaged_power = np.asarray([
-                float(np.mean(group_power[group_gain == gain])) for gain in unique_gain
-            ])
+            averaged_power = np.asarray(
+                [
+                    float(np.mean(group_power[group_gain == gain]))
+                    for gain in unique_gain
+                ]
+            )
             order = np.argsort(unique_gain)
             curves[float(frequency)] = (
                 unique_gain[order],
@@ -710,7 +729,10 @@ class CalibrationDatabase:
                 if "freq" not in columns:
                     continue
                 accepted = {
-                    "measured_value", "meas_in_pwr", "meas_slope", "meas_intercept"
+                    "measured_value",
+                    "meas_in_pwr",
+                    "meas_slope",
+                    "meas_intercept",
                 }
                 if not accepted.intersection(columns):
                     continue
@@ -747,26 +769,19 @@ class CalibrationDatabase:
                 )
                 minimum = float(np.min(frequencies))
                 maximum = float(np.max(frequencies))
-                if (
-                    requested_min < minimum - 1.0e-5
-                    or requested_max > maximum + 1.0e-5
-                ):
+                if requested_min < minimum - 1.0e-5 or requested_max > maximum + 1.0e-5:
                     continue
                 coefficient_frequencies = []
                 slopes = []
                 intercepts = []
                 for frequency in np.unique(frequencies):
-                    mask = np.isclose(
-                        frequencies, frequency, rtol=0.0, atol=1.0e-9
-                    )
+                    mask = np.isclose(frequencies, frequency, rtol=0.0, atol=1.0e-9)
                     measured = raw[mask, 1]
                     input_power = raw[mask, 2]
                     stored_slopes = raw[mask, 3]
                     stored_intercepts = raw[mask, 4]
                     finite_slope = stored_slopes[np.isfinite(stored_slopes)]
-                    finite_intercept = stored_intercepts[
-                        np.isfinite(stored_intercepts)
-                    ]
+                    finite_intercept = stored_intercepts[np.isfinite(stored_intercepts)]
                     if finite_slope.size and finite_intercept.size:
                         slope = float(np.mean(finite_slope))
                         intercept = float(np.mean(finite_intercept))
@@ -804,6 +819,12 @@ class CalibrationDatabase:
                         config_metadata.get("readout_attenuation_db", 0.0),
                     )
                 )
+                input_gain = float(
+                    config_metadata.get(
+                        "input_dc_gain_db",
+                        config_metadata.get("readout_dc_gain_db", 0.0),
+                    )
+                )
                 source_output_run_id = int(
                     config_metadata.get(
                         "output_run_id",
@@ -825,19 +846,22 @@ class CalibrationDatabase:
                     calibration_att1_db=att1,
                     calibration_att2_db=att2,
                     input_attenuation_db=input_attenuation,
+                    input_gain_db=input_gain,
                     source_output_run_id=source_output_run_id,
                     path_loss_db=path_loss_db,
                     purpose="input_power",
                 )
-                matches.append((
-                    int(row["run_id"]),
-                    InputPowerCalibration(
-                        summary,
-                        coefficient_frequencies,
-                        slopes,
-                        intercepts,
-                    ),
-                ))
+                matches.append(
+                    (
+                        int(row["run_id"]),
+                        InputPowerCalibration(
+                            summary,
+                            coefficient_frequencies,
+                            slopes,
+                            intercepts,
+                        ),
+                    )
+                )
         if not matches:
             raise LookupError(
                 f"no {board_type} ADC-to-input-power calibration fully covers "

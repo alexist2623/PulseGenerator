@@ -11,7 +11,7 @@ from math import prod
 from pathlib import Path
 import sys
 import traceback
-from typing import Tuple, Optional, List, Callable, Sequence
+from typing import Tuple, Optional, List, Callable, Mapping, Sequence
 import numpy as np
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -44,6 +44,8 @@ try:
         DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
+        QICK_INPUT_BOARD_TYPES,
+        QICK_OUTPUT_BOARD_TYPES,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
         QickSweepSpec,
@@ -62,6 +64,8 @@ except ImportError:
         DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
+        QICK_INPUT_BOARD_TYPES,
+        QICK_OUTPUT_BOARD_TYPES,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
         QickSweepSpec,
@@ -140,8 +144,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 9
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, SETTINGS_VERSION)
+SETTINGS_VERSION = 10
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -158,6 +162,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "duration_us": 1.0,
     "frequency_mhz": 50.0,
     "gain": 20000,
+    "output_board_type": "RF_Out",
     "att1_db": 0.0,
     "att2_db": 0.0,
     "filter_type": "bypass",
@@ -177,7 +182,9 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "readout_frequency_mhz": 50.0,
     "margin_input_samples": 1024,
     "force_overwrite": False,
+    "input_board_type": "RF_In",
     "attenuation_db": 20.0,
+    "dc_gain_db": 0.0,
     "filter_type": "bypass",
     "filter_cutoff": 2.5,
     "filter_bandwidth": 1.0,
@@ -1720,6 +1727,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.gen_ch = QtWidgets.QSpinBox()
         self.gen_ch.setRange(0, 255)
         self.gen_ch.setValue(index if default_gen_ch is None else default_gen_ch)
+        self.output_board_type = QtWidgets.QComboBox()
+        self.output_board_type.addItems(QICK_OUTPUT_BOARD_TYPES)
         self.segment = QtWidgets.QComboBox()
         self.delay = QtWidgets.QDoubleSpinBox()
         self.duration = QtWidgets.QDoubleSpinBox()
@@ -1766,6 +1775,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.require_within.setChecked(True)
 
         form.addRow("Generator index:", self.gen_ch)
+        form.addRow("Output board:", self.output_board_type)
         form.addRow("Anchor SET:", self.segment)
         self._delay_label = QtWidgets.QLabel()
         self._duration_label = QtWidgets.QLabel()
@@ -1789,6 +1799,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.set_time_unit(time_unit, force=True)
         for widget in (
             self.gen_ch,
+            self.output_board_type,
             self.segment,
             self.delay,
             self.duration,
@@ -1810,7 +1821,22 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 signal = getattr(widget, "toggled", None)
             signal.connect(self.changed.emit)
         self.toggled.connect(self.changed.emit)
+        self.output_board_type.currentTextChanged.connect(
+            self._update_board_controls
+        )
+        self._update_board_controls()
         self.set_index(index)
+
+    def _update_board_controls(self, *_args) -> None:
+        has_attenuators = self.output_board_type.currentText() == "RF_Out"
+        self.att1_db.setEnabled(has_attenuators)
+        self.att2_db.setEnabled(has_attenuators)
+        if has_attenuators:
+            tooltip = "RF_Out onboard attenuator"
+        else:
+            tooltip = "DC_Out has no onboard ATT1/ATT2; these values are ignored"
+        self.att1_db.setToolTip(tooltip)
+        self.att2_db.setToolTip(tooltip)
 
     def set_index(self, index: int) -> None:
         self._index = index
@@ -1863,6 +1889,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             filter_type=self.filter_type.currentText(),
             filter_cutoff=self.filter_cutoff.value(),
             filter_bandwidth=self.filter_bandwidth.value(),
+            output_board_type=self.output_board_type.currentText(),
         )
 
     def spec(self) -> Optional[QickRfPulseSpec]:
@@ -1880,6 +1907,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "duration_us": spec.duration_us,
             "frequency_mhz": spec.frequency_mhz,
             "gain": spec.gain,
+            "output_board_type": spec.output_board_type,
             "att1_db": spec.att1_db,
             "att2_db": spec.att2_db,
             "filter_type": spec.filter_type,
@@ -1914,6 +1942,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             filter_type=str(data.get("filter_type", "bypass")),
             filter_cutoff=float(data.get("filter_cutoff", 2.5)),
             filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
+            output_board_type=str(data.get("output_board_type", "RF_Out")),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -1926,6 +1955,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self.frequency_mhz.setValue(spec.frequency_mhz)
         self.gain.setValue(spec.gain)
+        self.output_board_type.setCurrentText(spec.output_board_type)
         self.att1_db.setValue(spec.att1_db)
         self.att2_db.setValue(spec.att2_db)
         self.filter_type.setCurrentText(spec.filter_type)
@@ -1934,6 +1964,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.phase_degrees.setValue(spec.phase_degrees)
         self.nqz.setValue(spec.nqz)
         self.require_within.setChecked(spec.require_within_segment)
+        self._update_board_controls()
         self.setChecked(enabled)
 
 
@@ -2013,11 +2044,35 @@ class RfPortsPanel(QtWidgets.QWidget):
         )
         panel.frequency_mhz.setValue(spec.frequency_mhz)
         panel.gain.setValue(spec.gain)
+        panel.output_board_type.setCurrentText(spec.output_board_type)
         panel.att1_db.setValue(spec.att1_db)
         panel.att2_db.setValue(spec.att2_db)
         panel.phase_degrees.setValue(spec.phase_degrees)
         panel.nqz.setValue(spec.nqz)
         panel.require_within.setChecked(spec.require_within_segment)
+
+    def apply_path_settings(self, values: Mapping[str, object]) -> int:
+        """Apply a committed RF path to the matching Experiment output editor."""
+        output_ch = int(values["output_ch"])
+        target = next(
+            (panel for panel in self._panels if panel.gen_ch.value() == output_ch),
+            self._panels[0] if self._panels else None,
+        )
+        if target is None:
+            self.add_port()
+            target = self._panels[0]
+        target.gen_ch.setValue(output_ch)
+        target.output_board_type.setCurrentText(str(values["output_board_type"]))
+        target.att1_db.setValue(float(values["output_att1_db"]))
+        target.att2_db.setValue(float(values["output_att2_db"]))
+        target.filter_type.setCurrentText(str(values["output_filter_type"]))
+        target.filter_cutoff.setValue(float(values["output_filter_cutoff_ghz"]))
+        target.filter_bandwidth.setValue(
+            float(values["output_filter_bandwidth_ghz"])
+        )
+        target._update_board_controls()
+        self._emit_specs()
+        return self._panels.index(target)
 
     def specs(self) -> Tuple[QickRfPulseSpec, ...]:
         specs = tuple(spec for panel in self._panels if (spec := panel.spec()) is not None)
@@ -2078,6 +2133,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form = QtWidgets.QFormLayout(self)
         self.ro_ch = QtWidgets.QSpinBox()
         self.ro_ch.setRange(0, 255)
+        self.input_board_type = QtWidgets.QComboBox()
+        self.input_board_type.addItems(QICK_INPUT_BOARD_TYPES)
         self.segment = QtWidgets.QComboBox()
         self.delay = QtWidgets.QDoubleSpinBox()
         self.delay.setRange(0.0, 1.0e12)
@@ -2096,6 +2153,15 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.attenuation_db.setSingleStep(0.25)
         self.attenuation_db.setValue(20.0)
         self.attenuation_db.setSuffix(" dB")
+        self.dc_gain_db = QtWidgets.QDoubleSpinBox()
+        self.dc_gain_db.setRange(-6.0, 26.0)
+        self.dc_gain_db.setDecimals(2)
+        self.dc_gain_db.setSingleStep(1.0)
+        self.dc_gain_db.setValue(0.0)
+        self.dc_gain_db.setSuffix(" dB")
+        self.input_condition_stack = QtWidgets.QStackedWidget()
+        self.input_condition_stack.addWidget(self.attenuation_db)
+        self.input_condition_stack.addWidget(self.dc_gain_db)
         self.filter_type = QtWidgets.QComboBox()
         self.filter_type.addItems(["bypass", "lowpass", "highpass", "bandpass"])
         self.filter_cutoff = QtWidgets.QDoubleSpinBox()
@@ -2114,12 +2180,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
 
         form.addRow("Readout index:", self.ro_ch)
+        form.addRow("Input board:", self.input_board_type)
         form.addRow("Anchor SET:", self.segment)
         self._delay_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
         form.addRow("Stored 1 MSPS samples:", self.samples)
         form.addRow("Readout/DDC frequency:", self.frequency_mhz)
-        form.addRow("Input attenuation:", self.attenuation_db)
+        self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
+        form.addRow(self.input_condition_label, self.input_condition_stack)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
@@ -2135,11 +2203,13 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.set_time_unit(time_unit, force=True)
         for widget in (
             self.ro_ch,
+            self.input_board_type,
             self.segment,
             self.delay,
             self.samples,
             self.frequency_mhz,
             self.attenuation_db,
+            self.dc_gain_db,
             self.filter_type,
             self.filter_cutoff,
             self.filter_bandwidth,
@@ -2153,6 +2223,17 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 signal = getattr(widget, "toggled", None)
             signal.connect(self._emit_spec)
         self.toggled.connect(self._emit_spec)
+        self.input_board_type.currentTextChanged.connect(
+            self._update_board_controls
+        )
+        self._update_board_controls()
+
+    def _update_board_controls(self, *_args) -> None:
+        rf_input = self.input_board_type.currentText() == "RF_In"
+        self.input_condition_stack.setCurrentIndex(0 if rf_input else 1)
+        self.input_condition_label.setText(
+            "Input attenuation:" if rf_input else "DC input gain:"
+        )
 
     def set_time_unit(self, unit: str, *, force: bool = False) -> None:
         if unit not in TIME_UNIT_NS:
@@ -2193,6 +2274,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             filter_type=self.filter_type.currentText(),
             filter_cutoff=self.filter_cutoff.value(),
             filter_bandwidth=self.filter_bandwidth.value(),
+            input_board_type=self.input_board_type.currentText(),
+            dc_gain_db=self.dc_gain_db.value(),
         )
 
     def spec(self) -> Optional[QickDdrReadoutSpec]:
@@ -2211,7 +2294,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
             "force_overwrite": spec.force_overwrite,
+            "input_board_type": spec.input_board_type,
             "attenuation_db": spec.attenuation_db,
+            "dc_gain_db": spec.dc_gain_db,
             "filter_type": spec.filter_type,
             "filter_cutoff": spec.filter_cutoff,
             "filter_bandwidth": spec.filter_bandwidth,
@@ -2238,6 +2323,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             filter_type=str(data.get("filter_type", "bypass")),
             filter_cutoff=float(data.get("filter_cutoff", 2.5)),
             filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
+            input_board_type=str(data.get("input_board_type", "RF_In")),
+            dc_gain_db=float(data.get("dc_gain_db", 0.0)),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -2253,13 +2340,30 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             )
             self.samples.setValue(spec.samples_per_trigger)
             self.frequency_mhz.setValue(spec.readout_frequency_mhz)
+            self.input_board_type.setCurrentText(spec.input_board_type)
             self.margin_samples.setValue(spec.margin_input_samples)
             self.force_overwrite.setChecked(spec.force_overwrite)
             self.attenuation_db.setValue(spec.attenuation_db)
+            self.dc_gain_db.setValue(spec.dc_gain_db)
             self.filter_type.setCurrentIndex(filter_index)
             self.filter_cutoff.setValue(spec.filter_cutoff)
             self.filter_bandwidth.setValue(spec.filter_bandwidth)
             self.setChecked(enabled)
+        self._update_board_controls()
+        self._emit_spec()
+
+    def apply_path_settings(self, values: Mapping[str, object]) -> None:
+        """Apply a committed RF path to this Experiment readout editor."""
+        self.ro_ch.setValue(int(values["readout_ch"]))
+        self.input_board_type.setCurrentText(str(values["input_board_type"]))
+        self.attenuation_db.setValue(float(values["readout_attenuation_db"]))
+        self.dc_gain_db.setValue(float(values["readout_dc_gain_db"]))
+        self.filter_type.setCurrentText(str(values["readout_filter_type"]))
+        self.filter_cutoff.setValue(float(values["readout_filter_cutoff_ghz"]))
+        self.filter_bandwidth.setValue(
+            float(values["readout_filter_bandwidth_ghz"])
+        )
+        self._update_board_controls()
         self._emit_spec()
 
     def _emit_spec(self, *_args) -> None:
@@ -3198,6 +3302,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._sparameter_panel.load_requested.connect(
             self._load_sparameter_run
         )
+        self._sparameter_panel.path_settings_applied.connect(
+            self._apply_rf_path_settings
+        )
         self._calibration_panel.output_requested.connect(
             lambda: self._run_power_calibration("output")
         )
@@ -3980,6 +4087,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sweep_config": self._sparameter_panel.config(),
             "tproc_mhz": self._experiment_panel.tproc_mhz.value(),
         }
+
+    def _apply_rf_path_settings(self, values: Mapping[str, object]) -> None:
+        """Synchronize committed RF path values with Experiment editors."""
+        output_index = self._rf_ports_panel.apply_path_settings(values)
+        self._rf_readout_panel.apply_path_settings(values)
+        self._rf_pulse_specs = list(self._rf_ports_panel.specs())
+        self._rf_pulse_spec = (
+            self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        )
+        self._ddr_readout_spec = self._rf_readout_panel.spec()
+        self._refresh_rf_timeline()
+        self.statusBar().showMessage(
+            "RF path applied to S-parameter and Experiment "
+            f"(RF output editor {output_index + 1})"
+        )
 
     def _run_sparameter_sweep(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -4837,6 +4959,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 filter_type=str(entry["filter_type"]),
                 filter_cutoff=float(entry["filter_cutoff"]),
                 filter_bandwidth=float(entry["filter_bandwidth"]),
+                output_board_type=str(entry["output_board_type"]),
             )
             if spec.segment_name not in set_names:
                 raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
@@ -4847,6 +4970,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "duration_us": spec.duration_us,
                 "frequency_mhz": spec.frequency_mhz,
                 "gain": spec.gain,
+                "output_board_type": spec.output_board_type,
                 "att1_db": spec.att1_db,
                 "att2_db": spec.att2_db,
                 "filter_type": spec.filter_type,
@@ -4889,6 +5013,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             filter_type=str(raw_readout["filter_type"]),
             filter_cutoff=float(raw_readout["filter_cutoff"]),
             filter_bandwidth=float(raw_readout["filter_bandwidth"]),
+            input_board_type=str(raw_readout["input_board_type"]),
+            dc_gain_db=float(raw_readout["dc_gain_db"]),
         )
         if readout_spec.segment_name not in set_names:
             raise ValueError(
@@ -4903,7 +5029,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
             "margin_input_samples": readout_spec.margin_input_samples,
             "force_overwrite": readout_spec.force_overwrite,
+            "input_board_type": readout_spec.input_board_type,
             "attenuation_db": readout_spec.attenuation_db,
+            "dc_gain_db": readout_spec.dc_gain_db,
             "filter_type": readout_spec.filter_type,
             "filter_cutoff": readout_spec.filter_cutoff,
             "filter_bandwidth": readout_spec.filter_bandwidth,

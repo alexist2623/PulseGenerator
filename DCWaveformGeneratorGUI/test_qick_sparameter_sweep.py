@@ -48,79 +48,91 @@ def _application():
 
 def _mock_soccfg(*, generator_type="axis_signal_gen_v6"):
     awg = generator_type == "axis_awg_tuning_v1"
-    return QickConfig({
-        "sw_version": "0.2.357",
-        "refclk_freq": 300.0,
-        "tprocs": [{
-            "type": "axis_tproc64x32_x8",
-            "f_time": 300.0,
-            "pmem_size": 65536,
-            "dmem_size": 4096,
-            "output_pins": [],
-        }],
-        "gens": [{
-            "type": generator_type,
-            "gen_type": "awg_tuning" if awg else "signal_generator",
-            "tproc_ch": 0,
-            "tmux_ch": 0,
-            "f_fabric": 300.0,
-            "f_dds": 300.0,
-            "fs_mult": 1,
-            "fs_div": 1,
-            "fdds_div": 1,
-            "samps_per_clk": 16,
-            "maxlen": 16384,
-            "maxv": 32764 if awg else 32766,
-            "maxv_scale": 1.0,
-            "complex_env": not awg,
-            "has_mixer": False,
-            "has_dds": not awg,
-            "b_dds": 32,
-            "b_phase": 32,
-            "dac": "00",
-            "interpolation": 1,
-            **({
-                "n_pts": 16,
-                "frac": 16,
-                "cmd_width": 160,
-                "step_width": 24,
-                "duration_width": 23,
-                "fixed_width": 48,
-            } if awg else {}),
-        }],
-        "readouts": [{
-            "type": "axis_dyn_readout_v1",
-            "ro_type": "axis_dyn_readout_v1",
-            "tproc_ctrl": 1,
-            "tmux_ch": 0,
-            "f_fabric": 300.0,
-            "f_output": 300.0,
-            "f_dds": 300.0,
-            "fs_mult": 1,
-            "fs_div": 1,
-            "fdds_div": 1,
-            "b_dds": 32,
-            "b_phase": 32,
-            "adc": "00",
-            "buf_maxlen": 16384,
-            "has_weights": False,
-            "has_edge_counter": False,
-            "trigger_type": "dport",
-            "trigger_port": 0,
-            "trigger_bit": 0,
-        }],
-        "ddr4_buf": {
-            "sample_capture": True,
-            "fir_enabled": True,
-            "fir_output_fs_mhz": 1.0,
-            "fir_decimation": 300,
-            "fir_group_delay_input_samples": 8677,
-            "fir_input_fs_mhz": 300.0,
-            "trigger_type": "dport",
-            "trigger_port": 0,
-            "trigger_bit": 1,
-        },
-    })
+    return QickConfig(
+        {
+            "sw_version": "0.2.357",
+            "refclk_freq": 300.0,
+            "tprocs": [
+                {
+                    "type": "axis_tproc64x32_x8",
+                    "f_time": 300.0,
+                    "pmem_size": 65536,
+                    "dmem_size": 4096,
+                    "output_pins": [],
+                }
+            ],
+            "gens": [
+                {
+                    "type": generator_type,
+                    "gen_type": "awg_tuning" if awg else "signal_generator",
+                    "tproc_ch": 0,
+                    "tmux_ch": 0,
+                    "f_fabric": 300.0,
+                    "f_dds": 300.0,
+                    "fs_mult": 1,
+                    "fs_div": 1,
+                    "fdds_div": 1,
+                    "samps_per_clk": 16,
+                    "maxlen": 16384,
+                    "maxv": 32764 if awg else 32766,
+                    "maxv_scale": 1.0,
+                    "complex_env": not awg,
+                    "has_mixer": False,
+                    "has_dds": not awg,
+                    "b_dds": 32,
+                    "b_phase": 32,
+                    "dac": "00",
+                    "interpolation": 1,
+                    **(
+                        {
+                            "n_pts": 16,
+                            "frac": 16,
+                            "cmd_width": 160,
+                            "step_width": 24,
+                            "duration_width": 23,
+                            "fixed_width": 48,
+                        }
+                        if awg
+                        else {}
+                    ),
+                }
+            ],
+            "readouts": [
+                {
+                    "type": "axis_dyn_readout_v1",
+                    "ro_type": "axis_dyn_readout_v1",
+                    "tproc_ctrl": 1,
+                    "tmux_ch": 0,
+                    "f_fabric": 300.0,
+                    "f_output": 300.0,
+                    "f_dds": 300.0,
+                    "fs_mult": 1,
+                    "fs_div": 1,
+                    "fdds_div": 1,
+                    "b_dds": 32,
+                    "b_phase": 32,
+                    "adc": "00",
+                    "buf_maxlen": 16384,
+                    "has_weights": False,
+                    "has_edge_counter": False,
+                    "trigger_type": "dport",
+                    "trigger_port": 0,
+                    "trigger_bit": 0,
+                }
+            ],
+            "ddr4_buf": {
+                "sample_capture": True,
+                "fir_enabled": True,
+                "fir_output_fs_mhz": 1.0,
+                "fir_decimation": 300,
+                "fir_group_delay_input_samples": 8677,
+                "fir_input_fs_mhz": 300.0,
+                "trigger_type": "dport",
+                "trigger_port": 0,
+                "trigger_bit": 1,
+            },
+        }
+    )
 
 
 def _config(**updates):
@@ -137,11 +149,14 @@ def _config(**updates):
 
 def _result():
     frequencies = np.asarray([10.0, 11.0, 12.0])
-    iq = np.asarray([
-        [[3, 4], [3, 4], [3, 4], [3, 4]],
-        [[-3, 1], [-3, 1], [-3, 1], [-3, 1]],
-        [[-3, -1], [-3, -1], [-3, -1], [-3, -1]],
-    ], dtype=np.int32)
+    iq = np.asarray(
+        [
+            [[3, 4], [3, 4], [3, 4], [3, 4]],
+            [[-3, 1], [-3, 1], [-3, 1], [-3, 1]],
+            [[-3, -1], [-3, -1], [-3, -1], [-3, -1]],
+        ],
+        dtype=np.int32,
+    )
     return SParameterSweepResult.from_iq(frequencies, frequencies, iq)
 
 
@@ -377,13 +392,54 @@ def test_rf_board_output_and_readout_controls_are_applied():
         def rfb_set_ro_filter(self, *args, **kwargs):
             calls.append(("ro_filter", args, kwargs))
 
-    actual = configure_sparameter_rf_board(FakeSoc(), _config())
+    actual = configure_sparameter_rf_board(
+        FakeSoc(),
+        _config(output_board_type="RF_Out", input_board_type="RF_In"),
+    )
 
-    assert [call[0] for call in calls] == [
-        "gen_rf", "gen_filter", "ro_rf", "ro_filter"
-    ]
+    assert [call[0] for call in calls] == ["gen_rf", "gen_filter", "ro_rf", "ro_filter"]
     assert actual["output"]["commanded_att1_db"] == 10.0
     assert actual["readout"]["commanded_attenuation_db"] == 20.0
+
+
+def test_dc_board_selection_uses_dc_apis_without_nonexistent_attenuators():
+    calls = []
+
+    class FakeSoc:
+        def rfb_set_gen_dc(self, *args):
+            calls.append(("gen_dc", args))
+
+        def rfb_set_gen_filter(self, *args, **kwargs):
+            calls.append(("gen_filter", args, kwargs))
+
+        def rfb_set_ro_dc(self, *args):
+            calls.append(("ro_dc", args))
+            return args[1]
+
+        def rfb_set_ro_filter(self, *args, **kwargs):
+            calls.append(("ro_filter", args, kwargs))
+
+    actual = configure_sparameter_rf_board(
+        FakeSoc(),
+        _config(
+            output_board_type="DC_Out",
+            input_board_type="DC_In",
+            readout_dc_gain_db=5.0,
+        ),
+    )
+
+    assert [call[0] for call in calls] == [
+        "gen_dc",
+        "gen_filter",
+        "ro_dc",
+        "ro_filter",
+    ]
+    assert actual["output"]["attenuators_present"] is False
+    assert actual["output"]["commanded_att1_db"] == 0.0
+    assert actual["output"]["commanded_att2_db"] == 0.0
+    assert actual["readout"]["attenuator_present"] is False
+    assert actual["readout"]["commanded_attenuation_db"] == 0.0
+    assert actual["readout"]["commanded_dc_gain_db"] == 5.0
 
 
 def test_qcodes_round_trip_stores_split_traces_and_derived_response(
@@ -557,9 +613,7 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
     monkeypatch.setattr(
         sparameter_module,
         "build_sparameter_program",
-        lambda _soccfg, point_config, tproc_mhz=None: FakeProgram(
-            point_config
-        ),
+        lambda _soccfg, point_config, tproc_mhz=None: FakeProgram(point_config),
     )
     live_updates = []
     progress_updates = []
@@ -571,12 +625,14 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
                 (stored.run_id,),
             ).fetchone()[0]
         payload = json.loads(payload_text)
-        live_updates.append((
-            stored.run_id,
-            stored.result.power_count,
-            payload["completed_power_points"],
-            tuple(payload["power_gains"]),
-        ))
+        live_updates.append(
+            (
+                stored.run_id,
+                stored.result.power_count,
+                payload["completed_power_points"],
+                tuple(payload["power_gains"]),
+            )
+        )
 
     stored = run_sparameter_sweep(
         connection_config=connection,
@@ -584,9 +640,7 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
         sweep_config=config,
         connector=lambda **_kwargs: (object(), object()),
         partial_callback=capture_partial,
-        progress_callback=lambda percent, _message: progress_updates.append(
-            percent
-        ),
+        progress_callback=lambda percent, _message: progress_updates.append(percent),
     )
 
     assert [update[1] for update in live_updates] == [1, 2, 3]
@@ -605,9 +659,9 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
         loaded.result.iq_traces,
         stored.result.iq_traces,
     )
-    magnitude_data = loaded.dataset.get_parameter_data(
+    magnitude_data = loaded.dataset.get_parameter_data(MAGNITUDE_DB_PARAMETER)[
         MAGNITUDE_DB_PARAMETER
-    )[MAGNITUDE_DB_PARAMETER]
+    ]
     assert POWER_GAIN_PARAMETER in magnitude_data
     np.testing.assert_array_equal(
         magnitude_data[POWER_GAIN_PARAMETER],
@@ -782,16 +836,13 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     assert decoded["s_parameter"]["power_end_gain"] == 10000
     assert decoded["s_parameter"]["power_points"] == 3
     assert decoded["s_parameter"]["power_scale"] == "log"
-    assert decoded["s_parameter"]["database_path"] == str(
-        sparameter_database
-    )
+    assert decoded["s_parameter"]["database_path"] == str(sparameter_database)
     assert decoded["run_config"].database_path == str(experiment_database)
     assert decoded["s_parameter"]["output_filter_type"] == "lowpass"
     assert decoded["s_parameter"]["readout_filter_type"] == "bandpass"
     assert decoded["calibration"]["database_path"] == str(calibration_database)
     assert (
-        decoded["calibration"]["output"]["oscilloscope"]["visa_resource"]
-        == "USB::MOCK"
+        decoded["calibration"]["output"]["oscilloscope"]["visa_resource"] == "USB::MOCK"
     )
     assert decoded["calibration"]["input"]["input_board_type"] == "RF_In"
     assert decoded["calibration"]["input"]["path_loss_db"] == 3.5
@@ -804,9 +855,7 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     assert legacy_decoded["calibration"]["input"]["input_board_type"] == "RF_In"
 
     run_arguments = window._sparameter_run_arguments()
-    assert run_arguments["run_config"].database_path == str(
-        sparameter_database
-    )
+    assert run_arguments["run_config"].database_path == str(sparameter_database)
     window._experiment_panel.database_path.setText(str(tmp_path / "changed.db"))
     assert window._sparameter_run_arguments()["run_config"].database_path == str(
         sparameter_database
@@ -837,12 +886,16 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
     panel.calibration_database_path.setText(str(calibration_path))
     panel.output_board_type.setCurrentText("DC_Out")
     panel.input_board_type.setCurrentText("RF_In")
+    panel.loss1_db.setValue(1.25)
+    panel.loss2_db.setValue(2.5)
+    panel.amplifier_gain_db.setValue(18.0)
     panel.output_power_dbm.setValue(-23.5)
     panel.power_sweep_enabled.setChecked(True)
     panel.power_start_dbm.setValue(-40.0)
     panel.power_end_dbm.setValue(-10.0)
     panel.power_points.setValue(7)
     panel.power_scale.setCurrentIndex(panel.power_scale.findData("log"))
+    panel.path_diagram.update_button.click()
 
     settings = window._settings_to_dict()
     decoded = window._decode_settings(settings)["s_parameter"]
@@ -851,11 +904,83 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
     assert decoded["calibration_database_path"] == str(calibration_path)
     assert decoded["output_board_type"] == "DC_Out"
     assert decoded["input_board_type"] == "RF_In"
+    assert decoded["loss1_db"] == 1.25
+    assert decoded["loss2_db"] == 2.5
+    assert decoded["amplifier_gain_db"] == 18.0
     assert decoded["output_power_dbm"] == -23.5
     assert decoded["power_start_dbm"] == -40.0
     assert decoded["power_end_dbm"] == -10.0
     assert panel.gain.isEnabled() is False
     assert panel.power_start_gain.isEnabled() is False
     assert panel.power_start_dbm.isEnabled() is True
+    assert panel.path_diagram.output_att1_component.isHidden()
+    assert panel.path_diagram.output_att2_component.isHidden()
+    assert (
+        panel.path_diagram.input_condition_stack.currentWidget()
+        is panel.readout_attenuation_db
+    )
+    panel.input_board_type.setCurrentText("DC_In")
+    assert (
+        panel.path_diagram.input_condition_stack.currentWidget()
+        is panel.readout_dc_gain_db
+    )
     app.processEvents()
+    window.close()
+
+
+def test_rf_path_update_commits_sparameter_and_experiment_values():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._sparameter_panel
+    original = panel.config()
+
+    panel.output_ch.setValue(6)
+    panel.readout_ch.setValue(3)
+    panel.output_board_type.setCurrentText("DC_Out")
+    panel.input_board_type.setCurrentText("DC_In")
+    panel.output_att1_db.setValue(7.0)
+    panel.output_att2_db.setValue(8.0)
+    panel.readout_dc_gain_db.setValue(12.0)
+    panel.loss1_db.setValue(1.5)
+    panel.loss2_db.setValue(2.5)
+    panel.amplifier_gain_db.setValue(10.0)
+    panel.output_filter_type.setCurrentText("lowpass")
+    panel.output_filter_cutoff_ghz.setValue(2.2)
+    panel.readout_filter_type.setCurrentText("bandpass")
+    panel.readout_filter_cutoff_ghz.setValue(1.8)
+    panel.readout_filter_bandwidth_ghz.setValue(0.4)
+
+    assert panel.path_diagram.update_button.isEnabled()
+    assert panel.config().output_ch == original.output_ch
+    assert panel.config().output_board_type == original.output_board_type
+
+    panel.path_diagram.update_button.click()
+    app.processEvents()
+
+    committed = panel.config()
+    assert committed.output_ch == 6
+    assert committed.readout_ch == 3
+    assert committed.output_board_type == "DC_Out"
+    assert committed.input_board_type == "DC_In"
+    assert committed.readout_dc_gain_db == 12.0
+    assert committed.loss1_db == 1.5
+    assert committed.loss2_db == 2.5
+    assert committed.amplifier_gain_db == 10.0
+    assert panel.path_diagram.update_button.isEnabled() is False
+
+    experiment_output = window._rf_ports_panel._panels[0]
+    assert experiment_output.gen_ch.value() == 6
+    assert experiment_output.output_board_type.currentText() == "DC_Out"
+    assert experiment_output.att1_db.value() == 7.0
+    assert experiment_output.att2_db.value() == 8.0
+    assert experiment_output.filter_type.currentText() == "lowpass"
+    assert experiment_output.filter_cutoff.value() == 2.2
+
+    experiment_input = window._rf_readout_panel
+    assert experiment_input.ro_ch.value() == 3
+    assert experiment_input.input_board_type.currentText() == "DC_In"
+    assert experiment_input.dc_gain_db.value() == 12.0
+    assert experiment_input.filter_type.currentText() == "bandpass"
+    assert experiment_input.filter_cutoff.value() == 1.8
+    assert experiment_input.filter_bandwidth.value() == 0.4
     window.close()

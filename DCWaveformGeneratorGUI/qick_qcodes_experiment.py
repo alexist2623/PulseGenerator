@@ -402,19 +402,24 @@ def configure_rf_board(
     outputs = []
     output_details = []
     for spec in rf_specs:
-        actual_attenuation = soc.rfb_set_gen_rf(
-            spec.gen_ch, spec.att1_db, spec.att2_db
-        )
-        try:
-            actual_att1, actual_att2 = (
-                float(actual_attenuation[0]),
-                float(actual_attenuation[1]),
+        if spec.output_board_type == "RF_Out":
+            actual_attenuation = soc.rfb_set_gen_rf(
+                spec.gen_ch, spec.att1_db, spec.att2_db
             )
-        except (IndexError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"RF generator {spec.gen_ch} returned an invalid attenuation result: "
-                f"{actual_attenuation!r}"
-            ) from exc
+            try:
+                actual_att1, actual_att2 = (
+                    float(actual_attenuation[0]),
+                    float(actual_attenuation[1]),
+                )
+            except (IndexError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"RF generator {spec.gen_ch} returned an invalid attenuation "
+                    f"result: {actual_attenuation!r}"
+                ) from exc
+        else:
+            soc.rfb_set_gen_dc(spec.gen_ch)
+            actual_att1 = 0.0
+            actual_att2 = 0.0
         outputs.append((actual_att1, actual_att2))
 
         soc.rfb_set_gen_filter(
@@ -425,6 +430,8 @@ def configure_rf_board(
         )
         output_details.append({
             "gen_ch": int(spec.gen_ch),
+            "board_type": str(spec.output_board_type),
+            "attenuators_present": spec.output_board_type == "RF_Out",
             "requested_att1_db": float(spec.att1_db),
             "requested_att2_db": float(spec.att2_db),
             "commanded_att1_db": actual_att1,
@@ -433,9 +440,24 @@ def configure_rf_board(
             "filter_cutoff_ghz": float(spec.filter_cutoff),
             "filter_bandwidth_ghz": float(spec.filter_bandwidth),
         })
-    readout_attenuation = soc.rfb_set_ro_rf(
-        readout_spec.ro_ch, readout_spec.attenuation_db
-    )
+    if readout_spec.input_board_type == "RF_In":
+        readout_setting = float(
+            soc.rfb_set_ro_rf(
+                readout_spec.ro_ch,
+                readout_spec.attenuation_db,
+            )
+        )
+        readout_attenuation = readout_setting
+        readout_dc_gain = 0.0
+    else:
+        readout_setting = float(
+            soc.rfb_set_ro_dc(
+                readout_spec.ro_ch,
+                readout_spec.dc_gain_db,
+            )
+        )
+        readout_attenuation = 0.0
+        readout_dc_gain = readout_setting
     soc.rfb_set_ro_filter(
         readout_spec.ro_ch,
         fc=readout_spec.filter_cutoff,
@@ -445,7 +467,19 @@ def configure_rf_board(
     return {
         "outputs": tuple(outputs),
         "output_details": tuple(output_details),
-        "readout": readout_attenuation,
+        "readout": readout_setting,
+        "readout_details": {
+            "ro_ch": int(readout_spec.ro_ch),
+            "board_type": str(readout_spec.input_board_type),
+            "attenuator_present": readout_spec.input_board_type == "RF_In",
+            "requested_attenuation_db": float(readout_spec.attenuation_db),
+            "commanded_attenuation_db": readout_attenuation,
+            "requested_dc_gain_db": float(readout_spec.dc_gain_db),
+            "commanded_dc_gain_db": readout_dc_gain,
+            "filter_type": str(readout_spec.filter_type),
+            "filter_cutoff_ghz": float(readout_spec.filter_cutoff),
+            "filter_bandwidth_ghz": float(readout_spec.filter_bandwidth),
+        },
     }
 
 
