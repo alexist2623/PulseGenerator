@@ -92,6 +92,7 @@ except ImportError:
 try:
     from .qick_sparameter_sweep import SParameterSweepConfig
     from .sparameter_gui import (
+        DEFAULT_SPARAMETER_DB_PATH,
         SParameterLoadWorker,
         SParameterPlotWidget,
         SParameterSweepPanel,
@@ -100,6 +101,7 @@ try:
 except ImportError:
     from qick_sparameter_sweep import SParameterSweepConfig
     from sparameter_gui import (
+        DEFAULT_SPARAMETER_DB_PATH,
         SParameterLoadWorker,
         SParameterPlotWidget,
         SParameterSweepPanel,
@@ -115,8 +117,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 7
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, SETTINGS_VERSION)
+SETTINGS_VERSION = 8
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -158,7 +160,10 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "filter_bandwidth": 1.0,
 }
 
-DEFAULT_SPARAMETER_SETTINGS = asdict(SParameterSweepConfig())
+DEFAULT_SPARAMETER_SETTINGS = {
+    "database_path": DEFAULT_SPARAMETER_DB_PATH,
+    **asdict(SParameterSweepConfig()),
+}
 
 
 def _time_from_ns(value_ns: float, unit: str) -> float:
@@ -2430,7 +2435,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         }
 
     def connection_values(
-        self, *, require_run_config: bool = True
+        self,
+        *,
+        require_run_config: bool = True,
+        database_path: Optional[str] = None,
     ) -> Tuple[QickConnectionConfig, Optional[QcodesRunConfig]]:
         """Return shared QICK/QCoDeS settings without validating AWG fields."""
         connection = QickConnectionConfig(
@@ -2440,7 +2448,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         run = (
             QcodesRunConfig(
-                database_path=self.database_path.text().strip(),
+                database_path=(
+                    self.database_path.text().strip()
+                    if database_path is None
+                    else str(database_path).strip()
+                ),
                 experiment_name=self.experiment_name.text().strip(),
                 sample_name=self.sample_name.text().strip(),
                 notes=self.notes.toPlainText(),
@@ -3927,7 +3939,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         }
 
     def _sparameter_run_arguments(self) -> dict:
-        connection, run = self._experiment_panel.connection_values()
+        connection, run = self._experiment_panel.connection_values(
+            database_path=self._sparameter_panel.database_path_value()
+        )
         return {
             "connection_config": connection,
             "run_config": run,
@@ -3990,8 +4004,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             return
         try:
-            _connection, run = self._experiment_panel.connection_values()
-        except (TypeError, ValueError) as exc:
+            database_path = self._sparameter_panel.database_path_value()
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(
                 self, "Cannot load RF sweep", str(exc)
             )
@@ -4001,7 +4015,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Loading saved RF S-parameter run...",
         )
         thread = QtCore.QThread(self)
-        worker = SParameterLoadWorker(str(run.resolved_database_path), run_id)
+        worker = SParameterLoadWorker(database_path, run_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_sparameter_finished)
@@ -4604,9 +4618,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_sparameter = {}
         if not isinstance(raw_sparameter, dict):
             raise TypeError("s_parameter must be a JSON object")
-        sparameter_config = SParameterSweepConfig(
-            **{**DEFAULT_SPARAMETER_SETTINGS, **raw_sparameter}
-        )
+        sparameter_settings = {
+            **DEFAULT_SPARAMETER_SETTINGS,
+            **raw_sparameter,
+        }
+        sparameter_database_path = str(
+            sparameter_settings.pop("database_path")
+        ).strip()
+        if not sparameter_database_path:
+            raise ValueError("RF S-parameter database path must not be empty")
+        sparameter_config = SParameterSweepConfig(**sparameter_settings)
 
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
         if "rf_outputs" in data:
@@ -4753,7 +4774,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "run_config": run_config,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
-            "s_parameter": asdict(sparameter_config),
+            "s_parameter": {
+                "database_path": sparameter_database_path,
+                **asdict(sparameter_config),
+            },
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:

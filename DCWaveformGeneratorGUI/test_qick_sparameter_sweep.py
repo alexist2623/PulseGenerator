@@ -500,7 +500,9 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
     )
 
 
-def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip():
+def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
+    tmp_path,
+):
     app = _application()
     window = gui.MainWindow()
     panel = window._sparameter_panel
@@ -515,6 +517,10 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip()
     panel.power_end_gain.setValue(10000)
     panel.power_points.setValue(3)
     panel.power_scale.setCurrentIndex(panel.power_scale.findData("log"))
+    experiment_database = tmp_path / "experiment.db"
+    sparameter_database = tmp_path / "sparameter.db"
+    window._experiment_panel.database_path.setText(str(experiment_database))
+    panel.database_path.setText(str(sparameter_database))
     panel.output_filter_type.setCurrentText("lowpass")
     panel.readout_filter_type.setCurrentText("bandpass")
     settings = window._settings_to_dict()
@@ -526,8 +532,25 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip()
     assert decoded["s_parameter"]["power_end_gain"] == 10000
     assert decoded["s_parameter"]["power_points"] == 3
     assert decoded["s_parameter"]["power_scale"] == "log"
+    assert decoded["s_parameter"]["database_path"] == str(
+        sparameter_database
+    )
+    assert decoded["run_config"].database_path == str(experiment_database)
     assert decoded["s_parameter"]["output_filter_type"] == "lowpass"
     assert decoded["s_parameter"]["readout_filter_type"] == "bandpass"
+
+    run_arguments = window._sparameter_run_arguments()
+    assert run_arguments["run_config"].database_path == str(
+        sparameter_database
+    )
+    window._experiment_panel.database_path.setText(str(tmp_path / "changed.db"))
+    assert window._sparameter_run_arguments()["run_config"].database_path == str(
+        sparameter_database
+    )
+    window._experiment_panel.database_path.clear()
+    assert window._sparameter_run_arguments()["run_config"].database_path == str(
+        sparameter_database
+    )
 
     window._sparameter_plot.set_result(_result())
     window._sparameter_plot.set_result(

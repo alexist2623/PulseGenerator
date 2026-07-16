@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 import traceback
 from typing import Any, Mapping
 
@@ -39,6 +40,11 @@ except ImportError:
         load_sparameter_run,
         run_sparameter_sweep,
     )
+
+
+DEFAULT_SPARAMETER_DB_PATH = str(
+    Path.home() / "qick_sparameter_experiments.db"
+)
 
 
 class SParameterSweepPanel(QtWidgets.QWidget):
@@ -153,6 +159,23 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         capture_form.addRow("Trigger stride (bytes):", self.stride_bytes)
         capture_form.addRow(self.force_overwrite)
         content_layout.addWidget(capture_group)
+
+        storage_group = QtWidgets.QGroupBox("S-Parameter Database")
+        storage_form = QtWidgets.QFormLayout(storage_group)
+        self.database_path = QtWidgets.QLineEdit(DEFAULT_SPARAMETER_DB_PATH)
+        self.browse_database = QtWidgets.QToolButton()
+        self.browse_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        self.browse_database.setToolTip(
+            "Choose RF S-parameter QCoDeS SQLite database"
+        )
+        self.browse_database.clicked.connect(self._browse_database)
+        database_row = QtWidgets.QHBoxLayout()
+        database_row.addWidget(self.database_path, 1)
+        database_row.addWidget(self.browse_database)
+        storage_form.addRow("QCoDeS DB file:", database_row)
+        content_layout.addWidget(storage_group)
         content_layout.addStretch(1)
 
         self.run_button = QtWidgets.QPushButton("Run RF S-Parameter Sweep")
@@ -242,6 +265,27 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         ):
             widget.setEnabled(enabled)
 
+    def _browse_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Choose RF S-parameter database",
+            self.database_path.text().strip() or DEFAULT_SPARAMETER_DB_PATH,
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            if Path(path).suffix.lower() != ".db":
+                path = str(Path(path).with_suffix(".db"))
+            self.database_path.setText(path)
+
+    def database_path_value(self) -> str:
+        value = self.database_path.text().strip()
+        if not value:
+            raise ValueError("RF S-parameter database path must not be empty")
+        path = Path(value).expanduser()
+        if path.suffix.lower() != ".db":
+            path = path.with_suffix(".db")
+        return str(path)
+
     def config(self) -> SParameterSweepConfig:
         return SParameterSweepConfig(
             output_ch=self.output_ch.value(),
@@ -279,10 +323,19 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
 
     def settings_dict(self) -> Mapping[str, Any]:
-        return asdict(self.config())
+        return {
+            "database_path": self.database_path_value(),
+            **asdict(self.config()),
+        }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
-        config = SParameterSweepConfig(**dict(settings))
+        values = dict(settings)
+        database_path = str(
+            values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
+        ).strip()
+        if not database_path:
+            raise ValueError("RF S-parameter database path must not be empty")
+        config = SParameterSweepConfig(**values)
         widgets = (
             (self.output_ch, config.output_ch),
             (self.readout_ch, config.readout_ch),
@@ -315,6 +368,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             widget.setValue(value)
         self.output_filter_type.setCurrentText(config.output_filter_type)
         self.readout_filter_type.setCurrentText(config.readout_filter_type)
+        self.database_path.setText(database_path)
         power_scale_index = self.power_scale.findData(config.power_scale)
         if power_scale_index < 0:
             raise ValueError(f"unsupported power scale {config.power_scale!r}")
@@ -332,6 +386,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
         self.load_button.setEnabled(not running)
+        self.database_path.setEnabled(not running)
+        self.browse_database.setEnabled(not running)
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)
@@ -529,6 +585,7 @@ class SParameterLoadWorker(QtCore.QObject):
 
 
 __all__ = [
+    "DEFAULT_SPARAMETER_DB_PATH",
     "SParameterLoadWorker",
     "SParameterPlotWidget",
     "SParameterSweepPanel",

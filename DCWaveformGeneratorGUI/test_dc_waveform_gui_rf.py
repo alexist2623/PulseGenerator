@@ -565,6 +565,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     document["experiment"].pop("notes")
     document.pop("rf_outputs")
     document["rf_readout"] = {"enabled": False}
+    document["s_parameter"].pop("database_path")
 
     old_path = tmp_path / "settings_v2.json"
     old_path.write_text(json.dumps(document), encoding="utf-8")
@@ -591,7 +592,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 7
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 8
     assert upgraded["display"]["voltage_view"] == "both"
     assert upgraded["grid"]["snap_enabled"] is False
     assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
@@ -605,6 +606,10 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert upgraded["experiment"]["notes"] == ""
     assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
     assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
+    assert (
+        upgraded["s_parameter"]["database_path"]
+        == gui.DEFAULT_SPARAMETER_SETTINGS["database_path"]
+    )
     window.close()
 
 

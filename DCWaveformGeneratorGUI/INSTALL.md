@@ -111,6 +111,11 @@ settings, frequency start/end/point count, output gain, and FIR acquisition time
 per frequency. Output gain is hard-limited to 32766 and is also checked against
 the selected generator's reported hardware limit.
 
+The S-parameter tab has its own QCoDeS DB file selector. Sweep execution and
+**Load Saved Run** use this dedicated path and do not use the DB path from the
+Experiment tab. QICK connection, experiment name, sample name, and notes remain
+shared with the Experiment tab.
+
 The optional **Power Sweep (Software)** repeats that complete tProcessor
 frequency sweep at a sequence of DAC gain codes. Linear spacing uses rounded
 `linspace(start_gain, end_gain)`, while logarithmic spacing uses rounded
