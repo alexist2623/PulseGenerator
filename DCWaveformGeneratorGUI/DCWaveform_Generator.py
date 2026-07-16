@@ -3981,6 +3981,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
         if self._trace is not None:
             self._trace.fit_view()
+        self._sparameter_plot.fit_view()
 
     def _show_rf_editor(self) -> None:
         """Compatibility helper: reveal the always-present RF Outputs tab."""

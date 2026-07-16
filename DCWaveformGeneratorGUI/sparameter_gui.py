@@ -10,6 +10,7 @@ from pathlib import Path
 import traceback
 from typing import Any, Mapping
 
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
@@ -17,6 +18,7 @@ try:
 except ImportError:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
     from matplotlib.figure import Figure
+    from matplotlib.widgets import SpanSelector
 
     _USE_PYQTGRAPH = False
 else:
@@ -949,16 +951,263 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
 
 
+def subtract_phase_linear_fit(
+    frequency_mhz: Any,
+    phase_deg: Any,
+    start_mhz: float,
+    stop_mhz: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Subtract one least-squares phase line per trace using a selected range."""
+    frequency = np.asarray(frequency_mhz, dtype=float).reshape(-1)
+    phase = np.asarray(phase_deg, dtype=float)
+    original_shape = phase.shape
+    if phase.ndim == 1:
+        rows = phase.reshape(1, -1)
+    elif phase.ndim == 2:
+        rows = phase
+    else:
+        raise ValueError("phase data must be one- or two-dimensional")
+    if frequency.size != rows.shape[1]:
+        raise ValueError("phase point count must match the frequency axis")
+    if frequency.size < 2 or not np.all(np.isfinite(frequency)):
+        raise ValueError("phase fitting requires at least two finite frequencies")
+    if not np.all(np.isfinite(rows)):
+        raise ValueError("phase data must be finite")
+    low, high = sorted((float(start_mhz), float(stop_mhz)))
+    selected = (frequency >= low) & (frequency <= high)
+    if np.count_nonzero(selected) < 2:
+        raise ValueError("phase fit range must contain at least two frequency points")
+    selected_frequency = frequency[selected]
+    if np.unique(selected_frequency).size < 2:
+        raise ValueError("phase fit range must contain two distinct frequencies")
+
+    corrected = np.empty_like(rows, dtype=float)
+    slopes = np.empty(rows.shape[0], dtype=float)
+    intercepts = np.empty(rows.shape[0], dtype=float)
+    design = np.column_stack(
+        (selected_frequency, np.ones(selected_frequency.size, dtype=float))
+    )
+    for index, values in enumerate(rows):
+        slope, intercept = np.linalg.lstsq(
+            design,
+            values[selected],
+            rcond=None,
+        )[0]
+        slopes[index] = slope
+        intercepts[index] = intercept
+        corrected[index] = values - (slope * frequency + intercept)
+    return corrected.reshape(original_shape), slopes, intercepts
+
+
+def nearest_sparameter_point(
+    frequency_mhz: Any,
+    values: Any,
+    x_mhz: float,
+    y_value: float,
+) -> tuple[int, int, float, float]:
+    """Return the curve and point nearest to a plot-space cursor position."""
+    frequency = np.asarray(frequency_mhz, dtype=float).reshape(-1)
+    rows = np.asarray(values, dtype=float)
+    if rows.ndim == 1:
+        rows = rows.reshape(1, -1)
+    if rows.ndim != 2 or rows.shape[1] != frequency.size or frequency.size == 0:
+        raise ValueError("marker data must have shape (trace, frequency)")
+    point_index = int(np.argmin(np.abs(frequency - float(x_mhz))))
+    curve_index = int(np.argmin(np.abs(rows[:, point_index] - float(y_value))))
+    return (
+        curve_index,
+        point_index,
+        float(frequency[point_index]),
+        float(rows[curve_index, point_index]),
+    )
+
+
+class _SParameterPlotMixin:
+    """Shared state and controls for the PyQtGraph and Matplotlib plots."""
+
+    def _initialize_plot_tools(self) -> None:
+        self._frequency = np.empty(0, dtype=float)
+        self._magnitude_values = np.empty((0, 0), dtype=float)
+        self._phase_original = np.empty((0, 0), dtype=float)
+        self._phase_display = np.empty((0, 0), dtype=float)
+        self._curve_labels = []
+        self._phase_fit_region = None
+        self._phase_fit_applied = False
+        self._markers_enabled = True
+
+    def _create_control_bar(self) -> QtWidgets.QWidget:
+        bar = QtWidgets.QWidget(self)
+        layout = QtWidgets.QHBoxLayout(bar)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
+
+        self.marker_button = QtWidgets.QToolButton(bar)
+        self.marker_button.setText("Markers")
+        self.marker_button.setCheckable(True)
+        self.marker_button.setChecked(True)
+        self.marker_button.setToolTip(
+            "Show the nearest frequency/value marker; left-click a point to pin it"
+        )
+        self.clear_markers_button = QtWidgets.QToolButton(bar)
+        self.clear_markers_button.setText("Clear markers")
+        self.clear_markers_button.setToolTip("Remove pinned S-parameter markers")
+        self.phase_range_button = QtWidgets.QToolButton(bar)
+        self.phase_range_button.setText("Phase fit range")
+        self.phase_range_button.setCheckable(True)
+        self.phase_range_button.setToolTip(
+            "Show a draggable frequency interval on the phase plot"
+        )
+        self.phase_subtract_button = QtWidgets.QToolButton(bar)
+        self.phase_subtract_button.setText("Fit && subtract")
+        self.phase_subtract_button.setToolTip(
+            "Fit phase versus frequency in the selected interval and subtract it"
+        )
+        self.phase_reset_button = QtWidgets.QToolButton(bar)
+        self.phase_reset_button.setText("Reset phase")
+        self.phase_reset_button.setToolTip("Restore the measured unwrapped phase")
+        self.plot_status = QtWidgets.QLabel("No S-parameter result loaded", bar)
+        self.plot_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+
+        layout.addWidget(self.marker_button)
+        layout.addWidget(self.clear_markers_button)
+        layout.addSpacing(8)
+        layout.addWidget(self.phase_range_button)
+        layout.addWidget(self.phase_subtract_button)
+        layout.addWidget(self.phase_reset_button)
+        layout.addStretch(1)
+        layout.addWidget(self.plot_status)
+
+        self.marker_button.toggled.connect(self._set_markers_enabled)
+        self.clear_markers_button.clicked.connect(self.clear_markers)
+        self.phase_range_button.toggled.connect(self._set_phase_region_visible)
+        self.phase_subtract_button.clicked.connect(self.subtract_phase_fit)
+        self.phase_reset_button.clicked.connect(self.reset_phase)
+        self._set_data_controls_enabled(False)
+        return bar
+
+    def _set_data_controls_enabled(self, enabled: bool) -> None:
+        self.marker_button.setEnabled(enabled)
+        self.clear_markers_button.setEnabled(enabled)
+        self.phase_range_button.setEnabled(enabled)
+        self.phase_subtract_button.setEnabled(enabled)
+        self.phase_reset_button.setEnabled(enabled)
+
+    def _load_result_arrays(self, result) -> None:
+        frequency = np.asarray(result.frequencies_mhz, dtype=float).reshape(-1)
+        magnitude = np.asarray(result.magnitude_db, dtype=float)
+        phase = np.asarray(result.phase_unwrapped_deg, dtype=float)
+        if magnitude.ndim == 1:
+            magnitude = magnitude.reshape(1, -1)
+            phase = phase.reshape(1, -1)
+            output_power = getattr(result, "output_power_dbm", None)
+            labels = [
+                None if output_power is None else f"{float(output_power):.6g} dBm"
+            ]
+        elif magnitude.ndim == 2:
+            output_powers = getattr(result, "output_powers_dbm", None)
+            if output_powers is None:
+                labels = [f"gain {int(gain)}" for gain in result.power_gains]
+            else:
+                labels = [f"{float(power):.6g} dBm" for power in output_powers]
+        else:
+            raise ValueError("S-parameter data must be one- or two-dimensional")
+        if magnitude.shape != phase.shape or magnitude.shape[1] != frequency.size:
+            raise ValueError("S-parameter magnitude/phase shapes do not match")
+        self._frequency = np.ascontiguousarray(frequency)
+        self._magnitude_values = np.ascontiguousarray(magnitude)
+        self._phase_original = np.ascontiguousarray(phase)
+        self._phase_display = self._phase_original.copy()
+        self._curve_labels = labels
+        self._phase_fit_applied = False
+        low = float(frequency[0])
+        high = float(frequency[-1])
+        if high < low:
+            low, high = high, low
+        span = high - low
+        self._phase_fit_region = (
+            (low + 0.25 * span, low + 0.75 * span)
+            if span > 0.0
+            else (low, high)
+        )
+        self._set_data_controls_enabled(frequency.size > 0)
+
+    def _curve_name(self, curve_index: int) -> str:
+        label = self._curve_labels[curve_index]
+        return label if label is not None else f"trace {curve_index + 1}"
+
+    def _marker_text(
+        self,
+        plot_name: str,
+        curve_index: int,
+        frequency: float,
+        value: float,
+    ) -> str:
+        unit = "dB" if plot_name == "Magnitude" else "deg"
+        return (
+            f"{self._curve_name(curve_index)} | {frequency:.9g} MHz | "
+            f"{plot_name} {value:.9g} {unit}"
+        )
+
+    def _set_markers_enabled(self, enabled: bool) -> None:
+        self._markers_enabled = bool(enabled)
+        if not enabled:
+            self._hide_hover_markers()
+
+    def subtract_phase_fit(self) -> None:
+        if self._frequency.size == 0:
+            return
+        try:
+            start, stop = self._phase_fit_bounds()
+            corrected, slopes, _intercepts = subtract_phase_linear_fit(
+                self._frequency,
+                self._phase_original,
+                start,
+                stop,
+            )
+        except (TypeError, ValueError) as exc:
+            self.plot_status.setText(str(exc))
+            return
+        self._phase_display = np.asarray(corrected, dtype=float).reshape(
+            self._phase_original.shape
+        )
+        self._phase_fit_applied = True
+        self._render_phase_values()
+        slope_text = ", ".join(
+            f"{self._curve_name(index)} {slope:+.6g} deg/MHz"
+            for index, slope in enumerate(slopes)
+        )
+        self.plot_status.setText(
+            f"Phase line removed over {min(start, stop):.9g}.."
+            f"{max(start, stop):.9g} MHz | {slope_text}"
+        )
+
+    def reset_phase(self) -> None:
+        if self._frequency.size == 0:
+            return
+        self._phase_display = self._phase_original.copy()
+        self._phase_fit_applied = False
+        self._render_phase_values()
+        self.plot_status.setText("Measured unwrapped phase restored")
+
+
 if _USE_PYQTGRAPH:
 
-    class SParameterPlotWidget(pg.GraphicsLayoutWidget):
-        """Magnitude and unwrapped-phase plots sharing one frequency axis."""
+    class SParameterPlotWidget(_SParameterPlotMixin, QtWidgets.QWidget):
+        """Interactive magnitude and phase plots sharing one frequency axis."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setBackground("w")
-            self.magnitude_plot = self.addPlot(row=0, col=0)
-            self.phase_plot = self.addPlot(row=1, col=0)
+            self._initialize_plot_tools()
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(2)
+            layout.addWidget(self._create_control_bar())
+            self.graph = pg.GraphicsLayoutWidget(self)
+            self.graph.setBackground("w")
+            layout.addWidget(self.graph, 1)
+
+            self.magnitude_plot = self.graph.addPlot(row=0, col=0)
+            self.phase_plot = self.graph.addPlot(row=1, col=0)
             self.phase_plot.setXLink(self.magnitude_plot)
             self.magnitude_plot.showGrid(x=True, y=True, alpha=0.25)
             self.phase_plot.showGrid(x=True, y=True, alpha=0.25)
@@ -969,11 +1218,158 @@ if _USE_PYQTGRAPH:
             self._phase_legend = self.phase_plot.addLegend(offset=(10, 10))
             self._magnitude_curves = []
             self._phase_curves = []
+            self._pinned_markers = []
+
+            self._phase_region = pg.LinearRegionItem(
+                values=(0.0, 1.0),
+                orientation="vertical",
+                movable=True,
+                brush=pg.mkBrush(62, 126, 180, 42),
+                pen=pg.mkPen(62, 126, 180, width=1.5),
+            )
+            self._phase_region.setZValue(20)
+            self.phase_plot.addItem(self._phase_region, ignoreBounds=True)
+            self._phase_region.hide()
+
+            self._hover_items = {}
+            for name, plot in (
+                ("Magnitude", self.magnitude_plot),
+                ("Phase", self.phase_plot),
+            ):
+                marker = pg.ScatterPlotItem(
+                    size=11,
+                    pen=pg.mkPen("#20252b", width=1.5),
+                    brush=pg.mkBrush("#ffd54f"),
+                )
+                label = pg.TextItem(color="#20252b", anchor=(0.0, 1.0))
+                marker.setZValue(40)
+                label.setZValue(41)
+                plot.addItem(marker, ignoreBounds=True)
+                plot.addItem(label, ignoreBounds=True)
+                marker.hide()
+                label.hide()
+                self._hover_items[name] = (marker, label)
+
+            self._mouse_proxy = pg.SignalProxy(
+                self.graph.scene().sigMouseMoved,
+                rateLimit=60,
+                slot=self._on_mouse_moved,
+            )
+            self.graph.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+
+        def _plot_at_scene_position(self, scene_position):
+            for name, plot, values in (
+                ("Magnitude", self.magnitude_plot, self._magnitude_values),
+                ("Phase", self.phase_plot, self._phase_display),
+            ):
+                if plot.sceneBoundingRect().contains(scene_position):
+                    view_position = plot.vb.mapSceneToView(scene_position)
+                    nearest = nearest_sparameter_point(
+                        self._frequency,
+                        values,
+                        view_position.x(),
+                        view_position.y(),
+                    )
+                    return name, plot, nearest
+            return None
+
+        def _on_mouse_moved(self, event) -> None:
+            if not self._markers_enabled or self._frequency.size == 0:
+                return
+            scene_position = event[0] if isinstance(event, tuple) else event
+            nearest = self._plot_at_scene_position(scene_position)
+            if nearest is None:
+                self._hide_hover_markers()
+                return
+            name, _plot, (curve_index, _point_index, frequency, value) = nearest
+            for other_name, (marker, label) in self._hover_items.items():
+                visible = other_name == name
+                marker.setVisible(visible)
+                label.setVisible(visible)
+            marker, label = self._hover_items[name]
+            marker.setData([frequency], [value])
+            text = self._marker_text(name, curve_index, frequency, value)
+            label.setHtml(
+                "<div style='background-color:rgba(255,255,255,220);"
+                "border:1px solid #68717a;padding:3px;'>"
+                + text
+                + "</div>"
+            )
+            label.setPos(frequency, value)
+            self.plot_status.setText(text)
+
+        def _on_mouse_clicked(self, event) -> None:
+            if (
+                not self._markers_enabled
+                or self._frequency.size == 0
+                or event.button() != QtCore.Qt.LeftButton
+            ):
+                return
+            nearest = self._plot_at_scene_position(event.scenePos())
+            if nearest is None:
+                return
+            name, plot, (curve_index, _point_index, frequency, value) = nearest
+            marker = pg.ScatterPlotItem(
+                [frequency],
+                [value],
+                size=10,
+                pen=pg.mkPen("#20252b", width=1.5),
+                brush=pg.mkBrush("#ff7043"),
+            )
+            text = self._marker_text(name, curve_index, frequency, value)
+            label = pg.TextItem(color="#20252b", anchor=(0.0, 1.0))
+            label.setHtml(
+                "<div style='background-color:rgba(255,255,255,230);"
+                "border:1px solid #d0522e;padding:3px;'>"
+                + text
+                + "</div>"
+            )
+            label.setPos(frequency, value)
+            marker.setZValue(35)
+            label.setZValue(36)
+            plot.addItem(marker, ignoreBounds=True)
+            plot.addItem(label, ignoreBounds=True)
+            self._pinned_markers.append((plot, marker, label))
+            self.plot_status.setText(f"Pinned | {text}")
+
+        def _hide_hover_markers(self) -> None:
+            for marker, label in self._hover_items.values():
+                marker.hide()
+                label.hide()
+
+        def clear_markers(self) -> None:
+            for plot, marker, label in self._pinned_markers:
+                plot.removeItem(marker)
+                plot.removeItem(label)
+            self._pinned_markers.clear()
+            self._hide_hover_markers()
+            if self._frequency.size:
+                self.plot_status.setText("Pinned markers cleared")
+
+        def _phase_fit_bounds(self) -> tuple[float, float]:
+            return tuple(float(value) for value in self._phase_region.getRegion())
+
+        def _set_phase_region_visible(self, visible: bool) -> None:
+            if visible and self._frequency.size:
+                self._phase_region.show()
+            else:
+                self._phase_region.hide()
+
+        def _render_phase_values(self) -> None:
+            for curve, values in zip(self._phase_curves, self._phase_display):
+                curve.setData(self._frequency, values)
+            self._hide_hover_markers()
+            self.phase_plot.autoRange()
+
+        def fit_view(self) -> None:
+            if self._frequency.size == 0:
+                return
+            self.magnitude_plot.autoRange()
+            self.phase_plot.autoRange()
 
         def set_result(self, result) -> None:
-            frequency = result.frequencies_mhz
-            magnitude = result.magnitude_db
-            phase = result.phase_unwrapped_deg
+            self._load_result_arrays(result)
+            self.clear_markers()
             self.magnitude_plot.setLabel(
                 "left",
                 (
@@ -983,24 +1379,6 @@ if _USE_PYQTGRAPH:
                 ),
                 units="dB",
             )
-            if getattr(magnitude, "ndim", 1) == 1:
-                magnitude = [magnitude]
-                phase = [phase]
-                curve_labels = [
-                    (
-                        None
-                        if getattr(result, "output_power_dbm", None) is None
-                        else f"{float(result.output_power_dbm):.6g} dBm"
-                    )
-                ]
-            else:
-                output_powers = getattr(result, "output_powers_dbm", None)
-                if output_powers is None:
-                    curve_labels = [f"gain {int(gain)}" for gain in result.power_gains]
-                else:
-                    curve_labels = [
-                        f"{float(power):.6g} dBm" for power in output_powers
-                    ]
             for curve in self._magnitude_curves:
                 self.magnitude_plot.removeItem(curve)
             for curve in self._phase_curves:
@@ -1009,14 +1387,18 @@ if _USE_PYQTGRAPH:
             self._phase_curves.clear()
             self._magnitude_legend.clear()
             self._phase_legend.clear()
-            count = len(curve_labels)
+            count = len(self._curve_labels)
             for index, (name, magnitude_values, phase_values) in enumerate(
-                zip(curve_labels, magnitude, phase)
+                zip(
+                    self._curve_labels,
+                    self._magnitude_values,
+                    self._phase_display,
+                )
             ):
                 color = pg.intColor(index, hues=max(1, count), values=1)
                 self._magnitude_curves.append(
                     self.magnitude_plot.plot(
-                        frequency,
+                        self._frequency,
                         magnitude_values,
                         pen=pg.mkPen(color, width=2),
                         symbol="o",
@@ -1026,7 +1408,7 @@ if _USE_PYQTGRAPH:
                 )
                 self._phase_curves.append(
                     self.phase_plot.plot(
-                        frequency,
+                        self._frequency,
                         phase_values,
                         pen=pg.mkPen(color, width=2),
                         symbol="o",
@@ -1034,59 +1416,206 @@ if _USE_PYQTGRAPH:
                         name=name,
                     )
                 )
-            self.magnitude_plot.autoRange()
-            self.phase_plot.autoRange()
+            self._phase_region.setRegion(self._phase_fit_region)
+            self._set_phase_region_visible(self.phase_range_button.isChecked())
+            self.plot_status.setText(
+                f"{self._frequency.size:,} frequency points | "
+                "hover for values; left-click to pin"
+            )
+            self.fit_view()
 
 else:
 
-    class SParameterPlotWidget(Canvas):
-        """Matplotlib fallback for magnitude and unwrapped-phase plots."""
+    class SParameterPlotWidget(_SParameterPlotMixin, QtWidgets.QWidget):
+        """Matplotlib fallback with the same marker and phase-fit controls."""
 
         def __init__(self, parent=None):
-            figure = Figure(tight_layout=True)
-            super().__init__(figure)
-            self.magnitude_plot, self.phase_plot = figure.subplots(2, 1, sharex=True)
+            super().__init__(parent)
+            self._initialize_plot_tools()
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(2)
+            layout.addWidget(self._create_control_bar())
+            self.figure = Figure(tight_layout=True)
+            self.canvas = Canvas(self.figure)
+            layout.addWidget(self.canvas, 1)
+            self.magnitude_plot, self.phase_plot = self.figure.subplots(
+                2, 1, sharex=True
+            )
+            self._magnitude_curves = []
+            self._phase_curves = []
+            self._pinned_markers = []
+            self._hover_artists = {}
+            self._span_selector = None
+            self.canvas.mpl_connect("motion_notify_event", self._on_mouse_moved)
+            self.canvas.mpl_connect("button_press_event", self._on_mouse_clicked)
+
+        def _install_span_selector(self) -> None:
+            self._span_selector = SpanSelector(
+                self.phase_plot,
+                self._on_phase_span,
+                "horizontal",
+                useblit=True,
+                props={"facecolor": "tab:blue", "alpha": 0.18},
+                interactive=True,
+                drag_from_anywhere=True,
+            )
+            self._span_selector.set_active(self.phase_range_button.isChecked())
+            if self._phase_fit_region is not None:
+                self._span_selector.extents = self._phase_fit_region
+            self._span_selector.set_visible(self.phase_range_button.isChecked())
+
+        def _on_phase_span(self, start: float, stop: float) -> None:
+            self._phase_fit_region = (float(start), float(stop))
+            self.plot_status.setText(
+                f"Phase fit range {min(start, stop):.9g}.."
+                f"{max(start, stop):.9g} MHz"
+            )
+
+        def _phase_fit_bounds(self) -> tuple[float, float]:
+            if self._phase_fit_region is None:
+                raise ValueError("select a phase fit range first")
+            return self._phase_fit_region
+
+        def _set_phase_region_visible(self, visible: bool) -> None:
+            if self._span_selector is not None:
+                self._span_selector.set_active(bool(visible))
+                self._span_selector.set_visible(bool(visible))
+                self.canvas.draw_idle()
+
+        def _render_phase_values(self) -> None:
+            for curve, values in zip(self._phase_curves, self._phase_display):
+                curve.set_ydata(values)
+            self.phase_plot.relim()
+            self.phase_plot.autoscale_view()
+            self._hide_hover_markers()
+            self.canvas.draw_idle()
+
+        def _nearest_from_event(self, event):
+            if event.inaxes is self.magnitude_plot:
+                name = "Magnitude"
+                values = self._magnitude_values
+            elif event.inaxes is self.phase_plot:
+                name = "Phase"
+                values = self._phase_display
+            else:
+                return None
+            nearest = nearest_sparameter_point(
+                self._frequency,
+                values,
+                event.xdata,
+                event.ydata,
+            )
+            return name, event.inaxes, nearest
+
+        def _on_mouse_moved(self, event) -> None:
+            if not self._markers_enabled or self._frequency.size == 0:
+                return
+            nearest = self._nearest_from_event(event)
+            if nearest is None:
+                self._hide_hover_markers()
+                return
+            name, axis, (curve_index, _point_index, frequency, value) = nearest
+            self._hide_hover_markers()
+            marker, annotation = self._hover_artists[name]
+            marker.set_data([frequency], [value])
+            annotation.xy = (frequency, value)
+            annotation.set_text(
+                self._marker_text(name, curve_index, frequency, value)
+            )
+            marker.set_visible(True)
+            annotation.set_visible(True)
+            self.plot_status.setText(annotation.get_text())
+            axis.figure.canvas.draw_idle()
+
+        def _on_mouse_clicked(self, event) -> None:
+            if (
+                not self._markers_enabled
+                or self._frequency.size == 0
+                or event.button != 1
+            ):
+                return
+            nearest = self._nearest_from_event(event)
+            if nearest is None:
+                return
+            name, axis, (curve_index, _point_index, frequency, value) = nearest
+            marker = axis.plot(
+                [frequency], [value], "o", color="tab:orange", zorder=20
+            )[0]
+            text = self._marker_text(name, curve_index, frequency, value)
+            annotation = axis.annotate(
+                text,
+                (frequency, value),
+                xytext=(8, 8),
+                textcoords="offset points",
+                bbox={"boxstyle": "round", "fc": "white", "alpha": 0.9},
+            )
+            self._pinned_markers.append((marker, annotation))
+            self.plot_status.setText(f"Pinned | {text}")
+            self.canvas.draw_idle()
+
+        def _hide_hover_markers(self) -> None:
+            for marker, annotation in self._hover_artists.values():
+                marker.set_visible(False)
+                annotation.set_visible(False)
+            self.canvas.draw_idle()
+
+        def clear_markers(self) -> None:
+            for marker, annotation in self._pinned_markers:
+                marker.remove()
+                annotation.remove()
+            self._pinned_markers.clear()
+            if self._hover_artists:
+                self._hide_hover_markers()
+            if self._frequency.size:
+                self.plot_status.setText("Pinned markers cleared")
+
+        def fit_view(self) -> None:
+            if self._frequency.size == 0:
+                return
+            for axis in (self.magnitude_plot, self.phase_plot):
+                axis.relim()
+                axis.autoscale_view()
+            self.canvas.draw_idle()
 
         def set_result(self, result) -> None:
+            self._load_result_arrays(result)
+            self.magnitude_plot.clear()
+            self.phase_plot.clear()
+            self._pinned_markers.clear()
+            self._hover_artists.clear()
             for axis in (self.magnitude_plot, self.phase_plot):
-                axis.clear()
                 axis.grid(True, alpha=0.25)
-            magnitude = result.magnitude_db
-            phase = result.phase_unwrapped_deg
-            if getattr(magnitude, "ndim", 1) == 1:
-                magnitude = [magnitude]
-                phase = [phase]
-                curve_labels = [
-                    (
-                        None
-                        if getattr(result, "output_power_dbm", None) is None
-                        else f"{float(result.output_power_dbm):.6g} dBm"
-                    )
-                ]
-            else:
-                output_powers = getattr(result, "output_powers_dbm", None)
-                if output_powers is None:
-                    curve_labels = [f"gain {int(gain)}" for gain in result.power_gains]
-                else:
-                    curve_labels = [
-                        f"{float(power):.6g} dBm" for power in output_powers
-                    ]
-            for label, magnitude_values, phase_values in zip(
-                curve_labels, magnitude, phase
+            self._magnitude_curves = []
+            self._phase_curves = []
+            count = len(self._curve_labels)
+            for index, (label, magnitude_values, phase_values) in enumerate(
+                zip(
+                    self._curve_labels,
+                    self._magnitude_values,
+                    self._phase_display,
+                )
             ):
-                self.magnitude_plot.plot(
-                    result.frequencies_mhz,
-                    magnitude_values,
-                    "-o",
-                    label=label,
+                color = f"C{index % max(1, min(count, 10))}"
+                self._magnitude_curves.append(
+                    self.magnitude_plot.plot(
+                        self._frequency,
+                        magnitude_values,
+                        "-o",
+                        color=color,
+                        label=label,
+                    )[0]
                 )
-                self.phase_plot.plot(
-                    result.frequencies_mhz,
-                    phase_values,
-                    "-o",
-                    label=label,
+                self._phase_curves.append(
+                    self.phase_plot.plot(
+                        self._frequency,
+                        phase_values,
+                        "-o",
+                        color=color,
+                        label=label,
+                    )[0]
                 )
-            if curve_labels[0] is not None:
+            if self._curve_labels[0] is not None:
                 self.magnitude_plot.legend()
                 self.phase_plot.legend()
             self.magnitude_plot.set_ylabel(
@@ -1098,7 +1627,35 @@ else:
             )
             self.phase_plot.set_ylabel("Unwrapped phase [deg]")
             self.phase_plot.set_xlabel("RF frequency [MHz]")
-            self.draw_idle()
+            self._hover_artists = {
+                "Magnitude": (
+                    self.magnitude_plot.plot([], [], "o", color="gold", zorder=30)[0],
+                    self.magnitude_plot.annotate(
+                        "",
+                        (0, 0),
+                        xytext=(8, 8),
+                        textcoords="offset points",
+                        bbox={"boxstyle": "round", "fc": "white", "alpha": 0.9},
+                    ),
+                ),
+                "Phase": (
+                    self.phase_plot.plot([], [], "o", color="gold", zorder=30)[0],
+                    self.phase_plot.annotate(
+                        "",
+                        (0, 0),
+                        xytext=(8, 8),
+                        textcoords="offset points",
+                        bbox={"boxstyle": "round", "fc": "white", "alpha": 0.9},
+                    ),
+                ),
+            }
+            self._hide_hover_markers()
+            self._install_span_selector()
+            self.plot_status.setText(
+                f"{self._frequency.size:,} frequency points | "
+                "hover for values; left-click to pin"
+            )
+            self.fit_view()
 
 
 class SParameterSweepWorker(QtCore.QObject):

@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 # Desktop imports need the PYNQ stubs installed before regular QICK modules.
 from qick.sim import QickSim  # noqa: F401
@@ -21,6 +22,7 @@ from qick.qick_asm import QickConfig
 
 import DCWaveform_Generator as gui
 import qick_sparameter_sweep as sparameter_module
+from sparameter_gui import nearest_sparameter_point, subtract_phase_linear_fit
 from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
     QcodesRunConfig,
@@ -174,6 +176,84 @@ def test_result_uses_mean_iq_db_magnitude_and_unwrapped_phase():
     )
     assert result.mean_i[0] == 3.0
     assert result.mean_q[0] == 4.0
+
+
+def test_phase_linear_fit_subtracts_each_trace_without_changing_shape():
+    frequency = np.linspace(100.0, 110.0, 11)
+    phase = np.vstack((2.5 * frequency + 30.0, -0.75 * frequency - 12.0))
+
+    corrected, slopes, intercepts = subtract_phase_linear_fit(
+        frequency,
+        phase,
+        102.0,
+        108.0,
+    )
+
+    assert corrected.shape == phase.shape
+    np.testing.assert_allclose(corrected, 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(slopes, [2.5, -0.75])
+    np.testing.assert_allclose(intercepts, [30.0, -12.0])
+
+
+def test_nearest_marker_selects_frequency_and_closest_trace():
+    frequency = np.asarray([100.0, 101.0, 102.0])
+    values = np.asarray([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])
+
+    curve, point, selected_frequency, selected_value = nearest_sparameter_point(
+        frequency,
+        values,
+        101.2,
+        18.0,
+    )
+
+    assert (curve, point) == (1, 1)
+    assert selected_frequency == 101.0
+    assert selected_value == 20.0
+
+
+def test_sparameter_plot_phase_fit_is_display_only_and_resettable():
+    app = _application()
+    frequency = np.linspace(10.0, 20.0, 11)
+    original_phase = 4.0 * frequency + 7.0
+    result = SimpleNamespace(
+        frequencies_mhz=frequency,
+        magnitude_db=np.linspace(-30.0, -20.0, frequency.size),
+        phase_unwrapped_deg=original_phase.copy(),
+        output_power_dbm=None,
+        physical_power_calibrated=False,
+    )
+    plot = gui.SParameterPlotWidget()
+    plot.resize(900, 600)
+    plot.set_result(result)
+    plot.show()
+    app.processEvents()
+    if hasattr(plot.magnitude_plot, "vb"):
+        hover_position = plot.magnitude_plot.vb.mapViewToScene(
+            QtCore.QPointF(15.1, -25.0)
+        )
+        plot._on_mouse_moved((hover_position,))
+        app.processEvents()
+        assert "MHz" in plot.plot_status.text()
+        assert "Magnitude" in plot.plot_status.text()
+        assert plot._hover_items["Magnitude"][0].isVisible()
+    if hasattr(plot, "_phase_region"):
+        plot._phase_region.setRegion((12.0, 18.0))
+    else:
+        plot._phase_fit_region = (12.0, 18.0)
+
+    plot.subtract_phase_fit()
+    app.processEvents()
+
+    assert plot._phase_fit_applied is True
+    np.testing.assert_allclose(plot._phase_display, 0.0, atol=1.0e-10)
+    np.testing.assert_array_equal(result.phase_unwrapped_deg, original_phase)
+    assert "deg/MHz" in plot.plot_status.text()
+
+    plot.reset_phase()
+    app.processEvents()
+    assert plot._phase_fit_applied is False
+    np.testing.assert_array_equal(plot._phase_display[0], original_phase)
+    plot.close()
 
 
 def test_gain_has_hard_limit():

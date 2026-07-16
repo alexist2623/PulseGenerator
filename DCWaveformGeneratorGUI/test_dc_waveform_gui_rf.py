@@ -540,6 +540,19 @@ def test_detailed_error_dialog_copies_summary_and_traceback():
     dialog.close()
 
 
+def test_main_fit_action_also_fits_sparameter_plot():
+    app = _application()
+    window = gui.MainWindow()
+    calls = []
+    window._sparameter_plot.fit_view = lambda: calls.append("sparameter")
+
+    window._fit_view()
+    app.processEvents()
+
+    assert calls == ["sparameter"]
+    window.close()
+
+
 def test_legacy_single_waveform_json_remains_loadable(tmp_path):
     app = _application()
     pulse = PulseSequence(-125.0, initial_duration_ns=750.0)
