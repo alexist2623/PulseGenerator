@@ -108,6 +108,29 @@ except ImportError:
         SParameterSweepWorker,
     )
 
+try:
+    from .calibration_gui import (
+        CalibrationPanel,
+        CalibrationWorker,
+        default_calibration_settings,
+    )
+    from .qick_power_calibration import (
+        InputPowerCalibrationConfig,
+        OscilloscopeConfig,
+        OutputPowerCalibrationConfig,
+    )
+except ImportError:
+    from calibration_gui import (
+        CalibrationPanel,
+        CalibrationWorker,
+        default_calibration_settings,
+    )
+    from qick_power_calibration import (
+        InputPowerCalibrationConfig,
+        OscilloscopeConfig,
+        OutputPowerCalibrationConfig,
+    )
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -117,8 +140,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 8
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, SETTINGS_VERSION)
+SETTINGS_VERSION = 9
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -164,6 +187,7 @@ DEFAULT_SPARAMETER_SETTINGS = {
     "database_path": DEFAULT_SPARAMETER_DB_PATH,
     **asdict(SParameterSweepConfig()),
 }
+DEFAULT_CALIBRATION_SETTINGS = default_calibration_settings()
 
 
 def _time_from_ns(value_ns: float, unit: str) -> float:
@@ -3160,6 +3184,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             parent=self,
         )
         self._sparameter_panel = SParameterSweepPanel(self)
+        self._calibration_panel = CalibrationPanel(self)
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
@@ -3172,6 +3197,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._sparameter_panel.load_requested.connect(
             self._load_sparameter_run
+        )
+        self._calibration_panel.output_requested.connect(
+            lambda: self._run_power_calibration("output")
+        )
+        self._calibration_panel.input_requested.connect(
+            lambda: self._run_power_calibration("input")
         )
 
         self._time_unit_combo = QtWidgets.QComboBox()
@@ -3188,6 +3219,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._rf_readout_panel, "RF Readout")
         self._control_tabs.addTab(self._experiment_panel, "Experiment")
         self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
+        self._control_tabs.addTab(self._calibration_panel, "Calibration")
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
         control_layout = QtWidgets.QVBoxLayout(control_container)
@@ -4065,6 +4097,85 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         dialog.setDetailedText(details)
         dialog.exec_()
 
+    def _run_power_calibration(self, mode: str) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            connection, _run = self._experiment_panel.connection_values(
+                database_path=self._calibration_panel.database_path_value()
+            )
+            calibration_config = (
+                self._calibration_panel.output_config()
+                if mode == "output"
+                else self._calibration_panel.input_config()
+            )
+            if mode == "output" and not (
+                calibration_config.oscilloscope.visa_resource.strip()
+            ):
+                raise ValueError("Oscilloscope VISA resource must not be empty")
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Cannot run calibration",
+                str(exc),
+            )
+            return
+        arguments = {
+            "connection_config": connection,
+            "calibration_config": calibration_config,
+        }
+        if mode == "input":
+            arguments["tproc_mhz"] = self._experiment_panel.tproc_mhz.value()
+        label = "oscilloscope output" if mode == "output" else "FIR-DDR input"
+        self._calibration_panel.set_running(
+            True,
+            f"0% - Preparing {label} calibration",
+        )
+        self.statusBar().showMessage(f"QICK {label} calibration running")
+        thread = QtCore.QThread(self)
+        worker = CalibrationWorker(mode, arguments)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_calibration_finished)
+        worker.failed.connect(self._on_calibration_failed)
+        worker.progress_changed.connect(self._on_calibration_progress)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_calibration_progress(self, percent: int, message: str) -> None:
+        self._calibration_panel.update_progress(percent, message)
+        self.statusBar().showMessage(f"Calibration {percent}%: {message}")
+
+    def _on_calibration_finished(self, stored) -> None:
+        self._calibration_panel.show_result(stored)
+        self.statusBar().showMessage(
+            f"Calibration Run {stored.run_id} saved to {stored.database_path}"
+        )
+
+    def _on_calibration_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown calibration error"
+        self._calibration_panel.set_running(False, f"Failed: {summary}")
+        self.statusBar().showMessage("QICK calibration failed")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        dialog.setWindowTitle("QICK calibration failed")
+        dialog.setText(summary)
+        dialog.setDetailedText(details)
+        dialog.exec_()
+
     def _run_qick_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -4420,6 +4531,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
             "s_parameter": dict(self._sparameter_panel.settings_dict()),
+            "calibration": dict(self._calibration_panel.settings_dict()),
         }
 
     @staticmethod
@@ -4629,6 +4741,67 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError("RF S-parameter database path must not be empty")
         sparameter_config = SParameterSweepConfig(**sparameter_settings)
 
+        raw_calibration = data.get("calibration", {})
+        if raw_calibration is None:
+            raw_calibration = {}
+        if not isinstance(raw_calibration, dict):
+            raise TypeError("calibration must be a JSON object")
+        calibration_defaults = default_calibration_settings()
+        calibration_database_path = str(
+            raw_calibration.get(
+                "database_path",
+                calibration_defaults["database_path"],
+            )
+        ).strip()
+        if not calibration_database_path:
+            raise ValueError("calibration database path must not be empty")
+        raw_output_calibration = raw_calibration.get("output", {})
+        raw_input_calibration = raw_calibration.get("input", {})
+        if not isinstance(raw_output_calibration, dict) or not isinstance(
+            raw_input_calibration,
+            dict,
+        ):
+            raise TypeError("calibration output and input must be JSON objects")
+        output_calibration_values = {
+            **calibration_defaults["output"],
+            **raw_output_calibration,
+        }
+        scope_values = {
+            **calibration_defaults["output"]["oscilloscope"],
+            **dict(output_calibration_values.pop("oscilloscope", {})),
+        }
+        output_calibration = OutputPowerCalibrationConfig(
+            database_path=calibration_database_path,
+            oscilloscope=OscilloscopeConfig(**scope_values),
+            **output_calibration_values,
+        )
+        input_calibration = InputPowerCalibrationConfig(
+            database_path=calibration_database_path,
+            **{
+                **calibration_defaults["input"],
+                **raw_input_calibration,
+            },
+        )
+        calibration_selected_tab = self._json_int(
+            raw_calibration.get(
+                "selected_tab",
+                calibration_defaults["selected_tab"],
+            ),
+            "calibration selected tab",
+        )
+        if calibration_selected_tab > 1:
+            raise ValueError("calibration selected tab must be 0 or 1")
+        output_calibration_settings = asdict(output_calibration)
+        input_calibration_settings = asdict(input_calibration)
+        output_calibration_settings.pop("database_path")
+        input_calibration_settings.pop("database_path")
+        calibration_settings = {
+            "database_path": calibration_database_path,
+            "selected_tab": calibration_selected_tab,
+            "output": output_calibration_settings,
+            "input": input_calibration_settings,
+        }
+
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
         if "rf_outputs" in data:
             raw_rf_outputs = data["rf_outputs"]
@@ -4778,6 +4951,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "database_path": sparameter_database_path,
                 **asdict(sparameter_config),
             },
+            "calibration": calibration_settings,
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -4835,6 +5009,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])
+        self._calibration_panel.load_settings(settings["calibration"])
 
         self._selected_port_idx = settings["selected_output"]
         self._plot.set_selected_port_idx(self._selected_port_idx)

@@ -24,6 +24,29 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 try:
+    from .power_calibration import (
+        CalibrationDatabase,
+        CalibrationRunSummary,
+        GAIN_DMEM_BASE_ADDRESS,
+        GainSchedule,
+        InputPowerCalibration,
+        INPUT_BOARD_TYPES,
+        MAX_DMEM_GAIN_ENTRIES,
+        OUTPUT_BOARD_TYPES,
+    )
+except ImportError:
+    from power_calibration import (
+        CalibrationDatabase,
+        CalibrationRunSummary,
+        GAIN_DMEM_BASE_ADDRESS,
+        GainSchedule,
+        InputPowerCalibration,
+        INPUT_BOARD_TYPES,
+        MAX_DMEM_GAIN_ENTRIES,
+        OUTPUT_BOARD_TYPES,
+    )
+
+try:
     from qick.averager_program import RAveragerProgram
 except ImportError as exc:  # keep the waveform editor importable without QICK
     _QICK_IMPORT_ERROR = exc
@@ -41,6 +64,8 @@ MAX_RF_OUTPUT_GAIN = 32766
 FILTER_TYPES = ("bypass", "lowpass", "highpass", "bandpass")
 POWER_SCALES = ("linear", "log")
 POWER_GAIN_PARAMETER = "rf_power_gain"
+OUTPUT_POWER_PARAMETER = "rf_output_power_dbm"
+CALIBRATED_GAIN_PARAMETER = "rf_calibrated_gain_code"
 FREQUENCY_PARAMETER = "rf_frequency_mhz"
 SAMPLE_INDEX_PARAMETER = "sample_index"
 I_TRACE_PARAMETER = "i_trace"
@@ -48,6 +73,9 @@ Q_TRACE_PARAMETER = "q_trace"
 MEAN_I_PARAMETER = "mean_i"
 MEAN_Q_PARAMETER = "mean_q"
 MAGNITUDE_DB_PARAMETER = "s_parameter_magnitude_db"
+ADC_MAGNITUDE_DB_PARAMETER = "adc_magnitude_db"
+ACTUAL_OUTPUT_POWER_PARAMETER = "actual_output_power_dbm"
+ACTUAL_INPUT_POWER_PARAMETER = "actual_input_power_dbm"
 PHASE_DEG_PARAMETER = "s_parameter_phase_unwrapped_deg"
 
 ProgressCallback = Callable[[int, str], None]
@@ -104,9 +132,16 @@ class SParameterSweepConfig:
     frequency_end_mhz: float = 100.0
     frequency_points: int = 101
     gain: int = 20000
+    power_calibration_enabled: bool = False
+    calibration_database_path: str = ""
+    output_board_type: str = "RF_Out"
+    input_board_type: str = "DC_In"
+    output_power_dbm: float = -20.0
     power_sweep_enabled: bool = False
     power_start_gain: int = 1000
     power_end_gain: int = 20000
+    power_start_dbm: float = -30.0
+    power_end_dbm: float = -10.0
     power_points: int = 5
     power_scale: str = "linear"
     scan_time_us: float = 10.0
@@ -127,6 +162,18 @@ class SParameterSweepConfig:
     settle_seconds: float = 0.05
     trigger_width_tproc_cycles: int = 12
     recovery_tproc_cycles: int = 20
+    calibrated_gain_table: Tuple[int, ...] = ()
+    calibrated_frequency_point_count: int = 0
+    calibrated_output_power_dbm: Optional[float] = None
+    calibrated_nominal_gain_code: Optional[int] = None
+    calibrated_reference_response_dbm: Optional[float] = None
+    calibrated_correction_min_db: Optional[float] = None
+    calibrated_correction_max_db: Optional[float] = None
+    gain_dmem_base_address: int = GAIN_DMEM_BASE_ADDRESS
+    calibration_output_run_id: int = 0
+    calibration_input_run_id: int = 0
+    calibration_output_sample_name: str = ""
+    calibration_input_sample_name: str = ""
 
     def __post_init__(self) -> None:
         _require_int(self.output_ch, "output_ch")
@@ -141,6 +188,26 @@ class SParameterSweepConfig:
             raise ValueError(
                 f"gain must not exceed the RF output limit {MAX_RF_OUTPUT_GAIN}"
             )
+        if not isinstance(self.power_calibration_enabled, bool):
+            raise TypeError("power_calibration_enabled must be boolean")
+        if self.output_board_type not in OUTPUT_BOARD_TYPES:
+            raise ValueError(
+                f"output_board_type must be one of {OUTPUT_BOARD_TYPES}"
+            )
+        if self.input_board_type not in INPUT_BOARD_TYPES:
+            raise ValueError(
+                f"input_board_type must be one of {INPUT_BOARD_TYPES}"
+            )
+        _require_finite(self.output_power_dbm, "output_power_dbm")
+        _require_finite(self.power_start_dbm, "power_start_dbm")
+        _require_finite(self.power_end_dbm, "power_end_dbm")
+        if self.power_calibration_enabled:
+            calibration_path = str(self.calibration_database_path).strip()
+            if not calibration_path:
+                raise ValueError(
+                    "calibration_database_path is required when power calibration "
+                    "is enabled"
+                )
         if not isinstance(self.power_sweep_enabled, bool):
             raise TypeError("power_sweep_enabled must be boolean")
         power_start = _require_int(self.power_start_gain, "power_start_gain")
@@ -154,15 +221,19 @@ class SParameterSweepConfig:
         if self.power_scale not in POWER_SCALES:
             raise ValueError(f"power_scale must be one of {POWER_SCALES}")
         if self.power_sweep_enabled:
-            if power_start == power_end:
-                raise ValueError("power sweep start and end gains must differ")
-            if self.power_scale == "log" and min(power_start, power_end) <= 0:
-                raise ValueError("log power sweep gains must be greater than zero")
-            if np.unique(self.power_gains).size != power_points:
-                raise ValueError(
-                    "power sweep points collapse to duplicate integer gain codes; "
-                    "reduce the point count or widen the gain range"
-                )
+            if self.power_calibration_enabled:
+                if self.power_start_dbm == self.power_end_dbm:
+                    raise ValueError("power sweep start and end dBm must differ")
+            else:
+                if power_start == power_end:
+                    raise ValueError("power sweep start and end gains must differ")
+                if self.power_scale == "log" and min(power_start, power_end) <= 0:
+                    raise ValueError("log power sweep gains must be greater than zero")
+                if np.unique(self.power_gains).size != power_points:
+                    raise ValueError(
+                        "power sweep points collapse to duplicate integer gain codes; "
+                        "reduce the point count or widen the gain range"
+                    )
         _require_finite(self.scan_time_us, "scan_time_us", positive=True)
         _require_attenuation(self.output_att1_db, "output_att1_db")
         _require_attenuation(self.output_att2_db, "output_att2_db")
@@ -207,6 +278,52 @@ class SParameterSweepConfig:
             1,
         )
         _require_int(self.recovery_tproc_cycles, "recovery_tproc_cycles")
+        gain_table = tuple(int(value) for value in self.calibrated_gain_table)
+        if len(gain_table) > MAX_DMEM_GAIN_ENTRIES:
+            raise ValueError(
+                f"calibrated gain table exceeds {MAX_DMEM_GAIN_ENTRIES} entries"
+            )
+        if any(value < 0 or value > MAX_RF_OUTPUT_GAIN for value in gain_table):
+            raise ValueError("calibrated gain table contains an invalid gain")
+        if gain_table:
+            point_count = _require_int(
+                self.calibrated_frequency_point_count,
+                "calibrated_frequency_point_count",
+                len(gain_table),
+            )
+            if point_count != points:
+                raise ValueError(
+                    "calibrated gain-table frequency count must match frequency_points"
+                )
+            if self.calibrated_output_power_dbm is None:
+                raise ValueError("calibrated gain table requires output power metadata")
+            _require_finite(
+                self.calibrated_output_power_dbm,
+                "calibrated_output_power_dbm",
+            )
+            if self.calibrated_nominal_gain_code is None:
+                raise ValueError("calibrated gain table requires nominal gain metadata")
+            nominal_gain = _require_int(
+                self.calibrated_nominal_gain_code,
+                "calibrated_nominal_gain_code",
+                1,
+            )
+            if nominal_gain > MAX_RF_OUTPUT_GAIN:
+                raise ValueError("calibrated nominal gain exceeds the generator limit")
+            for value, name in (
+                (
+                    self.calibrated_reference_response_dbm,
+                    "calibrated_reference_response_dbm",
+                ),
+                (self.calibrated_correction_min_db, "calibrated_correction_min_db"),
+                (self.calibrated_correction_max_db, "calibrated_correction_max_db"),
+            ):
+                if value is None:
+                    raise ValueError(f"calibrated gain table requires {name}")
+                _require_finite(value, name)
+        _require_int(self.gain_dmem_base_address, "gain_dmem_base_address", 2)
+        _require_int(self.calibration_output_run_id, "calibration_output_run_id")
+        _require_int(self.calibration_input_run_id, "calibration_input_run_id")
 
     @property
     def requested_frequencies_mhz(self) -> np.ndarray:
@@ -241,12 +358,66 @@ class SParameterSweepConfig:
         gains[-1] = self.power_end_gain
         return gains
 
+    @property
+    def target_powers_dbm(self) -> np.ndarray:
+        """Return calibrated output-power targets in execution order.
+
+        ``linear`` is uniform in physical milliwatts. ``log`` is uniform on
+        the logarithmic dBm axis.
+        """
+        if not self.power_calibration_enabled:
+            raise RuntimeError("target_powers_dbm requires power calibration")
+        if not self.power_sweep_enabled:
+            return np.asarray([self.output_power_dbm], dtype=float)
+        if self.power_scale == "log":
+            return np.linspace(
+                self.power_start_dbm,
+                self.power_end_dbm,
+                self.power_points,
+                dtype=float,
+            )
+        start_mw = 10.0 ** (self.power_start_dbm / 10.0)
+        end_mw = 10.0 ** (self.power_end_dbm / 10.0)
+        values_mw = np.linspace(start_mw, end_mw, self.power_points, dtype=float)
+        return 10.0 * np.log10(values_mw)
+
     def for_gain(self, gain: int) -> "SParameterSweepConfig":
         """Build one hardware-frequency-sweep config for a software power point."""
         return replace(
             self,
             gain=_require_int(gain, "gain"),
             power_sweep_enabled=False,
+        )
+
+    def for_gain_schedule(
+        self,
+        schedule: GainSchedule,
+        output_run: CalibrationRunSummary,
+        input_run: Optional[CalibrationRunSummary],
+    ) -> "SParameterSweepConfig":
+        """Build one fixed-power sweep with frequency gains loaded from DMEM."""
+        if schedule.frequency_point_count != self.frequency_points:
+            raise ValueError("gain schedule does not match the frequency sweep")
+        return replace(
+            self,
+            gain=int(schedule.nominal_gain_code),
+            power_sweep_enabled=False,
+            calibrated_gain_table=tuple(int(value) for value in schedule.gain_codes),
+            calibrated_frequency_point_count=schedule.frequency_point_count,
+            calibrated_output_power_dbm=float(schedule.target_power_dbm),
+            calibrated_nominal_gain_code=int(schedule.nominal_gain_code),
+            calibrated_reference_response_dbm=float(
+                schedule.reference_response_dbm
+            ),
+            calibrated_correction_min_db=float(np.min(schedule.correction_db)),
+            calibrated_correction_max_db=float(np.max(schedule.correction_db)),
+            gain_dmem_base_address=int(schedule.dmem_base_address),
+            calibration_output_run_id=int(output_run.run_id),
+            calibration_input_run_id=(0 if input_run is None else int(input_run.run_id)),
+            calibration_output_sample_name=str(output_run.sample_name),
+            calibration_input_sample_name=(
+                "" if input_run is None else str(input_run.sample_name)
+            ),
         )
 
 
@@ -259,10 +430,16 @@ class SParameterSweepResult:
     iq_traces: np.ndarray
     mean_i: np.ndarray
     mean_q: np.ndarray
+    adc_magnitude_db: np.ndarray
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
     reserved_physical_words: Optional[int] = None
+    output_power_dbm: Optional[float] = None
+    nominal_gain_code: Optional[int] = None
+    frequency_gain_codes: Optional[np.ndarray] = None
+    actual_output_powers_dbm: Optional[np.ndarray] = None
+    input_powers_dbm: Optional[np.ndarray] = None
 
     @classmethod
     def from_iq(
@@ -273,6 +450,11 @@ class SParameterSweepResult:
         *,
         sample_rate_hz: float = 1_000_000.0,
         reserved_physical_words: Optional[int] = None,
+        output_power_dbm: Optional[float] = None,
+        nominal_gain_code: Optional[int] = None,
+        frequency_gain_codes: Optional[Any] = None,
+        actual_output_powers_dbm: Optional[Any] = None,
+        input_powers_dbm: Optional[Any] = None,
     ) -> "SParameterSweepResult":
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
@@ -287,27 +469,107 @@ class SParameterSweepResult:
         mean_i = mean[:, 0]
         mean_q = mean[:, 1]
         magnitude = np.hypot(mean_i, mean_q)
-        magnitude_db = 20.0 * np.log10(
+        adc_magnitude_db = 20.0 * np.log10(
             np.maximum(magnitude, np.finfo(np.float64).tiny)
         )
         phase = np.degrees(np.unwrap(np.angle(mean_i + 1j * mean_q)))
+        applied_gains = None
+        if frequency_gain_codes is not None:
+            applied_gains = np.asarray(
+                frequency_gain_codes, dtype=np.int64
+            ).reshape(-1)
+            if applied_gains.size != frequencies.size:
+                raise ValueError(
+                    "frequency_gain_codes must contain one gain per frequency"
+                )
+            if np.any(applied_gains < 0) or np.any(
+                applied_gains > MAX_RF_OUTPUT_GAIN
+            ):
+                raise ValueError("frequency_gain_codes contains an invalid gain")
+        calibrated_power = None
+        nominal_gain = None
+        if output_power_dbm is not None:
+            calibrated_power = _require_finite(
+                output_power_dbm, "output_power_dbm"
+            )
+            if applied_gains is None:
+                raise ValueError(
+                    "frequency-compensated output power requires frequency gain codes"
+                )
+            if nominal_gain_code is None:
+                raise ValueError("frequency compensation requires nominal gain metadata")
+            nominal_gain = _require_int(
+                nominal_gain_code, "nominal_gain_code", 1
+            )
+            if nominal_gain > MAX_RF_OUTPUT_GAIN:
+                raise ValueError("nominal_gain_code exceeds the generator limit")
+        actual_output = None
+        actual_input = None
+        if actual_output_powers_dbm is not None:
+            actual_output = np.asarray(
+                actual_output_powers_dbm, dtype=float
+            ).reshape(-1)
+            if actual_output.size != frequencies.size or not np.all(
+                np.isfinite(actual_output)
+            ):
+                raise ValueError(
+                    "actual output powers must contain one finite value per frequency"
+                )
+        if input_powers_dbm is not None:
+            actual_input = np.asarray(input_powers_dbm, dtype=float).reshape(-1)
+            if actual_input.size != frequencies.size or not np.all(
+                np.isfinite(actual_input)
+            ):
+                raise ValueError(
+                    "input powers must contain one finite value per frequency"
+                )
+            if actual_output is None:
+                raise ValueError("input powers require actual output powers")
+        displayed_magnitude_db = (
+            actual_input - actual_output
+            if actual_input is not None
+            else adc_magnitude_db
+        )
         return cls(
             requested_frequencies_mhz=requested,
             frequencies_mhz=frequencies,
             iq_traces=np.ascontiguousarray(iq),
             mean_i=np.ascontiguousarray(mean_i),
             mean_q=np.ascontiguousarray(mean_q),
-            magnitude_db=np.ascontiguousarray(magnitude_db),
+            adc_magnitude_db=np.ascontiguousarray(adc_magnitude_db),
+            magnitude_db=np.ascontiguousarray(displayed_magnitude_db),
             phase_unwrapped_deg=np.ascontiguousarray(phase),
             sample_rate_hz=_require_finite(
                 sample_rate_hz, "sample_rate_hz", positive=True
             ),
             reserved_physical_words=reserved_physical_words,
+            output_power_dbm=calibrated_power,
+            nominal_gain_code=nominal_gain,
+            frequency_gain_codes=(
+                None if applied_gains is None else np.ascontiguousarray(applied_gains)
+            ),
+            actual_output_powers_dbm=(
+                None if actual_output is None else np.ascontiguousarray(actual_output)
+            ),
+            input_powers_dbm=(
+                None if actual_input is None else np.ascontiguousarray(actual_input)
+            ),
         )
 
     @property
     def sample_count(self) -> int:
         return int(self.iq_traces.shape[1])
+
+    @property
+    def calibrated(self) -> bool:
+        return self.output_power_dbm is not None
+
+    @property
+    def physical_power_calibrated(self) -> bool:
+        return (
+            self.actual_output_powers_dbm is not None
+            and self.input_powers_dbm is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -320,10 +582,15 @@ class SParameterPowerSweepResult:
     iq_traces: np.ndarray
     mean_i: np.ndarray
     mean_q: np.ndarray
+    adc_magnitude_db: np.ndarray
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
     reserved_physical_words: Tuple[Optional[int], ...] = ()
+    output_powers_dbm: Optional[np.ndarray] = None
+    frequency_gain_codes: Optional[np.ndarray] = None
+    actual_output_powers_dbm: Optional[np.ndarray] = None
+    input_powers_dbm: Optional[np.ndarray] = None
 
     @classmethod
     def from_iq(
@@ -335,6 +602,10 @@ class SParameterPowerSweepResult:
         *,
         sample_rate_hz: float = 1_000_000.0,
         reserved_physical_words: Sequence[Optional[int]] = (),
+        output_powers_dbm: Optional[Any] = None,
+        frequency_gain_codes: Optional[Any] = None,
+        actual_output_powers_dbm: Optional[Any] = None,
+        input_powers_dbm: Optional[Any] = None,
     ) -> "SParameterPowerSweepResult":
         gains = np.asarray(power_gains, dtype=np.int64).reshape(-1)
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
@@ -360,6 +631,43 @@ class SParameterPowerSweepResult:
         reserved = tuple(reserved_physical_words)
         if reserved and len(reserved) != gains.size:
             raise ValueError("reserved DDR word counts must match power points")
+        powers = None
+        applied_gains = None
+        if output_powers_dbm is not None:
+            powers = np.asarray(output_powers_dbm, dtype=float).reshape(-1)
+            if powers.size != gains.size or not np.all(np.isfinite(powers)):
+                raise ValueError("output power axis must match power points")
+            if frequency_gain_codes is None:
+                raise ValueError(
+                    "frequency-compensated powers require per-frequency gain codes"
+                )
+        if frequency_gain_codes is not None:
+            applied_gains = np.asarray(frequency_gain_codes, dtype=np.int64)
+            if applied_gains.shape != (gains.size, frequencies.size):
+                raise ValueError(
+                    "frequency gain codes must have shape (power, frequency)"
+                )
+        adc_magnitude_db = 20.0 * np.log10(
+            np.maximum(magnitude, np.finfo(np.float64).tiny)
+        )
+        actual_output = None
+        actual_input = None
+        if actual_output_powers_dbm is not None:
+            actual_output = np.asarray(actual_output_powers_dbm, dtype=float)
+            if actual_output.shape != (gains.size, frequencies.size) or not np.all(
+                np.isfinite(actual_output)
+            ):
+                raise ValueError(
+                    "actual output powers must have shape (power, frequency)"
+                )
+        if input_powers_dbm is not None:
+            actual_input = np.asarray(input_powers_dbm, dtype=float)
+            if actual_input.shape != (gains.size, frequencies.size) or not np.all(
+                np.isfinite(actual_input)
+            ):
+                raise ValueError("input powers must have shape (power, frequency)")
+            if actual_output is None:
+                raise ValueError("input powers require actual output powers")
         return cls(
             power_gains=np.ascontiguousarray(gains),
             requested_frequencies_mhz=np.ascontiguousarray(requested),
@@ -367,17 +675,31 @@ class SParameterPowerSweepResult:
             iq_traces=np.ascontiguousarray(iq),
             mean_i=np.ascontiguousarray(mean_i),
             mean_q=np.ascontiguousarray(mean_q),
+            adc_magnitude_db=np.ascontiguousarray(adc_magnitude_db),
             magnitude_db=np.ascontiguousarray(
-                20.0
-                * np.log10(
-                    np.maximum(magnitude, np.finfo(np.float64).tiny)
-                )
+                actual_input - actual_output
+                if actual_input is not None
+                else adc_magnitude_db
             ),
             phase_unwrapped_deg=np.ascontiguousarray(phase),
             sample_rate_hz=_require_finite(
                 sample_rate_hz, "sample_rate_hz", positive=True
             ),
             reserved_physical_words=reserved,
+            output_powers_dbm=(
+                None if powers is None else np.ascontiguousarray(powers)
+            ),
+            frequency_gain_codes=(
+                None
+                if applied_gains is None
+                else np.ascontiguousarray(applied_gains)
+            ),
+            actual_output_powers_dbm=(
+                None if actual_output is None else np.ascontiguousarray(actual_output)
+            ),
+            input_powers_dbm=(
+                None if actual_input is None else np.ascontiguousarray(actual_input)
+            ),
         )
 
     @classmethod
@@ -411,6 +733,32 @@ class SParameterPowerSweepResult:
             reserved_physical_words=[
                 result.reserved_physical_words for result in sweeps
             ],
+            output_powers_dbm=(
+                [float(result.output_power_dbm) for result in sweeps]
+                if all(result.output_power_dbm is not None for result in sweeps)
+                else None
+            ),
+            frequency_gain_codes=(
+                np.stack([result.frequency_gain_codes for result in sweeps], axis=0)
+                if all(result.frequency_gain_codes is not None for result in sweeps)
+                else None
+            ),
+            actual_output_powers_dbm=(
+                np.stack(
+                    [result.actual_output_powers_dbm for result in sweeps],
+                    axis=0,
+                )
+                if all(
+                    result.actual_output_powers_dbm is not None
+                    for result in sweeps
+                )
+                else None
+            ),
+            input_powers_dbm=(
+                np.stack([result.input_powers_dbm for result in sweeps], axis=0)
+                if all(result.input_powers_dbm is not None for result in sweeps)
+                else None
+            ),
         )
 
     @property
@@ -420,6 +768,64 @@ class SParameterPowerSweepResult:
     @property
     def sample_count(self) -> int:
         return int(self.iq_traces.shape[2])
+
+    @property
+    def calibrated(self) -> bool:
+        return self.output_powers_dbm is not None
+
+    @property
+    def physical_power_calibrated(self) -> bool:
+        return (
+            self.actual_output_powers_dbm is not None
+            and self.input_powers_dbm is not None
+        )
+
+
+def apply_power_calibration(
+    result: SParameterSweepResult,
+    *,
+    output_calibration: Any,
+    input_calibration: Optional[InputPowerCalibration],
+    output_att1_db: float,
+    output_att2_db: float,
+    input_attenuation_db: float,
+) -> SParameterSweepResult:
+    """Attach physical connector powers and derive calibrated transmission.
+
+    The output power is calculated for the actual per-frequency DAC gain.
+    When an input-board calibration is available, ``magnitude_db`` becomes
+    ``P_input_dbm - P_output_dbm``.  The original ADC magnitude remains in
+    ``adc_magnitude_db`` for diagnostics and backward-compatible analysis.
+    """
+    if result.frequency_gain_codes is None:
+        raise ValueError(
+            "physical power calibration requires one applied gain per frequency"
+        )
+    actual_output = output_calibration.output_power_dbm(
+        result.frequencies_mhz,
+        result.frequency_gain_codes,
+        output_att1_db=output_att1_db,
+        output_att2_db=output_att2_db,
+    )
+    actual_input = None
+    if input_calibration is not None:
+        actual_input = input_calibration.input_power_dbm(
+            result.frequencies_mhz,
+            result.adc_magnitude_db,
+            input_attenuation_db=input_attenuation_db,
+        )
+    return SParameterSweepResult.from_iq(
+        result.requested_frequencies_mhz,
+        result.frequencies_mhz,
+        result.iq_traces,
+        sample_rate_hz=result.sample_rate_hz,
+        reserved_physical_words=result.reserved_physical_words,
+        output_power_dbm=result.output_power_dbm,
+        nominal_gain_code=result.nominal_gain_code,
+        frequency_gain_codes=result.frequency_gain_codes,
+        actual_output_powers_dbm=actual_output,
+        input_powers_dbm=actual_input,
+    )
 
 
 def _signed_modular_delta(first: int, second: int, width: int) -> int:
@@ -536,6 +942,26 @@ class SParameterSweepProgram(RAveragerProgram):
                 f"gain {self.sweep.gain} exceeds channel {self.sweep.output_ch} "
                 f"limit {effective_max}"
             )
+        self._gain_table = np.asarray(
+            self.sweep.calibrated_gain_table, dtype=np.int32
+        ).reshape(-1)
+        self._uses_gain_table = bool(self._gain_table.size)
+        if self._uses_gain_table:
+            if np.any(self._gain_table > effective_max):
+                raise ValueError(
+                    "calibrated gain table exceeds the selected generator limit "
+                    f"{effective_max}"
+                )
+            dmem_size = int(self.tproccfg.get("dmem_size", 0))
+            table_end = (
+                int(self.sweep.gain_dmem_base_address) + self._gain_table.size
+            )
+            if dmem_size < 1 or table_end > dmem_size:
+                raise RuntimeError(
+                    f"calibrated gain table uses DMEM addresses "
+                    f"{self.sweep.gain_dmem_base_address}..{table_end - 1}, "
+                    f"but tProcessor DMEM depth is {dmem_size}"
+                )
         try:
             ddr_cfg = self.soccfg["ddr4_buf"]
         except KeyError as exc:
@@ -727,6 +1153,39 @@ class SParameterSweepProgram(RAveragerProgram):
             self._ro_frequency_delta,
             "RF readout DDS frequency step",
         )
+        self._gen_gain_register = self.sreg(self.sweep.output_ch, "gain")
+        self._gain_dmem_address_register = None
+        self._gain_dmem_error_register = None
+        self._gain_dmem_threshold_register = None
+        if self._uses_gain_table:
+            self._gain_dmem_address_register = self._allocate_step_register(
+                self._gen_frequency_page
+            )
+            self.safe_regwi(
+                self._gen_frequency_page,
+                self._gain_dmem_address_register,
+                int(self.sweep.gain_dmem_base_address),
+                "calibrated gain DMEM address",
+            )
+            if self._gain_table.size < self.sweep.frequency_points:
+                self._gain_dmem_error_register = self._allocate_step_register(
+                    self._gen_frequency_page
+                )
+                self._gain_dmem_threshold_register = self._allocate_step_register(
+                    self._gen_frequency_page
+                )
+                self.safe_regwi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_error_register,
+                    0,
+                    "calibrated gain nearest-point phase",
+                )
+                self.safe_regwi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_threshold_register,
+                    self.sweep.frequency_points,
+                    "calibrated gain frequency-point count",
+                )
         self.synci(128, "allow RF/readout register initialization")
 
     def body(self) -> None:
@@ -741,6 +1200,13 @@ class SParameterSweepProgram(RAveragerProgram):
             stdysel="zero",
             mode="periodic",
         )
+        if self._uses_gain_table:
+            self.memr(
+                self._gen_frequency_page,
+                self._gen_gain_register,
+                self._gain_dmem_address_register,
+                "load frequency-calibrated gain from DMEM",
+            )
         self.pulse(self.sweep.output_ch, t=self.output_command_time)
         self.trigger(
             ddr4=True,
@@ -781,6 +1247,69 @@ class SParameterSweepProgram(RAveragerProgram):
             self._ro_step_register,
             "advance RF readout frequency",
         )
+        if self._uses_gain_table:
+            if self._gain_table.size == self.sweep.frequency_points:
+                self.mathi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_address_register,
+                    self._gain_dmem_address_register,
+                    "+",
+                    1,
+                    "advance calibrated gain DMEM address",
+                )
+            else:
+                no_advance_label = "CAL_GAIN_KEEP_DMEM_ADDRESS"
+                self.mathi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_error_register,
+                    self._gain_dmem_error_register,
+                    "+",
+                    int(self._gain_table.size),
+                    "advance calibrated gain nearest-point phase",
+                )
+                self.condj(
+                    self._gen_frequency_page,
+                    self._gain_dmem_error_register,
+                    "<",
+                    self._gain_dmem_threshold_register,
+                    no_advance_label,
+                    "reuse adjacent calibrated gain when phase has not wrapped",
+                )
+                self.math(
+                    self._gen_frequency_page,
+                    self._gain_dmem_error_register,
+                    self._gain_dmem_error_register,
+                    "-",
+                    self._gain_dmem_threshold_register,
+                    "wrap calibrated gain nearest-point phase",
+                )
+                self.mathi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_address_register,
+                    self._gain_dmem_address_register,
+                    "+",
+                    1,
+                    "advance compressed calibrated gain DMEM address",
+                )
+                self.label(no_advance_label)
+                self.mathi(
+                    self._gen_frequency_page,
+                    self._gain_dmem_error_register,
+                    self._gain_dmem_error_register,
+                    "+",
+                    0,
+                    "calibrated gain mapping join",
+                )
+
+    def _load_runtime_dmem(self, soc) -> None:
+        if hasattr(soc, "reload_mem"):
+            soc.reload_mem()
+        if self._uses_gain_table:
+            soc.load_mem(
+                np.ascontiguousarray(self._gain_table, dtype=np.int32),
+                mem_sel="dmem",
+                addr=int(self.sweep.gain_dmem_base_address),
+            )
 
     def _run_with_counter_progress(
         self,
@@ -799,7 +1328,7 @@ class SParameterSweepProgram(RAveragerProgram):
         deadline = time.monotonic() + timeout_seconds
         self.config_all(soc, load_envelopes=True, load_mem=False)
         progress_callback(0, total)
-        soc.reload_mem()
+        self._load_runtime_dmem(soc)
         soc.clear_tproc_counter(addr=self.counter_addr)
         soc.start_src("internal")
         soc.start_tproc()
@@ -837,10 +1366,13 @@ class SParameterSweepProgram(RAveragerProgram):
             stride_bytes=self.sweep.stride_bytes,
             force_overwrite=self.sweep.force_overwrite,
         )
-        if counter_progress is None:
+        if counter_progress is None and not self._uses_gain_table:
             self.run_rounds(soc, progress=progress)
         else:
-            self._run_with_counter_progress(soc, counter_progress)
+            self._run_with_counter_progress(
+                soc,
+                counter_progress or (lambda _completed, _total: None),
+            )
         if self.sweep.settle_seconds:
             time.sleep(self.sweep.settle_seconds)
         raw = np.asarray(soc.get_ddr4_fir_samples(
@@ -860,7 +1392,28 @@ class SParameterSweepProgram(RAveragerProgram):
             raw.reshape(n_triggers, self.scan_samples, 2),
             sample_rate_hz=self.fir_output_rate_msps * 1_000_000.0,
             reserved_physical_words=reserved,
+            output_power_dbm=self.sweep.calibrated_output_power_dbm,
+            nominal_gain_code=self.sweep.calibrated_nominal_gain_code,
+            frequency_gain_codes=(
+                None
+                if not self._uses_gain_table
+                else self._expanded_gain_codes()
+            ),
         )
+
+    def _expanded_gain_codes(self) -> np.ndarray:
+        if not self._uses_gain_table:
+            return np.full(
+                self.sweep.frequency_points,
+                self.sweep.gain,
+                dtype=np.int64,
+            )
+        points = np.arange(self.sweep.frequency_points, dtype=np.int64)
+        indices = np.minimum(
+            self._gain_table.size - 1,
+            (points * self._gain_table.size) // self.sweep.frequency_points,
+        )
+        return np.ascontiguousarray(self._gain_table[indices], dtype=np.int64)
 
     def get_expt_pts(self) -> np.ndarray:
         return self.frequencies_mhz.copy()
@@ -879,6 +1432,58 @@ class SParameterSweepProgram(RAveragerProgram):
             "common_frequency_quantum_mhz": self.frequency_quantum_mhz,
             "gain": self.sweep.gain,
             "gain_limit": MAX_RF_OUTPUT_GAIN,
+            "power_calibration_enabled": self.sweep.power_calibration_enabled,
+            "calibrated_output_power_dbm": (
+                self.sweep.calibrated_output_power_dbm
+            ),
+            "calibrated_nominal_gain_code": (
+                self.sweep.calibrated_nominal_gain_code
+            ),
+            "calibrated_reference_response_dbm": (
+                self.sweep.calibrated_reference_response_dbm
+            ),
+            "calibrated_correction_min_db": (
+                self.sweep.calibrated_correction_min_db
+            ),
+            "calibrated_correction_max_db": (
+                self.sweep.calibrated_correction_max_db
+            ),
+            "frequency_compensation_model": (
+                "nominal_gain * 10**((weakest_response_db - response_db(f))/20)"
+                if self._uses_gain_table
+                else None
+            ),
+            "calibration_output_run_id": self.sweep.calibration_output_run_id,
+            "calibration_input_run_id": self.sweep.calibration_input_run_id,
+            "calibration_database_path": (
+                self.sweep.calibration_database_path
+                if self.sweep.power_calibration_enabled
+                else None
+            ),
+            "output_board_type": self.sweep.output_board_type,
+            "input_board_type": self.sweep.input_board_type,
+            "calibration_output_sample_name": (
+                self.sweep.calibration_output_sample_name
+            ),
+            "calibration_input_sample_name": (
+                self.sweep.calibration_input_sample_name
+            ),
+            "gain_source": (
+                "tproc_dmem_frequency_table"
+                if self._uses_gain_table
+                else "immediate_gain_register"
+            ),
+            "gain_dmem_base_address": (
+                self.sweep.gain_dmem_base_address
+                if self._uses_gain_table
+                else None
+            ),
+            "gain_dmem_entry_count": int(self._gain_table.size),
+            "gain_frequency_point_count": self.sweep.frequency_points,
+            "gain_table_compressed": (
+                bool(self._uses_gain_table)
+                and self._gain_table.size < self.sweep.frequency_points
+            ),
             "scan_time_requested_us": self.sweep.scan_time_us,
             "scan_samples": self.scan_samples,
             "scan_time_actual_us": (
@@ -958,6 +1563,100 @@ def build_sparameter_program(
     return SParameterSweepProgram(soccfg, config, tproc_mhz=tproc_mhz)
 
 
+def _calibration_probe_config(
+    config: SParameterSweepConfig,
+) -> SParameterSweepConfig:
+    return replace(
+        config,
+        power_calibration_enabled=False,
+        power_sweep_enabled=False,
+        calibrated_gain_table=(),
+        calibrated_frequency_point_count=0,
+        calibrated_output_power_dbm=None,
+        calibrated_nominal_gain_code=None,
+        calibrated_reference_response_dbm=None,
+        calibrated_correction_min_db=None,
+        calibrated_correction_max_db=None,
+        calibration_output_run_id=0,
+        calibration_input_run_id=0,
+        calibration_output_sample_name="",
+        calibration_input_sample_name="",
+    )
+
+
+def _prepare_power_calibration(
+    soccfg,
+    config: SParameterSweepConfig,
+    *,
+    tproc_mhz: Optional[float],
+) -> Tuple[
+    SParameterSweepProgram,
+    Any,
+    CalibrationRunSummary,
+    Optional[InputPowerCalibration],
+]:
+    """Quantize the frequency grid, then select matching board calibrations."""
+    probe = build_sparameter_program(
+        soccfg,
+        _calibration_probe_config(config),
+        tproc_mhz=tproc_mhz,
+    )
+    catalog = CalibrationDatabase(config.calibration_database_path)
+    output_calibration = catalog.output_calibration(
+        config.output_board_type,
+        probe.frequencies_mhz,
+    )
+    try:
+        input_calibration = catalog.input_calibration(
+            config.input_board_type,
+            probe.frequencies_mhz,
+        )
+    except LookupError:
+        input_calibration = None
+    return (
+        probe,
+        output_calibration,
+        output_calibration.summary,
+        input_calibration,
+    )
+
+
+def _build_calibrated_program(
+    soccfg,
+    config: SParameterSweepConfig,
+    *,
+    target_power_dbm: float,
+    probe: SParameterSweepProgram,
+    output_calibration: Any,
+    output_run: CalibrationRunSummary,
+    input_calibration: Optional[InputPowerCalibration],
+    actual_output_att1_db: float,
+    actual_output_att2_db: float,
+    tproc_mhz: Optional[float],
+) -> Tuple[SParameterSweepProgram, GainSchedule]:
+    schedule = output_calibration.build_gain_schedule(
+        probe.frequencies_mhz,
+        target_power_dbm,
+        output_att1_db=actual_output_att1_db,
+        output_att2_db=actual_output_att2_db,
+        max_entries=MAX_DMEM_GAIN_ENTRIES,
+        dmem_base_address=GAIN_DMEM_BASE_ADDRESS,
+    )
+    point_config = config.for_gain_schedule(
+        schedule,
+        output_run,
+        None if input_calibration is None else input_calibration.summary,
+    )
+    program = build_sparameter_program(
+        soccfg,
+        point_config,
+        tproc_mhz=tproc_mhz,
+    )
+    if not np.array_equal(program.frequencies_mhz, probe.frequencies_mhz):
+        raise RuntimeError("calibrated program frequency grid changed unexpectedly")
+    return program, schedule
+
+
 @dataclass
 class StoredSParameterSweep:
     run_id: int
@@ -996,14 +1695,27 @@ def _qcodes_helpers():
     )
 
 
+def _config_for_metadata(config: SParameterSweepConfig) -> Mapping[str, Any]:
+    """Serialize user settings without duplicating a potentially 4000-word table."""
+    payload = asdict(config)
+    gain_table = payload.pop("calibrated_gain_table", [])
+    payload["calibrated_gain_table_entries"] = len(gain_table)
+    return payload
+
+
 def _power_result_payload(
     result: SParameterPowerSweepResult,
     *,
     planned_power_gains: Sequence[int],
+    planned_output_powers_dbm: Sequence[float] = (),
     power_scale: str,
 ) -> Mapping[str, Any]:
-    return {
-        "schema": "qick-rf-s-parameter-power-sweep-v1",
+    payload = {
+        "schema": (
+            "qick-rf-s-parameter-frequency-compensated-power-sweep-v3"
+            if result.calibrated
+            else "qick-rf-s-parameter-power-sweep-v1"
+        ),
         "power_sweep_execution": "python_software_loop",
         "frequency_sweep_execution": "tproc_hardware_register_add",
         "power_scale": power_scale,
@@ -1016,11 +1728,39 @@ def _power_result_payload(
         "frequencies_mhz": result.frequencies_mhz.tolist(),
         "mean_i": result.mean_i.tolist(),
         "mean_q": result.mean_q.tolist(),
+        "adc_magnitude_db": result.adc_magnitude_db.tolist(),
         "magnitude_db": result.magnitude_db.tolist(),
         "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
         "sample_rate_hz": result.sample_rate_hz,
         "iq_shape": list(result.iq_traces.shape),
+        "physical_power_calibrated": result.physical_power_calibrated,
     }
+    if result.calibrated:
+        payload.update({
+            "planned_output_powers_dbm": [
+                float(value) for value in planned_output_powers_dbm
+            ],
+            "output_powers_dbm": result.output_powers_dbm.tolist(),
+            "frequency_gain_codes": result.frequency_gain_codes.tolist(),
+            "actual_output_powers_dbm": (
+                None
+                if result.actual_output_powers_dbm is None
+                else result.actual_output_powers_dbm.tolist()
+            ),
+            "input_powers_dbm": (
+                None
+                if result.input_powers_dbm is None
+                else result.input_powers_dbm.tolist()
+            ),
+            "gain_mapping": (
+                "one nominal gain per software power point multiplied by "
+                "relative frequency-response correction"
+            ),
+            "dmem_execution": (
+                "one frequency-gain table is loaded for each software power point"
+            ),
+        })
+    return payload
 
 
 class _SParameterPowerRunWriter:
@@ -1038,8 +1778,16 @@ class _SParameterPowerRunWriter:
         self.connection_config = connection_config
         self.run_config = run_config
         self.rf_settings = rf_settings
+        self.calibrated = bool(config.power_calibration_enabled)
         self.planned_power_gains = tuple(
-            int(value) for value in config.power_gains
+            int(value) for value in (
+                [] if self.calibrated else config.power_gains
+            )
+        )
+        self.planned_output_powers_dbm = tuple(
+            float(value) for value in (
+                config.target_powers_dbm if self.calibrated else []
+            )
         )
         self.database_path = Path(
             getattr(
@@ -1057,6 +1805,7 @@ class _SParameterPowerRunWriter:
         self.final_dataset = None
         self.results = []
         self.completed_power_gains = []
+        self.completed_output_powers_dbm = []
         self.program_summaries = []
         self.row_count = 0
         self._helpers = None
@@ -1102,11 +1851,18 @@ class _SParameterPowerRunWriter:
             self.run_config.sample_name,
         )
         measurement = Measurement(exp=experiment, station=Station())
-        power_gain = Parameter(
-            POWER_GAIN_PARAMETER,
-            label="RF output gain code",
-            unit="",
-        )
+        if self.calibrated:
+            power_axis = Parameter(
+                OUTPUT_POWER_PARAMETER,
+                label="Calibrated RF output power",
+                unit="dBm",
+            )
+        else:
+            power_axis = Parameter(
+                POWER_GAIN_PARAMETER,
+                label="RF output gain code",
+                unit="",
+            )
         frequency = Parameter(
             FREQUENCY_PARAMETER,
             label="RF frequency",
@@ -1124,6 +1880,11 @@ class _SParameterPowerRunWriter:
             label="S-parameter magnitude",
             unit="dB",
         )
+        adc_magnitude_db = Parameter(
+            ADC_MAGNITUDE_DB_PARAMETER,
+            label="Raw ADC magnitude",
+            unit="dB ADC",
+        )
         phase_deg = Parameter(
             PHASE_DEG_PARAMETER,
             label="S-parameter unwrapped phase",
@@ -1131,28 +1892,69 @@ class _SParameterPowerRunWriter:
         )
         i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit="ADC units")
         q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit="ADC units")
-        measurement.register_parameter(power_gain)
+        measurement.register_parameter(power_axis)
         measurement.register_parameter(frequency)
         measurement.register_parameter(sample_index, paramtype="array")
-        for parameter in (mean_i, mean_q, magnitude_db, phase_deg):
+        calibrated_gain = None
+        actual_output_power = None
+        actual_input_power = None
+        if self.calibrated:
+            calibrated_gain = Parameter(
+                CALIBRATED_GAIN_PARAMETER,
+                label="Applied frequency-compensated QICK gain",
+                unit="",
+            )
+            measurement.register_parameter(
+                calibrated_gain,
+                setpoints=(power_axis, frequency),
+            )
+            actual_output_power = Parameter(
+                ACTUAL_OUTPUT_POWER_PARAMETER,
+                label="Actual RF output power",
+                unit="dBm",
+            )
+            actual_input_power = Parameter(
+                ACTUAL_INPUT_POWER_PARAMETER,
+                label="Actual RF input power",
+                unit="dBm",
+            )
+            measurement.register_parameter(
+                actual_output_power,
+                setpoints=(power_axis, frequency),
+            )
+            measurement.register_parameter(
+                actual_input_power,
+                setpoints=(power_axis, frequency),
+            )
+        for parameter in (
+            mean_i,
+            mean_q,
+            adc_magnitude_db,
+            magnitude_db,
+            phase_deg,
+        ):
             measurement.register_parameter(
                 parameter,
-                setpoints=(power_gain, frequency),
+                setpoints=(power_axis, frequency),
             )
         for parameter in (i_trace, q_trace):
             measurement.register_parameter(
                 parameter,
-                setpoints=(power_gain, frequency, sample_index),
+                setpoints=(power_axis, frequency, sample_index),
                 paramtype="array",
             )
         self._parameters = {
-            "power_gain": power_gain,
+            "power_axis": power_axis,
+            "calibrated_gain": calibrated_gain,
             "frequency": frequency,
             "sample_index": sample_index,
             "mean_i": mean_i,
             "mean_q": mean_q,
+            "adc_magnitude_db": adc_magnitude_db,
             "magnitude_db": magnitude_db,
             "phase_deg": phase_deg,
+            "actual_output_power": actual_output_power,
+            "actual_input_power": actual_input_power,
             "i_trace": i_trace,
             "q_trace": q_trace,
         }
@@ -1169,6 +1971,7 @@ class _SParameterPowerRunWriter:
         payload = _power_result_payload(
             result,
             planned_power_gains=self.planned_power_gains,
+            planned_output_powers_dbm=self.planned_output_powers_dbm,
             power_scale=self.config.power_scale,
         )
         return {
@@ -1180,43 +1983,71 @@ class _SParameterPowerRunWriter:
                 **asdict(self.run_config),
                 "database_path": str(self.database_path),
             },
-            "config": asdict(self.config),
+            "config": _config_for_metadata(self.config),
             "rf_settings_actual": self.rf_settings,
             "program_summaries": list(self.program_summaries),
             "result": payload,
             "formulas": {
                 "mean_i": "mean(i_trace)",
                 "mean_q": "mean(q_trace)",
-                "magnitude_db": "20*log10(hypot(mean_i, mean_q))",
+                "adc_magnitude_db": "20*log10(hypot(mean_i, mean_q))",
+                "magnitude_db": (
+                    "actual_input_power_dbm - actual_output_power_dbm"
+                    if result.physical_power_calibrated
+                    else "adc_magnitude_db"
+                ),
                 "phase_unwrapped_deg": (
                     "degrees(unwrap(angle(mean_i + 1j*mean_q), frequency))"
+                ),
+                "frequency_gain": (
+                    "nominal_gain * 10**((weakest_response_db - "
+                    "response_db(frequency))/20)"
                 ),
             },
             "storage": (
                 "one split I/Q array row and scalar response per "
                 "power-gain/frequency point"
             ),
-            "live_update": "database snapshot published after every power gain",
+            "live_update": "database snapshot published after every software power point",
         }
 
     def append(
         self,
-        gain: int,
+        power_coordinate: float,
         result: SParameterSweepResult,
         program_summary: Mapping[str, Any],
     ) -> SParameterPowerSweepResult:
         if self.datasaver is None or self.dataset is None:
             raise RuntimeError("power-sweep database writer is not open")
-        if int(gain) not in self.planned_power_gains:
-            raise ValueError(f"unexpected power gain {gain}")
+        if self.calibrated:
+            coordinate = float(power_coordinate)
+            if not any(
+                np.isclose(coordinate, planned, rtol=0.0, atol=1.0e-9)
+                for planned in self.planned_output_powers_dbm
+            ):
+                raise ValueError(f"unexpected compensated power {coordinate} dBm")
+            if not result.calibrated or result.frequency_gain_codes is None:
+                raise ValueError("compensated power sweep result lacks gain mapping")
+            if result.nominal_gain_code is None:
+                raise ValueError("frequency-compensated result lacks nominal gain")
+            nominal_gain = int(result.nominal_gain_code)
+        else:
+            nominal_gain = int(power_coordinate)
+            coordinate = nominal_gain
+            if nominal_gain not in self.planned_power_gains:
+                raise ValueError(f"unexpected power gain {nominal_gain}")
         sample_values = np.arange(result.sample_count, dtype=np.int32)
         parameters = self._parameters
         for index, frequency_mhz in enumerate(result.frequencies_mhz):
-            self.datasaver.add_result(
-                (parameters["power_gain"], int(gain)),
+            values = [
+                (parameters["power_axis"], coordinate),
                 (parameters["frequency"], float(frequency_mhz)),
                 (parameters["mean_i"], float(result.mean_i[index])),
                 (parameters["mean_q"], float(result.mean_q[index])),
+                (
+                    parameters["adc_magnitude_db"],
+                    float(result.adc_magnitude_db[index]),
+                ),
                 (
                     parameters["magnitude_db"],
                     float(result.magnitude_db[index]),
@@ -1234,9 +2065,27 @@ class _SParameterPowerRunWriter:
                     parameters["q_trace"],
                     np.ascontiguousarray(result.iq_traces[index, :, 1]),
                 ),
-            )
+            ]
+            if self.calibrated:
+                values.append((
+                    parameters["calibrated_gain"],
+                    int(result.frequency_gain_codes[index]),
+                ))
+                if result.actual_output_powers_dbm is not None:
+                    values.append((
+                        parameters["actual_output_power"],
+                        float(result.actual_output_powers_dbm[index]),
+                    ))
+                if result.input_powers_dbm is not None:
+                    values.append((
+                        parameters["actual_input_power"],
+                        float(result.input_powers_dbm[index]),
+                    ))
+            self.datasaver.add_result(*values)
         self.results.append(result)
-        self.completed_power_gains.append(int(gain))
+        self.completed_power_gains.append(nominal_gain)
+        if self.calibrated:
+            self.completed_output_powers_dbm.append(coordinate)
         self.program_summaries.append(dict(program_summary))
         self.row_count += int(result.frequencies_mhz.size * result.sample_count)
         combined = SParameterPowerSweepResult.from_sweeps(
@@ -1345,6 +2194,11 @@ def store_sparameter_result(
         label="S-parameter magnitude",
         unit="dB",
     )
+    adc_magnitude_db = Parameter(
+        ADC_MAGNITUDE_DB_PARAMETER,
+        label="Raw ADC magnitude",
+        unit="dB ADC",
+    )
     phase_deg = Parameter(
         PHASE_DEG_PARAMETER,
         label="S-parameter unwrapped phase",
@@ -1354,7 +2208,35 @@ def store_sparameter_result(
     q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit="ADC units")
     measurement.register_parameter(frequency)
     measurement.register_parameter(sample_index, paramtype="array")
-    for parameter in (mean_i, mean_q, magnitude_db, phase_deg):
+    calibrated_gain = None
+    actual_output_power = None
+    actual_input_power = None
+    if result.calibrated:
+        calibrated_gain = Parameter(
+            CALIBRATED_GAIN_PARAMETER,
+            label="Applied frequency-compensated QICK gain",
+            unit="",
+        )
+        measurement.register_parameter(calibrated_gain, setpoints=(frequency,))
+        actual_output_power = Parameter(
+            ACTUAL_OUTPUT_POWER_PARAMETER,
+            label="Actual RF output power",
+            unit="dBm",
+        )
+        actual_input_power = Parameter(
+            ACTUAL_INPUT_POWER_PARAMETER,
+            label="Actual RF input power",
+            unit="dBm",
+        )
+        measurement.register_parameter(actual_output_power, setpoints=(frequency,))
+        measurement.register_parameter(actual_input_power, setpoints=(frequency,))
+    for parameter in (
+        mean_i,
+        mean_q,
+        adc_magnitude_db,
+        magnitude_db,
+        phase_deg,
+    ):
         measurement.register_parameter(parameter, setpoints=(frequency,))
     for parameter in (i_trace, q_trace):
         measurement.register_parameter(
@@ -1372,7 +2254,7 @@ def store_sparameter_result(
             **asdict(run_config),
             "database_path": str(database_path),
         },
-        "config": asdict(config),
+        "config": _config_for_metadata(config),
         "rf_settings_actual": rf_settings,
         "program_summary": program_summary,
         "result": {
@@ -1380,17 +2262,45 @@ def store_sparameter_result(
             "frequencies_mhz": result.frequencies_mhz.tolist(),
             "mean_i": result.mean_i.tolist(),
             "mean_q": result.mean_q.tolist(),
+            "adc_magnitude_db": result.adc_magnitude_db.tolist(),
             "magnitude_db": result.magnitude_db.tolist(),
             "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
             "sample_rate_hz": result.sample_rate_hz,
             "iq_shape": list(result.iq_traces.shape),
+            "output_power_dbm": result.output_power_dbm,
+            "nominal_gain_code": result.nominal_gain_code,
+            "frequency_gain_codes": (
+                None
+                if result.frequency_gain_codes is None
+                else result.frequency_gain_codes.tolist()
+            ),
+            "actual_output_powers_dbm": (
+                None
+                if result.actual_output_powers_dbm is None
+                else result.actual_output_powers_dbm.tolist()
+            ),
+            "input_powers_dbm": (
+                None
+                if result.input_powers_dbm is None
+                else result.input_powers_dbm.tolist()
+            ),
+            "physical_power_calibrated": result.physical_power_calibrated,
         },
         "formulas": {
             "mean_i": "mean(i_trace)",
             "mean_q": "mean(q_trace)",
-            "magnitude_db": "20*log10(hypot(mean_i, mean_q))",
+            "adc_magnitude_db": "20*log10(hypot(mean_i, mean_q))",
+            "magnitude_db": (
+                "actual_input_power_dbm - actual_output_power_dbm"
+                if result.physical_power_calibrated
+                else "adc_magnitude_db"
+            ),
             "phase_unwrapped_deg": (
                 "degrees(unwrap(angle(mean_i + 1j*mean_q)))"
+            ),
+            "frequency_gain": (
+                "nominal_gain * 10**((weakest_response_db - "
+                "response_db(frequency))/20)"
             ),
         },
         "storage": "one split I/Q array row and scalar response per frequency",
@@ -1411,16 +2321,33 @@ def store_sparameter_result(
         if run_config.notes:
             dataset.add_metadata("experiment_notes", run_config.notes)
         for index, frequency_mhz in enumerate(result.frequencies_mhz):
-            datasaver.add_result(
+            values = [
                 (frequency, float(frequency_mhz)),
                 (mean_i, float(result.mean_i[index])),
                 (mean_q, float(result.mean_q[index])),
+                (adc_magnitude_db, float(result.adc_magnitude_db[index])),
                 (magnitude_db, float(result.magnitude_db[index])),
                 (phase_deg, float(result.phase_unwrapped_deg[index])),
                 (sample_index, sample_values),
                 (i_trace, np.ascontiguousarray(result.iq_traces[index, :, 0])),
                 (q_trace, np.ascontiguousarray(result.iq_traces[index, :, 1])),
-            )
+            ]
+            if calibrated_gain is not None:
+                values.append((
+                    calibrated_gain,
+                    int(result.frequency_gain_codes[index]),
+                ))
+                if result.actual_output_powers_dbm is not None:
+                    values.append((
+                        actual_output_power,
+                        float(result.actual_output_powers_dbm[index]),
+                    ))
+                if result.input_powers_dbm is not None:
+                    values.append((
+                        actual_input_power,
+                        float(result.input_powers_dbm[index]),
+                    ))
+            datasaver.add_result(*values)
             percent = 65 + round(25 * (index + 1) / result.frequencies_mhz.size)
             _emit_progress(
                 progress_callback,
@@ -1461,8 +2388,74 @@ def run_sparameter_sweep(
     soc, soccfg = connect_qick(connection_config, connector=connector)
     _emit_progress(progress_callback, 5, "Configuring RF output/readout chains")
     rf_settings = configure_sparameter_rf_board(soc, sweep_config)
+    calibration_context = None
+    if sweep_config.power_calibration_enabled:
+        _emit_progress(
+            progress_callback,
+            6,
+            "Selecting board-matched frequency-response calibration",
+        )
+        calibration_context = _prepare_power_calibration(
+            soccfg,
+            sweep_config,
+            tproc_mhz=tproc_mhz,
+        )
+        probe, output_calibration, output_run, input_calibration = (
+            calibration_context
+        )
+        input_run = (
+            None if input_calibration is None else input_calibration.summary
+        )
+        rf_settings = {
+            **dict(rf_settings),
+            "board_selection": {
+                "output_board_type": sweep_config.output_board_type,
+                "input_board_type": sweep_config.input_board_type,
+            },
+            "frequency_response_compensation": {
+                "database_path": str(
+                    Path(sweep_config.calibration_database_path)
+                    .expanduser()
+                    .resolve()
+                ),
+                "output_run": output_run.as_dict(),
+                "input_run": None if input_run is None else input_run.as_dict(),
+                "input_mapping_applied": input_calibration is not None,
+                "s_parameter_formula": (
+                    "P_input_dbm - P_output_dbm"
+                    if input_calibration is not None
+                    else "20*log10(hypot(mean_i, mean_q))"
+                ),
+                "gain_axis_usage": (
+                    "used only to remove linear gain scaling before extracting "
+                    "frequency dependence"
+                ),
+                "dmem_scope": "one gain table for the current software power point",
+            },
+        }
+    output_settings = dict(rf_settings.get("output", {}))
+    actual_output_att1_db = float(
+        output_settings.get("commanded_att1_db", sweep_config.output_att1_db)
+    )
+    actual_output_att2_db = float(
+        output_settings.get("commanded_att2_db", sweep_config.output_att2_db)
+    )
+    readout_settings = dict(rf_settings.get("readout", {}))
+    actual_input_attenuation_db = float(
+        readout_settings.get(
+            "commanded_attenuation_db",
+            sweep_config.readout_attenuation_db,
+        )
+    )
     if sweep_config.power_sweep_enabled:
-        power_gains = tuple(int(value) for value in sweep_config.power_gains)
+        if sweep_config.power_calibration_enabled:
+            power_coordinates = tuple(
+                float(value) for value in sweep_config.target_powers_dbm
+            )
+        else:
+            power_coordinates = tuple(
+                int(value) for value in sweep_config.power_gains
+            )
         writer = _SParameterPowerRunWriter(
             config=sweep_config,
             connection_config=connection_config,
@@ -1474,24 +2467,43 @@ def run_sparameter_sweep(
         _emit_progress(
             progress_callback,
             7,
-            f"Preparing live DB run for {len(power_gains)} power points",
+            f"Preparing live DB run for {len(power_coordinates)} power points",
         )
         writer.open()
         try:
-            for power_index, gain in enumerate(power_gains):
-                point_config = sweep_config.for_gain(gain)
+            for power_index, power_coordinate in enumerate(power_coordinates):
+                if sweep_config.power_calibration_enabled:
+                    probe, output_calibration, output_run, input_calibration = (
+                        calibration_context
+                    )
+                    program, _schedule = _build_calibrated_program(
+                        soccfg,
+                        sweep_config,
+                        target_power_dbm=float(power_coordinate),
+                        probe=probe,
+                        output_calibration=output_calibration,
+                        output_run=output_run,
+                        input_calibration=input_calibration,
+                        actual_output_att1_db=actual_output_att1_db,
+                        actual_output_att2_db=actual_output_att2_db,
+                        tproc_mhz=tproc_mhz,
+                    )
+                    power_label = f"{float(power_coordinate):.6g} dBm"
+                else:
+                    point_config = sweep_config.for_gain(int(power_coordinate))
+                    program = build_sparameter_program(
+                        soccfg,
+                        point_config,
+                        tproc_mhz=tproc_mhz,
+                    )
+                    power_label = f"gain {int(power_coordinate)}"
                 _emit_progress(
                     progress_callback,
-                    8 + round(87 * power_index / len(power_gains)),
+                    8 + round(87 * power_index / len(power_coordinates)),
                     (
-                        f"Compiling power {power_index + 1}/{len(power_gains)} "
-                        f"at gain {gain}"
+                        f"Compiling power {power_index + 1}/"
+                        f"{len(power_coordinates)} at {power_label}"
                     ),
-                )
-                program = build_sparameter_program(
-                    soccfg,
-                    point_config,
-                    tproc_mhz=tproc_mhz,
                 )
                 programs.append(program)
 
@@ -1500,7 +2512,7 @@ def run_sparameter_sweep(
                     total: int,
                     *,
                     _power_index: int = power_index,
-                    _gain: int = gain,
+                    _power_label: str = power_label,
                 ) -> None:
                     del total
                     power_progress = (
@@ -1509,13 +2521,13 @@ def run_sparameter_sweep(
                         * completed
                         / sweep_config.frequency_points
                     )
-                    fraction = power_progress / len(power_gains)
+                    fraction = power_progress / len(power_coordinates)
                     _emit_progress(
                         progress_callback,
                         8 + round(87 * max(0.0, min(1.0, fraction))),
                         (
-                            f"Power {_power_index + 1}/{len(power_gains)} "
-                            f"gain {_gain}: frequency {completed}/"
+                            f"Power {_power_index + 1}/{len(power_coordinates)} "
+                            f"{_power_label}: frequency {completed}/"
                             f"{sweep_config.frequency_points}"
                         ),
                     )
@@ -1526,19 +2538,28 @@ def run_sparameter_sweep(
                         counter_progress if progress_callback is not None else None
                     ),
                 )
+                if sweep_config.power_calibration_enabled:
+                    result = apply_power_calibration(
+                        result,
+                        output_calibration=output_calibration,
+                        input_calibration=input_calibration,
+                        output_att1_db=actual_output_att1_db,
+                        output_att2_db=actual_output_att2_db,
+                        input_attenuation_db=actual_input_attenuation_db,
+                    )
                 _emit_progress(
                     progress_callback,
                     8
                     + round(
-                        87 * (power_index + 0.9) / len(power_gains)
+                        87 * (power_index + 0.9) / len(power_coordinates)
                     ),
                     (
-                        f"Saving power {power_index + 1}/{len(power_gains)} "
-                        f"gain {gain}"
+                        f"Saving power {power_index + 1}/"
+                        f"{len(power_coordinates)} {power_label}"
                     ),
                 )
                 combined_result = writer.append(
-                    gain,
+                    power_coordinate,
                     result,
                     program.summary(),
                 )
@@ -1557,10 +2578,10 @@ def run_sparameter_sweep(
                     progress_callback,
                     8
                     + round(
-                        87 * (power_index + 1) / len(power_gains)
+                        87 * (power_index + 1) / len(power_coordinates)
                     ),
                     (
-                        f"Power {power_index + 1}/{len(power_gains)} saved; "
+                        f"Power {power_index + 1}/{len(power_coordinates)} saved; "
                         "live database updated"
                     ),
                 )
@@ -1581,11 +2602,28 @@ def run_sparameter_sweep(
         )
 
     _emit_progress(progress_callback, 8, "Compiling hardware frequency sweep")
-    program = build_sparameter_program(
-        soccfg,
-        sweep_config,
-        tproc_mhz=tproc_mhz,
-    )
+    if sweep_config.power_calibration_enabled:
+        probe, output_calibration, output_run, input_calibration = (
+            calibration_context
+        )
+        program, _schedule = _build_calibrated_program(
+            soccfg,
+            sweep_config,
+            target_power_dbm=float(sweep_config.output_power_dbm),
+            probe=probe,
+            output_calibration=output_calibration,
+            output_run=output_run,
+            input_calibration=input_calibration,
+            actual_output_att1_db=actual_output_att1_db,
+            actual_output_att2_db=actual_output_att2_db,
+            tproc_mhz=tproc_mhz,
+        )
+    else:
+        program = build_sparameter_program(
+            soccfg,
+            sweep_config,
+            tproc_mhz=tproc_mhz,
+        )
 
     def counter_progress(completed: int, total: int) -> None:
         fraction = 1.0 if total <= 0 else completed / total
@@ -1601,6 +2639,15 @@ def run_sparameter_sweep(
             counter_progress if progress_callback is not None else None
         ),
     )
+    if sweep_config.power_calibration_enabled:
+        result = apply_power_calibration(
+            result,
+            output_calibration=output_calibration,
+            input_calibration=input_calibration,
+            output_att1_db=actual_output_att1_db,
+            output_att2_db=actual_output_att2_db,
+            input_attenuation_db=actual_input_attenuation_db,
+        )
     _emit_progress(progress_callback, 62, "Averaging FIR IQ traces")
     dataset, row_count = store_sparameter_result(
         result,
@@ -1704,6 +2751,10 @@ def load_sparameter_run(
             frequencies,
             iq,
             sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+            output_powers_dbm=payload.get("output_powers_dbm"),
+            frequency_gain_codes=payload.get("frequency_gain_codes"),
+            actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
+            input_powers_dbm=payload.get("input_powers_dbm"),
         )
     else:
         i_trace = _coerce_trace_rows(i_data[I_TRACE_PARAMETER], frequencies.size)
@@ -1714,6 +2765,18 @@ def load_sparameter_run(
             frequencies,
             iq,
             sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+            output_power_dbm=payload.get("output_power_dbm"),
+            nominal_gain_code=payload.get(
+                "nominal_gain_code",
+                (
+                    None
+                    if payload.get("frequency_gain_codes") is None
+                    else max(payload["frequency_gain_codes"])
+                ),
+            ),
+            frequency_gain_codes=payload.get("frequency_gain_codes"),
+            actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
+            input_powers_dbm=payload.get("input_powers_dbm"),
         )
     return StoredSParameterSweep(
         run_id=int(dataset.run_id),
@@ -1726,13 +2789,18 @@ def load_sparameter_run(
 
 
 __all__ = [
+    "ACTUAL_INPUT_POWER_PARAMETER",
+    "ACTUAL_OUTPUT_POWER_PARAMETER",
+    "ADC_MAGNITUDE_DB_PARAMETER",
     "FILTER_TYPES",
+    "CALIBRATED_GAIN_PARAMETER",
     "FREQUENCY_PARAMETER",
     "I_TRACE_PARAMETER",
     "MAGNITUDE_DB_PARAMETER",
     "MAX_RF_OUTPUT_GAIN",
     "MEAN_I_PARAMETER",
     "MEAN_Q_PARAMETER",
+    "OUTPUT_POWER_PARAMETER",
     "PHASE_DEG_PARAMETER",
     "POWER_GAIN_PARAMETER",
     "POWER_SCALES",
@@ -1743,6 +2811,7 @@ __all__ = [
     "SParameterSweepProgram",
     "SParameterSweepResult",
     "StoredSParameterSweep",
+    "apply_power_calibration",
     "build_sparameter_program",
     "configure_sparameter_rf_board",
     "load_sparameter_run",

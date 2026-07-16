@@ -27,6 +27,7 @@ from qick_qcodes_experiment import (
     QickConnectionConfig,
 )
 from qick_sparameter_sweep import (
+    CALIBRATED_GAIN_PARAMETER,
     MAGNITUDE_DB_PARAMETER,
     MAX_RF_OUTPUT_GAIN,
     POWER_GAIN_PARAMETER,
@@ -223,6 +224,56 @@ def test_program_is_fixed_size_hardware_sweep_and_updates_both_dds_registers():
     assert long.loop_dims == [1001, 1]
 
 
+def test_calibrated_program_reads_gain_table_from_dmem_and_compresses_addresses():
+    gain_table = tuple(1000 + index for index in range(4000))
+    config = _config(
+        frequency_points=5001,
+        frequency_start_mhz=10.0,
+        frequency_end_mhz=20.0,
+        power_calibration_enabled=True,
+        calibration_database_path="calibration.db",
+        output_power_dbm=-20.0,
+        calibrated_gain_table=gain_table,
+        calibrated_frequency_point_count=5001,
+        calibrated_output_power_dbm=-20.0,
+        calibrated_nominal_gain_code=5000,
+        calibrated_reference_response_dbm=10.0,
+        calibrated_correction_min_db=-1.0,
+        calibrated_correction_max_db=0.0,
+        calibration_output_run_id=31,
+    )
+    program = SParameterSweepProgram(_mock_soccfg(), config)
+    program.compile()
+
+    assert program.summary()["gain_source"] == "tproc_dmem_frequency_table"
+    assert program.summary()["gain_dmem_entry_count"] == 4000
+    assert program.summary()["gain_table_compressed"] is True
+    assert sum(inst["name"] == "memr" for inst in program.prog_list) == 1
+    assert any(
+        inst["name"] == "condj"
+        and "reuse adjacent calibrated gain" in inst.get("comment", "")
+        for inst in program.prog_list
+    )
+    np.testing.assert_array_equal(
+        program._expanded_gain_codes()[:4],
+        [1000, 1000, 1001, 1002],
+    )
+
+    calls = []
+
+    class FakeSoc:
+        def reload_mem(self):
+            calls.append(("reload",))
+
+        def load_mem(self, data, mem_sel, addr):
+            calls.append(("load", np.asarray(data).copy(), mem_sel, addr))
+
+    program._load_runtime_dmem(FakeSoc())
+    assert calls[0] == ("reload",)
+    assert calls[1][2:] == ("dmem", 16)
+    np.testing.assert_array_equal(calls[1][1], gain_table)
+
+
 def test_program_quantizes_from_channel_metadata_when_refclk_is_missing():
     soccfg = _mock_soccfg()
     del soccfg._cfg["refclk_freq"]
@@ -385,6 +436,70 @@ def test_qcodes_round_trip_stores_split_traces_and_derived_response(
     assert latest_sparameter.run_id == dataset.run_id
 
 
+def test_calibrated_single_power_round_trip_stores_applied_gain_per_frequency(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "calibrated_sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging-calibrated"))
+    connection = QickConnectionConfig(host="127.0.0.1")
+    run = QcodesRunConfig(
+        database_path=str(database_path),
+        experiment_name="Calibrated RF response",
+        sample_name="unit-test",
+    )
+    base = _result()
+    result = SParameterSweepResult.from_iq(
+        base.requested_frequencies_mhz,
+        base.frequencies_mhz,
+        base.iq_traces,
+        output_power_dbm=-20.0,
+        nominal_gain_code=1200,
+        frequency_gain_codes=[1000, 1100, 1200],
+        actual_output_powers_dbm=[-30.0, -29.0, -28.0],
+        input_powers_dbm=[-50.0, -48.0, -46.0],
+    )
+    config = _config(
+        frequency_points=3,
+        power_calibration_enabled=True,
+        calibration_database_path=str(tmp_path / "gain_pwr_calb.db"),
+        output_power_dbm=-20.0,
+    )
+
+    dataset, _row_count = store_sparameter_result(
+        result,
+        config=config,
+        connection_config=connection,
+        run_config=run,
+        program_summary={"gain_source": "tproc_dmem_frequency_table"},
+        rf_settings={"power_calibration": {"output_run": {"run_id": 31}}},
+    )
+    loaded = load_sparameter_run(database_path, dataset.run_id)
+
+    assert loaded.result.output_power_dbm == -20.0
+    assert loaded.result.nominal_gain_code == 1200
+    np.testing.assert_array_equal(
+        loaded.result.frequency_gain_codes,
+        [1000, 1100, 1200],
+    )
+    assert loaded.result.physical_power_calibrated
+    np.testing.assert_allclose(
+        loaded.result.actual_output_powers_dbm,
+        [-30.0, -29.0, -28.0],
+    )
+    np.testing.assert_allclose(
+        loaded.result.input_powers_dbm,
+        [-50.0, -48.0, -46.0],
+    )
+    np.testing.assert_allclose(loaded.result.magnitude_db, [-20.0, -19.0, -18.0])
+    gain_data = dataset.get_parameter_data(CALIBRATED_GAIN_PARAMETER)[
+        CALIBRATED_GAIN_PARAMETER
+    ]
+    np.testing.assert_array_equal(
+        gain_data[CALIBRATED_GAIN_PARAMETER],
+        [1000, 1100, 1200],
+    )
+
+
 def test_software_power_sweep_publishes_one_live_db_run_per_power(
     tmp_path, monkeypatch
 ):
@@ -500,14 +615,144 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
     )
 
 
+def test_compensated_power_sweep_builds_one_frequency_gain_table_per_power(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "compensated_power_sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging-compensated"))
+    connection = QickConnectionConfig(host="127.0.0.1")
+    run = QcodesRunConfig(
+        database_path=str(database_path),
+        experiment_name="Compensated RF power dependence",
+        sample_name="unit-test",
+    )
+    calibration_path = tmp_path / "gain_pwr_calb.db"
+    calibration_path.touch()
+    config = _config(
+        frequency_points=3,
+        scan_time_us=4.0,
+        power_calibration_enabled=True,
+        calibration_database_path=str(calibration_path),
+        output_power_dbm=-30.0,
+        power_sweep_enabled=True,
+        power_start_dbm=-30.0,
+        power_end_dbm=-20.0,
+        power_points=2,
+        power_scale="log",
+        settle_seconds=0.0,
+    )
+
+    class Summary:
+        run_id = 31
+        sample_name = "RF_Out_400MHz"
+
+        def as_dict(self):
+            return {"run_id": self.run_id, "sample_name": self.sample_name}
+
+    class FakeOutputCalibration:
+        def output_power_dbm(self, frequencies, gains, **_kwargs):
+            return -20.0 + np.zeros_like(frequencies, dtype=float)
+
+    class FakeInputCalibration:
+        summary = Summary()
+
+        def input_power_dbm(self, frequencies, adc_magnitude_db, **_kwargs):
+            del frequencies
+            return np.asarray(adc_magnitude_db, dtype=float) - 40.0
+
+    built_tables = []
+
+    class FakeProgram:
+        def __init__(self, target_power_dbm, nominal_gain, gains):
+            self.target_power_dbm = target_power_dbm
+            self.nominal_gain = nominal_gain
+            self.gains = np.asarray(gains, dtype=np.int64)
+            self.frequencies_mhz = config.requested_frequencies_mhz
+
+        def acquire_fir_ddr(self, _soc, counter_progress=None):
+            if counter_progress is not None:
+                counter_progress(config.frequency_points, config.frequency_points)
+            iq = np.zeros((config.frequency_points, 4, 2), dtype=np.int32)
+            iq[:, :, 0] = self.gains[:, np.newaxis]
+            return SParameterSweepResult.from_iq(
+                self.frequencies_mhz,
+                self.frequencies_mhz,
+                iq,
+                output_power_dbm=self.target_power_dbm,
+                nominal_gain_code=self.nominal_gain,
+                frequency_gain_codes=self.gains,
+            )
+
+        def summary(self):
+            return {
+                "gain_source": "tproc_dmem_frequency_table",
+                "nominal_gain": self.nominal_gain,
+            }
+
+    def build_for_power(
+        _soccfg,
+        _config_value,
+        *,
+        target_power_dbm,
+        **_kwargs,
+    ):
+        nominal_gain = int(round((target_power_dbm + 40.0) * 100.0))
+        gains = np.asarray(
+            [nominal_gain, nominal_gain - 10, nominal_gain - 20],
+            dtype=np.int64,
+        )
+        built_tables.append((float(target_power_dbm), gains.copy()))
+        return FakeProgram(target_power_dbm, nominal_gain, gains), object()
+
+    monkeypatch.setattr(
+        sparameter_module,
+        "configure_sparameter_rf_board",
+        lambda _soc, _config: {"output": {}, "readout": {}},
+    )
+    monkeypatch.setattr(
+        sparameter_module,
+        "_prepare_power_calibration",
+        lambda *_args, **_kwargs: (
+            object(),
+            FakeOutputCalibration(),
+            Summary(),
+            FakeInputCalibration(),
+        ),
+    )
+    monkeypatch.setattr(
+        sparameter_module,
+        "_build_calibrated_program",
+        build_for_power,
+    )
+
+    stored = run_sparameter_sweep(
+        connection_config=connection,
+        run_config=run,
+        sweep_config=config,
+        connector=lambda **_kwargs: (object(), object()),
+    )
+
+    assert [entry[0] for entry in built_tables] == [-30.0, -20.0]
+    np.testing.assert_array_equal(built_tables[0][1], [1000, 990, 980])
+    np.testing.assert_array_equal(built_tables[1][1], [2000, 1990, 1980])
+    np.testing.assert_array_equal(stored.result.power_gains, [1000, 2000])
+    np.testing.assert_array_equal(stored.result.output_powers_dbm, [-30.0, -20.0])
+    np.testing.assert_array_equal(
+        stored.result.frequency_gain_codes,
+        [[1000, 990, 980], [2000, 1990, 1980]],
+    )
+
+
 def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     tmp_path,
 ):
     app = _application()
     window = gui.MainWindow()
     panel = window._sparameter_panel
+    calibration_panel = window._calibration_panel
 
     assert window._control_tabs.indexOf(panel) >= 0
+    assert window._control_tabs.indexOf(calibration_panel) >= 0
     assert panel.gain.maximum() == MAX_RF_OUTPUT_GAIN
     panel.frequency_start_mhz.setValue(42.0)
     panel.frequency_end_mhz.setValue(84.0)
@@ -523,6 +768,11 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     panel.database_path.setText(str(sparameter_database))
     panel.output_filter_type.setCurrentText("lowpass")
     panel.readout_filter_type.setCurrentText("bandpass")
+    calibration_database = tmp_path / "gain_pwr_calb.db"
+    calibration_panel.database_path.setText(str(calibration_database))
+    calibration_panel.scope_resource.setText("USB::MOCK")
+    calibration_panel.input_board.setCurrentText("RF_In")
+    calibration_panel.input_path_loss.setValue(3.5)
     settings = window._settings_to_dict()
     decoded = window._decode_settings(settings)
     assert decoded["s_parameter"]["frequency_start_mhz"] == 42.0
@@ -538,6 +788,20 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     assert decoded["run_config"].database_path == str(experiment_database)
     assert decoded["s_parameter"]["output_filter_type"] == "lowpass"
     assert decoded["s_parameter"]["readout_filter_type"] == "bandpass"
+    assert decoded["calibration"]["database_path"] == str(calibration_database)
+    assert (
+        decoded["calibration"]["output"]["oscilloscope"]["visa_resource"]
+        == "USB::MOCK"
+    )
+    assert decoded["calibration"]["input"]["input_board_type"] == "RF_In"
+    assert decoded["calibration"]["input"]["path_loss_db"] == 3.5
+
+    legacy_settings = dict(settings)
+    legacy_settings["version"] = 8
+    legacy_settings.pop("calibration")
+    legacy_decoded = window._decode_settings(legacy_settings)
+    assert legacy_decoded["calibration"]["output"]["output_board_type"] == "RF_Out"
+    assert legacy_decoded["calibration"]["input"]["input_board_type"] == "RF_In"
 
     run_arguments = window._sparameter_run_arguments()
     assert run_arguments["run_config"].database_path == str(
@@ -559,5 +823,39 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
             [_result(), _result()],
         )
     )
+    app.processEvents()
+    window.close()
+
+
+def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._sparameter_panel
+    calibration_path = tmp_path / "gain_pwr_calb.db"
+
+    panel.power_calibration_enabled.setChecked(True)
+    panel.calibration_database_path.setText(str(calibration_path))
+    panel.output_board_type.setCurrentText("DC_Out")
+    panel.input_board_type.setCurrentText("RF_In")
+    panel.output_power_dbm.setValue(-23.5)
+    panel.power_sweep_enabled.setChecked(True)
+    panel.power_start_dbm.setValue(-40.0)
+    panel.power_end_dbm.setValue(-10.0)
+    panel.power_points.setValue(7)
+    panel.power_scale.setCurrentIndex(panel.power_scale.findData("log"))
+
+    settings = window._settings_to_dict()
+    decoded = window._decode_settings(settings)["s_parameter"]
+
+    assert decoded["power_calibration_enabled"] is True
+    assert decoded["calibration_database_path"] == str(calibration_path)
+    assert decoded["output_board_type"] == "DC_Out"
+    assert decoded["input_board_type"] == "RF_In"
+    assert decoded["output_power_dbm"] == -23.5
+    assert decoded["power_start_dbm"] == -40.0
+    assert decoded["power_end_dbm"] == -10.0
+    assert panel.gain.isEnabled() is False
+    assert panel.power_start_gain.isEnabled() is False
+    assert panel.power_start_dbm.isEnabled() is True
     app.processEvents()
     window.close()

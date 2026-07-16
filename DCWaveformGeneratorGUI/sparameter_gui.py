@@ -31,6 +31,7 @@ try:
         load_sparameter_run,
         run_sparameter_sweep,
     )
+    from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
 except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
@@ -40,6 +41,7 @@ except ImportError:
         load_sparameter_run,
         run_sparameter_sweep,
     )
+    from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
 
 
 DEFAULT_SPARAMETER_DB_PATH = str(
@@ -78,6 +80,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.gain.setRange(0, MAX_RF_OUTPUT_GAIN)
         self.gain.setValue(20000)
         self.gain.setSuffix(f" / {MAX_RF_OUTPUT_GAIN}")
+        self.output_power_dbm = self._power_spin(-20.0)
         self.scan_time_us = QtWidgets.QDoubleSpinBox()
         self.scan_time_us.setRange(0.001, 1.0e6)
         self.scan_time_us.setDecimals(6)
@@ -89,8 +92,50 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
         sweep_form.addRow("Single output gain:", self.gain)
+        sweep_form.addRow("Single target power:", self.output_power_dbm)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
         content_layout.addWidget(sweep_group)
+
+        self.power_calibration_enabled = QtWidgets.QGroupBox(
+            "Frequency Response Compensation"
+        )
+        self.power_calibration_enabled.setCheckable(True)
+        self.power_calibration_enabled.setChecked(False)
+        calibration_form = QtWidgets.QFormLayout(
+            self.power_calibration_enabled
+        )
+        self.calibration_database_path = QtWidgets.QLineEdit()
+        self.calibration_database_path.setPlaceholderText(
+            "Select gain_pwr_calb.db"
+        )
+        self.browse_calibration_database = QtWidgets.QToolButton()
+        self.browse_calibration_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_calibration_database.setToolTip(
+            "Choose a QCoDeS frequency-response calibration database"
+        )
+        self.browse_calibration_database.clicked.connect(
+            self._browse_calibration_database
+        )
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.addWidget(self.calibration_database_path, 1)
+        calibration_path_row.addWidget(self.browse_calibration_database)
+        self.output_board_type = QtWidgets.QComboBox()
+        self.output_board_type.addItems(OUTPUT_BOARD_TYPES)
+        self.output_board_type.setCurrentText("RF_Out")
+        self.input_board_type = QtWidgets.QComboBox()
+        self.input_board_type.addItems(INPUT_BOARD_TYPES)
+        self.input_board_type.setCurrentText("DC_In")
+        self.calibration_hint = QtWidgets.QLabel(
+            "Same-board response; normalized to the weakest frequency in the sweep."
+        )
+        self.calibration_hint.setWordWrap(True)
+        calibration_form.addRow("Calibration DB:", calibration_path_row)
+        calibration_form.addRow("Output board:", self.output_board_type)
+        calibration_form.addRow("Input board:", self.input_board_type)
+        calibration_form.addRow(self.calibration_hint)
+        content_layout.addWidget(self.power_calibration_enabled)
 
         self.power_sweep_enabled = QtWidgets.QGroupBox(
             "Power Sweep (Software)"
@@ -100,6 +145,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         power_form = QtWidgets.QFormLayout(self.power_sweep_enabled)
         self.power_start_gain = self._gain_spin(1000)
         self.power_end_gain = self._gain_spin(20000)
+        self.power_start_dbm = self._power_spin(-30.0)
+        self.power_end_dbm = self._power_spin(-10.0)
         self.power_points = QtWidgets.QSpinBox()
         self.power_points.setRange(2, 100_000)
         self.power_points.setValue(5)
@@ -109,9 +156,14 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.power_scale.addItem(scale_labels[scale], scale)
         power_form.addRow("Start gain code:", self.power_start_gain)
         power_form.addRow("End gain code:", self.power_end_gain)
+        power_form.addRow("Start target power:", self.power_start_dbm)
+        power_form.addRow("End target power:", self.power_end_dbm)
         power_form.addRow("Power points:", self.power_points)
         power_form.addRow("Spacing:", self.power_scale)
         self.power_sweep_enabled.toggled.connect(
+            self._update_power_control_state
+        )
+        self.power_calibration_enabled.toggled.connect(
             self._update_power_control_state
         )
         content_layout.addWidget(self.power_sweep_enabled)
@@ -231,6 +283,15 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         return widget
 
     @staticmethod
+    def _power_spin(value: float) -> QtWidgets.QDoubleSpinBox:
+        widget = QtWidgets.QDoubleSpinBox()
+        widget.setRange(-200.0, 100.0)
+        widget.setDecimals(6)
+        widget.setValue(value)
+        widget.setSuffix(" dBm")
+        return widget
+
+    @staticmethod
     def _attenuation_spin(value: float) -> QtWidgets.QDoubleSpinBox:
         widget = QtWidgets.QDoubleSpinBox()
         widget.setRange(0.0, 31.75)
@@ -255,15 +316,37 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         widget.addItems(FILTER_TYPES)
         return widget
 
-    def _update_power_control_state(self, enabled: bool) -> None:
-        self.gain.setEnabled(not enabled)
+    def _update_power_control_state(self, _enabled: bool) -> None:
+        sweep_enabled = self.power_sweep_enabled.isChecked()
+        calibrated = self.power_calibration_enabled.isChecked()
+        self.gain.setEnabled(not sweep_enabled and not calibrated)
+        self.output_power_dbm.setEnabled(not sweep_enabled and calibrated)
         for widget in (
             self.power_start_gain,
             self.power_end_gain,
-            self.power_points,
-            self.power_scale,
         ):
-            widget.setEnabled(enabled)
+            widget.setEnabled(sweep_enabled and not calibrated)
+        for widget in (self.power_start_dbm, self.power_end_dbm):
+            widget.setEnabled(sweep_enabled and calibrated)
+        self.power_points.setEnabled(sweep_enabled)
+        self.power_scale.setEnabled(sweep_enabled)
+        for widget in (
+            self.calibration_database_path,
+            self.browse_calibration_database,
+            self.output_board_type,
+            self.input_board_type,
+        ):
+            widget.setEnabled(calibrated)
+
+    def _browse_calibration_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose frequency-response calibration database",
+            self.calibration_database_path.text().strip(),
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.calibration_database_path.setText(path)
 
     def _browse_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -294,9 +377,20 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             frequency_end_mhz=self.frequency_end_mhz.value(),
             frequency_points=self.frequency_points.value(),
             gain=self.gain.value(),
+            power_calibration_enabled=(
+                self.power_calibration_enabled.isChecked()
+            ),
+            calibration_database_path=(
+                self.calibration_database_path.text().strip()
+            ),
+            output_board_type=self.output_board_type.currentText(),
+            input_board_type=self.input_board_type.currentText(),
+            output_power_dbm=self.output_power_dbm.value(),
             power_sweep_enabled=self.power_sweep_enabled.isChecked(),
             power_start_gain=self.power_start_gain.value(),
             power_end_gain=self.power_end_gain.value(),
+            power_start_dbm=self.power_start_dbm.value(),
+            power_end_dbm=self.power_end_dbm.value(),
             power_points=self.power_points.value(),
             power_scale=str(self.power_scale.currentData()),
             scan_time_us=self.scan_time_us.value(),
@@ -343,8 +437,11 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.frequency_end_mhz, config.frequency_end_mhz),
             (self.frequency_points, config.frequency_points),
             (self.gain, config.gain),
+            (self.output_power_dbm, config.output_power_dbm),
             (self.power_start_gain, config.power_start_gain),
             (self.power_end_gain, config.power_end_gain),
+            (self.power_start_dbm, config.power_start_dbm),
+            (self.power_end_dbm, config.power_end_dbm),
             (self.power_points, config.power_points),
             (self.scan_time_us, config.scan_time_us),
             (self.output_att1_db, config.output_att1_db),
@@ -368,11 +465,19 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             widget.setValue(value)
         self.output_filter_type.setCurrentText(config.output_filter_type)
         self.readout_filter_type.setCurrentText(config.readout_filter_type)
+        self.calibration_database_path.setText(
+            config.calibration_database_path
+        )
+        self.output_board_type.setCurrentText(config.output_board_type)
+        self.input_board_type.setCurrentText(config.input_board_type)
         self.database_path.setText(database_path)
         power_scale_index = self.power_scale.findData(config.power_scale)
         if power_scale_index < 0:
             raise ValueError(f"unsupported power scale {config.power_scale!r}")
         self.power_scale.setCurrentIndex(power_scale_index)
+        self.power_calibration_enabled.setChecked(
+            config.power_calibration_enabled
+        )
         self.power_sweep_enabled.setChecked(config.power_sweep_enabled)
         self._update_power_control_state(config.power_sweep_enabled)
         self.force_overwrite.setChecked(config.force_overwrite)
@@ -388,6 +493,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.load_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
+        self.power_calibration_enabled.setEnabled(not running)
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)
@@ -447,12 +553,33 @@ if _USE_PYQTGRAPH:
             frequency = result.frequencies_mhz
             magnitude = result.magnitude_db
             phase = result.phase_unwrapped_deg
+            self.magnitude_plot.setLabel(
+                "left",
+                (
+                    "S21 (P input / P output)"
+                    if getattr(result, "physical_power_calibrated", False)
+                    else "ADC magnitude"
+                ),
+                units="dB",
+            )
             if getattr(magnitude, "ndim", 1) == 1:
                 magnitude = [magnitude]
                 phase = [phase]
-                gains = [None]
+                curve_labels = [
+                    None
+                    if getattr(result, "output_power_dbm", None) is None
+                    else f"{float(result.output_power_dbm):.6g} dBm"
+                ]
             else:
-                gains = list(result.power_gains)
+                output_powers = getattr(result, "output_powers_dbm", None)
+                if output_powers is None:
+                    curve_labels = [
+                        f"gain {int(gain)}" for gain in result.power_gains
+                    ]
+                else:
+                    curve_labels = [
+                        f"{float(power):.6g} dBm" for power in output_powers
+                    ]
             for curve in self._magnitude_curves:
                 self.magnitude_plot.removeItem(curve)
             for curve in self._phase_curves:
@@ -461,12 +588,11 @@ if _USE_PYQTGRAPH:
             self._phase_curves.clear()
             self._magnitude_legend.clear()
             self._phase_legend.clear()
-            count = len(gains)
-            for index, (gain, magnitude_values, phase_values) in enumerate(
-                zip(gains, magnitude, phase)
+            count = len(curve_labels)
+            for index, (name, magnitude_values, phase_values) in enumerate(
+                zip(curve_labels, magnitude, phase)
             ):
                 color = pg.intColor(index, hues=max(1, count), values=1)
-                name = None if gain is None else f"gain {int(gain)}"
                 self._magnitude_curves.append(
                     self.magnitude_plot.plot(
                         frequency,
@@ -510,13 +636,24 @@ else:
             if getattr(magnitude, "ndim", 1) == 1:
                 magnitude = [magnitude]
                 phase = [phase]
-                gains = [None]
+                curve_labels = [
+                    None
+                    if getattr(result, "output_power_dbm", None) is None
+                    else f"{float(result.output_power_dbm):.6g} dBm"
+                ]
             else:
-                gains = list(result.power_gains)
-            for gain, magnitude_values, phase_values in zip(
-                gains, magnitude, phase
+                output_powers = getattr(result, "output_powers_dbm", None)
+                if output_powers is None:
+                    curve_labels = [
+                        f"gain {int(gain)}" for gain in result.power_gains
+                    ]
+                else:
+                    curve_labels = [
+                        f"{float(power):.6g} dBm" for power in output_powers
+                    ]
+            for label, magnitude_values, phase_values in zip(
+                curve_labels, magnitude, phase
             ):
-                label = None if gain is None else f"gain {int(gain)}"
                 self.magnitude_plot.plot(
                     result.frequencies_mhz,
                     magnitude_values,
@@ -529,10 +666,16 @@ else:
                     "-o",
                     label=label,
                 )
-            if gains[0] is not None:
+            if curve_labels[0] is not None:
                 self.magnitude_plot.legend()
                 self.phase_plot.legend()
-            self.magnitude_plot.set_ylabel("Magnitude [dB]")
+            self.magnitude_plot.set_ylabel(
+                (
+                    "S21, P input - P output [dB]"
+                    if getattr(result, "physical_power_calibrated", False)
+                    else "ADC magnitude [dB]"
+                )
+            )
             self.phase_plot.set_ylabel("Unwrapped phase [deg]")
             self.phase_plot.set_xlabel("RF frequency [MHz]")
             self.draw_idle()

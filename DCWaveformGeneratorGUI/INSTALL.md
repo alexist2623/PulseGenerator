@@ -124,6 +124,23 @@ The gain code controls RF amplitude; it is not a calibrated dBm value. Power is
 not advanced by tProcessor arithmetic: Python compiles and runs one hardware
 frequency sweep per gain point.
 
+Enable **Frequency Response Compensation** to select a board-matched
+`gain_pwr_calb.db` run covering the complete frequency range. The calibration
+code does not invert the measured power-versus-gain points. It removes the
+linear DAC-gain term from each measured point, extracts only the relative
+frequency response, and normalizes that response to the weakest frequency in
+the requested sweep. ATT1/ATT2 contribute only a frequency-independent level
+offset.
+
+For a single S-parameter sweep, Python creates one nominal gain for the target
+power and loads one frequency-dependent gain table into tProcessor DMEM. The
+hardware frequency loop reads the corresponding gain with `memr` at every
+frequency. For a power sweep, the power axis remains a Python software loop:
+each power point gets a new nominal gain and a newly loaded frequency-gain
+table, followed by one hardware frequency sweep. At most 4000 gain words are
+stored from DMEM address 16. Sweeps with more than 4000 frequency points map
+adjacent frequency points to the nearest representative table entry.
+
 RF output duration is not encoded as one 16-bit generator pulse length. A
 3-fabric-cycle periodic DDS command starts the output, and a separately timed
 zero-gain one-shot command stops it after the FIR capture interval. This removes
@@ -133,9 +150,13 @@ word so each hardware-sweep frequency update is accepted promptly.
 
 Each frequency point produces one post-FIR 1 MSPS DDR trace. The trace is saved
 as separate `i_trace[sample]` and `q_trace[sample]` QCoDeS arrays, then reduced
-to one complex response using the mean I and mean Q. The stored scalar response
-uses `20*log10(hypot(mean_i, mean_q))` for magnitude and an unwrapped
-`angle(mean_i + 1j*mean_q)` in degrees for phase. The GUI displays both curves
+to one complex response using the mean I and mean Q. Without input calibration,
+the stored scalar response uses `20*log10(hypot(mean_i, mean_q))` for magnitude.
+When the selected calibration DB contains both a matching output-board run and
+a matching input-board run, the raw ADC magnitude is retained as
+`adc_magnitude_db`, actual connector output/input powers are stored, and the
+displayed S-parameter becomes `P_input_dBm - P_output_dBm`. Phase remains the
+unwrapped `angle(mean_i + 1j*mean_q)` in degrees. The GUI displays both curves
 against the actual common-quantized RF frequency. **Load Saved Run** reconstructs
 the response from the stored I/Q arrays; run ID 0 selects the latest run carrying
 RF S-parameter metadata rather than the latest unrelated run in the database.
@@ -146,10 +167,34 @@ published to the configured DB path. Plottr and the GUI can therefore refresh
 the same run while later gain points are still being acquired. The GUI overlays
 the completed magnitude and phase traces with one color per gain code.
 
+## Power calibration
+
+The **Calibration** tab writes output and input runs to a dedicated
+`gain_pwr_calb.db`. Output calibration starts a periodic QICK DDS tone at every
+frequency/gain pair and reads a Keysight/Agilent oscilloscope FFT marker through
+PyVISA. Configure the scope VISA resource, input channel, FFT math function,
+span, settling time, and marker-average count. The resulting QCoDeS columns are
+`gain`, `freq`, and `pwr`, matching the original calibration notebooks. The
+scope must support the DSO-X 6000-series SCPI commands used by
+`KeysightFftPowerMeter`; adapters for other instruments can implement the same
+`measure_power_dbm()` interface.
+
+Input calibration selects a covering output-board run, performs one FIR-DDR
+hardware frequency sweep for every configured gain, and computes the known
+input power as calibrated output power minus the configured external path loss.
+At every frequency it fits
+`input_power_dbm = slope * 20*log10(hypot(mean_i,mean_q)) + intercept`.
+The QCoDeS columns `measured_value`, `meas_in_pwr`, `meas_slope`, and
+`meas_intercept`, plus `Calibration_Result` and `Calibration_Config` metadata,
+remain compatible with existing RF_In/DC_In runs. Input attenuation is recorded
+separately and corrected when a later S-parameter run uses a different setting.
+Both calibration workflows use local SQLite staging and publish the completed
+run to the selected DB after a WAL checkpoint.
+
 ## Verification
 
 ```powershell
-python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes, plottr; print('GUI dependencies OK')"
+python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes, plottr, pyvisa; print('GUI dependencies OK')"
 python DCWaveform_Generator.py
 ```
 
