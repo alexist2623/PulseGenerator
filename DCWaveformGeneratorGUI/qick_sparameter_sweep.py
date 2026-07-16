@@ -10,15 +10,16 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from math import ceil, isfinite
 from numbers import Integral, Real
 from pathlib import Path
 import json
+import shutil
 import sqlite3
 import time
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +39,8 @@ else:
 
 MAX_RF_OUTPUT_GAIN = 32766
 FILTER_TYPES = ("bypass", "lowpass", "highpass", "bandpass")
+POWER_SCALES = ("linear", "log")
+POWER_GAIN_PARAMETER = "rf_power_gain"
 FREQUENCY_PARAMETER = "rf_frequency_mhz"
 SAMPLE_INDEX_PARAMETER = "sample_index"
 I_TRACE_PARAMETER = "i_trace"
@@ -101,6 +104,11 @@ class SParameterSweepConfig:
     frequency_end_mhz: float = 100.0
     frequency_points: int = 101
     gain: int = 20000
+    power_sweep_enabled: bool = False
+    power_start_gain: int = 1000
+    power_end_gain: int = 20000
+    power_points: int = 5
+    power_scale: str = "linear"
     scan_time_us: float = 10.0
     output_att1_db: float = 10.0
     output_att2_db: float = 10.0
@@ -133,6 +141,28 @@ class SParameterSweepConfig:
             raise ValueError(
                 f"gain must not exceed the RF output limit {MAX_RF_OUTPUT_GAIN}"
             )
+        if not isinstance(self.power_sweep_enabled, bool):
+            raise TypeError("power_sweep_enabled must be boolean")
+        power_start = _require_int(self.power_start_gain, "power_start_gain")
+        power_end = _require_int(self.power_end_gain, "power_end_gain")
+        power_points = _require_int(self.power_points, "power_points", 2)
+        if power_start > MAX_RF_OUTPUT_GAIN or power_end > MAX_RF_OUTPUT_GAIN:
+            raise ValueError(
+                "power sweep gain must not exceed the RF output limit "
+                f"{MAX_RF_OUTPUT_GAIN}"
+            )
+        if self.power_scale not in POWER_SCALES:
+            raise ValueError(f"power_scale must be one of {POWER_SCALES}")
+        if self.power_sweep_enabled:
+            if power_start == power_end:
+                raise ValueError("power sweep start and end gains must differ")
+            if self.power_scale == "log" and min(power_start, power_end) <= 0:
+                raise ValueError("log power sweep gains must be greater than zero")
+            if np.unique(self.power_gains).size != power_points:
+                raise ValueError(
+                    "power sweep points collapse to duplicate integer gain codes; "
+                    "reduce the point count or widen the gain range"
+                )
         _require_finite(self.scan_time_us, "scan_time_us", positive=True)
         _require_attenuation(self.output_att1_db, "output_att1_db")
         _require_attenuation(self.output_att2_db, "output_att2_db")
@@ -185,6 +215,38 @@ class SParameterSweepConfig:
             self.frequency_end_mhz,
             self.frequency_points,
             dtype=float,
+        )
+
+    @property
+    def power_gains(self) -> np.ndarray:
+        """Return software-swept QICK DAC gain codes in execution order."""
+        if not self.power_sweep_enabled:
+            return np.asarray([self.gain], dtype=np.int64)
+        if self.power_scale == "linear":
+            values = np.linspace(
+                self.power_start_gain,
+                self.power_end_gain,
+                self.power_points,
+                dtype=float,
+            )
+        else:
+            values = np.geomspace(
+                self.power_start_gain,
+                self.power_end_gain,
+                self.power_points,
+                dtype=float,
+            )
+        gains = np.rint(values).astype(np.int64)
+        gains[0] = self.power_start_gain
+        gains[-1] = self.power_end_gain
+        return gains
+
+    def for_gain(self, gain: int) -> "SParameterSweepConfig":
+        """Build one hardware-frequency-sweep config for a software power point."""
+        return replace(
+            self,
+            gain=_require_int(gain, "gain"),
+            power_sweep_enabled=False,
         )
 
 
@@ -246,6 +308,118 @@ class SParameterSweepResult:
     @property
     def sample_count(self) -> int:
         return int(self.iq_traces.shape[1])
+
+
+@dataclass(frozen=True)
+class SParameterPowerSweepResult:
+    """Completed gain points from a software power sweep."""
+
+    power_gains: np.ndarray
+    requested_frequencies_mhz: np.ndarray
+    frequencies_mhz: np.ndarray
+    iq_traces: np.ndarray
+    mean_i: np.ndarray
+    mean_q: np.ndarray
+    magnitude_db: np.ndarray
+    phase_unwrapped_deg: np.ndarray
+    sample_rate_hz: float
+    reserved_physical_words: Tuple[Optional[int], ...] = ()
+
+    @classmethod
+    def from_iq(
+        cls,
+        power_gains: Any,
+        requested_frequencies_mhz: Any,
+        frequencies_mhz: Any,
+        iq_traces: Any,
+        *,
+        sample_rate_hz: float = 1_000_000.0,
+        reserved_physical_words: Sequence[Optional[int]] = (),
+    ) -> "SParameterPowerSweepResult":
+        gains = np.asarray(power_gains, dtype=np.int64).reshape(-1)
+        requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
+        frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
+        iq = np.asarray(iq_traces)
+        if iq.ndim != 4 or iq.shape[-1] != 2:
+            raise ValueError(
+                "power-sweep IQ must have shape (power, frequency, sample, 2)"
+            )
+        if iq.shape[:2] != (gains.size, frequencies.size):
+            raise ValueError("power/frequency axes do not match the IQ data")
+        if requested.size != frequencies.size:
+            raise ValueError("requested and actual frequency counts do not match")
+        if iq.shape[2] < 1:
+            raise ValueError("every power/frequency point needs at least one sample")
+        mean = iq.astype(np.float64).mean(axis=2)
+        mean_i = mean[:, :, 0]
+        mean_q = mean[:, :, 1]
+        magnitude = np.hypot(mean_i, mean_q)
+        phase = np.degrees(
+            np.unwrap(np.angle(mean_i + 1j * mean_q), axis=1)
+        )
+        reserved = tuple(reserved_physical_words)
+        if reserved and len(reserved) != gains.size:
+            raise ValueError("reserved DDR word counts must match power points")
+        return cls(
+            power_gains=np.ascontiguousarray(gains),
+            requested_frequencies_mhz=np.ascontiguousarray(requested),
+            frequencies_mhz=np.ascontiguousarray(frequencies),
+            iq_traces=np.ascontiguousarray(iq),
+            mean_i=np.ascontiguousarray(mean_i),
+            mean_q=np.ascontiguousarray(mean_q),
+            magnitude_db=np.ascontiguousarray(
+                20.0
+                * np.log10(
+                    np.maximum(magnitude, np.finfo(np.float64).tiny)
+                )
+            ),
+            phase_unwrapped_deg=np.ascontiguousarray(phase),
+            sample_rate_hz=_require_finite(
+                sample_rate_hz, "sample_rate_hz", positive=True
+            ),
+            reserved_physical_words=reserved,
+        )
+
+    @classmethod
+    def from_sweeps(
+        cls,
+        power_gains: Sequence[int],
+        sweeps: Sequence[SParameterSweepResult],
+    ) -> "SParameterPowerSweepResult":
+        if not sweeps:
+            raise ValueError("at least one completed power sweep is required")
+        reference = sweeps[0]
+        for result in sweeps[1:]:
+            if not np.array_equal(
+                result.requested_frequencies_mhz,
+                reference.requested_frequencies_mhz,
+            ) or not np.array_equal(
+                result.frequencies_mhz,
+                reference.frequencies_mhz,
+            ):
+                raise ValueError("all power points must share one frequency axis")
+            if result.iq_traces.shape != reference.iq_traces.shape:
+                raise ValueError("all power points must share one IQ trace shape")
+            if result.sample_rate_hz != reference.sample_rate_hz:
+                raise ValueError("all power points must share one sample rate")
+        return cls.from_iq(
+            power_gains,
+            reference.requested_frequencies_mhz,
+            reference.frequencies_mhz,
+            np.stack([result.iq_traces for result in sweeps], axis=0),
+            sample_rate_hz=reference.sample_rate_hz,
+            reserved_physical_words=[
+                result.reserved_physical_words for result in sweeps
+            ],
+        )
+
+    @property
+    def power_count(self) -> int:
+        return int(self.power_gains.size)
+
+    @property
+    def sample_count(self) -> int:
+        return int(self.iq_traces.shape[2])
 
 
 def _signed_modular_delta(first: int, second: int, width: int) -> int:
@@ -822,6 +996,295 @@ def _qcodes_helpers():
     )
 
 
+def _power_result_payload(
+    result: SParameterPowerSweepResult,
+    *,
+    planned_power_gains: Sequence[int],
+    power_scale: str,
+) -> Mapping[str, Any]:
+    return {
+        "schema": "qick-rf-s-parameter-power-sweep-v1",
+        "power_sweep_execution": "python_software_loop",
+        "frequency_sweep_execution": "tproc_hardware_register_add",
+        "power_scale": power_scale,
+        "planned_power_gains": [int(value) for value in planned_power_gains],
+        "power_gains": result.power_gains.tolist(),
+        "completed_power_points": result.power_count,
+        "requested_frequencies_mhz": (
+            result.requested_frequencies_mhz.tolist()
+        ),
+        "frequencies_mhz": result.frequencies_mhz.tolist(),
+        "mean_i": result.mean_i.tolist(),
+        "mean_q": result.mean_q.tolist(),
+        "magnitude_db": result.magnitude_db.tolist(),
+        "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
+        "sample_rate_hz": result.sample_rate_hz,
+        "iq_shape": list(result.iq_traces.shape),
+    }
+
+
+class _SParameterPowerRunWriter:
+    """Append and publish one QCoDeS power point at a time."""
+
+    def __init__(
+        self,
+        *,
+        config: SParameterSweepConfig,
+        connection_config: Any,
+        run_config: Any,
+        rf_settings: Mapping[str, Any],
+    ):
+        self.config = config
+        self.connection_config = connection_config
+        self.run_config = run_config
+        self.rf_settings = rf_settings
+        self.planned_power_gains = tuple(
+            int(value) for value in config.power_gains
+        )
+        self.database_path = Path(
+            getattr(
+                run_config,
+                "resolved_database_path",
+                run_config.database_path,
+            )
+        ).expanduser().resolve()
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.staging_directory = None
+        self.local_database_path = None
+        self.datasaver_context = None
+        self.datasaver = None
+        self.dataset = None
+        self.final_dataset = None
+        self.results = []
+        self.completed_power_gains = []
+        self.program_summaries = []
+        self.row_count = 0
+        self._helpers = None
+        self._load_by_guid = None
+        self._json_text = None
+        self._parameters = None
+
+    def open(self) -> None:
+        try:
+            from qcodes import (
+                Measurement,
+                Parameter,
+                Station,
+                initialise_or_create_database_at,
+                load_by_guid,
+                load_or_create_experiment,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "QCoDeS is required to save S-parameter power sweeps; "
+                "install qcodes==0.58.0"
+            ) from exc
+        (
+            _connect_qick,
+            json_text,
+            prepare_local_database,
+            checkpoint_database,
+            publish_database,
+        ) = _qcodes_helpers()
+        self._helpers = (
+            initialise_or_create_database_at,
+            checkpoint_database,
+            publish_database,
+        )
+        self._load_by_guid = load_by_guid
+        self._json_text = json_text
+        self.staging_directory, self.local_database_path = (
+            prepare_local_database(self.database_path)
+        )
+        initialise_or_create_database_at(str(self.local_database_path))
+        experiment = load_or_create_experiment(
+            self.run_config.experiment_name,
+            self.run_config.sample_name,
+        )
+        measurement = Measurement(exp=experiment, station=Station())
+        power_gain = Parameter(
+            POWER_GAIN_PARAMETER,
+            label="RF output gain code",
+            unit="",
+        )
+        frequency = Parameter(
+            FREQUENCY_PARAMETER,
+            label="RF frequency",
+            unit="MHz",
+        )
+        sample_index = Parameter(
+            SAMPLE_INDEX_PARAMETER,
+            label="FIR sample index",
+            unit="",
+        )
+        mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit="ADC units")
+        mean_q = Parameter(MEAN_Q_PARAMETER, label="Mean Q", unit="ADC units")
+        magnitude_db = Parameter(
+            MAGNITUDE_DB_PARAMETER,
+            label="S-parameter magnitude",
+            unit="dB",
+        )
+        phase_deg = Parameter(
+            PHASE_DEG_PARAMETER,
+            label="S-parameter unwrapped phase",
+            unit="deg",
+        )
+        i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit="ADC units")
+        q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit="ADC units")
+        measurement.register_parameter(power_gain)
+        measurement.register_parameter(frequency)
+        measurement.register_parameter(sample_index, paramtype="array")
+        for parameter in (mean_i, mean_q, magnitude_db, phase_deg):
+            measurement.register_parameter(
+                parameter,
+                setpoints=(power_gain, frequency),
+            )
+        for parameter in (i_trace, q_trace):
+            measurement.register_parameter(
+                parameter,
+                setpoints=(power_gain, frequency, sample_index),
+                paramtype="array",
+            )
+        self._parameters = {
+            "power_gain": power_gain,
+            "frequency": frequency,
+            "sample_index": sample_index,
+            "mean_i": mean_i,
+            "mean_q": mean_q,
+            "magnitude_db": magnitude_db,
+            "phase_deg": phase_deg,
+            "i_trace": i_trace,
+            "q_trace": q_trace,
+        }
+        self.datasaver_context = measurement.run(
+            write_in_background=False,
+            in_memory_cache=False,
+        )
+        self.datasaver = self.datasaver_context.__enter__()
+        self.dataset = self.datasaver.dataset
+        if self.run_config.notes:
+            self.dataset.add_metadata("experiment_notes", self.run_config.notes)
+
+    def _metadata(self, result: SParameterPowerSweepResult) -> Mapping[str, Any]:
+        payload = _power_result_payload(
+            result,
+            planned_power_gains=self.planned_power_gains,
+            power_scale=self.config.power_scale,
+        )
+        return {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "measurement": "rf_s_parameter_power_sweep",
+            "awg_tuning_used": False,
+            "connection": asdict(self.connection_config),
+            "run": {
+                **asdict(self.run_config),
+                "database_path": str(self.database_path),
+            },
+            "config": asdict(self.config),
+            "rf_settings_actual": self.rf_settings,
+            "program_summaries": list(self.program_summaries),
+            "result": payload,
+            "formulas": {
+                "mean_i": "mean(i_trace)",
+                "mean_q": "mean(q_trace)",
+                "magnitude_db": "20*log10(hypot(mean_i, mean_q))",
+                "phase_unwrapped_deg": (
+                    "degrees(unwrap(angle(mean_i + 1j*mean_q), frequency))"
+                ),
+            },
+            "storage": (
+                "one split I/Q array row and scalar response per "
+                "power-gain/frequency point"
+            ),
+            "live_update": "database snapshot published after every power gain",
+        }
+
+    def append(
+        self,
+        gain: int,
+        result: SParameterSweepResult,
+        program_summary: Mapping[str, Any],
+    ) -> SParameterPowerSweepResult:
+        if self.datasaver is None or self.dataset is None:
+            raise RuntimeError("power-sweep database writer is not open")
+        if int(gain) not in self.planned_power_gains:
+            raise ValueError(f"unexpected power gain {gain}")
+        sample_values = np.arange(result.sample_count, dtype=np.int32)
+        parameters = self._parameters
+        for index, frequency_mhz in enumerate(result.frequencies_mhz):
+            self.datasaver.add_result(
+                (parameters["power_gain"], int(gain)),
+                (parameters["frequency"], float(frequency_mhz)),
+                (parameters["mean_i"], float(result.mean_i[index])),
+                (parameters["mean_q"], float(result.mean_q[index])),
+                (
+                    parameters["magnitude_db"],
+                    float(result.magnitude_db[index]),
+                ),
+                (
+                    parameters["phase_deg"],
+                    float(result.phase_unwrapped_deg[index]),
+                ),
+                (parameters["sample_index"], sample_values),
+                (
+                    parameters["i_trace"],
+                    np.ascontiguousarray(result.iq_traces[index, :, 0]),
+                ),
+                (
+                    parameters["q_trace"],
+                    np.ascontiguousarray(result.iq_traces[index, :, 1]),
+                ),
+            )
+        self.results.append(result)
+        self.completed_power_gains.append(int(gain))
+        self.program_summaries.append(dict(program_summary))
+        self.row_count += int(result.frequencies_mhz.size * result.sample_count)
+        combined = SParameterPowerSweepResult.from_sweeps(
+            self.completed_power_gains,
+            self.results,
+        )
+        metadata = self._metadata(combined)
+        self.dataset.add_metadata(
+            "sparameter_experiment_json",
+            self._json_text(metadata),
+        )
+        self.dataset.add_metadata(
+            "sparameter_result_json",
+            self._json_text(metadata["result"]),
+        )
+        self.datasaver.flush_data_to_database()
+        self._helpers[2](self.local_database_path, self.database_path)
+        return combined
+
+    def close(self):
+        if self.datasaver_context is None or self.dataset is None:
+            raise RuntimeError("power-sweep database writer is not open")
+        self.datasaver_context.__exit__(None, None, None)
+        self.datasaver_context = None
+        guid = str(self.dataset.guid)
+        self.dataset.conn.close()
+        self._helpers[1](self.local_database_path)
+        self._helpers[2](self.local_database_path, self.database_path)
+        self._helpers[0](str(self.database_path))
+        self.final_dataset = self._load_by_guid(guid)
+        shutil.rmtree(self.staging_directory)
+        self.staging_directory = None
+        return self.final_dataset
+
+    def abort(self, exc: BaseException) -> None:
+        if self.datasaver_context is not None:
+            self.datasaver_context.__exit__(type(exc), exc, exc.__traceback__)
+            self.datasaver_context = None
+        if self.dataset is not None:
+            try:
+                self.dataset.conn.close()
+            except Exception:
+                pass
+        if self.staging_directory is not None:
+            shutil.rmtree(self.staging_directory, ignore_errors=True)
+            self.staging_directory = None
+
+
 def store_sparameter_result(
     result: SParameterSweepResult,
     *,
@@ -989,14 +1452,134 @@ def run_sparameter_sweep(
     tproc_mhz: Optional[float] = None,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    partial_callback: Optional[Callable[[StoredSParameterSweep], None]] = None,
 ) -> StoredSParameterSweep:
-    """Connect, run one RF-only hardware sweep, derive and persist response."""
+    """Run a frequency sweep, optionally inside a software gain sweep."""
     connect_qick, *_helpers = _qcodes_helpers()
     _emit_progress(progress_callback, 0, "Starting independent RF S-parameter sweep")
     _emit_progress(progress_callback, 2, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
     _emit_progress(progress_callback, 5, "Configuring RF output/readout chains")
     rf_settings = configure_sparameter_rf_board(soc, sweep_config)
+    if sweep_config.power_sweep_enabled:
+        power_gains = tuple(int(value) for value in sweep_config.power_gains)
+        writer = _SParameterPowerRunWriter(
+            config=sweep_config,
+            connection_config=connection_config,
+            run_config=run_config,
+            rf_settings=rf_settings,
+        )
+        programs = []
+        combined_result = None
+        _emit_progress(
+            progress_callback,
+            7,
+            f"Preparing live DB run for {len(power_gains)} power points",
+        )
+        writer.open()
+        try:
+            for power_index, gain in enumerate(power_gains):
+                point_config = sweep_config.for_gain(gain)
+                _emit_progress(
+                    progress_callback,
+                    8 + round(87 * power_index / len(power_gains)),
+                    (
+                        f"Compiling power {power_index + 1}/{len(power_gains)} "
+                        f"at gain {gain}"
+                    ),
+                )
+                program = build_sparameter_program(
+                    soccfg,
+                    point_config,
+                    tproc_mhz=tproc_mhz,
+                )
+                programs.append(program)
+
+                def counter_progress(
+                    completed: int,
+                    total: int,
+                    *,
+                    _power_index: int = power_index,
+                    _gain: int = gain,
+                ) -> None:
+                    del total
+                    power_progress = (
+                        _power_index
+                        + 0.85
+                        * completed
+                        / sweep_config.frequency_points
+                    )
+                    fraction = power_progress / len(power_gains)
+                    _emit_progress(
+                        progress_callback,
+                        8 + round(87 * max(0.0, min(1.0, fraction))),
+                        (
+                            f"Power {_power_index + 1}/{len(power_gains)} "
+                            f"gain {_gain}: frequency {completed}/"
+                            f"{sweep_config.frequency_points}"
+                        ),
+                    )
+
+                result = program.acquire_fir_ddr(
+                    soc,
+                    counter_progress=(
+                        counter_progress if progress_callback is not None else None
+                    ),
+                )
+                _emit_progress(
+                    progress_callback,
+                    8
+                    + round(
+                        87 * (power_index + 0.9) / len(power_gains)
+                    ),
+                    (
+                        f"Saving power {power_index + 1}/{len(power_gains)} "
+                        f"gain {gain}"
+                    ),
+                )
+                combined_result = writer.append(
+                    gain,
+                    result,
+                    program.summary(),
+                )
+                partial = StoredSParameterSweep(
+                    run_id=int(writer.dataset.run_id),
+                    guid=str(writer.dataset.guid),
+                    database_path=writer.database_path,
+                    row_count=writer.row_count,
+                    result=combined_result,
+                    program=program,
+                    rf_settings=rf_settings,
+                )
+                if partial_callback is not None:
+                    partial_callback(partial)
+                _emit_progress(
+                    progress_callback,
+                    8
+                    + round(
+                        87 * (power_index + 1) / len(power_gains)
+                    ),
+                    (
+                        f"Power {power_index + 1}/{len(power_gains)} saved; "
+                        "live database updated"
+                    ),
+                )
+            dataset = writer.close()
+        except BaseException as exc:
+            writer.abort(exc)
+            raise
+        _emit_progress(progress_callback, 100, "RF power sweep saved")
+        return StoredSParameterSweep(
+            run_id=int(dataset.run_id),
+            guid=str(dataset.guid),
+            database_path=writer.database_path,
+            row_count=writer.row_count,
+            result=combined_result,
+            dataset=dataset,
+            program=tuple(programs),
+            rf_settings=rf_settings,
+        )
+
     _emit_progress(progress_callback, 8, "Compiling hardware frequency sweep")
     program = build_sparameter_program(
         soccfg,
@@ -1104,15 +1687,34 @@ def load_sparameter_run(
     )
     i_data = dataset.get_parameter_data(I_TRACE_PARAMETER)[I_TRACE_PARAMETER]
     q_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)[Q_TRACE_PARAMETER]
-    i_trace = _coerce_trace_rows(i_data[I_TRACE_PARAMETER], frequencies.size)
-    q_trace = _coerce_trace_rows(q_data[Q_TRACE_PARAMETER], frequencies.size)
-    iq = np.stack((i_trace, q_trace), axis=-1)
-    result = SParameterSweepResult.from_iq(
-        requested,
-        frequencies,
-        iq,
-        sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
-    )
+    if "power_gains" in payload:
+        power_gains = np.asarray(payload["power_gains"], dtype=np.int64)
+        trace_count = int(power_gains.size * frequencies.size)
+        i_trace = _coerce_trace_rows(i_data[I_TRACE_PARAMETER], trace_count)
+        q_trace = _coerce_trace_rows(q_data[Q_TRACE_PARAMETER], trace_count)
+        iq = np.stack((i_trace, q_trace), axis=-1).reshape(
+            power_gains.size,
+            frequencies.size,
+            i_trace.shape[1],
+            2,
+        )
+        result = SParameterPowerSweepResult.from_iq(
+            power_gains,
+            requested,
+            frequencies,
+            iq,
+            sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+        )
+    else:
+        i_trace = _coerce_trace_rows(i_data[I_TRACE_PARAMETER], frequencies.size)
+        q_trace = _coerce_trace_rows(q_data[Q_TRACE_PARAMETER], frequencies.size)
+        iq = np.stack((i_trace, q_trace), axis=-1)
+        result = SParameterSweepResult.from_iq(
+            requested,
+            frequencies,
+            iq,
+            sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+        )
     return StoredSParameterSweep(
         run_id=int(dataset.run_id),
         guid=str(dataset.guid),
@@ -1132,8 +1734,11 @@ __all__ = [
     "MEAN_I_PARAMETER",
     "MEAN_Q_PARAMETER",
     "PHASE_DEG_PARAMETER",
+    "POWER_GAIN_PARAMETER",
+    "POWER_SCALES",
     "Q_TRACE_PARAMETER",
     "SAMPLE_INDEX_PARAMETER",
+    "SParameterPowerSweepResult",
     "SParameterSweepConfig",
     "SParameterSweepProgram",
     "SParameterSweepResult",

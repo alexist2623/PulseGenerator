@@ -25,6 +25,7 @@ try:
     from .qick_sparameter_sweep import (
         FILTER_TYPES,
         MAX_RF_OUTPUT_GAIN,
+        POWER_SCALES,
         SParameterSweepConfig,
         load_sparameter_run,
         run_sparameter_sweep,
@@ -33,6 +34,7 @@ except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
         MAX_RF_OUTPUT_GAIN,
+        POWER_SCALES,
         SParameterSweepConfig,
         load_sparameter_run,
         run_sparameter_sweep,
@@ -80,9 +82,34 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         sweep_form.addRow("Start frequency:", self.frequency_start_mhz)
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
-        sweep_form.addRow("Output gain:", self.gain)
+        sweep_form.addRow("Single output gain:", self.gain)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
         content_layout.addWidget(sweep_group)
+
+        self.power_sweep_enabled = QtWidgets.QGroupBox(
+            "Power Sweep (Software)"
+        )
+        self.power_sweep_enabled.setCheckable(True)
+        self.power_sweep_enabled.setChecked(False)
+        power_form = QtWidgets.QFormLayout(self.power_sweep_enabled)
+        self.power_start_gain = self._gain_spin(1000)
+        self.power_end_gain = self._gain_spin(20000)
+        self.power_points = QtWidgets.QSpinBox()
+        self.power_points.setRange(2, 100_000)
+        self.power_points.setValue(5)
+        self.power_scale = QtWidgets.QComboBox()
+        scale_labels = {"linear": "Linear", "log": "Logarithmic"}
+        for scale in POWER_SCALES:
+            self.power_scale.addItem(scale_labels[scale], scale)
+        power_form.addRow("Start gain code:", self.power_start_gain)
+        power_form.addRow("End gain code:", self.power_end_gain)
+        power_form.addRow("Power points:", self.power_points)
+        power_form.addRow("Spacing:", self.power_scale)
+        self.power_sweep_enabled.toggled.connect(
+            self._update_power_control_state
+        )
+        content_layout.addWidget(self.power_sweep_enabled)
+        self._update_power_control_state(False)
 
         output_group = QtWidgets.QGroupBox("RF Output Chain")
         output_form = QtWidgets.QFormLayout(output_group)
@@ -173,6 +200,14 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         return widget
 
     @staticmethod
+    def _gain_spin(value: int) -> QtWidgets.QSpinBox:
+        widget = QtWidgets.QSpinBox()
+        widget.setRange(0, MAX_RF_OUTPUT_GAIN)
+        widget.setValue(value)
+        widget.setSuffix(f" / {MAX_RF_OUTPUT_GAIN}")
+        return widget
+
+    @staticmethod
     def _attenuation_spin(value: float) -> QtWidgets.QDoubleSpinBox:
         widget = QtWidgets.QDoubleSpinBox()
         widget.setRange(0.0, 31.75)
@@ -197,6 +232,16 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         widget.addItems(FILTER_TYPES)
         return widget
 
+    def _update_power_control_state(self, enabled: bool) -> None:
+        self.gain.setEnabled(not enabled)
+        for widget in (
+            self.power_start_gain,
+            self.power_end_gain,
+            self.power_points,
+            self.power_scale,
+        ):
+            widget.setEnabled(enabled)
+
     def config(self) -> SParameterSweepConfig:
         return SParameterSweepConfig(
             output_ch=self.output_ch.value(),
@@ -205,6 +250,11 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             frequency_end_mhz=self.frequency_end_mhz.value(),
             frequency_points=self.frequency_points.value(),
             gain=self.gain.value(),
+            power_sweep_enabled=self.power_sweep_enabled.isChecked(),
+            power_start_gain=self.power_start_gain.value(),
+            power_end_gain=self.power_end_gain.value(),
+            power_points=self.power_points.value(),
+            power_scale=str(self.power_scale.currentData()),
             scan_time_us=self.scan_time_us.value(),
             output_att1_db=self.output_att1_db.value(),
             output_att2_db=self.output_att2_db.value(),
@@ -240,6 +290,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.frequency_end_mhz, config.frequency_end_mhz),
             (self.frequency_points, config.frequency_points),
             (self.gain, config.gain),
+            (self.power_start_gain, config.power_start_gain),
+            (self.power_end_gain, config.power_end_gain),
+            (self.power_points, config.power_points),
             (self.scan_time_us, config.scan_time_us),
             (self.output_att1_db, config.output_att1_db),
             (self.output_att2_db, config.output_att2_db),
@@ -262,6 +315,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             widget.setValue(value)
         self.output_filter_type.setCurrentText(config.output_filter_type)
         self.readout_filter_type.setCurrentText(config.readout_filter_type)
+        power_scale_index = self.power_scale.findData(config.power_scale)
+        if power_scale_index < 0:
+            raise ValueError(f"unsupported power scale {config.power_scale!r}")
+        self.power_scale.setCurrentIndex(power_scale_index)
+        self.power_sweep_enabled.setChecked(config.power_sweep_enabled)
+        self._update_power_control_state(config.power_sweep_enabled)
         self.force_overwrite.setChecked(config.force_overwrite)
         self._internal_settings = {
             "nqz": config.nqz,
@@ -286,13 +345,23 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def show_result(self, stored) -> None:
         result = stored.result
         self.run_id.setValue(stored.run_id)
+        power_count = int(getattr(result, "power_count", 1))
         self.set_running(
             False,
             (
-                f"Run {stored.run_id}: {result.frequencies_mhz.size} points, "
+                f"Run {stored.run_id}: {power_count} power point(s) x "
+                f"{result.frequencies_mhz.size} frequency points, "
                 f"{result.sample_count} FIR samples per point\n"
                 f"{stored.database_path}"
             ),
+        )
+
+    def show_partial_result(self, stored) -> None:
+        result = stored.result
+        self.run_id.setValue(stored.run_id)
+        power_count = int(getattr(result, "power_count", 1))
+        self.status.setText(
+            f"Run {stored.run_id}: {power_count} power point(s) saved to DB"
         )
 
 
@@ -311,17 +380,57 @@ if _USE_PYQTGRAPH:
             self.magnitude_plot.setLabel("left", "Magnitude", units="dB")
             self.phase_plot.setLabel("left", "Unwrapped phase", units="deg")
             self.phase_plot.setLabel("bottom", "RF frequency", units="MHz")
-            self._magnitude_curve = self.magnitude_plot.plot(
-                pen=pg.mkPen("#1565c0", width=2), symbol="o", symbolSize=5
+            self._magnitude_legend = self.magnitude_plot.addLegend(
+                offset=(10, 10)
             )
-            self._phase_curve = self.phase_plot.plot(
-                pen=pg.mkPen("#c62828", width=2), symbol="o", symbolSize=5
-            )
+            self._phase_legend = self.phase_plot.addLegend(offset=(10, 10))
+            self._magnitude_curves = []
+            self._phase_curves = []
 
         def set_result(self, result) -> None:
             frequency = result.frequencies_mhz
-            self._magnitude_curve.setData(frequency, result.magnitude_db)
-            self._phase_curve.setData(frequency, result.phase_unwrapped_deg)
+            magnitude = result.magnitude_db
+            phase = result.phase_unwrapped_deg
+            if getattr(magnitude, "ndim", 1) == 1:
+                magnitude = [magnitude]
+                phase = [phase]
+                gains = [None]
+            else:
+                gains = list(result.power_gains)
+            for curve in self._magnitude_curves:
+                self.magnitude_plot.removeItem(curve)
+            for curve in self._phase_curves:
+                self.phase_plot.removeItem(curve)
+            self._magnitude_curves.clear()
+            self._phase_curves.clear()
+            self._magnitude_legend.clear()
+            self._phase_legend.clear()
+            count = len(gains)
+            for index, (gain, magnitude_values, phase_values) in enumerate(
+                zip(gains, magnitude, phase)
+            ):
+                color = pg.intColor(index, hues=max(1, count), values=1)
+                name = None if gain is None else f"gain {int(gain)}"
+                self._magnitude_curves.append(
+                    self.magnitude_plot.plot(
+                        frequency,
+                        magnitude_values,
+                        pen=pg.mkPen(color, width=2),
+                        symbol="o",
+                        symbolSize=5,
+                        name=name,
+                    )
+                )
+                self._phase_curves.append(
+                    self.phase_plot.plot(
+                        frequency,
+                        phase_values,
+                        pen=pg.mkPen(color, width=2),
+                        symbol="o",
+                        symbolSize=5,
+                        name=name,
+                    )
+                )
             self.magnitude_plot.autoRange()
             self.phase_plot.autoRange()
 
@@ -340,12 +449,33 @@ else:
             for axis in (self.magnitude_plot, self.phase_plot):
                 axis.clear()
                 axis.grid(True, alpha=0.25)
-            self.magnitude_plot.plot(
-                result.frequencies_mhz, result.magnitude_db, "-o"
-            )
-            self.phase_plot.plot(
-                result.frequencies_mhz, result.phase_unwrapped_deg, "-o"
-            )
+            magnitude = result.magnitude_db
+            phase = result.phase_unwrapped_deg
+            if getattr(magnitude, "ndim", 1) == 1:
+                magnitude = [magnitude]
+                phase = [phase]
+                gains = [None]
+            else:
+                gains = list(result.power_gains)
+            for gain, magnitude_values, phase_values in zip(
+                gains, magnitude, phase
+            ):
+                label = None if gain is None else f"gain {int(gain)}"
+                self.magnitude_plot.plot(
+                    result.frequencies_mhz,
+                    magnitude_values,
+                    "-o",
+                    label=label,
+                )
+                self.phase_plot.plot(
+                    result.frequencies_mhz,
+                    phase_values,
+                    "-o",
+                    label=label,
+                )
+            if gains[0] is not None:
+                self.magnitude_plot.legend()
+                self.phase_plot.legend()
             self.magnitude_plot.set_ylabel("Magnitude [dB]")
             self.phase_plot.set_ylabel("Unwrapped phase [deg]")
             self.phase_plot.set_xlabel("RF frequency [MHz]")
@@ -358,6 +488,7 @@ class SParameterSweepWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
+    partial_result = QtCore.pyqtSignal(object)
 
     def __init__(self, kwargs: Mapping[str, Any], parent=None):
         super().__init__(parent)
@@ -368,6 +499,7 @@ class SParameterSweepWorker(QtCore.QObject):
         try:
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
+            kwargs["partial_callback"] = self.partial_result.emit
             stored = run_sparameter_sweep(**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())

@@ -111,6 +111,14 @@ settings, frequency start/end/point count, output gain, and FIR acquisition time
 per frequency. Output gain is hard-limited to 32766 and is also checked against
 the selected generator's reported hardware limit.
 
+The optional **Power Sweep (Software)** repeats that complete tProcessor
+frequency sweep at a sequence of DAC gain codes. Linear spacing uses rounded
+`linspace(start_gain, end_gain)`, while logarithmic spacing uses rounded
+`geomspace(start_gain, end_gain)` and therefore requires positive endpoints.
+The gain code controls RF amplitude; it is not a calibrated dBm value. Power is
+not advanced by tProcessor arithmetic: Python compiles and runs one hardware
+frequency sweep per gain point.
+
 RF output duration is not encoded as one 16-bit generator pulse length. A
 3-fabric-cycle periodic DDS command starts the output, and a separately timed
 zero-gain one-shot command stops it after the FIR capture interval. This removes
@@ -126,6 +134,12 @@ uses `20*log10(hypot(mean_i, mean_q))` for magnitude and an unwrapped
 against the actual common-quantized RF frequency. **Load Saved Run** reconstructs
 the response from the stored I/Q arrays; run ID 0 selects the latest run carrying
 RF S-parameter metadata rather than the latest unrelated run in the database.
+For a power sweep, scalar and trace data share one QCoDeS run with
+`rf_power_gain` and `rf_frequency_mhz` setpoints. After every completed gain,
+the new rows and result metadata are flushed and the local SQLite database is
+published to the configured DB path. Plottr and the GUI can therefore refresh
+the same run while later gain points are still being acquired. The GUI overlays
+the completed magnitude and phase traces with one color per gain code.
 
 ## Verification
 

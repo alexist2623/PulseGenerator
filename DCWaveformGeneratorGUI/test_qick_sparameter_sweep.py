@@ -5,7 +5,9 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,18 +20,23 @@ from qick.sim import QickSim  # noqa: F401
 from qick.qick_asm import QickConfig
 
 import DCWaveform_Generator as gui
+import qick_sparameter_sweep as sparameter_module
 from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
     QcodesRunConfig,
     QickConnectionConfig,
 )
 from qick_sparameter_sweep import (
+    MAGNITUDE_DB_PARAMETER,
     MAX_RF_OUTPUT_GAIN,
+    POWER_GAIN_PARAMETER,
+    SParameterPowerSweepResult,
     SParameterSweepConfig,
     SParameterSweepProgram,
     SParameterSweepResult,
     configure_sparameter_rf_board,
     load_sparameter_run,
+    run_sparameter_sweep,
     store_sparameter_result,
 )
 
@@ -157,6 +164,48 @@ def test_gain_has_hard_limit():
     assert SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN).gain == 32766
     with pytest.raises(ValueError, match="must not exceed"):
         SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN + 1)
+
+
+def test_power_gain_grid_supports_linear_and_log_spacing():
+    linear = SParameterSweepConfig(
+        power_sweep_enabled=True,
+        power_start_gain=1000,
+        power_end_gain=20000,
+        power_points=5,
+        power_scale="linear",
+    )
+    logarithmic = SParameterSweepConfig(
+        power_sweep_enabled=True,
+        power_start_gain=100,
+        power_end_gain=10000,
+        power_points=5,
+        power_scale="log",
+    )
+
+    np.testing.assert_array_equal(
+        linear.power_gains,
+        [1000, 5750, 10500, 15250, 20000],
+    )
+    np.testing.assert_array_equal(
+        logarithmic.power_gains,
+        [100, 316, 1000, 3162, 10000],
+    )
+    with pytest.raises(ValueError, match="greater than zero"):
+        SParameterSweepConfig(
+            power_sweep_enabled=True,
+            power_start_gain=0,
+            power_end_gain=100,
+            power_points=3,
+            power_scale="log",
+        )
+    with pytest.raises(ValueError, match="duplicate integer gain"):
+        SParameterSweepConfig(
+            power_sweep_enabled=True,
+            power_start_gain=1,
+            power_end_gain=2,
+            power_points=3,
+            power_scale="linear",
+        )
 
 
 def test_program_is_fixed_size_hardware_sweep_and_updates_both_dds_registers():
@@ -336,6 +385,121 @@ def test_qcodes_round_trip_stores_split_traces_and_derived_response(
     assert latest_sparameter.run_id == dataset.run_id
 
 
+def test_software_power_sweep_publishes_one_live_db_run_per_power(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "power_sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    connection = QickConnectionConfig(host="127.0.0.1")
+    run = QcodesRunConfig(
+        database_path=str(database_path),
+        experiment_name="RF power dependence",
+        sample_name="unit-test",
+    )
+    config = _config(
+        frequency_points=3,
+        scan_time_us=4.0,
+        power_sweep_enabled=True,
+        power_start_gain=100,
+        power_end_gain=10000,
+        power_points=3,
+        power_scale="log",
+        settle_seconds=0.0,
+    )
+
+    class FakeProgram:
+        def __init__(self, point_config):
+            self.sweep = point_config
+
+        def acquire_fir_ddr(self, _soc, counter_progress=None):
+            if counter_progress is not None:
+                counter_progress(0, self.sweep.frequency_points)
+                counter_progress(
+                    self.sweep.frequency_points,
+                    self.sweep.frequency_points,
+                )
+            frequencies = self.sweep.requested_frequencies_mhz
+            iq = np.zeros((frequencies.size, 4, 2), dtype=np.int32)
+            iq[:, :, 0] = self.sweep.gain
+            iq[:, :, 1] = np.arange(frequencies.size)[:, np.newaxis]
+            return SParameterSweepResult.from_iq(
+                frequencies,
+                frequencies,
+                iq,
+            )
+
+        def summary(self):
+            return {
+                "gain": self.sweep.gain,
+                "sweep_execution": "tproc_hardware_register_add",
+            }
+
+    monkeypatch.setattr(
+        sparameter_module,
+        "configure_sparameter_rf_board",
+        lambda _soc, _config: {"output": {}, "readout": {}},
+    )
+    monkeypatch.setattr(
+        sparameter_module,
+        "build_sparameter_program",
+        lambda _soccfg, point_config, tproc_mhz=None: FakeProgram(
+            point_config
+        ),
+    )
+    live_updates = []
+    progress_updates = []
+
+    def capture_partial(stored):
+        with sqlite3.connect(database_path) as connection_db:
+            payload_text = connection_db.execute(
+                "SELECT sparameter_result_json FROM runs WHERE run_id = ?",
+                (stored.run_id,),
+            ).fetchone()[0]
+        payload = json.loads(payload_text)
+        live_updates.append((
+            stored.run_id,
+            stored.result.power_count,
+            payload["completed_power_points"],
+            tuple(payload["power_gains"]),
+        ))
+
+    stored = run_sparameter_sweep(
+        connection_config=connection,
+        run_config=run,
+        sweep_config=config,
+        connector=lambda **_kwargs: (object(), object()),
+        partial_callback=capture_partial,
+        progress_callback=lambda percent, _message: progress_updates.append(
+            percent
+        ),
+    )
+
+    assert [update[1] for update in live_updates] == [1, 2, 3]
+    assert [update[2] for update in live_updates] == [1, 2, 3]
+    assert len({update[0] for update in live_updates}) == 1
+    assert live_updates[-1][3] == (100, 1000, 10000)
+    assert progress_updates == sorted(progress_updates)
+    assert progress_updates[-1] == 100
+    assert isinstance(stored.result, SParameterPowerSweepResult)
+    assert stored.result.iq_traces.shape == (3, 3, 4, 2)
+    assert stored.row_count == 3 * 3 * 4
+    loaded = load_sparameter_run(database_path, stored.run_id)
+    assert isinstance(loaded.result, SParameterPowerSweepResult)
+    np.testing.assert_array_equal(loaded.result.power_gains, [100, 1000, 10000])
+    np.testing.assert_array_equal(
+        loaded.result.iq_traces,
+        stored.result.iq_traces,
+    )
+    magnitude_data = loaded.dataset.get_parameter_data(
+        MAGNITUDE_DB_PARAMETER
+    )[MAGNITUDE_DB_PARAMETER]
+    assert POWER_GAIN_PARAMETER in magnitude_data
+    np.testing.assert_array_equal(
+        magnitude_data[POWER_GAIN_PARAMETER],
+        np.repeat([100, 1000, 10000], 3),
+    )
+
+
 def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip():
     app = _application()
     window = gui.MainWindow()
@@ -346,15 +510,31 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip()
     panel.frequency_start_mhz.setValue(42.0)
     panel.frequency_end_mhz.setValue(84.0)
     panel.frequency_points.setValue(33)
+    panel.power_sweep_enabled.setChecked(True)
+    panel.power_start_gain.setValue(100)
+    panel.power_end_gain.setValue(10000)
+    panel.power_points.setValue(3)
+    panel.power_scale.setCurrentIndex(panel.power_scale.findData("log"))
     panel.output_filter_type.setCurrentText("lowpass")
     panel.readout_filter_type.setCurrentText("bandpass")
     settings = window._settings_to_dict()
     decoded = window._decode_settings(settings)
     assert decoded["s_parameter"]["frequency_start_mhz"] == 42.0
     assert decoded["s_parameter"]["frequency_points"] == 33
+    assert decoded["s_parameter"]["power_sweep_enabled"] is True
+    assert decoded["s_parameter"]["power_start_gain"] == 100
+    assert decoded["s_parameter"]["power_end_gain"] == 10000
+    assert decoded["s_parameter"]["power_points"] == 3
+    assert decoded["s_parameter"]["power_scale"] == "log"
     assert decoded["s_parameter"]["output_filter_type"] == "lowpass"
     assert decoded["s_parameter"]["readout_filter_type"] == "bandpass"
 
     window._sparameter_plot.set_result(_result())
+    window._sparameter_plot.set_result(
+        SParameterPowerSweepResult.from_sweeps(
+            [100, 1000],
+            [_result(), _result()],
+        )
+    )
     app.processEvents()
     window.close()

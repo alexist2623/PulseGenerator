@@ -115,8 +115,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 6
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, SETTINGS_VERSION)
+SETTINGS_VERSION = 7
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -3953,10 +3953,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         config = arguments["sweep_config"]
         sample_count = max(1, int(np.ceil(config.scan_time_us)))
+        power_count = int(config.power_gains.size)
         self._sparameter_panel.set_running(
             True,
             (
-                f"0% - Preparing {config.frequency_points:,} frequency points, "
+                f"0% - Preparing {power_count:,} power point(s) x "
+                f"{config.frequency_points:,} frequency points, "
                 f"about {sample_count:,} FIR samples per point"
             ),
         )
@@ -3968,6 +3970,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.finished.connect(self._on_sparameter_finished)
         worker.failed.connect(self._on_sparameter_failed)
         worker.progress_changed.connect(self._on_sparameter_progress)
+        worker.partial_result.connect(self._on_sparameter_partial)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -4016,6 +4019,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_sparameter_progress(self, percent: int, message: str) -> None:
         self._sparameter_panel.update_progress(percent, message)
         self.statusBar().showMessage(f"RF sweep {percent}%: {message}")
+
+    def _on_sparameter_partial(self, stored) -> None:
+        self._sparameter_panel.show_partial_result(stored)
+        self._sparameter_plot.set_result(stored.result)
+        self._dock_sparameter.show()
+        self._dock_sparameter.raise_()
+        power_count = int(getattr(stored.result, "power_count", 1))
+        self.statusBar().showMessage(
+            f"RF sweep run {stored.run_id}: {power_count} power point(s) saved"
+        )
 
     def _on_sparameter_finished(self, stored) -> None:
         self._sparameter_panel.show_result(stored)
