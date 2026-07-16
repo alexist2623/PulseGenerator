@@ -111,6 +111,13 @@ settings, frequency start/end/point count, output gain, and FIR acquisition time
 per frequency. Output gain is hard-limited to 32766 and is also checked against
 the selected generator's reported hardware limit.
 
+RF output duration is not encoded as one 16-bit generator pulse length. A
+3-fabric-cycle periodic DDS command starts the output, and a separately timed
+zero-gain one-shot command stops it after the FIR capture interval. This removes
+the 65,535-fabric-cycle const-pulse limit; the stop takes effect at the next
+3-cycle periodic boundary. The dynamic readout uses the same short periodic
+word so each hardware-sweep frequency update is accepted promptly.
+
 Each frequency point produces one post-FIR 1 MSPS DDR trace. The trace is saved
 as separate `i_trace[sample]` and `q_trace[sample]` QCoDeS arrays, then reduced
 to one complex response using the mean I and mean Q. The stored scalar response

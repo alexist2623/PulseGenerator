@@ -184,6 +184,47 @@ def test_program_quantizes_from_channel_metadata_when_refclk_is_missing():
     assert sum(inst["name"] == "math" for inst in program.prog_list) == 2
 
 
+def test_long_scan_uses_periodic_start_and_timed_zero_stop():
+    program = SParameterSweepProgram(
+        _mock_soccfg(),
+        _config(scan_time_us=1000.0),
+    )
+    program.compile()
+
+    summary = program.summary()
+    assert summary["rf_output_mode"] == "periodic_start_timed_zero_stop"
+    assert summary["rf_periodic_word_fabric_cycles"] == 3
+    assert summary["rf_stop_word_fabric_cycles"] == 3
+    assert summary["readout_period_fabric_cycles"] == 3
+    assert summary["rf_stop_command_tproc_cycle"] > 65535
+
+    gain_writes = [
+        inst["args"][2]
+        for inst in program.prog_list
+        if inst.get("comment", "").startswith("gain =")
+    ]
+    assert gain_writes == [program.sweep.gain, 0]
+
+    generator_modes = [
+        inst["args"][2]
+        for inst in program.prog_list
+        if inst.get("comment", "").startswith("phrst|")
+    ]
+    assert len(generator_modes) == 2
+    start_mode, stop_mode = generator_modes
+    assert start_mode & 0xFFFF == 3
+    assert stop_mode & 0xFFFF == 3
+    assert (start_mode >> 16) & 0b00100
+    assert not ((stop_mode >> 16) & 0b00100)
+
+    initial_frequency_writes = [
+        inst
+        for inst in program.prog_list
+        if inst.get("comment", "").startswith("freq =")
+    ]
+    assert len(initial_frequency_writes) == 2
+
+
 def test_program_rejects_awg_tuning_as_rf_sweep_output():
     with pytest.raises(ValueError, match="not axis_awg_tuning_v1"):
         SParameterSweepProgram(

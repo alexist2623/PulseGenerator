@@ -304,6 +304,9 @@ class SParameterSweepProgram(RAveragerProgram):
     """ASM v1 RF frequency sweep using one tProcessor register-add loop."""
 
     COUNTER_ADDR = 1
+    PERIODIC_WORD_CYCLES = 3
+    STOP_WORD_CYCLES = 3
+    READOUT_PERIOD_CYCLES = 3
 
     def __init__(
         self,
@@ -509,44 +512,20 @@ class SParameterSweepProgram(RAveragerProgram):
             self.output_command_time + self.fir_warmup_tproc_cycles
         )
         self.capture_end_tproc_cycles = self.output_command_time + capture_cycles
-        rf_length_cycles = int(
-            ceil(
-                self.capture_end_tproc_cycles
-                * float(gen_cfg["f_fabric"])
-                / self.tproc_mhz
-            )
-        )
-        if not 3 <= rf_length_cycles < (1 << 16):
-            max_scan = (
-                ((1 << 16) - 1)
-                * self.tproc_mhz
-                / float(gen_cfg["f_fabric"])
-            )
-            raise ValueError(
-                "scan time plus FIR warmup exceeds one RF const-pulse word; "
-                f"the current channel allows fewer than {max_scan:.3f} "
-                "tProcessor cycles"
-            )
-        self.rf_length_fabric_cycles = rf_length_cycles
+        self.rf_stop_command_time = self.capture_end_tproc_cycles
         self.point_period_tproc_cycles = (
-            self.capture_end_tproc_cycles + self.sweep.recovery_tproc_cycles
+            self.rf_stop_command_time + self.sweep.recovery_tproc_cycles
         )
 
-        self.set_pulse_registers(
+        self.default_pulse_registers(
             ch=self.sweep.output_ch,
-            style="const",
             freq=self._gen_frequency_first,
             phase=0,
-            gain=self.sweep.gain,
-            length=self.rf_length_fabric_cycles,
-            phrst=0,
-            stdysel="zero",
-            mode="oneshot",
         )
         self.set_readout_registers(
             ch=self.sweep.readout_ch,
             freq=self._ro_frequency_first,
-            length=65535,
+            length=self.READOUT_PERIOD_CYCLES,
             mode="periodic",
             phrst=0,
         )
@@ -578,6 +557,16 @@ class SParameterSweepProgram(RAveragerProgram):
 
     def body(self) -> None:
         self.readout(self.sweep.readout_ch, t=self.readout_command_time)
+
+        self.set_pulse_registers(
+            ch=self.sweep.output_ch,
+            style="const",
+            gain=self.sweep.gain,
+            length=self.PERIODIC_WORD_CYCLES,
+            phrst=0,
+            stdysel="zero",
+            mode="periodic",
+        )
         self.pulse(self.sweep.output_ch, t=self.output_command_time)
         self.trigger(
             ddr4=True,
@@ -585,6 +574,17 @@ class SParameterSweepProgram(RAveragerProgram):
             t=0,
             width=self.sweep.trigger_width_tproc_cycles,
         )
+
+        self.set_pulse_registers(
+            ch=self.sweep.output_ch,
+            style="const",
+            gain=0,
+            length=self.STOP_WORD_CYCLES,
+            phrst=0,
+            stdysel="zero",
+            mode="oneshot",
+        )
+        self.pulse(self.sweep.output_ch, t=self.rf_stop_command_time)
         self.synci(
             self.point_period_tproc_cycles,
             "wait for FIR DDR capture before next frequency",
@@ -714,6 +714,11 @@ class SParameterSweepProgram(RAveragerProgram):
             "fir_decimation": self.fir_decimation,
             "fir_group_delay_input_samples": self.fir_group_delay_input_samples,
             "fir_warmup_tproc_cycles": self.fir_warmup_tproc_cycles,
+            "rf_output_mode": "periodic_start_timed_zero_stop",
+            "rf_periodic_word_fabric_cycles": self.PERIODIC_WORD_CYCLES,
+            "rf_stop_word_fabric_cycles": self.STOP_WORD_CYCLES,
+            "rf_stop_command_tproc_cycle": self.rf_stop_command_time,
+            "readout_period_fabric_cycles": self.READOUT_PERIOD_CYCLES,
             "point_period_tproc_cycles": self.point_period_tproc_cycles,
             "estimated_hardware_seconds": (
                 self.sweep.frequency_points
