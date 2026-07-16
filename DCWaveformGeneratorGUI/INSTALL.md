@@ -101,6 +101,25 @@ After the run it performs a WAL checkpoint and copies the completed SQLite
 database to the configured location, including Nextcloud paths. This avoids one
 SQL row per sample and slow network-synchronized writes during acquisition.
 
+## RF S-parameter sweep
+
+The **RF S-Parameter** tab is independent of the AWG-tuning waveform editor. It
+uses a normal DDS signal-generator channel and a dynamic-readout channel, and
+advances both frequency registers inside one tProcessor hardware loop. The tab
+configures output ATT1/ATT2 and filter settings, input attenuation and filter
+settings, frequency start/end/point count, output gain, and FIR acquisition time
+per frequency. Output gain is hard-limited to 32766 and is also checked against
+the selected generator's reported hardware limit.
+
+Each frequency point produces one post-FIR 1 MSPS DDR trace. The trace is saved
+as separate `i_trace[sample]` and `q_trace[sample]` QCoDeS arrays, then reduced
+to one complex response using the mean I and mean Q. The stored scalar response
+uses `20*log10(hypot(mean_i, mean_q))` for magnitude and an unwrapped
+`angle(mean_i + 1j*mean_q)` in degrees for phase. The GUI displays both curves
+against the actual common-quantized RF frequency. **Load Saved Run** reconstructs
+the response from the stored I/Q arrays; run ID 0 selects the latest run carrying
+RF S-parameter metadata rather than the latest unrelated run in the database.
+
 ## Verification
 
 ```powershell

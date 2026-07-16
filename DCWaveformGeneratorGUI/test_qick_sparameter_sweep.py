@@ -1,0 +1,319 @@
+"""RF-only hardware S-parameter sweep, storage, and GUI tests.
+
+Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
+"""
+
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np
+import pytest
+from PyQt5 import QtWidgets
+
+# Desktop imports need the PYNQ stubs installed before regular QICK modules.
+from qick.sim import QickSim  # noqa: F401
+from qick.qick_asm import QickConfig
+
+import DCWaveform_Generator as gui
+from qick_qcodes_experiment import (
+    QCODES_STAGING_ENV,
+    QcodesRunConfig,
+    QickConnectionConfig,
+)
+from qick_sparameter_sweep import (
+    MAX_RF_OUTPUT_GAIN,
+    SParameterSweepConfig,
+    SParameterSweepProgram,
+    SParameterSweepResult,
+    configure_sparameter_rf_board,
+    load_sparameter_run,
+    store_sparameter_result,
+)
+
+
+def _application():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def _mock_soccfg(*, generator_type="axis_signal_gen_v6"):
+    awg = generator_type == "axis_awg_tuning_v1"
+    return QickConfig({
+        "sw_version": "0.2.357",
+        "refclk_freq": 300.0,
+        "tprocs": [{
+            "type": "axis_tproc64x32_x8",
+            "f_time": 300.0,
+            "pmem_size": 65536,
+            "dmem_size": 4096,
+            "output_pins": [],
+        }],
+        "gens": [{
+            "type": generator_type,
+            "gen_type": "awg_tuning" if awg else "signal_generator",
+            "tproc_ch": 0,
+            "tmux_ch": 0,
+            "f_fabric": 300.0,
+            "f_dds": 300.0,
+            "fs_mult": 1,
+            "fs_div": 1,
+            "fdds_div": 1,
+            "samps_per_clk": 16,
+            "maxlen": 16384,
+            "maxv": 32764 if awg else 32766,
+            "maxv_scale": 1.0,
+            "complex_env": not awg,
+            "has_mixer": False,
+            "has_dds": not awg,
+            "b_dds": 32,
+            "b_phase": 32,
+            "dac": "00",
+            "interpolation": 1,
+            **({
+                "n_pts": 16,
+                "frac": 16,
+                "cmd_width": 160,
+                "step_width": 24,
+                "duration_width": 23,
+                "fixed_width": 48,
+            } if awg else {}),
+        }],
+        "readouts": [{
+            "type": "axis_dyn_readout_v1",
+            "ro_type": "axis_dyn_readout_v1",
+            "tproc_ctrl": 1,
+            "tmux_ch": 0,
+            "f_fabric": 300.0,
+            "f_output": 300.0,
+            "f_dds": 300.0,
+            "fs_mult": 1,
+            "fs_div": 1,
+            "fdds_div": 1,
+            "b_dds": 32,
+            "b_phase": 32,
+            "adc": "00",
+            "buf_maxlen": 16384,
+            "has_weights": False,
+            "has_edge_counter": False,
+            "trigger_type": "dport",
+            "trigger_port": 0,
+            "trigger_bit": 0,
+        }],
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_output_fs_mhz": 1.0,
+            "fir_decimation": 300,
+            "fir_group_delay_input_samples": 8677,
+            "fir_input_fs_mhz": 300.0,
+            "trigger_type": "dport",
+            "trigger_port": 0,
+            "trigger_bit": 1,
+        },
+    })
+
+
+def _config(**updates):
+    values = {
+        "frequency_start_mhz": 10.0,
+        "frequency_end_mhz": 20.0,
+        "frequency_points": 11,
+        "scan_time_us": 4.0,
+        "settle_seconds": 0.0,
+    }
+    values.update(updates)
+    return SParameterSweepConfig(**values)
+
+
+def _result():
+    frequencies = np.asarray([10.0, 11.0, 12.0])
+    iq = np.asarray([
+        [[3, 4], [3, 4], [3, 4], [3, 4]],
+        [[-3, 1], [-3, 1], [-3, 1], [-3, 1]],
+        [[-3, -1], [-3, -1], [-3, -1], [-3, -1]],
+    ], dtype=np.int32)
+    return SParameterSweepResult.from_iq(frequencies, frequencies, iq)
+
+
+def test_result_uses_mean_iq_db_magnitude_and_unwrapped_phase():
+    result = _result()
+
+    expected_complex = result.mean_i + 1j * result.mean_q
+    np.testing.assert_allclose(
+        result.magnitude_db,
+        20.0 * np.log10(np.abs(expected_complex)),
+    )
+    np.testing.assert_allclose(
+        result.phase_unwrapped_deg,
+        np.degrees(np.unwrap(np.angle(expected_complex))),
+    )
+    assert result.mean_i[0] == 3.0
+    assert result.mean_q[0] == 4.0
+
+
+def test_gain_has_hard_limit():
+    assert SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN).gain == 32766
+    with pytest.raises(ValueError, match="must not exceed"):
+        SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN + 1)
+
+
+def test_program_is_fixed_size_hardware_sweep_and_updates_both_dds_registers():
+    short = SParameterSweepProgram(_mock_soccfg(), _config(frequency_points=3))
+    long = SParameterSweepProgram(_mock_soccfg(), _config(frequency_points=1001))
+    short.compile()
+    long.compile()
+
+    assert len(short.prog_list) == len(long.prog_list)
+    assert sum(inst["name"] == "math" for inst in long.prog_list) == 2
+    assert sum(inst["name"] == "loopnz" for inst in long.prog_list) == 2
+    assert long.summary()["sweep_execution"] == "tproc_hardware_register_add"
+    assert long.summary()["awg_tuning_used"] is False
+    assert long.scan_samples == 4
+    assert long.loop_dims == [1001, 1]
+
+
+def test_program_quantizes_from_channel_metadata_when_refclk_is_missing():
+    soccfg = _mock_soccfg()
+    del soccfg._cfg["refclk_freq"]
+    program = SParameterSweepProgram(soccfg, _config())
+    program.compile()
+
+    assert program.frequency_quantum_mhz > 0.0
+    assert sum(inst["name"] == "math" for inst in program.prog_list) == 2
+
+
+def test_program_rejects_awg_tuning_as_rf_sweep_output():
+    with pytest.raises(ValueError, match="not axis_awg_tuning_v1"):
+        SParameterSweepProgram(
+            _mock_soccfg(generator_type="axis_awg_tuning_v1"),
+            _config(),
+        )
+
+
+def test_fir_ddr_acquisition_keeps_one_trace_per_frequency(monkeypatch):
+    program = SParameterSweepProgram(
+        _mock_soccfg(), _config(frequency_points=3, scan_time_us=4.0)
+    )
+    raw = np.arange(3 * 4 * 2, dtype=np.int32).reshape(12, 2)
+
+    class FakeSoc:
+        def arm_ddr4_fir_samples(self, **kwargs):
+            self.arm_kwargs = kwargs
+            return 24
+
+        def get_ddr4_fir_samples(self, **kwargs):
+            self.read_kwargs = kwargs
+            return raw
+
+    soc = FakeSoc()
+    monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
+    result = program.acquire_fir_ddr(soc)
+
+    assert soc.arm_kwargs["n_triggers"] == 3
+    assert soc.arm_kwargs["n_samples"] == 4
+    assert result.iq_traces.shape == (3, 4, 2)
+    np.testing.assert_array_equal(result.iq_traces.reshape(12, 2), raw)
+    np.testing.assert_allclose(result.mean_i, raw.reshape(3, 4, 2)[:, :, 0].mean(1))
+
+
+def test_rf_board_output_and_readout_controls_are_applied():
+    calls = []
+
+    class FakeSoc:
+        def rfb_set_gen_rf(self, *args):
+            calls.append(("gen_rf", args))
+            return args[1], args[2]
+
+        def rfb_set_gen_filter(self, *args, **kwargs):
+            calls.append(("gen_filter", args, kwargs))
+
+        def rfb_set_ro_rf(self, *args):
+            calls.append(("ro_rf", args))
+            return args[1]
+
+        def rfb_set_ro_filter(self, *args, **kwargs):
+            calls.append(("ro_filter", args, kwargs))
+
+    actual = configure_sparameter_rf_board(FakeSoc(), _config())
+
+    assert [call[0] for call in calls] == [
+        "gen_rf", "gen_filter", "ro_rf", "ro_filter"
+    ]
+    assert actual["output"]["commanded_att1_db"] == 10.0
+    assert actual["readout"]["commanded_attenuation_db"] == 20.0
+
+
+def test_qcodes_round_trip_stores_split_traces_and_derived_response(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    connection = QickConnectionConfig(host="127.0.0.1")
+    run = QcodesRunConfig(
+        database_path=str(database_path),
+        experiment_name="RF tank response",
+        sample_name="unit-test",
+    )
+    result = _result()
+    dataset, row_count = store_sparameter_result(
+        result,
+        config=_config(frequency_points=3),
+        connection_config=connection,
+        run_config=run,
+        program_summary={"sweep_execution": "tproc_hardware_register_add"},
+        rf_settings={"output": {}, "readout": {}},
+    )
+
+    assert database_path.exists()
+    assert row_count == 12
+    loaded = load_sparameter_run(database_path, dataset.run_id)
+    np.testing.assert_array_equal(loaded.result.iq_traces, result.iq_traces)
+    np.testing.assert_allclose(loaded.result.magnitude_db, result.magnitude_db)
+    np.testing.assert_allclose(
+        loaded.result.phase_unwrapped_deg, result.phase_unwrapped_deg
+    )
+
+    from qcodes import (
+        Measurement,
+        Parameter,
+        initialise_or_create_database_at,
+        load_or_create_experiment,
+    )
+
+    initialise_or_create_database_at(str(database_path))
+    unrelated_measurement = Measurement(
+        exp=load_or_create_experiment("unrelated", "unit-test")
+    )
+    unrelated = Parameter("unrelated_scalar")
+    unrelated_measurement.register_parameter(unrelated)
+    with unrelated_measurement.run() as datasaver:
+        datasaver.add_result((unrelated, 1.0))
+
+    latest_sparameter = load_sparameter_run(database_path, 0)
+    assert latest_sparameter.run_id == dataset.run_id
+
+
+def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._sparameter_panel
+
+    assert window._control_tabs.indexOf(panel) >= 0
+    assert panel.gain.maximum() == MAX_RF_OUTPUT_GAIN
+    panel.frequency_start_mhz.setValue(42.0)
+    panel.frequency_end_mhz.setValue(84.0)
+    panel.frequency_points.setValue(33)
+    panel.output_filter_type.setCurrentText("lowpass")
+    panel.readout_filter_type.setCurrentText("bandpass")
+    settings = window._settings_to_dict()
+    decoded = window._decode_settings(settings)
+    assert decoded["s_parameter"]["frequency_start_mhz"] == 42.0
+    assert decoded["s_parameter"]["frequency_points"] == 33
+    assert decoded["s_parameter"]["output_filter_type"] == "lowpass"
+    assert decoded["s_parameter"]["readout_filter_type"] == "bandpass"
+
+    window._sparameter_plot.set_result(_result())
+    app.processEvents()
+    window.close()

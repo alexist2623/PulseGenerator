@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
 
 import json
+from dataclasses import asdict
 from math import prod
 from pathlib import Path
 import sys
@@ -88,6 +89,23 @@ except ImportError:
         run_qick_qcodes_experiment,
     )
 
+try:
+    from .qick_sparameter_sweep import SParameterSweepConfig
+    from .sparameter_gui import (
+        SParameterLoadWorker,
+        SParameterPlotWidget,
+        SParameterSweepPanel,
+        SParameterSweepWorker,
+    )
+except ImportError:
+    from qick_sparameter_sweep import SParameterSweepConfig
+    from sparameter_gui import (
+        SParameterLoadWorker,
+        SParameterPlotWidget,
+        SParameterSweepPanel,
+        SParameterSweepWorker,
+    )
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -97,8 +115,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 5
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, SETTINGS_VERSION)
+SETTINGS_VERSION = 6
+SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, SETTINGS_VERSION)
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -139,6 +157,8 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "filter_cutoff": 2.5,
     "filter_bandwidth": 1.0,
 }
+
+DEFAULT_SPARAMETER_SETTINGS = asdict(SParameterSweepConfig())
 
 
 def _time_from_ns(value_ns: float, unit: str) -> float:
@@ -2394,6 +2414,25 @@ class ExperimentPanel(QtWidgets.QWidget):
         return channels
 
     def values(self, output_count: int, *, require_run_config: bool = True) -> dict:
+        connection, run = self.connection_values(
+            require_run_config=require_run_config
+        )
+        return {
+            "connection": connection,
+            "run": run,
+            "fabric_mhz": self.fabric_mhz.value(),
+            "tproc_mhz": self.tproc_mhz.value(),
+            "full_scale_mv": self.full_scale_mv.value(),
+            "awg_channels": self._parse_awg_channels(output_count),
+            "repetitions_per_sweep": self.repetitions.value(),
+            "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
+            "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
+        }
+
+    def connection_values(
+        self, *, require_run_config: bool = True
+    ) -> Tuple[QickConnectionConfig, Optional[QcodesRunConfig]]:
+        """Return shared QICK/QCoDeS settings without validating AWG fields."""
         connection = QickConnectionConfig(
             host=self.qick_host.text().strip(),
             ns_port=self.ns_port.value(),
@@ -2409,17 +2448,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             if require_run_config
             else None
         )
-        return {
-            "connection": connection,
-            "run": run,
-            "fabric_mhz": self.fabric_mhz.value(),
-            "tproc_mhz": self.tproc_mhz.value(),
-            "full_scale_mv": self.full_scale_mv.value(),
-            "awg_channels": self._parse_awg_channels(output_count),
-            "repetitions_per_sweep": self.repetitions.value(),
-            "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
-            "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
-        }
+        return connection, run
 
     def settings_dict(self, output_count: int) -> dict:
         values = self.values(output_count)
@@ -3118,6 +3147,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
             parent=self,
         )
+        self._sparameter_panel = SParameterSweepPanel(self)
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
@@ -3125,6 +3155,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._show_qick_program
         )
         self._experiment_panel.bias_t_changed.connect(self._on_bias_t_changed)
+        self._sparameter_panel.run_requested.connect(
+            self._run_sparameter_sweep
+        )
+        self._sparameter_panel.load_requested.connect(
+            self._load_sparameter_run
+        )
 
         self._time_unit_combo = QtWidgets.QComboBox()
         self._time_unit_combo.addItems(tuple(TIME_UNIT_NS))
@@ -3139,6 +3175,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._rf_ports_panel, "RF Outputs")
         self._control_tabs.addTab(self._rf_readout_panel, "RF Readout")
         self._control_tabs.addTab(self._experiment_panel, "Experiment")
+        self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
+        self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
         control_layout = QtWidgets.QVBoxLayout(control_container)
         control_layout.setContentsMargins(4, 4, 4, 4)
@@ -3185,7 +3223,18 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_trace = QtWidgets.QDockWidget("Trace Plot", self)
         self._dock_trace.setWidget(self._trace_placeholder)
 
-        for dock in (self._dock_ctrl, self._dock_plot, self._dock_trace):
+        self._sparameter_plot = SParameterPlotWidget(self)
+        self._dock_sparameter = QtWidgets.QDockWidget(
+            "RF S-Parameter", self
+        )
+        self._dock_sparameter.setWidget(self._sparameter_plot)
+
+        for dock in (
+            self._dock_ctrl,
+            self._dock_plot,
+            self._dock_trace,
+            self._dock_sparameter,
+        ):
             dock.setFeatures(
                 QtWidgets.QDockWidget.DockWidgetMovable |
                 QtWidgets.QDockWidget.DockWidgetFloatable
@@ -3195,12 +3244,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self._dock_ctrl)
         self.splitDockWidget(self._dock_ctrl, self._dock_plot, QtCore.Qt.Horizontal)
         self.splitDockWidget(self._dock_plot, self._dock_trace, QtCore.Qt.Horizontal)
+        self.tabifyDockWidget(self._dock_trace, self._dock_sparameter)
         self.resizeDocks(
             [self._dock_ctrl, self._dock_plot, self._dock_trace],
             [200, 400, 300],
             QtCore.Qt.Horizontal
         )
         self._dock_plot.raise_()
+        self._dock_trace.raise_()
 
         # status bar
         self.statusBar().showMessage("Ready")
@@ -3765,6 +3816,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_ctrl.show()
         self._dock_ctrl.raise_()
 
+    def _on_control_tab_changed(self, _index: int) -> None:
+        if self._control_tabs.currentWidget() is self._sparameter_panel:
+            self._dock_sparameter.show()
+            self._dock_sparameter.raise_()
+
     def _apply_rf_spec(self, spec: QickRfPulseSpec) -> None:
         self._rf_pulse_specs = [spec]
         self._rf_pulse_spec = spec
@@ -3869,6 +3925,118 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "gui_settings": gui_settings,
             "progress": False,
         }
+
+    def _sparameter_run_arguments(self) -> dict:
+        connection, run = self._experiment_panel.connection_values()
+        return {
+            "connection_config": connection,
+            "run_config": run,
+            "sweep_config": self._sparameter_panel.config(),
+            "tproc_mhz": self._experiment_panel.tproc_mhz.value(),
+        }
+
+    def _run_sparameter_sweep(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            arguments = self._sparameter_run_arguments()
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Cannot run RF sweep", str(exc)
+            )
+            return
+
+        config = arguments["sweep_config"]
+        sample_count = max(1, int(np.ceil(config.scan_time_us)))
+        self._sparameter_panel.set_running(
+            True,
+            (
+                f"0% - Preparing {config.frequency_points:,} frequency points, "
+                f"about {sample_count:,} FIR samples per point"
+            ),
+        )
+        self.statusBar().showMessage("RF S-parameter sweep running")
+        thread = QtCore.QThread(self)
+        worker = SParameterSweepWorker(arguments)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_sparameter_finished)
+        worker.failed.connect(self._on_sparameter_failed)
+        worker.progress_changed.connect(self._on_sparameter_progress)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _load_sparameter_run(self, run_id: int) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            _connection, run = self._experiment_panel.connection_values()
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Cannot load RF sweep", str(exc)
+            )
+            return
+        self._sparameter_panel.set_running(
+            True,
+            "Loading saved RF S-parameter run...",
+        )
+        thread = QtCore.QThread(self)
+        worker = SParameterLoadWorker(str(run.resolved_database_path), run_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_sparameter_finished)
+        worker.failed.connect(self._on_sparameter_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_sparameter_progress(self, percent: int, message: str) -> None:
+        self._sparameter_panel.update_progress(percent, message)
+        self.statusBar().showMessage(f"RF sweep {percent}%: {message}")
+
+    def _on_sparameter_finished(self, stored) -> None:
+        self._sparameter_panel.show_result(stored)
+        self._sparameter_plot.set_result(stored.result)
+        self._dock_sparameter.show()
+        self._dock_sparameter.raise_()
+        self.statusBar().showMessage(
+            f"RF S-parameter run {stored.run_id} loaded from {stored.database_path}"
+        )
+
+    def _on_sparameter_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown RF S-parameter error"
+        self._sparameter_panel.set_running(False, f"Failed: {summary}")
+        self.statusBar().showMessage("RF S-parameter sweep failed")
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        dialog.setWindowTitle("RF S-parameter sweep failed")
+        dialog.setText(summary)
+        dialog.setDetailedText(details)
+        dialog.exec_()
 
     def _run_qick_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -4224,6 +4392,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
+            "s_parameter": dict(self._sparameter_panel.settings_dict()),
         }
 
     @staticmethod
@@ -4417,6 +4586,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             notes=str(experiment.get("notes", "")),
         )
 
+        raw_sparameter = data.get("s_parameter", {})
+        if raw_sparameter is None:
+            raw_sparameter = {}
+        if not isinstance(raw_sparameter, dict):
+            raise TypeError("s_parameter must be a JSON object")
+        sparameter_config = SParameterSweepConfig(
+            **{**DEFAULT_SPARAMETER_SETTINGS, **raw_sparameter}
+        )
+
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}
         if "rf_outputs" in data:
             raw_rf_outputs = data["rf_outputs"]
@@ -4562,6 +4740,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "run_config": run_config,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
+            "s_parameter": asdict(sparameter_config),
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -4618,6 +4797,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._ddr_readout_spec = self._rf_readout_panel.spec()
+        self._sparameter_panel.load_settings(settings["s_parameter"])
 
         self._selected_port_idx = settings["selected_output"]
         self._plot.set_selected_port_idx(self._selected_port_idx)

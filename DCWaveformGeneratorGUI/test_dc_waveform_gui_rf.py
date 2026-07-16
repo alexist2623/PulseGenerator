@@ -584,10 +584,14 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
         window._rf_readout_panel.settings_dict()
         == gui.DEFAULT_RF_READOUT_SETTINGS
     )
+    assert (
+        window._sparameter_panel.settings_dict()
+        == gui.DEFAULT_SPARAMETER_SETTINGS
+    )
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 5
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 6
     assert upgraded["display"]["voltage_view"] == "both"
     assert upgraded["grid"]["snap_enabled"] is False
     assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
