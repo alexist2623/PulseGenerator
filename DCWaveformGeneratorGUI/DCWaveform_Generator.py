@@ -4927,6 +4927,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if calibration_selected_tab > 1:
             raise ValueError("calibration selected tab must be 0 or 1")
+        raw_input_calibration_plot = raw_calibration.get("input_plot", {})
+        if not isinstance(raw_input_calibration_plot, dict):
+            raise TypeError("calibration input_plot must be a JSON object")
+        input_calibration_plot = {
+            **calibration_defaults["input_plot"],
+            **raw_input_calibration_plot,
+        }
+        for axis_name in ("x_scale", "y_scale"):
+            axis_scale = str(input_calibration_plot[axis_name]).lower()
+            if axis_scale not in ("linear", "log"):
+                raise ValueError(
+                    f"calibration input plot {axis_name} must be linear or log"
+                )
+            input_calibration_plot[axis_name] = axis_scale
         output_calibration_settings = asdict(output_calibration)
         input_calibration_settings = asdict(input_calibration)
         output_calibration_settings.pop("database_path")
@@ -4936,6 +4950,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "selected_tab": calibration_selected_tab,
             "output": output_calibration_settings,
             "input": input_calibration_settings,
+            "input_plot": input_calibration_plot,
         }
 
         set_names = {f"set_{index}" for index in range(pulses[0].set_count)}

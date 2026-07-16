@@ -162,6 +162,25 @@ def _result():
     return SParameterSweepResult.from_iq(frequencies, frequencies, iq)
 
 
+def _power_result():
+    frequencies = np.asarray([10.0, 11.0, 12.0])
+    gains = np.asarray([1000, 2000, 3000])
+    iq = np.zeros((gains.size, frequencies.size, 2, 2), dtype=float)
+    for power_index in range(gains.size):
+        iq[power_index, :, :, 0] = (
+            10.0 * (power_index + 1) + np.arange(frequencies.size)
+        )[:, np.newaxis]
+    frequency_gain_codes = np.repeat(gains[:, np.newaxis], frequencies.size, axis=1)
+    return SParameterPowerSweepResult.from_iq(
+        gains,
+        frequencies,
+        frequencies,
+        iq,
+        output_powers_dbm=[-30.0, -20.0, -10.0],
+        frequency_gain_codes=frequency_gain_codes,
+    )
+
+
 def test_result_uses_mean_iq_db_magnitude_and_unwrapped_phase():
     result = _result()
 
@@ -253,6 +272,44 @@ def test_sparameter_plot_phase_fit_is_display_only_and_resettable():
     app.processEvents()
     assert plot._phase_fit_applied is False
     np.testing.assert_array_equal(plot._phase_display[0], original_phase)
+    plot.close()
+
+
+def test_sparameter_power_plot_uses_lines_and_can_select_one_power():
+    app = _application()
+    plot = gui.SParameterPlotWidget()
+    plot.resize(900, 600)
+    plot.set_result(_power_result())
+    plot.show()
+    app.processEvents()
+
+    assert plot.power_selector.isEnabled()
+    assert plot.power_selector.count() == 4
+    assert plot.power_selector.itemText(0) == "All powers"
+    assert plot.power_selector.itemText(2) == "-20 dBm"
+    np.testing.assert_array_equal(plot._visible_curve_indices, [0, 1, 2])
+    assert len(plot._magnitude_curves) == 3
+    if hasattr(plot._magnitude_curves[0], "opts"):
+        assert plot._magnitude_curves[0].opts.get("symbol") is None
+    else:
+        assert plot._magnitude_curves[0].get_marker() == "None"
+
+    plot.power_selector.setCurrentIndex(2)
+    app.processEvents()
+
+    np.testing.assert_array_equal(plot._visible_curve_indices, [1])
+    assert len(plot._magnitude_curves) == 1
+    assert len(plot._phase_curves) == 1
+    assert "-20 dBm" in plot.plot_status.text()
+    if hasattr(plot._magnitude_curves[0], "opts"):
+        assert plot._magnitude_curves[0].opts.get("symbol") is None
+    else:
+        assert plot._magnitude_curves[0].get_marker() == "None"
+
+    plot.power_selector.setCurrentIndex(0)
+    app.processEvents()
+    np.testing.assert_array_equal(plot._visible_curve_indices, [0, 1, 2])
+    assert len(plot._magnitude_curves) == 3
     plot.close()
 
 
@@ -909,6 +966,7 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     calibration_panel.scope_resource.setText("USB::MOCK")
     calibration_panel.input_board.setCurrentText("RF_In")
     calibration_panel.input_path_loss.setValue(3.5)
+    calibration_panel.input_response_plot.set_axis_scales("linear", "log")
     settings = window._settings_to_dict()
     decoded = window._decode_settings(settings)
     assert decoded["s_parameter"]["frequency_start_mhz"] == 42.0
@@ -928,6 +986,10 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     )
     assert decoded["calibration"]["input"]["input_board_type"] == "RF_In"
     assert decoded["calibration"]["input"]["path_loss_db"] == 3.5
+    assert decoded["calibration"]["input_plot"] == {
+        "x_scale": "linear",
+        "y_scale": "log",
+    }
 
     legacy_settings = dict(settings)
     legacy_settings["version"] = 8
@@ -935,6 +997,10 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     legacy_decoded = window._decode_settings(legacy_settings)
     assert legacy_decoded["calibration"]["output"]["output_board_type"] == "RF_Out"
     assert legacy_decoded["calibration"]["input"]["input_board_type"] == "RF_In"
+    assert legacy_decoded["calibration"]["input_plot"] == {
+        "x_scale": "log",
+        "y_scale": "log",
+    }
 
     run_arguments = window._sparameter_run_arguments()
     assert run_arguments["run_config"].database_path == str(sparameter_database)

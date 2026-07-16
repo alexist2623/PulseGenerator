@@ -10,7 +10,18 @@ from pathlib import Path
 import traceback
 from typing import Any, Mapping
 
+import numpy as np
 from PyQt5 import QtCore, QtWidgets
+
+try:
+    import pyqtgraph as pg
+except ImportError:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
+    from matplotlib.figure import Figure
+
+    _USE_PYQTGRAPH = False
+else:
+    _USE_PYQTGRAPH = True
 
 try:
     from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
@@ -35,6 +46,241 @@ except ImportError:
 
 
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
+MAX_INPUT_CALIBRATION_PLOT_CURVES = 32
+
+
+def input_calibration_plot_data(
+    result: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return frequency, gain, input-power, and ADC arrays for plotting.
+
+    Calibration storage uses dBm and dB ADC values.  The graph uses the
+    corresponding positive linear quantities so either axis can use a real
+    linear or logarithmic scale without applying a logarithm to negative dBm.
+    """
+    if not isinstance(result, Mapping):
+        raise TypeError("input calibration result must be a mapping")
+    required = (
+        "frequencies_mhz",
+        "gains",
+        "input_power_dbm",
+        "adc_magnitude_db",
+    )
+    missing = [name for name in required if name not in result]
+    if missing:
+        raise ValueError(
+            "input calibration result is missing " + ", ".join(missing)
+        )
+
+    frequencies = np.asarray(result["frequencies_mhz"], dtype=float).reshape(-1)
+    gains = np.asarray(result["gains"], dtype=float).reshape(-1)
+    input_power_dbm = np.asarray(result["input_power_dbm"], dtype=float)
+    adc_magnitude_db = np.asarray(result["adc_magnitude_db"], dtype=float)
+    expected_shape = (gains.size, frequencies.size)
+    if frequencies.size == 0 or gains.size == 0:
+        raise ValueError("input calibration result must not be empty")
+    if input_power_dbm.shape != expected_shape:
+        raise ValueError(
+            "input_power_dbm must have shape (gain, frequency); "
+            f"expected {expected_shape}, got {input_power_dbm.shape}"
+        )
+    if adc_magnitude_db.shape != expected_shape:
+        raise ValueError(
+            "adc_magnitude_db must have shape (gain, frequency); "
+            f"expected {expected_shape}, got {adc_magnitude_db.shape}"
+        )
+    for name, values in (
+        ("frequencies_mhz", frequencies),
+        ("gains", gains),
+        ("input_power_dbm", input_power_dbm),
+        ("adc_magnitude_db", adc_magnitude_db),
+    ):
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} must contain only finite values")
+
+    input_power_mw = np.power(10.0, input_power_dbm / 10.0)
+    adc_magnitude = np.power(10.0, adc_magnitude_db / 20.0)
+    if not np.all(np.isfinite(input_power_mw)) or np.any(input_power_mw <= 0.0):
+        raise ValueError("input power cannot be represented as positive mW values")
+    if not np.all(np.isfinite(adc_magnitude)) or np.any(adc_magnitude <= 0.0):
+        raise ValueError("ADC magnitude must be positive for logarithmic plotting")
+    return (
+        np.ascontiguousarray(frequencies),
+        np.ascontiguousarray(gains),
+        np.ascontiguousarray(input_power_mw),
+        np.ascontiguousarray(adc_magnitude),
+    )
+
+
+class InputCalibrationPlotWidget(QtWidgets.QWidget):
+    """Plot calibrated input power against measured ADC magnitude."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._frequencies_mhz = np.empty(0, dtype=float)
+        self._gains = np.empty(0, dtype=float)
+        self._input_power_mw = np.empty((0, 0), dtype=float)
+        self._adc_magnitude = np.empty((0, 0), dtype=float)
+        self.displayed_frequency_indices = np.empty(0, dtype=np.int64)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(6)
+        self.frequency_selector = QtWidgets.QComboBox(self)
+        self.frequency_selector.addItem("All frequencies", None)
+        self.frequency_selector.setEnabled(False)
+        self.x_scale = self._scale_combo("Log")
+        self.y_scale = self._scale_combo("Log")
+        self.status = QtWidgets.QLabel("Run an input calibration to display data", self)
+        self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        controls.addWidget(QtWidgets.QLabel("Frequency:", self))
+        controls.addWidget(self.frequency_selector, 1)
+        controls.addWidget(QtWidgets.QLabel("X axis:", self))
+        controls.addWidget(self.x_scale)
+        controls.addWidget(QtWidgets.QLabel("Y axis:", self))
+        controls.addWidget(self.y_scale)
+        controls.addStretch(1)
+        controls.addWidget(self.status)
+        layout.addLayout(controls)
+
+        if _USE_PYQTGRAPH:
+            self.graph = pg.PlotWidget(self)
+            self.graph.setBackground("w")
+            self.plot_item = self.graph.getPlotItem()
+            self.plot_item.showGrid(x=True, y=True, alpha=0.25)
+            self.legend = self.plot_item.addLegend(offset=(10, 10))
+            layout.addWidget(self.graph, 1)
+        else:
+            self.figure = Figure(tight_layout=True)
+            self.canvas = Canvas(self.figure)
+            self.plot_item = self.figure.subplots(1, 1)
+            layout.addWidget(self.canvas, 1)
+        self.setMinimumHeight(360)
+
+        self.frequency_selector.currentIndexChanged.connect(self._render)
+        self.x_scale.currentIndexChanged.connect(self._apply_axis_scales)
+        self.y_scale.currentIndexChanged.connect(self._apply_axis_scales)
+        self._apply_axis_scales()
+
+    @staticmethod
+    def _scale_combo(default: str) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox()
+        combo.addItem("Linear", "linear")
+        combo.addItem("Log", "log")
+        combo.setCurrentText(default)
+        return combo
+
+    @property
+    def x_scale_mode(self) -> str:
+        return str(self.x_scale.currentData())
+
+    @property
+    def y_scale_mode(self) -> str:
+        return str(self.y_scale.currentData())
+
+    def set_axis_scales(self, x_scale: str, y_scale: str) -> None:
+        for name, combo, value in (
+            ("X", self.x_scale, x_scale),
+            ("Y", self.y_scale, y_scale),
+        ):
+            index = combo.findData(str(value).lower())
+            if index < 0:
+                raise ValueError(f"{name} axis scale must be linear or log")
+            combo.setCurrentIndex(index)
+        self._apply_axis_scales()
+
+    def set_result(self, result: Mapping[str, Any]) -> None:
+        (
+            self._frequencies_mhz,
+            self._gains,
+            self._input_power_mw,
+            self._adc_magnitude,
+        ) = input_calibration_plot_data(result)
+        self.frequency_selector.blockSignals(True)
+        self.frequency_selector.clear()
+        self.frequency_selector.addItem("All frequencies", None)
+        for index, frequency in enumerate(self._frequencies_mhz):
+            self.frequency_selector.addItem(f"{frequency:.9g} MHz", index)
+        self.frequency_selector.setCurrentIndex(0)
+        self.frequency_selector.setEnabled(True)
+        self.frequency_selector.blockSignals(False)
+        self._render()
+
+    def _frequency_indices(self) -> np.ndarray:
+        selected = self.frequency_selector.currentData()
+        if selected is not None:
+            return np.asarray([int(selected)], dtype=np.int64)
+        count = self._frequencies_mhz.size
+        if count <= MAX_INPUT_CALIBRATION_PLOT_CURVES:
+            return np.arange(count, dtype=np.int64)
+        return np.unique(
+            np.linspace(
+                0,
+                count - 1,
+                MAX_INPUT_CALIBRATION_PLOT_CURVES,
+                dtype=np.int64,
+            )
+        )
+
+    def _render(self, *_args) -> None:
+        if self._frequencies_mhz.size == 0:
+            return
+        indices = self._frequency_indices()
+        self.displayed_frequency_indices = indices
+        if _USE_PYQTGRAPH:
+            self.plot_item.clear()
+            self.legend.clear()
+            for curve_index, frequency_index in enumerate(indices):
+                color = pg.intColor(curve_index, hues=max(1, indices.size), values=1)
+                self.plot_item.plot(
+                    self._input_power_mw[:, frequency_index],
+                    self._adc_magnitude[:, frequency_index],
+                    pen=pg.mkPen(color, width=2),
+                    symbol="o",
+                    symbolSize=7,
+                    symbolBrush=color,
+                    name=f"{self._frequencies_mhz[frequency_index]:.9g} MHz",
+                )
+        else:
+            self.plot_item.clear()
+            for curve_index, frequency_index in enumerate(indices):
+                self.plot_item.plot(
+                    self._input_power_mw[:, frequency_index],
+                    self._adc_magnitude[:, frequency_index],
+                    "-o",
+                    label=f"{self._frequencies_mhz[frequency_index]:.9g} MHz",
+                    color=f"C{curve_index % 10}",
+                )
+            self.plot_item.grid(True, alpha=0.25)
+            self.plot_item.legend(fontsize=8, ncol=2)
+        self._apply_axis_scales()
+        shown = indices.size
+        total = self._frequencies_mhz.size
+        limited = " (sampled)" if shown < total else ""
+        self.status.setText(
+            f"{self._gains.size} gains | {shown}/{total} frequencies{limited}"
+        )
+
+    def _apply_axis_scales(self, *_args) -> None:
+        x_log = self.x_scale_mode == "log"
+        y_log = self.y_scale_mode == "log"
+        if _USE_PYQTGRAPH:
+            self.plot_item.setLabel("bottom", "Calibrated input power", units="mW")
+            self.plot_item.setLabel("left", "ADC magnitude", units="ADC units")
+            self.plot_item.setLogMode(x=x_log, y=y_log)
+            if self._frequencies_mhz.size:
+                self.plot_item.autoRange()
+        else:
+            self.plot_item.set_xlabel("Calibrated input power [mW]")
+            self.plot_item.set_ylabel("ADC magnitude [ADC units]")
+            self.plot_item.set_xscale("log" if x_log else "linear")
+            self.plot_item.set_yscale("log" if y_log else "linear")
+            if self._frequencies_mhz.size:
+                self.plot_item.relim()
+                self.plot_item.autoscale_view()
+            self.canvas.draw_idle()
 
 
 class CalibrationPanel(QtWidgets.QWidget):
@@ -322,6 +568,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.run_input_button.clicked.connect(self.input_requested.emit)
         vertical.insertWidget(1, self.run_input_button)
+        plot_group = QtWidgets.QGroupBox("Input Power / ADC Response")
+        plot_layout = QtWidgets.QVBoxLayout(plot_group)
+        self.input_response_plot = InputCalibrationPlotWidget(plot_group)
+        plot_layout.addWidget(self.input_response_plot)
+        vertical.insertWidget(2, plot_group)
         self.input_output_board.currentTextChanged.connect(self._update_board_controls)
         self.input_board.currentTextChanged.connect(self._update_board_controls)
         self._update_board_controls()
@@ -455,6 +706,10 @@ class CalibrationPanel(QtWidgets.QWidget):
             "selected_tab": self.tabs.currentIndex(),
             "output": output,
             "input": input_config,
+            "input_plot": {
+                "x_scale": self.input_response_plot.x_scale_mode,
+                "y_scale": self.input_response_plot.y_scale_mode,
+            },
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
@@ -530,6 +785,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_readout_filter.setCurrentText(input_config.readout_filter_type)
         self.input_experiment_name.setText(input_config.experiment_name)
         self.input_sample_name.setText(input_config.sample_name)
+        input_plot = dict(settings.get("input_plot", {}))
+        self.input_response_plot.set_axis_scales(
+            str(input_plot.get("x_scale", "log")),
+            str(input_plot.get("y_scale", "log")),
+        )
         self._update_board_controls()
         self.tabs.setCurrentIndex(max(0, min(1, int(settings.get("selected_tab", 0)))))
 
@@ -549,11 +809,25 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.status.setText(f"{percent}% - {message}")
 
     def show_result(self, stored) -> None:
+        plot_message = ""
+        result = getattr(stored, "result", None)
+        if isinstance(result, Mapping) and {
+            "frequencies_mhz",
+            "gains",
+            "input_power_dbm",
+            "adc_magnitude_db",
+        }.issubset(result):
+            try:
+                self.input_response_plot.set_result(result)
+            except (TypeError, ValueError) as exc:
+                plot_message = f"\nPlot unavailable: {exc}"
+            else:
+                self.tabs.setCurrentIndex(1)
         self.set_running(
             False,
             (
                 f"{stored.board_type} calibration Run {stored.run_id}: "
-                f"{stored.row_count:,} rows\n{stored.database_path}"
+                f"{stored.row_count:,} rows\n{stored.database_path}{plot_message}"
             ),
         )
 
@@ -603,6 +877,10 @@ def default_calibration_settings() -> Mapping[str, Any]:
         "selected_tab": 0,
         "output": output,
         "input": input_config,
+        "input_plot": {
+            "x_scale": "log",
+            "y_scale": "log",
+        },
     }
 
 
@@ -610,5 +888,7 @@ __all__ = [
     "CalibrationPanel",
     "CalibrationWorker",
     "DEFAULT_CALIBRATION_DB_PATH",
+    "InputCalibrationPlotWidget",
     "default_calibration_settings",
+    "input_calibration_plot_data",
 ]

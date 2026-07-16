@@ -1031,6 +1031,8 @@ class _SParameterPlotMixin:
         self._phase_original = np.empty((0, 0), dtype=float)
         self._phase_display = np.empty((0, 0), dtype=float)
         self._curve_labels = []
+        self._visible_curve_indices = np.empty(0, dtype=np.int64)
+        self._physical_power_calibrated = False
         self._phase_fit_region = None
         self._phase_fit_applied = False
         self._markers_enabled = True
@@ -1041,6 +1043,12 @@ class _SParameterPlotMixin:
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(6)
 
+        self.power_selector = QtWidgets.QComboBox(bar)
+        self.power_selector.addItem("Single sweep", 0)
+        self.power_selector.setEnabled(False)
+        self.power_selector.setToolTip(
+            "Show all power-sweep traces or select one output power"
+        )
         self.marker_button = QtWidgets.QToolButton(bar)
         self.marker_button.setText("Markers")
         self.marker_button.setCheckable(True)
@@ -1068,6 +1076,9 @@ class _SParameterPlotMixin:
         self.plot_status = QtWidgets.QLabel("No S-parameter result loaded", bar)
         self.plot_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
+        layout.addWidget(QtWidgets.QLabel("Power:", bar))
+        layout.addWidget(self.power_selector)
+        layout.addSpacing(8)
         layout.addWidget(self.marker_button)
         layout.addWidget(self.clear_markers_button)
         layout.addSpacing(8)
@@ -1077,6 +1088,9 @@ class _SParameterPlotMixin:
         layout.addStretch(1)
         layout.addWidget(self.plot_status)
 
+        self.power_selector.currentIndexChanged.connect(
+            self._on_power_selection_changed
+        )
         self.marker_button.toggled.connect(self._set_markers_enabled)
         self.clear_markers_button.clicked.connect(self.clear_markers)
         self.phase_range_button.toggled.connect(self._set_phase_region_visible)
@@ -1118,6 +1132,10 @@ class _SParameterPlotMixin:
         self._phase_original = np.ascontiguousarray(phase)
         self._phase_display = self._phase_original.copy()
         self._curve_labels = labels
+        self._physical_power_calibrated = bool(
+            getattr(result, "physical_power_calibrated", False)
+        )
+        self._configure_power_selector()
         self._phase_fit_applied = False
         low = float(frequency[0])
         high = float(frequency[-1])
@@ -1130,6 +1148,62 @@ class _SParameterPlotMixin:
             else (low, high)
         )
         self._set_data_controls_enabled(frequency.size > 0)
+
+    def _configure_power_selector(self) -> None:
+        self.power_selector.blockSignals(True)
+        self.power_selector.clear()
+        curve_count = len(self._curve_labels)
+        if curve_count > 1:
+            self.power_selector.addItem("All powers", None)
+            for index in range(curve_count):
+                self.power_selector.addItem(self._curve_name(index), index)
+            self.power_selector.setEnabled(True)
+            self._visible_curve_indices = np.arange(curve_count, dtype=np.int64)
+        else:
+            label = self._curve_name(0) if curve_count else "Single sweep"
+            self.power_selector.addItem(label, 0)
+            self.power_selector.setEnabled(False)
+            self._visible_curve_indices = np.asarray([0], dtype=np.int64)
+        self.power_selector.setCurrentIndex(0)
+        self.power_selector.blockSignals(False)
+
+    def _on_power_selection_changed(self, *_args) -> None:
+        if not self._curve_labels:
+            return
+        selected = self.power_selector.currentData()
+        self._visible_curve_indices = (
+            np.arange(len(self._curve_labels), dtype=np.int64)
+            if selected is None
+            else np.asarray([int(selected)], dtype=np.int64)
+        )
+        self.clear_markers()
+        self._render_curves()
+        self._set_result_status()
+        self.fit_view()
+
+    def _set_result_status(self) -> None:
+        if self._frequency.size == 0:
+            return
+        if len(self._curve_labels) > 1:
+            selected = self.power_selector.currentData()
+            power_text = (
+                f"all {len(self._curve_labels)} powers"
+                if selected is None
+                else self._curve_name(int(selected))
+            )
+            power_text = f" | {power_text}"
+        else:
+            power_text = ""
+        self.plot_status.setText(
+            f"{self._frequency.size:,} frequency points{power_text} | "
+            "hover for values; left-click to pin"
+        )
+
+    def _visible_values(self, values: np.ndarray) -> np.ndarray:
+        return np.asarray(values)[self._visible_curve_indices]
+
+    def _original_curve_index(self, visible_curve_index: int) -> int:
+        return int(self._visible_curve_indices[int(visible_curve_index)])
 
     def _curve_name(self, curve_index: int) -> str:
         label = self._curve_labels[curve_index]
@@ -1175,6 +1249,7 @@ class _SParameterPlotMixin:
         slope_text = ", ".join(
             f"{self._curve_name(index)} {slope:+.6g} deg/MHz"
             for index, slope in enumerate(slopes)
+            if index in self._visible_curve_indices
         )
         self.plot_status.setText(
             f"Phase line removed over {min(start, stop):.9g}.."
@@ -1264,13 +1339,23 @@ if _USE_PYQTGRAPH:
             ):
                 if plot.sceneBoundingRect().contains(scene_position):
                     view_position = plot.vb.mapSceneToView(scene_position)
-                    nearest = nearest_sparameter_point(
+                    (
+                        visible_curve_index,
+                        point_index,
+                        frequency,
+                        value,
+                    ) = nearest_sparameter_point(
                         self._frequency,
-                        values,
+                        self._visible_values(values),
                         view_position.x(),
                         view_position.y(),
                     )
-                    return name, plot, nearest
+                    return name, plot, (
+                        self._original_curve_index(visible_curve_index),
+                        point_index,
+                        frequency,
+                        value,
+                    )
             return None
 
         def _on_mouse_moved(self, event) -> None:
@@ -1356,8 +1441,11 @@ if _USE_PYQTGRAPH:
                 self._phase_region.hide()
 
         def _render_phase_values(self) -> None:
-            for curve, values in zip(self._phase_curves, self._phase_display):
-                curve.setData(self._frequency, values)
+            for curve, curve_index in zip(
+                self._phase_curves,
+                self._visible_curve_indices,
+            ):
+                curve.setData(self._frequency, self._phase_display[curve_index])
             self._hide_hover_markers()
             self.phase_plot.autoRange()
 
@@ -1367,14 +1455,12 @@ if _USE_PYQTGRAPH:
             self.magnitude_plot.autoRange()
             self.phase_plot.autoRange()
 
-        def set_result(self, result) -> None:
-            self._load_result_arrays(result)
-            self.clear_markers()
+        def _render_curves(self) -> None:
             self.magnitude_plot.setLabel(
                 "left",
                 (
                     "S21 (P input / P output)"
-                    if getattr(result, "physical_power_calibrated", False)
+                    if self._physical_power_calibrated
                     else "ADC magnitude"
                 ),
                 units="dB",
@@ -1388,40 +1474,33 @@ if _USE_PYQTGRAPH:
             self._magnitude_legend.clear()
             self._phase_legend.clear()
             count = len(self._curve_labels)
-            for index, (name, magnitude_values, phase_values) in enumerate(
-                zip(
-                    self._curve_labels,
-                    self._magnitude_values,
-                    self._phase_display,
-                )
-            ):
-                color = pg.intColor(index, hues=max(1, count), values=1)
+            for curve_index in self._visible_curve_indices:
+                name = self._curve_labels[curve_index]
+                color = pg.intColor(curve_index, hues=max(1, count), values=1)
                 self._magnitude_curves.append(
                     self.magnitude_plot.plot(
                         self._frequency,
-                        magnitude_values,
+                        self._magnitude_values[curve_index],
                         pen=pg.mkPen(color, width=2),
-                        symbol="o",
-                        symbolSize=5,
                         name=name,
                     )
                 )
                 self._phase_curves.append(
                     self.phase_plot.plot(
                         self._frequency,
-                        phase_values,
+                        self._phase_display[curve_index],
                         pen=pg.mkPen(color, width=2),
-                        symbol="o",
-                        symbolSize=5,
                         name=name,
                     )
                 )
+
+        def set_result(self, result) -> None:
+            self._load_result_arrays(result)
+            self.clear_markers()
+            self._render_curves()
             self._phase_region.setRegion(self._phase_fit_region)
             self._set_phase_region_visible(self.phase_range_button.isChecked())
-            self.plot_status.setText(
-                f"{self._frequency.size:,} frequency points | "
-                "hover for values; left-click to pin"
-            )
+            self._set_result_status()
             self.fit_view()
 
 else:
@@ -1484,8 +1563,11 @@ else:
                 self.canvas.draw_idle()
 
         def _render_phase_values(self) -> None:
-            for curve, values in zip(self._phase_curves, self._phase_display):
-                curve.set_ydata(values)
+            for curve, curve_index in zip(
+                self._phase_curves,
+                self._visible_curve_indices,
+            ):
+                curve.set_ydata(self._phase_display[curve_index])
             self.phase_plot.relim()
             self.phase_plot.autoscale_view()
             self._hide_hover_markers()
@@ -1500,13 +1582,23 @@ else:
                 values = self._phase_display
             else:
                 return None
-            nearest = nearest_sparameter_point(
+            (
+                visible_curve_index,
+                point_index,
+                frequency,
+                value,
+            ) = nearest_sparameter_point(
                 self._frequency,
-                values,
+                self._visible_values(values),
                 event.xdata,
                 event.ydata,
             )
-            return name, event.inaxes, nearest
+            return name, event.inaxes, (
+                self._original_curve_index(visible_curve_index),
+                point_index,
+                frequency,
+                value,
+            )
 
         def _on_mouse_moved(self, event) -> None:
             if not self._markers_enabled or self._frequency.size == 0:
@@ -1578,8 +1670,9 @@ else:
                 axis.autoscale_view()
             self.canvas.draw_idle()
 
-        def set_result(self, result) -> None:
-            self._load_result_arrays(result)
+        def _render_curves(self) -> None:
+            if self._span_selector is not None:
+                self._span_selector.disconnect_events()
             self.magnitude_plot.clear()
             self.phase_plot.clear()
             self._pinned_markers.clear()
@@ -1589,19 +1682,14 @@ else:
             self._magnitude_curves = []
             self._phase_curves = []
             count = len(self._curve_labels)
-            for index, (label, magnitude_values, phase_values) in enumerate(
-                zip(
-                    self._curve_labels,
-                    self._magnitude_values,
-                    self._phase_display,
-                )
-            ):
-                color = f"C{index % max(1, min(count, 10))}"
+            for curve_index in self._visible_curve_indices:
+                label = self._curve_labels[curve_index]
+                color = f"C{curve_index % max(1, min(count, 10))}"
                 self._magnitude_curves.append(
                     self.magnitude_plot.plot(
                         self._frequency,
-                        magnitude_values,
-                        "-o",
+                        self._magnitude_values[curve_index],
+                        "-",
                         color=color,
                         label=label,
                     )[0]
@@ -1609,19 +1697,22 @@ else:
                 self._phase_curves.append(
                     self.phase_plot.plot(
                         self._frequency,
-                        phase_values,
-                        "-o",
+                        self._phase_display[curve_index],
+                        "-",
                         color=color,
                         label=label,
                     )[0]
                 )
-            if self._curve_labels[0] is not None:
+            if any(
+                self._curve_labels[index] is not None
+                for index in self._visible_curve_indices
+            ):
                 self.magnitude_plot.legend()
                 self.phase_plot.legend()
             self.magnitude_plot.set_ylabel(
                 (
                     "S21, P input - P output [dB]"
-                    if getattr(result, "physical_power_calibrated", False)
+                    if self._physical_power_calibrated
                     else "ADC magnitude [dB]"
                 )
             )
@@ -1651,10 +1742,11 @@ else:
             }
             self._hide_hover_markers()
             self._install_span_selector()
-            self.plot_status.setText(
-                f"{self._frequency.size:,} frequency points | "
-                "hover for values; left-click to pin"
-            )
+
+        def set_result(self, result) -> None:
+            self._load_result_arrays(result)
+            self._render_curves()
+            self._set_result_status()
             self.fit_view()
 
 

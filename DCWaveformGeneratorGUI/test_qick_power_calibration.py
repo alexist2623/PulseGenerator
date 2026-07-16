@@ -12,7 +12,9 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+from PyQt5 import QtWidgets
 
+from calibration_gui import CalibrationPanel, input_calibration_plot_data
 from power_calibration import CalibrationDatabase, MAX_QICK_GAIN
 from qick_power_calibration import (
     InputPowerCalibrationConfig,
@@ -24,6 +26,10 @@ from qick_power_calibration import (
 )
 from qick_qcodes_experiment import QCODES_STAGING_ENV, QickConnectionConfig
 from qick_sparameter_sweep import SParameterSweepResult, apply_power_calibration
+
+
+def _application():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
 class _FakeSoc:
@@ -89,6 +95,67 @@ def test_keysight_fft_adapter_uses_original_notebook_scpi(monkeypatch):
     assert ":FUNCtion1:SOURce CHANnel2" in instrument.commands
     assert ":MARKer:X1Position 450000000" in instrument.commands
     assert instrument.commands.count(":MARKer:Y1Position?") == 2
+
+
+def test_input_calibration_plot_data_restores_positive_linear_quantities():
+    frequencies, gains, input_mw, adc_magnitude = input_calibration_plot_data(
+        {
+            "frequencies_mhz": [400.0, 500.0],
+            "gains": [1000, 2000],
+            "input_power_dbm": [[-30.0, -20.0], [-20.0, -10.0]],
+            "adc_magnitude_db": [
+                [0.0, 20.0],
+                [20.0 * np.log10(2.0), 40.0],
+            ],
+        }
+    )
+
+    np.testing.assert_array_equal(frequencies, [400.0, 500.0])
+    np.testing.assert_array_equal(gains, [1000.0, 2000.0])
+    np.testing.assert_allclose(input_mw, [[0.001, 0.01], [0.01, 0.1]])
+    np.testing.assert_allclose(adc_magnitude, [[1.0, 10.0], [2.0, 100.0]])
+
+
+def test_input_calibration_result_plot_has_independent_axis_scales(tmp_path):
+    app = _application()
+    panel = CalibrationPanel()
+    stored = SimpleNamespace(
+        run_id=17,
+        row_count=8,
+        board_type="RF_In",
+        database_path=tmp_path / "gain_pwr_calb.db",
+        result={
+            "frequencies_mhz": [400.0, 500.0],
+            "gains": [1000, 2000, 3000],
+            "input_power_dbm": [
+                [-40.0, -39.0],
+                [-30.0, -29.0],
+                [-20.0, -19.0],
+            ],
+            "adc_magnitude_db": [
+                [10.0, 11.0],
+                [20.0, 21.0],
+                [30.0, 31.0],
+            ],
+        },
+    )
+
+    panel.show_result(stored)
+    app.processEvents()
+
+    plot = panel.input_response_plot
+    assert panel.tabs.currentIndex() == 1
+    assert plot.x_scale_mode == "log"
+    assert plot.y_scale_mode == "log"
+    np.testing.assert_array_equal(plot.displayed_frequency_indices, [0, 1])
+    plot.set_axis_scales("linear", "log")
+    assert plot.x_scale_mode == "linear"
+    assert plot.y_scale_mode == "log"
+    assert panel.settings_dict()["input_plot"] == {
+        "x_scale": "linear",
+        "y_scale": "log",
+    }
+    panel.close()
 
 
 def _create_output_calibration(tmp_path, monkeypatch):
