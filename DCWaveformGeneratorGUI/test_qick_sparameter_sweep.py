@@ -281,11 +281,13 @@ def test_calibrated_program_reads_gain_table_from_dmem_and_compresses_addresses(
             calls.append(("reload",))
 
         def load_mem(self, data, mem_sel, addr):
-            calls.append(("load", np.asarray(data).copy(), mem_sel, addr))
+            calls.append(("load", data, mem_sel, addr))
 
     program._load_runtime_dmem(FakeSoc())
     assert calls[0] == ("reload",)
     assert calls[1][2:] == ("dmem", 16)
+    assert isinstance(calls[1][1], list)
+    assert all(type(value) is int for value in calls[1][1])
     np.testing.assert_array_equal(calls[1][1], gain_table)
 
 

@@ -519,6 +519,24 @@ def test_qick_assembly_dialog_is_read_only_and_copyable():
     dialog.copy_button.click()
     app.processEvents()
     assert QtWidgets.QApplication.clipboard().text() == assembly
+
+
+def test_detailed_error_dialog_copies_summary_and_traceback():
+    app = _application()
+    details = "Traceback (most recent call last):\nModuleNotFoundError: numpy._core"
+    dialog = gui.DetailedErrorMessageBox(
+        "RF S-parameter sweep failed",
+        "ModuleNotFoundError: numpy._core",
+        details,
+    )
+
+    assert dialog.detailedText() == details
+    assert dialog.copy_button.text() == "Copy Details"
+    dialog.copy_button.click()
+    app.processEvents()
+    copied = QtWidgets.QApplication.clipboard().text()
+    assert "RF S-parameter sweep failed" in copied
+    assert details in copied
     dialog.close()
 
 

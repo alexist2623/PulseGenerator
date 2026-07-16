@@ -1346,8 +1346,12 @@ class SParameterSweepProgram(RAveragerProgram):
         if hasattr(soc, "reload_mem"):
             soc.reload_mem()
         if self._uses_gain_table:
+            # Keep the Pyro payload independent of NumPy's pickle internals.
+            # QickSoc.load_mem() converts this plain list back to int32 on the
+            # ZCU216, so mixed NumPy 1.x/2.x client-server installations work.
+            gain_words = [int(value) for value in self._gain_table]
             soc.load_mem(
-                np.ascontiguousarray(self._gain_table, dtype=np.int32),
+                gain_words,
                 mem_sel="dmem",
                 addr=int(self.sweep.gain_dmem_base_address),
             )

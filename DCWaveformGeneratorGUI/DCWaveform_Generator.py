@@ -2748,6 +2748,27 @@ class QickProgramWorker(QtCore.QObject):
         self.finished.emit(result)
 
 
+class DetailedErrorMessageBox(QtWidgets.QMessageBox):
+    """Error message with expandable traceback and one-click clipboard copy."""
+
+    def __init__(self, title: str, summary: str, details: str, parent=None):
+        super().__init__(parent)
+        self._copy_text = f"{title}\n{summary}\n\n{details}".strip()
+        self.setIcon(QtWidgets.QMessageBox.Critical)
+        self.setWindowTitle(title)
+        self.setText(summary)
+        self.setDetailedText(details)
+        self.setStandardButtons(QtWidgets.QMessageBox.Close)
+        self.copy_button = self.addButton(
+            "Copy Details", QtWidgets.QMessageBox.ActionRole
+        )
+        self.copy_button.setToolTip("Copy the complete error and traceback")
+        self.copy_button.clicked.connect(self.copy_details)
+
+    def copy_details(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self._copy_text)
+
+
 class QickAssemblyDialog(QtWidgets.QDialog):
     """Read-only tProcessor assembly viewer with copy and save actions."""
 
@@ -4212,11 +4233,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         summary = lines[-1] if lines else "Unknown RF S-parameter error"
         self._sparameter_panel.set_running(False, f"Failed: {summary}")
         self.statusBar().showMessage("RF S-parameter sweep failed")
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Critical)
-        dialog.setWindowTitle("RF S-parameter sweep failed")
-        dialog.setText(summary)
-        dialog.setDetailedText(details)
+        dialog = DetailedErrorMessageBox(
+            "RF S-parameter sweep failed", summary, details, self
+        )
         dialog.exec_()
 
     def _run_power_calibration(self, mode: str) -> None:
@@ -4291,11 +4310,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         summary = lines[-1] if lines else "Unknown calibration error"
         self._calibration_panel.set_running(False, f"Failed: {summary}")
         self.statusBar().showMessage("QICK calibration failed")
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Critical)
-        dialog.setWindowTitle("QICK calibration failed")
-        dialog.setText(summary)
-        dialog.setDetailedText(details)
+        dialog = DetailedErrorMessageBox(
+            "QICK calibration failed", summary, details, self
+        )
         dialog.exec_()
 
     def _run_qick_experiment(self) -> None:
@@ -4411,11 +4428,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         summary = lines[-1] if lines else "Unknown QICK program compilation error"
         self._experiment_panel.set_running(False, f"Failed: {summary}")
         self.statusBar().showMessage("QICK program compilation failed")
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Critical)
-        dialog.setWindowTitle("Cannot show QICK program")
-        dialog.setText(summary)
-        dialog.setDetailedText(details)
+        dialog = DetailedErrorMessageBox(
+            "Cannot show QICK program", summary, details, self
+        )
         dialog.exec_()
 
     def _on_experiment_progress(self, percent: int, message: str) -> None:
@@ -4433,11 +4448,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         summary = lines[-1] if lines else "Unknown QICK experiment error"
         self._experiment_panel.set_running(False, f"Failed: {summary}")
         self.statusBar().showMessage("QICK experiment failed")
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Critical)
-        dialog.setWindowTitle("QICK experiment failed")
-        dialog.setText(summary)
-        dialog.setDetailedText(details)
+        dialog = DetailedErrorMessageBox(
+            "QICK experiment failed", summary, details, self
+        )
         dialog.exec_()
 
     def _clear_experiment_thread(self) -> None:
