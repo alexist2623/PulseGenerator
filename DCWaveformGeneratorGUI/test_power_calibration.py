@@ -116,6 +116,45 @@ def _calibration_database(path):
     connection.close()
 
 
+def _add_input_calibration_run(path, run_id, board_type, input_attenuation_db):
+    connection = sqlite3.connect(path)
+    table = f"results-input-{run_id}"
+    connection.execute(
+        "INSERT INTO experiments VALUES (?, 'input calibration', ?)",
+        (run_id, f"{board_type}_400MHz"),
+    )
+    connection.execute(
+        "INSERT INTO runs "
+        "(run_id, exp_id, result_table_name, is_completed, Attenuation, "
+        "Calibration_Config) VALUES (?, ?, ?, 1, NULL, ?)",
+        (
+            run_id,
+            run_id,
+            table,
+            json.dumps({"input_attenuation_db": input_attenuation_db}),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO layouts VALUES (?, ?, 'freq', 'freq', 'MHz', '')",
+        (run_id, run_id),
+    )
+    connection.execute(
+        f'CREATE TABLE "{table}" '
+        "(id INTEGER PRIMARY KEY, freq REAL, measured_value REAL, "
+        "meas_in_pwr REAL, meas_slope REAL, meas_intercept REAL)"
+    )
+    row_id = 1
+    for frequency in (400.0, 450.0, 500.0):
+        for measured_value in (-20.0, -10.0):
+            connection.execute(
+                f'INSERT INTO "{table}" VALUES (?, ?, ?, ?, NULL, NULL)',
+                (row_id, frequency, measured_value, measured_value - 60.0),
+            )
+            row_id += 1
+    connection.commit()
+    connection.close()
+
+
 def test_selects_same_board_and_covering_frequency_run(tmp_path):
     path = tmp_path / "gain_pwr_calb.db"
     _calibration_database(path)
@@ -182,6 +221,50 @@ def test_output_and_input_power_calibration_use_physical_dbm(tmp_path):
         input_attenuation_db=10.0,
     )
     np.testing.assert_allclose(attenuated_measurement, [-80.0])
+
+
+def test_input_calibration_selects_manual_run_or_latest_same_attenuation(tmp_path):
+    path = tmp_path / "gain_pwr_calb.db"
+    _calibration_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE runs ADD COLUMN Calibration_Config TEXT")
+    _add_input_calibration_run(path, 10, "RF_In", 20.0)
+    _add_input_calibration_run(path, 11, "RF_In", 10.0)
+    _add_input_calibration_run(path, 12, "RF_In", 20.0)
+    catalog = CalibrationDatabase(path)
+
+    latest_20_db = catalog.input_calibration(
+        "RF_In",
+        [410.0, 490.0],
+        input_attenuation_db=20.0,
+    )
+    latest_10_db = catalog.input_calibration(
+        "RF_In",
+        [410.0, 490.0],
+        input_attenuation_db=10.0,
+    )
+    manual = catalog.input_calibration(
+        "RF_In",
+        [410.0, 490.0],
+        run_id=10,
+        input_attenuation_db=10.0,
+    )
+
+    assert latest_20_db.summary.run_id == 12
+    assert latest_10_db.summary.run_id == 11
+    assert manual.summary.run_id == 10
+    with pytest.raises(LookupError, match="available covering runs"):
+        catalog.input_calibration(
+            "RF_In",
+            [410.0, 490.0],
+            input_attenuation_db=15.0,
+        )
+    with pytest.raises(LookupError, match="Run 99"):
+        catalog.input_calibration(
+            "RF_In",
+            [410.0, 490.0],
+            run_id=99,
+        )
 
 
 def test_schedule_uses_one_entry_per_point_up_to_dmem_limit(tmp_path):

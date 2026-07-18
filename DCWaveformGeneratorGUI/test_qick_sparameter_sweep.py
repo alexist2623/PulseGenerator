@@ -22,6 +22,7 @@ from qick.qick_asm import QickConfig
 
 import DCWaveform_Generator as gui
 import qick_sparameter_sweep as sparameter_module
+import sparameter_gui as sparameter_gui_module
 from sparameter_gui import nearest_sparameter_point, subtract_phase_linear_fit
 from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
@@ -317,6 +318,139 @@ def test_gain_has_hard_limit():
     assert SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN).gain == 32766
     with pytest.raises(ValueError, match="must not exceed"):
         SParameterSweepConfig(gain=MAX_RF_OUTPUT_GAIN + 1)
+
+
+def test_manual_input_calibration_requires_a_positive_run_id():
+    with pytest.raises(ValueError, match="requires a Run ID"):
+        _config(
+            power_calibration_enabled=True,
+            calibration_database_path="calibration.db",
+            input_calibration_selection="manual_run_id",
+        )
+
+
+def test_power_calibration_manual_run_warns_on_input_attenuation_mismatch(
+    monkeypatch,
+):
+    input_summary = SimpleNamespace(input_attenuation_db=10.0, run_id=73)
+    input_calibration = SimpleNamespace(summary=input_summary)
+    calls = []
+
+    class FakeCatalog:
+        def __init__(self, database_path):
+            assert database_path == "calibration.db"
+
+        def output_calibration(self, board_type, frequencies):
+            del board_type, frequencies
+            return SimpleNamespace(summary=SimpleNamespace(run_id=11))
+
+        def input_calibration(self, board_type, frequencies, **kwargs):
+            del board_type, frequencies
+            calls.append(kwargs)
+            return input_calibration
+
+    probe = SimpleNamespace(frequencies_mhz=np.asarray([10.0, 20.0]))
+    monkeypatch.setattr(sparameter_module, "CalibrationDatabase", FakeCatalog)
+    monkeypatch.setattr(
+        sparameter_module,
+        "build_sparameter_program",
+        lambda *_args, **_kwargs: probe,
+    )
+    messages = []
+    config = _config(
+        frequency_points=2,
+        power_calibration_enabled=True,
+        calibration_database_path="calibration.db",
+        input_board_type="RF_In",
+        readout_attenuation_db=20.0,
+        input_calibration_selection="manual_run_id",
+        requested_input_calibration_run_id=73,
+    )
+
+    *_, selected_input = sparameter_module._prepare_power_calibration(
+        object(),
+        config,
+        tproc_mhz=None,
+        warning_callback=messages.append,
+    )
+
+    assert selected_input is input_calibration
+    assert calls == [{"run_id": 73}]
+    assert len(messages) == 1
+    assert "sweep 20 dB, calibration 10 dB" in messages[0]
+
+
+def test_power_calibration_auto_mode_requests_same_input_attenuation(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeCatalog:
+        def __init__(self, _database_path):
+            pass
+
+        def output_calibration(self, board_type, frequencies):
+            del board_type, frequencies
+            return SimpleNamespace(summary=SimpleNamespace(run_id=11))
+
+        def input_calibration(self, board_type, frequencies, **kwargs):
+            del board_type, frequencies
+            calls.append(kwargs)
+            raise LookupError("no same-attenuation input run")
+
+    probe = SimpleNamespace(frequencies_mhz=np.asarray([10.0, 20.0]))
+    monkeypatch.setattr(sparameter_module, "CalibrationDatabase", FakeCatalog)
+    monkeypatch.setattr(
+        sparameter_module,
+        "build_sparameter_program",
+        lambda *_args, **_kwargs: probe,
+    )
+    messages = []
+    config = _config(
+        frequency_points=2,
+        power_calibration_enabled=True,
+        calibration_database_path="calibration.db",
+        input_board_type="RF_In",
+        readout_attenuation_db=20.0,
+    )
+
+    *_, selected_input = sparameter_module._prepare_power_calibration(
+        object(),
+        config,
+        tproc_mhz=None,
+        warning_callback=messages.append,
+    )
+
+    assert selected_input is None
+    assert calls[0]["input_attenuation_db"] == 20.0
+    assert len(messages) == 1
+    assert "was not applied" in messages[0]
+
+
+def test_sparameter_worker_forwards_calibration_warnings(monkeypatch):
+    app = _application()
+    stored = object()
+
+    def fake_run_sparameter_sweep(**kwargs):
+        kwargs["warning_callback"]("calibration attenuation mismatch")
+        return stored
+
+    monkeypatch.setattr(
+        sparameter_gui_module,
+        "run_sparameter_sweep",
+        fake_run_sparameter_sweep,
+    )
+    worker = sparameter_gui_module.SParameterSweepWorker({})
+    messages = []
+    results = []
+    worker.warning_raised.connect(messages.append)
+    worker.finished.connect(results.append)
+
+    worker.run()
+    app.processEvents()
+
+    assert messages == ["calibration attenuation mismatch"]
+    assert results == [stored]
 
 
 def test_power_gain_grid_supports_linear_and_log_spacing():
@@ -1032,6 +1166,10 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
 
     panel.power_calibration_enabled.setChecked(True)
     panel.calibration_database_path.setText(str(calibration_path))
+    panel.input_calibration_selection.setCurrentIndex(
+        panel.input_calibration_selection.findData("manual_run_id")
+    )
+    panel.requested_input_calibration_run_id.setValue(81)
     panel.output_board_type.setCurrentText("DC_Out")
     panel.input_board_type.setCurrentText("RF_In")
     panel.loss1_db.setValue(1.25)
@@ -1050,6 +1188,8 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
 
     assert decoded["power_calibration_enabled"] is True
     assert decoded["calibration_database_path"] == str(calibration_path)
+    assert decoded["input_calibration_selection"] == "manual_run_id"
+    assert decoded["requested_input_calibration_run_id"] == 81
     assert decoded["output_board_type"] == "DC_Out"
     assert decoded["input_board_type"] == "RF_In"
     assert decoded["loss1_db"] == 1.25

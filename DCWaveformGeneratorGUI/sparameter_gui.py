@@ -27,6 +27,7 @@ else:
 try:
     from .qick_sparameter_sweep import (
         FILTER_TYPES,
+        INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
         POWER_SCALES,
         SParameterSweepConfig,
@@ -37,6 +38,7 @@ try:
 except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
+        INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
         POWER_SCALES,
         SParameterSweepConfig,
@@ -552,7 +554,35 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             "Same-board response; normalized to the weakest frequency in the sweep."
         )
         self.calibration_hint.setWordWrap(True)
+        self.input_calibration_selection = QtWidgets.QComboBox()
+        selection_labels = {
+            "latest_matching_attenuation": "Latest with same input ATT",
+            "manual_run_id": "Manual Run ID",
+        }
+        for selection in INPUT_CALIBRATION_SELECTIONS:
+            self.input_calibration_selection.addItem(
+                selection_labels[selection], selection
+            )
+        self.input_calibration_selection.setToolTip(
+            "Automatically use the newest covering input calibration acquired "
+            "at the current input attenuation, or choose a specific QCoDeS Run ID."
+        )
+        self.requested_input_calibration_run_id = QtWidgets.QSpinBox()
+        self.requested_input_calibration_run_id.setRange(0, 2_147_483_647)
+        self.requested_input_calibration_run_id.setSpecialValueText(
+            "Select Run ID"
+        )
+        self.requested_input_calibration_run_id.setToolTip(
+            "Input-power calibration QCoDeS Run ID used in manual mode"
+        )
         calibration_form.addRow("Calibration DB:", calibration_path_row)
+        calibration_form.addRow(
+            "Input calibration:", self.input_calibration_selection
+        )
+        calibration_form.addRow(
+            "Input calibration Run ID:",
+            self.requested_input_calibration_run_id,
+        )
         calibration_form.addRow(self.calibration_hint)
         content_layout.addWidget(self.power_calibration_enabled)
 
@@ -579,6 +609,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         power_form.addRow("Spacing:", self.power_scale)
         self.power_sweep_enabled.toggled.connect(self._update_power_control_state)
         self.power_calibration_enabled.toggled.connect(self._update_power_control_state)
+        self.input_calibration_selection.currentIndexChanged.connect(
+            self._update_power_control_state
+        )
         content_layout.addWidget(self.power_sweep_enabled)
         self._update_power_control_state(False)
 
@@ -738,8 +771,15 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         for widget in (
             self.calibration_database_path,
             self.browse_calibration_database,
+            self.input_calibration_selection,
         ):
             widget.setEnabled(calibrated)
+        manual_input_run = (
+            self.input_calibration_selection.currentData() == "manual_run_id"
+        )
+        self.requested_input_calibration_run_id.setEnabled(
+            calibrated and manual_input_run
+        )
 
     def _browse_calibration_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -804,6 +844,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             gain=self.gain.value(),
             power_calibration_enabled=(self.power_calibration_enabled.isChecked()),
             calibration_database_path=(self.calibration_database_path.text().strip()),
+            input_calibration_selection=str(
+                self.input_calibration_selection.currentData()
+            ),
+            requested_input_calibration_run_id=(
+                self.requested_input_calibration_run_id.value()
+            ),
             output_board_type=path["output_board_type"],
             input_board_type=path["input_board_type"],
             output_power_dbm=self.output_power_dbm.value(),
@@ -885,6 +931,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.margin_input_samples, config.margin_input_samples),
             (self.address, config.address),
             (self.stride_bytes, config.stride_bytes or 0),
+            (
+                self.requested_input_calibration_run_id,
+                config.requested_input_calibration_run_id,
+            ),
         )
         for widget, value in widgets:
             widget.setValue(value)
@@ -900,6 +950,15 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         if power_scale_index < 0:
             raise ValueError(f"unsupported power scale {config.power_scale!r}")
         self.power_scale.setCurrentIndex(power_scale_index)
+        selection_index = self.input_calibration_selection.findData(
+            config.input_calibration_selection
+        )
+        if selection_index < 0:
+            raise ValueError(
+                "unsupported input calibration selection "
+                f"{config.input_calibration_selection!r}"
+            )
+        self.input_calibration_selection.setCurrentIndex(selection_index)
         self.power_calibration_enabled.setChecked(config.power_calibration_enabled)
         self.power_sweep_enabled.setChecked(config.power_sweep_enabled)
         self._update_power_control_state(config.power_sweep_enabled)
@@ -1757,6 +1816,7 @@ class SParameterSweepWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
     partial_result = QtCore.pyqtSignal(object)
+    warning_raised = QtCore.pyqtSignal(str)
 
     def __init__(self, kwargs: Mapping[str, Any], parent=None):
         super().__init__(parent)
@@ -1768,6 +1828,7 @@ class SParameterSweepWorker(QtCore.QObject):
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
             kwargs["partial_callback"] = self.partial_result.emit
+            kwargs["warning_callback"] = self.warning_raised.emit
             stored = run_sparameter_sweep(**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())

@@ -19,6 +19,7 @@ import json
 import shutil
 import sqlite3
 import time
+import warnings
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -64,6 +65,11 @@ else:
 MAX_RF_OUTPUT_GAIN = 32766
 FILTER_TYPES = ("bypass", "lowpass", "highpass", "bandpass")
 POWER_SCALES = ("linear", "log")
+INPUT_CALIBRATION_SELECTIONS = (
+    "latest_matching_attenuation",
+    "manual_run_id",
+)
+INPUT_ATTENUATION_MATCH_TOLERANCE_DB = 1.0e-6
 POWER_GAIN_PARAMETER = "rf_power_gain"
 OUTPUT_POWER_PARAMETER = "rf_output_power_dbm"
 CALIBRATED_GAIN_PARAMETER = "rf_calibrated_gain_code"
@@ -80,6 +86,7 @@ ACTUAL_INPUT_POWER_PARAMETER = "actual_input_power_dbm"
 PHASE_DEG_PARAMETER = "s_parameter_phase_unwrapped_deg"
 
 ProgressCallback = Callable[[int, str], None]
+WarningCallback = Callable[[str], None]
 
 
 def _require_int(value: Any, name: str, minimum: int = 0) -> int:
@@ -123,6 +130,13 @@ def _emit_progress(
         callback(max(0, min(100, int(percent))), str(message))
 
 
+def _emit_warning(callback: Optional[WarningCallback], message: str) -> None:
+    if callback is None:
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+    else:
+        callback(str(message))
+
+
 @dataclass(frozen=True)
 class SParameterSweepConfig:
     """Independent RF output/readout configuration for one hardware sweep."""
@@ -135,6 +149,8 @@ class SParameterSweepConfig:
     gain: int = 20000
     power_calibration_enabled: bool = False
     calibration_database_path: str = ""
+    input_calibration_selection: str = "latest_matching_attenuation"
+    requested_input_calibration_run_id: int = 0
     output_board_type: str = "RF_Out"
     input_board_type: str = "DC_In"
     output_power_dbm: float = -20.0
@@ -209,6 +225,23 @@ class SParameterSweepConfig:
                     "calibration_database_path is required when power calibration "
                     "is enabled"
                 )
+        if self.input_calibration_selection not in INPUT_CALIBRATION_SELECTIONS:
+            raise ValueError(
+                "input_calibration_selection must be one of "
+                f"{INPUT_CALIBRATION_SELECTIONS}"
+            )
+        requested_input_run_id = _require_int(
+            self.requested_input_calibration_run_id,
+            "requested_input_calibration_run_id",
+        )
+        if (
+            self.power_calibration_enabled
+            and self.input_calibration_selection == "manual_run_id"
+            and requested_input_run_id < 1
+        ):
+            raise ValueError(
+                "manual input calibration selection requires a Run ID >= 1"
+            )
         if not isinstance(self.power_sweep_enabled, bool):
             raise TypeError("power_sweep_enabled must be boolean")
         power_start = _require_int(self.power_start_gain, "power_start_gain")
@@ -1490,6 +1523,12 @@ class SParameterSweepProgram(RAveragerProgram):
             ),
             "calibration_output_run_id": self.sweep.calibration_output_run_id,
             "calibration_input_run_id": self.sweep.calibration_input_run_id,
+            "input_calibration_selection": (
+                self.sweep.input_calibration_selection
+            ),
+            "requested_input_calibration_run_id": (
+                self.sweep.requested_input_calibration_run_id
+            ),
             "calibration_database_path": (
                 self.sweep.calibration_database_path
                 if self.sweep.power_calibration_enabled
@@ -1639,6 +1678,7 @@ def _prepare_power_calibration(
     config: SParameterSweepConfig,
     *,
     tproc_mhz: Optional[float],
+    warning_callback: Optional[WarningCallback] = None,
 ) -> Tuple[
     SParameterSweepProgram,
     Any,
@@ -1657,12 +1697,48 @@ def _prepare_power_calibration(
         probe.frequencies_mhz,
     )
     try:
-        input_calibration = catalog.input_calibration(
-            config.input_board_type,
-            probe.frequencies_mhz,
+        if config.input_calibration_selection == "manual_run_id":
+            input_calibration = catalog.input_calibration(
+                config.input_board_type,
+                probe.frequencies_mhz,
+                run_id=config.requested_input_calibration_run_id,
+            )
+        else:
+            input_calibration = catalog.input_calibration(
+                config.input_board_type,
+                probe.frequencies_mhz,
+                input_attenuation_db=config.effective_input_attenuation_db,
+                attenuation_tolerance_db=(
+                    INPUT_ATTENUATION_MATCH_TOLERANCE_DB
+                ),
+            )
+    except LookupError as exc:
+        if config.input_calibration_selection == "manual_run_id":
+            raise
+        _emit_warning(
+            warning_callback,
+            f"Input-power calibration was not applied: {exc}",
         )
-    except LookupError:
         input_calibration = None
+    if input_calibration is not None:
+        calibration_attenuation = (
+            input_calibration.summary.input_attenuation_db
+        )
+        if (
+            abs(
+                calibration_attenuation
+                - config.effective_input_attenuation_db
+            )
+            > INPUT_ATTENUATION_MATCH_TOLERANCE_DB
+        ):
+            _emit_warning(
+                warning_callback,
+                "Input attenuation differs from input calibration Run "
+                f"{input_calibration.summary.run_id}: sweep "
+                f"{config.effective_input_attenuation_db:.6g} dB, calibration "
+                f"{calibration_attenuation:.6g} dB. Compensated input power "
+                "may be inaccurate.",
+            )
     return (
         probe,
         output_calibration,
@@ -2443,6 +2519,7 @@ def run_sparameter_sweep(
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     partial_callback: Optional[Callable[[StoredSParameterSweep], None]] = None,
+    warning_callback: Optional[WarningCallback] = None,
 ) -> StoredSParameterSweep:
     """Run a frequency sweep, optionally inside a software gain sweep."""
     connect_qick, *_helpers = _qcodes_helpers()
@@ -2462,6 +2539,7 @@ def run_sparameter_sweep(
             soccfg,
             sweep_config,
             tproc_mhz=tproc_mhz,
+            warning_callback=warning_callback,
         )
         probe, output_calibration, output_run, input_calibration = calibration_context
         input_run = None if input_calibration is None else input_calibration.summary
@@ -2477,6 +2555,20 @@ def run_sparameter_sweep(
                 ),
                 "output_run": output_run.as_dict(),
                 "input_run": None if input_run is None else input_run.as_dict(),
+                "input_calibration_selection": (
+                    sweep_config.input_calibration_selection
+                ),
+                "requested_input_calibration_run_id": (
+                    sweep_config.requested_input_calibration_run_id
+                ),
+                "requested_input_attenuation_db": (
+                    sweep_config.effective_input_attenuation_db
+                ),
+                "calibration_input_attenuation_db": (
+                    None
+                    if input_run is None
+                    else getattr(input_run, "input_attenuation_db", None)
+                ),
                 "input_mapping_applied": input_calibration is not None,
                 "s_parameter_formula": (
                     "(P_RF_IN + LOSS2 - AMP_GAIN) - (P_RF_OUT - LOSS1)"
@@ -2859,6 +2951,7 @@ __all__ = [
     "CALIBRATED_GAIN_PARAMETER",
     "FREQUENCY_PARAMETER",
     "I_TRACE_PARAMETER",
+    "INPUT_CALIBRATION_SELECTIONS",
     "MAGNITUDE_DB_PARAMETER",
     "MAX_RF_OUTPUT_GAIN",
     "MEAN_I_PARAMETER",

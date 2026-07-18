@@ -713,9 +713,38 @@ class CalibrationDatabase:
         self,
         board_type: str,
         requested_frequencies_mhz: Any,
+        *,
+        run_id: Optional[int] = None,
+        input_attenuation_db: Optional[float] = None,
+        attenuation_tolerance_db: float = 1.0e-6,
     ) -> InputPowerCalibration:
-        """Load the newest input calibration covering the requested span."""
+        """Load one input calibration covering the requested frequency span.
+
+        ``run_id`` selects an exact run and takes precedence over attenuation
+        matching.  Otherwise, ``input_attenuation_db`` restricts automatic
+        selection to runs acquired with the same input attenuation, and the
+        newest matching run is returned.
+        """
         board_type = _validate_board_type(board_type, output=False)
+        selected_run_id = None
+        if run_id is not None:
+            if isinstance(run_id, (bool, np.bool_)) or not isinstance(
+                run_id, (int, np.integer)
+            ):
+                raise TypeError("run_id must be an integer")
+            selected_run_id = int(run_id)
+            if selected_run_id < 1:
+                raise ValueError("run_id must be >= 1")
+        selected_attenuation = None
+        if input_attenuation_db is not None:
+            selected_attenuation = float(input_attenuation_db)
+            if not np.isfinite(selected_attenuation):
+                raise ValueError("input_attenuation_db must be finite")
+        attenuation_tolerance_db = float(attenuation_tolerance_db)
+        if not np.isfinite(attenuation_tolerance_db):
+            raise ValueError("attenuation_tolerance_db must be finite")
+        if attenuation_tolerance_db < 0.0:
+            raise ValueError("attenuation_tolerance_db must be nonnegative")
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         if requested.size < 1 or not np.all(np.isfinite(requested)):
             raise ValueError("requested frequencies must be a nonempty finite array")
@@ -863,22 +892,64 @@ class CalibrationDatabase:
                     )
                 )
         if not matches:
+            run_description = (
+                ""
+                if selected_run_id is None
+                else f" for requested Run {selected_run_id}"
+            )
             raise LookupError(
                 f"no {board_type} ADC-to-input-power calibration fully covers "
+                f"{requested_min:.6g}..{requested_max:.6g} MHz{run_description}"
+            )
+        if selected_run_id is not None:
+            for candidate_run_id, calibration in matches:
+                if candidate_run_id == selected_run_id:
+                    return calibration
+            raise LookupError(
+                f"input calibration Run {selected_run_id} is not a {board_type} "
+                "run covering "
                 f"{requested_min:.6g}..{requested_max:.6g} MHz"
             )
+        if selected_attenuation is not None:
+            attenuation_matches = [
+                (candidate_run_id, calibration)
+                for candidate_run_id, calibration in matches
+                if abs(
+                    calibration.summary.input_attenuation_db
+                    - selected_attenuation
+                )
+                <= attenuation_tolerance_db
+            ]
+            if not attenuation_matches:
+                available = ", ".join(
+                    f"Run {candidate_run_id}: "
+                    f"{calibration.summary.input_attenuation_db:.6g} dB"
+                    for candidate_run_id, calibration in matches
+                )
+                raise LookupError(
+                    f"no {board_type} input calibration acquired at "
+                    f"{selected_attenuation:.6g} dB covers "
+                    f"{requested_min:.6g}..{requested_max:.6g} MHz; "
+                    f"available covering runs: {available}"
+                )
+            return max(attenuation_matches, key=lambda item: item[0])[1]
         return max(matches, key=lambda item: item[0])[1]
 
     def matching_input_run(
         self,
         board_type: str,
         requested_frequencies_mhz: Any,
+        *,
+        run_id: Optional[int] = None,
+        input_attenuation_db: Optional[float] = None,
     ) -> Optional[CalibrationRunSummary]:
         """Return input calibration metadata, retaining the legacy API."""
         try:
             return self.input_calibration(
                 board_type,
                 requested_frequencies_mhz,
+                run_id=run_id,
+                input_attenuation_db=input_attenuation_db,
             ).summary
         except LookupError:
             return None

@@ -4161,6 +4161,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.failed.connect(self._on_sparameter_failed)
         worker.progress_changed.connect(self._on_sparameter_progress)
         worker.partial_result.connect(self._on_sparameter_partial)
+        worker.warning_raised.connect(self._on_sparameter_warning)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -4209,6 +4210,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_sparameter_progress(self, percent: int, message: str) -> None:
         self._sparameter_panel.update_progress(percent, message)
         self.statusBar().showMessage(f"RF sweep {percent}%: {message}")
+
+    def _on_sparameter_warning(self, message: str) -> None:
+        self._sparameter_panel.status.setText(f"Warning: {message}")
+        self.statusBar().showMessage(f"RF sweep warning: {message}")
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Input calibration warning",
+            message,
+        )
 
     def _on_sparameter_partial(self, stored) -> None:
         self._sparameter_panel.show_partial_result(stored)
