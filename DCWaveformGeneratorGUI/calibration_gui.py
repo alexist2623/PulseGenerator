@@ -696,6 +696,32 @@ class CalibrationPanel(QtWidgets.QWidget):
             sample_name=self.input_sample_name.text().strip(),
         )
 
+    def apply_path_settings(self, values: Mapping[str, Any]) -> None:
+        """Apply the shared front-panel RF path to both calibration modes."""
+        output_ch = int(values["output_ch"])
+        readout_ch = int(values["readout_ch"])
+        output_board = str(values["output_board_type"])
+        input_board = str(values["input_board_type"])
+        att1 = float(values["output_att1_db"])
+        att2 = float(values["output_att2_db"])
+        input_att = float(values["readout_attenuation_db"])
+        input_gain = float(values["readout_dc_gain_db"])
+
+        self.output_ch.setValue(output_ch)
+        self.output_board.setCurrentText(output_board)
+        self.output_att1.setValue(att1)
+        self.output_att2.setValue(att2)
+
+        self.input_output_ch.setValue(output_ch)
+        self.input_readout_ch.setValue(readout_ch)
+        self.input_output_board.setCurrentText(output_board)
+        self.input_board.setCurrentText(input_board)
+        self.input_output_att1.setValue(att1)
+        self.input_output_att2.setValue(att2)
+        self.input_attenuation.setValue(input_att)
+        self.input_dc_gain.setValue(input_gain)
+        self._update_board_controls()
+
     def settings_dict(self) -> Mapping[str, Any]:
         output = asdict(self.output_config())
         output.pop("database_path")

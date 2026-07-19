@@ -135,6 +135,17 @@ except ImportError:
         OutputPowerCalibrationConfig,
     )
 
+try:
+    from .qick_front_panel import (
+        QickFrontPanelControl,
+        identify_qick_front_panel,
+    )
+except ImportError:
+    from qick_front_panel import (
+        QickFrontPanelControl,
+        identify_qick_front_panel,
+    )
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -2748,6 +2759,27 @@ class QickProgramWorker(QtCore.QObject):
         self.finished.emit(result)
 
 
+class QickConfigurationWorker(QtCore.QObject):
+    """Fetch the live HWH-derived config and reconstruct physical SMA routing."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, connection_config, parent=None):
+        super().__init__(parent)
+        self._connection_config = connection_config
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            _soc, soccfg = connect_qick(self._connection_config)
+            configuration = identify_qick_front_panel(soccfg)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(configuration)
+
+
 class DetailedErrorMessageBox(QtWidgets.QMessageBox):
     """Error message with expandable traceback and one-click clipboard copy."""
 
@@ -3310,6 +3342,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._sparameter_panel = SParameterSweepPanel(self)
         self._calibration_panel = CalibrationPanel(self)
+        self._qick_front_panel = QickFrontPanelControl(self)
+        self._qick_front_panel.set_path_values(
+            self._sparameter_panel.path_diagram.applied_values()
+        )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
@@ -3332,6 +3368,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.input_requested.connect(
             lambda: self._run_power_calibration("input")
         )
+        self._qick_front_panel.identify_requested.connect(
+            self._identify_qick_configuration
+        )
+        self._qick_front_panel.settings_applied.connect(
+            self._apply_front_panel_settings
+        )
 
         self._time_unit_combo = QtWidgets.QComboBox()
         self._time_unit_combo.addItems(tuple(TIME_UNIT_NS))
@@ -3348,6 +3390,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._experiment_panel, "Experiment")
         self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
+        self._control_tabs.addTab(self._qick_front_panel, "QICK Front Panel")
+        self._control_tabs.setCurrentWidget(self._qick_front_panel)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
         control_layout = QtWidgets.QVBoxLayout(control_container)
@@ -4110,10 +4154,94 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "tproc_mhz": self._experiment_panel.tproc_mhz.value(),
         }
 
+    def _identify_qick_configuration(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            connection, _run = self._experiment_panel.connection_values(
+                require_run_config=False
+            )
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Cannot identify QICK",
+                str(exc),
+            )
+            return
+
+        self._qick_front_panel.set_identifying(
+            True,
+            "Connecting and reading HWH configuration...",
+        )
+        self.statusBar().showMessage("Identifying QICK front-panel configuration")
+        thread = QtCore.QThread(self)
+        worker = QickConfigurationWorker(connection)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_qick_configuration_identified)
+        worker.failed.connect(self._on_qick_configuration_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_qick_configuration_identified(self, configuration) -> None:
+        self._qick_front_panel.set_configuration(configuration)
+        self._qick_front_panel.set_identifying(
+            False,
+            f"{configuration.mapped_output_count} DAC / "
+            f"{configuration.mapped_input_count} ADC ports mapped",
+        )
+        self.statusBar().showMessage(
+            f"QICK identified: {configuration.mapped_output_count} DAC and "
+            f"{configuration.mapped_input_count} ADC front-panel mappings"
+        )
+
+    def _on_qick_configuration_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown QICK identification error"
+        self._qick_front_panel.set_identifying(False, f"Failed: {summary}")
+        self.statusBar().showMessage("QICK front-panel identification failed")
+        dialog = DetailedErrorMessageBox(
+            "QICK configuration identification failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
+    def _apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
+        """Commit graphical SMA selections through the existing RF path model."""
+        path = self._sparameter_panel.path_diagram
+        path.output_ch.setValue(int(values["output_ch"]))
+        path.readout_ch.setValue(int(values["readout_ch"]))
+        path.output_board_type.setCurrentText(str(values["output_board_type"]))
+        path.input_board_type.setCurrentText(str(values["input_board_type"]))
+        path.output_att1_db.setValue(float(values["output_att1_db"]))
+        path.output_att2_db.setValue(float(values["output_att2_db"]))
+        path.readout_attenuation_db.setValue(
+            float(values["readout_attenuation_db"])
+        )
+        path.readout_dc_gain_db.setValue(float(values["readout_dc_gain_db"]))
+        path._update_board_controls()
+        path.apply_settings()
+
     def _apply_rf_path_settings(self, values: Mapping[str, object]) -> None:
-        """Synchronize committed RF path values with Experiment editors."""
+        """Synchronize committed RF path values across all measurement editors."""
         output_index = self._rf_ports_panel.apply_path_settings(values)
         self._rf_readout_panel.apply_path_settings(values)
+        self._calibration_panel.apply_path_settings(values)
+        self._qick_front_panel.set_path_values(values)
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = (
             self._rf_pulse_specs[0] if self._rf_pulse_specs else None
@@ -4121,7 +4249,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._refresh_rf_timeline()
         self.statusBar().showMessage(
-            "RF path applied to S-parameter and Experiment "
+            "RF path applied to Front Panel, S-parameter, Experiment, and Calibration "
             f"(RF output editor {output_index + 1})"
         )
 
@@ -5177,6 +5305,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
+        self._qick_front_panel.set_path_values(
+            self._sparameter_panel.path_diagram.applied_values()
+        )
 
         self._selected_port_idx = settings["selected_output"]
         self._plot.set_selected_port_idx(self._selected_port_idx)
