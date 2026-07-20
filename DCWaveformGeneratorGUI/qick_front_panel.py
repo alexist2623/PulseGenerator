@@ -642,6 +642,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.output_sma = QtWidgets.QLabel("-")
         self.output_channel = QtWidgets.QComboBox()
         self.output_board = QtWidgets.QLabel("-")
+        self.output_nqz = self._nyquist_spin()
         self.output_att1_db = self._attenuation_spin(10.0)
         self.output_att2_db = self._attenuation_spin(10.0)
         self.output_filter_type = self._filter_combo()
@@ -650,6 +651,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         output_form.addRow("Front-panel connector:", self.output_sma)
         output_form.addRow("QICK generator channel:", self.output_channel)
         output_form.addRow("Detected board:", self.output_board)
+        output_form.addRow("DAC Nyquist zone:", self.output_nqz)
         output_form.addRow("ATT1:", self.output_att1_db)
         output_form.addRow("ATT2:", self.output_att2_db)
         output_form.addRow("Filter:", self.output_filter_type)
@@ -662,6 +664,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_sma = QtWidgets.QLabel("-")
         self.input_channel = QtWidgets.QComboBox()
         self.input_board = QtWidgets.QLabel("-")
+        self.input_nqz = self._nyquist_spin()
         self.input_condition_stack = QtWidgets.QStackedWidget()
         self.input_attenuation_db = self._attenuation_spin(20.0)
         self.input_dc_gain_db = QtWidgets.QDoubleSpinBox()
@@ -676,10 +679,22 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_condition_stack.addWidget(self.input_attenuation_db)
         self.input_condition_stack.addWidget(self.input_dc_gain_db)
         self.input_condition_stack.addWidget(self.input_unknown)
+        self.input_condition_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.input_condition_stack.setFixedHeight(
+            max(
+                self.input_attenuation_db.sizeHint().height(),
+                self.input_dc_gain_db.sizeHint().height(),
+                self.input_unknown.sizeHint().height(),
+            )
+        )
         self.input_condition_label = QtWidgets.QLabel("Input ATT:")
         input_form.addRow("Front-panel connector:", self.input_sma)
         input_form.addRow("QICK readout channel:", self.input_channel)
         input_form.addRow("Detected board:", self.input_board)
+        input_form.addRow("ADC Nyquist zone:", self.input_nqz)
         input_form.addRow(self.input_condition_label, self.input_condition_stack)
         input_form.addRow("Filter:", self.input_filter_type)
         input_form.addRow("Cutoff/center:", self.input_filter_cutoff_ghz)
@@ -708,6 +723,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
 
         self.output_channel.currentIndexChanged.connect(self._update_summary)
         self.input_channel.currentIndexChanged.connect(self._update_summary)
+        self.output_nqz.valueChanged.connect(self._update_summary)
+        self.input_nqz.valueChanged.connect(self._update_summary)
         self.output_att1_db.valueChanged.connect(self._update_summary)
         self.output_att2_db.valueChanged.connect(self._update_summary)
         self.output_filter_type.currentIndexChanged.connect(self._update_summary)
@@ -728,6 +745,14 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         widget.setSingleStep(0.25)
         widget.setValue(value)
         widget.setSuffix(" dB")
+        return widget
+
+    @staticmethod
+    def _nyquist_spin() -> QtWidgets.QSpinBox:
+        widget = QtWidgets.QSpinBox()
+        widget.setRange(1, 2)
+        widget.setValue(1)
+        widget.setToolTip("RFDC Nyquist zone; supported values are 1 and 2")
         return widget
 
     @staticmethod
@@ -880,6 +905,12 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         """Mirror manually edited path values without replacing live card identity."""
         self._preferred_output_ch = int(values.get("output_ch", self._preferred_output_ch))
         self._preferred_input_ch = int(values.get("readout_ch", self._preferred_input_ch))
+        self.output_nqz.setValue(
+            int(values.get("output_nqz", values.get("nqz", self.output_nqz.value())))
+        )
+        self.input_nqz.setValue(
+            int(values.get("readout_nqz", self.input_nqz.value()))
+        )
         self.output_att1_db.setValue(float(values.get("output_att1_db", self.output_att1_db.value())))
         self.output_att2_db.setValue(float(values.get("output_att2_db", self.output_att2_db.value())))
         self.output_filter_type.setCurrentText(
@@ -952,6 +983,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 {
                     "output_ch": int(self.output_channel.currentData()),
                     "output_board_type": str(output.board_type),
+                    "output_nqz": self.output_nqz.value(),
                     "output_att1_db": self.output_att1_db.value(),
                     "output_att2_db": self.output_att2_db.value(),
                     "output_filter_type": self.output_filter_type.currentText(),
@@ -971,6 +1003,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 {
                     "readout_ch": int(self.input_channel.currentData()),
                     "input_board_type": str(input_port.board_type),
+                    "readout_nqz": self.input_nqz.value(),
                     "readout_attenuation_db": self.input_attenuation_db.value(),
                     "readout_dc_gain_db": self.input_dc_gain_db.value(),
                     "readout_filter_type": self.input_filter_type.currentText(),
@@ -1027,7 +1060,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 f"OUTPUT  {output.label} | QICK gen "
                 f"{output_ch if output_ch is not None else '-'} | "
                 f"RFDC DAC {output.converter_id} | slot {output.board_slot} "
-                f"{output.board_label} | {output_condition} | {output_path}"
+                f"{output.board_label} | NQZ {self.output_nqz.value()} | "
+                f"{output_condition} | {output_path}"
             )
         if self._scope in {"path", "input"}:
             input_port = self._configuration.port("input", self._selected_input or 0)
@@ -1048,7 +1082,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 f"INPUT   {input_port.label} | QICK readout "
                 f"{input_ch if input_ch is not None else '-'} | "
                 f"RFDC ADC {input_port.converter_id} | slot {input_port.board_slot} "
-                f"{input_port.board_label} | {input_condition} | {input_path}"
+                f"{input_port.board_label} | NQZ {self.input_nqz.value()} | "
+                f"{input_condition} | {input_path}"
             )
         self.summary.setText("\n".join(lines))
 

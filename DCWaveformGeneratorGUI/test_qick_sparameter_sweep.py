@@ -710,6 +710,32 @@ def test_dc_board_selection_uses_dc_apis_without_nonexistent_attenuators():
     assert actual["readout"]["commanded_dc_gain_db"] == 5.0
 
 
+def test_adc_nyquist_zone_is_applied_through_qick_soc_api():
+    calls = []
+
+    class FakeSoc:
+        def set_nyquist(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+        def rfb_set_gen_dc(self, *_args):
+            return None
+
+        def rfb_set_ro_dc(self, *_args):
+            return 0.0
+
+    actual = configure_sparameter_rf_board(
+        FakeSoc(),
+        _config(
+            output_board_type="DC_Out",
+            input_board_type="DC_In",
+            readout_nqz=2,
+        ),
+    )
+
+    assert calls == [((0, 2), {"blocktype": "adc"})]
+    assert actual["readout"]["nyquist_zone"] == 2
+
+
 def test_qcodes_round_trip_stores_split_traces_and_derived_response(
     tmp_path, monkeypatch
 ):

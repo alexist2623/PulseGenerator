@@ -95,10 +95,11 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
     settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, compact: bool = False):
         super().__init__("RF Path and DUT De-embedding", parent)
         self._front_panel_configuration = None
-        self.setMinimumHeight(430)
+        self._compact = bool(compact)
+        self.setMinimumHeight(330 if self._compact else 430)
         self.setStyleSheet(
             "QGroupBox { color: #20252b; font-weight: 600; }"
             "QLabel { color: #20252b; }"
@@ -109,6 +110,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
 
         self.output_ch = self._channel_spin()
         self.readout_ch = self._channel_spin()
+        self.output_nqz = self._nyquist_spin()
+        self.readout_nqz = self._nyquist_spin()
         self.output_board_type = self._board_combo(OUTPUT_BOARD_TYPES, "RF_Out")
         self.input_board_type = self._board_combo(INPUT_BOARD_TYPES, "DC_In")
 
@@ -125,6 +128,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             self._endpoint_form(
                 ("Readout channel", self.readout_ch),
                 ("Input board", self.input_board_type),
+                ("ADC Nyquist", self.readout_nqz),
             ),
             self,
         )
@@ -133,6 +137,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             self._endpoint_form(
                 ("Output channel", self.output_ch),
                 ("Output board", self.output_board_type),
+                ("DAC Nyquist", self.output_nqz),
             ),
             self,
         )
@@ -172,7 +177,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
         )
         self.update_button.setToolTip(
-            "Apply the edited RF path values to RF S-parameter and Experiment settings"
+            "Apply this RF path to AWG Tuning, Stability Diagram, "
+            "RF S-Parameter, and Calibration"
         )
         self.apply_status = QtWidgets.QLabel("Applied", self)
         self.apply_status.setAlignment(QtCore.Qt.AlignCenter)
@@ -204,6 +210,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         for widget in (
             self.output_ch,
             self.readout_ch,
+            self.output_nqz,
+            self.readout_nqz,
             self.output_att1_db,
             self.output_att2_db,
             self.readout_attenuation_db,
@@ -226,6 +234,14 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
     def _channel_spin() -> QtWidgets.QSpinBox:
         widget = QtWidgets.QSpinBox()
         widget.setRange(0, 255)
+        return widget
+
+    @staticmethod
+    def _nyquist_spin() -> QtWidgets.QSpinBox:
+        widget = QtWidgets.QSpinBox()
+        widget.setRange(1, 2)
+        widget.setValue(1)
+        widget.setToolTip("RFDC Nyquist zone; supported values are 1 and 2")
         return widget
 
     @staticmethod
@@ -283,6 +299,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         return {
             "output_ch": self.output_ch.value(),
             "readout_ch": self.readout_ch.value(),
+            "output_nqz": self.output_nqz.value(),
+            "readout_nqz": self.readout_nqz.value(),
             "output_board_type": self.output_board_type.currentText(),
             "input_board_type": self.input_board_type.currentText(),
             "output_att1_db": self.output_att1_db.value(),
@@ -298,11 +316,36 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         """Return the last values committed with the Update button."""
         return dict(self._applied_values)
 
+    def apply_external_settings(self, values: Mapping[str, Any]) -> None:
+        """Adopt a committed shared path without emitting another update."""
+        assignments = (
+            (self.output_ch, "output_ch"),
+            (self.readout_ch, "readout_ch"),
+            (self.output_nqz, "output_nqz"),
+            (self.readout_nqz, "readout_nqz"),
+            (self.output_att1_db, "output_att1_db"),
+            (self.output_att2_db, "output_att2_db"),
+            (self.readout_attenuation_db, "readout_attenuation_db"),
+            (self.readout_dc_gain_db, "readout_dc_gain_db"),
+            (self.loss1_db, "loss1_db"),
+            (self.loss2_db, "loss2_db"),
+            (self.amplifier_gain_db, "amplifier_gain_db"),
+        )
+        for widget, key in assignments:
+            if key in values:
+                widget.setValue(values[key])
+        if "output_board_type" in values:
+            self.output_board_type.setCurrentText(str(values["output_board_type"]))
+        if "input_board_type" in values:
+            self.input_board_type.setCurrentText(str(values["input_board_type"]))
+        self._update_board_controls()
+        self.apply_settings(emit=False)
+
     def apply_settings(self, _checked=False, *, emit: bool = True) -> None:
         """Commit edited path values and optionally notify linked panels."""
         self._applied_values = self._editor_values()
         self.update_button.setEnabled(False)
-        self.apply_status.setText("Applied to RF S-Parameter and Experiment")
+        self.apply_status.setText("Applied to all RF measurement tabs")
         self.apply_status.setStyleSheet(
             "QLabel { color: #2f6f4e; background: transparent; font-weight: 600; }"
         )
@@ -493,6 +536,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.path_diagram = RfPathCorrectionWidget(content)
         self.output_ch = self.path_diagram.output_ch
         self.readout_ch = self.path_diagram.readout_ch
+        self.output_nqz = self.path_diagram.output_nqz
+        self.readout_nqz = self.path_diagram.readout_nqz
         self.output_board_type = self.path_diagram.output_board_type
         self.input_board_type = self.path_diagram.input_board_type
         self.output_att1_db = self.path_diagram.output_att1_db
@@ -507,6 +552,13 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.front_panel_requested.emit
         )
         content_layout.addWidget(self.path_diagram)
+        path_hint = QtWidgets.QLabel(
+            "ATT, RF filters, board selection, and Nyquist zones are shared "
+            "through the RF path above and its HWH-backed front-panel editor."
+        )
+        path_hint.setWordWrap(True)
+        path_hint.setStyleSheet("QLabel { color: #4f5b66; padding: 2px 6px; }")
+        content_layout.addWidget(path_hint)
 
         sweep_group = QtWidgets.QGroupBox("Frequency Sweep")
         sweep_form = QtWidgets.QFormLayout(sweep_group)
@@ -628,6 +680,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         output_form.addRow("Cutoff/center:", self.output_filter_cutoff_ghz)
         output_form.addRow("Bandwidth:", self.output_filter_bandwidth_ghz)
         content_layout.addWidget(output_group)
+        output_group.hide()
 
         readout_group = QtWidgets.QGroupBox("Input Filter")
         readout_form = QtWidgets.QFormLayout(readout_group)
@@ -638,6 +691,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         readout_form.addRow("Cutoff/center:", self.readout_filter_cutoff_ghz)
         readout_form.addRow("Bandwidth:", self.readout_filter_bandwidth_ghz)
         content_layout.addWidget(readout_group)
+        readout_group.hide()
         self.output_board_type.currentTextChanged.connect(
             self._update_filter_control_state
         )
@@ -708,7 +762,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         outer.addWidget(self.status)
 
         self._internal_settings = {
-            "nqz": 1,
             "settle_seconds": 0.05,
             "trigger_width_tproc_cycles": 12,
             "recovery_tproc_cycles": 20,
@@ -904,6 +957,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             loss1_db=path["loss1_db"],
             loss2_db=path["loss2_db"],
             amplifier_gain_db=path["amplifier_gain_db"],
+            nqz=path["output_nqz"],
+            readout_nqz=path["readout_nqz"],
             margin_input_samples=self.margin_input_samples.value(),
             address=self.address.value(),
             stride_bytes=(
@@ -930,6 +985,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         widgets = (
             (self.output_ch, config.output_ch),
             (self.readout_ch, config.readout_ch),
+            (self.output_nqz, config.nqz),
+            (self.readout_nqz, config.readout_nqz),
             (self.frequency_start_mhz, config.frequency_start_mhz),
             (self.frequency_end_mhz, config.frequency_end_mhz),
             (self.frequency_points, config.frequency_points),
@@ -994,7 +1051,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_power_control_state(config.power_sweep_enabled)
         self.force_overwrite.setChecked(config.force_overwrite)
         self._internal_settings = {
-            "nqz": config.nqz,
             "settle_seconds": config.settle_seconds,
             "trigger_width_tproc_cycles": config.trigger_width_tproc_cycles,
             "recovery_tproc_cycles": config.recovery_tproc_cycles,

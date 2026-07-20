@@ -226,7 +226,8 @@ class OutputPowerCalibrationConfig:
             "output filter bandwidth",
             positive=True,
         )
-        _integer(self.nqz, "nqz", 1)
+        if _integer(self.nqz, "nqz", 1) not in (1, 2):
+            raise ValueError("nqz must be 1 or 2")
         _integer(self.tone_length_fabric_cycles, "tone length", 3)
         if not str(self.experiment_name).strip():
             raise ValueError("experiment_name must not be empty")
@@ -294,6 +295,7 @@ class InputPowerCalibrationConfig:
     fit_trim_low: int = 0
     fit_trim_high: int = 0
     nqz: int = 1
+    readout_nqz: int = 1
     margin_input_samples: int = 1024
     settle_seconds: float = 0.05
     force_overwrite: bool = True
@@ -337,7 +339,10 @@ class InputPowerCalibrationConfig:
         high = _integer(self.fit_trim_high, "fit_trim_high")
         if low + high > gains.size - 2:
             raise ValueError("fit trimming must leave at least two gain points")
-        _integer(self.nqz, "nqz", 1)
+        if _integer(self.nqz, "nqz", 1) not in (1, 2):
+            raise ValueError("nqz must be 1 or 2")
+        if _integer(self.readout_nqz, "readout_nqz", 1) not in (1, 2):
+            raise ValueError("readout_nqz must be 1 or 2")
         _integer(self.margin_input_samples, "margin_input_samples")
         if _finite(self.settle_seconds, "settle_seconds") < 0.0:
             raise ValueError("settle_seconds must be nonnegative")
@@ -385,6 +390,7 @@ class InputPowerCalibrationConfig:
             readout_filter_cutoff_ghz=self.readout_filter_cutoff_ghz,
             readout_filter_bandwidth_ghz=self.readout_filter_bandwidth_ghz,
             nqz=self.nqz,
+            readout_nqz=self.readout_nqz,
             margin_input_samples=self.margin_input_samples,
             force_overwrite=self.force_overwrite,
             settle_seconds=self.settle_seconds,

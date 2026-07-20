@@ -180,7 +180,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 15
+SETTINGS_VERSION = 16
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -226,6 +226,7 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "filter_type": "bypass",
     "filter_cutoff": 2.5,
     "filter_bandwidth": 1.0,
+    "nqz": 1,
 }
 
 DEFAULT_SPARAMETER_SETTINGS = {
@@ -1567,7 +1568,7 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         self.phase_degrees.setDecimals(6)
         self.phase_degrees.setSuffix(" deg")
         self.nqz = QtWidgets.QSpinBox()
-        self.nqz.setRange(1, 3)
+        self.nqz.setRange(1, 2)
         self.nqz.setValue(1)
         self.require_within = QtWidgets.QCheckBox("Require pulse inside selected SET")
         self.require_within.setChecked(True)
@@ -1809,7 +1810,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.phase_degrees.setDecimals(6)
         self.phase_degrees.setSuffix(" deg")
         self.nqz = QtWidgets.QSpinBox()
-        self.nqz.setRange(1, 3)
+        self.nqz.setRange(1, 2)
         self.nqz.setValue(1)
         self.require_within = QtWidgets.QCheckBox("Keep pulse inside anchor SET")
         self.require_within.setChecked(True)
@@ -1828,11 +1829,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow(self._duration_label, self.duration)
         form.addRow("Frequency:", self.frequency_mhz)
         form.addRow("Gain:", self.gain)
-        form.addRow("Output ATT1:", self.att1_db)
-        form.addRow("Output ATT2:", self.att2_db)
-        form.addRow("Output filter:", self.filter_type)
-        form.addRow("Filter cutoff/center:", self.filter_cutoff)
-        form.addRow("Filter bandwidth:", self.filter_bandwidth)
+        shared_path_note = QtWidgets.QLabel(
+            "ATT and filter settings are edited from the HWH-backed Front Panel."
+        )
+        shared_path_note.setWordWrap(True)
+        shared_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
+        form.addRow(shared_path_note)
         form.addRow("Phase:", self.phase_degrees)
         form.addRow("Nyquist zone:", self.nqz)
         form.addRow(self.require_within)
@@ -1915,6 +1917,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.filter_bandwidth.setValue(
             float(values["output_filter_bandwidth_ghz"])
         )
+        self.nqz.setValue(int(values.get("output_nqz", self.nqz.value())))
         self._update_board_controls()
         self._sync_front_panel_selection()
         self.changed.emit()
@@ -2156,6 +2159,7 @@ class RfPortsPanel(QtWidgets.QWidget):
         target.filter_bandwidth.setValue(
             float(values["output_filter_bandwidth_ghz"])
         )
+        target.nqz.setValue(int(values.get("output_nqz", target.nqz.value())))
         target._update_board_controls()
         self._emit_specs()
         return self._panels.index(target)
@@ -2283,6 +2287,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_bandwidth.setDecimals(6)
         self.filter_bandwidth.setValue(1.0)
         self.filter_bandwidth.setSuffix(" GHz")
+        self.nqz = QtWidgets.QSpinBox()
+        self.nqz.setRange(1, 2)
+        self.nqz.setValue(1)
         self.margin_samples = QtWidgets.QSpinBox()
         self.margin_samples.setRange(0, 10_000_000)
         self.margin_samples.setValue(1024)
@@ -2331,6 +2338,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.filter_type,
             self.filter_cutoff,
             self.filter_bandwidth,
+            self.nqz,
             self.margin_samples,
             self.force_overwrite,
         ):
@@ -2398,6 +2406,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_bandwidth.setValue(
             float(values["readout_filter_bandwidth_ghz"])
         )
+        self.nqz.setValue(int(values.get("readout_nqz", self.nqz.value())))
         self._update_board_controls()
         self._sync_front_panel_selection()
         self._emit_spec()
@@ -2445,6 +2454,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             dc_gain_db=self.dc_gain_db.value(),
             dc_measure_mode=self.dc_measure_mode.isChecked(),
             dc_measure_gain_v_per_a=self.dc_measure_gain_v_per_a.value(),
+            nqz=self.nqz.value(),
         )
 
     def spec(self) -> Optional[QickDdrReadoutSpec]:
@@ -2482,6 +2492,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "filter_type": spec.filter_type,
             "filter_cutoff": spec.filter_cutoff,
             "filter_bandwidth": spec.filter_bandwidth,
+            "nqz": spec.nqz,
         }
 
     def load_settings(self, data: dict) -> None:
@@ -2517,6 +2528,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                     DEFAULT_DC_MEASURE_GAIN_V_PER_A,
                 )
             ),
+            nqz=int(data.get("nqz", 1)),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -2544,6 +2556,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.filter_type.setCurrentIndex(filter_index)
             self.filter_cutoff.setValue(spec.filter_cutoff)
             self.filter_bandwidth.setValue(spec.filter_bandwidth)
+            self.nqz.setValue(spec.nqz)
             self.setChecked(enabled)
         self._update_board_controls()
         self._emit_spec()
@@ -2559,6 +2572,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_bandwidth.setValue(
             float(values["readout_filter_bandwidth_ghz"])
         )
+        self.nqz.setValue(int(values.get("readout_nqz", self.nqz.value())))
         self._update_board_controls()
         self._emit_spec()
 
@@ -2800,9 +2814,16 @@ class ExperimentPanel(QtWidgets.QWidget):
             raise ValueError("AWG generator indices must be unique and nonnegative")
         return channels
 
-    def values(self, output_count: int, *, require_run_config: bool = True) -> dict:
+    def values(
+        self,
+        output_count: int,
+        *,
+        require_run_config: bool = True,
+        database_path: Optional[str] = None,
+    ) -> dict:
         connection, run = self.connection_values(
-            require_run_config=require_run_config
+            require_run_config=require_run_config,
+            database_path=database_path,
         )
         return {
             "connection": connection,
@@ -3712,9 +3733,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         front_panel_buttons.rejected.connect(self._qick_front_panel_dialog.close)
         front_panel_layout.addWidget(front_panel_buttons)
-        self._qick_front_panel.set_path_values(
-            self._sparameter_panel.path_diagram.applied_values()
-        )
+        initial_rf_path = self._sparameter_panel.path_diagram.applied_values()
+        self._qick_front_panel.set_path_values(initial_rf_path)
+        self._stability_panel.apply_path_settings(initial_rf_path)
+        self._calibration_panel.apply_path_settings(initial_rf_path)
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._stability_panel.dc_measure_changed.connect(
@@ -3733,6 +3755,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._stability_panel.single_shot_requested.connect(
             lambda: self._run_stability_diagram(continuous=False)
+        )
+        self._stability_panel.path_settings_applied.connect(
+            self._apply_rf_path_settings
+        )
+        self._stability_panel.front_panel_requested.connect(
+            lambda: self._show_qick_front_panel("path")
         )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
@@ -3757,6 +3785,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._calibration_panel.input_requested.connect(
             lambda: self._run_power_calibration("input")
+        )
+        self._calibration_panel.path_settings_applied.connect(
+            self._apply_rf_path_settings
+        )
+        self._calibration_panel.front_panel_requested.connect(
+            lambda: self._show_qick_front_panel("path")
         )
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
@@ -4626,6 +4660,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         values = self._experiment_panel.values(
             len(self._pulse),
             require_run_config=save,
+            database_path=(
+                self._stability_panel.database_path_value() if save else None
+            ),
         )
         self._qick_fabric_mhz = values["fabric_mhz"]
         self._qick_tproc_mhz = values["tproc_mhz"]
@@ -4728,6 +4765,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             values = {
                 "output_ch": spec.gen_ch,
                 "output_board_type": spec.output_board_type,
+                "output_nqz": spec.nqz,
                 "output_att1_db": spec.att1_db,
                 "output_att2_db": spec.att2_db,
                 "output_filter_type": spec.filter_type,
@@ -4739,6 +4777,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             values = {
                 "readout_ch": spec.ro_ch,
                 "input_board_type": spec.input_board_type,
+                "readout_nqz": spec.nqz,
                 "readout_attenuation_db": spec.attenuation_db,
                 "readout_dc_gain_db": spec.dc_gain_db,
                 "readout_filter_type": spec.filter_type,
@@ -4824,8 +4863,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_configuration = configuration
         self._qick_front_panel.set_configuration(configuration)
         self._sparameter_panel.set_front_panel_configuration(configuration)
+        self._stability_panel.set_front_panel_configuration(configuration)
         self._rf_ports_panel.set_front_panel_configuration(configuration)
         self._rf_readout_panel.set_front_panel_configuration(configuration)
+        self._calibration_panel.set_front_panel_configuration(configuration)
         self._qick_front_panel.set_identifying(
             False,
             f"{configuration.mapped_output_count} DAC / "
@@ -4876,16 +4917,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
 
         path = self._sparameter_panel.path_diagram
-        path.output_ch.setValue(int(values["output_ch"]))
-        path.readout_ch.setValue(int(values["readout_ch"]))
-        path.output_board_type.setCurrentText(str(values["output_board_type"]))
-        path.input_board_type.setCurrentText(str(values["input_board_type"]))
-        path.output_att1_db.setValue(float(values["output_att1_db"]))
-        path.output_att2_db.setValue(float(values["output_att2_db"]))
-        path.readout_attenuation_db.setValue(
-            float(values["readout_attenuation_db"])
-        )
-        path.readout_dc_gain_db.setValue(float(values["readout_dc_gain_db"]))
+        path.apply_external_settings(values)
         self._sparameter_panel.output_filter_type.setCurrentText(
             str(values["output_filter_type"])
         )
@@ -4910,10 +4942,37 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _apply_rf_path_settings(self, values: Mapping[str, object]) -> None:
         """Synchronize committed RF path values across all measurement editors."""
-        output_index = self._rf_ports_panel.apply_path_settings(values)
-        self._rf_readout_panel.apply_path_settings(values)
-        self._calibration_panel.apply_path_settings(values)
-        self._qick_front_panel.set_path_values(values)
+        shared = dict(values)
+        shared.setdefault(
+            "output_filter_type",
+            self._sparameter_panel.output_filter_type.currentText(),
+        )
+        shared.setdefault(
+            "output_filter_cutoff_ghz",
+            self._sparameter_panel.output_filter_cutoff_ghz.value(),
+        )
+        shared.setdefault(
+            "output_filter_bandwidth_ghz",
+            self._sparameter_panel.output_filter_bandwidth_ghz.value(),
+        )
+        shared.setdefault(
+            "readout_filter_type",
+            self._sparameter_panel.readout_filter_type.currentText(),
+        )
+        shared.setdefault(
+            "readout_filter_cutoff_ghz",
+            self._sparameter_panel.readout_filter_cutoff_ghz.value(),
+        )
+        shared.setdefault(
+            "readout_filter_bandwidth_ghz",
+            self._sparameter_panel.readout_filter_bandwidth_ghz.value(),
+        )
+        self._sparameter_panel.path_diagram.apply_external_settings(shared)
+        self._stability_panel.apply_path_settings(shared)
+        output_index = self._rf_ports_panel.apply_path_settings(shared)
+        self._rf_readout_panel.apply_path_settings(shared)
+        self._calibration_panel.apply_path_settings(shared)
+        self._qick_front_panel.set_path_values(shared)
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = (
             self._rf_pulse_specs[0] if self._rf_pulse_specs else None
@@ -6048,6 +6107,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "RF readout dc_measure_gain_v_per_a",
                 positive=True,
             ),
+            nqz=self._json_int(raw_readout["nqz"], "RF readout nqz", minimum=1),
         )
         if readout_spec.segment_name not in set_names:
             raise ValueError(
@@ -6070,6 +6130,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "filter_type": readout_spec.filter_type,
             "filter_cutoff": readout_spec.filter_cutoff,
             "filter_bandwidth": readout_spec.filter_bandwidth,
+            "nqz": readout_spec.nqz,
         }
 
         return {
@@ -6189,9 +6250,32 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
-        self._qick_front_panel.set_path_values(
-            self._sparameter_panel.path_diagram.applied_values()
+        loaded_path = self._sparameter_panel.path_diagram.applied_values()
+        loaded_path.update(
+            {
+                "output_filter_type": (
+                    self._sparameter_panel.output_filter_type.currentText()
+                ),
+                "output_filter_cutoff_ghz": (
+                    self._sparameter_panel.output_filter_cutoff_ghz.value()
+                ),
+                "output_filter_bandwidth_ghz": (
+                    self._sparameter_panel.output_filter_bandwidth_ghz.value()
+                ),
+                "readout_filter_type": (
+                    self._sparameter_panel.readout_filter_type.currentText()
+                ),
+                "readout_filter_cutoff_ghz": (
+                    self._sparameter_panel.readout_filter_cutoff_ghz.value()
+                ),
+                "readout_filter_bandwidth_ghz": (
+                    self._sparameter_panel.readout_filter_bandwidth_ghz.value()
+                ),
+            }
         )
+        self._stability_panel.apply_path_settings(loaded_path)
+        self._calibration_panel.apply_path_settings(loaded_path)
+        self._qick_front_panel.set_path_values(loaded_path)
 
         self._selected_port_idx = settings["selected_output"]
         self._plot.set_selected_port_idx(self._selected_port_idx)

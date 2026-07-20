@@ -241,7 +241,7 @@ class QickRfPulseSpec:
             if value < 0.0 or value > 31.75:
                 raise ValueError(f"{name} must be in [0, 31.75] dB")
         _finite_real(self.phase_degrees, "RF phase_degrees")
-        _bounded_int(self.nqz, "RF nqz", 1, 3)
+        _bounded_int(self.nqz, "RF nqz", 1, 2)
         if not isinstance(self.require_within_segment, bool):
             raise TypeError("require_within_segment must be bool")
         if self.filter_type not in {"bypass", "lowpass", "highpass", "bandpass"}:
@@ -284,6 +284,7 @@ class QickDdrReadoutSpec:
     dc_gain_db: float = 0.0
     dc_measure_mode: bool = False
     dc_measure_gain_v_per_a: float = DEFAULT_DC_MEASURE_GAIN_V_PER_A
+    nqz: int = 1
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -292,6 +293,7 @@ class QickDdrReadoutSpec:
         _nonnegative_real(self.delay_us, "DDR delay_us")
         _positive_int(self.samples_per_trigger, "DDR samples_per_trigger")
         _finite_real(self.readout_frequency_mhz, "DDR readout_frequency_mhz")
+        _bounded_int(self.nqz, "DDR readout nqz", 1, 2)
         _bounded_int(self.margin_input_samples, "DDR margin_input_samples", 0, 1 << 30)
         _bounded_int(self.address, "DDR address", 0, (1 << 63) - 1)
         if not isinstance(self.force_overwrite, bool):

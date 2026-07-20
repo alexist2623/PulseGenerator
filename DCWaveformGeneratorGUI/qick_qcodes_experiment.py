@@ -443,6 +443,24 @@ def configure_rf_board(
             "filter_cutoff_ghz": float(spec.filter_cutoff),
             "filter_bandwidth_ghz": float(spec.filter_bandwidth),
         })
+    set_nyquist = getattr(soc, "set_nyquist", None)
+    if set_nyquist is None:
+        if readout_spec.nqz != 1:
+            raise RuntimeError(
+                "ADC Nyquist-zone control requires an updated QICK server"
+            )
+    else:
+        try:
+            set_nyquist(
+                readout_spec.ro_ch,
+                readout_spec.nqz,
+                blocktype="adc",
+            )
+        except TypeError as exc:
+            if readout_spec.nqz != 1:
+                raise RuntimeError(
+                    "ADC Nyquist-zone control requires an updated QICK server"
+                ) from exc
     if readout_spec.input_board_type == "RF_In":
         readout_setting = float(
             soc.rfb_set_ro_rf(
@@ -475,6 +493,7 @@ def configure_rf_board(
         "readout_details": {
             "ro_ch": int(readout_spec.ro_ch),
             "board_type": str(readout_spec.input_board_type),
+            "nyquist_zone": int(readout_spec.nqz),
             "attenuator_present": readout_spec.input_board_type == "RF_In",
             "requested_attenuation_db": float(readout_spec.attenuation_db),
             "commanded_attenuation_db": readout_attenuation,

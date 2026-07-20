@@ -10,6 +10,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event
 import traceback
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -31,6 +32,7 @@ try:
         execute_qick_sequence,
         store_qick_result,
     )
+    from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
     from dc_waveform_core import dc_iq_to_current
     from qick_qcodes_experiment import (
@@ -40,12 +42,14 @@ except ImportError:
         execute_qick_sequence,
         store_qick_result,
     )
+    from sparameter_gui import RfPathCorrectionWidget
 
 
 DEFAULT_STABILITY_START_MV = -100.0
 DEFAULT_STABILITY_STOP_MV = 100.0
 DEFAULT_STABILITY_POINTS = 51
 DEFAULT_STABILITY_REPETITIONS = 1
+DEFAULT_STABILITY_DB_PATH = str(Path.home() / "qick_stability_diagrams.db")
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -196,6 +200,7 @@ def default_stability_settings(
             "points": DEFAULT_STABILITY_POINTS,
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
+        "database_path": DEFAULT_STABILITY_DB_PATH,
     }
 
 
@@ -256,6 +261,12 @@ def normalize_stability_settings(
         "stability repetitions per point",
         1,
     )
+    database_path = str(
+        settings.get("database_path", defaults["database_path"])
+    ).strip()
+    if not database_path:
+        raise ValueError("stability database path must not be empty")
+    normalized["database_path"] = database_path
     return normalized
 
 
@@ -760,17 +771,35 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()
     single_shot_requested = QtCore.pyqtSignal()
     dc_measure_changed = QtCore.pyqtSignal(bool, float)
+    path_settings_applied = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         outer = QtWidgets.QVBoxLayout(self)
-        controls = QtWidgets.QHBoxLayout()
-        self.x_axis = _StabilityAxisEditor("X Electrode", self)
-        self.y_axis = _StabilityAxisEditor("Y Electrode", self)
+        outer.setContentsMargins(4, 4, 4, 4)
+
+        self.controls_scroll = QtWidgets.QScrollArea(self)
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        controls_content = QtWidgets.QWidget(self.controls_scroll)
+        controls = QtWidgets.QVBoxLayout(controls_content)
+        controls.setContentsMargins(2, 2, 2, 2)
+        controls.setSpacing(6)
+
+        self.path_diagram = RfPathCorrectionWidget(controls_content, compact=True)
+        self.path_diagram.settings_applied.connect(self.path_settings_applied.emit)
+        self.path_diagram.front_panel_requested.connect(
+            self.front_panel_requested.emit
+        )
+        controls.addWidget(self.path_diagram)
+
+        self.x_axis = _StabilityAxisEditor("X Electrode", controls_content)
+        self.y_axis = _StabilityAxisEditor("Y Electrode", controls_content)
         controls.addWidget(self.x_axis)
         controls.addWidget(self.y_axis)
 
-        acquisition = QtWidgets.QGroupBox("Acquisition", self)
+        acquisition = QtWidgets.QGroupBox("Acquisition", controls_content)
         acquisition_form = QtWidgets.QFormLayout(acquisition)
         self.repetitions = QtWidgets.QSpinBox(acquisition)
         self.repetitions.setRange(1, 1_000_000)
@@ -794,20 +823,36 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.dc_measure_gain_v_per_a,
         )
         controls.addWidget(acquisition)
-        controls.setStretch(0, 2)
-        controls.setStretch(1, 2)
-        controls.setStretch(2, 1)
-        outer.addLayout(controls)
 
-        action_row = QtWidgets.QHBoxLayout()
-        self.start_button = QtWidgets.QPushButton("Start", self)
+        database_group = QtWidgets.QGroupBox(
+            "Single-Shot Database",
+            controls_content,
+        )
+        database_form = QtWidgets.QFormLayout(database_group)
+        self.database_path = QtWidgets.QLineEdit(
+            DEFAULT_STABILITY_DB_PATH,
+            database_group,
+        )
+        self.browse_database = QtWidgets.QToolButton(database_group)
+        self.browse_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        self.browse_database.setToolTip("Choose the stability-diagram QCoDeS DB")
+        self.browse_database.clicked.connect(self._browse_database)
+        database_row = QtWidgets.QHBoxLayout()
+        database_row.addWidget(self.database_path, 1)
+        database_row.addWidget(self.browse_database)
+        database_form.addRow("QCoDeS DB file:", database_row)
+        controls.addWidget(database_group)
+
+        self.start_button = QtWidgets.QPushButton("Start", controls_content)
         self.start_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
         self.start_button.setToolTip(
             "Continuously repeat full hardware scans without writing QCoDeS"
         )
-        self.stop_button = QtWidgets.QPushButton("Stop", self)
+        self.stop_button = QtWidgets.QPushButton("Stop", controls_content)
         self.stop_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
         )
@@ -815,33 +860,38 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "Stop after the currently active full hardware scan completes"
         )
         self.stop_button.setEnabled(False)
-        self.single_shot_button = QtWidgets.QPushButton("Single Shot && Save", self)
+        self.single_shot_button = QtWidgets.QPushButton(
+            "Single Shot && Save",
+            controls_content,
+        )
         self.single_shot_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
         )
         self.single_shot_button.setToolTip(
             "Acquire one full stability diagram and save its FIR I/Q traces "
-            "to the Experiment-tab QCoDeS database"
+            "to the database selected above"
         )
-        self.fit_button = QtWidgets.QToolButton(self)
+        self.fit_button = QtWidgets.QPushButton("Fit", controls_content)
         self.fit_button.setText("Fit")
         self.fit_button.setToolTip("Fit both stability plots to the full sweep")
-        action_row.addWidget(self.start_button)
-        action_row.addWidget(self.stop_button)
-        action_row.addWidget(self.single_shot_button)
-        action_row.addWidget(self.fit_button)
-        action_row.addStretch(1)
-        outer.addLayout(action_row)
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.single_shot_button)
+        controls.addWidget(self.fit_button)
 
-        self.progress = QtWidgets.QProgressBar(self)
+        self.progress = QtWidgets.QProgressBar(controls_content)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.hide()
-        outer.addWidget(self.progress)
-        self.status = QtWidgets.QLabel("Ready", self)
+        controls.addWidget(self.progress)
+        self.status = QtWidgets.QLabel("Ready", controls_content)
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        outer.addWidget(self.status)
+        controls.addWidget(self.status)
+        controls.addStretch(1)
+        self.controls_scroll.setWidget(controls_content)
+        outer.addWidget(self.controls_scroll, 1)
+
         self.plot = StabilityDiagramPlotWidget(self)
         outer.addWidget(self.plot, 1)
 
@@ -916,6 +966,34 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.status.setText("Add at least two AWG outputs to run a stability scan")
         self._set_idle_button_state()
 
+    def _browse_database(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Choose stability-diagram database",
+            self.database_path.text().strip() or DEFAULT_STABILITY_DB_PATH,
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            selected = Path(path)
+            if selected.suffix.lower() != ".db":
+                selected = selected.with_suffix(".db")
+            self.database_path.setText(str(selected))
+
+    def database_path_value(self) -> str:
+        value = self.database_path.text().strip()
+        if not value:
+            raise ValueError("stability database path must not be empty")
+        path = Path(value).expanduser()
+        if path.suffix.lower() != ".db":
+            path = path.with_suffix(".db")
+        return str(path)
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self.path_diagram.set_front_panel_configuration(configuration)
+
+    def apply_path_settings(self, values: Mapping[str, Any]) -> None:
+        self.path_diagram.apply_external_settings(values)
+
     def config(self, *, full_scale_mv: float) -> StabilityDiagramConfig:
         if not self._targets_available:
             raise ValueError("stability diagram requires at least two AWG outputs")
@@ -932,12 +1010,16 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "x_axis": self.x_axis.settings_dict(),
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
+            "database_path": self.database_path_value(),
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         self.x_axis.load_settings(settings["x_axis"])
         self.y_axis.load_settings(settings["y_axis"])
         self.repetitions.setValue(int(settings["repetitions_per_point"]))
+        self.database_path.setText(
+            str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
+        )
         self._update_point_count()
 
     def set_running(self, running: bool, message: str) -> None:
@@ -948,6 +1030,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         for editor in (self.x_axis, self.y_axis):
             editor.setEnabled(not running)
         self.repetitions.setEnabled(not running)
+        self.path_diagram.setEnabled(not running)
+        self.database_path.setEnabled(not running)
+        self.browse_database.setEnabled(not running)
         self._update_dc_measure_controls()
         self.progress.setVisible(running)
         if not running:

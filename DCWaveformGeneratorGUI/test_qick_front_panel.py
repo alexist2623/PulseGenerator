@@ -84,6 +84,8 @@ def test_front_panel_control_selects_smas_and_reports_channel_attenuation():
             "readout_ch": 1,
             "output_att1_db": 3.25,
             "output_att2_db": 4.5,
+            "output_nqz": 2,
+            "readout_nqz": 2,
             "readout_attenuation_db": 7.25,
             "readout_dc_gain_db": 12.0,
         }
@@ -99,6 +101,8 @@ def test_front_panel_control_selects_smas_and_reports_channel_attenuation():
     assert panel.input_channel.currentData() == 1
     assert panel.input_board.text() == "RF In"
     assert panel.input_condition_stack.currentWidget() is panel.input_attenuation_db
+    assert panel.output_nqz.value() == 2
+    assert panel.input_nqz.value() == 2
     assert "QICK gen 1" in panel.summary.text()
     assert "ATT 7.25 dB" in panel.summary.text()
 
@@ -117,6 +121,8 @@ def test_front_panel_control_selects_smas_and_reports_channel_attenuation():
     assert applied[0]["output_board_type"] == "RF_Out"
     assert applied[0]["input_board_type"] == "RF_In"
     assert applied[0]["readout_attenuation_db"] == 7.25
+    assert applied[0]["output_nqz"] == 2
+    assert applied[0]["readout_nqz"] == 2
     panel.close()
 
 
@@ -134,6 +140,8 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     panel.output_att1_db.setValue(6.25)
     panel.output_att2_db.setValue(8.5)
     panel.input_attenuation_db.setValue(11.75)
+    panel.output_nqz.setValue(2)
+    panel.input_nqz.setValue(2)
     panel.apply_button.click()
     app.processEvents()
 
@@ -145,12 +153,15 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     assert sparameter.output_att1_db == 6.25
     assert sparameter.output_att2_db == 8.5
     assert sparameter.readout_attenuation_db == 11.75
+    assert sparameter.nqz == 2
+    assert sparameter.readout_nqz == 2
 
     experiment_output = window._rf_ports_panel._panels[0]
     assert experiment_output.gen_ch.value() == 0
     assert experiment_output.att1_db.value() == 6.25
     assert window._rf_readout_panel.ro_ch.value() == 1
     assert window._rf_readout_panel.attenuation_db.value() == 11.75
+    assert window._rf_readout_panel.nqz.value() == 2
 
     calibration = window._calibration_panel
     assert calibration.output_ch.value() == 0

@@ -33,6 +33,7 @@ try:
         run_output_power_calibration,
     )
     from .qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
+    from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from qick_power_calibration import (
@@ -43,6 +44,7 @@ except ImportError:
         run_output_power_calibration,
     )
     from qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
+    from sparameter_gui import RfPathCorrectionWidget
 
 
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
@@ -288,10 +290,19 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     output_requested = QtCore.pyqtSignal()
     input_requested = QtCore.pyqtSignal()
+    path_settings_applied = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
+
+        self.path_diagram = RfPathCorrectionWidget(self, compact=True)
+        self.path_diagram.settings_applied.connect(self.path_settings_applied.emit)
+        self.path_diagram.front_panel_requested.connect(
+            self.front_panel_requested.emit
+        )
+        layout.addWidget(self.path_diagram)
 
         database_group = QtWidgets.QGroupBox("Calibration Database")
         database_form = QtWidgets.QFormLayout(database_group)
@@ -420,9 +431,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.output_sample_name = QtWidgets.QLineEdit()
         self.output_sample_name.setPlaceholderText("Auto: RF_Out_<range>MHz")
+        form.addRow(
+            QtWidgets.QLabel(
+                "Board, channel, ATT, filter, and Nyquist settings use the shared "
+                "RF path above."
+            )
+        )
         for label, widget in (
-            ("Output board:", self.output_board),
-            ("QICK generator channel:", self.output_ch),
             ("Start frequency:", self.output_frequency_start),
             ("End frequency:", self.output_frequency_end),
             ("Frequency points:", self.output_frequency_points),
@@ -430,11 +445,6 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("End gain:", self.output_gain_end),
             ("Gain points:", self.output_gain_points),
             ("Gain spacing:", self.output_gain_scale),
-            ("Output ATT1:", self.output_att1),
-            ("Output ATT2:", self.output_att2),
-            ("Output filter:", self.output_filter_type),
-            ("Filter cutoff/center:", self.output_filter_cutoff),
-            ("Filter bandwidth:", self.output_filter_bandwidth),
             ("Experiment name:", self.output_experiment_name),
             ("Sample name:", self.output_sample_name),
         ):
@@ -532,11 +542,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.input_sample_name = QtWidgets.QLineEdit()
         self.input_sample_name.setPlaceholderText("Auto: RF_In_<range>MHz")
+        form.addRow(
+            QtWidgets.QLabel(
+                "Board, channel, ATT, filter, and Nyquist settings use the shared "
+                "RF path above."
+            )
+        )
         for label, widget in (
-            ("Calibrated output board:", self.input_output_board),
-            ("Input board:", self.input_board),
-            ("QICK generator channel:", self.input_output_ch),
-            ("QICK readout channel:", self.input_readout_ch),
             ("Start frequency:", self.input_frequency_start),
             ("End frequency:", self.input_frequency_end),
             ("Frequency points:", self.input_frequency_points),
@@ -545,17 +557,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Gain points:", self.input_gain_points),
             ("Gain spacing:", self.input_gain_scale),
             ("FIR scan time per point:", self.input_scan_time),
-            ("Output ATT1:", self.input_output_att1),
-            ("Output ATT2:", self.input_output_att2),
-            ("Input attenuation:", self.input_attenuation),
-            ("DC input gain:", self.input_dc_gain),
             ("External path loss:", self.input_path_loss),
-            ("Output filter:", self.input_output_filter),
-            ("Output cutoff/center:", self.input_output_cutoff),
-            ("Output bandwidth:", self.input_output_bandwidth),
-            ("Input filter:", self.input_readout_filter),
-            ("Input cutoff/center:", self.input_readout_cutoff),
-            ("Input bandwidth:", self.input_readout_bandwidth),
             ("Trim low-gain points:", self.input_trim_low),
             ("Trim high-gain points:", self.input_trim_high),
             ("Experiment name:", self.input_experiment_name),
@@ -636,6 +638,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             output_filter_type=self.output_filter_type.currentText(),
             output_filter_cutoff_ghz=self.output_filter_cutoff.value(),
             output_filter_bandwidth_ghz=self.output_filter_bandwidth.value(),
+            nqz=self.path_diagram.applied_values()["output_nqz"],
             experiment_name=self.output_experiment_name.text().strip(),
             sample_name=self.output_sample_name.text().strip(),
             oscilloscope=OscilloscopeConfig(
@@ -690,6 +693,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             readout_filter_type=self.input_readout_filter.currentText(),
             readout_filter_cutoff_ghz=self.input_readout_cutoff.value(),
             readout_filter_bandwidth_ghz=self.input_readout_bandwidth.value(),
+            nqz=self.path_diagram.applied_values()["output_nqz"],
+            readout_nqz=self.path_diagram.applied_values()["readout_nqz"],
             fit_trim_low=self.input_trim_low.value(),
             fit_trim_high=self.input_trim_high.value(),
             experiment_name=self.input_experiment_name.text().strip(),
@@ -698,6 +703,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def apply_path_settings(self, values: Mapping[str, Any]) -> None:
         """Apply the shared front-panel RF path to both calibration modes."""
+        self.path_diagram.apply_external_settings(values)
         output_ch = int(values["output_ch"])
         readout_ch = int(values["readout_ch"])
         output_board = str(values["output_board_type"])
@@ -720,7 +726,37 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_output_att2.setValue(att2)
         self.input_attenuation.setValue(input_att)
         self.input_dc_gain.setValue(input_gain)
+        if "output_filter_type" in values:
+            self.output_filter_type.setCurrentText(
+                str(values["output_filter_type"])
+            )
+            self.input_output_filter.setCurrentText(
+                str(values["output_filter_type"])
+            )
+        if "output_filter_cutoff_ghz" in values:
+            cutoff = float(values["output_filter_cutoff_ghz"])
+            self.output_filter_cutoff.setValue(cutoff)
+            self.input_output_cutoff.setValue(cutoff)
+        if "output_filter_bandwidth_ghz" in values:
+            bandwidth = float(values["output_filter_bandwidth_ghz"])
+            self.output_filter_bandwidth.setValue(bandwidth)
+            self.input_output_bandwidth.setValue(bandwidth)
+        if "readout_filter_type" in values:
+            self.input_readout_filter.setCurrentText(
+                str(values["readout_filter_type"])
+            )
+        if "readout_filter_cutoff_ghz" in values:
+            self.input_readout_cutoff.setValue(
+                float(values["readout_filter_cutoff_ghz"])
+            )
+        if "readout_filter_bandwidth_ghz" in values:
+            self.input_readout_bandwidth.setValue(
+                float(values["readout_filter_bandwidth_ghz"])
+            )
         self._update_board_controls()
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self.path_diagram.set_front_panel_configuration(configuration)
 
     def settings_dict(self) -> Mapping[str, Any]:
         output = asdict(self.output_config())
@@ -816,6 +852,20 @@ class CalibrationPanel(QtWidgets.QWidget):
             str(input_plot.get("x_scale", "log")),
             str(input_plot.get("y_scale", "log")),
         )
+        self.path_diagram.apply_external_settings(
+            {
+                "output_ch": input_config.output_ch,
+                "readout_ch": input_config.readout_ch,
+                "output_nqz": input_config.nqz,
+                "readout_nqz": input_config.readout_nqz,
+                "output_board_type": input_config.output_board_type,
+                "input_board_type": input_config.input_board_type,
+                "output_att1_db": input_config.output_att1_db,
+                "output_att2_db": input_config.output_att2_db,
+                "readout_attenuation_db": input_config.input_attenuation_db,
+                "readout_dc_gain_db": input_config.input_dc_gain_db,
+            }
+        )
         self._update_board_controls()
         self.tabs.setCurrentIndex(max(0, min(1, int(settings.get("selected_tab", 0)))))
 
@@ -824,6 +874,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.run_input_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
+        self.path_diagram.setEnabled(not running)
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)

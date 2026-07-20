@@ -176,6 +176,7 @@ class SParameterSweepConfig:
     loss2_db: float = 0.0
     amplifier_gain_db: float = 0.0
     nqz: int = 1
+    readout_nqz: int = 1
     margin_input_samples: int = 1024
     address: int = 0
     stride_bytes: Optional[int] = None
@@ -307,7 +308,13 @@ class SParameterSweepConfig:
             "readout_filter_bandwidth_ghz",
             positive=True,
         )
-        _require_int(self.nqz, "nqz", 1)
+        for value, name in (
+            (self.nqz, "nqz"),
+            (self.readout_nqz, "readout_nqz"),
+        ):
+            zone = _require_int(value, name, 1)
+            if zone not in (1, 2):
+                raise ValueError(f"{name} must be 1 or 2")
         _require_int(self.margin_input_samples, "margin_input_samples")
         _require_int(self.address, "address")
         if self.stride_bytes is not None:
@@ -1579,6 +1586,24 @@ def configure_sparameter_rf_board(
     soc, config: SParameterSweepConfig
 ) -> Mapping[str, Any]:
     """Apply settings through the API matching each selected board type."""
+    set_nyquist = getattr(soc, "set_nyquist", None)
+    if set_nyquist is None:
+        if config.readout_nqz != 1:
+            raise RuntimeError(
+                "ADC Nyquist-zone control requires an updated QICK server"
+            )
+    else:
+        try:
+            set_nyquist(
+                config.readout_ch,
+                config.readout_nqz,
+                blocktype="adc",
+            )
+        except TypeError as exc:
+            if config.readout_nqz != 1:
+                raise RuntimeError(
+                    "ADC Nyquist-zone control requires an updated QICK server"
+                ) from exc
     if config.output_board_type == "RF_Out":
         output_att = soc.rfb_set_gen_rf(
             config.output_ch,
@@ -1621,6 +1646,7 @@ def configure_sparameter_rf_board(
         "output": {
             "channel": config.output_ch,
             "board_type": config.output_board_type,
+            "nyquist_zone": config.nqz,
             "requested_att1_db": config.output_att1_db,
             "requested_att2_db": config.output_att2_db,
             "commanded_att1_db": actual_att1,
@@ -1633,6 +1659,7 @@ def configure_sparameter_rf_board(
         "readout": {
             "channel": config.readout_ch,
             "board_type": config.input_board_type,
+            "nyquist_zone": config.readout_nqz,
             "requested_attenuation_db": config.readout_attenuation_db,
             "commanded_attenuation_db": input_att,
             "requested_dc_gain_db": config.readout_dc_gain_db,

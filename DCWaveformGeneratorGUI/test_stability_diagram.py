@@ -272,7 +272,7 @@ def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
     assert finished[0].diagram.magnitude.shape == (2, 2)
 
 
-def test_stability_panel_controls_and_settings_round_trip():
+def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     app = _application()
     panel = stability.StabilityDiagramPanel()
     panel.refresh_targets(
@@ -290,6 +290,8 @@ def test_stability_panel_controls_and_settings_round_trip():
     panel.x_axis.points.setValue(11)
     panel.y_axis.points.setValue(7)
     panel.repetitions.setValue(4)
+    database_path = tmp_path / "stability_single_shot.db"
+    panel.database_path.setText(str(database_path))
     app.processEvents()
 
     config = panel.config(full_scale_mv=2500.0)
@@ -298,6 +300,8 @@ def test_stability_panel_controls_and_settings_round_trip():
     assert config.y_axis.output_name == "awg_2"
     assert config.point_count == 77
     assert panel.point_count.text() == "77"
+    assert panel.database_path_value() == str(database_path)
+    assert panel.layout().indexOf(panel.controls_scroll) >= 0
 
     saved = panel.settings_dict()
     restored = stability.StabilityDiagramPanel()
