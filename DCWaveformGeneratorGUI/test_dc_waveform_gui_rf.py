@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtWidgets
 import numpy as np
+import pytest
 
 import DCWaveform_Generator as gui
 from dc_waveform_core import (
@@ -20,6 +21,8 @@ from dc_waveform_core import (
     QickDdrReadoutSpec,
     QickRfPulseSpec,
     QickSweepSpec,
+    adc_iq_to_voltage,
+    dc_iq_to_current,
     generate_qick_program_code,
 )
 
@@ -37,7 +40,15 @@ def test_gui_defaults_and_time_unit_round_trip():
     assert window._experiment_panel.fabric_mhz.value() == 300.0
     assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._experiment_panel.bias_t_group.isChecked() is False
+    assert window._experiment_panel.bias_t_mode.currentData() == "fixed_voltage"
     assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
+    assert window._experiment_panel.bias_t_duration_us.value() == 1.0
+    assert window._experiment_panel.bias_t_compensation_mv.isEnabledTo(
+        window._experiment_panel.bias_t_group
+    ) is True
+    assert window._experiment_panel.bias_t_duration_us.isEnabledTo(
+        window._experiment_panel.bias_t_group
+    ) is False
     assert window._pulse[0].t.tolist() == [0.0, 1000.0]
     assert window._pulse[0].v.tolist() == [100.0, 100.0]
     assert control.edit_ramp.text() == "1"
@@ -120,15 +131,30 @@ def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
     dialog.close()
 
 
-def test_rf_controls_are_left_tabs_and_support_multiple_ports():
+def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
     app = _application()
     window = gui.MainWindow()
-    assert [window._control_tabs.tabText(i) for i in range(4)] == [
+    assert [
+        window._control_tabs.tabText(i)
+        for i in range(window._control_tabs.count())
+    ] == [
+        "AWG Tuning",
+        "Stability Diagram",
+        "RF S-Parameter",
+        "Calibration",
+    ]
+    assert [
+        window._awg_tuning_tabs.tabText(i)
+        for i in range(window._awg_tuning_tabs.count())
+    ] == [
         "AWG Outputs",
         "RF Outputs",
         "RF Readout",
         "Experiment",
     ]
+    window._show_rf_editor()
+    assert window._control_tabs.currentWidget() is window._awg_tuning_page
+    assert window._awg_tuning_tabs.currentWidget() is window._rf_ports_panel
     toolbar_labels = [action.text() for bar in window.findChildren(QtWidgets.QToolBar)
                       for action in bar.actions()]
     assert "RF Pulse" not in toolbar_labels
@@ -188,6 +214,50 @@ def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     window.close()
 
 
+def test_dc_measure_mode_converts_iq_and_is_available_only_for_dc_input():
+    raw_iq = np.asarray([[2.0, -4.0], [6.0, 8.0]])
+    np.testing.assert_array_equal(adc_iq_to_voltage(raw_iq), raw_iq)
+    np.testing.assert_allclose(
+        dc_iq_to_current(raw_iq, gain_v_per_a=2.0),
+        [[1.0, -2.0], [3.0, 4.0]],
+    )
+    with pytest.raises(ValueError, match="must be positive"):
+        dc_iq_to_current(raw_iq, gain_v_per_a=0.0)
+    with pytest.raises(ValueError, match="requires the DC_In"):
+        QickDdrReadoutSpec(
+            0,
+            "set_0",
+            0.0,
+            8,
+            input_board_type="RF_In",
+            dc_measure_mode=True,
+        )
+
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_readout_panel
+    panel.setChecked(True)
+    panel.input_board_type.setCurrentText("DC_In")
+    panel.dc_measure_mode.setChecked(True)
+    panel.dc_measure_gain_v_per_a.setValue(2.0)
+    app.processEvents()
+
+    spec = panel.spec()
+    assert spec is not None
+    assert spec.input_board_type == "DC_In"
+    assert spec.dc_measure_mode is True
+    assert spec.dc_measure_gain_v_per_a == 2.0
+    assert spec.measurement_unit == "A"
+    assert panel.dc_measure_gain_v_per_a.isEnabled() is True
+
+    panel.input_board_type.setCurrentText("RF_In")
+    app.processEvents()
+    assert panel.dc_measure_mode.isChecked() is False
+    assert panel.dc_measure_mode.isEnabled() is False
+    assert panel.dc_measure_gain_v_per_a.isEnabled() is False
+    window.close()
+
+
 def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
     pulse = PulseSequence(100.0, initial_duration_ns=1000.0)
     pulse.add_flat_ramp(1000.0, 5000.0, 200.0)
@@ -217,6 +287,8 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
         ddr_readout_spec=readout,
         bias_t_compensation_enabled=True,
         bias_t_compensation_voltage_mv=125.0,
+        bias_t_compensation_mode="fixed_time",
+        bias_t_compensation_duration_us=2.5,
     )
     ast.parse(code)
     namespace = {}
@@ -224,7 +296,12 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
     assert namespace["TPROC_MHZ"] == 300.0
     assert namespace["BIAS_T_COMPENSATION_ENABLED"] is True
     assert namespace["BIAS_T_COMPENSATION_VOLTAGE_MV"] == 125.0
-    assert namespace["build_sequence"]().bias_t_compensation.amplitude == 0.05
+    assert namespace["BIAS_T_COMPENSATION_MODE"] == "fixed_time"
+    assert namespace["BIAS_T_COMPENSATION_DURATION_CYCLES"] == 750
+    bias_t_config = namespace["build_sequence"]().bias_t_compensation
+    assert bias_t_config.amplitude == 0.05
+    assert bias_t_config.mode == "fixed_time"
+    assert bias_t_config.fixed_duration_cycles == 750
     stale_hwh_soccfg = {
         "tprocs": [{"f_time": 400.0}],
         "gens": [
@@ -300,7 +377,8 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     window._set_voltage_view("physical")
     window._voltage_view_actions["physical"].setChecked(True)
     window._port_select(1)
-    window._control_tabs.setCurrentWidget(window._rf_readout_panel)
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_readout_panel)
 
     rf_panel = window._rf_ports_panel._panels[0]
     rf_panel.setChecked(True)
@@ -333,6 +411,10 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     readout.filter_bandwidth.setValue(0.5)
     readout.margin_samples.setValue(2048)
     readout.force_overwrite.setChecked(True)
+    readout.input_board_type.setCurrentText("DC_In")
+    readout.dc_gain_db.setValue(12.0)
+    readout.dc_measure_mode.setChecked(True)
+    readout.dc_measure_gain_v_per_a.setValue(1.0e6)
     experiment = window._experiment_panel
     experiment.qick_host.setText("192.0.2.44")
     experiment.ns_port.setValue(9999)
@@ -344,6 +426,10 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     experiment.tproc_mhz.setValue(275.0)
     experiment.bias_t_group.setChecked(True)
     experiment.bias_t_compensation_mv.setValue(125.0)
+    experiment.bias_t_mode.setCurrentIndex(
+        experiment.bias_t_mode.findData("fixed_time")
+    )
+    experiment.bias_t_duration_us.setValue(2.5)
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -355,13 +441,18 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["qick"]["tproc_mhz"] == 275.0
     assert document["qick"]["bias_t_compensation"] == {
         "enabled": True,
+        "mode": "fixed_time",
         "voltage_mv": 125.0,
+        "duration_us": 2.5,
     }
     assert len(document["awg"]["outputs"]) == 2
     assert len(document["rf_outputs"]) == 2
     assert document["rf_outputs"][0]["filter_type"] == "highpass"
     assert document["rf_outputs"][0]["filter_cutoff"] == 1.75
     assert document["rf_outputs"][0]["filter_bandwidth"] == 0.625
+    assert document["rf_readout"]["input_board_type"] == "DC_In"
+    assert document["rf_readout"]["dc_measure_mode"] is True
+    assert document["rf_readout"]["dc_measure_gain_v_per_a"] == 1.0e6
 
     restored = gui.MainWindow()
     restored._load_settings_json(saved_path)
@@ -372,7 +463,11 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
     assert restored._experiment_panel.tproc_mhz.value() == 275.0
     assert restored._experiment_panel.bias_t_group.isChecked() is True
+    assert restored._experiment_panel.bias_t_mode.currentData() == "fixed_time"
     assert restored._experiment_panel.bias_t_compensation_mv.value() == 125.0
+    assert restored._experiment_panel.bias_t_duration_us.value() == 2.5
+    assert restored._control_tabs.currentWidget() is restored._awg_tuning_page
+    assert restored._awg_tuning_tabs.currentWidget() is restored._rf_readout_panel
     assert restored._experiment_panel.database_path.text().endswith("experiment.db")
     window.close()
     restored.close()
@@ -408,6 +503,48 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert window._experiment_panel.progress.value() == 47
     assert "47%" in window._experiment_panel.run_status.text()
     app.processEvents()
+    window.close()
+
+
+def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    window._rf_readout_panel.setChecked(True)
+    window._rf_readout_panel.samples.setValue(16)
+    window._rf_readout_panel.input_board_type.setCurrentText("DC_In")
+    window._rf_readout_panel.dc_measure_mode.setChecked(True)
+    window._rf_readout_panel.dc_measure_gain_v_per_a.setValue(2.0e6)
+    window._stability_panel.x_axis.start_mv.setValue(-200.0)
+    window._stability_panel.x_axis.stop_mv.setValue(100.0)
+    window._stability_panel.x_axis.points.setValue(5)
+    window._stability_panel.y_axis.start_mv.setValue(-50.0)
+    window._stability_panel.y_axis.stop_mv.setValue(75.0)
+    window._stability_panel.y_axis.points.setValue(3)
+    window._stability_panel.repetitions.setValue(4)
+    app.processEvents()
+
+    assert window._stability_panel.dc_measure_mode.isChecked() is True
+    assert window._stability_panel.dc_measure_mode.isEnabled() is True
+    assert window._stability_panel.dc_measure_gain_v_per_a.value() == 2.0e6
+    window._stability_panel.dc_measure_gain_v_per_a.setValue(3.0e6)
+    app.processEvents()
+    assert window._rf_readout_panel.dc_measure_gain_v_per_a.value() == 3.0e6
+
+    arguments = window._stability_run_arguments(save=False)
+
+    assert arguments["run_config"] is None
+    assert arguments["gui_settings"] is None
+    assert arguments["repetitions_per_sweep"] == 4
+    assert arguments["sequence"].sweep_shape == (5, 3)
+    assert [axis.output_name for axis in arguments["sequence"].sweep_axes] == [
+        "awg_0",
+        "awg_1",
+    ]
+    assert arguments["sequence"].sweep_point_count == 15
+    assert arguments["readout_spec"].samples_per_trigger == 16
+    assert arguments["readout_spec"].dc_measure_mode is True
+    assert arguments["readout_spec"].dc_measure_gain_v_per_a == 3.0e6
     window.close()
 
 
@@ -581,11 +718,36 @@ def test_settings_without_tproc_clock_use_300_mhz_default():
     window.close()
 
 
+@pytest.mark.parametrize(
+    ("old_index", "panel_name"),
+    ((1, "_sparameter_panel"), (2, "_calibration_panel")),
+)
+def test_version_12_top_level_tabs_migrate_after_stability_tab_insertion(
+    old_index,
+    panel_name,
+):
+    app = _application()
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["version"] = 12
+    document["display"]["selected_control_tab"] = old_index
+    document.pop("stability_diagram")
+
+    decoded = window._decode_settings(document)
+    window._apply_decoded_settings(decoded)
+    app.processEvents()
+
+    assert window._control_tabs.currentWidget() is getattr(window, panel_name)
+    window.close()
+
+
 def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     app = _application()
     window = gui.MainWindow()
     document = window._settings_to_dict()
     document["version"] = 2
+    document["display"]["selected_control_tab"] = 2
+    document["display"].pop("selected_awg_tuning_tab")
     document["display"].pop("voltage_view")
     document["grid"].pop("snap_enabled")
     document["awg"].pop("cross_capacitance")
@@ -610,6 +772,8 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert window._experiment_panel.repetitions.value() == 1
     assert window._experiment_panel.bias_t_group.isChecked() is False
     assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
+    assert window._control_tabs.currentWidget() is window._awg_tuning_page
+    assert window._awg_tuning_tabs.currentWidget() is window._rf_readout_panel
     assert len(window._rf_ports_panel._panels) == 1
     assert window._rf_ports_panel.settings()[0] == gui.DEFAULT_RF_OUTPUT_SETTINGS
     assert (
@@ -623,20 +787,28 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 10
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 14
+    assert upgraded["display"]["selected_control_tab"] == 0
+    assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"
     assert upgraded["grid"]["snap_enabled"] is False
     assert upgraded["awg"]["cross_capacitance"] == [[1.0]]
     assert upgraded["awg"]["sweeps"] == []
+    assert upgraded["stability_diagram"]["x_axis"]["output_name"] == "awg_0"
+    assert upgraded["stability_diagram"]["y_axis"]["output_name"] == "awg_0"
     assert upgraded["qick"]["tproc_mhz"] == 300.0
     assert upgraded["qick"]["repetitions_per_sweep"] == 1
     assert upgraded["qick"]["bias_t_compensation"] == {
         "enabled": False,
+        "mode": "fixed_voltage",
         "voltage_mv": 250.0,
+        "duration_us": 1.0,
     }
     assert upgraded["experiment"]["notes"] == ""
     assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
     assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
+    assert upgraded["rf_readout"]["dc_measure_mode"] is False
+    assert upgraded["rf_readout"]["dc_measure_gain_v_per_a"] == 1.0
     assert (
         upgraded["s_parameter"]["database_path"]
         == gui.DEFAULT_SPARAMETER_SETTINGS["database_path"]
@@ -655,6 +827,27 @@ def test_bias_t_gui_extends_and_plots_the_physical_awg_trace():
     assert window._bias_t_compensation_enabled is True
     assert window._plot._physical_time_ns[-1] > original_end_ns
     assert np.min(window._plot._physical_values_mv[0]) == -100.0
+    assert window._plot._physical_values_mv[0, -1] == 0.0
+    window.close()
+
+
+def test_bias_t_gui_fixed_time_disables_voltage_and_adjusts_preview_level():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    panel.bias_t_mode.setCurrentIndex(panel.bias_t_mode.findData("fixed_time"))
+    panel.bias_t_duration_us.setValue(2.0)
+    panel.bias_t_group.setChecked(True)
+    app.processEvents()
+
+    assert panel.bias_t_compensation_mv.isEnabled() is False
+    assert panel.bias_t_duration_us.isEnabled() is True
+    assert window._bias_t_compensation_mode == "fixed_time"
+    assert window._bias_t_compensation_duration_us == 2.0
+    assert np.min(window._plot._physical_values_mv[0]) == pytest.approx(
+        -50.0,
+        abs=0.2,
+    )
     assert window._plot._physical_values_mv[0, -1] == 0.0
     window.close()
 

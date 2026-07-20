@@ -38,7 +38,10 @@ else:
 
 try:
     from .dc_waveform_core import (
+        BIAS_T_COMPENSATION_MODES,
+        DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_TPROC_MHZ,
@@ -58,7 +61,10 @@ try:
 
 except ImportError:
     from dc_waveform_core import (
+        BIAS_T_COMPENSATION_MODES,
+        DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_TPROC_MHZ,
@@ -113,6 +119,19 @@ except ImportError:
     )
 
 try:
+    from .stability_diagram import (
+        StabilityDiagramPanel,
+        StabilityDiagramWorker,
+        normalize_stability_settings,
+    )
+except ImportError:
+    from stability_diagram import (
+        StabilityDiagramPanel,
+        StabilityDiagramWorker,
+        normalize_stability_settings,
+    )
+
+try:
     from .calibration_gui import (
         CalibrationPanel,
         CalibrationWorker,
@@ -138,11 +157,13 @@ except ImportError:
 try:
     from .qick_front_panel import (
         QickFrontPanelControl,
+        QickFrontPanelPreview,
         identify_qick_front_panel,
     )
 except ImportError:
     from qick_front_panel import (
         QickFrontPanelControl,
+        QickFrontPanelPreview,
         identify_qick_front_panel,
     )
 
@@ -155,8 +176,8 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 10
-SUPPORTED_SETTINGS_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, SETTINGS_VERSION)
+SETTINGS_VERSION = 14
+SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -196,6 +217,8 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "input_board_type": "RF_In",
     "attenuation_db": 20.0,
     "dc_gain_db": 0.0,
+    "dc_measure_mode": False,
+    "dc_measure_gain_v_per_a": DEFAULT_DC_MEASURE_GAIN_V_PER_A,
     "filter_type": "bypass",
     "filter_cutoff": 2.5,
     "filter_bandwidth": 1.0,
@@ -1717,6 +1740,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     changed = QtCore.pyqtSignal()
     remove_requested = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -1731,6 +1755,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._pulse = pulse
         self._index = index
         self._time_unit = time_unit
+        self._front_panel_configuration = None
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
@@ -1785,6 +1810,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.require_within = QtWidgets.QCheckBox("Keep pulse inside anchor SET")
         self.require_within.setChecked(True)
 
+        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.activated.connect(
+            lambda: self.front_panel_requested.emit(self)
+        )
+        form.addRow("Front panel:", self.front_panel_preview)
         form.addRow("Generator index:", self.gen_ch)
         form.addRow("Output board:", self.output_board_type)
         form.addRow("Anchor SET:", self.segment)
@@ -1835,6 +1865,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.output_board_type.currentTextChanged.connect(
             self._update_board_controls
         )
+        self.gen_ch.valueChanged.connect(self._sync_front_panel_selection)
         self._update_board_controls()
         self.set_index(index)
 
@@ -1842,12 +1873,47 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         has_attenuators = self.output_board_type.currentText() == "RF_Out"
         self.att1_db.setEnabled(has_attenuators)
         self.att2_db.setEnabled(has_attenuators)
+        self.filter_type.setEnabled(has_attenuators)
+        self.filter_cutoff.setEnabled(has_attenuators)
+        self.filter_bandwidth.setEnabled(has_attenuators)
         if has_attenuators:
             tooltip = "RF_Out onboard attenuator"
         else:
             tooltip = "DC_Out has no onboard ATT1/ATT2; these values are ignored"
         self.att1_db.setToolTip(tooltip)
         self.att2_db.setToolTip(tooltip)
+        self.filter_type.setToolTip(tooltip)
+        self.filter_cutoff.setToolTip(tooltip)
+        self.filter_bandwidth.setToolTip(tooltip)
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
+        self.front_panel_preview.set_configuration(configuration)
+        self._sync_front_panel_selection()
+
+    def _sync_front_panel_selection(self, *_args) -> None:
+        self.front_panel_preview.set_channels(output_ch=self.gen_ch.value())
+        if self._front_panel_configuration is None:
+            return
+        for port in self._front_panel_configuration.outputs:
+            if self.gen_ch.value() in port.qick_channels:
+                if port.board_type in QICK_OUTPUT_BOARD_TYPES:
+                    self.output_board_type.setCurrentText(port.board_type)
+                return
+
+    def apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
+        self.gen_ch.setValue(int(values["output_ch"]))
+        self.output_board_type.setCurrentText(str(values["output_board_type"]))
+        self.att1_db.setValue(float(values["output_att1_db"]))
+        self.att2_db.setValue(float(values["output_att2_db"]))
+        self.filter_type.setCurrentText(str(values["output_filter_type"]))
+        self.filter_cutoff.setValue(float(values["output_filter_cutoff_ghz"]))
+        self.filter_bandwidth.setValue(
+            float(values["output_filter_bandwidth_ghz"])
+        )
+        self._update_board_controls()
+        self._sync_front_panel_selection()
+        self.changed.emit()
 
     def set_index(self, index: int) -> None:
         self._index = index
@@ -1983,6 +2049,7 @@ class RfPortsPanel(QtWidgets.QWidget):
     """Add/remove editor for up to eight normal QICK RF outputs."""
 
     specs_changed = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal(object)
     MAX_PORTS = 8
 
     def __init__(self, pulse: PulseSequence, *, time_unit: str, parent=None):
@@ -1990,6 +2057,7 @@ class RfPortsPanel(QtWidgets.QWidget):
         self._pulse = pulse
         self._time_unit = time_unit
         self._panels: List[RfPulsePortPanel] = []
+        self._front_panel_configuration = None
         layout = QtWidgets.QVBoxLayout(self)
         self._scroll = QtWidgets.QScrollArea(self)
         self._scroll.setWidgetResizable(True)
@@ -2022,6 +2090,9 @@ class RfPortsPanel(QtWidgets.QWidget):
         )
         panel.changed.connect(self._emit_specs)
         panel.remove_requested.connect(self.remove_port)
+        panel.front_panel_requested.connect(self.front_panel_requested.emit)
+        if self._front_panel_configuration is not None:
+            panel.set_front_panel_configuration(self._front_panel_configuration)
         self._content_layout.insertWidget(self._content_layout.count() - 1, panel)
         self._panels.append(panel)
         if spec is not None:
@@ -2085,6 +2156,11 @@ class RfPortsPanel(QtWidgets.QWidget):
         self._emit_specs()
         return self._panels.index(target)
 
+    def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
+        for panel in self._panels:
+            panel.set_front_panel_configuration(configuration)
+
     def specs(self) -> Tuple[QickRfPulseSpec, ...]:
         specs = tuple(spec for panel in self._panels if (spec := panel.spec()) is not None)
         channels = tuple(spec.gen_ch for spec in specs)
@@ -2134,11 +2210,13 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
     """RF input and FIR-decimated DDR capture configuration."""
 
     spec_changed = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, pulse: PulseSequence, *, time_unit: str, parent=None):
         super().__init__("RF Readout 1", parent)
         self._pulse = pulse
         self._time_unit = time_unit
+        self._front_panel_configuration = None
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
@@ -2170,6 +2248,22 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.dc_gain_db.setSingleStep(1.0)
         self.dc_gain_db.setValue(0.0)
         self.dc_gain_db.setSuffix(" dB")
+        self.dc_measure_mode = QtWidgets.QCheckBox("Convert FIR I/Q to current")
+        self.dc_measure_mode.setToolTip(
+            "DC_In only: use identity ADC-to-voltage conversion, then divide "
+            "I and Q by the measurement gain"
+        )
+        self.dc_measure_gain_v_per_a = QtWidgets.QDoubleSpinBox()
+        self.dc_measure_gain_v_per_a.setRange(1.0e-9, 1.0e15)
+        self.dc_measure_gain_v_per_a.setDecimals(6)
+        self.dc_measure_gain_v_per_a.setValue(
+            DEFAULT_DC_MEASURE_GAIN_V_PER_A
+        )
+        self.dc_measure_gain_v_per_a.setSuffix(" V/A")
+        self.dc_measure_gain_v_per_a.setToolTip(
+            "Current conversion: I_current = I_voltage / gain and "
+            "Q_current = Q_voltage / gain"
+        )
         self.input_condition_stack = QtWidgets.QStackedWidget()
         self.input_condition_stack.addWidget(self.attenuation_db)
         self.input_condition_stack.addWidget(self.dc_gain_db)
@@ -2190,6 +2284,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.margin_samples.setValue(1024)
         self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
 
+        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.activated.connect(
+            lambda: self.front_panel_requested.emit(self)
+        )
+        form.addRow("Front panel:", self.front_panel_preview)
         form.addRow("Readout index:", self.ro_ch)
         form.addRow("Input board:", self.input_board_type)
         form.addRow("Anchor SET:", self.segment)
@@ -2199,6 +2298,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow("Readout/DDC frequency:", self.frequency_mhz)
         self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
         form.addRow(self.input_condition_label, self.input_condition_stack)
+        form.addRow(self.dc_measure_mode)
+        form.addRow("DC measurement gain:", self.dc_measure_gain_v_per_a)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
@@ -2221,6 +2322,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.frequency_mhz,
             self.attenuation_db,
             self.dc_gain_db,
+            self.dc_measure_mode,
+            self.dc_measure_gain_v_per_a,
             self.filter_type,
             self.filter_cutoff,
             self.filter_bandwidth,
@@ -2237,14 +2340,63 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.input_board_type.currentTextChanged.connect(
             self._update_board_controls
         )
+        self.dc_measure_mode.toggled.connect(self._update_board_controls)
+        self.ro_ch.valueChanged.connect(self._sync_front_panel_selection)
         self._update_board_controls()
 
     def _update_board_controls(self, *_args) -> None:
         rf_input = self.input_board_type.currentText() == "RF_In"
+        if rf_input and self.dc_measure_mode.isChecked():
+            with QtCore.QSignalBlocker(self.dc_measure_mode):
+                self.dc_measure_mode.setChecked(False)
         self.input_condition_stack.setCurrentIndex(0 if rf_input else 1)
         self.input_condition_label.setText(
             "Input attenuation:" if rf_input else "DC input gain:"
         )
+        self.filter_type.setEnabled(rf_input)
+        self.filter_cutoff.setEnabled(rf_input)
+        self.filter_bandwidth.setEnabled(rf_input)
+        self.dc_measure_mode.setEnabled(not rf_input)
+        self.dc_measure_gain_v_per_a.setEnabled(
+            not rf_input and self.dc_measure_mode.isChecked()
+        )
+        tooltip = (
+            "RF_In onboard filter"
+            if rf_input
+            else "DC_In has no onboard RF filter; these values are ignored"
+        )
+        self.filter_type.setToolTip(tooltip)
+        self.filter_cutoff.setToolTip(tooltip)
+        self.filter_bandwidth.setToolTip(tooltip)
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
+        self.front_panel_preview.set_configuration(configuration)
+        self._sync_front_panel_selection()
+
+    def _sync_front_panel_selection(self, *_args) -> None:
+        self.front_panel_preview.set_channels(input_ch=self.ro_ch.value())
+        if self._front_panel_configuration is None:
+            return
+        for port in self._front_panel_configuration.inputs:
+            if self.ro_ch.value() in port.qick_channels:
+                if port.board_type in QICK_INPUT_BOARD_TYPES:
+                    self.input_board_type.setCurrentText(port.board_type)
+                return
+
+    def apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
+        self.ro_ch.setValue(int(values["readout_ch"]))
+        self.input_board_type.setCurrentText(str(values["input_board_type"]))
+        self.attenuation_db.setValue(float(values["readout_attenuation_db"]))
+        self.dc_gain_db.setValue(float(values["readout_dc_gain_db"]))
+        self.filter_type.setCurrentText(str(values["readout_filter_type"]))
+        self.filter_cutoff.setValue(float(values["readout_filter_cutoff_ghz"]))
+        self.filter_bandwidth.setValue(
+            float(values["readout_filter_bandwidth_ghz"])
+        )
+        self._update_board_controls()
+        self._sync_front_panel_selection()
+        self._emit_spec()
 
     def set_time_unit(self, unit: str, *, force: bool = False) -> None:
         if unit not in TIME_UNIT_NS:
@@ -2287,12 +2439,25 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             filter_bandwidth=self.filter_bandwidth.value(),
             input_board_type=self.input_board_type.currentText(),
             dc_gain_db=self.dc_gain_db.value(),
+            dc_measure_mode=self.dc_measure_mode.isChecked(),
+            dc_measure_gain_v_per_a=self.dc_measure_gain_v_per_a.value(),
         )
 
     def spec(self) -> Optional[QickDdrReadoutSpec]:
         if not self.isChecked():
             return None
         return self.configured_spec()
+
+    def set_dc_measurement(self, enabled: bool, gain_v_per_a: float) -> None:
+        """Update the shared DC current conversion from another GUI view."""
+        if enabled and self.input_board_type.currentText() != "DC_In":
+            raise ValueError("DC measure mode requires the DC_In input board")
+        with QtCore.QSignalBlocker(self.dc_measure_mode):
+            self.dc_measure_mode.setChecked(bool(enabled))
+        with QtCore.QSignalBlocker(self.dc_measure_gain_v_per_a):
+            self.dc_measure_gain_v_per_a.setValue(float(gain_v_per_a))
+        self._update_board_controls()
+        self._emit_spec()
 
     def settings_dict(self) -> dict:
         spec = self.configured_spec()
@@ -2308,6 +2473,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "input_board_type": spec.input_board_type,
             "attenuation_db": spec.attenuation_db,
             "dc_gain_db": spec.dc_gain_db,
+            "dc_measure_mode": spec.dc_measure_mode,
+            "dc_measure_gain_v_per_a": spec.dc_measure_gain_v_per_a,
             "filter_type": spec.filter_type,
             "filter_cutoff": spec.filter_cutoff,
             "filter_bandwidth": spec.filter_bandwidth,
@@ -2322,6 +2489,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             raise TypeError("RF readout enabled must be boolean")
         if not isinstance(force_overwrite, bool):
             raise TypeError("RF readout force_overwrite must be boolean")
+        dc_measure_mode = data.get("dc_measure_mode", False)
+        if not isinstance(dc_measure_mode, bool):
+            raise TypeError("RF readout dc_measure_mode must be boolean")
         spec = QickDdrReadoutSpec(
             ro_ch=int(data["ro_ch"]),
             segment_name=str(data["segment_name"]),
@@ -2336,6 +2506,13 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
             input_board_type=str(data.get("input_board_type", "RF_In")),
             dc_gain_db=float(data.get("dc_gain_db", 0.0)),
+            dc_measure_mode=dc_measure_mode,
+            dc_measure_gain_v_per_a=float(
+                data.get(
+                    "dc_measure_gain_v_per_a",
+                    DEFAULT_DC_MEASURE_GAIN_V_PER_A,
+                )
+            ),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -2356,6 +2533,10 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.force_overwrite.setChecked(spec.force_overwrite)
             self.attenuation_db.setValue(spec.attenuation_db)
             self.dc_gain_db.setValue(spec.dc_gain_db)
+            self.dc_measure_mode.setChecked(spec.dc_measure_mode)
+            self.dc_measure_gain_v_per_a.setValue(
+                spec.dc_measure_gain_v_per_a
+            )
             self.filter_type.setCurrentIndex(filter_index)
             self.filter_cutoff.setValue(spec.filter_cutoff)
             self.filter_bandwidth.setValue(spec.filter_bandwidth)
@@ -2390,7 +2571,7 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     run_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
-    bias_t_changed = QtCore.pyqtSignal(bool, float)
+    bias_t_changed = QtCore.pyqtSignal(bool, float, str, float)
 
     def __init__(
         self,
@@ -2402,6 +2583,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         repetitions: int,
         bias_t_enabled: bool = False,
         bias_t_compensation_mv: Optional[float] = None,
+        bias_t_mode: str = "fixed_voltage",
+        bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         parent=None,
     ):
         super().__init__(parent)
@@ -2455,6 +2638,15 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self.bias_t_mode = QtWidgets.QComboBox()
+        self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
+        self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
+        mode_index = self.bias_t_mode.findData(str(bias_t_mode))
+        if mode_index < 0:
+            raise ValueError(
+                f"Bias-T compensation mode must be one of {BIAS_T_COMPENSATION_MODES}"
+            )
+        self.bias_t_mode.setCurrentIndex(mode_index)
         self.bias_t_compensation_mv = QtWidgets.QDoubleSpinBox()
         self.bias_t_compensation_mv.setRange(0.001, float(full_scale_mv))
         self.bias_t_compensation_mv.setDecimals(6)
@@ -2466,7 +2658,14 @@ class ExperimentPanel(QtWidgets.QWidget):
                 else bias_t_compensation_mv
             )
         )
+        self.bias_t_duration_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_duration_us.setRange(1.0e-6, 1.0e9)
+        self.bias_t_duration_us.setDecimals(6)
+        self.bias_t_duration_us.setSuffix(" us")
+        self.bias_t_duration_us.setValue(float(bias_t_duration_us))
+        bias_t_form.addRow("Control mode:", self.bias_t_mode)
         bias_t_form.addRow("Compensation voltage:", self.bias_t_compensation_mv)
+        bias_t_form.addRow("Compensation time:", self.bias_t_duration_us)
         self.set_qick_values(
             fabric_mhz=fabric_mhz,
             tproc_mhz=tproc_mhz,
@@ -2492,6 +2691,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.valueChanged.connect(self._update_bias_t_range)
         self.bias_t_group.toggled.connect(self._emit_bias_t_changed)
         self.bias_t_compensation_mv.valueChanged.connect(self._emit_bias_t_changed)
+        self.bias_t_duration_us.valueChanged.connect(self._emit_bias_t_changed)
+        self.bias_t_mode.currentIndexChanged.connect(self._on_bias_t_mode_changed)
+        self._update_bias_t_mode_controls()
 
         self.run_button = QtWidgets.QPushButton("Run QICK Experiment")
         self.run_button.setIcon(
@@ -2527,7 +2729,18 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_changed.emit(
             self.bias_t_group.isChecked(),
             self.bias_t_compensation_mv.value(),
+            str(self.bias_t_mode.currentData()),
+            self.bias_t_duration_us.value(),
         )
+
+    def _update_bias_t_mode_controls(self) -> None:
+        fixed_time = self.bias_t_mode.currentData() == "fixed_time"
+        self.bias_t_compensation_mv.setEnabled(not fixed_time)
+        self.bias_t_duration_us.setEnabled(fixed_time)
+
+    def _on_bias_t_mode_changed(self, *_args) -> None:
+        self._update_bias_t_mode_controls()
+        self._emit_bias_t_changed()
 
     def _browse_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -2571,6 +2784,8 @@ class ExperimentPanel(QtWidgets.QWidget):
             "repetitions_per_sweep": self.repetitions.value(),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
+            "bias_t_compensation_mode": str(self.bias_t_mode.currentData()),
+            "bias_t_compensation_duration_us": self.bias_t_duration_us.value(),
         }
 
     def connection_values(
@@ -2630,12 +2845,29 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels.setText(", ".join(str(value) for value in awg_channels))
         self.repetitions.setValue(int(repetitions))
 
-    def set_bias_t_values(self, *, enabled: bool, compensation_mv: float) -> None:
+    def set_bias_t_values(
+        self,
+        *,
+        enabled: bool,
+        compensation_mv: float,
+        mode: str = "fixed_voltage",
+        duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+    ) -> None:
+        mode_index = self.bias_t_mode.findData(str(mode))
+        if mode_index < 0:
+            raise ValueError(
+                f"Bias-T compensation mode must be one of {BIAS_T_COMPENSATION_MODES}"
+            )
         with QtCore.QSignalBlocker(self.bias_t_group), QtCore.QSignalBlocker(
             self.bias_t_compensation_mv
+        ), QtCore.QSignalBlocker(self.bias_t_mode), QtCore.QSignalBlocker(
+            self.bias_t_duration_us
         ):
             self.bias_t_group.setChecked(bool(enabled))
             self.bias_t_compensation_mv.setValue(float(compensation_mv))
+            self.bias_t_mode.setCurrentIndex(mode_index)
+            self.bias_t_duration_us.setValue(float(duration_us))
+        self._update_bias_t_mode_controls()
         self._emit_bias_t_changed()
 
     def load_settings(
@@ -2650,6 +2882,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         repetitions: int,
         bias_t_enabled: bool = False,
         bias_t_compensation_mv: float = DEFAULT_BIAS_T_COMPENSATION_MV,
+        bias_t_mode: str = "fixed_voltage",
+        bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
     ) -> None:
         self.qick_host.setText(connection.host)
         self.ns_port.setValue(connection.ns_port)
@@ -2668,6 +2902,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.set_bias_t_values(
             enabled=bias_t_enabled,
             compensation_mv=bias_t_compensation_mv,
+            mode=bias_t_mode,
+            duration_us=bias_t_duration_us,
         )
 
     def set_running(
@@ -2887,6 +3123,8 @@ class QickExportDialog(QtWidgets.QDialog):
         initial_repetitions: int = 1,
         initial_bias_t_enabled: bool = False,
         initial_bias_t_compensation_mv: Optional[float] = None,
+        initial_bias_t_mode: str = "fixed_voltage",
+        initial_bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
     ):
         super().__init__(parent)
         self.setWindowTitle("QICK export settings")
@@ -2955,6 +3193,15 @@ class QickExportDialog(QtWidgets.QDialog):
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(initial_bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self.bias_t_mode = QtWidgets.QComboBox()
+        self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
+        self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
+        mode_index = self.bias_t_mode.findData(str(initial_bias_t_mode))
+        if mode_index < 0:
+            raise ValueError(
+                f"Bias-T compensation mode must be one of {BIAS_T_COMPENSATION_MODES}"
+            )
+        self.bias_t_mode.setCurrentIndex(mode_index)
         self.bias_t_compensation_mv = QtWidgets.QDoubleSpinBox()
         self.bias_t_compensation_mv.setRange(0.001, float(initial_full_scale_mv))
         self.bias_t_compensation_mv.setDecimals(6)
@@ -2964,12 +3211,23 @@ class QickExportDialog(QtWidgets.QDialog):
             if initial_bias_t_compensation_mv is None
             else initial_bias_t_compensation_mv
         ))
+        self.bias_t_duration_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_duration_us.setRange(1.0e-6, 1.0e9)
+        self.bias_t_duration_us.setDecimals(6)
+        self.bias_t_duration_us.setSuffix(" us")
+        self.bias_t_duration_us.setValue(float(initial_bias_t_duration_us))
+        bias_t_form.addRow("Control mode:", self.bias_t_mode)
         bias_t_form.addRow("Compensation voltage:", self.bias_t_compensation_mv)
+        bias_t_form.addRow("Compensation time:", self.bias_t_duration_us)
         self.full_scale_mv.valueChanged.connect(
             lambda value: self.bias_t_compensation_mv.setMaximum(
                 max(0.001, float(value))
             )
         )
+        self.bias_t_mode.currentIndexChanged.connect(
+            self._update_bias_t_mode_controls
+        )
+        self._update_bias_t_mode_controls()
 
         form.addRow("AWG fabric clock:", self.fabric_mhz)
         form.addRow("tProcessor clock:", self.tproc_mhz)
@@ -3079,6 +3337,11 @@ class QickExportDialog(QtWidgets.QDialog):
             stop=self.sweep_stop.value() / full_scale_mv,
             count=self.sweep_count.value(),
         )
+
+    def _update_bias_t_mode_controls(self, *_args) -> None:
+        fixed_time = self.bias_t_mode.currentData() == "fixed_time"
+        self.bias_t_compensation_mv.setEnabled(not fixed_time)
+        self.bias_t_duration_us.setEnabled(fixed_time)
 
     def _rescale_sweep_voltage_controls(self, value: float) -> None:
         new_scale_mv = float(value)
@@ -3240,6 +3503,8 @@ class QickExportDialog(QtWidgets.QDialog):
             "repetitions_per_sweep": self.repetitions.value(),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
+            "bias_t_compensation_mode": str(self.bias_t_mode.currentData()),
+            "bias_t_compensation_duration_us": self.bias_t_duration_us.value(),
             "sweep": sweep,
             "sweeps": sweeps,
             "cross_capacitance": tuple(
@@ -3303,6 +3568,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_voltage_mv = float(
             DEFAULT_BIAS_T_COMPENSATION_MV
         )
+        self._bias_t_compensation_mode = "fixed_voltage"
+        self._bias_t_compensation_duration_us = float(
+            DEFAULT_BIAS_T_COMPENSATION_DURATION_US
+        )
         self._experiment_thread: Optional[QtCore.QThread] = None
         self._experiment_worker: Optional[QtCore.QObject] = None
         self._grid_time_ns = 1000.0
@@ -3338,21 +3607,52 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             repetitions=self._qick_repetitions_per_sweep,
             bias_t_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
+            bias_t_mode=self._bias_t_compensation_mode,
+            bias_t_duration_us=self._bias_t_compensation_duration_us,
             parent=self,
         )
+        self._stability_panel = StabilityDiagramPanel(self)
         self._sparameter_panel = SParameterSweepPanel(self)
         self._calibration_panel = CalibrationPanel(self)
-        self._qick_front_panel = QickFrontPanelControl(self)
+        self._qick_configuration = None
+        self._qick_front_panel_target = None
+        self._qick_front_panel_dialog = QtWidgets.QDialog(self)
+        self._qick_front_panel_dialog.setModal(False)
+        self._qick_front_panel_dialog.setWindowTitle("QICK Front Panel")
+        self._qick_front_panel_dialog.resize(1080, 680)
+        front_panel_layout = QtWidgets.QVBoxLayout(self._qick_front_panel_dialog)
+        self._qick_front_panel = QickFrontPanelControl(
+            self._qick_front_panel_dialog
+        )
+        front_panel_layout.addWidget(self._qick_front_panel)
+        front_panel_buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Close,
+            parent=self._qick_front_panel_dialog,
+        )
+        front_panel_buttons.rejected.connect(self._qick_front_panel_dialog.close)
+        front_panel_layout.addWidget(front_panel_buttons)
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.path_diagram.applied_values()
         )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
+        self._stability_panel.dc_measure_changed.connect(
+            self._on_stability_dc_measure_changed
+        )
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
         )
         self._experiment_panel.bias_t_changed.connect(self._on_bias_t_changed)
+        self._stability_panel.start_requested.connect(
+            lambda: self._run_stability_diagram(continuous=True)
+        )
+        self._stability_panel.stop_requested.connect(
+            self._stop_stability_diagram
+        )
+        self._stability_panel.single_shot_requested.connect(
+            lambda: self._run_stability_diagram(continuous=False)
+        )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
         )
@@ -3361,6 +3661,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._sparameter_panel.path_settings_applied.connect(
             self._apply_rf_path_settings
+        )
+        self._sparameter_panel.front_panel_requested.connect(
+            lambda: self._show_qick_front_panel("path")
+        )
+        self._rf_ports_panel.front_panel_requested.connect(
+            lambda panel: self._show_qick_front_panel("output", panel)
+        )
+        self._rf_readout_panel.front_panel_requested.connect(
+            lambda panel: self._show_qick_front_panel("input", panel)
         )
         self._calibration_panel.output_requested.connect(
             lambda: self._run_power_calibration("output")
@@ -3383,15 +3692,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         unit_row.addWidget(QtWidgets.QLabel("Time unit:"))
         unit_row.addWidget(self._time_unit_combo)
         unit_row.addStretch(1)
+
+        self._awg_tuning_page = QtWidgets.QWidget(self)
+        awg_tuning_layout = QtWidgets.QVBoxLayout(self._awg_tuning_page)
+        awg_tuning_layout.setContentsMargins(0, 0, 0, 0)
+        self._awg_tuning_tabs = QtWidgets.QTabWidget(self._awg_tuning_page)
+        self._awg_tuning_tabs.addTab(self._multi_ctrl, "AWG Outputs")
+        self._awg_tuning_tabs.addTab(self._rf_ports_panel, "RF Outputs")
+        self._awg_tuning_tabs.addTab(self._rf_readout_panel, "RF Readout")
+        self._awg_tuning_tabs.addTab(self._experiment_panel, "Experiment")
+        self._awg_tuning_tabs.setCurrentWidget(self._multi_ctrl)
+        awg_tuning_layout.addWidget(self._awg_tuning_tabs)
+
         self._control_tabs = QtWidgets.QTabWidget()
-        self._control_tabs.addTab(self._multi_ctrl, "AWG Outputs")
-        self._control_tabs.addTab(self._rf_ports_panel, "RF Outputs")
-        self._control_tabs.addTab(self._rf_readout_panel, "RF Readout")
-        self._control_tabs.addTab(self._experiment_panel, "Experiment")
+        self._control_tabs.addTab(self._awg_tuning_page, "AWG Tuning")
+        self._control_tabs.addTab(
+            self._stability_panel,
+            "Stability Diagram",
+        )
         self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
-        self._control_tabs.addTab(self._qick_front_panel, "QICK Front Panel")
-        self._control_tabs.setCurrentWidget(self._qick_front_panel)
+        self._control_tabs.setCurrentWidget(self._awg_tuning_page)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
         control_layout = QtWidgets.QVBoxLayout(control_container)
@@ -3439,6 +3760,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_trace = QtWidgets.QDockWidget("Trace Plot", self)
         self._dock_trace.setWidget(self._trace_placeholder)
 
+        self._stability_plot = self._stability_panel.detach_plot()
+        self._dock_stability = QtWidgets.QDockWidget(
+            "Stability Diagram - FIR Magnitude / Phase",
+            self,
+        )
+        self._dock_stability.setWidget(self._stability_plot)
+
         self._sparameter_plot = SParameterPlotWidget(self)
         self._dock_sparameter = QtWidgets.QDockWidget(
             "RF S-Parameter", self
@@ -3449,6 +3777,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._dock_ctrl,
             self._dock_plot,
             self._dock_trace,
+            self._dock_stability,
             self._dock_sparameter,
         ):
             dock.setFeatures(
@@ -3460,6 +3789,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self._dock_ctrl)
         self.splitDockWidget(self._dock_ctrl, self._dock_plot, QtCore.Qt.Horizontal)
         self.splitDockWidget(self._dock_plot, self._dock_trace, QtCore.Qt.Horizontal)
+        self.tabifyDockWidget(self._dock_trace, self._dock_stability)
         self.tabifyDockWidget(self._dock_trace, self._dock_sparameter)
         self.resizeDocks(
             [self._dock_ctrl, self._dock_plot, self._dock_trace],
@@ -3779,6 +4109,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 cross_capacitance=self._cross_capacitance,
                 bias_t_compensation_enabled=True,
                 bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
+                bias_t_compensation_mode=self._bias_t_compensation_mode,
+                bias_t_compensation_duration_us=(
+                    self._bias_t_compensation_duration_us
+                ),
             )
             cycles, waveforms, _boundaries = (
                 sequence.compensated_waveform_vertices(0)
@@ -3997,6 +4331,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self.statusBar().showMessage(
                 "Sweeps for the modified port were removed after segment structure changed"
             )
+        self._refresh_stability_targets()
 
     def _build_toolbar(self):
         tb          = self.addToolBar("Tools")
@@ -4025,18 +4360,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
         if self._trace is not None:
             self._trace.fit_view()
+        self._stability_panel.plot.fit_view()
         self._sparameter_plot.fit_view()
 
     def _show_rf_editor(self) -> None:
         """Compatibility helper: reveal the always-present RF Outputs tab."""
-        self._control_tabs.setCurrentWidget(self._rf_ports_panel)
+        self._control_tabs.setCurrentWidget(self._awg_tuning_page)
+        self._awg_tuning_tabs.setCurrentWidget(self._rf_ports_panel)
         self._dock_ctrl.show()
         self._dock_ctrl.raise_()
 
     def _on_control_tab_changed(self, _index: int) -> None:
-        if self._control_tabs.currentWidget() is self._sparameter_panel:
+        current = self._control_tabs.currentWidget()
+        if current is self._stability_panel:
+            self._dock_stability.show()
+            self._dock_stability.raise_()
+        elif current is self._sparameter_panel:
             self._dock_sparameter.show()
             self._dock_sparameter.raise_()
+        else:
+            self._dock_plot.show()
+            self._dock_plot.raise_()
 
     def _apply_rf_spec(self, spec: QickRfPulseSpec) -> None:
         self._rf_pulse_specs = [spec]
@@ -4061,25 +4405,58 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_readout_spec_changed(self, spec) -> None:
         self._ddr_readout_spec = spec
+        configured = self._rf_readout_panel.configured_spec()
+        self._stability_panel.set_dc_measure_context(
+            configured.input_board_type,
+            configured.dc_measure_mode,
+            configured.dc_measure_gain_v_per_a,
+        )
         if spec is None:
             self.statusBar().showMessage("RF readout disabled")
+        elif spec.dc_measure_mode:
+            self.statusBar().showMessage(
+                f"DC current readout {spec.ro_ch}: "
+                f"{spec.samples_per_trigger} samples at 1 MSPS, "
+                f"gain {spec.dc_measure_gain_v_per_a:g} V/A"
+            )
         else:
             self.statusBar().showMessage(
                 f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
             )
 
-    def _on_bias_t_changed(self, enabled: bool, compensation_mv: float) -> None:
+    def _on_stability_dc_measure_changed(
+        self,
+        enabled: bool,
+        gain_v_per_a: float,
+    ) -> None:
+        self._rf_readout_panel.set_dc_measurement(enabled, gain_v_per_a)
+
+    def _on_bias_t_changed(
+        self,
+        enabled: bool,
+        compensation_mv: float,
+        mode: str,
+        duration_us: float,
+    ) -> None:
         self._bias_t_compensation_enabled = bool(enabled)
         self._bias_t_compensation_voltage_mv = float(compensation_mv)
+        self._bias_t_compensation_mode = str(mode)
+        self._bias_t_compensation_duration_us = float(duration_us)
         try:
             self._refresh_physical_waveforms(fit_view=False)
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
             self.statusBar().showMessage(f"Bias-T preview unavailable: {exc}")
             return
         if enabled:
-            self.statusBar().showMessage(
-                f"Bias-T compensation enabled at {compensation_mv:.6g} mV"
-            )
+            if mode == "fixed_time":
+                self.statusBar().showMessage(
+                    "Bias-T compensation enabled for "
+                    f"{duration_us:.6g} us; voltage follows pulse area"
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Bias-T compensation enabled at {compensation_mv:.6g} mV"
+                )
         else:
             self.statusBar().showMessage("Bias-T compensation disabled")
 
@@ -4102,6 +4479,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._bias_t_compensation_voltage_mv = values[
             "bias_t_compensation_voltage_mv"
+        ]
+        self._bias_t_compensation_mode = values["bias_t_compensation_mode"]
+        self._bias_t_compensation_duration_us = values[
+            "bias_t_compensation_duration_us"
         ]
         rf_specs = self._rf_ports_panel.specs()
         readout_spec = self._rf_readout_panel.spec()
@@ -4129,6 +4510,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             cross_capacitance=self._cross_capacitance.copy(),
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
+            bias_t_compensation_mode=self._bias_t_compensation_mode,
+            bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
         )
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
@@ -4143,6 +4526,81 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "progress": False,
         }
 
+    def _stability_run_arguments(self, *, save: bool) -> dict:
+        values = self._experiment_panel.values(
+            len(self._pulse),
+            require_run_config=save,
+        )
+        self._qick_fabric_mhz = values["fabric_mhz"]
+        self._qick_tproc_mhz = values["tproc_mhz"]
+        self._qick_full_scale_mv = values["full_scale_mv"]
+        self._qick_awg_channels = values["awg_channels"]
+        self._bias_t_compensation_enabled = values[
+            "bias_t_compensation_enabled"
+        ]
+        self._bias_t_compensation_voltage_mv = values[
+            "bias_t_compensation_voltage_mv"
+        ]
+        self._bias_t_compensation_mode = values["bias_t_compensation_mode"]
+        self._bias_t_compensation_duration_us = values[
+            "bias_t_compensation_duration_us"
+        ]
+        self._refresh_stability_targets()
+        stability_config = self._stability_panel.config(
+            full_scale_mv=self._qick_full_scale_mv
+        )
+        rf_specs = self._rf_ports_panel.specs()
+        readout_spec = self._rf_readout_panel.spec()
+        if readout_spec is None:
+            raise ValueError(
+                "enable RF Readout before acquiring a stability diagram"
+            )
+        overlap = {spec.gen_ch for spec in rf_specs}.intersection(
+            self._qick_awg_channels
+        )
+        if overlap:
+            raise ValueError(
+                "RF and AWG generator indices overlap: "
+                + ", ".join(str(channel) for channel in sorted(overlap))
+            )
+
+        sweeps = tuple(
+            QickSweepSpec(
+                segment_name=axis.segment_name,
+                output_name=axis.output_name,
+                start=axis.start_mv / self._qick_full_scale_mv,
+                stop=axis.stop_mv / self._qick_full_scale_mv,
+                count=axis.points,
+            )
+            for axis in (stability_config.x_axis, stability_config.y_axis)
+        )
+        sequence = build_qick_sequence(
+            tuple(pulse.copy() for pulse in self._pulse),
+            output_names=self._qick_output_names(),
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            sweeps=sweeps,
+            cross_capacitance=self._cross_capacitance.copy(),
+            bias_t_compensation_enabled=self._bias_t_compensation_enabled,
+            bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
+            bias_t_compensation_mode=self._bias_t_compensation_mode,
+            bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
+        )
+        return {
+            "connection_config": values["connection"],
+            "run_config": values["run"],
+            "gui_settings": self._settings_to_dict() if save else None,
+            "stability_config": stability_config,
+            "full_scale_mv": self._qick_full_scale_mv,
+            "sequence": sequence,
+            "awg_channels": self._qick_awg_channels,
+            "repetitions_per_sweep": stability_config.repetitions_per_point,
+            "tproc_mhz": self._qick_tproc_mhz,
+            "rf_specs": rf_specs,
+            "readout_spec": readout_spec,
+            "progress": False,
+        }
+
     def _sparameter_run_arguments(self) -> dict:
         connection, run = self._experiment_panel.connection_values(
             database_path=self._sparameter_panel.database_path_value()
@@ -4153,6 +4611,73 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sweep_config": self._sparameter_panel.config(),
             "tproc_mhz": self._experiment_panel.tproc_mhz.value(),
         }
+
+    def _show_qick_front_panel(self, scope: str, target=None) -> None:
+        """Open the live front-panel selector for the requesting editor."""
+        self._qick_front_panel_target = target
+        self._qick_front_panel.set_scope(scope)
+        titles = {
+            "path": "QICK Front Panel - RF Measurement Path",
+            "output": "QICK Front Panel - RF Output",
+            "input": "QICK Front Panel - RF Readout",
+        }
+        self._qick_front_panel_dialog.setWindowTitle(titles[scope])
+
+        if scope == "output":
+            spec = target.configured_spec()
+            values = {
+                "output_ch": spec.gen_ch,
+                "output_board_type": spec.output_board_type,
+                "output_att1_db": spec.att1_db,
+                "output_att2_db": spec.att2_db,
+                "output_filter_type": spec.filter_type,
+                "output_filter_cutoff_ghz": spec.filter_cutoff,
+                "output_filter_bandwidth_ghz": spec.filter_bandwidth,
+            }
+        elif scope == "input":
+            spec = target.configured_spec()
+            values = {
+                "readout_ch": spec.ro_ch,
+                "input_board_type": spec.input_board_type,
+                "readout_attenuation_db": spec.attenuation_db,
+                "readout_dc_gain_db": spec.dc_gain_db,
+                "readout_filter_type": spec.filter_type,
+                "readout_filter_cutoff_ghz": spec.filter_cutoff,
+                "readout_filter_bandwidth_ghz": spec.filter_bandwidth,
+            }
+        else:
+            path = self._sparameter_panel.path_diagram
+            values = path._editor_values()
+            values.update(
+                {
+                    "output_filter_type": (
+                        self._sparameter_panel.output_filter_type.currentText()
+                    ),
+                    "output_filter_cutoff_ghz": (
+                        self._sparameter_panel.output_filter_cutoff_ghz.value()
+                    ),
+                    "output_filter_bandwidth_ghz": (
+                        self._sparameter_panel.output_filter_bandwidth_ghz.value()
+                    ),
+                    "readout_filter_type": (
+                        self._sparameter_panel.readout_filter_type.currentText()
+                    ),
+                    "readout_filter_cutoff_ghz": (
+                        self._sparameter_panel.readout_filter_cutoff_ghz.value()
+                    ),
+                    "readout_filter_bandwidth_ghz": (
+                        self._sparameter_panel.readout_filter_bandwidth_ghz.value()
+                    ),
+                }
+            )
+        self._qick_front_panel.set_path_values(values)
+        if self._qick_configuration is not None:
+            self._qick_front_panel.set_configuration(self._qick_configuration)
+        self._qick_front_panel_dialog.show()
+        self._qick_front_panel_dialog.raise_()
+        self._qick_front_panel_dialog.activateWindow()
+        if self._qick_configuration is None:
+            QtCore.QTimer.singleShot(0, self._identify_qick_configuration)
 
     def _identify_qick_configuration(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -4196,7 +4721,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         thread.start()
 
     def _on_qick_configuration_identified(self, configuration) -> None:
+        self._qick_configuration = configuration
         self._qick_front_panel.set_configuration(configuration)
+        self._sparameter_panel.set_front_panel_configuration(configuration)
+        self._rf_ports_panel.set_front_panel_configuration(configuration)
+        self._rf_readout_panel.set_front_panel_configuration(configuration)
         self._qick_front_panel.set_identifying(
             False,
             f"{configuration.mapped_output_count} DAC / "
@@ -4222,6 +4751,30 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
         """Commit graphical SMA selections through the existing RF path model."""
+        scope = str(values.get("selection_scope", "path"))
+        if scope == "output":
+            target = self._qick_front_panel_target
+            if not isinstance(target, RfPulsePortPanel):
+                raise RuntimeError("RF output front-panel target is no longer available")
+            target.apply_front_panel_settings(values)
+            self._qick_front_panel_dialog.close()
+            self.statusBar().showMessage(
+                f"RF output {target._index + 1} mapped to "
+                f"DAC{values['output_panel_port']} / generator {values['output_ch']}"
+            )
+            return
+        if scope == "input":
+            target = self._qick_front_panel_target
+            if not isinstance(target, RfReadoutPanel):
+                raise RuntimeError("RF readout front-panel target is no longer available")
+            target.apply_front_panel_settings(values)
+            self._qick_front_panel_dialog.close()
+            self.statusBar().showMessage(
+                f"RF readout mapped to ADC{values['input_panel_port']} / "
+                f"readout {values['readout_ch']}"
+            )
+            return
+
         path = self._sparameter_panel.path_diagram
         path.output_ch.setValue(int(values["output_ch"]))
         path.readout_ch.setValue(int(values["readout_ch"]))
@@ -4233,8 +4786,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             float(values["readout_attenuation_db"])
         )
         path.readout_dc_gain_db.setValue(float(values["readout_dc_gain_db"]))
+        self._sparameter_panel.output_filter_type.setCurrentText(
+            str(values["output_filter_type"])
+        )
+        self._sparameter_panel.output_filter_cutoff_ghz.setValue(
+            float(values["output_filter_cutoff_ghz"])
+        )
+        self._sparameter_panel.output_filter_bandwidth_ghz.setValue(
+            float(values["output_filter_bandwidth_ghz"])
+        )
+        self._sparameter_panel.readout_filter_type.setCurrentText(
+            str(values["readout_filter_type"])
+        )
+        self._sparameter_panel.readout_filter_cutoff_ghz.setValue(
+            float(values["readout_filter_cutoff_ghz"])
+        )
+        self._sparameter_panel.readout_filter_bandwidth_ghz.setValue(
+            float(values["readout_filter_bandwidth_ghz"])
+        )
         path._update_board_controls()
         path.apply_settings()
+        self._qick_front_panel_dialog.close()
 
     def _apply_rf_path_settings(self, values: Mapping[str, object]) -> None:
         """Synchronize committed RF path values across all measurement editors."""
@@ -4454,6 +5026,102 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _run_stability_diagram(self, *, continuous: bool) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        try:
+            arguments = self._stability_run_arguments(save=not continuous)
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Cannot run stability diagram",
+                str(exc),
+            )
+            return
+
+        config = arguments["stability_config"]
+        mode = "continuous" if continuous else "single shot"
+        self._stability_panel.set_running(
+            True,
+            (
+                f"Preparing {mode} scan: {config.x_axis.points} x "
+                f"{config.y_axis.points} points, "
+                f"{config.repetitions_per_point} repetitions / point"
+            ),
+        )
+        self.statusBar().showMessage(f"QICK stability diagram {mode} running")
+        thread = QtCore.QThread(self)
+        worker = StabilityDiagramWorker(arguments, continuous=continuous)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.scan_ready.connect(self._on_stability_scan_ready)
+        worker.progress_changed.connect(self._on_stability_progress)
+        worker.single_finished.connect(self._on_stability_single_finished)
+        worker.stopped.connect(self._on_stability_stopped)
+        worker.failed.connect(self._on_stability_failed)
+        worker.single_finished.connect(thread.quit)
+        worker.stopped.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.single_finished.connect(worker.deleteLater)
+        worker.stopped.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _stop_stability_diagram(self) -> None:
+        worker = self._experiment_worker
+        if not isinstance(worker, StabilityDiagramWorker):
+            return
+        worker.request_stop()
+        self._stability_panel.set_stopping()
+        self.statusBar().showMessage(
+            "Stopping after the active stability scan completes"
+        )
+
+    def _on_stability_progress(self, percent: int, message: str) -> None:
+        self._stability_panel.update_progress(percent, message)
+        self.statusBar().showMessage(
+            f"Stability diagram {percent}%: {message}"
+        )
+
+    def _on_stability_scan_ready(self, result) -> None:
+        self._stability_panel.show_result(result)
+        self.statusBar().showMessage(
+            f"Stability diagram scan {result.iteration} complete"
+        )
+
+    def _on_stability_single_finished(self, stored) -> None:
+        self._stability_panel.show_saved_result(stored)
+        self.statusBar().showMessage(
+            f"Stability diagram QCoDeS Run {stored.run_id} saved to "
+            f"{stored.database_path}"
+        )
+
+    def _on_stability_stopped(self) -> None:
+        self._stability_panel.set_running(False, "Continuous acquisition stopped")
+        self.statusBar().showMessage("Stability diagram acquisition stopped")
+
+    def _on_stability_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown stability-diagram error"
+        self._stability_panel.set_running(False, f"Failed: {summary}")
+        self.statusBar().showMessage("QICK stability diagram failed")
+        dialog = DetailedErrorMessageBox(
+            "QICK stability diagram failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
     def _run_qick_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -4670,6 +5338,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._plot.refresh()
         self._plot.fit_view()
         self._multi_ctrl.refresh_table()
+        self._refresh_stability_targets()
         self._refresh_trace_if_needed(force=True)
         self._refresh_sweep_overlay()
         if self._selected_port_idx == 0:
@@ -4752,6 +5421,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_voltage_mv = experiment_values[
             "bias_t_compensation_voltage_mv"
         ]
+        self._bias_t_compensation_mode = experiment_values[
+            "bias_t_compensation_mode"
+        ]
+        self._bias_t_compensation_duration_us = experiment_values[
+            "bias_t_compensation_duration_us"
+        ]
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
@@ -4760,6 +5435,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "voltage_view": self._plot.voltage_view,
                 "selected_awg_output": self._selected_port_idx,
                 "selected_control_tab": self._control_tabs.currentIndex(),
+                "selected_awg_tuning_tab": self._awg_tuning_tabs.currentIndex(),
             },
             "grid": {
                 "time_step_ns": self._grid_time_ns,
@@ -4790,7 +5466,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
                 "bias_t_compensation": {
                     "enabled": self._bias_t_compensation_enabled,
+                    "mode": self._bias_t_compensation_mode,
                     "voltage_mv": self._bias_t_compensation_voltage_mv,
+                    "duration_us": self._bias_t_compensation_duration_us,
                 },
             },
             "experiment": {
@@ -4804,6 +5482,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
+            "stability_diagram": self._stability_panel.settings_dict(),
             "s_parameter": dict(self._sparameter_panel.settings_dict()),
             "calibration": dict(self._calibration_panel.settings_dict()),
         }
@@ -4872,12 +5551,47 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if selected_output >= len(pulses):
             raise ValueError("selected AWG output is out of range")
-        selected_tab = self._json_int(
+        stored_selected_tab = self._json_int(
             display.get("selected_control_tab", 0),
             "selected control tab",
         )
+        if settings_version < 12:
+            if stored_selected_tab <= 3:
+                selected_tab = 0
+                selected_awg_tuning_tab = stored_selected_tab
+            elif stored_selected_tab in {4, 6}:
+                # Version 10 briefly stored the former full-size Front Panel
+                # tab at index 6; restore that view to RF S-Parameter.
+                selected_tab = self._control_tabs.indexOf(self._sparameter_panel)
+                selected_awg_tuning_tab = 0
+            elif stored_selected_tab == 5:
+                selected_tab = self._control_tabs.indexOf(self._calibration_panel)
+                selected_awg_tuning_tab = 0
+            else:
+                raise ValueError("selected control tab is out of range")
+        elif settings_version == 12:
+            selected_awg_tuning_tab = self._json_int(
+                display.get("selected_awg_tuning_tab", 0),
+                "selected AWG Tuning tab",
+            )
+            if stored_selected_tab == 0:
+                selected_tab = self._control_tabs.indexOf(self._awg_tuning_page)
+            elif stored_selected_tab == 1:
+                selected_tab = self._control_tabs.indexOf(self._sparameter_panel)
+            elif stored_selected_tab == 2:
+                selected_tab = self._control_tabs.indexOf(self._calibration_panel)
+            else:
+                raise ValueError("selected control tab is out of range")
+        else:
+            selected_tab = stored_selected_tab
+            selected_awg_tuning_tab = self._json_int(
+                display.get("selected_awg_tuning_tab", 0),
+                "selected AWG Tuning tab",
+            )
         if selected_tab >= self._control_tabs.count():
             raise ValueError("selected control tab is out of range")
+        if selected_awg_tuning_tab >= self._awg_tuning_tabs.count():
+            raise ValueError("selected AWG Tuning tab is out of range")
 
         expected_shape = (len(pulses), len(pulses))
         if "cross_capacitance" in awg:
@@ -4937,6 +5651,18 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "QICK full_scale_mv",
             positive=True,
         )
+        stability_settings = normalize_stability_settings(
+            data.get("stability_diagram"),
+            output_names=tuple(f"awg_{index}" for index in range(len(pulses))),
+            segment_names=qick_set_segment_names(pulses[0]),
+        )
+        for axis_name in ("x_axis", "y_axis"):
+            axis = stability_settings[axis_name]
+            if max(abs(axis["start_mv"]), abs(axis["stop_mv"])) > full_scale_mv:
+                raise ValueError(
+                    f"{axis_name} stability sweep exceeds +/-{full_scale_mv:g} mV "
+                    "AWG full scale"
+                )
         raw_bias_t = qick.get("bias_t_compensation", {})
         if raw_bias_t is None:
             raw_bias_t = {}
@@ -4946,6 +5672,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_bias_t.get("enabled", False),
             "QICK Bias-T compensation enabled",
         )
+        bias_t_mode = str(raw_bias_t.get("mode", "fixed_voltage"))
+        if bias_t_mode not in BIAS_T_COMPENSATION_MODES:
+            raise ValueError(
+                f"QICK Bias-T compensation mode must be one of "
+                f"{BIAS_T_COMPENSATION_MODES}"
+            )
         bias_t_compensation_mv = self._json_finite_float(
             raw_bias_t.get(
                 "voltage_mv",
@@ -4958,6 +5690,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError(
                 "QICK Bias-T compensation voltage exceeds full_scale_mv"
             )
+        bias_t_duration_us = self._json_finite_float(
+            raw_bias_t.get(
+                "duration_us",
+                DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+            ),
+            "QICK Bias-T compensation duration_us",
+            positive=True,
+        )
         repetitions = self._json_int(
             qick.get("repetitions_per_sweep", 1),
             "QICK repetitions_per_sweep",
@@ -5182,6 +5922,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             filter_bandwidth=float(raw_readout["filter_bandwidth"]),
             input_board_type=str(raw_readout["input_board_type"]),
             dc_gain_db=float(raw_readout["dc_gain_db"]),
+            dc_measure_mode=self._json_bool(
+                raw_readout["dc_measure_mode"],
+                "RF readout dc_measure_mode",
+            ),
+            dc_measure_gain_v_per_a=self._json_finite_float(
+                raw_readout["dc_measure_gain_v_per_a"],
+                "RF readout dc_measure_gain_v_per_a",
+                positive=True,
+            ),
         )
         if readout_spec.segment_name not in set_names:
             raise ValueError(
@@ -5199,6 +5948,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "input_board_type": readout_spec.input_board_type,
             "attenuation_db": readout_spec.attenuation_db,
             "dc_gain_db": readout_spec.dc_gain_db,
+            "dc_measure_mode": readout_spec.dc_measure_mode,
+            "dc_measure_gain_v_per_a": readout_spec.dc_measure_gain_v_per_a,
             "filter_type": readout_spec.filter_type,
             "filter_cutoff": readout_spec.filter_cutoff,
             "filter_bandwidth": readout_spec.filter_bandwidth,
@@ -5212,6 +5963,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "voltage_view": voltage_view,
             "selected_output": selected_output,
             "selected_tab": selected_tab,
+            "selected_awg_tuning_tab": selected_awg_tuning_tab,
             "grid_time_ns": self._json_finite_float(
                 grid.get("time_step_ns", 1000.0),
                 "grid time_step_ns",
@@ -5237,11 +5989,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "bias_t_enabled": bias_t_enabled,
+            "bias_t_mode": bias_t_mode,
             "bias_t_compensation_mv": bias_t_compensation_mv,
+            "bias_t_duration_us": bias_t_duration_us,
             "connection_config": connection_config,
             "run_config": run_config,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
+            "stability_diagram": stability_settings,
             "s_parameter": {
                 "database_path": sparameter_database_path,
                 **asdict(sparameter_config),
@@ -5273,6 +6028,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_voltage_mv = settings[
             "bias_t_compensation_mv"
         ]
+        self._bias_t_compensation_mode = settings["bias_t_mode"]
+        self._bias_t_compensation_duration_us = settings["bias_t_duration_us"]
         self._experiment_panel.load_settings(
             settings["connection_config"],
             settings["run_config"],
@@ -5283,7 +6040,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             repetitions=self._qick_repetitions_per_sweep,
             bias_t_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
+            bias_t_mode=self._bias_t_compensation_mode,
+            bias_t_duration_us=self._bias_t_compensation_duration_us,
         )
+        self._refresh_stability_targets()
+        self._stability_panel.load_settings(settings["stability_diagram"])
 
         with QtCore.QSignalBlocker(self._time_unit_combo):
             self._time_unit_combo.setCurrentText(settings["time_unit"])
@@ -5312,6 +6073,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._selected_port_idx = settings["selected_output"]
         self._plot.set_selected_port_idx(self._selected_port_idx)
         self._control_tabs.setCurrentIndex(settings["selected_tab"])
+        self._awg_tuning_tabs.setCurrentIndex(
+            settings["selected_awg_tuning_tab"]
+        )
         with QtCore.QSignalBlocker(self._voltage_view_actions[settings["voltage_view"]]):
             self._voltage_view_actions[settings["voltage_view"]].setChecked(True)
         self._set_voltage_view(settings["voltage_view"])
@@ -5467,6 +6231,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._bias_t_compensation_voltage_mv = experiment_values[
                 "bias_t_compensation_voltage_mv"
             ]
+            self._bias_t_compensation_mode = experiment_values[
+                "bias_t_compensation_mode"
+            ]
+            self._bias_t_compensation_duration_us = experiment_values[
+                "bias_t_compensation_duration_us"
+            ]
             set_names = qick_set_segment_names(self._pulse[0])
             self._rf_pulse_specs = list(self._rf_ports_panel.specs())
             self._rf_pulse_spec = (
@@ -5497,6 +6267,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             initial_repetitions=self._qick_repetitions_per_sweep,
             initial_bias_t_enabled=self._bias_t_compensation_enabled,
             initial_bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
+            initial_bias_t_mode=self._bias_t_compensation_mode,
+            initial_bias_t_duration_us=self._bias_t_compensation_duration_us,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
@@ -5521,6 +6293,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_voltage_mv = settings[
             "bias_t_compensation_voltage_mv"
         ]
+        self._bias_t_compensation_mode = settings["bias_t_compensation_mode"]
+        self._bias_t_compensation_duration_us = settings[
+            "bias_t_compensation_duration_us"
+        ]
         self._experiment_panel.set_qick_values(
             fabric_mhz=self._qick_fabric_mhz,
             tproc_mhz=self._qick_tproc_mhz,
@@ -5531,6 +6307,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.set_bias_t_values(
             enabled=self._bias_t_compensation_enabled,
             compensation_mv=self._bias_t_compensation_voltage_mv,
+            mode=self._bias_t_compensation_mode,
+            duration_us=self._bias_t_compensation_duration_us,
         )
         self._cross_capacitance = np.asarray(
             settings["cross_capacitance"], dtype=float
@@ -5577,6 +6355,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "cross_capacitance",
                 "bias_t_compensation_enabled",
                 "bias_t_compensation_voltage_mv",
+                "bias_t_compensation_mode",
+                "bias_t_compensation_duration_us",
             )
         }
         try:
@@ -5711,6 +6491,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             btn_y = QtWidgets.QPushButton("set_y")
             btn_y.clicked.connect(self._make_row_slot(self._set_y))
             self._multi_ctrl.panel_table.setCellWidget(idx, 3, btn_y)
+
+        self._refresh_stability_targets()
+
+    def _refresh_stability_targets(self) -> None:
+        if not hasattr(self, "_stability_panel"):
+            return
+        try:
+            segment_names = qick_set_segment_names(self._pulse[0])
+        except ValueError:
+            segment_names = ()
+        self._stability_panel.refresh_targets(
+            self._qick_output_names(),
+            self._qick_awg_channels,
+            segment_names,
+        )
 
     def _set_x(self, idx):
         trace = self._ensure_trace_widget()

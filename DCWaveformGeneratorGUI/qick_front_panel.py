@@ -218,8 +218,11 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(1080, 370)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setMinimumSize(480, 164)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.setMouseTracking(True)
         self._configuration: Optional[QickFrontPanelConfiguration] = None
         self._selected_output: Optional[int] = None
@@ -230,21 +233,36 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     @staticmethod
     def _build_port_centers() -> Dict[Tuple[str, int], QtCore.QPointF]:
         centers: Dict[Tuple[str, int], QtCore.QPointF] = {}
-        for slot in range(4):
-            group_x = 30.0 + 190.0 * slot
-            for local in range(4):
-                centers[("output", 4 * slot + local)] = QtCore.QPointF(
-                    group_x + 28.0 + 43.0 * local,
+        for visual_slot in range(4):
+            physical_slot = 3 - visual_slot
+            group_x = 30.0 + 190.0 * visual_slot
+            for visual_local in range(4):
+                physical_local = 3 - visual_local
+                panel_index = 4 * physical_slot + physical_local
+                centers[("output", panel_index)] = QtCore.QPointF(
+                    group_x + 28.0 + 43.0 * visual_local,
                     155.0,
                 )
-        for slot in range(4):
-            group_x = 815.0 + 91.0 * slot
-            for local in range(2):
-                centers[("input", 2 * slot + local)] = QtCore.QPointF(
-                    group_x + 25.0 + 40.0 * local,
+        for visual_slot in range(4):
+            physical_slot = 3 - visual_slot
+            group_x = 815.0 + 91.0 * visual_slot
+            for visual_local in range(2):
+                physical_local = 1 - visual_local
+                panel_index = 2 * physical_slot + physical_local
+                centers[("input", panel_index)] = QtCore.QPointF(
+                    group_x + 25.0 + 40.0 * visual_local,
                     155.0,
                 )
         return centers
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(900, 308)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return max(164, round(width * self.LOGICAL_HEIGHT / self.LOGICAL_WIDTH))
 
     def set_configuration(self, configuration: QickFrontPanelConfiguration) -> None:
         self._configuration = configuration
@@ -445,18 +463,18 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         body_font.setBold(False)
         body_font.setPointSizeF(8.0)
         painter.setFont(body_font)
-        for slot in range(4):
+        for visual_slot in range(4):
             self._draw_card_group(
                 painter,
                 "output",
-                slot,
-                QtCore.QRectF(30.0 + 190.0 * slot, 42.0, 178.0, 176.0),
+                3 - visual_slot,
+                QtCore.QRectF(30.0 + 190.0 * visual_slot, 42.0, 178.0, 176.0),
             )
             self._draw_card_group(
                 painter,
                 "input",
-                slot,
-                QtCore.QRectF(815.0 + 91.0 * slot, 42.0, 84.0, 176.0),
+                3 - visual_slot,
+                QtCore.QRectF(815.0 + 91.0 * visual_slot, 42.0, 84.0, 176.0),
             )
 
         for key, center in self._port_centers.items():
@@ -476,11 +494,16 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         painter.drawText(QtCore.QRectF(495.0, 250.0, 310.0, 20.0), QtCore.Qt.AlignCenter, "STATUS LEDS")
         painter.drawText(QtCore.QRectF(825.0, 250.0, 320.0, 20.0), QtCore.Qt.AlignCenter, "DIGITAL I/O")
 
-        for index in range(8):
-            center = QtCore.QPointF(55.0 + 40.0 * index, 310.0)
-            self._draw_sma(painter, ("aux", index), center)
+        for visual_index in range(8):
+            panel_index = 7 - visual_index
+            center = QtCore.QPointF(55.0 + 40.0 * visual_index, 310.0)
+            self._draw_sma(painter, ("aux", panel_index), center)
             painter.setPen(QtGui.QColor("#f5e4c4"))
-            painter.drawText(QtCore.QRectF(center.x() - 22.0, 332.0, 44.0, 18.0), QtCore.Qt.AlignCenter, f"BIAS{index}")
+            painter.drawText(
+                QtCore.QRectF(center.x() - 22.0, 332.0, 44.0, 18.0),
+                QtCore.Qt.AlignCenter,
+                f"BIAS{panel_index}",
+            )
 
         painter.setPen(QtGui.QPen(QtGui.QColor("#25282c"), 2.0))
         painter.setBrush(QtGui.QColor("#a9adb1"))
@@ -490,25 +513,85 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                 painter.setBrush(QtGui.QColor("#3d4247"))
                 painter.drawEllipse(QtCore.QPointF(399.0 + 8.0 * column, 295.0 + 18.0 * row), 2.2, 2.2)
 
-        for index in range(8):
+        for visual_index in range(8):
+            panel_index = 7 - visual_index
             self._draw_indicator(
                 painter,
-                QtCore.QPointF(515.0 + 38.0 * index, 310.0),
+                QtCore.QPointF(515.0 + 38.0 * visual_index, 310.0),
                 QtGui.QColor("#536168"),
             )
             painter.setPen(QtGui.QColor("#f5e4c4"))
-            painter.drawText(QtCore.QRectF(495.0 + 38.0 * index, 332.0, 40.0, 18.0), QtCore.Qt.AlignCenter, f"LED{index}")
+            painter.drawText(
+                QtCore.QRectF(495.0 + 38.0 * visual_index, 332.0, 40.0, 18.0),
+                QtCore.Qt.AlignCenter,
+                f"LED{panel_index}",
+            )
 
-        for index in range(8):
-            center = QtCore.QPointF(845.0 + 39.0 * index, 310.0)
-            self._draw_sma(painter, ("aux", 8 + index), center)
+        for visual_index in range(8):
+            panel_index = 7 - visual_index
+            center = QtCore.QPointF(845.0 + 39.0 * visual_index, 310.0)
+            self._draw_sma(painter, ("aux", 8 + panel_index), center)
             painter.setPen(QtGui.QColor("#f5e4c4"))
-            painter.drawText(QtCore.QRectF(center.x() - 20.0, 332.0, 40.0, 18.0), QtCore.Qt.AlignCenter, f"IO{index}")
+            painter.drawText(
+                QtCore.QRectF(center.x() - 20.0, 332.0, 40.0, 18.0),
+                QtCore.Qt.AlignCenter,
+                f"IO{panel_index}",
+            )
 
         self._draw_indicator(painter, QtCore.QPointF(1166.0, 310.0), QtGui.QColor("#36b66a"))
         painter.setPen(QtGui.QColor("#f5e4c4"))
         painter.drawText(QtCore.QRectF(1138.0, 332.0, 56.0, 18.0), QtCore.Qt.AlignCenter, "POWER")
         painter.end()
+
+
+class QickFrontPanelPreview(QickFrontPanelCanvas):
+    """Small clickable front-panel preview used by RF configuration editors."""
+
+    activated = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(210, 72)
+        self.setMaximumHeight(112)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setToolTip(
+            "Open the HWH-backed QICK front-panel channel and board settings"
+        )
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(270, 92)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.activated.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def set_channels(
+        self,
+        *,
+        output_ch: Optional[int] = None,
+        input_ch: Optional[int] = None,
+    ) -> None:
+        if self._configuration is None:
+            return
+        if output_ch is not None:
+            index = QickFrontPanelControl._find_port_for_channel(
+                self._configuration.outputs,
+                int(output_ch),
+            )
+            self.set_selected("output", index)
+        if input_ch is not None:
+            index = QickFrontPanelControl._find_port_for_channel(
+                self._configuration.inputs,
+                int(input_ch),
+            )
+            self.set_selected("input", index)
 
 
 class QickFrontPanelControl(QtWidgets.QWidget):
@@ -524,6 +607,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self._selected_input: Optional[int] = None
         self._preferred_output_ch = 0
         self._preferred_input_ch = 0
+        self._scope = "path"
 
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
@@ -547,7 +631,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumHeight(390)
+        scroll.setMinimumHeight(235)
         scroll.setWidget(self.canvas)
         layout.addWidget(scroll)
         self.canvas.port_clicked.connect(self._select_port)
@@ -560,11 +644,17 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.output_board = QtWidgets.QLabel("-")
         self.output_att1_db = self._attenuation_spin(10.0)
         self.output_att2_db = self._attenuation_spin(10.0)
+        self.output_filter_type = self._filter_combo()
+        self.output_filter_cutoff_ghz = self._filter_spin(2.5)
+        self.output_filter_bandwidth_ghz = self._filter_spin(1.0)
         output_form.addRow("Front-panel connector:", self.output_sma)
         output_form.addRow("QICK generator channel:", self.output_channel)
         output_form.addRow("Detected board:", self.output_board)
         output_form.addRow("ATT1:", self.output_att1_db)
         output_form.addRow("ATT2:", self.output_att2_db)
+        output_form.addRow("Filter:", self.output_filter_type)
+        output_form.addRow("Cutoff/center:", self.output_filter_cutoff_ghz)
+        output_form.addRow("Bandwidth:", self.output_filter_bandwidth_ghz)
         controls.addWidget(self.output_group)
 
         self.input_group = QtWidgets.QGroupBox("Selected Input SMA")
@@ -580,6 +670,9 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_dc_gain_db.setSingleStep(1.0)
         self.input_dc_gain_db.setSuffix(" dB")
         self.input_unknown = QtWidgets.QLabel("-")
+        self.input_filter_type = self._filter_combo()
+        self.input_filter_cutoff_ghz = self._filter_spin(2.5)
+        self.input_filter_bandwidth_ghz = self._filter_spin(1.0)
         self.input_condition_stack.addWidget(self.input_attenuation_db)
         self.input_condition_stack.addWidget(self.input_dc_gain_db)
         self.input_condition_stack.addWidget(self.input_unknown)
@@ -588,6 +681,9 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         input_form.addRow("QICK readout channel:", self.input_channel)
         input_form.addRow("Detected board:", self.input_board)
         input_form.addRow(self.input_condition_label, self.input_condition_stack)
+        input_form.addRow("Filter:", self.input_filter_type)
+        input_form.addRow("Cutoff/center:", self.input_filter_cutoff_ghz)
+        input_form.addRow("Bandwidth:", self.input_filter_bandwidth_ghz)
         controls.addWidget(self.input_group)
         layout.addLayout(controls)
 
@@ -614,8 +710,15 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_channel.currentIndexChanged.connect(self._update_summary)
         self.output_att1_db.valueChanged.connect(self._update_summary)
         self.output_att2_db.valueChanged.connect(self._update_summary)
+        self.output_filter_type.currentIndexChanged.connect(self._update_summary)
+        self.output_filter_cutoff_ghz.valueChanged.connect(self._update_summary)
+        self.output_filter_bandwidth_ghz.valueChanged.connect(self._update_summary)
         self.input_attenuation_db.valueChanged.connect(self._update_summary)
         self.input_dc_gain_db.valueChanged.connect(self._update_summary)
+        self.input_filter_type.currentIndexChanged.connect(self._update_summary)
+        self.input_filter_cutoff_ghz.valueChanged.connect(self._update_summary)
+        self.input_filter_bandwidth_ghz.valueChanged.connect(self._update_summary)
+        self.set_scope("path")
 
     @staticmethod
     def _attenuation_spin(value: float) -> QtWidgets.QDoubleSpinBox:
@@ -626,6 +729,41 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         widget.setValue(value)
         widget.setSuffix(" dB")
         return widget
+
+    @staticmethod
+    def _filter_combo() -> QtWidgets.QComboBox:
+        widget = QtWidgets.QComboBox()
+        widget.addItems(("bypass", "lowpass", "highpass", "bandpass"))
+        return widget
+
+    @staticmethod
+    def _filter_spin(value: float) -> QtWidgets.QDoubleSpinBox:
+        widget = QtWidgets.QDoubleSpinBox()
+        widget.setRange(0.001, 100.0)
+        widget.setDecimals(6)
+        widget.setValue(value)
+        widget.setSuffix(" GHz")
+        return widget
+
+    @property
+    def scope(self) -> str:
+        return self._scope
+
+    def set_scope(self, scope: str) -> None:
+        """Select whether the dialog edits a full path, output, or input."""
+        if scope not in {"path", "output", "input"}:
+            raise ValueError("front-panel scope must be path, output, or input")
+        self._scope = scope
+        self.output_group.setVisible(scope in {"path", "output"})
+        self.input_group.setVisible(scope in {"path", "input"})
+        labels = {
+            "path": "Update Measurement Path",
+            "output": "Update RF Output",
+            "input": "Update RF Readout",
+        }
+        self.apply_button.setText(labels[scope])
+        self.apply_button.setEnabled(self._selection_is_valid())
+        self._update_summary()
 
     def set_identifying(self, identifying: bool, message: str) -> None:
         self.identify_button.setEnabled(not identifying)
@@ -691,6 +829,9 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             rf_output = port.board_type == "RF_Out"
             self.output_att1_db.setEnabled(rf_output)
             self.output_att2_db.setEnabled(rf_output)
+            self.output_filter_type.setEnabled(rf_output)
+            self.output_filter_cutoff_ghz.setEnabled(rf_output)
+            self.output_filter_bandwidth_ghz.setEnabled(rf_output)
         else:
             self._selected_input = int(panel_index)
             self.input_sma.setText(port.label)
@@ -704,6 +845,10 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             else:
                 self.input_condition_stack.setCurrentIndex(2)
                 self.input_condition_label.setText("Input setting:")
+            rf_input = port.board_type == "RF_In"
+            self.input_filter_type.setEnabled(rf_input)
+            self.input_filter_cutoff_ghz.setEnabled(rf_input)
+            self.input_filter_bandwidth_ghz.setEnabled(rf_input)
         self.canvas.set_selected(direction, int(panel_index))
         self.apply_button.setEnabled(self._selection_is_valid())
         self._update_summary()
@@ -711,16 +856,25 @@ class QickFrontPanelControl(QtWidgets.QWidget):
     def _selection_is_valid(self) -> bool:
         if self._configuration is None:
             return False
-        if self._selected_output is None or self._selected_input is None:
-            return False
-        output = self._configuration.port("output", self._selected_output)
-        input_port = self._configuration.port("input", self._selected_input)
-        return bool(
-            output.board_type in OUTPUT_BOARD_TYPES
-            and input_port.board_type in INPUT_BOARD_TYPES
-            and self.output_channel.currentData() is not None
-            and self.input_channel.currentData() is not None
-        )
+        output_valid = False
+        if self._selected_output is not None:
+            output = self._configuration.port("output", self._selected_output)
+            output_valid = bool(
+                output.board_type in OUTPUT_BOARD_TYPES
+                and self.output_channel.currentData() is not None
+            )
+        input_valid = False
+        if self._selected_input is not None:
+            input_port = self._configuration.port("input", self._selected_input)
+            input_valid = bool(
+                input_port.board_type in INPUT_BOARD_TYPES
+                and self.input_channel.currentData() is not None
+            )
+        if self._scope == "output":
+            return output_valid
+        if self._scope == "input":
+            return input_valid
+        return output_valid and input_valid
 
     def set_path_values(self, values: Mapping[str, Any]) -> None:
         """Mirror manually edited path values without replacing live card identity."""
@@ -728,11 +882,49 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self._preferred_input_ch = int(values.get("readout_ch", self._preferred_input_ch))
         self.output_att1_db.setValue(float(values.get("output_att1_db", self.output_att1_db.value())))
         self.output_att2_db.setValue(float(values.get("output_att2_db", self.output_att2_db.value())))
+        self.output_filter_type.setCurrentText(
+            str(values.get("output_filter_type", self.output_filter_type.currentText()))
+        )
+        self.output_filter_cutoff_ghz.setValue(
+            float(
+                values.get(
+                    "output_filter_cutoff_ghz",
+                    self.output_filter_cutoff_ghz.value(),
+                )
+            )
+        )
+        self.output_filter_bandwidth_ghz.setValue(
+            float(
+                values.get(
+                    "output_filter_bandwidth_ghz",
+                    self.output_filter_bandwidth_ghz.value(),
+                )
+            )
+        )
         self.input_attenuation_db.setValue(
             float(values.get("readout_attenuation_db", self.input_attenuation_db.value()))
         )
         self.input_dc_gain_db.setValue(
             float(values.get("readout_dc_gain_db", self.input_dc_gain_db.value()))
+        )
+        self.input_filter_type.setCurrentText(
+            str(values.get("readout_filter_type", self.input_filter_type.currentText()))
+        )
+        self.input_filter_cutoff_ghz.setValue(
+            float(
+                values.get(
+                    "readout_filter_cutoff_ghz",
+                    self.input_filter_cutoff_ghz.value(),
+                )
+            )
+        )
+        self.input_filter_bandwidth_ghz.setValue(
+            float(
+                values.get(
+                    "readout_filter_bandwidth_ghz",
+                    self.input_filter_bandwidth_ghz.value(),
+                )
+            )
         )
         if self._configuration is not None:
             self._select_port(
@@ -752,69 +944,119 @@ class QickFrontPanelControl(QtWidgets.QWidget):
 
     def selected_settings(self) -> Dict[str, Any]:
         if not self._selection_is_valid() or self._configuration is None:
-            raise ValueError("select mapped DAC and ADC SMAs before applying")
-        output = self._configuration.port("output", self._selected_output)
-        input_port = self._configuration.port("input", self._selected_input)
-        return {
-            "output_ch": int(self.output_channel.currentData()),
-            "readout_ch": int(self.input_channel.currentData()),
-            "output_board_type": str(output.board_type),
-            "input_board_type": str(input_port.board_type),
-            "output_att1_db": self.output_att1_db.value(),
-            "output_att2_db": self.output_att2_db.value(),
-            "readout_attenuation_db": self.input_attenuation_db.value(),
-            "readout_dc_gain_db": self.input_dc_gain_db.value(),
-            "output_panel_port": output.panel_index,
-            "input_panel_port": input_port.panel_index,
-            "output_converter_id": output.converter_id,
-            "input_converter_id": input_port.converter_id,
-        }
+            raise ValueError("select the required mapped QICK SMA before applying")
+        values: Dict[str, Any] = {"selection_scope": self._scope}
+        if self._scope in {"path", "output"}:
+            output = self._configuration.port("output", self._selected_output)
+            values.update(
+                {
+                    "output_ch": int(self.output_channel.currentData()),
+                    "output_board_type": str(output.board_type),
+                    "output_att1_db": self.output_att1_db.value(),
+                    "output_att2_db": self.output_att2_db.value(),
+                    "output_filter_type": self.output_filter_type.currentText(),
+                    "output_filter_cutoff_ghz": (
+                        self.output_filter_cutoff_ghz.value()
+                    ),
+                    "output_filter_bandwidth_ghz": (
+                        self.output_filter_bandwidth_ghz.value()
+                    ),
+                    "output_panel_port": output.panel_index,
+                    "output_converter_id": output.converter_id,
+                }
+            )
+        if self._scope in {"path", "input"}:
+            input_port = self._configuration.port("input", self._selected_input)
+            values.update(
+                {
+                    "readout_ch": int(self.input_channel.currentData()),
+                    "input_board_type": str(input_port.board_type),
+                    "readout_attenuation_db": self.input_attenuation_db.value(),
+                    "readout_dc_gain_db": self.input_dc_gain_db.value(),
+                    "readout_filter_type": self.input_filter_type.currentText(),
+                    "readout_filter_cutoff_ghz": (
+                        self.input_filter_cutoff_ghz.value()
+                    ),
+                    "readout_filter_bandwidth_ghz": (
+                        self.input_filter_bandwidth_ghz.value()
+                    ),
+                    "input_panel_port": input_port.panel_index,
+                    "input_converter_id": input_port.converter_id,
+                }
+            )
+        return values
 
     def apply_settings(self) -> None:
         values = self.selected_settings()
-        self._preferred_output_ch = values["output_ch"]
-        self._preferred_input_ch = values["readout_ch"]
+        if "output_ch" in values:
+            self._preferred_output_ch = values["output_ch"]
+        if "readout_ch" in values:
+            self._preferred_input_ch = values["readout_ch"]
         self.settings_applied.emit(values)
-        self.identify_status.setText(
-            f"Applied DAC{values['output_panel_port']} / ADC{values['input_panel_port']}"
-        )
+        if self._scope == "output":
+            status = f"Applied DAC{values['output_panel_port']}"
+        elif self._scope == "input":
+            status = f"Applied ADC{values['input_panel_port']}"
+        else:
+            status = (
+                f"Applied DAC{values['output_panel_port']} / "
+                f"ADC{values['input_panel_port']}"
+            )
+        self.identify_status.setText(status)
 
     def _update_summary(self, *_args) -> None:
         if self._configuration is None:
             self.summary.setText("No live QICK configuration loaded")
             return
-        output = self._configuration.port("output", self._selected_output or 0)
-        input_port = self._configuration.port("input", self._selected_input or 0)
-        output_ch = self.output_channel.currentData()
-        input_ch = self.input_channel.currentData()
-        output_path = self.output_channel.currentText().partition("|")[2].strip() or "unmapped"
-        input_path = self.input_channel.currentText().partition("|")[2].strip() or "unmapped"
-        output_condition = (
-            f"ATT1 {self.output_att1_db.value():.2f} dB, "
-            f"ATT2 {self.output_att2_db.value():.2f} dB"
-            if output.board_type == "RF_Out"
-            else "no output attenuator"
-        )
-        input_condition = (
-            f"ATT {self.input_attenuation_db.value():.2f} dB"
-            if input_port.board_type == "RF_In"
-            else f"gain {self.input_dc_gain_db.value():.1f} dB"
-            if input_port.board_type == "DC_In"
-            else "no detected input board"
-        )
-        self.summary.setText(
-            f"OUTPUT  {output.label} | QICK gen {output_ch if output_ch is not None else '-'} | "
-            f"RFDC DAC {output.converter_id} | slot {output.board_slot} {output.board_label} | "
-            f"{output_condition} | {output_path}\n"
-            f"INPUT   {input_port.label} | QICK readout {input_ch if input_ch is not None else '-'} | "
-            f"RFDC ADC {input_port.converter_id} | slot {input_port.board_slot} {input_port.board_label} | "
-            f"{input_condition} | {input_path}"
-        )
+        lines = []
+        if self._scope in {"path", "output"}:
+            output = self._configuration.port("output", self._selected_output or 0)
+            output_ch = self.output_channel.currentData()
+            output_path = (
+                self.output_channel.currentText().partition("|")[2].strip()
+                or "unmapped"
+            )
+            output_condition = (
+                f"ATT1 {self.output_att1_db.value():.2f} dB, "
+                f"ATT2 {self.output_att2_db.value():.2f} dB, "
+                f"{self.output_filter_type.currentText()} filter"
+                if output.board_type == "RF_Out"
+                else "no RF attenuator or filter"
+            )
+            lines.append(
+                f"OUTPUT  {output.label} | QICK gen "
+                f"{output_ch if output_ch is not None else '-'} | "
+                f"RFDC DAC {output.converter_id} | slot {output.board_slot} "
+                f"{output.board_label} | {output_condition} | {output_path}"
+            )
+        if self._scope in {"path", "input"}:
+            input_port = self._configuration.port("input", self._selected_input or 0)
+            input_ch = self.input_channel.currentData()
+            input_path = (
+                self.input_channel.currentText().partition("|")[2].strip()
+                or "unmapped"
+            )
+            input_condition = (
+                f"ATT {self.input_attenuation_db.value():.2f} dB, "
+                f"{self.input_filter_type.currentText()} filter"
+                if input_port.board_type == "RF_In"
+                else f"gain {self.input_dc_gain_db.value():.1f} dB"
+                if input_port.board_type == "DC_In"
+                else "no detected input board"
+            )
+            lines.append(
+                f"INPUT   {input_port.label} | QICK readout "
+                f"{input_ch if input_ch is not None else '-'} | "
+                f"RFDC ADC {input_port.converter_id} | slot {input_port.board_slot} "
+                f"{input_port.board_label} | {input_condition} | {input_path}"
+            )
+        self.summary.setText("\n".join(lines))
 
 
 __all__ = [
     "QickFrontPanelConfiguration",
     "QickFrontPanelControl",
     "QickFrontPanelPort",
+    "QickFrontPanelPreview",
     "identify_qick_front_panel",
 ]

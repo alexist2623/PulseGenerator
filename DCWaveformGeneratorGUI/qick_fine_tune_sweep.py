@@ -23,10 +23,10 @@ the returned DDR array is grouped as ``(point, repetition, sample, I/Q)`` and
 ``iq_grid`` restores the original Cartesian sweep dimensions.
 
 Optional Bias-T compensation appends an opposite-polarity physical-AWG SET
-after each shot. Its signed fixed-point duration is kept in tProcessor DMEM
-and advanced by the same hardware sweep loops as the pulse fields; the
-tProcessor resolves the sign, rounds to whole cycles, and applies the dynamic
-duration with ``sync`` without expanding sweep points in PMEM.
+after each shot. It can keep voltage fixed and vary duration, or keep duration
+fixed and vary voltage. The swept compensation state is kept in tProcessor
+DMEM and advanced by the same hardware loops as the pulse fields without
+expanding sweep points in PMEM.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -57,6 +57,7 @@ COMMAND_REGISTER_NAMES = (
 )
 DEFAULT_BIAS_T_DURATION_FRAC_BITS = 8
 BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
+BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 
 
 def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -184,14 +185,16 @@ class AmplitudeSweep:
 class BiasTCompensationConfig:
     """Per-shot opposite-polarity area compensation settings.
 
-    ``amplitude`` is a positive normalized physical-AWG voltage. The
-    tProcessor stores the signed compensation duration with
-    ``duration_frac_bits`` fractional bits, resolves its sign, rounds the
-    magnitude to whole tProcessor cycles, schedules every independent output
-    at one common start time, and advances time to the latest channel stop.
+    In ``fixed_voltage`` mode, ``amplitude`` is a positive normalized
+    physical-AWG voltage and the compensation duration varies with pulse area.
+    In ``fixed_time`` mode, ``fixed_duration_cycles`` is held constant and the
+    opposite-polarity voltage varies with pulse area. Every independent output
+    starts at one common time.
     """
 
     amplitude: float
+    mode: str = "fixed_voltage"
+    fixed_duration_cycles: Optional[int] = None
     duration_frac_bits: int = DEFAULT_BIAS_T_DURATION_FRAC_BITS
     # Legacy API name: this is now one common pre-compensation guard, not a
     # delay inserted between outputs.
@@ -201,6 +204,23 @@ class BiasTCompensationConfig:
         amplitude = _require_amplitude(self.amplitude, "Bias-T compensation amplitude")
         if amplitude <= 0.0:
             raise ValueError("Bias-T compensation amplitude must be positive")
+        if self.mode not in BIAS_T_COMPENSATION_MODES:
+            raise ValueError(
+                f"Bias-T compensation mode must be one of "
+                f"{BIAS_T_COMPENSATION_MODES}"
+            )
+        if self.mode == "fixed_time":
+            _require_int(
+                self.fixed_duration_cycles,
+                "Bias-T fixed duration cycles",
+                1,
+            )
+        elif self.fixed_duration_cycles is not None:
+            _require_int(
+                self.fixed_duration_cycles,
+                "Bias-T fixed duration cycles",
+                1,
+            )
         frac_bits = _require_int(
             self.duration_frac_bits,
             "Bias-T duration fractional bits",
@@ -429,14 +449,18 @@ class FineTuneSequence:
         amplitude: Real = 0.1,
         *,
         enabled: bool = True,
+        mode: str = "fixed_voltage",
+        fixed_duration_cycles: Optional[int] = None,
         duration_frac_bits: int = DEFAULT_BIAS_T_DURATION_FRAC_BITS,
         inter_output_gap_cycles: int = 1,
     ):
         """Enable opposite-polarity Bias-T area compensation per shot.
 
         The supplied positive amplitude is in normalized physical-AWG units.
-        Compensation is applied after the pulse/readout portion of each shot.
-        Disabling the option restores the original sequence behavior exactly.
+        ``fixed_time`` ignores it for output generation and calculates the
+        required voltage for ``fixed_duration_cycles``. Compensation is
+        applied after the pulse/readout portion of each shot. Disabling the
+        option restores the original sequence behavior exactly.
         """
         if not isinstance(enabled, (bool, np.bool_)):
             raise TypeError("Bias-T compensation enabled must be boolean")
@@ -445,6 +469,8 @@ class FineTuneSequence:
             return self
         self.bias_t_compensation = BiasTCompensationConfig(
             amplitude=float(amplitude),
+            mode=str(mode),
+            fixed_duration_cycles=fixed_duration_cycles,
             duration_frac_bits=duration_frac_bits,
             inter_output_gap_cycles=inter_output_gap_cycles,
         )
@@ -834,8 +860,9 @@ class FineTuneSequence:
 
         SET intervals contribute ``level * duration`` and RAMP intervals use
         the exact trapezoid area ``(start + target) * duration / 2``. The
-        duration is rounded to the nearest whole AWG fabric cycle, which
-        minimizes the remaining area for the selected compensation voltage.
+        In fixed-voltage mode, duration is rounded to the nearest whole AWG
+        fabric cycle. In fixed-time mode, voltage is rounded to the nearest
+        legal 14-effective-bit DAC code for the selected duration.
         """
         self._validate()
         config = self.bias_t_compensation
@@ -868,6 +895,19 @@ class FineTuneSequence:
             if np.isclose(area, 0.0, rtol=0.0, atol=1.0e-15):
                 target = 0.0
                 duration = 0
+            elif config.mode == "fixed_time":
+                duration = int(config.fixed_duration_cycles)
+                ideal_target = -float(area) / duration
+                if abs(ideal_target) > 1.0:
+                    raise ValueError(
+                        "Bias-T fixed compensation time is too short for "
+                        f"{self.output_names[output_index]}; required voltage "
+                        f"is {ideal_target:+.6g} full scale"
+                    )
+                target_code = normalized_to_dac(ideal_target)
+                target = dac_to_normalized(target_code)
+                if target_code == 0:
+                    duration = 0
             else:
                 target = -config.amplitude if area > 0.0 else config.amplitude
                 duration = max(1, int(np.floor(abs(area) / config.amplitude + 0.5)))
@@ -1425,68 +1465,20 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     current[output_index] = target
         return tuple(area2)
 
-    def _build_bias_t_models(self, sweep_axes, sweep_shape):
-        """Build signed fixed-point duration states advanced by sweep adds."""
-        config = self.sequence.bias_t_compensation
-        if config is None:
-            self._bias_t_fields = ()
-            self._bias_t_comp_codes = ()
-            self._bias_t_duration_q_requested = np.empty((0, 0), dtype=np.int64)
-            self._bias_t_duration_q_actual = np.empty((0, 0), dtype=np.int64)
-            self._bias_t_max_duration_q_error = 0
-            return ()
-
-        scale = 1 << int(config.duration_frac_bits)
-        rounding = scale >> 1
-        comp_codes = []
-        for gen_ch in self.awg_channels:
-            gen_cfg = self.soccfg["gens"][gen_ch]
-            kwargs = {
-                "min_code": int(gen_cfg.get("minv", -32768)),
-                "max_code": int(gen_cfg.get("maxv", 32764)),
-                "invalid_lsb": int(gen_cfg.get("dac_invalid_lsb", 2)),
-            }
-            positive = normalized_to_dac(config.amplitude, **kwargs)
-            negative = normalized_to_dac(-config.amplitude, **kwargs)
-            if positive <= 0 or negative >= 0:
-                raise ValueError(
-                    "Bias-T compensation voltage is below one legal DAC code"
-                )
-            comp_codes.append((positive, negative))
-
-        requested = []
-        for point in self.compiled_points:
-            area2 = self._compiled_point_area2(point)
-            point_values = []
-            for output_index, signed_area2 in enumerate(area2):
-                if signed_area2 == 0:
-                    duration_q = 0
-                else:
-                    positive, negative = comp_codes[output_index]
-                    target_magnitude = abs(negative) if signed_area2 > 0 else positive
-                    gen_ch = self.awg_channels[output_index]
-                    fabric_mhz = Fraction(str(self.soccfg["gens"][gen_ch]["f_fabric"]))
-                    tproc_mhz = Fraction(str(self.tproc_mhz))
-                    ratio = Fraction(
-                        int(signed_area2) * scale,
-                        2 * int(target_magnitude),
-                    ) * tproc_mhz / fabric_mhz
-                    duration_q = _round_div_nearest(
-                        ratio.numerator,
-                        ratio.denominator,
-                    )
-                if abs(duration_q) + rounding > (1 << 31) - 1:
-                    raise ValueError(
-                        "Bias-T compensation duration exceeds the signed 32-bit "
-                        "tProcessor fixed-point range; increase compensation voltage"
-                    )
-                point_values.append(duration_q)
-            requested.append(tuple(point_values))
-        requested_array = np.asarray(requested, dtype=np.int64)
-
+    def _linear_bias_t_models(
+        self,
+        requested_array,
+        sweep_axes,
+        sweep_shape,
+        *,
+        register_name,
+        metadata,
+    ):
+        """Represent a linear per-output Bias-T state with sweep-axis adds."""
         models = []
         for output_index in range(self.sequence.n_outputs):
             base = int(requested_array[0, output_index])
+            quantum = int(metadata[output_index].get("quantum", 1))
             axis_deltas = []
             for axis_index, axis in enumerate(sweep_axes):
                 if axis.count <= 1:
@@ -1498,20 +1490,21 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     np.ravel_multi_index(tuple(indices), sweep_shape, order="C")
                 )
                 endpoint = int(requested_array[endpoint_index, output_index])
-                axis_deltas.append(
-                    _round_div_nearest(endpoint - base, axis.count - 1)
+                units = _round_div_nearest(
+                    endpoint - base,
+                    (axis.count - 1) * quantum,
                 )
-            models.append({
-                "key": ("bias_t", output_index, "duration_q"),
-                "register_name": "bias_t_duration_q",
+                axis_deltas.append(units * quantum)
+            model = {
+                "key": ("bias_t", output_index, register_name),
+                "register_name": register_name,
                 "base": base,
                 "axis_deltas": tuple(axis_deltas),
                 "output_index": output_index,
                 "gen_ch": self.awg_channels[output_index],
-                "positive_code": int(comp_codes[output_index][0]),
-                "negative_code": int(comp_codes[output_index][1]),
-                "duration_frac_bits": int(config.duration_frac_bits),
-            })
+            }
+            model.update(metadata[output_index])
+            models.append(model)
 
         actual = np.empty_like(requested_array)
         max_error = 0
@@ -1531,12 +1524,152 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     max_error,
                     abs(value - int(requested_array[point_index, output_index])),
                 )
+        return tuple(models), actual, int(max_error)
 
+    def _build_bias_t_models(self, sweep_axes, sweep_shape):
+        """Build fixed-voltage duration or fixed-time target-code states."""
+        config = self.sequence.bias_t_compensation
+        self._bias_t_mode = None if config is None else config.mode
+        self._bias_t_comp_codes = ()
+        self._bias_t_duration_q_requested = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_duration_q_actual = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_target_code_requested = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_target_code_actual = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_max_duration_q_error = 0
+        self._bias_t_max_target_code_error = 0
+        if config is None:
+            self._bias_t_fields = ()
+            return ()
+
+        if config.mode == "fixed_time":
+            duration = int(config.fixed_duration_cycles)
+            metadata = []
+            limits = []
+            for gen_ch in self.awg_channels:
+                gen_cfg = self.soccfg["gens"][gen_ch]
+                minimum = int(gen_cfg.get("minv", -32768))
+                maximum = int(gen_cfg.get("maxv", 32764))
+                quantum = 1 << int(gen_cfg.get("dac_invalid_lsb", 2))
+                fabric_mhz = Fraction(str(gen_cfg["f_fabric"]))
+                duration_ratio = (
+                    Fraction(duration) * Fraction(str(self.tproc_mhz)) / fabric_mhz
+                )
+                duration_tproc = max(
+                    1,
+                    (duration_ratio.numerator + duration_ratio.denominator - 1)
+                    // duration_ratio.denominator,
+                )
+                limits.append((minimum, maximum, quantum))
+                metadata.append(
+                    {
+                        "fixed_duration_fabric_cycles": duration,
+                        "fixed_duration_tproc_cycles": int(duration_tproc),
+                        "quantum": quantum,
+                    }
+                )
+
+            requested = []
+            for point in self.compiled_points:
+                point_values = []
+                for output_index, signed_area2 in enumerate(
+                    self._compiled_point_area2(point)
+                ):
+                    minimum, maximum, quantum = limits[output_index]
+                    units = _round_div_nearest(
+                        -int(signed_area2),
+                        2 * duration * quantum,
+                    )
+                    target_code = units * quantum
+                    if target_code < minimum or target_code > maximum:
+                        raise ValueError(
+                            "Bias-T fixed compensation time is too short for "
+                            f"{self.sequence.output_names[output_index]}; required "
+                            f"DAC code {target_code} is outside "
+                            f"[{minimum}, {maximum}]"
+                        )
+                    point_values.append(target_code)
+                requested.append(tuple(point_values))
+            requested_array = np.asarray(requested, dtype=np.int64)
+            models, actual, max_error = self._linear_bias_t_models(
+                requested_array,
+                sweep_axes,
+                sweep_shape,
+                register_name="bias_t_target_code",
+                metadata=metadata,
+            )
+            self._bias_t_target_code_requested = requested_array
+            self._bias_t_target_code_actual = actual
+            self._bias_t_max_target_code_error = max_error
+            return models
+
+        scale = 1 << int(config.duration_frac_bits)
+        rounding = scale >> 1
+        comp_codes = []
+        metadata = []
+        for gen_ch in self.awg_channels:
+            gen_cfg = self.soccfg["gens"][gen_ch]
+            kwargs = {
+                "min_code": int(gen_cfg.get("minv", -32768)),
+                "max_code": int(gen_cfg.get("maxv", 32764)),
+                "invalid_lsb": int(gen_cfg.get("dac_invalid_lsb", 2)),
+            }
+            positive = normalized_to_dac(config.amplitude, **kwargs)
+            negative = normalized_to_dac(-config.amplitude, **kwargs)
+            if positive <= 0 or negative >= 0:
+                raise ValueError(
+                    "Bias-T compensation voltage is below one legal DAC code"
+                )
+            comp_codes.append((positive, negative))
+            metadata.append(
+                {
+                    "positive_code": int(positive),
+                    "negative_code": int(negative),
+                    "duration_frac_bits": int(config.duration_frac_bits),
+                }
+            )
+
+        requested = []
+        for point in self.compiled_points:
+            area2 = self._compiled_point_area2(point)
+            point_values = []
+            for output_index, signed_area2 in enumerate(area2):
+                if signed_area2 == 0:
+                    duration_q = 0
+                else:
+                    positive, negative = comp_codes[output_index]
+                    target_magnitude = abs(negative) if signed_area2 > 0 else positive
+                    gen_ch = self.awg_channels[output_index]
+                    fabric_mhz = Fraction(
+                        str(self.soccfg["gens"][gen_ch]["f_fabric"])
+                    )
+                    ratio = Fraction(
+                        int(signed_area2) * scale,
+                        2 * int(target_magnitude),
+                    ) * Fraction(str(self.tproc_mhz)) / fabric_mhz
+                    duration_q = _round_div_nearest(
+                        ratio.numerator,
+                        ratio.denominator,
+                    )
+                if abs(duration_q) + rounding > (1 << 31) - 1:
+                    raise ValueError(
+                        "Bias-T compensation duration exceeds the signed 32-bit "
+                        "tProcessor fixed-point range; increase compensation voltage"
+                    )
+                point_values.append(duration_q)
+            requested.append(tuple(point_values))
+        requested_array = np.asarray(requested, dtype=np.int64)
+        models, actual, max_error = self._linear_bias_t_models(
+            requested_array,
+            sweep_axes,
+            sweep_shape,
+            register_name="bias_t_duration_q",
+            metadata=metadata,
+        )
         self._bias_t_comp_codes = tuple(comp_codes)
         self._bias_t_duration_q_requested = requested_array
         self._bias_t_duration_q_actual = actual
-        self._bias_t_max_duration_q_error = int(max_error)
-        return tuple(models)
+        self._bias_t_max_duration_q_error = max_error
+        return models
 
     def _build_sweep_register_plan(self):
         """Map Cartesian sweep axes to tProcessor register increments."""
@@ -1708,7 +1841,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         for field in fields:
             page = field["page"]
-            if field.get("register_name") == "bias_t_duration_q":
+            if field.get("register_name") in {
+                "bias_t_duration_q",
+                "bias_t_target_code",
+            }:
                 work_page, work_register = self._gen_regmap[
                     (int(field["gen_ch"]), "duration")
                 ]
@@ -1777,7 +1913,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self._bias_t_fields = tuple(
             field
             for field in fields
-            if field.get("register_name") == "bias_t_duration_q"
+            if str(field.get("register_name", "")).startswith("bias_t_")
         )
         self._sweep_axis_runtime = axis_runtime
         self._sweep_max_target_error = int(max_target_error)
@@ -2161,7 +2297,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
     def _emit_bias_t_compensation(self):
         """Schedule simultaneous SET starts and per-channel SET-zero stops."""
-        if self.sequence.bias_t_compensation is None:
+        config = self.sequence.bias_t_compensation
+        if config is None:
+            return
+        if config.mode == "fixed_time":
+            self._emit_bias_t_fixed_time()
             return
 
         max_duration_addr = int(self._bias_t_max_duration_dmem_addr)
@@ -2407,6 +2547,174 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "+",
             0,
             "simultaneous Bias-T compensation complete",
+        )
+
+    def _emit_bias_t_fixed_time(self):
+        """Emit fixed-time compensation with a sweep-dependent SET voltage."""
+        active_addr = int(self._bias_t_max_duration_dmem_addr)
+        first_field = self._bias_t_fields[0]
+        first_page = int(first_field["page"])
+        first_target_register = self._gen_regmap[
+            (int(first_field["gen_ch"]), "target")
+        ][1]
+        self.safe_regwi(
+            first_page,
+            first_target_register,
+            0,
+            "clear fixed-time Bias-T active marker",
+        )
+        self.memwi(
+            first_page,
+            first_target_register,
+            active_addr,
+            "store cleared fixed-time Bias-T active marker",
+        )
+
+        for field in self._bias_t_fields:
+            output_index = int(field["output_index"])
+            output_name = self.sequence.output_names[output_index]
+            gen_ch = int(field["gen_ch"])
+            page = int(field["page"])
+            work_register = int(field["work_register"])
+            target_register = self._gen_regmap[(gen_ch, "target")][1]
+            _, time_register = self._gen_regmap[(gen_ch, "t")]
+            command_words = _pack_command_words(
+                self.soccfg["gens"][gen_ch],
+                0,
+                0,
+                0,
+                OP_SET,
+            )
+            for register_name, word in zip(
+                COMMAND_REGISTER_NAMES[1:],
+                command_words[1:],
+            ):
+                reg_page, register = self._gen_regmap[(gen_ch, register_name)]
+                if int(reg_page) != page:
+                    raise RuntimeError("AWG command registers must share one page")
+                self.safe_regwi(
+                    page,
+                    register,
+                    int(word),
+                    f"{output_name} fixed-time Bias-T {register_name}",
+                )
+
+            self.safe_regwi(
+                page,
+                time_register,
+                self.bias_t_simultaneous_start_lead_cycles,
+                f"{output_name} common fixed-time Bias-T start offset",
+            )
+            self.memri(
+                page,
+                work_register,
+                int(field["dmem_addr"]),
+                f"load fixed-time Bias-T target for {output_name}",
+            )
+            done_label = f"BIAS_T_FIXED_TIME_DONE_{output_index}"
+            self.condj(
+                page,
+                work_register,
+                "==",
+                0,
+                done_label,
+                f"skip zero-area fixed-time Bias-T output {output_name}",
+            )
+            self.mathi(
+                page,
+                target_register,
+                work_register,
+                "+",
+                0,
+                f"apply fixed-time Bias-T target for {output_name}",
+            )
+            command_registers = [
+                self._gen_regmap[(gen_ch, name)][1]
+                for name in COMMAND_REGISTER_NAMES
+            ]
+            self.set(
+                int(self.soccfg["gens"][gen_ch]["tproc_ch"]),
+                page,
+                *command_registers,
+                time_register,
+                f"start fixed-time Bias-T compensation on {output_name}",
+            )
+            self.safe_regwi(
+                page,
+                target_register,
+                0,
+                f"{output_name} return to zero after fixed-time Bias-T",
+            )
+            self.safe_regwi(
+                page,
+                time_register,
+                self.bias_t_simultaneous_start_lead_cycles
+                + int(field["fixed_duration_tproc_cycles"]),
+                f"{output_name} fixed-time Bias-T stop offset",
+            )
+            self.set(
+                int(self.soccfg["gens"][gen_ch]["tproc_ch"]),
+                page,
+                *command_registers,
+                time_register,
+                f"finish fixed-time Bias-T compensation on {output_name}",
+            )
+            self.memwi(
+                page,
+                work_register,
+                active_addr,
+                f"mark fixed-time Bias-T active for {output_name}",
+            )
+            self.label(done_label)
+            self.mathi(
+                page,
+                work_register,
+                work_register,
+                "+",
+                0,
+                f"fixed-time Bias-T output {output_name} complete",
+            )
+
+        final_page = int(first_field["page"])
+        final_register = int(first_field["work_register"])
+        no_compensation_label = "BIAS_T_FIXED_TIME_NO_ACTIVE_OUTPUT"
+        self.memri(
+            final_page,
+            final_register,
+            active_addr,
+            "load fixed-time Bias-T active marker",
+        )
+        self.condj(
+            final_page,
+            final_register,
+            "==",
+            0,
+            no_compensation_label,
+            "skip fixed-time Bias-T advance when all areas are zero",
+        )
+        final_offset = self.bias_t_simultaneous_start_lead_cycles + max(
+            int(field["fixed_duration_tproc_cycles"])
+            for field in self._bias_t_fields
+        )
+        self.safe_regwi(
+            final_page,
+            final_register,
+            final_offset,
+            "fixed-time Bias-T latest stop offset",
+        )
+        self.sync(
+            final_page,
+            final_register,
+            "advance to fixed-time Bias-T stop",
+        )
+        self.label(no_compensation_label)
+        self.mathi(
+            final_page,
+            final_register,
+            final_register,
+            "+",
+            0,
+            "fixed-time Bias-T compensation complete",
         )
 
     def _emit_point(self):
@@ -2816,10 +3124,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "sweep_max_step_quantization_error": self._sweep_max_step_error,
             "bias_t_compensation": self.sequence.bias_t_compensation is not None,
             "bias_t_compensation_config": self.sequence.bias_t_compensation,
+            "bias_t_compensation_mode": self._bias_t_mode,
             "bias_t_duration_execution": (
-                "tproc_simultaneous_set_and_max_sync"
-                if self.sequence.bias_t_compensation is not None
-                else None
+                None
+                if self.sequence.bias_t_compensation is None
+                else (
+                    "tproc_fixed_time_dynamic_voltage"
+                    if self._bias_t_mode == "fixed_time"
+                    else "tproc_simultaneous_set_and_max_sync"
+                )
             ),
             "bias_t_dynamic_register_fields": 0,
             "bias_t_dynamic_dmem_fields": len(self._bias_t_fields),
@@ -2827,6 +3140,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 int(field["dmem_addr"]) for field in self._bias_t_fields
             ),
             "bias_t_max_duration_q_error": self._bias_t_max_duration_q_error,
+            "bias_t_max_target_code_error": self._bias_t_max_target_code_error,
             "bias_t_simultaneous_start": (
                 self.sequence.bias_t_compensation is not None
             ),

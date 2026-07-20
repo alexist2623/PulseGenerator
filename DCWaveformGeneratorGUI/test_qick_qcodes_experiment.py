@@ -318,6 +318,49 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert not list(staging_root.glob("qick_qcodes_*"))
 
 
+def test_store_qick_result_converts_dc_input_iq_to_current(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    dataset, _row_count = store_qick_result(
+        _ddr_result(),
+        run_config=QcodesRunConfig(
+            str(tmp_path / "dc_current.db"),
+            experiment_name="DC current trace test",
+            sample_name="identity ADC voltage model",
+        ),
+        connection_config=QickConnectionConfig(
+            "192.0.2.10",
+            8888,
+            "myqick",
+        ),
+        program_summary={},
+        gui_settings=_gui_metadata(),
+        rf_settings={
+            "readout_details": {
+                "board_type": "DC_In",
+                "dc_measure_mode": True,
+                "dc_measure_gain_v_per_a": 2.0,
+            }
+        },
+    )
+
+    loaded = load_qick_iq_arrays(dataset)
+    np.testing.assert_allclose(loaded["iq"], _ddr_result().iq / 2.0)
+    assert loaded["iq_unit"] == "A"
+    assert loaded["measurement_mode"] == "dc_current_iq"
+    metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
+    layout = metadata["measurement_layout"]
+    assert layout["iq_unit"] == "A"
+    assert layout["measurement_mode"] == "dc_current_iq"
+    assert layout["measurement_conversion"] == {
+        "adc_to_voltage": "identity",
+        "voltage_to_current": "current_a = voltage_v / gain_v_per_a",
+        "gain_v_per_a": 2.0,
+    }
+
+
 def test_store_qick_result_keeps_cartesian_sweeps_and_repetitions_grouped(
     tmp_path,
     monkeypatch,
@@ -730,15 +773,22 @@ def test_configure_rf_board_uses_zcu216_dc_chain_apis():
         8,
         input_board_type="DC_In",
         dc_gain_db=12.0,
+        dc_measure_mode=True,
+        dc_measure_gain_v_per_a=1.0e6,
     )
 
     configured = configure_rf_board(FakeSoc(), (rf,), readout)
 
     assert ("gen_dc", 4) in calls
     assert ("ro_dc", 2, 12.0) in calls
+    assert not any(call[0] in {"gen_filter", "ro_filter"} for call in calls)
     assert configured["outputs"] == ((0.0, 0.0),)
     assert configured["readout"] == 12.0
     assert configured["output_details"][0]["board_type"] == "DC_Out"
     assert configured["output_details"][0]["attenuators_present"] is False
     assert configured["readout_details"]["board_type"] == "DC_In"
     assert configured["readout_details"]["commanded_dc_gain_db"] == 12.0
+    assert configured["readout_details"]["dc_measure_mode"] is True
+    assert configured["readout_details"]["dc_measure_gain_v_per_a"] == 1.0e6
+    assert configured["readout_details"]["adc_to_voltage_conversion"] == "identity"
+    assert configured["readout_details"]["measurement_unit"] == "A"

@@ -1590,12 +1590,13 @@ def configure_sparameter_rf_board(
         soc.rfb_set_gen_dc(config.output_ch)
         actual_att1 = 0.0
         actual_att2 = 0.0
-    soc.rfb_set_gen_filter(
-        config.output_ch,
-        fc=config.output_filter_cutoff_ghz,
-        bw=config.output_filter_bandwidth_ghz,
-        ftype=config.output_filter_type,
-    )
+    if config.output_board_type == "RF_Out":
+        soc.rfb_set_gen_filter(
+            config.output_ch,
+            fc=config.output_filter_cutoff_ghz,
+            bw=config.output_filter_bandwidth_ghz,
+            ftype=config.output_filter_type,
+        )
     if config.input_board_type == "RF_In":
         input_att = float(
             soc.rfb_set_ro_rf(
@@ -1609,12 +1610,13 @@ def configure_sparameter_rf_board(
         input_gain = float(
             soc.rfb_set_ro_dc(config.readout_ch, config.readout_dc_gain_db)
         )
-    soc.rfb_set_ro_filter(
-        config.readout_ch,
-        fc=config.readout_filter_cutoff_ghz,
-        bw=config.readout_filter_bandwidth_ghz,
-        ftype=config.readout_filter_type,
-    )
+    if config.input_board_type == "RF_In":
+        soc.rfb_set_ro_filter(
+            config.readout_ch,
+            fc=config.readout_filter_cutoff_ghz,
+            bw=config.readout_filter_bandwidth_ghz,
+            ftype=config.readout_filter_type,
+        )
     return {
         "output": {
             "channel": config.output_ch,

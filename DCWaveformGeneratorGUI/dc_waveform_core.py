@@ -29,7 +29,10 @@ DEFAULT_QCS_FULL_SCALE_V = 5.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 2500.0
+DEFAULT_DC_MEASURE_GAIN_V_PER_A = 1.0
 DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
+DEFAULT_BIAS_T_COMPENSATION_DURATION_US = 1.0
+BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -49,6 +52,27 @@ def _positive_real(value: Real, name: str) -> float:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def adc_iq_to_voltage(iq) -> np.ndarray:
+    """Convert ADC I/Q values to volts using the temporary identity model."""
+    values = np.asarray(iq, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("ADC I/Q values must be finite")
+    return values
+
+
+def dc_iq_to_current(
+    iq,
+    gain_v_per_a: Real = DEFAULT_DC_MEASURE_GAIN_V_PER_A,
+) -> np.ndarray:
+    """Convert DC-input I/Q to amperes using ``voltage / gain``.
+
+    ADC-to-voltage conversion is intentionally identity until a calibrated
+    transfer function is introduced.
+    """
+    gain = _positive_real(gain_v_per_a, "DC measurement gain_v_per_a")
+    return adc_iq_to_voltage(iq) / gain
 
 
 def _nonnegative_real(value: Real, name: str) -> float:
@@ -256,6 +280,8 @@ class QickDdrReadoutSpec:
     filter_bandwidth: float = 1.0
     input_board_type: str = "RF_In"
     dc_gain_db: float = 0.0
+    dc_measure_mode: bool = False
+    dc_measure_gain_v_per_a: float = DEFAULT_DC_MEASURE_GAIN_V_PER_A
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -284,6 +310,14 @@ class QickDdrReadoutSpec:
         dc_gain = _finite_real(self.dc_gain_db, "DC input dc_gain_db")
         if dc_gain < -6.0 or dc_gain > 26.0:
             raise ValueError("DC input dc_gain_db must be in [-6, 26] dB")
+        if not isinstance(self.dc_measure_mode, bool):
+            raise TypeError("DC measure mode must be bool")
+        _positive_real(
+            self.dc_measure_gain_v_per_a,
+            "DC measurement gain_v_per_a",
+        )
+        if self.dc_measure_mode and self.input_board_type != "DC_In":
+            raise ValueError("DC measure mode requires the DC_In input board")
 
     @property
     def effective_attenuation_db(self) -> float:
@@ -292,6 +326,10 @@ class QickDdrReadoutSpec:
     @property
     def effective_dc_gain_db(self) -> float:
         return float(self.dc_gain_db) if self.input_board_type == "DC_In" else 0.0
+
+    @property
+    def measurement_unit(self) -> str:
+        return "A" if self.dc_measure_mode else "ADC units"
 
 
 @dataclass(frozen=True)
@@ -597,6 +635,8 @@ def build_qick_sequence(
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
     bias_t_compensation_voltage_mv: Optional[Real] = None,
+    bias_t_compensation_mode: str = "fixed_voltage",
+    bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
 ):
     """Build a real qick_fine_tune_sweep.FineTuneSequence instance."""
     pulses = tuple(pulses)
@@ -628,9 +668,27 @@ def build_qick_sequence(
     )
     if compensation_mv > full_scale_mv:
         raise ValueError("Bias-T compensation voltage exceeds QICK full scale")
+    if bias_t_compensation_mode not in BIAS_T_COMPENSATION_MODES:
+        raise ValueError(
+            f"bias_t_compensation_mode must be one of {BIAS_T_COMPENSATION_MODES}"
+        )
+    compensation_duration_us = _positive_real(
+        bias_t_compensation_duration_us,
+        "bias_t_compensation_duration_us",
+    )
+    compensation_duration_cycles = _cycles_from_ns(
+        compensation_duration_us * 1000.0,
+        fabric_mhz,
+    )
     sequence.set_bias_t_compensation(
         compensation_mv / full_scale_mv,
         enabled=bool(bias_t_compensation_enabled),
+        mode=bias_t_compensation_mode,
+        fixed_duration_cycles=(
+            compensation_duration_cycles
+            if bias_t_compensation_mode == "fixed_time"
+            else None
+        ),
     )
     for spec in specs:
         if spec.kind == "set":
@@ -794,6 +852,8 @@ def generate_qick_program_code(
     ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
     bias_t_compensation_enabled: bool = False,
     bias_t_compensation_voltage_mv: Optional[Real] = None,
+    bias_t_compensation_mode: str = "fixed_voltage",
+    bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
 ) -> str:
     """Generate a QICK builder/execution module.
 
@@ -828,6 +888,18 @@ def generate_qick_program_code(
     )
     if bias_t_compensation_voltage_mv > full_scale_mv:
         raise ValueError("Bias-T compensation voltage exceeds QICK full scale")
+    if bias_t_compensation_mode not in BIAS_T_COMPENSATION_MODES:
+        raise ValueError(
+            f"bias_t_compensation_mode must be one of {BIAS_T_COMPENSATION_MODES}"
+        )
+    bias_t_compensation_duration_us = _positive_real(
+        bias_t_compensation_duration_us,
+        "bias_t_compensation_duration_us",
+    )
+    bias_t_compensation_duration_cycles = _cycles_from_ns(
+        bias_t_compensation_duration_us * 1000.0,
+        fabric_mhz,
+    )
     repetitions_per_sweep = _positive_int(repetitions_per_sweep, "repetitions_per_sweep")
     sweep_specs = _coerce_sweep_specs(sweep, sweeps)
     if rf_pulse_spec is not None and rf_pulse_specs is not None:
@@ -911,6 +983,10 @@ def generate_qick_program_code(
         "filter_bandwidth": float(ddr_readout_spec.filter_bandwidth),
         "input_board_type": str(ddr_readout_spec.input_board_type),
         "dc_gain_db": float(ddr_readout_spec.dc_gain_db),
+        "dc_measure_mode": bool(ddr_readout_spec.dc_measure_mode),
+        "dc_measure_gain_v_per_a": float(
+            ddr_readout_spec.dc_measure_gain_v_per_a
+        ),
     }
     lines = [
         '"""Generated QICK AWG-tuning, RF pulse, and 1 MSPS DDR program."""',
@@ -929,6 +1005,9 @@ def generate_qick_program_code(
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
         f"BIAS_T_COMPENSATION_ENABLED = {bool(bias_t_compensation_enabled)!r}",
         f"BIAS_T_COMPENSATION_VOLTAGE_MV = {float(bias_t_compensation_voltage_mv)!r}",
+        f"BIAS_T_COMPENSATION_MODE = {bias_t_compensation_mode!r}",
+        f"BIAS_T_COMPENSATION_DURATION_US = {float(bias_t_compensation_duration_us)!r}",
+        f"BIAS_T_COMPENSATION_DURATION_CYCLES = {bias_t_compensation_duration_cycles}",
         f"REPETITIONS_PER_SWEEP = {repetitions_per_sweep}",
         f"SWEEP_SPECS = {sweep_config!r}",
         f"CROSS_CAPACITANCE = {cross_capacitance!r}",
@@ -943,6 +1022,12 @@ def generate_qick_program_code(
         "    sequence.set_bias_t_compensation(",
         "        BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
         "        enabled=BIAS_T_COMPENSATION_ENABLED,",
+        "        mode=BIAS_T_COMPENSATION_MODE,",
+        "        fixed_duration_cycles=(",
+        "            BIAS_T_COMPENSATION_DURATION_CYCLES",
+        "            if BIAS_T_COMPENSATION_MODE == 'fixed_time'",
+        "            else None",
+        "        ),",
         "    )",
     ]
     for spec in specs:
@@ -1062,12 +1147,13 @@ def generate_qick_program_code(
             "            soc.rfb_set_gen_dc(cfg['gen_ch'])",
             "            configured = (0.0, 0.0)",
             "        actual.append(configured)",
-            "        soc.rfb_set_gen_filter(",
-            "            cfg['gen_ch'],",
-            "            fc=cfg['filter_cutoff'],",
-            "            bw=cfg['filter_bandwidth'],",
-            "            ftype=cfg['filter_type'],",
-            "        )",
+            "        if cfg['output_board_type'] == 'RF_Out':",
+            "            soc.rfb_set_gen_filter(",
+            "                cfg['gen_ch'],",
+            "                fc=cfg['filter_cutoff'],",
+            "                bw=cfg['filter_bandwidth'],",
+            "                ftype=cfg['filter_type'],",
+            "            )",
             "    actual = tuple(actual)",
             "    return actual[0] if len(actual) == 1 else actual",
             "",
@@ -1080,12 +1166,13 @@ def generate_qick_program_code(
             "        configured = soc.rfb_set_ro_rf(cfg['ro_ch'], cfg['attenuation_db'])",
             "    else:",
             "        configured = soc.rfb_set_ro_dc(cfg['ro_ch'], cfg['dc_gain_db'])",
-            "    soc.rfb_set_ro_filter(",
-            "        cfg['ro_ch'],",
-            "        fc=cfg['filter_cutoff'],",
-            "        bw=cfg['filter_bandwidth'],",
-            "        ftype=cfg['filter_type'],",
-            "    )",
+            "    if cfg['input_board_type'] == 'RF_In':",
+            "        soc.rfb_set_ro_filter(",
+            "            cfg['ro_ch'],",
+            "            fc=cfg['filter_cutoff'],",
+            "            bw=cfg['filter_bandwidth'],",
+            "            ftype=cfg['filter_type'],",
+            "        )",
             "    return configured",
             "",
             "",
@@ -1109,7 +1196,10 @@ def generate_qick_program_code(
 
 
 __all__ = [
+    "BIAS_T_COMPENSATION_MODES",
+    "DEFAULT_BIAS_T_COMPENSATION_DURATION_US",
     "DEFAULT_BIAS_T_COMPENSATION_FRACTION",
+    "DEFAULT_DC_MEASURE_GAIN_V_PER_A",
     "DEFAULT_INITIAL_DURATION_NS",
     "DEFAULT_INITIAL_VOLTAGE_MV",
     "DEFAULT_INSERT_FLAT_NS",
@@ -1124,7 +1214,9 @@ __all__ = [
     "QickSegmentSpec",
     "QickSweepSpec",
     "WaveformInterval",
+    "adc_iq_to_voltage",
     "build_qick_sequence",
+    "dc_iq_to_current",
     "generate_qcs_program_code",
     "generate_qick_program_code",
     "make_qick_segment_specs",

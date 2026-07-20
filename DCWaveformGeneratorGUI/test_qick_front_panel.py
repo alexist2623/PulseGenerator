@@ -9,11 +9,15 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtTest, QtWidgets
 import pytest
 
 import DCWaveform_Generator as gui
-from qick_front_panel import QickFrontPanelControl, identify_qick_front_panel
+from qick_front_panel import (
+    QickFrontPanelControl,
+    QickFrontPanelPreview,
+    identify_qick_front_panel,
+)
 
 
 def _application():
@@ -120,7 +124,9 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     app = _application()
     window = gui.MainWindow()
     panel = window._qick_front_panel
-    assert window._control_tabs.currentWidget() is panel
+    assert window._control_tabs.indexOf(panel) == -1
+    assert window._control_tabs.currentWidget() is window._awg_tuning_page
+    assert window._awg_tuning_tabs.currentWidget() is window._multi_ctrl
 
     panel.set_configuration(identify_qick_front_panel(_live_config()))
     panel.canvas.select_port("output", 0)
@@ -152,6 +158,72 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     assert calibration.input_output_ch.value() == 0
     assert calibration.input_readout_ch.value() == 1
     assert calibration.input_attenuation.value() == 11.75
+    window.close()
+
+
+def test_front_panel_visual_order_is_physical_descending_order():
+    app = _application()
+    preview = QickFrontPanelPreview()
+    preview.set_configuration(identify_qick_front_panel(_live_config()))
+    preview.show()
+    app.processEvents()
+
+    assert preview._port_centers[("output", 15)].x() < preview._port_centers[("output", 0)].x()
+    assert preview._port_centers[("input", 7)].x() < preview._port_centers[("input", 0)].x()
+    activated = []
+    preview.activated.connect(lambda: activated.append(True))
+    QtTest.QTest.mouseClick(preview, QtCore.Qt.LeftButton)
+    assert activated == [True]
+    preview.close()
+
+
+def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
+    app = _application()
+    window = gui.MainWindow()
+    configuration = identify_qick_front_panel(_live_config())
+    window._on_qick_configuration_identified(configuration)
+    output = window._rf_ports_panel._panels[0]
+    output.gen_ch.setValue(1)
+    app.processEvents()
+
+    assert output.output_board_type.currentText() == "DC_Out"
+    assert output.filter_type.isEnabled() is False
+
+    output.gen_ch.setValue(0)
+    window._show_qick_front_panel("output", output)
+    app.processEvents()
+    panel = window._qick_front_panel
+    assert panel.scope == "output"
+    assert panel.output_group.isVisible()
+    assert panel.input_group.isVisible() is False
+    panel.canvas.select_port("output", 0)
+    panel.output_att1_db.setValue(5.25)
+    panel.output_att2_db.setValue(7.5)
+    panel.output_filter_type.setCurrentText("lowpass")
+    panel.apply_button.click()
+    app.processEvents()
+
+    assert output.gen_ch.value() == 0
+    assert output.output_board_type.currentText() == "RF_Out"
+    assert output.att1_db.value() == 5.25
+    assert output.att2_db.value() == 7.5
+    assert output.filter_type.currentText() == "lowpass"
+    assert window._qick_front_panel_dialog.isVisible() is False
+    window.close()
+
+
+def test_sparameter_path_uses_compact_preview_and_update_below_dut():
+    _application()
+    window = gui.MainWindow()
+    path = window._sparameter_panel.path_diagram
+    layout = path.layout()
+    update_position = layout.getItemPosition(layout.indexOf(path.update_button))
+    preview_position = layout.getItemPosition(layout.indexOf(path.front_panel_preview))
+
+    assert not hasattr(path, "summary")
+    assert layout.horizontalSpacing() == 10
+    assert preview_position == (0, 1, 1, 1)
+    assert update_position == (5, 0, 1, 3)
     window.close()
 
 

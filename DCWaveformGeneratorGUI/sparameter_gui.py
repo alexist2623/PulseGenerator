@@ -35,6 +35,7 @@ try:
         run_sparameter_sweep,
     )
     from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
+    from .qick_front_panel import QickFrontPanelPreview
 except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
@@ -46,6 +47,7 @@ except ImportError:
         run_sparameter_sweep,
     )
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
+    from qick_front_panel import QickFrontPanelPreview
 
 
 DEFAULT_SPARAMETER_DB_PATH = str(Path.home() / "qick_sparameter_experiments.db")
@@ -91,10 +93,12 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
     """U-shaped output-to-DUT-to-input path with board-aware controls."""
 
     settings_applied = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("RF Path and DUT De-embedding", parent)
-        self.setMinimumHeight(500)
+        self._front_panel_configuration = None
+        self.setMinimumHeight(430)
         self.setStyleSheet(
             "QGroupBox { color: #20252b; font-weight: 600; }"
             "QLabel { color: #20252b; }"
@@ -161,14 +165,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         dut_label.setAlignment(QtCore.Qt.AlignCenter)
         self.dut_component = _PathComponent("DUT", dut_label, self)
 
-        self.summary = QtWidgets.QLabel(self)
-        self.summary.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
-        self.summary.setWordWrap(True)
-        self.summary.setMinimumWidth(210)
-        self.summary.setStyleSheet(
-            "QLabel { color: #20252b; background: #f3f6f8;"
-            " border: 1px solid #aeb7c2; padding: 10px; }"
-        )
+        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.activated.connect(self.front_panel_requested.emit)
         self.update_button = QtWidgets.QPushButton("Update", self)
         self.update_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
@@ -181,23 +179,15 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         self.apply_status.setStyleSheet(
             "QLabel { color: #2f6f4e; background: transparent; font-weight: 600; }"
         )
-        summary_panel = QtWidgets.QWidget(self)
-        summary_layout = QtWidgets.QVBoxLayout(summary_panel)
-        summary_layout.setContentsMargins(0, 0, 0, 0)
-        summary_layout.setSpacing(8)
-        summary_layout.addWidget(self.summary, 1)
-        summary_layout.addWidget(self.update_button)
-        summary_layout.addWidget(self.apply_status)
-
         layout = QtWidgets.QGridLayout(self)
-        layout.setContentsMargins(22, 26, 22, 18)
-        layout.setHorizontalSpacing(36)
-        layout.setVerticalSpacing(16)
+        layout.setContentsMargins(12, 20, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
         layout.setColumnStretch(0, 3)
-        layout.setColumnStretch(1, 4)
+        layout.setColumnStretch(1, 3)
         layout.setColumnStretch(2, 3)
         layout.addWidget(self.input_endpoint, 0, 0)
-        layout.addWidget(summary_panel, 0, 1, 4, 1)
+        layout.addWidget(self.front_panel_preview, 0, 1)
         layout.addWidget(self.output_endpoint, 0, 2)
         layout.addWidget(self.input_condition, 1, 0)
         layout.addWidget(self.output_att1_component, 1, 2)
@@ -206,6 +196,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.loss2_component, 3, 0)
         layout.addWidget(self.loss1_component, 3, 2)
         layout.addWidget(self.dut_component, 4, 1)
+        layout.addWidget(self.update_button, 5, 0, 1, 3)
+        layout.addWidget(self.apply_status, 6, 0, 1, 3)
 
         self.output_board_type.currentTextChanged.connect(self._update_board_controls)
         self.input_board_type.currentTextChanged.connect(self._update_board_controls)
@@ -223,6 +215,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             widget.valueChanged.connect(self._mark_dirty)
         self.output_board_type.currentTextChanged.connect(self._mark_dirty)
         self.input_board_type.currentTextChanged.connect(self._mark_dirty)
+        self.output_ch.valueChanged.connect(self._sync_front_panel_selection)
+        self.readout_ch.valueChanged.connect(self._sync_front_panel_selection)
         self.update_button.clicked.connect(self.apply_settings)
         self._applied_values = {}
         self._update_board_controls()
@@ -333,34 +327,40 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             )
 
     def _update_summary(self, *_args) -> None:
-        values = self._applied_values or self._editor_values()
-        output_note = (
-            "RF_Out: ATT1 and ATT2 active"
-            if values["output_board_type"] == "RF_Out"
-            else "DC_Out: no onboard ATT1/ATT2"
+        values = self._editor_values()
+        self.front_panel_preview.set_channels(
+            output_ch=int(values["output_ch"]),
+            input_ch=int(values["readout_ch"]),
         )
-        input_note = (
-            "RF_In: input attenuator active"
-            if values["input_board_type"] == "RF_In"
-            else "DC_In: no attenuator; LMH6401 gain active"
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        """Display live HWH routing and adopt detected board types by channel."""
+        self._front_panel_configuration = configuration
+        self.front_panel_preview.set_configuration(configuration)
+        self._sync_front_panel_selection()
+
+    def _sync_front_panel_selection(self, *_args) -> None:
+        if self._front_panel_configuration is None:
+            return
+        configuration = self._front_panel_configuration
+        self._adopt_detected_board(
+            configuration.outputs,
+            self.output_ch.value(),
+            self.output_board_type,
         )
-        correction = (
-            values["loss1_db"]
-            + values["loss2_db"]
-            - values["amplifier_gain_db"]
+        self._adopt_detected_board(
+            configuration.inputs,
+            self.readout_ch.value(),
+            self.input_board_type,
         )
-        self.summary.setText(
-            "REFERENCE PLANES\n\n"
-            "P_DUT,in = P_RF_OUT - LOSS1\n"
-            "P_DUT,out = P_RF_IN + LOSS2 - AMP GAIN\n\n"
-            "S21 = P_DUT,out - P_DUT,in\n"
-            f"Path correction: {correction:+.2f} dB\n\n"
-            f"RF OUT channel {values['output_ch']} -> "
-            f"RF IN channel {values['readout_ch']}\n"
-            f"{output_note}\n{input_note}\n\n"
-            "Physical S21 uses these terms when matching output and input "
-            "power calibrations are available."
-        )
+        self._update_board_controls()
+
+    @staticmethod
+    def _adopt_detected_board(ports, channel: int, combo: QtWidgets.QComboBox) -> None:
+        for port in ports:
+            if channel in port.qick_channels and port.board_type is not None:
+                combo.setCurrentText(port.board_type)
+                return
 
     @staticmethod
     def _top_center(widget: QtWidgets.QWidget) -> QtCore.QPointF:
@@ -478,6 +478,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     run_requested = QtCore.pyqtSignal()
     load_requested = QtCore.pyqtSignal(int)
     path_settings_applied = QtCore.pyqtSignal(object)
+    front_panel_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -502,6 +503,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.loss2_db = self.path_diagram.loss2_db
         self.amplifier_gain_db = self.path_diagram.amplifier_gain_db
         self.path_diagram.settings_applied.connect(self._forward_path_settings)
+        self.path_diagram.front_panel_requested.connect(
+            self.front_panel_requested.emit
+        )
         content_layout.addWidget(self.path_diagram)
 
         sweep_group = QtWidgets.QGroupBox("Frequency Sweep")
@@ -634,6 +638,13 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         readout_form.addRow("Cutoff/center:", self.readout_filter_cutoff_ghz)
         readout_form.addRow("Bandwidth:", self.readout_filter_bandwidth_ghz)
         content_layout.addWidget(readout_group)
+        self.output_board_type.currentTextChanged.connect(
+            self._update_filter_control_state
+        )
+        self.input_board_type.currentTextChanged.connect(
+            self._update_filter_control_state
+        )
+        self._update_filter_control_state()
 
         capture_group = QtWidgets.QGroupBox("FIR DDR Capture")
         capture_form = QtWidgets.QFormLayout(capture_group)
@@ -781,6 +792,22 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             calibrated and manual_input_run
         )
 
+    def _update_filter_control_state(self, *_args) -> None:
+        output_rf = self.output_board_type.currentText() == "RF_Out"
+        input_rf = self.input_board_type.currentText() == "RF_In"
+        for widget in (
+            self.output_filter_type,
+            self.output_filter_cutoff_ghz,
+            self.output_filter_bandwidth_ghz,
+        ):
+            widget.setEnabled(output_rf)
+        for widget in (
+            self.readout_filter_type,
+            self.readout_filter_cutoff_ghz,
+            self.readout_filter_bandwidth_ghz,
+        ):
+            widget.setEnabled(input_rf)
+
     def _browse_calibration_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -832,6 +859,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             }
         )
         self.path_settings_applied.emit(linked)
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self.path_diagram.set_front_panel_configuration(configuration)
 
     def config(self) -> SParameterSweepConfig:
         path = self.path_diagram.applied_values()

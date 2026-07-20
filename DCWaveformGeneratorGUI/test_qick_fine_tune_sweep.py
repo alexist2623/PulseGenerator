@@ -671,3 +671,83 @@ def test_bias_t_fixed_point_range_supports_100us_full_scale_pulse():
         abs(int(program._bias_t_duration_q_actual[0, 0])) + (1 << 7)
     ) >> 8
     assert 299_900 <= duration_cycles <= 300_100
+
+
+def test_bias_t_fixed_time_preview_adjusts_voltage_and_keeps_duration():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (0.2,), 10)
+    sequence.set_bias_t_compensation(
+        0.1,
+        mode="fixed_time",
+        fixed_duration_cycles=20,
+    )
+
+    (preview,) = sequence.bias_t_compensation_preview()
+    assert preview.pulse_area == 2.0
+    assert preview.duration_cycles == 20
+    assert preview.target_amplitude == pytest.approx(-0.1, abs=2 / 32768)
+    assert abs(preview.residual_area) <= 40 / 32768
+
+
+def test_bias_t_fixed_time_sweeps_dmem_target_and_emits_constant_duration():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (0.1,), 20)
+    sequence.set_amplitude_sweep("hold", "awg_0", 0.1, 0.3, 3)
+    sequence.set_bias_t_compensation(
+        0.1,
+        mode="fixed_time",
+        fixed_duration_cycles=40,
+    )
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+    )
+    program.compile()
+
+    expected_targets = program._bias_t_target_code_actual[:, 0].tolist()
+    assert len(set(expected_targets)) == 3
+    assert all(target < 0 and target & 0b11 == 0 for target in expected_targets)
+    assert program.summary()["bias_t_compensation_mode"] == "fixed_time"
+    assert program.summary()["bias_t_duration_execution"] == (
+        "tproc_fixed_time_dynamic_voltage"
+    )
+    assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
+
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+
+    def signed_target(event):
+        target = event.word & 0xFFFFFFFF
+        return target - (1 << 32) if target & (1 << 31) else target
+
+    starts = [
+        event
+        for event in tproc.output_events
+        if signed_target(event) in set(expected_targets)
+    ]
+    assert [signed_target(event) for event in starts] == expected_targets
+    for event in starts:
+        following_zero = next(
+            candidate
+            for candidate in tproc.output_events
+            if candidate.tproc_ch == event.tproc_ch
+            and candidate.cycle > event.cycle
+            and (candidate.word & 0xFFFFFFFF) == 0
+        )
+        assert following_zero.cycle - event.cycle == 40
+    assert tproc.timing_conflicts == []
+
+
+def test_bias_t_fixed_time_rejects_duration_that_requires_overrange_voltage():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (1.0,), 100)
+    sequence.set_bias_t_compensation(
+        0.1,
+        mode="fixed_time",
+        fixed_duration_cycles=1,
+    )
+
+    with pytest.raises(ValueError, match="too short"):
+        sequence.make_program(_mock_soccfg(1), awg_channels=(0,))

@@ -701,12 +701,7 @@ def test_dc_board_selection_uses_dc_apis_without_nonexistent_attenuators():
         ),
     )
 
-    assert [call[0] for call in calls] == [
-        "gen_dc",
-        "gen_filter",
-        "ro_dc",
-        "ro_filter",
-    ]
+    assert [call[0] for call in calls] == ["gen_dc", "ro_dc"]
     assert actual["output"]["attenuators_present"] is False
     assert actual["output"]["commanded_att1_db"] == 0.0
     assert actual["output"]["commanded_att2_db"] == 0.0

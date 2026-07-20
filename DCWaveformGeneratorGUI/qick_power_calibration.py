@@ -527,12 +527,13 @@ def _configure_output_chain(
         soc.rfb_set_gen_dc(config.output_ch)
         actual_att1 = 0.0
         actual_att2 = 0.0
-    soc.rfb_set_gen_filter(
-        config.output_ch,
-        fc=config.output_filter_cutoff_ghz,
-        bw=config.output_filter_bandwidth_ghz,
-        ftype=config.output_filter_type,
-    )
+    if config.output_board_type == "RF_Out":
+        soc.rfb_set_gen_filter(
+            config.output_ch,
+            fc=config.output_filter_cutoff_ghz,
+            bw=config.output_filter_bandwidth_ghz,
+            ftype=config.output_filter_type,
+        )
     return {
         "output_ch": config.output_ch,
         "board_type": config.output_board_type,

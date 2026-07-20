@@ -36,12 +36,14 @@ try:
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        dc_iq_to_current,
     )
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        dc_iq_to_current,
     )
 
 
@@ -422,12 +424,13 @@ def configure_rf_board(
             actual_att2 = 0.0
         outputs.append((actual_att1, actual_att2))
 
-        soc.rfb_set_gen_filter(
-            spec.gen_ch,
-            fc=spec.filter_cutoff,
-            bw=spec.filter_bandwidth,
-            ftype=spec.filter_type,
-        )
+        if spec.output_board_type == "RF_Out":
+            soc.rfb_set_gen_filter(
+                spec.gen_ch,
+                fc=spec.filter_cutoff,
+                bw=spec.filter_bandwidth,
+                ftype=spec.filter_type,
+            )
         output_details.append({
             "gen_ch": int(spec.gen_ch),
             "board_type": str(spec.output_board_type),
@@ -458,12 +461,13 @@ def configure_rf_board(
         )
         readout_attenuation = 0.0
         readout_dc_gain = readout_setting
-    soc.rfb_set_ro_filter(
-        readout_spec.ro_ch,
-        fc=readout_spec.filter_cutoff,
-        bw=readout_spec.filter_bandwidth,
-        ftype=readout_spec.filter_type,
-    )
+    if readout_spec.input_board_type == "RF_In":
+        soc.rfb_set_ro_filter(
+            readout_spec.ro_ch,
+            fc=readout_spec.filter_cutoff,
+            bw=readout_spec.filter_bandwidth,
+            ftype=readout_spec.filter_type,
+        )
     return {
         "outputs": tuple(outputs),
         "output_details": tuple(output_details),
@@ -476,6 +480,12 @@ def configure_rf_board(
             "commanded_attenuation_db": readout_attenuation,
             "requested_dc_gain_db": float(readout_spec.dc_gain_db),
             "commanded_dc_gain_db": readout_dc_gain,
+            "dc_measure_mode": bool(readout_spec.dc_measure_mode),
+            "dc_measure_gain_v_per_a": float(
+                readout_spec.dc_measure_gain_v_per_a
+            ),
+            "adc_to_voltage_conversion": "identity",
+            "measurement_unit": readout_spec.measurement_unit,
             "filter_type": str(readout_spec.filter_type),
             "filter_cutoff_ghz": float(readout_spec.filter_cutoff),
             "filter_bandwidth_ghz": float(readout_spec.filter_bandwidth),
@@ -756,7 +766,35 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
         "time_us": sample_index * sample_period_us,
         "repetition_index": repetitions,
         "sweep_coordinates_mv": sweep_coordinates_mv,
+        "iq_unit": str(layout.get("iq_unit", "ADC units")),
+        "measurement_mode": str(layout.get("measurement_mode", "raw_iq")),
         "metadata": metadata,
+    }
+
+
+def _measurement_iq_values(
+    iq: Any,
+    rf_settings: Mapping[str, Any],
+) -> Tuple[np.ndarray, str, str, Mapping[str, Any]]:
+    """Apply the selected readout-domain representation before storage."""
+    raw_iq = np.asarray(iq)
+    readout_details = rf_settings.get("readout_details", {})
+    if not isinstance(readout_details, Mapping):
+        readout_details = {}
+    dc_measure_mode = bool(readout_details.get("dc_measure_mode", False))
+    if not dc_measure_mode:
+        return raw_iq, "ADC units", "raw_iq", {
+            "adc_to_voltage": "not_applied",
+            "voltage_to_current": "not_applied",
+        }
+    if readout_details.get("board_type") != "DC_In":
+        raise ValueError("DC measure mode requires a DC_In readout")
+    gain_v_per_a = float(readout_details.get("dc_measure_gain_v_per_a", 1.0))
+    current_iq = dc_iq_to_current(raw_iq, gain_v_per_a)
+    return current_iq, "A", "dc_current_iq", {
+        "adc_to_voltage": "identity",
+        "voltage_to_current": "current_a = voltage_v / gain_v_per_a",
+        "gain_v_per_a": gain_v_per_a,
     }
 
 
@@ -788,7 +826,10 @@ def store_qick_result(
             "QCoDeS is required to save experiments; install qcodes==0.58.0"
         ) from exc
 
-    iq = np.asarray(ddr_result.iq)
+    raw_iq = np.asarray(ddr_result.iq)
+    iq, iq_unit, measurement_mode, measurement_conversion = (
+        _measurement_iq_values(raw_iq, rf_settings)
+    )
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError("DDR IQ must have shape (point, repetition, sample, 2)")
     if isinstance(batch_rows, bool) or int(batch_rows) < 1:
@@ -853,13 +894,13 @@ def store_qick_result(
 
     i_trace = Parameter(
         I_TRACE_PARAMETER,
-        label="I trace",
-        unit="ADC units",
+        label="I current trace" if iq_unit == "A" else "I trace",
+        unit=iq_unit,
     )
     q_trace = Parameter(
         Q_TRACE_PARAMETER,
-        label="Q trace",
-        unit="ADC units",
+        label="Q current trace" if iq_unit == "A" else "Q trace",
+        unit=iq_unit,
     )
     for parameter in (i_trace, q_trace):
         measurement.register_parameter(
@@ -971,6 +1012,10 @@ def store_qick_result(
                 "i": str(iq[..., 0].dtype),
                 "q": str(iq[..., 1].dtype),
             },
+            "raw_iq_dtype": str(raw_iq.dtype),
+            "iq_unit": iq_unit,
+            "measurement_mode": measurement_mode,
+            "measurement_conversion": dict(measurement_conversion),
             "storage_format": "qcodes_split_array_per_trace_v3",
             "trace_count": point_count * repetition_count,
             "sql_rows_per_trace": 2,
