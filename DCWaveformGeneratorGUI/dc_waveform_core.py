@@ -56,25 +56,35 @@ def _positive_real(value: Real, name: str) -> float:
     return value
 
 
-def adc_iq_to_voltage(iq) -> np.ndarray:
-    """Convert ADC I/Q values to volts using the temporary identity model."""
+def adc_iq_to_voltage(iq, calibration=None) -> np.ndarray:
+    """Convert ADC I/Q values to volts using an optional fitted calibration.
+
+    With no calibration, the legacy identity conversion is retained for old
+    settings files and scripts.  A calibration object must provide
+    ``convert_iq(values)`` and return the same final I/Q dimension.
+    """
     values = np.asarray(iq, dtype=np.float64)
     if not np.all(np.isfinite(values)):
         raise ValueError("ADC I/Q values must be finite")
-    return values
+    if calibration is None:
+        return values
+    converter = getattr(calibration, "convert_iq", None)
+    if not callable(converter):
+        raise TypeError("DC voltage calibration must provide convert_iq()")
+    converted = np.asarray(converter(values), dtype=np.float64)
+    if converted.shape != values.shape or not np.all(np.isfinite(converted)):
+        raise ValueError("calibrated DC voltage I/Q has an invalid shape or value")
+    return converted
 
 
 def dc_iq_to_current(
     iq,
     gain_v_per_a: Real = DEFAULT_DC_MEASURE_GAIN_V_PER_A,
+    calibration=None,
 ) -> np.ndarray:
-    """Convert DC-input I/Q to amperes using ``voltage / gain``.
-
-    ADC-to-voltage conversion is intentionally identity until a calibrated
-    transfer function is introduced.
-    """
+    """Convert DC-input I/Q to amperes using calibrated ``voltage / gain``."""
     gain = _positive_real(gain_v_per_a, "DC measurement gain_v_per_a")
-    return adc_iq_to_voltage(iq) / gain
+    return adc_iq_to_voltage(iq, calibration=calibration) / gain
 
 
 def _nonnegative_real(value: Real, name: str) -> float:
@@ -276,6 +286,7 @@ class QickDdrReadoutSpec:
     margin_input_samples: int = 1024
     address: int = 0
     force_overwrite: bool = False
+    post_run_read_delay_seconds: float = 0.1
     attenuation_db: float = 20.0
     filter_type: str = "bypass"
     filter_cutoff: float = 2.5
@@ -284,6 +295,9 @@ class QickDdrReadoutSpec:
     dc_gain_db: float = 0.0
     dc_measure_mode: bool = False
     dc_measure_gain_v_per_a: float = DEFAULT_DC_MEASURE_GAIN_V_PER_A
+    dc_voltage_calibration_enabled: bool = False
+    dc_voltage_calibration_database_path: str = ""
+    dc_voltage_calibration_run_id: int = 0
     nqz: int = 1
 
     def __post_init__(self) -> None:
@@ -298,6 +312,10 @@ class QickDdrReadoutSpec:
         _bounded_int(self.address, "DDR address", 0, (1 << 63) - 1)
         if not isinstance(self.force_overwrite, bool):
             raise TypeError("force_overwrite must be bool")
+        _nonnegative_real(
+            self.post_run_read_delay_seconds,
+            "DDR post_run_read_delay_seconds",
+        )
         attenuation = _finite_real(self.attenuation_db, "RF input attenuation_db")
         if attenuation < 0.0 or attenuation > 31.75:
             raise ValueError("RF input attenuation_db must be in [0, 31.75] dB")
@@ -322,6 +340,19 @@ class QickDdrReadoutSpec:
         )
         if self.dc_measure_mode and self.input_board_type != "DC_In":
             raise ValueError("DC measure mode requires the DC_In input board")
+        if not isinstance(self.dc_voltage_calibration_enabled, bool):
+            raise TypeError("DC voltage calibration enabled must be bool")
+        _bounded_int(
+            self.dc_voltage_calibration_run_id,
+            "DC voltage calibration run_id",
+            0,
+            (1 << 31) - 1,
+        )
+        if self.dc_voltage_calibration_enabled:
+            if self.input_board_type != "DC_In":
+                raise ValueError("DC voltage calibration requires the DC_In input board")
+            if not str(self.dc_voltage_calibration_database_path).strip():
+                raise ValueError("DC voltage calibration database path must not be empty")
 
     @property
     def effective_attenuation_db(self) -> float:
@@ -333,7 +364,11 @@ class QickDdrReadoutSpec:
 
     @property
     def measurement_unit(self) -> str:
-        return "A" if self.dc_measure_mode else "ADC units"
+        if self.dc_measure_mode:
+            return "A"
+        if self.dc_voltage_calibration_enabled:
+            return "V"
+        return "ADC units"
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1044,9 @@ def generate_qick_program_code(
         "margin_input_samples": int(ddr_readout_spec.margin_input_samples),
         "address": int(ddr_readout_spec.address),
         "force_overwrite": bool(ddr_readout_spec.force_overwrite),
+        "post_run_read_delay_seconds": float(
+            ddr_readout_spec.post_run_read_delay_seconds
+        ),
         "attenuation_db": float(ddr_readout_spec.attenuation_db),
         "filter_type": str(ddr_readout_spec.filter_type),
         "filter_cutoff": float(ddr_readout_spec.filter_cutoff),
@@ -1018,6 +1056,15 @@ def generate_qick_program_code(
         "dc_measure_mode": bool(ddr_readout_spec.dc_measure_mode),
         "dc_measure_gain_v_per_a": float(
             ddr_readout_spec.dc_measure_gain_v_per_a
+        ),
+        "dc_voltage_calibration_enabled": bool(
+            ddr_readout_spec.dc_voltage_calibration_enabled
+        ),
+        "dc_voltage_calibration_database_path": str(
+            ddr_readout_spec.dc_voltage_calibration_database_path
+        ),
+        "dc_voltage_calibration_run_id": int(
+            ddr_readout_spec.dc_voltage_calibration_run_id
         ),
     }
     lines = [

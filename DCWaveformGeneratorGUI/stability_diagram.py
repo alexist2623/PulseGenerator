@@ -24,7 +24,8 @@ except ImportError:
     pg = None
 
 try:
-    from .dc_waveform_core import dc_iq_to_current
+    from .dc_waveform_core import adc_iq_to_voltage, dc_iq_to_current
+    from .dc_voltage_calibration import load_dc_voltage_calibration
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -34,7 +35,8 @@ try:
     )
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
-    from dc_waveform_core import dc_iq_to_current
+    from dc_waveform_core import adc_iq_to_voltage, dc_iq_to_current
+    from dc_voltage_calibration import load_dc_voltage_calibration
     from qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -321,18 +323,41 @@ def reduce_fir_stability_result(
         raise ValueError("stability sweep-coordinate shape does not match FIR IQ")
 
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
-    dc_measure_mode = bool(
-        getattr(readout_spec, "dc_measure_mode", False)
+    dc_measure_mode = bool(getattr(readout_spec, "dc_measure_mode", False))
+    calibration_enabled = bool(
+        getattr(readout_spec, "dc_voltage_calibration_enabled", False)
     )
-    if dc_measure_mode:
+    if dc_measure_mode or calibration_enabled:
         if getattr(readout_spec, "input_board_type", None) != "DC_In":
             raise ValueError("DC measure mode requires a DC_In readout")
-        point_iq = dc_iq_to_current(
-            point_iq,
-            getattr(readout_spec, "dc_measure_gain_v_per_a", 1.0),
-        )
-        value_unit = "A"
-        measurement_mode = "dc_current_iq"
+        calibration = None
+        if calibration_enabled:
+            calibration = load_dc_voltage_calibration(
+                getattr(
+                    readout_spec,
+                    "dc_voltage_calibration_database_path",
+                    "",
+                ),
+                readout_ch=int(getattr(readout_spec, "ro_ch", 0)),
+                input_dc_gain_db=float(
+                    getattr(readout_spec, "dc_gain_db", 0.0)
+                ),
+                run_id=int(
+                    getattr(readout_spec, "dc_voltage_calibration_run_id", 0)
+                ),
+            )
+        if dc_measure_mode:
+            point_iq = dc_iq_to_current(
+                point_iq,
+                getattr(readout_spec, "dc_measure_gain_v_per_a", 1.0),
+                calibration=calibration,
+            )
+            value_unit = "A"
+            measurement_mode = "dc_current_iq"
+        else:
+            point_iq = adc_iq_to_voltage(point_iq, calibration=calibration)
+            value_unit = "V"
+            measurement_mode = "dc_voltage_iq"
     else:
         value_unit = "ADC units"
         measurement_mode = "raw_iq"

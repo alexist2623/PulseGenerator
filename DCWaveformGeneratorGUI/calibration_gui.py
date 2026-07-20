@@ -14,8 +14,16 @@ import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
 try:
+    from .dc_voltage_calibration import (
+        DcVoltageCalibrationConfig,
+        run_dc_voltage_calibration,
+    )
     import pyqtgraph as pg
 except ImportError:
+    from dc_voltage_calibration import (
+        DcVoltageCalibrationConfig,
+        run_dc_voltage_calibration,
+    )
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
     from matplotlib.figure import Figure
 
@@ -290,6 +298,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     output_requested = QtCore.pyqtSignal()
     input_requested = QtCore.pyqtSignal()
+    dc_voltage_requested = QtCore.pyqtSignal()
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
 
@@ -322,6 +331,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.addTab(self._build_output_tab(), "Output / Oscilloscope")
         self.tabs.addTab(self._build_input_tab(), "Input / ADC")
+        self.tabs.addTab(self._build_dc_voltage_tab(), "DC Voltage")
         layout.addWidget(self.tabs, 1)
 
         self.progress = QtWidgets.QProgressBar()
@@ -580,6 +590,94 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._update_board_controls()
         return scroll
 
+    def _build_dc_voltage_tab(self) -> QtWidgets.QWidget:
+        scroll, form, vertical = self._scroll_form(
+            "DC_Out to DC_In Voltage Calibration"
+        )
+        self.dc_voltage_output_ch = self._channel(1)
+        self.dc_voltage_readout_ch = self._channel(0)
+        self.dc_voltage_start_mv = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_start_mv.setRange(-10000.0, 10000.0)
+        self.dc_voltage_start_mv.setDecimals(6)
+        self.dc_voltage_start_mv.setValue(-800.0)
+        self.dc_voltage_start_mv.setSuffix(" mV")
+        self.dc_voltage_stop_mv = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_stop_mv.setRange(-10000.0, 10000.0)
+        self.dc_voltage_stop_mv.setDecimals(6)
+        self.dc_voltage_stop_mv.setValue(800.0)
+        self.dc_voltage_stop_mv.setSuffix(" mV")
+        self.dc_voltage_points = self._points(33)
+        self.dc_voltage_full_scale_mv = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_full_scale_mv.setRange(1.0, 10000.0)
+        self.dc_voltage_full_scale_mv.setDecimals(6)
+        self.dc_voltage_full_scale_mv.setValue(800.0)
+        self.dc_voltage_full_scale_mv.setSuffix(" mV")
+        self.dc_voltage_samples = QtWidgets.QSpinBox()
+        self.dc_voltage_samples.setRange(1, 200)
+        self.dc_voltage_samples.setValue(128)
+        self.dc_voltage_repetitions = QtWidgets.QSpinBox()
+        self.dc_voltage_repetitions.setRange(1, 100000)
+        self.dc_voltage_repetitions.setValue(4)
+        self.dc_voltage_input_gain = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_input_gain.setRange(-6.0, 26.0)
+        self.dc_voltage_input_gain.setDecimals(1)
+        self.dc_voltage_input_gain.setSingleStep(1.0)
+        self.dc_voltage_input_gain.setValue(0.0)
+        self.dc_voltage_input_gain.setSuffix(" dB")
+        self.dc_voltage_settle_us = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_settle_us.setRange(0.0, 1000000.0)
+        self.dc_voltage_settle_us.setDecimals(6)
+        self.dc_voltage_settle_us.setValue(5.0)
+        self.dc_voltage_settle_us.setSuffix(" us")
+        self.dc_voltage_margin_samples = QtWidgets.QSpinBox()
+        self.dc_voltage_margin_samples.setRange(0, 10000000)
+        self.dc_voltage_margin_samples.setValue(1024)
+        self.dc_voltage_force_overwrite = QtWidgets.QCheckBox(
+            "Allow overwrite of reserved DDR range"
+        )
+        self.dc_voltage_force_overwrite.setChecked(True)
+        self.dc_voltage_experiment_name = QtWidgets.QLineEdit(
+            "QICK DC input voltage calibration"
+        )
+        self.dc_voltage_sample_name = QtWidgets.QLineEdit()
+        self.dc_voltage_sample_name.setPlaceholderText(
+            "Auto: DC_In_voltage_ch<readout>_gain<dB>"
+        )
+        frequency_note = QtWidgets.QLabel(
+            "This is a DC voltage sweep only. The readout/DDC frequency is "
+            "fixed to 0 MHz, and the FIR-DDR path stores 1 MSPS samples."
+        )
+        frequency_note.setWordWrap(True)
+        form.addRow(frequency_note)
+        for label, widget in (
+            ("DC output generator index:", self.dc_voltage_output_ch),
+            ("DC input readout index:", self.dc_voltage_readout_ch),
+            ("Start voltage:", self.dc_voltage_start_mv),
+            ("Stop voltage:", self.dc_voltage_stop_mv),
+            ("Voltage points:", self.dc_voltage_points),
+            ("DC output full scale (+/-):", self.dc_voltage_full_scale_mv),
+            ("FIR samples / point:", self.dc_voltage_samples),
+            ("Repetitions / point:", self.dc_voltage_repetitions),
+            ("DC input gain:", self.dc_voltage_input_gain),
+            ("Settle before trigger:", self.dc_voltage_settle_us),
+            ("FIR input margin:", self.dc_voltage_margin_samples),
+            ("Experiment name:", self.dc_voltage_experiment_name),
+            ("Sample name:", self.dc_voltage_sample_name),
+        ):
+            form.addRow(label, widget)
+        form.addRow(self.dc_voltage_force_overwrite)
+        self.run_dc_voltage_button = QtWidgets.QPushButton(
+            "Run 0 MHz DC Voltage Calibration"
+        )
+        self.run_dc_voltage_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        )
+        self.run_dc_voltage_button.clicked.connect(
+            self.dc_voltage_requested.emit
+        )
+        vertical.insertWidget(1, self.run_dc_voltage_button)
+        return scroll
+
     def _update_board_controls(self, *_args) -> None:
         output_rf = self.output_board.currentText() == "RF_Out"
         self.output_att1.setEnabled(output_rf)
@@ -701,6 +799,25 @@ class CalibrationPanel(QtWidgets.QWidget):
             sample_name=self.input_sample_name.text().strip(),
         )
 
+    def dc_voltage_config(self) -> DcVoltageCalibrationConfig:
+        return DcVoltageCalibrationConfig(
+            database_path=self.database_path_value(),
+            output_ch=self.dc_voltage_output_ch.value(),
+            readout_ch=self.dc_voltage_readout_ch.value(),
+            voltage_start_mv=self.dc_voltage_start_mv.value(),
+            voltage_stop_mv=self.dc_voltage_stop_mv.value(),
+            voltage_points=self.dc_voltage_points.value(),
+            output_full_scale_mv=self.dc_voltage_full_scale_mv.value(),
+            samples_per_point=self.dc_voltage_samples.value(),
+            repetitions_per_point=self.dc_voltage_repetitions.value(),
+            input_dc_gain_db=self.dc_voltage_input_gain.value(),
+            settle_us=self.dc_voltage_settle_us.value(),
+            margin_input_samples=self.dc_voltage_margin_samples.value(),
+            force_overwrite=self.dc_voltage_force_overwrite.isChecked(),
+            experiment_name=self.dc_voltage_experiment_name.text().strip(),
+            sample_name=self.dc_voltage_sample_name.text().strip(),
+        )
+
     def apply_path_settings(self, values: Mapping[str, Any]) -> None:
         """Apply the shared front-panel RF path to both calibration modes."""
         self.path_diagram.apply_external_settings(values)
@@ -720,6 +837,9 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         self.input_output_ch.setValue(output_ch)
         self.input_readout_ch.setValue(readout_ch)
+        self.dc_voltage_output_ch.setValue(output_ch)
+        self.dc_voltage_readout_ch.setValue(readout_ch)
+        self.dc_voltage_input_gain.setValue(input_gain)
         self.input_output_board.setCurrentText(output_board)
         self.input_board.setCurrentText(input_board)
         self.input_output_att1.setValue(att1)
@@ -763,11 +883,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         output.pop("database_path")
         input_config = asdict(self.input_config())
         input_config.pop("database_path")
+        dc_voltage = asdict(self.dc_voltage_config())
+        dc_voltage.pop("database_path")
         return {
             "database_path": self.database_path_value(),
             "selected_tab": self.tabs.currentIndex(),
             "output": output,
             "input": input_config,
+            "dc_voltage": dc_voltage,
             "input_plot": {
                 "x_scale": self.input_response_plot.x_scale_mode,
                 "y_scale": self.input_response_plot.y_scale_mode,
@@ -779,6 +902,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         database_path = str(settings.get("database_path", DEFAULT_CALIBRATION_DB_PATH))
         output_values = dict(settings.get("output", {}))
         input_values = dict(settings.get("input", {}))
+        dc_voltage_values = dict(settings.get("dc_voltage", {}))
         scope_values = dict(output_values.pop("oscilloscope", {}))
         output = OutputPowerCalibrationConfig(
             database_path=database_path,
@@ -788,6 +912,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         input_config = InputPowerCalibrationConfig(
             database_path=database_path,
             **input_values,
+        )
+        dc_voltage = DcVoltageCalibrationConfig(
+            database_path=database_path,
+            **dc_voltage_values,
         )
         self.database_path.setText(database_path)
         assignments = (
@@ -827,6 +955,17 @@ class CalibrationPanel(QtWidgets.QWidget):
             (self.input_readout_bandwidth, input_config.readout_filter_bandwidth_ghz),
             (self.input_trim_low, input_config.fit_trim_low),
             (self.input_trim_high, input_config.fit_trim_high),
+            (self.dc_voltage_output_ch, dc_voltage.output_ch),
+            (self.dc_voltage_readout_ch, dc_voltage.readout_ch),
+            (self.dc_voltage_start_mv, dc_voltage.voltage_start_mv),
+            (self.dc_voltage_stop_mv, dc_voltage.voltage_stop_mv),
+            (self.dc_voltage_points, dc_voltage.voltage_points),
+            (self.dc_voltage_full_scale_mv, dc_voltage.output_full_scale_mv),
+            (self.dc_voltage_samples, dc_voltage.samples_per_point),
+            (self.dc_voltage_repetitions, dc_voltage.repetitions_per_point),
+            (self.dc_voltage_input_gain, dc_voltage.input_dc_gain_db),
+            (self.dc_voltage_settle_us, dc_voltage.settle_us),
+            (self.dc_voltage_margin_samples, dc_voltage.margin_input_samples),
         )
         for widget, value in assignments:
             widget.setValue(value)
@@ -847,6 +986,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_readout_filter.setCurrentText(input_config.readout_filter_type)
         self.input_experiment_name.setText(input_config.experiment_name)
         self.input_sample_name.setText(input_config.sample_name)
+        self.dc_voltage_force_overwrite.setChecked(dc_voltage.force_overwrite)
+        self.dc_voltage_experiment_name.setText(dc_voltage.experiment_name)
+        self.dc_voltage_sample_name.setText(dc_voltage.sample_name)
         input_plot = dict(settings.get("input_plot", {}))
         self.input_response_plot.set_axis_scales(
             str(input_plot.get("x_scale", "log")),
@@ -867,11 +1009,12 @@ class CalibrationPanel(QtWidgets.QWidget):
             }
         )
         self._update_board_controls()
-        self.tabs.setCurrentIndex(max(0, min(1, int(settings.get("selected_tab", 0)))))
+        self.tabs.setCurrentIndex(max(0, min(2, int(settings.get("selected_tab", 0)))))
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_output_button.setEnabled(not running)
         self.run_input_button.setEnabled(not running)
+        self.run_dc_voltage_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
@@ -900,6 +1043,15 @@ class CalibrationPanel(QtWidgets.QWidget):
                 plot_message = f"\nPlot unavailable: {exc}"
             else:
                 self.tabs.setCurrentIndex(1)
+        elif isinstance(result, Mapping) and "calibration" in result:
+            calibration = result.get("calibration", {})
+            if isinstance(calibration, Mapping):
+                plot_message = (
+                    "\n0 MHz DC voltage fit: "
+                    f"R^2={float(calibration.get('r_squared', float('nan'))):.8f}, "
+                    f"RMSE={float(calibration.get('rmse_adc', float('nan'))):.6g} ADC"
+                )
+            self.tabs.setCurrentIndex(2)
         self.set_running(
             False,
             (
@@ -918,8 +1070,8 @@ class CalibrationWorker(QtCore.QObject):
 
     def __init__(self, mode: str, kwargs: Mapping[str, Any], parent=None):
         super().__init__(parent)
-        if mode not in ("output", "input"):
-            raise ValueError("calibration mode must be output or input")
+        if mode not in ("output", "input", "dc_voltage"):
+            raise ValueError("calibration mode must be output, input, or dc_voltage")
         self.mode = mode
         self.kwargs = dict(kwargs)
 
@@ -928,11 +1080,12 @@ class CalibrationWorker(QtCore.QObject):
         try:
             kwargs = dict(self.kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
-            stored = (
-                run_output_power_calibration(**kwargs)
-                if self.mode == "output"
-                else run_input_power_calibration(**kwargs)
-            )
+            runners = {
+                "output": run_output_power_calibration,
+                "input": run_input_power_calibration,
+                "dc_voltage": run_dc_voltage_calibration,
+            }
+            stored = runners[self.mode](**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -947,13 +1100,18 @@ def default_calibration_settings() -> Mapping[str, Any]:
     input_config = asdict(
         InputPowerCalibrationConfig(database_path=DEFAULT_CALIBRATION_DB_PATH)
     )
+    dc_voltage = asdict(
+        DcVoltageCalibrationConfig(database_path=DEFAULT_CALIBRATION_DB_PATH)
+    )
     output.pop("database_path")
     input_config.pop("database_path")
+    dc_voltage.pop("database_path")
     return {
         "database_path": DEFAULT_CALIBRATION_DB_PATH,
         "selected_tab": 0,
         "output": output,
         "input": input_config,
+        "dc_voltage": dc_voltage,
         "input_plot": {
             "x_scale": "log",
             "y_scale": "log",

@@ -1,0 +1,242 @@
+"""DC voltage calibration model, acquisition, and database tests.
+
+Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+
+from qick.sim import QickSim  # noqa: F401
+from qick.qick_asm import QickConfig
+
+from dc_voltage_calibration import (
+    DcVoltageCalibration,
+    DcVoltageCalibrationConfig,
+    build_dc_voltage_calibration_program,
+    load_dc_voltage_calibration,
+    run_dc_voltage_calibration,
+)
+from qick_qcodes_experiment import QCODES_STAGING_ENV, QickConnectionConfig
+from qick_qcodes_experiment import _measurement_iq_values
+
+
+def _dc_soccfg():
+    return QickConfig(
+        {
+            "sw_version": "0.2.357",
+            "refclk_freq": 300.0,
+            "tprocs": [
+                {
+                    "type": "axis_tproc64x32_x8",
+                    "f_time": 300.0,
+                    "pmem_size": 65536,
+                    "dmem_size": 4096,
+                }
+            ],
+            "gens": [
+                {
+                    "type": "axis_awg_tuning_v1",
+                    "gen_type": "awg_tuning",
+                    "tproc_ch": 0,
+                    "tmux_ch": 0,
+                    "f_fabric": 300.0,
+                    "n_pts": 16,
+                    "samps_per_clk": 16,
+                    "frac": 16,
+                    "cmd_width": 160,
+                    "step_width": 24,
+                    "duration_width": 23,
+                    "fixed_width": 48,
+                    "dac_invalid_lsb": 2,
+                    "maxv": 32764,
+                    "minv": -32768,
+                    "has_mixer": False,
+                    "has_dds": False,
+                    "b_dds": 32,
+                    "b_phase": 32,
+                    "dac": "00",
+                    "interpolation": 1,
+                }
+            ],
+            "readouts": [
+                {
+                    "type": "axis_dyn_readout_v1",
+                    "ro_type": "axis_dyn_readout_v1",
+                    "tproc_ctrl": 1,
+                    "tmux_ch": 0,
+                    "f_fabric": 300.0,
+                    "f_output": 300.0,
+                    "f_dds": 300.0,
+                    "fs_mult": 1,
+                    "fs_div": 1,
+                    "fdds_div": 1,
+                    "b_dds": 32,
+                    "b_phase": 32,
+                    "adc": "00",
+                    "buf_maxlen": 16384,
+                    "has_weights": False,
+                    "has_edge_counter": False,
+                    "trigger_type": "dport",
+                    "trigger_port": 0,
+                    "trigger_bit": 0,
+                }
+            ],
+            "ddr4_buf": {
+                "sample_capture": True,
+                "fir_enabled": True,
+                "fir_output_fs_mhz": 1.0,
+                "fir_decimation": 300,
+                "fir_group_delay_input_samples": 8677,
+                "fir_input_fs_mhz": 300.0,
+                "trigger_type": "dport",
+                "trigger_port": 0,
+                "trigger_bit": 1,
+            },
+        }
+    )
+
+
+def test_dc_calibration_program_fixes_readout_frequency_to_zero():
+    config = DcVoltageCalibrationConfig(
+        database_path="calibration.db",
+        output_ch=0,
+        readout_ch=0,
+        voltage_points=5,
+        samples_per_point=8,
+        repetitions_per_point=2,
+    )
+    program = build_dc_voltage_calibration_program(
+        _dc_soccfg(), config, tproc_mhz=300.0
+    )
+    assert program.ddr_readout_config.readout_freq_mhz == 0.0
+    assert program.sequence.sweep_point_count == 5
+    assert program.sequence.segments[-1].name == "return_zero"
+    assert program.sequence.segments[-1].amplitudes == (0.0,)
+
+
+def test_dc_scalar_adc_fit_recovers_voltage_and_ignores_q():
+    voltage_mv = np.linspace(-800.0, 800.0, 17)
+    voltage_v = voltage_mv / 1000.0
+    mean_i = 120.0 + 5000.0 * voltage_v
+    calibration = DcVoltageCalibration.fit(voltage_mv, mean_i)
+
+    measured = np.column_stack((mean_i, np.full_like(mean_i, 12345.0)))
+    converted = calibration.convert_iq(measured)
+    np.testing.assert_allclose(converted[:, 0], voltage_v, atol=1.0e-12)
+    np.testing.assert_allclose(converted[:, 1], 0.0, atol=1.0e-12)
+    assert calibration.r_squared > 0.999999999
+
+
+def test_dc_voltage_calibration_run_and_qcodes_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    database_path = tmp_path / "gain_pwr_calb.db"
+    config = DcVoltageCalibrationConfig(
+        database_path=str(database_path),
+        output_ch=3,
+        readout_ch=2,
+        voltage_start_mv=-800.0,
+        voltage_stop_mv=800.0,
+        voltage_points=9,
+        output_full_scale_mv=800.0,
+        samples_per_point=8,
+        repetitions_per_point=3,
+        input_dc_gain_db=6.0,
+        settle_us=2.0,
+    )
+    calls = []
+
+    class FakeSoc:
+        def rfb_set_gen_dc(self, channel):
+            calls.append(("gen_dc", channel))
+
+        def rfb_set_ro_dc(self, channel, gain):
+            calls.append(("ro_dc", channel, gain))
+            return float(gain)
+
+    class FakeProgram:
+        pass
+
+    def program_factory(_soccfg, received_config, *, tproc_mhz=None):
+        assert received_config == config
+        assert tproc_mhz == 300.0
+        # DC calibration has no RF frequency field; its readout is fixed at 0 MHz.
+        return FakeProgram()
+
+    def acquire(_soc, _program):
+        voltage_v = config.voltages_mv / 1000.0
+        iq = np.empty(
+            (
+                config.voltage_points,
+                config.repetitions_per_point,
+                config.samples_per_point,
+                2,
+            ),
+            dtype=float,
+        )
+        iq[..., 0] = (50.0 + 4000.0 * voltage_v)[:, None, None]
+        iq[..., 1] = (-25.0 + 3000.0 * voltage_v)[:, None, None]
+        return SimpleNamespace(iq=iq)
+
+    stored = run_dc_voltage_calibration(
+        connection_config=QickConnectionConfig(host="127.0.0.1"),
+        calibration_config=config,
+        tproc_mhz=300.0,
+        connector=lambda **_kwargs: (FakeSoc(), object()),
+        program_factory=program_factory,
+        acquisition_callback=acquire,
+    )
+    assert stored.run_id > 0
+    assert stored.row_count == config.voltage_points
+    assert calls == [("gen_dc", 3), ("ro_dc", 2, 6.0)]
+
+    loaded = load_dc_voltage_calibration(
+        database_path,
+        readout_ch=2,
+        input_dc_gain_db=6.0,
+    )
+    assert loaded.run_id == stored.run_id
+    assert loaded.output_ch == 3
+    test_voltage_v = np.asarray([-0.4, 0.0, 0.7])
+    test_iq = np.column_stack((50.0 + 4000.0 * test_voltage_v, [9, 8, 7]))
+    converted = loaded.convert_iq(test_iq)
+    np.testing.assert_allclose(converted[:, 0], test_voltage_v, atol=1.0e-12)
+    np.testing.assert_allclose(converted[:, 1], 0.0, atol=1.0e-12)
+
+    stored_iq, unit, mode, metadata = _measurement_iq_values(
+        test_iq.reshape(1, 1, 3, 2),
+        {
+            "readout_details": {
+                "board_type": "DC_In",
+                "ro_ch": 2,
+                "commanded_dc_gain_db": 6.0,
+                "dc_measure_mode": False,
+                "dc_voltage_calibration_enabled": True,
+                "dc_voltage_calibration_database_path": str(database_path),
+                "dc_voltage_calibration_run_id": stored.run_id,
+            }
+        },
+    )
+    assert unit == "V"
+    assert mode == "dc_voltage_iq"
+    assert metadata["dc_voltage_calibration_run_id"] == stored.run_id
+    np.testing.assert_allclose(
+        stored_iq[0, 0, :, 0], test_voltage_v, atol=1.0e-12
+    )
+    np.testing.assert_allclose(stored_iq[0, 0, :, 1], 0.0, atol=1.0e-12)
+
+
+def test_dc_voltage_config_rejects_points_outside_full_scale():
+    try:
+        DcVoltageCalibrationConfig(
+            database_path="calibration.db",
+            voltage_start_mv=-900.0,
+            voltage_stop_mv=800.0,
+            output_full_scale_mv=800.0,
+        )
+    except ValueError as exc:
+        assert "+/- output full scale" in str(exc)
+    else:
+        raise AssertionError("out-of-range DC voltage sweep was accepted")

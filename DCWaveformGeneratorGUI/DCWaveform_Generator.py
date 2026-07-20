@@ -146,6 +146,7 @@ try:
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
     )
+    from .dc_voltage_calibration import DcVoltageCalibrationConfig
 except ImportError:
     from calibration_gui import (
         CalibrationPanel,
@@ -157,6 +158,7 @@ except ImportError:
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
     )
+    from dc_voltage_calibration import DcVoltageCalibrationConfig
 
 try:
     from .qick_front_panel import (
@@ -218,11 +220,15 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "readout_frequency_mhz": 50.0,
     "margin_input_samples": 1024,
     "force_overwrite": False,
+    "post_run_read_delay_seconds": 0.1,
     "input_board_type": "RF_In",
     "attenuation_db": 20.0,
     "dc_gain_db": 0.0,
     "dc_measure_mode": False,
     "dc_measure_gain_v_per_a": DEFAULT_DC_MEASURE_GAIN_V_PER_A,
+    "dc_voltage_calibration_enabled": False,
+    "dc_voltage_calibration_database_path": "",
+    "dc_voltage_calibration_run_id": 0,
     "filter_type": "bypass",
     "filter_cutoff": 2.5,
     "filter_bandwidth": 1.0,
@@ -2294,6 +2300,36 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.margin_samples.setRange(0, 10_000_000)
         self.margin_samples.setValue(1024)
         self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
+        self.post_run_read_delay = QtWidgets.QDoubleSpinBox()
+        self.post_run_read_delay.setRange(0.0, 60.0)
+        self.post_run_read_delay.setDecimals(6)
+        self.post_run_read_delay.setValue(0.1)
+        self.post_run_read_delay.setSuffix(" s")
+        self.post_run_read_delay.setToolTip(
+            "Wait after the tProcessor program completes before reading DDR"
+        )
+        self.dc_voltage_calibration_enabled = QtWidgets.QCheckBox(
+            "Apply DC input voltage calibration"
+        )
+        self.dc_voltage_calibration_path = QtWidgets.QLineEdit()
+        self.dc_voltage_calibration_path.setPlaceholderText(
+            "QCoDeS calibration DB containing a DC Voltage run"
+        )
+        self.dc_voltage_calibration_browse = QtWidgets.QToolButton()
+        self.dc_voltage_calibration_browse.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.dc_voltage_calibration_browse.setToolTip(
+            "Choose DC voltage calibration database"
+        )
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.addWidget(self.dc_voltage_calibration_path, 1)
+        calibration_path_row.addWidget(self.dc_voltage_calibration_browse)
+        self.dc_voltage_calibration_run_id = QtWidgets.QSpinBox()
+        self.dc_voltage_calibration_run_id.setRange(0, (1 << 31) - 1)
+        self.dc_voltage_calibration_run_id.setSpecialValueText(
+            "Latest matching channel/gain"
+        )
 
         self.front_panel_preview = QickFrontPanelPreview(self)
         self.front_panel_preview.activated.connect(
@@ -2311,10 +2347,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow(self.input_condition_label, self.input_condition_stack)
         form.addRow(self.dc_measure_mode)
         form.addRow("DC measurement gain:", self.dc_measure_gain_v_per_a)
+        form.addRow(self.dc_voltage_calibration_enabled)
+        form.addRow("DC calibration DB:", calibration_path_row)
+        form.addRow("DC calibration Run ID:", self.dc_voltage_calibration_run_id)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
         form.addRow("FIR input margin:", self.margin_samples)
+        form.addRow("DDR read delay after run:", self.post_run_read_delay)
         form.addRow(self.force_overwrite)
         note = QtWidgets.QLabel(
             "The qstl_awg_tuning_fir path stores post-FIR samples at 1 MSPS."
@@ -2335,11 +2375,15 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.dc_gain_db,
             self.dc_measure_mode,
             self.dc_measure_gain_v_per_a,
+            self.dc_voltage_calibration_enabled,
+            self.dc_voltage_calibration_path,
+            self.dc_voltage_calibration_run_id,
             self.filter_type,
             self.filter_cutoff,
             self.filter_bandwidth,
             self.nqz,
             self.margin_samples,
+            self.post_run_read_delay,
             self.force_overwrite,
         ):
             signal = getattr(widget, "valueChanged", None)
@@ -2347,12 +2391,20 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 signal = getattr(widget, "currentIndexChanged", None)
             if signal is None:
                 signal = getattr(widget, "toggled", None)
+            if signal is None:
+                signal = getattr(widget, "textChanged", None)
             signal.connect(self._emit_spec)
         self.toggled.connect(self._emit_spec)
         self.input_board_type.currentTextChanged.connect(
             self._update_board_controls
         )
         self.dc_measure_mode.toggled.connect(self._update_board_controls)
+        self.dc_voltage_calibration_enabled.toggled.connect(
+            self._update_board_controls
+        )
+        self.dc_voltage_calibration_browse.clicked.connect(
+            self._browse_dc_voltage_calibration
+        )
         self.ro_ch.valueChanged.connect(self._sync_front_panel_selection)
         self._update_board_controls()
 
@@ -2361,6 +2413,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         if rf_input and self.dc_measure_mode.isChecked():
             with QtCore.QSignalBlocker(self.dc_measure_mode):
                 self.dc_measure_mode.setChecked(False)
+        if rf_input and self.dc_voltage_calibration_enabled.isChecked():
+            with QtCore.QSignalBlocker(self.dc_voltage_calibration_enabled):
+                self.dc_voltage_calibration_enabled.setChecked(False)
         self.input_condition_stack.setCurrentIndex(0 if rf_input else 1)
         self.input_condition_label.setText(
             "Input attenuation:" if rf_input else "DC input gain:"
@@ -2372,6 +2427,13 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.dc_measure_gain_v_per_a.setEnabled(
             not rf_input and self.dc_measure_mode.isChecked()
         )
+        calibration_enabled = (
+            not rf_input and self.dc_voltage_calibration_enabled.isChecked()
+        )
+        self.dc_voltage_calibration_enabled.setEnabled(not rf_input)
+        self.dc_voltage_calibration_path.setEnabled(calibration_enabled)
+        self.dc_voltage_calibration_browse.setEnabled(calibration_enabled)
+        self.dc_voltage_calibration_run_id.setEnabled(calibration_enabled)
         tooltip = (
             "RF_In onboard filter"
             if rf_input
@@ -2380,6 +2442,16 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_type.setToolTip(tooltip)
         self.filter_cutoff.setToolTip(tooltip)
         self.filter_bandwidth.setToolTip(tooltip)
+
+    def _browse_dc_voltage_calibration(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose DC voltage calibration database",
+            self.dc_voltage_calibration_path.text().strip(),
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.dc_voltage_calibration_path.setText(path)
 
     def set_front_panel_configuration(self, configuration) -> None:
         self._front_panel_configuration = configuration
@@ -2446,6 +2518,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             readout_frequency_mhz=self.frequency_mhz.value(),
             margin_input_samples=self.margin_samples.value(),
             force_overwrite=self.force_overwrite.isChecked(),
+            post_run_read_delay_seconds=self.post_run_read_delay.value(),
             attenuation_db=self.attenuation_db.value(),
             filter_type=self.filter_type.currentText(),
             filter_cutoff=self.filter_cutoff.value(),
@@ -2454,6 +2527,15 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             dc_gain_db=self.dc_gain_db.value(),
             dc_measure_mode=self.dc_measure_mode.isChecked(),
             dc_measure_gain_v_per_a=self.dc_measure_gain_v_per_a.value(),
+            dc_voltage_calibration_enabled=(
+                self.dc_voltage_calibration_enabled.isChecked()
+            ),
+            dc_voltage_calibration_database_path=(
+                self.dc_voltage_calibration_path.text().strip()
+            ),
+            dc_voltage_calibration_run_id=(
+                self.dc_voltage_calibration_run_id.value()
+            ),
             nqz=self.nqz.value(),
         )
 
@@ -2473,6 +2555,20 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._update_board_controls()
         self._emit_spec()
 
+    def set_dc_voltage_calibration(
+        self,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        """Select a completed DC calibration for subsequent measurements."""
+        if self.input_board_type.currentText() != "DC_In":
+            self.input_board_type.setCurrentText("DC_In")
+        self.dc_voltage_calibration_path.setText(str(database_path))
+        self.dc_voltage_calibration_run_id.setValue(int(run_id))
+        self.dc_voltage_calibration_enabled.setChecked(True)
+        self._update_board_controls()
+        self._emit_spec()
+
     def settings_dict(self) -> dict:
         spec = self.configured_spec()
         return {
@@ -2484,11 +2580,21 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
             "force_overwrite": spec.force_overwrite,
+            "post_run_read_delay_seconds": spec.post_run_read_delay_seconds,
             "input_board_type": spec.input_board_type,
             "attenuation_db": spec.attenuation_db,
             "dc_gain_db": spec.dc_gain_db,
             "dc_measure_mode": spec.dc_measure_mode,
             "dc_measure_gain_v_per_a": spec.dc_measure_gain_v_per_a,
+            "dc_voltage_calibration_enabled": (
+                spec.dc_voltage_calibration_enabled
+            ),
+            "dc_voltage_calibration_database_path": (
+                spec.dc_voltage_calibration_database_path
+            ),
+            "dc_voltage_calibration_run_id": (
+                spec.dc_voltage_calibration_run_id
+            ),
             "filter_type": spec.filter_type,
             "filter_cutoff": spec.filter_cutoff,
             "filter_bandwidth": spec.filter_bandwidth,
@@ -2515,6 +2621,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             readout_frequency_mhz=float(data.get("readout_frequency_mhz", 0.0)),
             margin_input_samples=int(data.get("margin_input_samples", 1024)),
             force_overwrite=force_overwrite,
+            post_run_read_delay_seconds=float(
+                data.get("post_run_read_delay_seconds", 0.1)
+            ),
             attenuation_db=float(data.get("attenuation_db", 20.0)),
             filter_type=str(data.get("filter_type", "bypass")),
             filter_cutoff=float(data.get("filter_cutoff", 2.5)),
@@ -2527,6 +2636,15 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                     "dc_measure_gain_v_per_a",
                     DEFAULT_DC_MEASURE_GAIN_V_PER_A,
                 )
+            ),
+            dc_voltage_calibration_enabled=bool(
+                data.get("dc_voltage_calibration_enabled", False)
+            ),
+            dc_voltage_calibration_database_path=str(
+                data.get("dc_voltage_calibration_database_path", "")
+            ),
+            dc_voltage_calibration_run_id=int(
+                data.get("dc_voltage_calibration_run_id", 0)
             ),
             nqz=int(data.get("nqz", 1)),
         )
@@ -2547,11 +2665,23 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.input_board_type.setCurrentText(spec.input_board_type)
             self.margin_samples.setValue(spec.margin_input_samples)
             self.force_overwrite.setChecked(spec.force_overwrite)
+            self.post_run_read_delay.setValue(
+                spec.post_run_read_delay_seconds
+            )
             self.attenuation_db.setValue(spec.attenuation_db)
             self.dc_gain_db.setValue(spec.dc_gain_db)
             self.dc_measure_mode.setChecked(spec.dc_measure_mode)
             self.dc_measure_gain_v_per_a.setValue(
                 spec.dc_measure_gain_v_per_a
+            )
+            self.dc_voltage_calibration_enabled.setChecked(
+                spec.dc_voltage_calibration_enabled
+            )
+            self.dc_voltage_calibration_path.setText(
+                spec.dc_voltage_calibration_database_path
+            )
+            self.dc_voltage_calibration_run_id.setValue(
+                spec.dc_voltage_calibration_run_id
             )
             self.filter_type.setCurrentIndex(filter_index)
             self.filter_cutoff.setValue(spec.filter_cutoff)
@@ -3786,6 +3916,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.input_requested.connect(
             lambda: self._run_power_calibration("input")
         )
+        self._calibration_panel.dc_voltage_requested.connect(
+            lambda: self._run_power_calibration("dc_voltage")
+        )
         self._calibration_panel.path_settings_applied.connect(
             self._apply_rf_path_settings
         )
@@ -4536,6 +4669,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"{spec.samples_per_trigger} samples at 1 MSPS, "
                 f"gain {spec.dc_measure_gain_v_per_a:g} V/A"
             )
+        elif spec.dc_voltage_calibration_enabled:
+            run_label = (
+                "latest matching"
+                if spec.dc_voltage_calibration_run_id == 0
+                else f"Run {spec.dc_voltage_calibration_run_id}"
+            )
+            self.statusBar().showMessage(
+                f"Calibrated DC voltage readout {spec.ro_ch}: "
+                f"{spec.samples_per_trigger} samples at 1 MSPS, {run_label}"
+            )
         else:
             self.statusBar().showMessage(
                 f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
@@ -5123,7 +5266,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             calibration_config = (
                 self._calibration_panel.output_config()
                 if mode == "output"
-                else self._calibration_panel.input_config()
+                else (
+                    self._calibration_panel.input_config()
+                    if mode == "input"
+                    else self._calibration_panel.dc_voltage_config()
+                )
             )
             if mode == "output" and not (
                 calibration_config.oscilloscope.visa_resource.strip()
@@ -5140,9 +5287,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "connection_config": connection,
             "calibration_config": calibration_config,
         }
-        if mode == "input":
+        if mode in ("input", "dc_voltage"):
             arguments["tproc_mhz"] = self._experiment_panel.tproc_mhz.value()
-        label = "oscilloscope output" if mode == "output" else "FIR-DDR input"
+        label = {
+            "output": "oscilloscope output",
+            "input": "FIR-DDR input",
+            "dc_voltage": "0 MHz DC voltage",
+        }[mode]
         self._calibration_panel.set_running(
             True,
             f"0% - Preparing {label} calibration",
@@ -5171,6 +5322,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_calibration_finished(self, stored) -> None:
         self._calibration_panel.show_result(stored)
+        result = getattr(stored, "result", None)
+        if isinstance(result, Mapping) and "calibration" in result:
+            self._rf_readout_panel.set_dc_voltage_calibration(
+                str(stored.database_path),
+                int(stored.run_id),
+            )
         self.statusBar().showMessage(
             f"Calibration Run {stored.run_id} saved to {stored.database_path}"
         )
@@ -5947,11 +6104,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError("calibration database path must not be empty")
         raw_output_calibration = raw_calibration.get("output", {})
         raw_input_calibration = raw_calibration.get("input", {})
+        raw_dc_voltage_calibration = raw_calibration.get("dc_voltage", {})
         if not isinstance(raw_output_calibration, dict) or not isinstance(
             raw_input_calibration,
             dict,
         ):
             raise TypeError("calibration output and input must be JSON objects")
+        if not isinstance(raw_dc_voltage_calibration, dict):
+            raise TypeError("calibration dc_voltage must be a JSON object")
         output_calibration_values = {
             **calibration_defaults["output"],
             **raw_output_calibration,
@@ -5972,6 +6132,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 **raw_input_calibration,
             },
         )
+        dc_voltage_calibration = DcVoltageCalibrationConfig(
+            database_path=calibration_database_path,
+            **{
+                **calibration_defaults["dc_voltage"],
+                **raw_dc_voltage_calibration,
+            },
+        )
         calibration_selected_tab = self._json_int(
             raw_calibration.get(
                 "selected_tab",
@@ -5979,8 +6146,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
             "calibration selected tab",
         )
-        if calibration_selected_tab > 1:
-            raise ValueError("calibration selected tab must be 0 or 1")
+        if calibration_selected_tab > 2:
+            raise ValueError("calibration selected tab must be 0, 1, or 2")
         raw_input_calibration_plot = raw_calibration.get("input_plot", {})
         if not isinstance(raw_input_calibration_plot, dict):
             raise TypeError("calibration input_plot must be a JSON object")
@@ -5997,13 +6164,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             input_calibration_plot[axis_name] = axis_scale
         output_calibration_settings = asdict(output_calibration)
         input_calibration_settings = asdict(input_calibration)
+        dc_voltage_calibration_settings = asdict(dc_voltage_calibration)
         output_calibration_settings.pop("database_path")
         input_calibration_settings.pop("database_path")
+        dc_voltage_calibration_settings.pop("database_path")
         calibration_settings = {
             "database_path": calibration_database_path,
             "selected_tab": calibration_selected_tab,
             "output": output_calibration_settings,
             "input": input_calibration_settings,
+            "dc_voltage": dc_voltage_calibration_settings,
             "input_plot": input_calibration_plot,
         }
 
@@ -6092,6 +6262,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "RF readout margin_input_samples",
             ),
             force_overwrite=force_overwrite,
+            post_run_read_delay_seconds=self._json_finite_float(
+                raw_readout.get("post_run_read_delay_seconds", 0.1),
+                "RF readout post_run_read_delay_seconds",
+            ),
             attenuation_db=float(raw_readout["attenuation_db"]),
             filter_type=str(raw_readout["filter_type"]),
             filter_cutoff=float(raw_readout["filter_cutoff"]),
@@ -6106,6 +6280,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 raw_readout["dc_measure_gain_v_per_a"],
                 "RF readout dc_measure_gain_v_per_a",
                 positive=True,
+            ),
+            dc_voltage_calibration_enabled=self._json_bool(
+                raw_readout.get("dc_voltage_calibration_enabled", False),
+                "RF readout dc_voltage_calibration_enabled",
+            ),
+            dc_voltage_calibration_database_path=str(
+                raw_readout.get("dc_voltage_calibration_database_path", "")
+            ),
+            dc_voltage_calibration_run_id=self._json_int(
+                raw_readout.get("dc_voltage_calibration_run_id", 0),
+                "RF readout dc_voltage_calibration_run_id",
             ),
             nqz=self._json_int(raw_readout["nqz"], "RF readout nqz", minimum=1),
         )
@@ -6122,11 +6307,23 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
             "margin_input_samples": readout_spec.margin_input_samples,
             "force_overwrite": readout_spec.force_overwrite,
+            "post_run_read_delay_seconds": (
+                readout_spec.post_run_read_delay_seconds
+            ),
             "input_board_type": readout_spec.input_board_type,
             "attenuation_db": readout_spec.attenuation_db,
             "dc_gain_db": readout_spec.dc_gain_db,
             "dc_measure_mode": readout_spec.dc_measure_mode,
             "dc_measure_gain_v_per_a": readout_spec.dc_measure_gain_v_per_a,
+            "dc_voltage_calibration_enabled": (
+                readout_spec.dc_voltage_calibration_enabled
+            ),
+            "dc_voltage_calibration_database_path": (
+                readout_spec.dc_voltage_calibration_database_path
+            ),
+            "dc_voltage_calibration_run_id": (
+                readout_spec.dc_voltage_calibration_run_id
+            ),
             "filter_type": readout_spec.filter_type,
             "filter_cutoff": readout_spec.filter_cutoff,
             "filter_bandwidth": readout_spec.filter_bandwidth,

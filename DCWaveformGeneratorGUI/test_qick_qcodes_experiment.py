@@ -580,7 +580,14 @@ def test_runtime_configs_accept_manual_tproc_clock_override():
     rf = QickRfPulseSpec(
         0, "set_0", 0.2, 0.4, 43.5, 10000, 6.0, 7.0
     )
-    ddr = QickDdrReadoutSpec(0, "set_0", 0.25, 16, 12.5)
+    ddr = QickDdrReadoutSpec(
+        0,
+        "set_0",
+        0.25,
+        16,
+        12.5,
+        post_run_read_delay_seconds=0.375,
+    )
     runtime_rf = build_runtime_rf_pulses(
         soccfg, (rf,), tproc_mhz=300.0
     )[0]
@@ -592,6 +599,7 @@ def test_runtime_configs_accept_manual_tproc_clock_override():
     assert runtime_rf.delay_tproc_cycles == 60
     assert runtime_ddr.trigger_delay_tproc_cycles == 75
     assert runtime_ddr.samples_per_trigger == 16
+    assert runtime_ddr.settle_seconds == 0.375
 
     # Direct callers retain the HWH fallback when no override is supplied.
     assert build_runtime_rf_pulses(

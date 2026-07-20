@@ -36,15 +36,19 @@ try:
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        adc_iq_to_voltage,
         dc_iq_to_current,
     )
+    from .dc_voltage_calibration import load_dc_voltage_calibration
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        adc_iq_to_voltage,
         dc_iq_to_current,
     )
+    from dc_voltage_calibration import load_dc_voltage_calibration
 
 
 def _runtime_types():
@@ -365,6 +369,7 @@ def build_runtime_ddr_readout(
         margin_input_samples=spec.margin_input_samples,
         address=spec.address,
         force_overwrite=spec.force_overwrite,
+        settle_seconds=spec.post_run_read_delay_seconds,
     )
 
 
@@ -503,7 +508,23 @@ def configure_rf_board(
             "dc_measure_gain_v_per_a": float(
                 readout_spec.dc_measure_gain_v_per_a
             ),
-            "adc_to_voltage_conversion": "identity",
+            "dc_voltage_calibration_enabled": bool(
+                readout_spec.dc_voltage_calibration_enabled
+            ),
+            "dc_voltage_calibration_database_path": str(
+                readout_spec.dc_voltage_calibration_database_path
+            ),
+            "dc_voltage_calibration_run_id": int(
+                readout_spec.dc_voltage_calibration_run_id
+            ),
+            "post_run_read_delay_seconds": float(
+                readout_spec.post_run_read_delay_seconds
+            ),
+            "adc_to_voltage_conversion": (
+                "qcodes_dc_voltage_calibration"
+                if readout_spec.dc_voltage_calibration_enabled
+                else "identity"
+            ),
             "measurement_unit": readout_spec.measurement_unit,
             "filter_type": str(readout_spec.filter_type),
             "filter_cutoff_ghz": float(readout_spec.filter_cutoff),
@@ -801,19 +822,62 @@ def _measurement_iq_values(
     if not isinstance(readout_details, Mapping):
         readout_details = {}
     dc_measure_mode = bool(readout_details.get("dc_measure_mode", False))
-    if not dc_measure_mode:
+    calibration_enabled = bool(
+        readout_details.get("dc_voltage_calibration_enabled", False)
+    )
+    if not dc_measure_mode and not calibration_enabled:
         return raw_iq, "ADC units", "raw_iq", {
             "adc_to_voltage": "not_applied",
             "voltage_to_current": "not_applied",
         }
     if readout_details.get("board_type") != "DC_In":
         raise ValueError("DC measure mode requires a DC_In readout")
+    calibration = None
+    calibration_metadata = {}
+    if calibration_enabled:
+        calibration = load_dc_voltage_calibration(
+            readout_details.get("dc_voltage_calibration_database_path", ""),
+            readout_ch=int(readout_details.get("ro_ch", 0)),
+            input_dc_gain_db=float(
+                readout_details.get(
+                    "commanded_dc_gain_db",
+                    readout_details.get("requested_dc_gain_db", 0.0),
+                )
+            ),
+            run_id=int(readout_details.get("dc_voltage_calibration_run_id", 0)),
+        )
+        calibration_metadata = {
+            "dc_voltage_calibration_run_id": int(calibration.run_id),
+            "dc_voltage_calibration_database_path": str(
+                calibration.database_path
+            ),
+            "dc_voltage_calibration_r_squared": float(
+                calibration.r_squared
+            ),
+            "dc_voltage_calibration_formula": calibration.as_dict()["formula"],
+        }
+    voltage_iq = adc_iq_to_voltage(raw_iq, calibration=calibration)
+    if not dc_measure_mode:
+        return voltage_iq, "V", "dc_voltage_iq", {
+            "adc_to_voltage": (
+                "fitted_scalar_adc_i" if calibration is not None else "identity"
+            ),
+            "voltage_to_current": "not_applied",
+            **calibration_metadata,
+        }
     gain_v_per_a = float(readout_details.get("dc_measure_gain_v_per_a", 1.0))
-    current_iq = dc_iq_to_current(raw_iq, gain_v_per_a)
+    current_iq = dc_iq_to_current(
+        raw_iq,
+        gain_v_per_a,
+        calibration=calibration,
+    )
     return current_iq, "A", "dc_current_iq", {
-        "adc_to_voltage": "identity",
+        "adc_to_voltage": (
+            "fitted_scalar_adc_i" if calibration is not None else "identity"
+        ),
         "voltage_to_current": "current_a = voltage_v / gain_v_per_a",
         "gain_v_per_a": gain_v_per_a,
+        **calibration_metadata,
     }
 
 
