@@ -136,6 +136,19 @@ except ImportError:
     )
 
 try:
+    from .noise_analysis import (
+        NoiseAnalysisPanel,
+        NoiseTraceLoadWorker,
+        normalize_noise_analysis_settings,
+    )
+except ImportError:
+    from noise_analysis import (
+        NoiseAnalysisPanel,
+        NoiseTraceLoadWorker,
+        normalize_noise_analysis_settings,
+    )
+
+try:
     from .calibration_gui import (
         CalibrationPanel,
         CalibrationWorker,
@@ -182,7 +195,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 16
+SETTINGS_VERSION = 17
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -3846,6 +3859,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_panel = StabilityDiagramPanel(self)
         self._sparameter_panel = SParameterSweepPanel(self)
         self._calibration_panel = CalibrationPanel(self)
+        self._noise_panel = NoiseAnalysisPanel(
+            self,
+            default_database_path=DEFAULT_QCODES_DB_PATH,
+        )
         self._qick_configuration = None
         self._qick_front_panel_target = None
         self._qick_front_panel_dialog = QtWidgets.QDialog(self)
@@ -3925,6 +3942,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.front_panel_requested.connect(
             lambda: self._show_qick_front_panel("path")
         )
+        self._noise_panel.load_requested.connect(self._load_noise_trace)
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
         )
@@ -3960,6 +3978,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
+        self._control_tabs.addTab(self._noise_panel, "Noise Analysis")
         self._control_tabs.setCurrentWidget(self._awg_tuning_page)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
@@ -4021,12 +4040,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._dock_sparameter.setWidget(self._sparameter_plot)
 
+        self._noise_plot = self._noise_panel.detach_plot()
+        self._dock_noise = QtWidgets.QDockWidget(
+            "Noise Analysis - Current / ASD", self
+        )
+        self._dock_noise.setWidget(self._noise_plot)
+
         for dock in (
             self._dock_ctrl,
             self._dock_plot,
             self._dock_trace,
             self._dock_stability,
             self._dock_sparameter,
+            self._dock_noise,
         ):
             dock.setFeatures(
                 QtWidgets.QDockWidget.DockWidgetMovable |
@@ -4039,6 +4065,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.splitDockWidget(self._dock_plot, self._dock_trace, QtCore.Qt.Horizontal)
         self.tabifyDockWidget(self._dock_trace, self._dock_stability)
         self.tabifyDockWidget(self._dock_trace, self._dock_sparameter)
+        self.tabifyDockWidget(self._dock_trace, self._dock_noise)
         self.resizeDocks(
             [self._dock_ctrl, self._dock_plot, self._dock_trace],
             [200, 400, 300],
@@ -4612,6 +4639,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._trace.fit_view()
         self._stability_panel.plot.fit_view()
         self._sparameter_plot.fit_view()
+        self._noise_plot.fit_view()
 
     def _show_rf_editor(self) -> None:
         """Compatibility helper: reveal the always-present RF Outputs tab."""
@@ -4628,6 +4656,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif current is self._sparameter_panel:
             self._dock_sparameter.show()
             self._dock_sparameter.raise_()
+        elif current is self._noise_panel:
+            self._dock_noise.show()
+            self._dock_noise.raise_()
         else:
             self._dock_plot.show()
             self._dock_plot.raise_()
@@ -5251,6 +5282,58 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _load_noise_trace(self, database_path: str, run_id: int) -> None:
+        """Load one saved experiment's I traces outside the GUI thread."""
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        self._noise_panel.set_loading(
+            True,
+            "Loading saved QCoDeS I traces...",
+        )
+        self.statusBar().showMessage("Loading I traces for noise analysis")
+        thread = QtCore.QThread(self)
+        worker = NoiseTraceLoadWorker(database_path, run_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_noise_trace_loaded)
+        worker.failed.connect(self._on_noise_trace_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_noise_trace_loaded(self, collection) -> None:
+        self._noise_panel.set_collection(collection)
+        self._dock_noise.show()
+        self._dock_noise.raise_()
+        self.statusBar().showMessage(
+            f"Noise analysis loaded {collection.source}: "
+            f"{collection.sample_count:,} I samples per trace"
+        )
+
+    def _on_noise_trace_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown noise-analysis load error"
+        self._noise_panel.show_load_error(summary)
+        self.statusBar().showMessage("Noise-analysis trace load failed")
+        dialog = DetailedErrorMessageBox(
+            "Cannot load noise-analysis trace",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
     def _run_power_calibration(self, mode: str) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -5562,6 +5645,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_experiment_finished(self, result) -> None:
         self._experiment_panel.show_result(result)
+        try:
+            self._noise_panel.set_experiment_result(result)
+        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+            self._noise_panel.show_load_error(str(exc))
         self.statusBar().showMessage(
             f"QCoDeS run {result.run_id} saved to {result.database_path}"
         )
@@ -5807,6 +5894,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "stability_diagram": self._stability_panel.settings_dict(),
             "s_parameter": dict(self._sparameter_panel.settings_dict()),
             "calibration": dict(self._calibration_panel.settings_dict()),
+            "noise_analysis": dict(self._noise_panel.settings_dict()),
         }
 
     @staticmethod
@@ -5977,6 +6065,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             data.get("stability_diagram"),
             output_names=tuple(f"awg_{index}" for index in range(len(pulses))),
             segment_names=qick_set_segment_names(pulses[0]),
+        )
+        noise_analysis_settings = normalize_noise_analysis_settings(
+            data.get("noise_analysis")
         )
         for axis_name in ("x_axis", "y_axis"):
             axis = stability_settings[axis_name]
@@ -6379,6 +6470,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 **asdict(sparameter_config),
             },
             "calibration": calibration_settings,
+            "noise_analysis": noise_analysis_settings,
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -6447,6 +6539,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
+        self._noise_panel.load_settings(settings["noise_analysis"])
         loaded_path = self._sparameter_panel.path_diagram.applied_values()
         loaded_path.update(
             {
