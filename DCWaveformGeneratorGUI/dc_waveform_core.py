@@ -32,7 +32,9 @@ DEFAULT_QICK_FULL_SCALE_MV = 2500.0
 DEFAULT_DC_MEASURE_GAIN_V_PER_A = 1.0
 DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
 DEFAULT_BIAS_T_COMPENSATION_DURATION_US = 1.0
+DEFAULT_BIAS_T_FILTER_TAU_US = 100.0
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
+BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -634,9 +636,11 @@ def build_qick_sequence(
     sweeps: Optional[Sequence[QickSweepSpec]] = None,
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
+    bias_t_compensation_type: str = "dc",
     bias_t_compensation_voltage_mv: Optional[Real] = None,
     bias_t_compensation_mode: str = "fixed_voltage",
     bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+    bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
 ):
     """Build a real qick_fine_tune_sweep.FineTuneSequence instance."""
     pulses = tuple(pulses)
@@ -658,6 +662,11 @@ def build_qick_sequence(
     )
     if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
         raise TypeError("bias_t_compensation_enabled must be boolean")
+    if bias_t_compensation_type not in BIAS_T_COMPENSATION_TYPES:
+        raise ValueError(
+            "bias_t_compensation_type must be one of "
+            f"{BIAS_T_COMPENSATION_TYPES}"
+        )
     if bias_t_compensation_voltage_mv is None:
         bias_t_compensation_voltage_mv = (
             full_scale_mv * DEFAULT_BIAS_T_COMPENSATION_FRACTION
@@ -680,16 +689,26 @@ def build_qick_sequence(
         compensation_duration_us * 1000.0,
         fabric_mhz,
     )
-    sequence.set_bias_t_compensation(
-        compensation_mv / full_scale_mv,
-        enabled=bool(bias_t_compensation_enabled),
-        mode=bias_t_compensation_mode,
-        fixed_duration_cycles=(
-            compensation_duration_cycles
-            if bias_t_compensation_mode == "fixed_time"
-            else None
-        ),
+    filter_tau_us = _positive_real(
+        bias_t_filter_tau_us,
+        "bias_t_filter_tau_us",
     )
+    if bias_t_compensation_type == "filter":
+        sequence.set_bias_t_filter_compensation(
+            filter_tau_us * fabric_mhz,
+            enabled=bool(bias_t_compensation_enabled),
+        )
+    else:
+        sequence.set_bias_t_compensation(
+            compensation_mv / full_scale_mv,
+            enabled=bool(bias_t_compensation_enabled),
+            mode=bias_t_compensation_mode,
+            fixed_duration_cycles=(
+                compensation_duration_cycles
+                if bias_t_compensation_mode == "fixed_time"
+                else None
+            ),
+        )
     for spec in specs:
         if spec.kind == "set":
             sequence.add_set(spec.name, spec.amplitudes, spec.duration_cycles)
@@ -851,9 +870,11 @@ def generate_qick_program_code(
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
     bias_t_compensation_enabled: bool = False,
+    bias_t_compensation_type: str = "dc",
     bias_t_compensation_voltage_mv: Optional[Real] = None,
     bias_t_compensation_mode: str = "fixed_voltage",
     bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+    bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
 ) -> str:
     """Generate a QICK builder/execution module.
 
@@ -878,6 +899,11 @@ def generate_qick_program_code(
     full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
     if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
         raise TypeError("bias_t_compensation_enabled must be boolean")
+    if bias_t_compensation_type not in BIAS_T_COMPENSATION_TYPES:
+        raise ValueError(
+            "bias_t_compensation_type must be one of "
+            f"{BIAS_T_COMPENSATION_TYPES}"
+        )
     if bias_t_compensation_voltage_mv is None:
         bias_t_compensation_voltage_mv = (
             full_scale_mv * DEFAULT_BIAS_T_COMPENSATION_FRACTION
@@ -899,6 +925,10 @@ def generate_qick_program_code(
     bias_t_compensation_duration_cycles = _cycles_from_ns(
         bias_t_compensation_duration_us * 1000.0,
         fabric_mhz,
+    )
+    bias_t_filter_tau_us = _positive_real(
+        bias_t_filter_tau_us,
+        "bias_t_filter_tau_us",
     )
     repetitions_per_sweep = _positive_int(repetitions_per_sweep, "repetitions_per_sweep")
     sweep_specs = _coerce_sweep_specs(sweep, sweeps)
@@ -1004,10 +1034,13 @@ def generate_qick_program_code(
         f"TPROC_MHZ = {tproc_mhz!r}",
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
         f"BIAS_T_COMPENSATION_ENABLED = {bool(bias_t_compensation_enabled)!r}",
+        f"BIAS_T_COMPENSATION_TYPE = {bias_t_compensation_type!r}",
         f"BIAS_T_COMPENSATION_VOLTAGE_MV = {float(bias_t_compensation_voltage_mv)!r}",
         f"BIAS_T_COMPENSATION_MODE = {bias_t_compensation_mode!r}",
         f"BIAS_T_COMPENSATION_DURATION_US = {float(bias_t_compensation_duration_us)!r}",
         f"BIAS_T_COMPENSATION_DURATION_CYCLES = {bias_t_compensation_duration_cycles}",
+        f"BIAS_T_FILTER_TAU_US = {float(bias_t_filter_tau_us)!r}",
+        f"BIAS_T_FILTER_TAU_CYCLES = {float(bias_t_filter_tau_us * fabric_mhz)!r}",
         f"REPETITIONS_PER_SWEEP = {repetitions_per_sweep}",
         f"SWEEP_SPECS = {sweep_config!r}",
         f"CROSS_CAPACITANCE = {cross_capacitance!r}",
@@ -1019,16 +1052,22 @@ def generate_qick_program_code(
         "def build_sequence() -> FineTuneSequence:",
         "    sequence = FineTuneSequence(OUTPUT_NAMES)",
         "    sequence.set_cross_capacitance(CROSS_CAPACITANCE)",
-        "    sequence.set_bias_t_compensation(",
-        "        BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
-        "        enabled=BIAS_T_COMPENSATION_ENABLED,",
-        "        mode=BIAS_T_COMPENSATION_MODE,",
-        "        fixed_duration_cycles=(",
-        "            BIAS_T_COMPENSATION_DURATION_CYCLES",
-        "            if BIAS_T_COMPENSATION_MODE == 'fixed_time'",
-        "            else None",
-        "        ),",
-        "    )",
+        "    if BIAS_T_COMPENSATION_TYPE == 'filter':",
+        "        sequence.set_bias_t_filter_compensation(",
+        "            BIAS_T_FILTER_TAU_CYCLES,",
+        "            enabled=BIAS_T_COMPENSATION_ENABLED,",
+        "        )",
+        "    else:",
+        "        sequence.set_bias_t_compensation(",
+        "            BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
+        "            enabled=BIAS_T_COMPENSATION_ENABLED,",
+        "            mode=BIAS_T_COMPENSATION_MODE,",
+        "            fixed_duration_cycles=(",
+        "                BIAS_T_COMPENSATION_DURATION_CYCLES",
+        "                if BIAS_T_COMPENSATION_MODE == 'fixed_time'",
+        "                else None",
+        "            ),",
+        "        )",
     ]
     for spec in specs:
         if spec.kind == "set":
@@ -1197,8 +1236,10 @@ def generate_qick_program_code(
 
 __all__ = [
     "BIAS_T_COMPENSATION_MODES",
+    "BIAS_T_COMPENSATION_TYPES",
     "DEFAULT_BIAS_T_COMPENSATION_DURATION_US",
     "DEFAULT_BIAS_T_COMPENSATION_FRACTION",
+    "DEFAULT_BIAS_T_FILTER_TAU_US",
     "DEFAULT_DC_MEASURE_GAIN_V_PER_A",
     "DEFAULT_INITIAL_DURATION_NS",
     "DEFAULT_INITIAL_VOLTAGE_MV",

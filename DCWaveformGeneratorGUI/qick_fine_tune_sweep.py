@@ -22,10 +22,11 @@ attached to named SET segments.  Each sweep point may be repeated N times;
 the returned DDR array is grouped as ``(point, repetition, sample, I/Q)`` and
 ``iq_grid`` restores the original Cartesian sweep dimensions.
 
-Optional Bias-T compensation appends an opposite-polarity physical-AWG SET
-after each shot. It can keep voltage fixed and vary duration, or keep duration
-fixed and vary voltage. The swept compensation state is kept in tProcessor
-DMEM and advanced by the same hardware loops as the pulse fields without
+Optional Bias-T compensation has two distinct modes. DC compensation appends
+the existing opposite-polarity physical-AWG SET after each shot and can keep
+either voltage or duration fixed. Filter compensation treats the Bias-T as a
+first-order high-pass and replaces each physical flat with a SET followed by a
+linear ``target/tau`` slew. Both modes reuse tProcessor hardware loops without
 expanding sweep points in PMEM.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
@@ -58,6 +59,7 @@ COMMAND_REGISTER_NAMES = (
 DEFAULT_BIAS_T_DURATION_FRAC_BITS = 8
 BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
+BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
 
 
 def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -234,6 +236,30 @@ class BiasTCompensationConfig:
             0,
         )
 
+    @property
+    def compensation_type(self) -> str:
+        return "dc"
+
+
+@dataclass(frozen=True)
+class BiasTFilterCompensationConfig:
+    """Flat-segment inverse response for a first-order Bias-T high-pass.
+
+    ``tau_cycles`` is the Bias-T time constant in AWG fabric-clock cycles.
+    During a flat desired output ``target``, the AWG input is ramped with
+    ``dV/dcycle = target / tau_cycles``. This is the exact inverse response
+    for an isolated flat level with a correctly initialized filter state.
+    """
+
+    tau_cycles: float
+
+    def __post_init__(self):
+        _require_positive_real(self.tau_cycles, "Bias-T filter tau_cycles")
+
+    @property
+    def compensation_type(self) -> str:
+        return "filter"
+
 
 @dataclass(frozen=True)
 class BiasTCompensationPreview:
@@ -386,6 +412,7 @@ class CompiledCommand:
     duration_samples: int
     step: int
     words: Tuple[int, int, int, int, int]
+    command_slot: int = 0
 
 
 @dataclass(frozen=True)
@@ -417,7 +444,9 @@ class FineTuneSequence:
         self.sweeps = []
         self._sweep_coordinate_cache: Optional[np.ndarray] = None
         self.cross_capacitance = np.eye(self.n_outputs, dtype=float)
-        self.bias_t_compensation: Optional[BiasTCompensationConfig] = None
+        self.bias_t_compensation: Optional[
+            Union[BiasTCompensationConfig, BiasTFilterCompensationConfig]
+        ] = None
 
     @property
     def n_outputs(self) -> int:
@@ -473,6 +502,28 @@ class FineTuneSequence:
             fixed_duration_cycles=fixed_duration_cycles,
             duration_frac_bits=duration_frac_bits,
             inter_output_gap_cycles=inter_output_gap_cycles,
+        )
+        return self
+
+    def set_bias_t_filter_compensation(
+        self,
+        tau_cycles: Real,
+        *,
+        enabled: bool = True,
+    ):
+        """Enable first-order flat-segment Bias-T filter compensation.
+
+        Each physical flat level starts at its nominal target and ramps at
+        ``target / tau_cycles`` for that flat's duration. DC area
+        compensation is not appended in this mode.
+        """
+        if not isinstance(enabled, (bool, np.bool_)):
+            raise TypeError("Bias-T filter compensation enabled must be boolean")
+        if not enabled:
+            self.bias_t_compensation = None
+            return self
+        self.bias_t_compensation = BiasTFilterCompensationConfig(
+            tau_cycles=float(tau_cycles)
         )
         return self
 
@@ -722,6 +773,72 @@ class FineTuneSequence:
             for index, value in enumerate(physical_values)
         )
 
+    def _effective_physical_set_amplitudes_at(
+        self,
+        point_index: int,
+        segment_index: int,
+    ) -> Tuple[float, ...]:
+        """Resolve held virtual levels and apply cross-capacitance."""
+        virtual_values = self._effective_virtual_set_amplitudes_at(
+            point_index,
+            segment_index,
+        )
+        physical_values = self.cross_capacitance @ np.asarray(
+            virtual_values,
+            dtype=float,
+        )
+        return tuple(
+            _require_amplitude(
+                float(value),
+                f"physical amplitude[{self.output_names[index]}]",
+            )
+            for index, value in enumerate(physical_values)
+        )
+
+    def filter_compensated_segment_levels(
+        self,
+        point_index: int = 0,
+    ) -> Tuple[Tuple[Tuple[float, ...], Tuple[float, ...]], ...]:
+        """Return compensated input start/end levels for every segment."""
+        config = self.bias_t_compensation
+        if not isinstance(config, BiasTFilterCompensationConfig):
+            raise ValueError("filter compensation is not enabled")
+        self._validate()
+        levels = []
+        current = None
+        for segment_index, segment in enumerate(self.segments):
+            if segment.kind == "set":
+                start = np.asarray(
+                    self._effective_physical_set_amplitudes_at(
+                        point_index,
+                        segment_index,
+                    ),
+                    dtype=float,
+                )
+                end = start + start * (
+                    float(segment.duration_cycles) / float(config.tau_cycles)
+                )
+            else:
+                if current is None:
+                    raise RuntimeError("filter-compensated RAMP has no start")
+                start = current.copy()
+                end = np.asarray(
+                    self._effective_physical_set_amplitudes_at(
+                        point_index,
+                        segment_index + 1,
+                    ),
+                    dtype=float,
+                )
+            for output_index, value in enumerate(end):
+                _require_amplitude(
+                    float(value),
+                    "Bias-T filter compensated endpoint "
+                    f"{self.output_names[output_index]}/{segment.name}",
+                )
+            levels.append((tuple(start), tuple(end)))
+            current = end
+        return tuple(levels)
+
     def _effective_virtual_set_amplitudes_at(
         self, point_index: int, segment_index: int
     ) -> Tuple[float, ...]:
@@ -866,7 +983,7 @@ class FineTuneSequence:
         """
         self._validate()
         config = self.bias_t_compensation
-        if config is None:
+        if config is None or isinstance(config, BiasTFilterCompensationConfig):
             return ()
 
         current = np.asarray(self.amplitudes_at(point_index, 0), dtype=float)
@@ -921,6 +1038,43 @@ class FineTuneSequence:
             ))
         return tuple(previews)
 
+    def filter_compensated_waveform_vertices(self, point_index: int = 0):
+        """Return physical AWG input vertices for filter compensation."""
+        levels = self.filter_compensated_segment_levels(point_index)
+        time_values = []
+        columns = []
+        boundaries = []
+        time_now = 0.0
+
+        def append_vertex(time_value: float, values, *, force: bool = False):
+            vector = np.asarray(values, dtype=float)
+            if (
+                not force
+                and time_values
+                and float(time_value) == time_values[-1]
+                and np.array_equal(vector, columns[-1])
+            ):
+                return
+            time_values.append(float(time_value))
+            columns.append(vector.copy())
+
+        for segment, (start, end) in zip(self.segments, levels):
+            start_time = time_now
+            append_vertex(start_time, start, force=bool(time_values))
+            time_now += int(segment.duration_cycles)
+            append_vertex(time_now, end)
+            boundaries.append((segment.name, start_time, time_now))
+
+        matrix = np.asarray(columns, dtype=float).T
+        return (
+            np.asarray(time_values, dtype=float),
+            {
+                name: matrix[index]
+                for index, name in enumerate(self.output_names)
+            },
+            tuple(boundaries),
+        )
+
     def compensated_waveform_vertices(self, point_index: int = 0):
         """Return physical pulse vertices with simultaneous Bias-T starts.
 
@@ -929,6 +1083,11 @@ class FineTuneSequence:
         common start time. Each output independently returns to zero after its
         own compensation duration.
         """
+        if isinstance(
+            self.bias_t_compensation,
+            BiasTFilterCompensationConfig,
+        ):
+            return self.filter_compensated_waveform_vertices(point_index)
         times, waveforms, boundaries = self.waveform_vertices(
             point_index,
             space="physical",
@@ -1188,6 +1347,122 @@ def _pack_command_words(gen_cfg: Mapping, target: int, duration: int, step: int,
     )
 
 
+def _target_code(gen_cfg: Mapping, amplitude: Real) -> int:
+    return normalized_to_dac(
+        amplitude,
+        min_code=int(gen_cfg.get("minv", -32768)),
+        max_code=int(gen_cfg.get("maxv", 32764)),
+        invalid_lsb=int(gen_cfg.get("dac_invalid_lsb", 2)),
+    )
+
+
+def _ramp_step(
+    gen_cfg: Mapping,
+    start_code: int,
+    target_code: int,
+    duration_cycles: int,
+    segment_name: str,
+) -> Tuple[int, int]:
+    duration_samples = int(duration_cycles) * int(gen_cfg["n_pts"])
+    if duration_samples > (1 << 23) - 1:
+        raise ValueError(
+            f"RAMP {segment_name!r} duration expands to {duration_samples} "
+            "scalar samples, exceeding the 23-bit command field"
+        )
+    denominator = max(1, duration_samples - 1)
+    numerator = (int(target_code) - int(start_code)) << int(gen_cfg["frac"])
+    step = _div_trunc_zero(numerator, denominator)
+    if step < -(1 << 23) or step > (1 << 23) - 1:
+        raise ValueError(
+            f"RAMP {segment_name!r} step {step} exceeds signed 24 bits; "
+            "increase duration_cycles or reduce the amplitude span"
+        )
+    return duration_samples, step
+
+
+def _compile_filter_point(
+    sequence: FineTuneSequence,
+    point_index: int,
+    channels: Sequence[int],
+    gen_cfgs: Sequence[Mapping],
+) -> Tuple[Tuple[CompiledCommand, ...], ...]:
+    """Compile flat target/tau slew commands without point-table storage."""
+    levels = sequence.filter_compensated_segment_levels(point_index)
+    current_codes = [None] * sequence.n_outputs
+    compiled_segments = []
+    for segment_index, (segment, (starts, ends)) in enumerate(
+        zip(sequence.segments, levels)
+    ):
+        commands = []
+        for output_index, gen_cfg in enumerate(gen_cfgs):
+            start_code = _target_code(gen_cfg, starts[output_index])
+            target_code = _target_code(gen_cfg, ends[output_index])
+            if segment.kind == "set":
+                set_words = _pack_command_words(
+                    gen_cfg,
+                    start_code,
+                    0,
+                    0,
+                    OP_SET,
+                )
+                commands.append(
+                    CompiledCommand(
+                        point_index=point_index,
+                        segment_index=segment_index,
+                        segment_name=segment.name,
+                        output_index=output_index,
+                        output_name=sequence.output_names[output_index],
+                        gen_ch=channels[output_index],
+                        kind="set",
+                        target_code=start_code,
+                        duration_samples=0,
+                        step=0,
+                        words=set_words,
+                        command_slot=0,
+                    )
+                )
+                current_codes[output_index] = start_code
+                command_slot = 1
+            else:
+                if current_codes[output_index] is None:
+                    raise RuntimeError("filter-compensated RAMP has no start code")
+                command_slot = 0
+
+            duration_samples, step = _ramp_step(
+                gen_cfg,
+                int(current_codes[output_index]),
+                target_code,
+                segment.duration_cycles,
+                segment.name,
+            )
+            ramp_words = _pack_command_words(
+                gen_cfg,
+                target_code,
+                duration_samples,
+                step,
+                OP_RAMP,
+            )
+            commands.append(
+                CompiledCommand(
+                    point_index=point_index,
+                    segment_index=segment_index,
+                    segment_name=segment.name,
+                    output_index=output_index,
+                    output_name=sequence.output_names[output_index],
+                    gen_ch=channels[output_index],
+                    kind="ramp",
+                    target_code=target_code,
+                    duration_samples=duration_samples,
+                    step=step,
+                    words=ramp_words,
+                    command_slot=command_slot,
+                )
+            )
+            current_codes[output_index] = target_code
+        compiled_segments.append(tuple(commands))
+    return tuple(compiled_segments)
+
+
 def compile_sequence(
     sequence: FineTuneSequence,
     soccfg,
@@ -1208,6 +1483,26 @@ def compile_sequence(
     compiled_points = []
     for point_index in range(sequence.sweep_point_count):
         sweep_coordinate = sequence.sweep_coordinate(point_index)
+        if isinstance(
+            sequence.bias_t_compensation,
+            BiasTFilterCompensationConfig,
+        ):
+            compiled_segments = _compile_filter_point(
+                sequence,
+                point_index,
+                channels,
+                gen_cfgs,
+            )
+            if len(sweep_coordinate) == 1:
+                sweep_value = sweep_coordinate[0]
+            elif sweep_coordinate:
+                sweep_value = sweep_coordinate
+            else:
+                sweep_value = 0.0
+            compiled_points.append(
+                CompiledPoint(sweep_value, compiled_segments)
+            )
+            continue
         current_codes = [None] * sequence.n_outputs
         compiled_segments = []
         for segment_index, segment in enumerate(sequence.segments):
@@ -1217,12 +1512,7 @@ def compile_sequence(
                 if amplitude is None:
                     continue
                 gen_cfg = gen_cfgs[output_index]
-                target = normalized_to_dac(
-                    amplitude,
-                    min_code=int(gen_cfg.get("minv", -32768)),
-                    max_code=int(gen_cfg.get("maxv", 32764)),
-                    invalid_lsb=int(gen_cfg.get("dac_invalid_lsb", 2)),
-                )
+                target = _target_code(gen_cfg, amplitude)
                 if segment.kind == "set":
                     duration_samples = 0
                     step = 0
@@ -1233,20 +1523,13 @@ def compile_sequence(
                             f"RAMP {segment.name!r} has no known start value for "
                             f"output {sequence.output_names[output_index]!r}"
                         )
-                    duration_samples = segment.duration_cycles * int(gen_cfg["n_pts"])
-                    if duration_samples > (1 << 23) - 1:
-                        raise ValueError(
-                            f"RAMP {segment.name!r} duration expands to {duration_samples} "
-                            "scalar samples, exceeding the 23-bit command field"
-                        )
-                    denominator = max(1, duration_samples - 1)
-                    numerator = (target - current_codes[output_index]) << int(gen_cfg["frac"])
-                    step = _div_trunc_zero(numerator, denominator)
-                    if step < -(1 << 23) or step > (1 << 23) - 1:
-                        raise ValueError(
-                            f"RAMP {segment.name!r} step {step} exceeds signed 24 bits; "
-                            "increase duration_cycles or reduce the amplitude span"
-                        )
+                    duration_samples, step = _ramp_step(
+                        gen_cfg,
+                        int(current_codes[output_index]),
+                        target,
+                        segment.duration_cycles,
+                        segment.name,
+                    )
                     opcode = OP_RAMP
                 words = _pack_command_words(gen_cfg, target, duration_samples, step, opcode)
                 commands.append(
@@ -1386,7 +1669,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self._validate_bias_t_tproc_ports()
         self.bias_t_simultaneous_start_lead_cycles = (
             BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * len(self.awg_channels)
-            if self.sequence.bias_t_compensation is not None
+            if isinstance(
+                self.sequence.bias_t_compensation,
+                BiasTCompensationConfig,
+            )
             else 0
         )
         self._build_sweep_register_plan()
@@ -1412,12 +1698,30 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             )
 
     @staticmethod
-    def _command_key(command: CompiledCommand) -> Tuple[int, int]:
-        return command.segment_index, command.output_index
+    def _command_key(command: CompiledCommand) -> Tuple[int, int, int]:
+        return (
+            command.segment_index,
+            command.output_index,
+            command.command_slot,
+        )
+
+    @staticmethod
+    def _timing_key(command: CompiledCommand):
+        """Keep legacy two-item keys for the primary command slot."""
+        if command.command_slot == 0:
+            return command.segment_index, command.output_index
+        return (
+            command.segment_index,
+            command.output_index,
+            command.command_slot,
+        )
 
     def _validate_bias_t_tproc_ports(self):
         """Require independent tProcessor outputs for exact simultaneous SETs."""
-        if self.sequence.bias_t_compensation is None:
+        if not isinstance(
+            self.sequence.bias_t_compensation,
+            BiasTCompensationConfig,
+        ):
             return
         channels_by_port = {}
         for output_name, gen_ch in zip(self.sequence.output_names, self.awg_channels):
@@ -1529,7 +1833,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def _build_bias_t_models(self, sweep_axes, sweep_shape):
         """Build fixed-voltage duration or fixed-time target-code states."""
         config = self.sequence.bias_t_compensation
-        self._bias_t_mode = None if config is None else config.mode
+        self._bias_t_mode = (
+            None
+            if config is None
+            else (
+                "filter"
+                if isinstance(config, BiasTFilterCompensationConfig)
+                else config.mode
+            )
+        )
         self._bias_t_comp_codes = ()
         self._bias_t_duration_q_requested = np.empty((0, 0), dtype=np.int64)
         self._bias_t_duration_q_actual = np.empty((0, 0), dtype=np.int64)
@@ -1537,7 +1849,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self._bias_t_target_code_actual = np.empty((0, 0), dtype=np.int64)
         self._bias_t_max_duration_q_error = 0
         self._bias_t_max_target_code_error = 0
-        if config is None:
+        if config is None or isinstance(config, BiasTFilterCompensationConfig):
             self._bias_t_fields = ()
             return ()
 
@@ -1732,8 +2044,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         (axis.count - 1) * quantum,
                     )
                     axis_deltas.append(units * quantum)
-                models[(key[0], key[1], register_name)] = {
-                    "key": (key[0], key[1], register_name),
+                models[(*key, register_name)] = {
+                    "key": (*key, register_name),
                     "command_key": key,
                     "register_name": register_name,
                     "word_index": word_index,
@@ -1754,12 +2066,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             for commands in requested_point.segment_commands:
                 actual_commands = []
                 for command in commands:
-                    target_model = models[
-                        (command.segment_index, command.output_index, "target")
-                    ]
-                    step_model = models[
-                        (command.segment_index, command.output_index, "step")
-                    ]
+                    command_key = self._command_key(command)
+                    target_model = models[(*command_key, "target")]
+                    step_model = models[(*command_key, "step")]
                     target = int(target_model["base"]) + sum(
                         int(index) * int(delta)
                         for index, delta in zip(indices, target_model["axis_deltas"])
@@ -2069,7 +2378,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         rf_timings = []
         occupied_by_port = {}
-        for (_awg_segment, output_index), command_time in self.timing["command_times"].items():
+        for timing_key, command_time in self.timing["command_times"].items():
+            output_index = int(timing_key[1])
             awg_ch = self.awg_channels[output_index]
             awg_port = int(self.soccfg["gens"][awg_ch]["tproc_ch"])
             occupied_by_port.setdefault(awg_port, set()).add(int(command_time))
@@ -2141,7 +2451,82 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             raise ValueError("tProcessor and AWG fabric clocks must be positive")
         return max(1, int(ceil(fabric_cycles * f_time / f_fabric - 1e-12)))
 
+    def _build_filter_timing(self):
+        """Schedule SET+RAMP flat compensation without dropped commands.
+
+        Filter-compensated segments are consecutive RAMP operations. The next
+        command is therefore issued only after the previous RAMP and guard
+        have completed. A flat begins after its SET command and the following
+        RAMP startup pipeline; this latency is included in all anchor times.
+        """
+        first_point = self.compiled_points[0]
+        command_times = {}
+        segment_starts = []
+        segment_ends = []
+        time_now = 0
+        for segment_index, segment in enumerate(self.sequence.segments):
+            output_starts = []
+            output_ends = []
+            commands_by_output = {
+                output_index: sorted(
+                    (
+                        command
+                        for command in first_point.segment_commands[segment_index]
+                        if command.output_index == output_index
+                    ),
+                    key=lambda command: command.command_slot,
+                )
+                for output_index in range(self.sequence.n_outputs)
+            }
+            for output_index, gen_ch in enumerate(self.awg_channels):
+                commands = commands_by_output[output_index]
+                ramp_command = commands[-1]
+                if ramp_command.kind != "ramp":
+                    raise RuntimeError("filter segment must end with a RAMP command")
+                shared_slot = int(self._channel_slots[gen_ch])
+                if segment.kind == "set":
+                    set_command = commands[0]
+                    set_time = time_now + 2 * shared_slot
+                    ramp_time = set_time + self.command_spacing_tproc_cycles
+                    command_times[self._timing_key(set_command)] = set_time
+                else:
+                    ramp_time = time_now + shared_slot
+                command_times[self._timing_key(ramp_command)] = ramp_time
+
+                gen_cfg = self.soccfg["gens"][gen_ch]
+                startup_cycles = int(
+                    gen_cfg.get("ramp_startup_latency_cycles", 5)
+                )
+                startup_tproc = self._fabric_to_tproc(
+                    gen_ch,
+                    startup_cycles,
+                )
+                output_starts.append(ramp_time + startup_tproc)
+                occupancy = (
+                    startup_cycles
+                    + segment.duration_cycles
+                    + int(gen_cfg.get("ramp_guard_cycles", 1))
+                )
+                output_ends.append(
+                    ramp_time + self._fabric_to_tproc(gen_ch, occupancy)
+                )
+            segment_starts.append(max(output_starts))
+            time_now = max(output_ends)
+            segment_ends.append(time_now)
+
+        return {
+            "command_times": command_times,
+            "segment_starts": tuple(segment_starts),
+            "segment_ends": tuple(segment_ends),
+            "point_end": int(time_now),
+        }
+
     def _build_timing(self):
+        if isinstance(
+            self.sequence.bias_t_compensation,
+            BiasTFilterCompensationConfig,
+        ):
+            return self._build_filter_timing()
         first_point = self.compiled_points[0]
         command_times = {}
         segment_starts = []
@@ -2192,7 +2577,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 else:
                     command_time = time_now + self._channel_slots[gen_ch]
                     occupancy = segment.duration_cycles
-                command_times[(segment_index, output_index)] = command_time
+                command_times[self._timing_key(command)] = command_time
                 output_end_times.append(
                     command_time + self._fabric_to_tproc(gen_ch, occupancy)
                 )
@@ -2216,7 +2601,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if reg_page != page:
                 raise RuntimeError("AWG command registers must share one register page")
             field = self._sweep_field_by_key.get(
-                (command.segment_index, command.output_index, register_name)
+                (*self._command_key(command), register_name)
             )
             comment = f"{command.output_name}:{command.segment_name}:{register_name}"
             if field is None:
@@ -2298,7 +2683,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def _emit_bias_t_compensation(self):
         """Schedule simultaneous SET starts and per-channel SET-zero stops."""
         config = self.sequence.bias_t_compensation
-        if config is None:
+        if config is None or isinstance(config, BiasTFilterCompensationConfig):
             return
         if config.mode == "fixed_time":
             self._emit_bias_t_fixed_time()
@@ -2740,10 +3125,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         point = self.compiled_points[0]
         for segment_index, commands in enumerate(point.segment_commands):
             for command in commands:
-                command_time = self.timing["command_times"][(
-                    segment_index,
-                    command.output_index,
-                )]
+                command_time = self.timing["command_times"][
+                    self._timing_key(command)
+                ]
                 schedule(command_time, 10, "awg", command)
 
         if self.ddr_readout_config is not None:
@@ -2771,7 +3155,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         point_end = int(self.timing["point_end"])
         bias_t_static_end = point_end
-        if self.sequence.bias_t_compensation is not None:
+        if isinstance(
+            self.sequence.bias_t_compensation,
+            BiasTCompensationConfig,
+        ):
             # End the user-defined AWG pulse before the compensation epilogue.
             # This also prevents a long FIR/readout window from adding an
             # unmodeled final-level hold to the area being compensated.
@@ -2845,7 +3232,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if ro.wait:
                 self.wait_all()
 
-        if self.sequence.bias_t_compensation is None:
+        if not isinstance(
+            self.sequence.bias_t_compensation,
+            BiasTCompensationConfig,
+        ):
             self.sync_all(self.recovery_tproc_cycles)
         else:
             # Move the reference beyond all statically timed AWG/RF/readout
@@ -3095,6 +3485,25 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         )
 
     def summary(self):
+        dmem_addresses = {
+            int(field["dmem_addr"])
+            for field in self._sweep_fields
+            if field.get("storage") == "dmem"
+        }
+        if self._bias_t_max_duration_dmem_addr is not None:
+            dmem_addresses.add(int(self._bias_t_max_duration_dmem_addr))
+        for instruction in self.prog_list:
+            if instruction.get("name") in {"memri", "memwi"}:
+                args = instruction.get("args", ())
+                if len(args) >= 3:
+                    dmem_addresses.add(int(args[2]))
+        compensation = self.sequence.bias_t_compensation
+        compensation_type = (
+            None
+            if compensation is None
+            else compensation.compensation_type
+        )
+        pmem_words = len(self.prog_list)
         return {
             "outputs": self.sequence.output_names,
             "awg_channels": self.awg_channels,
@@ -3123,15 +3532,20 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "sweep_max_target_quantization_error": self._sweep_max_target_error,
             "sweep_max_step_quantization_error": self._sweep_max_step_error,
             "bias_t_compensation": self.sequence.bias_t_compensation is not None,
+            "bias_t_compensation_type": compensation_type,
             "bias_t_compensation_config": self.sequence.bias_t_compensation,
             "bias_t_compensation_mode": self._bias_t_mode,
             "bias_t_duration_execution": (
                 None
                 if self.sequence.bias_t_compensation is None
                 else (
-                    "tproc_fixed_time_dynamic_voltage"
-                    if self._bias_t_mode == "fixed_time"
-                    else "tproc_simultaneous_set_and_max_sync"
+                    "awg_flat_ramp_target_over_tau"
+                    if self._bias_t_mode == "filter"
+                    else (
+                        "tproc_fixed_time_dynamic_voltage"
+                        if self._bias_t_mode == "fixed_time"
+                        else "tproc_simultaneous_set_and_max_sync"
+                    )
                 )
             ),
             "bias_t_dynamic_register_fields": 0,
@@ -3142,7 +3556,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "bias_t_max_duration_q_error": self._bias_t_max_duration_q_error,
             "bias_t_max_target_code_error": self._bias_t_max_target_code_error,
             "bias_t_simultaneous_start": (
-                self.sequence.bias_t_compensation is not None
+                isinstance(
+                    self.sequence.bias_t_compensation,
+                    BiasTCompensationConfig,
+                )
             ),
             "bias_t_simultaneous_start_lead_cycles": (
                 self.bias_t_simultaneous_start_lead_cycles
@@ -3156,6 +3573,18 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "tproc_clock_is_manual": self.tproc_clock_is_manual,
             "point_end_tproc_cycles": self.timing["point_end"],
             "program_instructions": len(self.prog_list),
+            "tproc_pmem_words_used": pmem_words,
+            "tproc_dmem_words_reserved": len(dmem_addresses),
+            "tproc_dmem_words_required": (
+                max(dmem_addresses) + 1 if dmem_addresses else 0
+            ),
+            "tproc_dmem_addresses": tuple(sorted(dmem_addresses)),
+            "tproc_pmem_capacity": int(self.tproccfg.get("pmem_size", 0)),
+            "tproc_dmem_capacity": int(self.tproccfg.get("dmem_size", 0)),
+            "tproc_memory_within_4096": (
+                pmem_words < 4096
+                and all(0 <= address < 4096 for address in dmem_addresses)
+            ),
             "rf_pulse": bool(self.rf_pulse_configs),
             "rf_pulse_count": len(self.rf_pulse_configs),
             "fir_ddr_readout": self.ddr_readout_config is not None,
@@ -3170,8 +3599,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
 __all__ = [
     "AmplitudeSweep",
+    "BIAS_T_COMPENSATION_TYPES",
     "BiasTCompensationConfig",
     "BiasTCompensationPreview",
+    "BiasTFilterCompensationConfig",
     "CompiledCommand",
     "CompiledPoint",
     "DdrFirReadoutConfig",

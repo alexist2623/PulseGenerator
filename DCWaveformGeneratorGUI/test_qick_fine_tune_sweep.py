@@ -751,3 +751,146 @@ def test_bias_t_fixed_time_rejects_duration_that_requires_overrange_voltage():
 
     with pytest.raises(ValueError, match="too short"):
         sequence.make_program(_mock_soccfg(1), awg_channels=(0,))
+
+
+def test_bias_t_filter_flat_slew_is_target_over_tau_and_cancels_droop():
+    target = 0.2
+    tau_cycles = 3_000.0
+    flat_cycles = 300
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (target,), flat_cycles)
+    sequence.set_bias_t_filter_compensation(tau_cycles)
+
+    (((start,), (end,)),) = sequence.filter_compensated_segment_levels()
+    assert start == pytest.approx(target)
+    assert (end - start) / flat_cycles == pytest.approx(target / tau_cycles)
+
+    # First-order Bias-T model: tau*dz/dt + z = x and y = x-z. For a
+    # piecewise-linear input x=a+b*t, this is the exact analytic response.
+    times = np.linspace(0.0, float(flat_cycles), 101)
+
+    def highpass_linear(a, slope):
+        x = a + slope * times
+        z0 = 0.0
+        z = (
+            a
+            + slope * (times - tau_cycles)
+            + (z0 - a + slope * tau_cycles) * np.exp(-times / tau_cycles)
+        )
+        return x - z
+
+    compensated = highpass_linear(target, target / tau_cycles)
+    uncompensated = highpass_linear(target, 0.0)
+    assert np.max(np.abs(compensated - target)) < 1.0e-12
+    assert uncompensated[-1] == pytest.approx(
+        target * np.exp(-flat_cycles / tau_cycles)
+    )
+    assert uncompensated[-1] < target
+
+
+def test_bias_t_filter_compiles_each_flat_as_set_then_ramp():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("hold", (0.2,), 300)
+    sequence.set_bias_t_filter_compensation(3_000)
+    program = sequence.make_program(_mock_soccfg(1), awg_channels=(0,))
+    program.compile()
+
+    commands = program.compiled_points[0].segment_commands[0]
+    assert [(command.kind, command.command_slot) for command in commands] == [
+        ("set", 0),
+        ("ramp", 1),
+    ]
+    assert commands[1].duration_samples == 300 * 16
+    assert commands[0].target_code == 6552
+    assert commands[1].target_code == 7208
+    assert commands[1].step > 0
+    assert all(command.target_code & 0b11 == 0 for command in commands)
+    actual_slew_code_per_cycle = commands[1].step * 16 / (1 << 16)
+    expected_slew_code_per_cycle = commands[0].target_code / 3_000
+    assert actual_slew_code_per_cycle == pytest.approx(
+        expected_slew_code_per_cycle,
+        rel=2.0e-3,
+    )
+
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+    assert [event.word for event in tproc.output_events] == _expected_words(program)
+    assert tproc.timing_conflicts == []
+    assert program.summary()["bias_t_duration_execution"] == (
+        "awg_flat_ramp_target_over_tau"
+    )
+
+
+def test_bias_t_filter_retargets_transitions_from_compensated_flat_endpoint():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("positive", (0.2,), 100)
+    sequence.add_ramp("to_negative", 50)
+    sequence.add_set("negative", (-0.1,), 200)
+    sequence.set_bias_t_filter_compensation(1_000)
+
+    levels = sequence.filter_compensated_segment_levels()
+    assert np.asarray(levels[0]) == pytest.approx(np.asarray(((0.2,), (0.22,))))
+    assert np.asarray(levels[1]) == pytest.approx(np.asarray(((0.22,), (-0.1,))))
+    assert np.asarray(levels[2]) == pytest.approx(np.asarray(((-0.1,), (-0.12,))))
+
+
+def test_bias_t_filter_large_hardware_sweep_stays_below_4096_pmem_dmem():
+    instruction_counts = []
+    large_summary = None
+    for count in (3, 5_001):
+        sequence = FineTuneSequence(("awg_0",))
+        sequence.add_set("hold", (0.1,), 30)
+        sequence.set_amplitude_sweep("hold", "awg_0", -0.2, 0.2, count)
+        sequence.set_bias_t_filter_compensation(30_000)
+        soccfg = _mock_soccfg(1)
+        soccfg["tprocs"][0]["pmem_size"] = 4096
+        program = sequence.make_program(soccfg, awg_channels=(0,))
+        program.compile()
+        instruction_counts.append(len(program.prog_list))
+        large_summary = program.summary()
+
+    # Integer register-delta quantization can remove a no-op update, so the
+    # exact count may differ by a few instructions. It must not scale with the
+    # 5,001 sweep points or materialize one instruction block per point.
+    assert max(instruction_counts) < 64
+    assert abs(instruction_counts[0] - instruction_counts[1]) <= 4
+    assert large_summary["cartesian_point_count"] == 5_001
+    assert large_summary["sweep_uses_point_table"] is False
+    assert large_summary["tproc_pmem_words_used"] < 4096
+    assert large_summary["tproc_pmem_capacity"] == 4096
+    assert large_summary["tproc_dmem_capacity"] == 4096
+    assert large_summary["tproc_dmem_words_reserved"] < 4096
+    assert large_summary["tproc_dmem_words_required"] <= 4096
+    assert all(
+        0 <= address < 4096
+        for address in large_summary["tproc_dmem_addresses"]
+    )
+    assert large_summary["tproc_memory_within_4096"] is True
+
+
+def test_bias_t_filter_eight_outputs_stay_within_tprocessor_memory_limits():
+    names = tuple(f"awg_{index}" for index in range(8))
+    sequence = FineTuneSequence(names)
+    sequence.add_set("hold", tuple(0.02 * (index + 1) for index in range(8)), 20)
+    sequence.set_amplitude_sweep("hold", "awg_0", -0.1, 0.1, 5)
+    sequence.set_bias_t_filter_compensation(20_000)
+    soccfg = _mock_soccfg(8)
+    soccfg["tprocs"][0]["pmem_size"] = 4096
+    program = sequence.make_program(
+        soccfg,
+        awg_channels=tuple(range(8)),
+    )
+    program.compile()
+    summary = program.summary()
+
+    assert summary["commands_per_point"] == 16
+    assert summary["bias_t_compensation_type"] == "filter"
+    assert summary["bias_t_simultaneous_start"] is False
+    assert summary["tproc_pmem_words_used"] < 4096
+    assert summary["tproc_pmem_capacity"] == 4096
+    assert summary["tproc_dmem_capacity"] == 4096
+    assert summary["tproc_dmem_words_reserved"] < 4096
+    assert summary["tproc_dmem_words_required"] <= 4096
+    assert summary["tproc_memory_within_4096"] is True

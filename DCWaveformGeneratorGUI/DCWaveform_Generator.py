@@ -39,8 +39,10 @@ else:
 try:
     from .dc_waveform_core import (
         BIAS_T_COMPENSATION_MODES,
+        BIAS_T_COMPENSATION_TYPES,
         DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
@@ -62,8 +64,10 @@ try:
 except ImportError:
     from dc_waveform_core import (
         BIAS_T_COMPENSATION_MODES,
+        BIAS_T_COMPENSATION_TYPES,
         DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
         DEFAULT_QICK_FABRIC_MHZ,
@@ -176,7 +180,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 14
+SETTINGS_VERSION = 15
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -2571,7 +2575,7 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     run_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
-    bias_t_changed = QtCore.pyqtSignal(bool, float, str, float)
+    bias_t_changed = QtCore.pyqtSignal(bool, str, float, str, float, float)
 
     def __init__(
         self,
@@ -2582,9 +2586,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         awg_channels: Sequence[int],
         repetitions: int,
         bias_t_enabled: bool = False,
+        bias_t_compensation_type: str = "dc",
         bias_t_compensation_mv: Optional[float] = None,
         bias_t_mode: str = "fixed_voltage",
         bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
         parent=None,
     ):
         super().__init__(parent)
@@ -2638,6 +2644,16 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self.bias_t_type = QtWidgets.QComboBox()
+        self.bias_t_type.addItem("DC compensation", "dc")
+        self.bias_t_type.addItem("Filter compensation", "filter")
+        type_index = self.bias_t_type.findData(str(bias_t_compensation_type))
+        if type_index < 0:
+            raise ValueError(
+                "Bias-T compensation type must be one of "
+                f"{BIAS_T_COMPENSATION_TYPES}"
+            )
+        self.bias_t_type.setCurrentIndex(type_index)
         self.bias_t_mode = QtWidgets.QComboBox()
         self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
         self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
@@ -2663,9 +2679,16 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_duration_us.setDecimals(6)
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(bias_t_duration_us))
-        bias_t_form.addRow("Control mode:", self.bias_t_mode)
-        bias_t_form.addRow("Compensation voltage:", self.bias_t_compensation_mv)
-        bias_t_form.addRow("Compensation time:", self.bias_t_duration_us)
+        self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setDecimals(6)
+        self.bias_t_filter_tau_us.setSuffix(" us")
+        self.bias_t_filter_tau_us.setValue(float(bias_t_filter_tau_us))
+        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow("DC control mode:", self.bias_t_mode)
+        bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
+        bias_t_form.addRow("DC time:", self.bias_t_duration_us)
+        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
         self.set_qick_values(
             fabric_mhz=fabric_mhz,
             tproc_mhz=tproc_mhz,
@@ -2692,6 +2715,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_group.toggled.connect(self._emit_bias_t_changed)
         self.bias_t_compensation_mv.valueChanged.connect(self._emit_bias_t_changed)
         self.bias_t_duration_us.valueChanged.connect(self._emit_bias_t_changed)
+        self.bias_t_filter_tau_us.valueChanged.connect(self._emit_bias_t_changed)
+        self.bias_t_type.currentIndexChanged.connect(self._on_bias_t_mode_changed)
         self.bias_t_mode.currentIndexChanged.connect(self._on_bias_t_mode_changed)
         self._update_bias_t_mode_controls()
 
@@ -2728,15 +2753,20 @@ class ExperimentPanel(QtWidgets.QWidget):
     def _emit_bias_t_changed(self, *_args) -> None:
         self.bias_t_changed.emit(
             self.bias_t_group.isChecked(),
+            str(self.bias_t_type.currentData()),
             self.bias_t_compensation_mv.value(),
             str(self.bias_t_mode.currentData()),
             self.bias_t_duration_us.value(),
+            self.bias_t_filter_tau_us.value(),
         )
 
     def _update_bias_t_mode_controls(self) -> None:
+        filter_mode = self.bias_t_type.currentData() == "filter"
         fixed_time = self.bias_t_mode.currentData() == "fixed_time"
-        self.bias_t_compensation_mv.setEnabled(not fixed_time)
-        self.bias_t_duration_us.setEnabled(fixed_time)
+        self.bias_t_mode.setEnabled(not filter_mode)
+        self.bias_t_compensation_mv.setEnabled(not filter_mode and not fixed_time)
+        self.bias_t_duration_us.setEnabled(not filter_mode and fixed_time)
+        self.bias_t_filter_tau_us.setEnabled(filter_mode)
 
     def _on_bias_t_mode_changed(self, *_args) -> None:
         self._update_bias_t_mode_controls()
@@ -2783,9 +2813,11 @@ class ExperimentPanel(QtWidgets.QWidget):
             "awg_channels": self._parse_awg_channels(output_count),
             "repetitions_per_sweep": self.repetitions.value(),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
+            "bias_t_compensation_type": str(self.bias_t_type.currentData()),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
             "bias_t_compensation_mode": str(self.bias_t_mode.currentData()),
             "bias_t_compensation_duration_us": self.bias_t_duration_us.value(),
+            "bias_t_filter_tau_us": self.bias_t_filter_tau_us.value(),
         }
 
     def connection_values(
@@ -2849,24 +2881,36 @@ class ExperimentPanel(QtWidgets.QWidget):
         self,
         *,
         enabled: bool,
+        compensation_type: str = "dc",
         compensation_mv: float,
         mode: str = "fixed_voltage",
         duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
     ) -> None:
+        type_index = self.bias_t_type.findData(str(compensation_type))
+        if type_index < 0:
+            raise ValueError(
+                "Bias-T compensation type must be one of "
+                f"{BIAS_T_COMPENSATION_TYPES}"
+            )
         mode_index = self.bias_t_mode.findData(str(mode))
         if mode_index < 0:
             raise ValueError(
                 f"Bias-T compensation mode must be one of {BIAS_T_COMPENSATION_MODES}"
             )
         with QtCore.QSignalBlocker(self.bias_t_group), QtCore.QSignalBlocker(
-            self.bias_t_compensation_mv
-        ), QtCore.QSignalBlocker(self.bias_t_mode), QtCore.QSignalBlocker(
-            self.bias_t_duration_us
+            self.bias_t_type
+        ), QtCore.QSignalBlocker(self.bias_t_compensation_mv), QtCore.QSignalBlocker(
+            self.bias_t_mode
+        ), QtCore.QSignalBlocker(self.bias_t_duration_us), QtCore.QSignalBlocker(
+            self.bias_t_filter_tau_us
         ):
             self.bias_t_group.setChecked(bool(enabled))
+            self.bias_t_type.setCurrentIndex(type_index)
             self.bias_t_compensation_mv.setValue(float(compensation_mv))
             self.bias_t_mode.setCurrentIndex(mode_index)
             self.bias_t_duration_us.setValue(float(duration_us))
+            self.bias_t_filter_tau_us.setValue(float(filter_tau_us))
         self._update_bias_t_mode_controls()
         self._emit_bias_t_changed()
 
@@ -2881,9 +2925,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         awg_channels: Sequence[int],
         repetitions: int,
         bias_t_enabled: bool = False,
+        bias_t_compensation_type: str = "dc",
         bias_t_compensation_mv: float = DEFAULT_BIAS_T_COMPENSATION_MV,
         bias_t_mode: str = "fixed_voltage",
         bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
     ) -> None:
         self.qick_host.setText(connection.host)
         self.ns_port.setValue(connection.ns_port)
@@ -2901,9 +2947,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         self.set_bias_t_values(
             enabled=bias_t_enabled,
+            compensation_type=bias_t_compensation_type,
             compensation_mv=bias_t_compensation_mv,
             mode=bias_t_mode,
             duration_us=bias_t_duration_us,
+            filter_tau_us=bias_t_filter_tau_us,
         )
 
     def set_running(
@@ -3122,9 +3170,11 @@ class QickExportDialog(QtWidgets.QDialog):
         initial_awg_channels: Optional[Sequence[int]] = None,
         initial_repetitions: int = 1,
         initial_bias_t_enabled: bool = False,
+        initial_bias_t_compensation_type: str = "dc",
         initial_bias_t_compensation_mv: Optional[float] = None,
         initial_bias_t_mode: str = "fixed_voltage",
         initial_bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        initial_bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
     ):
         super().__init__(parent)
         self.setWindowTitle("QICK export settings")
@@ -3193,6 +3243,18 @@ class QickExportDialog(QtWidgets.QDialog):
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(initial_bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self.bias_t_type = QtWidgets.QComboBox()
+        self.bias_t_type.addItem("DC compensation", "dc")
+        self.bias_t_type.addItem("Filter compensation", "filter")
+        type_index = self.bias_t_type.findData(
+            str(initial_bias_t_compensation_type)
+        )
+        if type_index < 0:
+            raise ValueError(
+                "Bias-T compensation type must be one of "
+                f"{BIAS_T_COMPENSATION_TYPES}"
+            )
+        self.bias_t_type.setCurrentIndex(type_index)
         self.bias_t_mode = QtWidgets.QComboBox()
         self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
         self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
@@ -3216,15 +3278,25 @@ class QickExportDialog(QtWidgets.QDialog):
         self.bias_t_duration_us.setDecimals(6)
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(initial_bias_t_duration_us))
-        bias_t_form.addRow("Control mode:", self.bias_t_mode)
-        bias_t_form.addRow("Compensation voltage:", self.bias_t_compensation_mv)
-        bias_t_form.addRow("Compensation time:", self.bias_t_duration_us)
+        self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setDecimals(6)
+        self.bias_t_filter_tau_us.setSuffix(" us")
+        self.bias_t_filter_tau_us.setValue(float(initial_bias_t_filter_tau_us))
+        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow("DC control mode:", self.bias_t_mode)
+        bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
+        bias_t_form.addRow("DC time:", self.bias_t_duration_us)
+        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
         self.full_scale_mv.valueChanged.connect(
             lambda value: self.bias_t_compensation_mv.setMaximum(
                 max(0.001, float(value))
             )
         )
         self.bias_t_mode.currentIndexChanged.connect(
+            self._update_bias_t_mode_controls
+        )
+        self.bias_t_type.currentIndexChanged.connect(
             self._update_bias_t_mode_controls
         )
         self._update_bias_t_mode_controls()
@@ -3339,9 +3411,12 @@ class QickExportDialog(QtWidgets.QDialog):
         )
 
     def _update_bias_t_mode_controls(self, *_args) -> None:
+        filter_mode = self.bias_t_type.currentData() == "filter"
         fixed_time = self.bias_t_mode.currentData() == "fixed_time"
-        self.bias_t_compensation_mv.setEnabled(not fixed_time)
-        self.bias_t_duration_us.setEnabled(fixed_time)
+        self.bias_t_mode.setEnabled(not filter_mode)
+        self.bias_t_compensation_mv.setEnabled(not filter_mode and not fixed_time)
+        self.bias_t_duration_us.setEnabled(not filter_mode and fixed_time)
+        self.bias_t_filter_tau_us.setEnabled(filter_mode)
 
     def _rescale_sweep_voltage_controls(self, value: float) -> None:
         new_scale_mv = float(value)
@@ -3502,9 +3577,11 @@ class QickExportDialog(QtWidgets.QDialog):
             "awg_channels": awg_channels,
             "repetitions_per_sweep": self.repetitions.value(),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
+            "bias_t_compensation_type": str(self.bias_t_type.currentData()),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
             "bias_t_compensation_mode": str(self.bias_t_mode.currentData()),
             "bias_t_compensation_duration_us": self.bias_t_duration_us.value(),
+            "bias_t_filter_tau_us": self.bias_t_filter_tau_us.value(),
             "sweep": sweep,
             "sweeps": sweeps,
             "cross_capacitance": tuple(
@@ -3565,6 +3642,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_awg_channels = (DEFAULT_QSTL_AWG_CHANNELS[0],)
         self._qick_repetitions_per_sweep = 1
         self._bias_t_compensation_enabled = False
+        self._bias_t_compensation_type = "dc"
         self._bias_t_compensation_voltage_mv = float(
             DEFAULT_BIAS_T_COMPENSATION_MV
         )
@@ -3572,6 +3650,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_duration_us = float(
             DEFAULT_BIAS_T_COMPENSATION_DURATION_US
         )
+        self._bias_t_filter_tau_us = float(DEFAULT_BIAS_T_FILTER_TAU_US)
         self._experiment_thread: Optional[QtCore.QThread] = None
         self._experiment_worker: Optional[QtCore.QObject] = None
         self._grid_time_ns = 1000.0
@@ -3606,9 +3685,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
             bias_t_enabled=self._bias_t_compensation_enabled,
+            bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
             bias_t_mode=self._bias_t_compensation_mode,
             bias_t_duration_us=self._bias_t_compensation_duration_us,
+            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
             parent=self,
         )
         self._stability_panel = StabilityDiagramPanel(self)
@@ -4108,11 +4189,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 sweeps=(tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None),
                 cross_capacitance=self._cross_capacitance,
                 bias_t_compensation_enabled=True,
+                bias_t_compensation_type=self._bias_t_compensation_type,
                 bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
                 bias_t_compensation_mode=self._bias_t_compensation_mode,
                 bias_t_compensation_duration_us=(
                     self._bias_t_compensation_duration_us
                 ),
+                bias_t_filter_tau_us=self._bias_t_filter_tau_us,
             )
             cycles, waveforms, _boundaries = (
                 sequence.compensated_waveform_vertices(0)
@@ -4434,21 +4517,30 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_bias_t_changed(
         self,
         enabled: bool,
+        compensation_type: str,
         compensation_mv: float,
         mode: str,
         duration_us: float,
+        filter_tau_us: float,
     ) -> None:
         self._bias_t_compensation_enabled = bool(enabled)
+        self._bias_t_compensation_type = str(compensation_type)
         self._bias_t_compensation_voltage_mv = float(compensation_mv)
         self._bias_t_compensation_mode = str(mode)
         self._bias_t_compensation_duration_us = float(duration_us)
+        self._bias_t_filter_tau_us = float(filter_tau_us)
         try:
             self._refresh_physical_waveforms(fit_view=False)
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
             self.statusBar().showMessage(f"Bias-T preview unavailable: {exc}")
             return
         if enabled:
-            if mode == "fixed_time":
+            if compensation_type == "filter":
+                self.statusBar().showMessage(
+                    "Bias-T filter compensation enabled; flat-segment slew is "
+                    f"target/tau with tau={filter_tau_us:.6g} us"
+                )
+            elif mode == "fixed_time":
                 self.statusBar().showMessage(
                     "Bias-T compensation enabled for "
                     f"{duration_us:.6g} us; voltage follows pulse area"
@@ -4477,6 +4569,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_enabled = values[
             "bias_t_compensation_enabled"
         ]
+        self._bias_t_compensation_type = values["bias_t_compensation_type"]
         self._bias_t_compensation_voltage_mv = values[
             "bias_t_compensation_voltage_mv"
         ]
@@ -4484,6 +4577,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_duration_us = values[
             "bias_t_compensation_duration_us"
         ]
+        self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
         rf_specs = self._rf_ports_panel.specs()
         readout_spec = self._rf_readout_panel.spec()
         if require_readout and readout_spec is None:
@@ -4509,9 +4603,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             sweeps=sweeps,
             cross_capacitance=self._cross_capacitance.copy(),
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
+            bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
             bias_t_compensation_mode=self._bias_t_compensation_mode,
             bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
+            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
@@ -4538,6 +4634,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_enabled = values[
             "bias_t_compensation_enabled"
         ]
+        self._bias_t_compensation_type = values["bias_t_compensation_type"]
         self._bias_t_compensation_voltage_mv = values[
             "bias_t_compensation_voltage_mv"
         ]
@@ -4545,6 +4642,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_duration_us = values[
             "bias_t_compensation_duration_us"
         ]
+        self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
         self._refresh_stability_targets()
         stability_config = self._stability_panel.config(
             full_scale_mv=self._qick_full_scale_mv
@@ -4582,9 +4680,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             sweeps=sweeps,
             cross_capacitance=self._cross_capacitance.copy(),
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
+            bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
             bias_t_compensation_mode=self._bias_t_compensation_mode,
             bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
+            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         return {
             "connection_config": values["connection"],
@@ -5418,6 +5518,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_enabled = experiment_values[
             "bias_t_compensation_enabled"
         ]
+        self._bias_t_compensation_type = experiment_values[
+            "bias_t_compensation_type"
+        ]
         self._bias_t_compensation_voltage_mv = experiment_values[
             "bias_t_compensation_voltage_mv"
         ]
@@ -5427,6 +5530,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_duration_us = experiment_values[
             "bias_t_compensation_duration_us"
         ]
+        self._bias_t_filter_tau_us = experiment_values["bias_t_filter_tau_us"]
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
@@ -5466,9 +5570,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
                 "bias_t_compensation": {
                     "enabled": self._bias_t_compensation_enabled,
+                    "type": self._bias_t_compensation_type,
                     "mode": self._bias_t_compensation_mode,
                     "voltage_mv": self._bias_t_compensation_voltage_mv,
                     "duration_us": self._bias_t_compensation_duration_us,
+                    "filter_tau_us": self._bias_t_filter_tau_us,
                 },
             },
             "experiment": {
@@ -5672,6 +5778,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_bias_t.get("enabled", False),
             "QICK Bias-T compensation enabled",
         )
+        bias_t_type = str(raw_bias_t.get("type", "dc"))
+        if bias_t_type not in BIAS_T_COMPENSATION_TYPES:
+            raise ValueError(
+                "QICK Bias-T compensation type must be one of "
+                f"{BIAS_T_COMPENSATION_TYPES}"
+            )
         bias_t_mode = str(raw_bias_t.get("mode", "fixed_voltage"))
         if bias_t_mode not in BIAS_T_COMPENSATION_MODES:
             raise ValueError(
@@ -5696,6 +5808,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
             ),
             "QICK Bias-T compensation duration_us",
+            positive=True,
+        )
+        bias_t_filter_tau_us = self._json_finite_float(
+            raw_bias_t.get("filter_tau_us", DEFAULT_BIAS_T_FILTER_TAU_US),
+            "QICK Bias-T filter_tau_us",
             positive=True,
         )
         repetitions = self._json_int(
@@ -5989,9 +6106,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "bias_t_enabled": bias_t_enabled,
+            "bias_t_type": bias_t_type,
             "bias_t_mode": bias_t_mode,
             "bias_t_compensation_mv": bias_t_compensation_mv,
             "bias_t_duration_us": bias_t_duration_us,
+            "bias_t_filter_tau_us": bias_t_filter_tau_us,
             "connection_config": connection_config,
             "run_config": run_config,
             "rf_outputs": tuple(rf_outputs),
@@ -6025,11 +6144,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_awg_channels = tuple(settings["awg_channels"])
         self._qick_repetitions_per_sweep = settings["repetitions"]
         self._bias_t_compensation_enabled = settings["bias_t_enabled"]
+        self._bias_t_compensation_type = settings["bias_t_type"]
         self._bias_t_compensation_voltage_mv = settings[
             "bias_t_compensation_mv"
         ]
         self._bias_t_compensation_mode = settings["bias_t_mode"]
         self._bias_t_compensation_duration_us = settings["bias_t_duration_us"]
+        self._bias_t_filter_tau_us = settings["bias_t_filter_tau_us"]
         self._experiment_panel.load_settings(
             settings["connection_config"],
             settings["run_config"],
@@ -6039,9 +6160,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
             bias_t_enabled=self._bias_t_compensation_enabled,
+            bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
             bias_t_mode=self._bias_t_compensation_mode,
             bias_t_duration_us=self._bias_t_compensation_duration_us,
+            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         self._refresh_stability_targets()
         self._stability_panel.load_settings(settings["stability_diagram"])
@@ -6228,6 +6351,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._bias_t_compensation_enabled = experiment_values[
                 "bias_t_compensation_enabled"
             ]
+            self._bias_t_compensation_type = experiment_values[
+                "bias_t_compensation_type"
+            ]
             self._bias_t_compensation_voltage_mv = experiment_values[
                 "bias_t_compensation_voltage_mv"
             ]
@@ -6236,6 +6362,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ]
             self._bias_t_compensation_duration_us = experiment_values[
                 "bias_t_compensation_duration_us"
+            ]
+            self._bias_t_filter_tau_us = experiment_values[
+                "bias_t_filter_tau_us"
             ]
             set_names = qick_set_segment_names(self._pulse[0])
             self._rf_pulse_specs = list(self._rf_ports_panel.specs())
@@ -6266,9 +6395,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             initial_awg_channels=self._qick_awg_channels,
             initial_repetitions=self._qick_repetitions_per_sweep,
             initial_bias_t_enabled=self._bias_t_compensation_enabled,
+            initial_bias_t_compensation_type=self._bias_t_compensation_type,
             initial_bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
             initial_bias_t_mode=self._bias_t_compensation_mode,
             initial_bias_t_duration_us=self._bias_t_compensation_duration_us,
+            initial_bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
@@ -6290,6 +6421,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_enabled = settings[
             "bias_t_compensation_enabled"
         ]
+        self._bias_t_compensation_type = settings["bias_t_compensation_type"]
         self._bias_t_compensation_voltage_mv = settings[
             "bias_t_compensation_voltage_mv"
         ]
@@ -6297,6 +6429,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_duration_us = settings[
             "bias_t_compensation_duration_us"
         ]
+        self._bias_t_filter_tau_us = settings["bias_t_filter_tau_us"]
         self._experiment_panel.set_qick_values(
             fabric_mhz=self._qick_fabric_mhz,
             tproc_mhz=self._qick_tproc_mhz,
@@ -6306,9 +6439,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._experiment_panel.set_bias_t_values(
             enabled=self._bias_t_compensation_enabled,
+            compensation_type=self._bias_t_compensation_type,
             compensation_mv=self._bias_t_compensation_voltage_mv,
             mode=self._bias_t_compensation_mode,
             duration_us=self._bias_t_compensation_duration_us,
+            filter_tau_us=self._bias_t_filter_tau_us,
         )
         self._cross_capacitance = np.asarray(
             settings["cross_capacitance"], dtype=float
@@ -6354,9 +6489,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "sweeps",
                 "cross_capacitance",
                 "bias_t_compensation_enabled",
+                "bias_t_compensation_type",
                 "bias_t_compensation_voltage_mv",
                 "bias_t_compensation_mode",
                 "bias_t_compensation_duration_us",
+                "bias_t_filter_tau_us",
             )
         }
         try:

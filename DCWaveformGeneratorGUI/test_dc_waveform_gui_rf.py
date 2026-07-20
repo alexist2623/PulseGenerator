@@ -40,13 +40,18 @@ def test_gui_defaults_and_time_unit_round_trip():
     assert window._experiment_panel.fabric_mhz.value() == 300.0
     assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._experiment_panel.bias_t_group.isChecked() is False
+    assert window._experiment_panel.bias_t_type.currentData() == "dc"
     assert window._experiment_panel.bias_t_mode.currentData() == "fixed_voltage"
     assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
     assert window._experiment_panel.bias_t_duration_us.value() == 1.0
+    assert window._experiment_panel.bias_t_filter_tau_us.value() == 100.0
     assert window._experiment_panel.bias_t_compensation_mv.isEnabledTo(
         window._experiment_panel.bias_t_group
     ) is True
     assert window._experiment_panel.bias_t_duration_us.isEnabledTo(
+        window._experiment_panel.bias_t_group
+    ) is False
+    assert window._experiment_panel.bias_t_filter_tau_us.isEnabledTo(
         window._experiment_panel.bias_t_group
     ) is False
     assert window._pulse[0].t.tolist() == [0.0, 1000.0]
@@ -441,9 +446,11 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["qick"]["tproc_mhz"] == 275.0
     assert document["qick"]["bias_t_compensation"] == {
         "enabled": True,
+        "type": "dc",
         "mode": "fixed_time",
         "voltage_mv": 125.0,
         "duration_us": 2.5,
+        "filter_tau_us": 100.0,
     }
     assert len(document["awg"]["outputs"]) == 2
     assert len(document["rf_outputs"]) == 2
@@ -463,6 +470,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
     assert restored._experiment_panel.tproc_mhz.value() == 275.0
     assert restored._experiment_panel.bias_t_group.isChecked() is True
+    assert restored._experiment_panel.bias_t_type.currentData() == "dc"
     assert restored._experiment_panel.bias_t_mode.currentData() == "fixed_time"
     assert restored._experiment_panel.bias_t_compensation_mv.value() == 125.0
     assert restored._experiment_panel.bias_t_duration_us.value() == 2.5
@@ -787,7 +795,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 14
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 15
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"
@@ -800,9 +808,11 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert upgraded["qick"]["repetitions_per_sweep"] == 1
     assert upgraded["qick"]["bias_t_compensation"] == {
         "enabled": False,
+        "type": "dc",
         "mode": "fixed_voltage",
         "voltage_mv": 250.0,
         "duration_us": 1.0,
+        "filter_tau_us": 100.0,
     }
     assert upgraded["experiment"]["notes"] == ""
     assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
@@ -850,6 +860,69 @@ def test_bias_t_gui_fixed_time_disables_voltage_and_adjusts_preview_level():
     )
     assert window._plot._physical_values_mv[0, -1] == 0.0
     window.close()
+
+
+def test_bias_t_gui_filter_mode_enables_tau_and_slopes_flat_segment(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    panel.bias_t_type.setCurrentIndex(panel.bias_t_type.findData("filter"))
+    panel.bias_t_filter_tau_us.setValue(50.0)
+    panel.bias_t_group.setChecked(True)
+    app.processEvents()
+
+    assert panel.bias_t_mode.isEnabled() is False
+    assert panel.bias_t_compensation_mv.isEnabled() is False
+    assert panel.bias_t_duration_us.isEnabled() is False
+    assert panel.bias_t_filter_tau_us.isEnabled() is True
+    assert window._bias_t_compensation_type == "filter"
+    assert window._bias_t_filter_tau_us == 50.0
+    assert window._plot._physical_values_mv[0, 0] == pytest.approx(100.0)
+    assert window._plot._physical_values_mv[0, -1] == pytest.approx(102.0)
+
+    sequence = window._experiment_run_arguments(
+        require_readout=False,
+        require_run_config=False,
+    )["sequence"]
+    assert sequence.bias_t_compensation.compensation_type == "filter"
+    assert sequence.bias_t_compensation.tau_cycles == 15_000.0
+
+    settings_path = window._save_settings_json(tmp_path / "filter_compensation")
+    restored = gui.MainWindow()
+    restored._load_settings_json(settings_path)
+    app.processEvents()
+    assert restored._experiment_panel.bias_t_type.currentData() == "filter"
+    assert restored._experiment_panel.bias_t_filter_tau_us.value() == 50.0
+    assert restored._bias_t_compensation_type == "filter"
+    assert restored._bias_t_filter_tau_us == 50.0
+    restored.close()
+    window.close()
+
+
+def test_generated_qick_filter_compensation_preserves_tau_configuration():
+    pulse = PulseSequence(
+        initial_voltage=100.0,
+        initial_duration_ns=1_000.0,
+    )
+    code = generate_qick_program_code(
+        (pulse,),
+        output_names=("awg_0",),
+        awg_channels=(1,),
+        fabric_mhz=300.0,
+        bias_t_compensation_enabled=True,
+        bias_t_compensation_type="filter",
+        bias_t_filter_tau_us=50.0,
+    )
+    ast.parse(code)
+    namespace = {}
+    exec(compile(code, "<filter-comp-generated>", "exec"), namespace)
+
+    assert namespace["BIAS_T_COMPENSATION_TYPE"] == "filter"
+    assert namespace["BIAS_T_FILTER_TAU_US"] == 50.0
+    assert namespace["BIAS_T_FILTER_TAU_CYCLES"] == 15_000.0
+    config = namespace["build_sequence"]().bias_t_compensation
+    assert config.compensation_type == "filter"
+    assert config.tau_cycles == 15_000.0
 
 
 def test_partial_legacy_rf_settings_fill_nested_defaults():
