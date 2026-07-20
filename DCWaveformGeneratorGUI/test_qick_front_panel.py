@@ -223,18 +223,25 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     window.close()
 
 
-def test_sparameter_path_uses_compact_preview_and_update_below_dut():
+def test_sparameter_path_places_preview_above_two_column_path():
     _application()
     window = gui.MainWindow()
     path = window._sparameter_panel.path_diagram
     layout = path.layout()
     update_position = layout.getItemPosition(layout.indexOf(path.update_button))
     preview_position = layout.getItemPosition(layout.indexOf(path.front_panel_preview))
+    input_position = layout.getItemPosition(layout.indexOf(path.input_endpoint))
+    output_position = layout.getItemPosition(layout.indexOf(path.output_endpoint))
+    dut_position = layout.getItemPosition(layout.indexOf(path.dut_component))
 
     assert not hasattr(path, "summary")
     assert layout.horizontalSpacing() == 10
-    assert preview_position == (0, 1, 1, 1)
-    assert update_position == (5, 0, 1, 3)
+    assert layout.columnCount() == 2
+    assert preview_position == (0, 0, 1, 2)
+    assert input_position == (1, 0, 1, 1)
+    assert output_position == (1, 1, 1, 1)
+    assert dut_position == (5, 0, 1, 2)
+    assert update_position == (6, 0, 1, 2)
     window.close()
 
 

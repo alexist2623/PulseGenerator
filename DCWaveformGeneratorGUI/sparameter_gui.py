@@ -90,7 +90,7 @@ class _PathComponent(QtWidgets.QFrame):
 
 
 class RfPathCorrectionWidget(QtWidgets.QGroupBox):
-    """U-shaped output-to-DUT-to-input path with board-aware controls."""
+    """Two-column output-to-DUT-to-input path with a top panel preview."""
 
     settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
@@ -99,7 +99,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         super().__init__("RF Path and DUT De-embedding", parent)
         self._front_panel_configuration = None
         self._compact = bool(compact)
-        self.setMinimumHeight(330 if self._compact else 430)
+        self.setMinimumHeight(500 if self._compact else 540)
         self.setStyleSheet(
             "QGroupBox { color: #20252b; font-weight: 600; }"
             "QLabel { color: #20252b; }"
@@ -169,6 +169,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         dut_label = QtWidgets.QLabel("Device under test")
         dut_label.setAlignment(QtCore.Qt.AlignCenter)
         self.dut_component = _PathComponent("DUT", dut_label, self)
+        self.dut_component.setMinimumWidth(180)
 
         self.front_panel_preview = QickFrontPanelPreview(self)
         self.front_panel_preview.activated.connect(self.front_panel_requested.emit)
@@ -189,21 +190,27 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         layout.setContentsMargins(12, 20, 12, 12)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(8)
-        layout.setColumnStretch(0, 3)
-        layout.setColumnStretch(1, 3)
-        layout.setColumnStretch(2, 3)
-        layout.addWidget(self.input_endpoint, 0, 0)
-        layout.addWidget(self.front_panel_preview, 0, 1)
-        layout.addWidget(self.output_endpoint, 0, 2)
-        layout.addWidget(self.input_condition, 1, 0)
-        layout.addWidget(self.output_att1_component, 1, 2)
-        layout.addWidget(self.amplifier_component, 2, 0)
-        layout.addWidget(self.output_att2_component, 2, 2)
-        layout.addWidget(self.loss2_component, 3, 0)
-        layout.addWidget(self.loss1_component, 3, 2)
-        layout.addWidget(self.dut_component, 4, 1)
-        layout.addWidget(self.update_button, 5, 0, 1, 3)
-        layout.addWidget(self.apply_status, 6, 0, 1, 3)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        layout.addWidget(self.front_panel_preview, 0, 0, 1, 2)
+        layout.addWidget(self.input_endpoint, 1, 0)
+        layout.addWidget(self.output_endpoint, 1, 1)
+        layout.addWidget(self.input_condition, 2, 0)
+        layout.addWidget(self.output_att1_component, 2, 1)
+        layout.addWidget(self.amplifier_component, 3, 0)
+        layout.addWidget(self.output_att2_component, 3, 1)
+        layout.addWidget(self.loss2_component, 4, 0)
+        layout.addWidget(self.loss1_component, 4, 1)
+        layout.addWidget(
+            self.dut_component,
+            5,
+            0,
+            1,
+            2,
+            QtCore.Qt.AlignHCenter,
+        )
+        layout.addWidget(self.update_button, 6, 0, 1, 2)
+        layout.addWidget(self.apply_status, 7, 0, 1, 2)
 
         self.output_board_type.currentTextChanged.connect(self._update_board_controls)
         self.input_board_type.currentTextChanged.connect(self._update_board_controls)
