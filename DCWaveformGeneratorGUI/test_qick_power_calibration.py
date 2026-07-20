@@ -158,6 +158,38 @@ def test_input_calibration_result_plot_has_independent_axis_scales(tmp_path):
     panel.close()
 
 
+def test_dc_calibration_application_is_owned_by_calibration_tab(tmp_path):
+    app = _application()
+    database_path = tmp_path / "dc_voltage_calibration.db"
+    panel = CalibrationPanel()
+    changes = []
+    panel.dc_application_changed.connect(
+        lambda enabled, path, run_id: changes.append(
+            (enabled, path, run_id)
+        )
+    )
+    panel.set_dc_application_selection(True, str(database_path), 19)
+    app.processEvents()
+
+    assert panel.tabs.tabText(2) == "DC Voltage"
+    assert panel.dc_application_group.isChecked() is True
+    assert panel.dc_application_path.text() == str(database_path)
+    assert panel.dc_application_run_id.value() == 19
+    assert changes[-1] == (True, str(database_path), 19)
+    settings = panel.settings_dict()
+    assert settings["dc_voltage_application"] == {
+        "enabled": True,
+        "database_path": str(database_path),
+        "run_id": 19,
+    }
+
+    restored = CalibrationPanel()
+    restored.load_settings(settings)
+    assert restored.settings_dict() == settings
+    panel.close()
+    restored.close()
+
+
 def _create_output_calibration(tmp_path, monkeypatch):
     database_path = tmp_path / "gain_pwr_calb.db"
     monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))

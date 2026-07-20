@@ -29,8 +29,10 @@ except ImportError:
 
 try:
     from .qick_qcodes_experiment import load_qick_iq_arrays
+    from .dc_voltage_calibration import load_dc_voltage_calibration
 except ImportError:
     from qick_qcodes_experiment import load_qick_iq_arrays
+    from dc_voltage_calibration import load_dc_voltage_calibration
 
 
 INPUT_MODES = ("voltage", "adc", "current")
@@ -48,6 +50,11 @@ DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "window": "flattop",
     "detrend": "constant",
     "nfft": 0,
+    "dc_voltage_calibration_enabled": False,
+    "dc_voltage_calibration_database_path": "",
+    "dc_voltage_calibration_run_id": 0,
+    "dc_voltage_calibration_readout_ch": 0,
+    "dc_voltage_calibration_input_gain_db": 0.0,
 }
 
 
@@ -57,6 +64,15 @@ def _finite_positive(value: Any, name: str) -> float:
     result = float(value)
     if not isfinite(result) or result <= 0.0:
         raise ValueError(f"{name} must be positive and finite")
+    return result
+
+
+def _finite(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be numeric")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{name} must be finite")
     return result
 
 
@@ -81,7 +97,14 @@ def normalize_noise_analysis_settings(
     settings["database_path"] = str(settings["database_path"]).strip()
     if not settings["database_path"]:
         raise ValueError("noise-analysis database path must not be empty")
-    for name in ("run_id", "point_index", "repetition_index", "nfft"):
+    for name in (
+        "run_id",
+        "point_index",
+        "repetition_index",
+        "nfft",
+        "dc_voltage_calibration_run_id",
+        "dc_voltage_calibration_readout_ch",
+    ):
         settings[name] = _nonnegative_integer(settings[name], name)
     settings["transimpedance_gain_v_per_a"] = _finite_positive(
         settings["transimpedance_gain_v_per_a"],
@@ -94,6 +117,24 @@ def normalize_noise_analysis_settings(
     settings["sample_rate_hz"] = _finite_positive(
         settings["sample_rate_hz"],
         "sample_rate_hz",
+    )
+    calibration_enabled = settings["dc_voltage_calibration_enabled"]
+    if not isinstance(calibration_enabled, (bool, np.bool_)):
+        raise TypeError("dc_voltage_calibration_enabled must be boolean")
+    settings["dc_voltage_calibration_enabled"] = bool(calibration_enabled)
+    settings["dc_voltage_calibration_database_path"] = str(
+        settings["dc_voltage_calibration_database_path"]
+    ).strip()
+    if (
+        settings["dc_voltage_calibration_enabled"]
+        and not settings["dc_voltage_calibration_database_path"]
+    ):
+        raise ValueError(
+            "DC voltage calibration database path must not be empty"
+        )
+    settings["dc_voltage_calibration_input_gain_db"] = _finite(
+        settings["dc_voltage_calibration_input_gain_db"],
+        "dc_voltage_calibration_input_gain_db",
     )
     settings["input_mode"] = str(settings["input_mode"]).lower()
     settings["window"] = str(settings["window"]).lower()
@@ -438,6 +479,8 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._collection: Optional[NoiseTraceCollection] = None
         self._result: Optional[NoiseAnalysisResult] = None
+        self._dc_calibration_cache_key = None
+        self._dc_calibration_cache = None
         outer = QtWidgets.QVBoxLayout(self)
 
         source_group = QtWidgets.QGroupBox("I Trace Source", self)
@@ -499,6 +542,64 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         conversion_form.addRow("ADC input scale:", self.input_scale)
         outer.addWidget(conversion_group)
 
+        self.dc_calibration_group = QtWidgets.QGroupBox(
+            "Apply DC Input Voltage Calibration",
+            self,
+        )
+        self.dc_calibration_group.setCheckable(True)
+        self.dc_calibration_group.setChecked(False)
+        calibration_form = QtWidgets.QFormLayout(self.dc_calibration_group)
+        self.dc_calibration_path = QtWidgets.QLineEdit(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_path.setPlaceholderText(
+            "QCoDeS DB containing a DC Voltage calibration run"
+        )
+        self.dc_calibration_browse = QtWidgets.QToolButton(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_browse.setText("...")
+        self.dc_calibration_browse.setToolTip(
+            "Select a DC voltage calibration database"
+        )
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.addWidget(self.dc_calibration_path, 1)
+        calibration_path_row.addWidget(self.dc_calibration_browse)
+        self.dc_calibration_run_id = QtWidgets.QSpinBox(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_run_id.setRange(0, 2_147_483_647)
+        self.dc_calibration_run_id.setSpecialValueText(
+            "Latest matching channel/gain"
+        )
+        self.dc_calibration_readout_ch = QtWidgets.QSpinBox(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_readout_ch.setRange(0, 255)
+        self.dc_calibration_input_gain = QtWidgets.QDoubleSpinBox(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_input_gain.setRange(-6.0, 26.0)
+        self.dc_calibration_input_gain.setDecimals(2)
+        self.dc_calibration_input_gain.setSuffix(" dB")
+        self.dc_calibration_status = QtWidgets.QLabel(
+            "Disabled",
+            self.dc_calibration_group,
+        )
+        self.dc_calibration_status.setWordWrap(True)
+        calibration_form.addRow("Calibration DB:", calibration_path_row)
+        calibration_form.addRow("Run ID:", self.dc_calibration_run_id)
+        calibration_form.addRow(
+            "Readout channel:",
+            self.dc_calibration_readout_ch,
+        )
+        calibration_form.addRow(
+            "DC input gain:",
+            self.dc_calibration_input_gain,
+        )
+        calibration_form.addRow("Status:", self.dc_calibration_status)
+        outer.addWidget(self.dc_calibration_group)
+
         spectrum_group = QtWidgets.QGroupBox("Spectrum", self)
         spectrum_form = QtWidgets.QFormLayout(spectrum_group)
         self.sample_rate = QtWidgets.QDoubleSpinBox(spectrum_group)
@@ -538,6 +639,24 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.point_index.valueChanged.connect(self._selection_changed)
         self.repetition_index.valueChanged.connect(self._selection_changed)
         self.input_mode.currentIndexChanged.connect(self._update_mode_controls)
+        self.dc_calibration_group.toggled.connect(
+            self._calibration_controls_changed
+        )
+        self.dc_calibration_path.editingFinished.connect(
+            self._calibration_controls_changed
+        )
+        self.dc_calibration_run_id.valueChanged.connect(
+            self._calibration_controls_changed
+        )
+        self.dc_calibration_readout_ch.valueChanged.connect(
+            self._calibration_controls_changed
+        )
+        self.dc_calibration_input_gain.valueChanged.connect(
+            self._calibration_controls_changed
+        )
+        self.dc_calibration_browse.clicked.connect(
+            self._browse_dc_calibration
+        )
         self._update_mode_controls()
 
     def _browse_database(self) -> None:
@@ -558,6 +677,65 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             )
             return
         self.load_requested.emit(path, self.run_id.value())
+
+    def _browse_dc_calibration(self) -> None:
+        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select DC voltage calibration database",
+            self.dc_calibration_path.text().strip(),
+            "SQLite database (*.db);;All files (*)",
+        )
+        if path:
+            self.dc_calibration_path.setText(path)
+            self._calibration_controls_changed()
+
+    def _calibration_controls_changed(self, *_args) -> None:
+        self._dc_calibration_cache_key = None
+        self._dc_calibration_cache = None
+        if not self.dc_calibration_group.isChecked():
+            self.dc_calibration_status.setText("Disabled")
+        elif self._collection is not None:
+            self.analyze_selected_trace()
+
+    def _selected_dc_calibration(self, config: NoiseAnalysisConfig):
+        if not self.dc_calibration_group.isChecked():
+            self.dc_calibration_status.setText("Disabled")
+            return None
+        unit = "" if self._collection is None else self._collection.unit
+        if str(unit).strip().lower() in {"v", "a"}:
+            self.dc_calibration_status.setText(
+                f"Not applied: loaded trace is already stored in {unit}"
+            )
+            return None
+        if config.input_mode != "adc":
+            self.dc_calibration_status.setText(
+                "Not applied: select 'ADC units scaled to volts' for a raw trace"
+            )
+            return None
+        path = self.dc_calibration_path.text().strip()
+        if not path:
+            raise ValueError("DC voltage calibration database path is empty")
+        key = (
+            str(Path(path).expanduser()),
+            self.dc_calibration_run_id.value(),
+            self.dc_calibration_readout_ch.value(),
+            self.dc_calibration_input_gain.value(),
+        )
+        if key != self._dc_calibration_cache_key:
+            self._dc_calibration_cache = load_dc_voltage_calibration(
+                path,
+                readout_ch=self.dc_calibration_readout_ch.value(),
+                input_dc_gain_db=self.dc_calibration_input_gain.value(),
+                run_id=self.dc_calibration_run_id.value(),
+            )
+            self._dc_calibration_cache_key = key
+        calibration = self._dc_calibration_cache
+        self.dc_calibration_status.setText(
+            f"Run {calibration.run_id}: subtract offset "
+            f"{calibration.offset_adc:.6g} ADC, divide by "
+            f"{calibration.response_adc_per_v:.6g} ADC/V"
+        )
+        return calibration
 
     def _selection_changed(self, _value: int) -> None:
         if self._collection is not None:
@@ -642,18 +820,36 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             self.statistics.setText("Load an I trace to calculate noise.")
             return None
         try:
+            trace = self._collection.trace(
+                self.point_index.value(), self.repetition_index.value()
+            )
+            config = self._config()
+            input_unit = self._collection.unit
+            calibration = self._selected_dc_calibration(config)
+            if calibration is not None:
+                trace = calibration.convert_adc(trace)
+                config = NoiseAnalysisConfig(
+                    input_mode="voltage",
+                    transimpedance_gain_v_per_a=(
+                        config.transimpedance_gain_v_per_a
+                    ),
+                    input_scale_v_per_unit=1.0,
+                    sample_rate_hz=config.sample_rate_hz,
+                    window=config.window,
+                    detrend=config.detrend,
+                    nfft=config.nfft,
+                )
+                input_unit = f"V (DC calibration Run {calibration.run_id})"
             result = analyze_i_trace(
-                self._collection.trace(
-                    self.point_index.value(), self.repetition_index.value()
-                ),
-                self._config(),
+                trace,
+                config,
                 source=(
                     f"{self._collection.source}, point {self.point_index.value()}, "
                     f"rep {self.repetition_index.value()}"
                 ),
-                input_unit=self._collection.unit,
+                input_unit=input_unit,
             )
-        except (RuntimeError, TypeError, ValueError) as exc:
+        except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
             self.statistics.setText(f"Analysis failed: {exc}")
             return None
         self._result = result
@@ -694,6 +890,21 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             "window": self.window.currentText(),
             "detrend": self.detrend.currentText(),
             "nfft": self.nfft.value(),
+            "dc_voltage_calibration_enabled": (
+                self.dc_calibration_group.isChecked()
+            ),
+            "dc_voltage_calibration_database_path": (
+                self.dc_calibration_path.text().strip()
+            ),
+            "dc_voltage_calibration_run_id": (
+                self.dc_calibration_run_id.value()
+            ),
+            "dc_voltage_calibration_readout_ch": (
+                self.dc_calibration_readout_ch.value()
+            ),
+            "dc_voltage_calibration_input_gain_db": (
+                self.dc_calibration_input_gain.value()
+            ),
         }
 
     def load_settings(self, values: Mapping[str, Any]) -> None:
@@ -712,6 +923,27 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.window.setCurrentText(settings["window"])
         self.detrend.setCurrentText(settings["detrend"])
         self.nfft.setValue(settings["nfft"])
+        with QtCore.QSignalBlocker(self.dc_calibration_group):
+            self.dc_calibration_group.setChecked(
+                settings["dc_voltage_calibration_enabled"]
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_path):
+            self.dc_calibration_path.setText(
+                settings["dc_voltage_calibration_database_path"]
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_run_id):
+            self.dc_calibration_run_id.setValue(
+                settings["dc_voltage_calibration_run_id"]
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_readout_ch):
+            self.dc_calibration_readout_ch.setValue(
+                settings["dc_voltage_calibration_readout_ch"]
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_input_gain):
+            self.dc_calibration_input_gain.setValue(
+                settings["dc_voltage_calibration_input_gain_db"]
+            )
+        self._calibration_controls_changed()
         self._update_mode_controls()
 
 

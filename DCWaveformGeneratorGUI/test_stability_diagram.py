@@ -314,20 +314,44 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert restored.settings_dict() == saved
 
     dc_changes = []
+    calibration_changes = []
     panel.dc_measure_changed.connect(
         lambda enabled, gain: dc_changes.append((enabled, gain))
     )
-    panel.set_dc_measure_context("DC_In", True, 2.0e6)
+    panel.dc_calibration_changed.connect(
+        lambda enabled, path, run_id: calibration_changes.append(
+            (enabled, path, run_id)
+        )
+    )
+    panel.set_dc_measure_context(
+        "DC_In",
+        True,
+        2.0e6,
+        True,
+        "dc_calibration.db",
+        4,
+    )
     assert panel.dc_measure_mode.isChecked() is True
     assert panel.dc_measure_mode.isEnabled() is True
     assert panel.dc_measure_gain_v_per_a.isEnabled() is True
+    assert panel.dc_calibration_group.isChecked() is True
+    assert panel.dc_calibration_group.isEnabled() is True
+    assert panel.dc_calibration_path.text() == "dc_calibration.db"
+    assert panel.dc_calibration_run_id.value() == 4
     panel.dc_measure_gain_v_per_a.setValue(3.0e6)
+    panel.dc_calibration_run_id.setValue(5)
     app.processEvents()
     assert dc_changes[-1] == (True, 3.0e6)
+    assert calibration_changes[-1] == (True, "dc_calibration.db", 5)
+    calibrated_settings = panel.settings_dict()
+    restored.load_settings(calibrated_settings)
+    assert restored.settings_dict() == calibrated_settings
     panel.set_dc_measure_context("RF_In", True, 4.0e6)
     assert panel.dc_measure_mode.isChecked() is False
     assert panel.dc_measure_mode.isEnabled() is False
     assert panel.dc_measure_gain_v_per_a.isEnabled() is False
+    assert panel.dc_calibration_group.isChecked() is False
+    assert panel.dc_calibration_group.isEnabled() is False
 
     panel.set_running(True, "running")
     assert panel.start_button.isEnabled() is False

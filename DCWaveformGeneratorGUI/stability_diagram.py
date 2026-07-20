@@ -203,6 +203,9 @@ def default_stability_settings(
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
         "database_path": DEFAULT_STABILITY_DB_PATH,
+        "dc_voltage_calibration_enabled": False,
+        "dc_voltage_calibration_database_path": "",
+        "dc_voltage_calibration_run_id": 0,
     }
 
 
@@ -269,6 +272,34 @@ def normalize_stability_settings(
     if not database_path:
         raise ValueError("stability database path must not be empty")
     normalized["database_path"] = database_path
+    calibration_enabled = settings.get(
+        "dc_voltage_calibration_enabled",
+        defaults["dc_voltage_calibration_enabled"],
+    )
+    if not isinstance(calibration_enabled, (bool, np.bool_)):
+        raise TypeError(
+            "stability DC voltage calibration enabled must be boolean"
+        )
+    calibration_path = str(
+        settings.get(
+            "dc_voltage_calibration_database_path",
+            defaults["dc_voltage_calibration_database_path"],
+        )
+    ).strip()
+    if calibration_enabled and not calibration_path:
+        raise ValueError(
+            "stability DC voltage calibration database path must not be empty"
+        )
+    normalized["dc_voltage_calibration_enabled"] = bool(calibration_enabled)
+    normalized["dc_voltage_calibration_database_path"] = calibration_path
+    normalized["dc_voltage_calibration_run_id"] = _integer(
+        settings.get(
+            "dc_voltage_calibration_run_id",
+            defaults["dc_voltage_calibration_run_id"],
+        ),
+        "stability DC voltage calibration Run ID",
+        0,
+    )
     return normalized
 
 
@@ -796,6 +827,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()
     single_shot_requested = QtCore.pyqtSignal()
     dc_measure_changed = QtCore.pyqtSignal(bool, float)
+    dc_calibration_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
 
@@ -848,6 +880,42 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.dc_measure_gain_v_per_a,
         )
         controls.addWidget(acquisition)
+
+        self.dc_calibration_group = QtWidgets.QGroupBox(
+            "Apply DC Input Voltage Calibration",
+            controls_content,
+        )
+        self.dc_calibration_group.setCheckable(True)
+        self.dc_calibration_group.setChecked(False)
+        calibration_form = QtWidgets.QFormLayout(self.dc_calibration_group)
+        self.dc_calibration_path = QtWidgets.QLineEdit(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_path.setPlaceholderText(
+            "QCoDeS DB containing a DC Voltage calibration run"
+        )
+        self.dc_calibration_browse = QtWidgets.QToolButton(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_browse.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.dc_calibration_browse.setToolTip(
+            "Choose the DC voltage calibration database"
+        )
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.addWidget(self.dc_calibration_path, 1)
+        calibration_path_row.addWidget(self.dc_calibration_browse)
+        self.dc_calibration_run_id = QtWidgets.QSpinBox(
+            self.dc_calibration_group
+        )
+        self.dc_calibration_run_id.setRange(0, (1 << 31) - 1)
+        self.dc_calibration_run_id.setSpecialValueText(
+            "Latest matching channel/gain"
+        )
+        calibration_form.addRow("Calibration DB:", calibration_path_row)
+        calibration_form.addRow("Run ID:", self.dc_calibration_run_id)
+        controls.addWidget(self.dc_calibration_group)
 
         database_group = QtWidgets.QGroupBox(
             "Single-Shot Database",
@@ -930,6 +998,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.valueChanged.connect(
             self._emit_dc_measure_changed
         )
+        self.dc_calibration_group.toggled.connect(
+            self._emit_dc_calibration_changed
+        )
+        self.dc_calibration_path.editingFinished.connect(
+            self._emit_dc_calibration_changed
+        )
+        self.dc_calibration_run_id.valueChanged.connect(
+            self._emit_dc_calibration_changed
+        )
+        self.dc_calibration_browse.clicked.connect(
+            self._browse_dc_calibration
+        )
         self._targets_available = False
         self._dc_input_available = False
         self._running = False
@@ -942,6 +1022,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.setEnabled(
             editable and self.dc_measure_mode.isChecked()
         )
+        self.dc_calibration_group.setEnabled(editable)
 
     def _emit_dc_measure_changed(self, *_args) -> None:
         self._update_dc_measure_controls()
@@ -950,11 +1031,33 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.dc_measure_gain_v_per_a.value(),
         )
 
+    def _emit_dc_calibration_changed(self, *_args) -> None:
+        self._update_dc_measure_controls()
+        self.dc_calibration_changed.emit(
+            self.dc_calibration_group.isChecked(),
+            self.dc_calibration_path.text().strip(),
+            self.dc_calibration_run_id.value(),
+        )
+
+    def _browse_dc_calibration(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose DC voltage calibration database",
+            self.dc_calibration_path.text().strip(),
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.dc_calibration_path.setText(path)
+            self._emit_dc_calibration_changed()
+
     def set_dc_measure_context(
         self,
         input_board_type: str,
         enabled: bool,
         gain_v_per_a: float,
+        calibration_enabled: bool = False,
+        calibration_database_path: str = "",
+        calibration_run_id: int = 0,
     ) -> None:
         """Mirror the shared FIR readout measurement settings."""
         self._dc_input_available = str(input_board_type) == "DC_In"
@@ -964,6 +1067,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             )
         with QtCore.QSignalBlocker(self.dc_measure_gain_v_per_a):
             self.dc_measure_gain_v_per_a.setValue(float(gain_v_per_a))
+        with QtCore.QSignalBlocker(self.dc_calibration_group):
+            self.dc_calibration_group.setChecked(
+                bool(calibration_enabled) if self._dc_input_available else False
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_path):
+            self.dc_calibration_path.setText(str(calibration_database_path))
+        with QtCore.QSignalBlocker(self.dc_calibration_run_id):
+            self.dc_calibration_run_id.setValue(int(calibration_run_id))
         self._update_dc_measure_controls()
 
     def refresh_targets(
@@ -1036,6 +1147,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
             "database_path": self.database_path_value(),
+            "dc_voltage_calibration_enabled": (
+                self.dc_calibration_group.isChecked()
+            ),
+            "dc_voltage_calibration_database_path": (
+                self.dc_calibration_path.text().strip()
+            ),
+            "dc_voltage_calibration_run_id": (
+                self.dc_calibration_run_id.value()
+            ),
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
@@ -1045,7 +1165,25 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.database_path.setText(
             str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
         )
+        with QtCore.QSignalBlocker(self.dc_calibration_group):
+            self.dc_calibration_group.setChecked(
+                bool(settings.get("dc_voltage_calibration_enabled", False))
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_path):
+            self.dc_calibration_path.setText(
+                str(
+                    settings.get(
+                        "dc_voltage_calibration_database_path",
+                        "",
+                    )
+                )
+            )
+        with QtCore.QSignalBlocker(self.dc_calibration_run_id):
+            self.dc_calibration_run_id.setValue(
+                int(settings.get("dc_voltage_calibration_run_id", 0))
+            )
         self._update_point_count()
+        self._update_dc_measure_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)

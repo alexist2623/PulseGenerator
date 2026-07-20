@@ -12,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PyQt5 import QtWidgets
 
+import noise_analysis as noise_module
+from dc_voltage_calibration import DcVoltageCalibration
 from noise_analysis import (
     DEFAULT_NOISE_ANALYSIS_SETTINGS,
     NoiseAnalysisConfig,
@@ -116,3 +118,95 @@ def test_noise_panel_selects_point_and_repetition_and_round_trips_settings():
     app.processEvents()
     panel.close()
     restored.close()
+
+
+def test_noise_panel_applies_dc_calibration_offset_before_current_conversion(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    calibration_path = tmp_path / "dc_calibration.db"
+    calibration = DcVoltageCalibration(
+        database_path=calibration_path,
+        run_id=12,
+        output_ch=1,
+        readout_ch=2,
+        input_dc_gain_db=6.0,
+        voltage_min_mv=-800.0,
+        voltage_max_mv=800.0,
+        voltage_points=33,
+        offset_adc=120.0,
+        response_adc_per_v=400.0,
+        rmse_adc=0.0,
+        r_squared=1.0,
+    )
+    calls = []
+
+    def fake_load(path, *, readout_ch, input_dc_gain_db, run_id):
+        calls.append((str(path), readout_ch, input_dc_gain_db, run_id))
+        return calibration
+
+    monkeypatch.setattr(
+        noise_module,
+        "load_dc_voltage_calibration",
+        fake_load,
+    )
+    adc_trace = 120.0 + 400.0 * np.linspace(-0.25, 0.25, 64)
+    panel = NoiseAnalysisPanel(default_database_path="noise.db")
+    panel.set_collection(NoiseTraceCollection(
+        i_traces=adc_trace.reshape(1, 1, -1),
+        sample_rate_hz=1.0e6,
+        unit="ADC units",
+        source="raw DC input",
+    ))
+    panel.transimpedance_gain.setValue(2.0)
+    panel.dc_calibration_path.setText(str(calibration_path))
+    panel.dc_calibration_run_id.setValue(12)
+    panel.dc_calibration_readout_ch.setValue(2)
+    panel.dc_calibration_input_gain.setValue(6.0)
+    panel.dc_calibration_group.setChecked(True)
+    result = panel.analyze_selected_trace()
+
+    assert result is not None
+    expected_voltage = (adc_trace - 120.0) / 400.0
+    np.testing.assert_allclose(result.input_trace, expected_voltage)
+    np.testing.assert_allclose(result.current_a, expected_voltage / 2.0)
+    assert result.input_unit == "V (DC calibration Run 12)"
+    assert "subtract offset 120" in panel.dc_calibration_status.text()
+    assert calls[-1] == (str(calibration_path), 2, 6.0, 12)
+    settings = panel.settings_dict()
+    assert settings["dc_voltage_calibration_enabled"] is True
+    restored = NoiseAnalysisPanel(default_database_path="other.db")
+    restored.load_settings(settings)
+    assert restored.settings_dict() == settings
+    app.processEvents()
+    panel.close()
+    restored.close()
+
+
+def test_noise_panel_does_not_double_calibrate_saved_voltage_trace(monkeypatch):
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="noise.db")
+    panel.dc_calibration_path.setText("unused.db")
+    panel.dc_calibration_group.setChecked(True)
+    monkeypatch.setattr(
+        noise_module,
+        "load_dc_voltage_calibration",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("calibration loader must not be called")
+        ),
+    )
+    voltage = np.linspace(-0.1, 0.1, 64)
+    panel.set_collection(NoiseTraceCollection(
+        i_traces=voltage.reshape(1, 1, -1),
+        sample_rate_hz=1.0e6,
+        unit="V",
+        source="already calibrated",
+    ))
+    result = panel.analyze_selected_trace()
+
+    assert result is not None
+    np.testing.assert_allclose(result.input_trace, voltage)
+    assert "already stored in V" in panel.dc_calibration_status.text()
+    app.processEvents()
+    panel.close()

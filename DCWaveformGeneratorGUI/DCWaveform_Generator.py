@@ -195,7 +195,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 17
+SETTINGS_VERSION = 18
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -2335,9 +2335,6 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.dc_voltage_calibration_browse.setToolTip(
             "Choose DC voltage calibration database"
         )
-        calibration_path_row = QtWidgets.QHBoxLayout()
-        calibration_path_row.addWidget(self.dc_voltage_calibration_path, 1)
-        calibration_path_row.addWidget(self.dc_voltage_calibration_browse)
         self.dc_voltage_calibration_run_id = QtWidgets.QSpinBox()
         self.dc_voltage_calibration_run_id.setRange(0, (1 << 31) - 1)
         self.dc_voltage_calibration_run_id.setSpecialValueText(
@@ -2360,9 +2357,6 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow(self.input_condition_label, self.input_condition_stack)
         form.addRow(self.dc_measure_mode)
         form.addRow("DC measurement gain:", self.dc_measure_gain_v_per_a)
-        form.addRow(self.dc_voltage_calibration_enabled)
-        form.addRow("DC calibration DB:", calibration_path_row)
-        form.addRow("DC calibration Run ID:", self.dc_voltage_calibration_run_id)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
@@ -2576,9 +2570,27 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         """Select a completed DC calibration for subsequent measurements."""
         if self.input_board_type.currentText() != "DC_In":
             self.input_board_type.setCurrentText("DC_In")
-        self.dc_voltage_calibration_path.setText(str(database_path))
-        self.dc_voltage_calibration_run_id.setValue(int(run_id))
-        self.dc_voltage_calibration_enabled.setChecked(True)
+        self.set_dc_voltage_calibration_selection(
+            True,
+            database_path,
+            run_id,
+        )
+
+    def set_dc_voltage_calibration_selection(
+        self,
+        enabled: bool,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        """Update the shared DC calibration selection from another tab."""
+        if enabled and self.input_board_type.currentText() != "DC_In":
+            raise ValueError("DC voltage calibration requires the DC_In input board")
+        with QtCore.QSignalBlocker(self.dc_voltage_calibration_path):
+            self.dc_voltage_calibration_path.setText(str(database_path))
+        with QtCore.QSignalBlocker(self.dc_voltage_calibration_run_id):
+            self.dc_voltage_calibration_run_id.setValue(int(run_id))
+        with QtCore.QSignalBlocker(self.dc_voltage_calibration_enabled):
+            self.dc_voltage_calibration_enabled.setChecked(bool(enabled))
         self._update_board_controls()
         self._emit_spec()
 
@@ -3889,6 +3901,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_panel.dc_measure_changed.connect(
             self._on_stability_dc_measure_changed
         )
+        self._stability_panel.dc_calibration_changed.connect(
+            self._on_stability_dc_calibration_changed
+        )
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
@@ -3935,6 +3950,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._calibration_panel.dc_voltage_requested.connect(
             lambda: self._run_power_calibration("dc_voltage")
+        )
+        self._calibration_panel.dc_application_changed.connect(
+            self._on_calibration_dc_application_changed
         )
         self._calibration_panel.path_settings_applied.connect(
             self._apply_rf_path_settings
@@ -4691,6 +4709,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             configured.input_board_type,
             configured.dc_measure_mode,
             configured.dc_measure_gain_v_per_a,
+            configured.dc_voltage_calibration_enabled,
+            configured.dc_voltage_calibration_database_path,
+            configured.dc_voltage_calibration_run_id,
         )
         if spec is None:
             self.statusBar().showMessage("RF readout disabled")
@@ -4721,6 +4742,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         gain_v_per_a: float,
     ) -> None:
         self._rf_readout_panel.set_dc_measurement(enabled, gain_v_per_a)
+
+    def _on_stability_dc_calibration_changed(
+        self,
+        enabled: bool,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        self._calibration_panel.set_dc_application_selection(
+            enabled,
+            database_path,
+            run_id,
+        )
+
+    def _on_calibration_dc_application_changed(
+        self,
+        enabled: bool,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        if enabled:
+            self._rf_readout_panel.set_dc_voltage_calibration(
+                database_path,
+                run_id,
+            )
+        else:
+            self._rf_readout_panel.set_dc_voltage_calibration_selection(
+                False,
+                "",
+                0,
+            )
 
     def _on_bias_t_changed(
         self,
@@ -5405,12 +5456,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_calibration_finished(self, stored) -> None:
         self._calibration_panel.show_result(stored)
-        result = getattr(stored, "result", None)
-        if isinstance(result, Mapping) and "calibration" in result:
-            self._rf_readout_panel.set_dc_voltage_calibration(
-                str(stored.database_path),
-                int(stored.run_id),
-            )
         self.statusBar().showMessage(
             f"Calibration Run {stored.run_id} saved to {stored.database_path}"
         )
@@ -6196,6 +6241,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         raw_output_calibration = raw_calibration.get("output", {})
         raw_input_calibration = raw_calibration.get("input", {})
         raw_dc_voltage_calibration = raw_calibration.get("dc_voltage", {})
+        dc_application_explicit = "dc_voltage_application" in raw_calibration
+        raw_dc_application = raw_calibration.get(
+            "dc_voltage_application",
+            calibration_defaults["dc_voltage_application"],
+        )
         if not isinstance(raw_output_calibration, dict) or not isinstance(
             raw_input_calibration,
             dict,
@@ -6203,6 +6253,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise TypeError("calibration output and input must be JSON objects")
         if not isinstance(raw_dc_voltage_calibration, dict):
             raise TypeError("calibration dc_voltage must be a JSON object")
+        if not isinstance(raw_dc_application, dict):
+            raise TypeError(
+                "calibration dc_voltage_application must be a JSON object"
+            )
         output_calibration_values = {
             **calibration_defaults["output"],
             **raw_output_calibration,
@@ -6253,6 +6307,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     f"calibration input plot {axis_name} must be linear or log"
                 )
             input_calibration_plot[axis_name] = axis_scale
+        dc_application_enabled = self._json_bool(
+            raw_dc_application.get("enabled", False),
+            "DC voltage calibration application enabled",
+        )
+        dc_application_database_path = str(
+            raw_dc_application.get(
+                "database_path",
+                calibration_database_path,
+            )
+        ).strip()
+        if dc_application_enabled and not dc_application_database_path:
+            raise ValueError(
+                "DC voltage calibration application database path must not be empty"
+            )
+        dc_application_run_id = self._json_int(
+            raw_dc_application.get("run_id", 0),
+            "DC voltage calibration application Run ID",
+        )
         output_calibration_settings = asdict(output_calibration)
         input_calibration_settings = asdict(input_calibration)
         dc_voltage_calibration_settings = asdict(dc_voltage_calibration)
@@ -6265,6 +6337,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "output": output_calibration_settings,
             "input": input_calibration_settings,
             "dc_voltage": dc_voltage_calibration_settings,
+            "dc_voltage_application": {
+                "enabled": dc_application_enabled,
+                "database_path": dc_application_database_path,
+                "run_id": dc_application_run_id,
+            },
             "input_plot": input_calibration_plot,
         }
 
@@ -6420,6 +6497,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "filter_bandwidth": readout_spec.filter_bandwidth,
             "nqz": readout_spec.nqz,
         }
+        if not dc_application_explicit:
+            calibration_settings["dc_voltage_application"] = {
+                "enabled": readout_spec.dc_voltage_calibration_enabled,
+                "database_path": (
+                    readout_spec.dc_voltage_calibration_database_path
+                    or calibration_database_path
+                ),
+                "run_id": readout_spec.dc_voltage_calibration_run_id,
+            }
 
         return {
             "pulses": pulses,

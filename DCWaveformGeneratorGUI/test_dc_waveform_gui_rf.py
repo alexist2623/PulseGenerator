@@ -204,6 +204,11 @@ def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     panel.filter_bandwidth.setValue(0.75)
     app.processEvents()
 
+    calibration_row, _role = panel.layout().getWidgetPosition(
+        panel.dc_voltage_calibration_enabled
+    )
+    assert calibration_row == -1
+
     spec = panel.spec()
     assert spec == QickDdrReadoutSpec(
         ro_ch=2,
@@ -524,6 +529,11 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     window._rf_readout_panel.input_board_type.setCurrentText("DC_In")
     window._rf_readout_panel.dc_measure_mode.setChecked(True)
     window._rf_readout_panel.dc_measure_gain_v_per_a.setValue(2.0e6)
+    window._calibration_panel.set_dc_application_selection(
+        True,
+        "dc_calibration.db",
+        7,
+    )
     window._stability_panel.x_axis.start_mv.setValue(-200.0)
     window._stability_panel.x_axis.stop_mv.setValue(100.0)
     window._stability_panel.x_axis.points.setValue(5)
@@ -536,9 +546,18 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert window._stability_panel.dc_measure_mode.isChecked() is True
     assert window._stability_panel.dc_measure_mode.isEnabled() is True
     assert window._stability_panel.dc_measure_gain_v_per_a.value() == 2.0e6
+    assert window._stability_panel.dc_calibration_group.isChecked() is True
+    assert (
+        window._stability_panel.dc_calibration_path.text()
+        == "dc_calibration.db"
+    )
+    assert window._stability_panel.dc_calibration_run_id.value() == 7
     window._stability_panel.dc_measure_gain_v_per_a.setValue(3.0e6)
+    window._stability_panel.dc_calibration_run_id.setValue(8)
     app.processEvents()
     assert window._rf_readout_panel.dc_measure_gain_v_per_a.value() == 3.0e6
+    assert window._rf_readout_panel.dc_voltage_calibration_run_id.value() == 8
+    assert window._calibration_panel.dc_application_run_id.value() == 8
 
     arguments = window._stability_run_arguments(save=False)
 
@@ -554,6 +573,8 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert arguments["readout_spec"].samples_per_trigger == 16
     assert arguments["readout_spec"].dc_measure_mode is True
     assert arguments["readout_spec"].dc_measure_gain_v_per_a == 3.0e6
+    assert arguments["readout_spec"].dc_voltage_calibration_enabled is True
+    assert arguments["readout_spec"].dc_voltage_calibration_run_id == 8
     window.close()
 
 
@@ -796,7 +817,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 17
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 18
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

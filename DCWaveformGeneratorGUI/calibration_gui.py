@@ -299,6 +299,7 @@ class CalibrationPanel(QtWidgets.QWidget):
     output_requested = QtCore.pyqtSignal()
     input_requested = QtCore.pyqtSignal()
     dc_voltage_requested = QtCore.pyqtSignal()
+    dc_application_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
 
@@ -594,6 +595,44 @@ class CalibrationPanel(QtWidgets.QWidget):
         scroll, form, vertical = self._scroll_form(
             "DC_Out to DC_In Voltage Calibration"
         )
+        self.dc_application_group = QtWidgets.QGroupBox(
+            "Apply DC Input Voltage Calibration"
+        )
+        self.dc_application_group.setCheckable(True)
+        self.dc_application_group.setChecked(False)
+        application_form = QtWidgets.QFormLayout(self.dc_application_group)
+        self.dc_application_path = QtWidgets.QLineEdit(
+            DEFAULT_CALIBRATION_DB_PATH
+        )
+        self.dc_application_path.setPlaceholderText(
+            "QCoDeS DB containing a DC Voltage calibration run"
+        )
+        self.dc_application_browse = QtWidgets.QToolButton()
+        self.dc_application_browse.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.dc_application_browse.setToolTip(
+            "Choose the DC voltage calibration database to apply"
+        )
+        application_path_row = QtWidgets.QHBoxLayout()
+        application_path_row.addWidget(self.dc_application_path, 1)
+        application_path_row.addWidget(self.dc_application_browse)
+        self.dc_application_run_id = QtWidgets.QSpinBox()
+        self.dc_application_run_id.setRange(0, (1 << 31) - 1)
+        self.dc_application_run_id.setSpecialValueText(
+            "Latest matching channel/gain"
+        )
+        application_note = QtWidgets.QLabel(
+            "This selection is applied to DC_In Experiment and Stability "
+            "Diagram measurements. Run ID 0 selects the latest calibration "
+            "matching the readout channel and DC input gain."
+        )
+        application_note.setWordWrap(True)
+        application_form.addRow("Application DB:", application_path_row)
+        application_form.addRow("Run ID:", self.dc_application_run_id)
+        application_form.addRow(application_note)
+        vertical.insertWidget(0, self.dc_application_group)
+
         self.dc_voltage_output_ch = self._channel(1)
         self.dc_voltage_readout_ch = self._channel(0)
         self.dc_voltage_start_mv = QtWidgets.QDoubleSpinBox()
@@ -675,8 +714,66 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.run_dc_voltage_button.clicked.connect(
             self.dc_voltage_requested.emit
         )
-        vertical.insertWidget(1, self.run_dc_voltage_button)
+        vertical.insertWidget(2, self.run_dc_voltage_button)
+        self.dc_application_group.toggled.connect(
+            self._emit_dc_application_changed
+        )
+        self.dc_application_path.editingFinished.connect(
+            self._emit_dc_application_changed
+        )
+        self.dc_application_run_id.valueChanged.connect(
+            self._emit_dc_application_changed
+        )
+        self.dc_application_browse.clicked.connect(
+            self._browse_dc_application
+        )
         return scroll
+
+    def _browse_dc_application(self) -> None:
+        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose DC voltage calibration database to apply",
+            self.dc_application_path.text().strip(),
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.dc_application_path.setText(path)
+            self._emit_dc_application_changed()
+
+    def _emit_dc_application_changed(self, *_args) -> None:
+        self.dc_application_changed.emit(
+            self.dc_application_group.isChecked(),
+            self.dc_application_path.text().strip(),
+            self.dc_application_run_id.value(),
+        )
+
+    def set_dc_application_selection(
+        self,
+        enabled: bool,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        """Set the central DC calibration used by measurement tabs."""
+        with QtCore.QSignalBlocker(self.dc_application_path):
+            self.dc_application_path.setText(str(database_path))
+        with QtCore.QSignalBlocker(self.dc_application_run_id):
+            self.dc_application_run_id.setValue(int(run_id))
+        with QtCore.QSignalBlocker(self.dc_application_group):
+            self.dc_application_group.setChecked(bool(enabled))
+        self._emit_dc_application_changed()
+
+    def dc_application_selection(self) -> Mapping[str, Any]:
+        """Return the central DC calibration application selection."""
+        path = self.dc_application_path.text().strip()
+        if self.dc_application_group.isChecked() and not path:
+            raise ValueError(
+                "DC voltage calibration application DB must not be empty"
+            )
+        return {
+            "enabled": self.dc_application_group.isChecked(),
+            "database_path": path,
+            "run_id": self.dc_application_run_id.value(),
+        }
 
     def _update_board_controls(self, *_args) -> None:
         output_rf = self.output_board.currentText() == "RF_Out"
@@ -885,12 +982,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         input_config.pop("database_path")
         dc_voltage = asdict(self.dc_voltage_config())
         dc_voltage.pop("database_path")
+        dc_application = self.dc_application_selection()
         return {
             "database_path": self.database_path_value(),
             "selected_tab": self.tabs.currentIndex(),
             "output": output,
             "input": input_config,
             "dc_voltage": dc_voltage,
+            "dc_voltage_application": dict(dc_application),
             "input_plot": {
                 "x_scale": self.input_response_plot.x_scale_mode,
                 "y_scale": self.input_response_plot.y_scale_mode,
@@ -903,6 +1002,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         output_values = dict(settings.get("output", {}))
         input_values = dict(settings.get("input", {}))
         dc_voltage_values = dict(settings.get("dc_voltage", {}))
+        dc_application = dict(settings.get("dc_voltage_application", {}))
         scope_values = dict(output_values.pop("oscilloscope", {}))
         output = OutputPowerCalibrationConfig(
             database_path=database_path,
@@ -989,6 +1089,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_force_overwrite.setChecked(dc_voltage.force_overwrite)
         self.dc_voltage_experiment_name.setText(dc_voltage.experiment_name)
         self.dc_voltage_sample_name.setText(dc_voltage.sample_name)
+        self.set_dc_application_selection(
+            bool(dc_application.get("enabled", False)),
+            str(dc_application.get("database_path", database_path)),
+            int(dc_application.get("run_id", 0)),
+        )
         input_plot = dict(settings.get("input_plot", {}))
         self.input_response_plot.set_axis_scales(
             str(input_plot.get("x_scale", "log")),
@@ -1015,6 +1120,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.run_output_button.setEnabled(not running)
         self.run_input_button.setEnabled(not running)
         self.run_dc_voltage_button.setEnabled(not running)
+        self.dc_application_group.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
@@ -1052,6 +1158,11 @@ class CalibrationPanel(QtWidgets.QWidget):
                     f"RMSE={float(calibration.get('rmse_adc', float('nan'))):.6g} ADC"
                 )
             self.tabs.setCurrentIndex(2)
+            self.set_dc_application_selection(
+                True,
+                str(stored.database_path),
+                int(stored.run_id),
+            )
         self.set_running(
             False,
             (
@@ -1112,6 +1223,11 @@ def default_calibration_settings() -> Mapping[str, Any]:
         "output": output,
         "input": input_config,
         "dc_voltage": dc_voltage,
+        "dc_voltage_application": {
+            "enabled": False,
+            "database_path": DEFAULT_CALIBRATION_DB_PATH,
+            "run_id": 0,
+        },
         "input_plot": {
             "x_scale": "log",
             "y_scale": "log",
