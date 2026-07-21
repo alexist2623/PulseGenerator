@@ -14,7 +14,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PyQt5 import QtWidgets
 
-from calibration_gui import CalibrationPanel, input_calibration_plot_data
+from calibration_gui import (
+    CalibrationPanel,
+    dc_voltage_calibration_plot_data,
+    input_calibration_plot_data,
+)
 from power_calibration import CalibrationDatabase, MAX_QICK_GAIN
 from qick_power_calibration import (
     InputPowerCalibrationConfig,
@@ -158,6 +162,50 @@ def test_input_calibration_result_plot_has_independent_axis_scales(tmp_path):
     panel.close()
 
 
+def test_dc_voltage_calibration_result_plots_adc_against_voltage(tmp_path):
+    app = _application()
+    result = {
+        "voltages_mv": [-800.0, 0.0, 800.0],
+        "mean_adc": [-1590.0, 10.0, 1610.0],
+        "std_adc": [3.0, 2.0, 4.0],
+        "calibration": {
+            "offset_adc": 10.0,
+            "response_adc_per_v": 2000.0,
+            "r_squared": 1.0,
+            "rmse_adc": 0.0,
+        },
+    }
+    voltage, mean_adc, std_adc, fitted_adc = dc_voltage_calibration_plot_data(
+        result
+    )
+    np.testing.assert_allclose(voltage, [-800.0, 0.0, 800.0])
+    np.testing.assert_allclose(mean_adc, [-1590.0, 10.0, 1610.0])
+    np.testing.assert_allclose(std_adc, [3.0, 2.0, 4.0])
+    np.testing.assert_allclose(fitted_adc, mean_adc)
+
+    database_path = tmp_path / "dc_voltage_calibration.db"
+    stored = SimpleNamespace(
+        result=result,
+        database_path=database_path,
+        run_id=37,
+        board_type="DC_In",
+        row_count=3,
+    )
+    panel = CalibrationPanel()
+    panel.show_result(stored)
+    app.processEvents()
+
+    plot = panel.dc_voltage_response_plot
+    assert panel.tabs.currentIndex() == 2
+    np.testing.assert_allclose(plot.voltages_mv, voltage)
+    np.testing.assert_allclose(plot.mean_adc, mean_adc)
+    np.testing.assert_allclose(plot.std_adc, std_adc)
+    np.testing.assert_allclose(plot.fitted_adc, fitted_adc)
+    assert "2000 ADC/V" in plot.status.text()
+    assert panel.dc_application_run_id.value() == 37
+    panel.close()
+
+
 def test_dc_calibration_application_is_owned_by_calibration_tab(tmp_path):
     app = _application()
     database_path = tmp_path / "dc_voltage_calibration.db"
@@ -188,6 +236,58 @@ def test_dc_calibration_application_is_owned_by_calibration_tab(tmp_path):
     assert restored.settings_dict() == settings
     panel.close()
     restored.close()
+
+
+def test_calibration_subtab_paths_round_trip_independently(tmp_path):
+    _application()
+    panel = CalibrationPanel()
+    panel.database_path.setText(str(tmp_path / "gain_pwr_calb.db"))
+    output_path = panel.path_diagram_for("output").applied_values()
+    output_path.update(
+        output_ch=2,
+        output_att1_db=3.25,
+        output_att2_db=4.5,
+    )
+    input_path = panel.path_diagram_for("input").applied_values()
+    input_path.update(
+        output_ch=4,
+        readout_ch=3,
+        output_att1_db=8.0,
+        readout_attenuation_db=11.25,
+    )
+    dc_path = panel.path_diagram_for("dc_voltage").applied_values()
+    dc_path.update(
+        output_ch=6,
+        readout_ch=5,
+        readout_dc_gain_db=12.0,
+    )
+    panel.apply_path_settings(output_path, mode="output")
+    panel.apply_path_settings(input_path, mode="input")
+    panel.apply_path_settings(dc_path, mode="dc_voltage")
+
+    settings = panel.settings_dict()
+    restored = CalibrationPanel()
+    restored.load_settings(settings)
+
+    assert restored.path_diagram_for("output").applied_values() == output_path
+    assert restored.path_diagram_for("input").applied_values() == input_path
+    assert restored.path_diagram_for("dc_voltage").applied_values() == dc_path
+    assert restored.output_ch.value() == 2
+    assert restored.input_output_ch.value() == 4
+    assert restored.input_readout_ch.value() == 3
+    assert restored.dc_voltage_output_ch.value() == 6
+    assert restored.dc_voltage_readout_ch.value() == 5
+
+    legacy = dict(settings)
+    legacy.pop("paths")
+    migrated = CalibrationPanel()
+    migrated.load_settings(legacy)
+    assert migrated.path_diagram_for("output").applied_values()["output_ch"] == 2
+    assert migrated.path_diagram_for("input").applied_values()["output_ch"] == 4
+    assert migrated.path_diagram_for("dc_voltage").applied_values()["output_ch"] == 6
+    panel.close()
+    restored.close()
+    migrated.close()
 
 
 def _create_output_calibration(tmp_path, monkeypatch):

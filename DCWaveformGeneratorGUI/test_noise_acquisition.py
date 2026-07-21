@@ -1,0 +1,163 @@
+"""Direct FIR-DDR Noise Analysis acquisition tests.
+
+Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from noise_acquisition import (
+    NoiseAcquisitionConfig,
+    acquire_noise_fir_trace,
+)
+
+
+class _FakeSoc:
+    def __init__(self, samples: int):
+        self.samples = samples
+        self.calls = []
+
+    def set_nyquist(self, ch, nqz, *, blocktype):
+        self.calls.append(("nyquist", ch, nqz, blocktype))
+
+    def rfb_set_ro_rf(self, ch, attenuation):
+        self.calls.append(("rf", ch, attenuation))
+        return attenuation
+
+    def rfb_set_ro_dc(self, ch, gain):
+        self.calls.append(("dc", ch, gain))
+        return gain
+
+    def rfb_set_ro_filter(self, ch, *, fc, bw, ftype):
+        self.calls.append(("filter", ch, fc, bw, ftype))
+
+    def arm_ddr4_fir_samples(self, **kwargs):
+        self.calls.append(("arm", kwargs))
+        return 512
+
+    def get_ddr4_fir_samples(self, **kwargs):
+        self.calls.append(("read", kwargs))
+        values = np.arange(self.samples, dtype=np.int64)
+        return np.column_stack((values, -values))
+
+
+class _FakeProgram:
+    def __init__(self):
+        self.calls = []
+
+    def run_rounds(self, soc, *, progress):
+        self.calls.append((soc, progress))
+
+
+def _soccfg():
+    return {
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_output_fs_mhz": 1.0,
+            "fir_input_fs_mhz": 300.0,
+            "fir_group_delay_input_samples": 8677,
+        },
+        "readouts": [{"buf_maxlen": 4096, "b_dds": 32, "f_dds": 300.0}],
+        "tprocs": [{"f_time": 300.0}],
+    }
+
+
+def test_direct_noise_acquisition_uses_only_requested_input_and_fir_length():
+    config = NoiseAcquisitionConfig(
+        host="noise-qick",
+        ns_port=9999,
+        proxy_name="noise-proxy",
+        ro_ch=0,
+        input_board_type="RF_In",
+        nqz=2,
+        fir_samples=128,
+        readout_frequency_mhz=43.5,
+        attenuation_db=12.25,
+        filter_type="bandpass",
+        filter_cutoff_ghz=0.5,
+        filter_bandwidth_ghz=0.2,
+        margin_input_samples=600,
+        post_run_read_delay_seconds=0.25,
+    )
+    soc = _FakeSoc(config.fir_samples)
+    program = _FakeProgram()
+    connection_calls = []
+    sleeps = []
+    progress = []
+
+    def connector(**kwargs):
+        connection_calls.append(kwargs)
+        return soc, _soccfg()
+
+    result = acquire_noise_fir_trace(
+        config,
+        connector=connector,
+        program_factory=lambda soccfg, received: (
+            program
+            if soccfg is not None and received is config
+            else None
+        ),
+        sleeper=sleeps.append,
+        progress_callback=lambda percent, message: progress.append(
+            (percent, message)
+        ),
+    )
+
+    assert connection_calls == [{
+        "ns_host": "noise-qick",
+        "ns_port": 9999,
+        "proxy_name": "noise-proxy",
+    }]
+    assert ("nyquist", 0, 2, "adc") in soc.calls
+    assert ("rf", 0, 12.25) in soc.calls
+    assert ("filter", 0, 0.5, 0.2, "bandpass") in soc.calls
+    arm = next(call[1] for call in soc.calls if call[0] == "arm")
+    read = next(call[1] for call in soc.calls if call[0] == "read")
+    assert arm["n_samples"] == read["n_samples"] == 128
+    assert arm["n_triggers"] == read["n_triggers"] == 1
+    assert program.calls == [(soc, False)]
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0.25
+    assert result.iq.shape == (128, 2)
+    assert result.sample_rate_hz == 1_000_000.0
+    assert result.reserved_physical_words == 512
+    assert progress[-1] == (100, "Noise trace acquired")
+
+
+def test_direct_noise_acquisition_supports_dc_input_without_rf_filter():
+    config = NoiseAcquisitionConfig(
+        ro_ch=0,
+        input_board_type="DC_In",
+        dc_gain_db=6.0,
+        fir_samples=32,
+        post_run_read_delay_seconds=0.0,
+    )
+    soc = _FakeSoc(config.fir_samples)
+    program = _FakeProgram()
+    acquire_noise_fir_trace(
+        config,
+        connector=lambda **_kwargs: (soc, _soccfg()),
+        program_factory=lambda _soccfg, _config: program,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert ("dc", 0, 6.0) in soc.calls
+    assert not any(call[0] == "filter" for call in soc.calls)
+
+
+def test_noise_acquisition_rejects_non_fir_hwh():
+    config = NoiseAcquisitionConfig(fir_samples=16)
+    soccfg = _soccfg()
+    soccfg["ddr4_buf"]["fir_enabled"] = False
+    try:
+        acquire_noise_fir_trace(
+            config,
+            connector=lambda **_kwargs: (_FakeSoc(16), soccfg),
+            sleeper=lambda _seconds: None,
+        )
+    except RuntimeError as exc:
+        assert "FIR 300:1" in str(exc)
+    else:
+        raise AssertionError("non-FIR HWH was accepted")

@@ -137,12 +137,14 @@ except ImportError:
 
 try:
     from .noise_analysis import (
+        NoiseAcquisitionWorker,
         NoiseAnalysisPanel,
         NoiseTraceLoadWorker,
         normalize_noise_analysis_settings,
     )
 except ImportError:
     from noise_analysis import (
+        NoiseAcquisitionWorker,
         NoiseAnalysisPanel,
         NoiseTraceLoadWorker,
         normalize_noise_analysis_settings,
@@ -153,6 +155,7 @@ try:
         CalibrationPanel,
         CalibrationWorker,
         default_calibration_settings,
+        normalize_calibration_paths,
     )
     from .qick_power_calibration import (
         InputPowerCalibrationConfig,
@@ -165,6 +168,7 @@ except ImportError:
         CalibrationPanel,
         CalibrationWorker,
         default_calibration_settings,
+        normalize_calibration_paths,
     )
     from qick_power_calibration import (
         InputPowerCalibrationConfig,
@@ -195,7 +199,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 20
+SETTINGS_VERSION = 23
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -3873,16 +3877,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             parent=self,
         )
         self._stability_panel = StabilityDiagramPanel(self)
-        self._stability_rf_ports_panel = RfPortsPanel(
-            self._pulse[0], time_unit=self._time_unit, parent=self._stability_panel
-        )
-        self._stability_rf_readout_panel = RfReadoutPanel(
-            self._pulse[0], time_unit=self._time_unit, parent=self._stability_panel
-        )
-        self._stability_panel.set_rf_editors(
-            self._stability_rf_ports_panel,
-            self._stability_rf_readout_panel,
-        )
         self._stability_panel.apply_path_settings(
             self._stability_panel.front_panel_values()
         )
@@ -3914,21 +3908,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
-        self._stability_rf_readout_panel.spec_changed.connect(
-            self._on_stability_readout_spec_changed
-        )
-        self._stability_rf_ports_panel.specs_changed.connect(
-            self._sync_stability_path_from_editors
-        )
-        self._on_stability_readout_spec_changed(
-            self._stability_rf_readout_panel.spec()
-        )
-        self._stability_panel.dc_measure_changed.connect(
-            self._on_stability_dc_measure_changed
-        )
-        self._stability_panel.dc_calibration_changed.connect(
-            self._on_stability_dc_calibration_changed
-        )
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
@@ -3946,6 +3925,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_panel.front_panel_requested.connect(
             lambda: self._show_qick_front_panel("path", self._stability_panel)
         )
+        self._stability_panel.electrode_front_panel_requested.connect(
+            lambda editor: self._show_qick_front_panel("output", editor)
+        )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
         )
@@ -3961,12 +3943,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_readout_panel.front_panel_requested.connect(
             lambda panel: self._show_qick_front_panel("input", panel)
         )
-        self._stability_rf_ports_panel.front_panel_requested.connect(
-            lambda panel: self._show_qick_front_panel("output", panel)
-        )
-        self._stability_rf_readout_panel.front_panel_requested.connect(
-            lambda panel: self._show_qick_front_panel("input", panel)
-        )
         self._calibration_panel.output_requested.connect(
             lambda: self._run_power_calibration("output")
         )
@@ -3977,9 +3953,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             lambda: self._run_power_calibration("dc_voltage")
         )
         self._calibration_panel.front_panel_requested.connect(
-            lambda: self._show_qick_front_panel("path", self._calibration_panel)
+            lambda target: self._show_qick_front_panel("path", target)
         )
         self._noise_panel.load_requested.connect(self._load_noise_trace)
+        self._noise_panel.acquire_requested.connect(
+            self._run_noise_acquisition
+        )
+        self._noise_panel.front_panel_requested.connect(
+            lambda target: self._show_qick_front_panel("input", target)
+        )
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
         )
@@ -4332,8 +4314,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl.set_time_unit(unit)
         self._rf_ports_panel.set_time_unit(unit)
         self._rf_readout_panel.set_time_unit(unit)
-        self._stability_rf_ports_panel.set_time_unit(unit)
-        self._stability_rf_readout_panel.set_time_unit(unit)
         if hasattr(self._plot, "set_time_unit"):
             self._plot.set_time_unit(unit)
         for timeline in self._rf_timelines:
@@ -4748,45 +4728,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
             )
 
-    def _on_stability_readout_spec_changed(self, _spec) -> None:
-        configured = self._stability_rf_readout_panel.configured_spec()
-        self._stability_panel.set_dc_measure_context(
-            configured.input_board_type,
-            configured.dc_measure_mode,
-            configured.dc_measure_gain_v_per_a,
-            configured.dc_voltage_calibration_enabled,
-            configured.dc_voltage_calibration_database_path,
-            configured.dc_voltage_calibration_run_id,
-        )
-        self._sync_stability_path_from_editors()
-
-    def _sync_stability_path_from_editors(self, *_args) -> None:
-        self._stability_panel.path_diagram.apply_external_settings(
-            self._stability_panel.front_panel_values()
-        )
-
-    def _on_stability_dc_measure_changed(
-        self,
-        enabled: bool,
-        gain_v_per_a: float,
-    ) -> None:
-        self._stability_rf_readout_panel.set_dc_measurement(
-            enabled,
-            gain_v_per_a,
-        )
-
-    def _on_stability_dc_calibration_changed(
-        self,
-        enabled: bool,
-        database_path: str,
-        run_id: int,
-    ) -> None:
-        self._stability_rf_readout_panel.set_dc_voltage_calibration_selection(
-            enabled,
-            database_path,
-            run_id,
-        )
-
     def _on_bias_t_changed(
         self,
         enabled: bool,
@@ -4923,15 +4864,60 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         stability_config = self._stability_panel.config(
             full_scale_mv=self._qick_full_scale_mv
         )
-        rf_specs = self._stability_rf_ports_panel.specs()
-        readout_spec = self._stability_rf_readout_panel.spec()
-        if readout_spec is None:
-            raise ValueError(
-                "enable RF Readout before acquiring a stability diagram"
-            )
-        readout_spec = replace(
-            readout_spec,
+        path = dict(self._stability_panel.front_panel_values())
+        anchor_segment = stability_config.x_axis.segment_name
+        modulation_duration_us = max(
+            1.0,
+            float(stability_config.trace_samples_per_point),
+        )
+        rf_specs = (
+            QickRfPulseSpec(
+                gen_ch=int(path["output_ch"]),
+                segment_name=anchor_segment,
+                delay_us=0.0,
+                duration_us=modulation_duration_us,
+                frequency_mhz=stability_config.modulation_frequency_mhz,
+                gain=stability_config.modulation_gain,
+                att1_db=float(path["output_att1_db"]),
+                att2_db=float(path["output_att2_db"]),
+                phase_degrees=0.0,
+                nqz=int(path["output_nqz"]),
+                require_within_segment=False,
+                filter_type=str(path["output_filter_type"]),
+                filter_cutoff=float(path["output_filter_cutoff_ghz"]),
+                filter_bandwidth=float(path["output_filter_bandwidth_ghz"]),
+                output_board_type=str(path["output_board_type"]),
+            ),
+        )
+        readout_spec = QickDdrReadoutSpec(
+            ro_ch=int(path["readout_ch"]),
+            segment_name=anchor_segment,
+            delay_us=0.0,
             samples_per_trigger=stability_config.trace_samples_per_point,
+            readout_frequency_mhz=stability_config.modulation_frequency_mhz,
+            margin_input_samples=1024,
+            force_overwrite=True,
+            post_run_read_delay_seconds=0.1,
+            attenuation_db=float(path["readout_attenuation_db"]),
+            filter_type=str(path["readout_filter_type"]),
+            filter_cutoff=float(path["readout_filter_cutoff_ghz"]),
+            filter_bandwidth=float(path["readout_filter_bandwidth_ghz"]),
+            input_board_type=str(path["input_board_type"]),
+            dc_gain_db=float(path["readout_dc_gain_db"]),
+            dc_measure_mode=self._stability_panel.dc_measure_mode.isChecked(),
+            dc_measure_gain_v_per_a=(
+                self._stability_panel.dc_measure_gain_v_per_a.value()
+            ),
+            dc_voltage_calibration_enabled=(
+                self._stability_panel.dc_calibration_group.isChecked()
+            ),
+            dc_voltage_calibration_database_path=(
+                self._stability_panel.dc_calibration_path.text().strip()
+            ),
+            dc_voltage_calibration_run_id=(
+                self._stability_panel.dc_calibration_run_id.value()
+            ),
+            nqz=int(path["readout_nqz"]),
         )
         overlap = {spec.gen_ch for spec in rf_specs}.intersection(
             self._qick_awg_channels
@@ -5002,19 +4988,29 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "input": "QICK Front Panel - RF Readout",
         }
         self._qick_front_panel_dialog.setWindowTitle(titles[scope])
+        if scope == "output" and not isinstance(target, RfPulsePortPanel):
+            self._qick_front_panel_dialog.setWindowTitle(
+                "QICK Front Panel - Stability Electrode"
+            )
+            self._qick_front_panel.apply_button.setText(
+                "Update Stability Electrode"
+            )
 
         if scope == "output":
-            spec = target.configured_spec()
-            values = {
-                "output_ch": spec.gen_ch,
-                "output_board_type": spec.output_board_type,
-                "output_nqz": spec.nqz,
-                "output_att1_db": spec.att1_db,
-                "output_att2_db": spec.att2_db,
-                "output_filter_type": spec.filter_type,
-                "output_filter_cutoff_ghz": spec.filter_cutoff,
-                "output_filter_bandwidth_ghz": spec.filter_bandwidth,
-            }
+            if hasattr(target, "front_panel_values"):
+                values = dict(target.front_panel_values())
+            else:
+                spec = target.configured_spec()
+                values = {
+                    "output_ch": spec.gen_ch,
+                    "output_board_type": spec.output_board_type,
+                    "output_nqz": spec.nqz,
+                    "output_att1_db": spec.att1_db,
+                    "output_att2_db": spec.att2_db,
+                    "output_filter_type": spec.filter_type,
+                    "output_filter_cutoff_ghz": spec.filter_cutoff,
+                    "output_filter_bandwidth_ghz": spec.filter_bandwidth,
+                }
         elif scope == "input":
             spec = target.configured_spec()
             values = {
@@ -5037,7 +5033,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel_dialog.show()
         self._qick_front_panel_dialog.raise_()
         self._qick_front_panel_dialog.activateWindow()
-        if self._qick_configuration is None:
+        # A tab-local connection (currently Noise Analysis) must identify its
+        # own HWH even when another tab already populated the shared preview.
+        if self._qick_configuration is None or (
+            target is not None and hasattr(target, "connection_config")
+        ):
             QtCore.QTimer.singleShot(0, self._identify_qick_configuration)
 
     def _identify_qick_configuration(self) -> None:
@@ -5049,9 +5049,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             return
         try:
-            connection, _run = self._experiment_panel.connection_values(
-                require_run_config=False
-            )
+            target = self._qick_front_panel_target
+            if target is not None and hasattr(target, "connection_config"):
+                connection = target.connection_config()
+            else:
+                connection, _run = self._experiment_panel.connection_values(
+                    require_run_config=False
+                )
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -5089,6 +5093,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_ports_panel.set_front_panel_configuration(configuration)
         self._rf_readout_panel.set_front_panel_configuration(configuration)
         self._calibration_panel.set_front_panel_configuration(configuration)
+        self._noise_panel.set_front_panel_configuration(configuration)
         self._qick_front_panel.set_identifying(
             False,
             f"{configuration.mapped_output_count} DAC / "
@@ -5117,23 +5122,44 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         scope = str(values.get("selection_scope", "path"))
         if scope == "output":
             target = self._qick_front_panel_target
-            if not isinstance(target, RfPulsePortPanel):
+            if target is None or not hasattr(target, "apply_front_panel_settings"):
                 raise RuntimeError("RF output front-panel target is no longer available")
-            target.apply_front_panel_settings(values)
+            try:
+                target.apply_front_panel_settings(values)
+            except (TypeError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid output selection",
+                    str(exc),
+                )
+                return
             self._qick_front_panel_dialog.close()
+            target_name = (
+                f"RF output {target._index + 1}"
+                if isinstance(target, RfPulsePortPanel)
+                else "Stability electrode"
+            )
             self.statusBar().showMessage(
-                f"RF output {target._index + 1} mapped to "
+                f"{target_name} mapped to "
                 f"DAC{values['output_panel_port']} / generator {values['output_ch']}"
             )
             return
         if scope == "input":
             target = self._qick_front_panel_target
-            if not isinstance(target, RfReadoutPanel):
+            if target is None or not hasattr(target, "apply_front_panel_settings"):
                 raise RuntimeError("RF readout front-panel target is no longer available")
-            target.apply_front_panel_settings(values)
+            try:
+                target.apply_front_panel_settings(values)
+            except (TypeError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid input selection",
+                    str(exc),
+                )
+                return
             self._qick_front_panel_dialog.close()
             self.statusBar().showMessage(
-                f"RF readout mapped to ADC{values['input_panel_port']} / "
+                f"Readout mapped to ADC{values['input_panel_port']} / "
                 f"readout {values['readout_ch']}"
             )
             return
@@ -5268,6 +5294,72 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage("RF S-parameter sweep failed")
         dialog = DetailedErrorMessageBox(
             "RF S-parameter sweep failed", summary, details, self
+        )
+        dialog.exec_()
+
+    def _run_noise_acquisition(self, config) -> None:
+        """Run the Noise tab's self-contained FIR-DDR acquisition."""
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish.",
+            )
+            return
+        self._noise_panel.set_acquiring(
+            True,
+            "Connecting for independent FIR-DDR acquisition...",
+        )
+        self.statusBar().showMessage("Starting independent noise acquisition")
+        thread = QtCore.QThread(self)
+        worker = NoiseAcquisitionWorker(config)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress_changed.connect(
+            self._on_noise_acquisition_progress
+        )
+        worker.finished.connect(self._on_noise_acquisition_finished)
+        worker.failed.connect(self._on_noise_acquisition_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_noise_acquisition_progress(
+        self,
+        percent: int,
+        message: str,
+    ) -> None:
+        self._noise_panel.update_acquisition_progress(percent, message)
+        self.statusBar().showMessage(
+            f"Noise acquisition {int(percent)}%: {message}"
+        )
+
+    def _on_noise_acquisition_finished(self, collection) -> None:
+        self._noise_panel.set_acquiring(False)
+        self._noise_panel.set_collection(collection)
+        self._dock_noise.show()
+        self._dock_noise.raise_()
+        self.statusBar().showMessage(
+            f"Noise acquisition completed: {collection.sample_count:,} "
+            "FIR samples analyzed"
+        )
+
+    def _on_noise_acquisition_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown noise-acquisition error"
+        self._noise_panel.show_acquisition_error(summary)
+        self.statusBar().showMessage("Noise FIR-DDR acquisition failed")
+        dialog = DetailedErrorMessageBox(
+            "Noise FIR-DDR acquisition failed",
+            summary,
+            details,
+            self,
         )
         dialog.exec_()
 
@@ -5629,10 +5721,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_experiment_finished(self, result) -> None:
         self._experiment_panel.show_result(result)
-        try:
-            self._noise_panel.set_experiment_result(result)
-        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-            self._noise_panel.show_load_error(str(exc))
         self.statusBar().showMessage(
             f"QCoDeS run {result.run_id} saved to {result.database_path}"
         )
@@ -5705,8 +5793,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_rf_timeline()
         self._rf_ports_panel.refresh_segments(self._pulse[0])
         self._rf_readout_panel.refresh_segments(self._pulse[0])
-        self._stability_rf_ports_panel.refresh_segments(self._pulse[0])
-        self._stability_rf_readout_panel.refresh_segments(self._pulse[0])
         if self._rf_panel is None:
             return
         self._rf_panel.refresh_segments(self._pulse[0])
@@ -5821,12 +5907,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._bias_t_filter_tau_us = experiment_values["bias_t_filter_tau_us"]
         stability_settings = self._stability_panel.settings_dict()
-        stability_settings["rf_outputs"] = list(
-            self._stability_rf_ports_panel.settings()
-        )
-        stability_settings["rf_readout"] = (
-            self._stability_rf_readout_panel.settings_dict()
-        )
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
@@ -6391,6 +6471,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 **raw_dc_voltage_calibration,
             },
         )
+        calibration_paths = normalize_calibration_paths(
+            raw_calibration,
+            output_calibration,
+            input_calibration,
+            dc_voltage_calibration,
+        )
         calibration_selected_tab = self._json_int(
             raw_calibration.get(
                 "selected_tab",
@@ -6444,6 +6530,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "output": output_calibration_settings,
             "input": input_calibration_settings,
             "dc_voltage": dc_voltage_calibration_settings,
+            "paths": calibration_paths,
             "dc_voltage_application": {
                 "enabled": dc_application_enabled,
                 "database_path": dc_application_database_path,
@@ -6604,28 +6691,65 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "filter_bandwidth": readout_spec.filter_bandwidth,
             "nqz": readout_spec.nqz,
         }
-        if isinstance(raw_stability_settings, Mapping) and (
-            "rf_outputs" in raw_stability_settings
-        ):
-            stability_rf_outputs = self._decode_rf_output_entries(
-                raw_stability_settings["rf_outputs"],
-                set_names=set_names,
-                label="stability RF outputs",
-            )
-        else:
-            stability_rf_outputs = tuple(dict(entry) for entry in rf_outputs)
-        if isinstance(raw_stability_settings, Mapping) and (
-            "rf_readout" in raw_stability_settings
-        ):
-            stability_rf_readout = self._decode_rf_readout_entry(
-                raw_stability_settings["rf_readout"],
-                set_names=set_names,
-                label="stability RF readout",
-            )
-        else:
-            stability_rf_readout = dict(rf_readout)
-        stability_settings["rf_outputs"] = stability_rf_outputs
-        stability_settings["rf_readout"] = stability_rf_readout
+        # Version 20 and earlier stored a second full RF output/readout editor
+        # inside Stability Diagram.  Fold those values into the compact path
+        # and shared modulation controls when loading an old JSON file.
+        if isinstance(raw_stability_settings, Mapping):
+            legacy_outputs = raw_stability_settings.get("rf_outputs")
+            legacy_readout = raw_stability_settings.get("rf_readout")
+            path = dict(stability_settings["rf_path"])
+            if legacy_outputs:
+                decoded_outputs = self._decode_rf_output_entries(
+                    legacy_outputs,
+                    set_names=set_names,
+                    label="stability RF outputs",
+                )
+                if decoded_outputs:
+                    output = decoded_outputs[0]
+                    path.update(
+                        {
+                            "output_ch": output["gen_ch"],
+                            "output_board_type": output["output_board_type"],
+                            "output_nqz": output["nqz"],
+                            "output_att1_db": output["att1_db"],
+                            "output_att2_db": output["att2_db"],
+                            "output_filter_type": output["filter_type"],
+                            "output_filter_cutoff_ghz": output["filter_cutoff"],
+                            "output_filter_bandwidth_ghz": output["filter_bandwidth"],
+                        }
+                    )
+                    if "modulation_frequency_mhz" not in raw_stability_settings:
+                        stability_settings["modulation_frequency_mhz"] = output[
+                            "frequency_mhz"
+                        ]
+                    if "modulation_gain" not in raw_stability_settings:
+                        stability_settings["modulation_gain"] = output["gain"]
+            if legacy_readout is not None:
+                readout = self._decode_rf_readout_entry(
+                    legacy_readout,
+                    set_names=set_names,
+                    label="stability RF readout",
+                )
+                path.update(
+                    {
+                        "readout_ch": readout["ro_ch"],
+                        "input_board_type": readout["input_board_type"],
+                        "readout_nqz": readout["nqz"],
+                        "readout_attenuation_db": readout["attenuation_db"],
+                        "readout_dc_gain_db": readout["dc_gain_db"],
+                        "readout_filter_type": readout["filter_type"],
+                        "readout_filter_cutoff_ghz": readout["filter_cutoff"],
+                        "readout_filter_bandwidth_ghz": readout["filter_bandwidth"],
+                    }
+                )
+                if (
+                    "modulation_frequency_mhz" not in raw_stability_settings
+                    and not legacy_outputs
+                ):
+                    stability_settings["modulation_frequency_mhz"] = readout[
+                        "readout_frequency_mhz"
+                    ]
+            stability_settings["rf_path"] = path
         if not dc_application_explicit:
             calibration_settings["dc_voltage_application"] = {
                 "enabled": readout_spec.dc_voltage_calibration_enabled,
@@ -6749,17 +6873,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_ports_panel.load_settings(settings["rf_outputs"])
         self._rf_readout_panel.refresh_segments(self._pulse[0])
         self._rf_readout_panel.load_settings(settings["rf_readout"])
-        self._stability_rf_ports_panel.refresh_segments(self._pulse[0])
-        self._stability_rf_ports_panel.load_settings(
-            settings["stability_diagram"]["rf_outputs"]
-        )
-        self._stability_rf_readout_panel.refresh_segments(self._pulse[0])
-        self._stability_rf_readout_panel.load_settings(
-            settings["stability_diagram"]["rf_readout"]
-        )
-        self._on_stability_readout_spec_changed(
-            self._stability_rf_readout_panel.spec()
-        )
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._ddr_readout_spec = self._rf_readout_panel.spec()
@@ -7220,9 +7333,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._qick_awg_channels,
             segment_names,
         )
-        if hasattr(self, "_stability_rf_ports_panel"):
-            self._stability_rf_ports_panel.refresh_segments(self._pulse[0])
-            self._stability_rf_readout_panel.refresh_segments(self._pulse[0])
 
     def _set_x(self, idx):
         trace = self._ensure_trace_widget()

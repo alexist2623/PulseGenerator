@@ -52,6 +52,8 @@ DEFAULT_STABILITY_STOP_MV = 100.0
 DEFAULT_STABILITY_POINTS = 51
 DEFAULT_STABILITY_REPETITIONS = 1
 DEFAULT_STABILITY_TRACE_SAMPLES = 64
+DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
+DEFAULT_STABILITY_MODULATION_GAIN = 20_000
 DEFAULT_STABILITY_DB_PATH = str(Path.home() / "qick_stability_diagrams.db")
 DEFAULT_STABILITY_RF_PATH = {
     "output_ch": 0,
@@ -67,6 +69,12 @@ DEFAULT_STABILITY_RF_PATH = {
     "loss1_db": 0.0,
     "loss2_db": 0.0,
     "amplifier_gain_db": 0.0,
+    "output_filter_type": "bypass",
+    "output_filter_cutoff_ghz": 2.5,
+    "output_filter_bandwidth_ghz": 1.0,
+    "readout_filter_type": "bypass",
+    "readout_filter_cutoff_ghz": 2.5,
+    "readout_filter_bandwidth_ghz": 1.0,
 }
 
 
@@ -127,6 +135,8 @@ class StabilityDiagramConfig:
     y_axis: StabilitySweepAxis
     repetitions_per_point: int = DEFAULT_STABILITY_REPETITIONS
     trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
+    modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
+    modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
 
     def __post_init__(self) -> None:
         if self.x_axis.output_name == self.y_axis.output_name:
@@ -149,6 +159,17 @@ class StabilityDiagramConfig:
             "stability FIR trace samples per point",
             1,
         )
+        _finite_float(
+            self.modulation_frequency_mhz,
+            "stability modulation frequency",
+        )
+        modulation_gain = _integer(
+            self.modulation_gain,
+            "stability modulation gain",
+            0,
+        )
+        if modulation_gain > 32767:
+            raise ValueError("stability modulation gain must not exceed 32767")
 
     @property
     def point_count(self) -> int:
@@ -225,6 +246,8 @@ def default_stability_settings(
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
+        "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
+        "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
         "rf_path": dict(DEFAULT_STABILITY_RF_PATH),
         "database_path": DEFAULT_STABILITY_DB_PATH,
         "dc_voltage_calibration_enabled": False,
@@ -298,6 +321,20 @@ def normalize_stability_settings(
         "stability FIR trace samples per point",
         1,
     )
+    normalized["modulation_frequency_mhz"] = _finite_float(
+        settings.get(
+            "modulation_frequency_mhz",
+            defaults["modulation_frequency_mhz"],
+        ),
+        "stability modulation frequency",
+    )
+    normalized["modulation_gain"] = _integer(
+        settings.get("modulation_gain", defaults["modulation_gain"]),
+        "stability modulation gain",
+        0,
+    )
+    if normalized["modulation_gain"] > 32767:
+        raise ValueError("stability modulation gain must not exceed 32767")
     raw_rf_path = settings.get("rf_path", defaults["rf_path"])
     if not isinstance(raw_rf_path, Mapping):
         raise TypeError("stability RF path must be a JSON object")
@@ -317,8 +354,16 @@ def normalize_stability_settings(
         "loss1_db",
         "loss2_db",
         "amplifier_gain_db",
+        "output_filter_cutoff_ghz",
+        "output_filter_bandwidth_ghz",
+        "readout_filter_cutoff_ghz",
+        "readout_filter_bandwidth_ghz",
     ):
         rf_path[key] = _finite_float(rf_path[key], f"stability RF path {key}")
+    for key in ("output_filter_type", "readout_filter_type"):
+        rf_path[key] = str(rf_path[key])
+        if rf_path[key] not in {"bypass", "lowpass", "highpass", "bandpass"}:
+            raise ValueError(f"stability RF path {key} is invalid")
     rf_path["output_board_type"] = str(rf_path["output_board_type"])
     rf_path["input_board_type"] = str(rf_path["input_board_type"])
     normalized["rf_path"] = rf_path
@@ -494,12 +539,8 @@ def reduce_fir_stability_result(
         q_mean=q_mean,
         magnitude=magnitude,
         phase_deg=phase_deg,
-        x_axis_label=(
-            f"{config.x_axis.output_name} / {config.x_axis.segment_name}"
-        ),
-        y_axis_label=(
-            f"{config.y_axis.output_name} / {config.y_axis.segment_name}"
-        ),
+        x_axis_label=config.x_axis.output_name,
+        y_axis_label=config.y_axis.output_name,
         value_unit=value_unit,
         measurement_mode=measurement_mode,
         iteration=_integer(iteration, "stability iteration", 1),
@@ -644,21 +685,42 @@ class StabilityDiagramWorker(QtCore.QObject):
 class _StabilityAxisEditor(QtWidgets.QGroupBox):
     """Compact editor for one voltage axis."""
 
+    front_panel_requested = QtCore.pyqtSignal(object)
+
     def __init__(self, title: str, parent=None):
         super().__init__(title, parent)
         form = QtWidgets.QFormLayout(self)
         self.output = QtWidgets.QComboBox(self)
-        self.segment = QtWidgets.QComboBox(self)
+        self._segment_name = ""
+        self._front_panel_configuration = None
+        self.front_panel_button = QtWidgets.QPushButton(
+            "Select DAC SMA on Front Panel",
+            self,
+        )
+        self.front_panel_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.front_panel_button.clicked.connect(
+            lambda: self.front_panel_requested.emit(self)
+        )
+        self.front_panel_status = QtWidgets.QLabel("Not identified", self)
+        self.front_panel_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        front_panel_row = QtWidgets.QHBoxLayout()
+        front_panel_row.addWidget(self.front_panel_button)
+        front_panel_row.addWidget(self.front_panel_status, 1)
         self.start_mv = self._voltage_spin(DEFAULT_STABILITY_START_MV)
         self.stop_mv = self._voltage_spin(DEFAULT_STABILITY_STOP_MV)
         self.points = QtWidgets.QSpinBox(self)
         self.points.setRange(2, 1_000_000)
         self.points.setValue(DEFAULT_STABILITY_POINTS)
-        form.addRow("Virtual electrode:", self.output)
-        form.addRow("SET segment:", self.segment)
+        form.addRow("Electrode SMA:", front_panel_row)
+        form.addRow("AWG electrode:", self.output)
         form.addRow("Start:", self.start_mv)
         form.addRow("Stop:", self.stop_mv)
         form.addRow("Points:", self.points)
+        self.output.currentIndexChanged.connect(self._sync_front_panel_status)
 
     @staticmethod
     def _voltage_spin(value: float) -> QtWidgets.QDoubleSpinBox:
@@ -677,28 +739,80 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         preferred_output_index: int,
     ) -> None:
         previous_output = self.output.currentData()
-        previous_segment = self.segment.currentData()
         with QtCore.QSignalBlocker(self.output):
             self.output.clear()
             for output_name, gen_ch in outputs:
                 self.output.addItem(f"{output_name} (gen {gen_ch})", output_name)
+                self.output.setItemData(
+                    self.output.count() - 1,
+                    int(gen_ch),
+                    QtCore.Qt.UserRole + 1,
+                )
             output_index = self.output.findData(previous_output)
             if output_index < 0 and self.output.count():
                 output_index = min(preferred_output_index, self.output.count() - 1)
             self.output.setCurrentIndex(output_index)
-        with QtCore.QSignalBlocker(self.segment):
-            self.segment.clear()
-            for segment_name in segments:
-                self.segment.addItem(segment_name, segment_name)
-            segment_index = self.segment.findData(previous_segment)
-            if segment_index < 0 and self.segment.count():
-                segment_index = 0
-            self.segment.setCurrentIndex(segment_index)
+        segment_names = tuple(str(name) for name in segments)
+        if self._segment_name not in segment_names:
+            self._segment_name = segment_names[0] if segment_names else ""
+        self._sync_front_panel_status()
+
+    def current_gen_ch(self) -> int:
+        value = self.output.currentData(QtCore.Qt.UserRole + 1)
+        return -1 if value is None else int(value)
+
+    def front_panel_values(self) -> Mapping[str, Any]:
+        return {
+            "output_ch": self.current_gen_ch(),
+            "output_board_type": "DC_Out",
+            "output_nqz": 1,
+            "output_att1_db": 0.0,
+            "output_att2_db": 0.0,
+            "output_filter_type": "bypass",
+            "output_filter_cutoff_ghz": 2.5,
+            "output_filter_bandwidth_ghz": 1.0,
+        }
+
+    def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
+        generator = int(values["output_ch"])
+        match = -1
+        for index in range(self.output.count()):
+            if int(self.output.itemData(index, QtCore.Qt.UserRole + 1)) == generator:
+                match = index
+                break
+        if match < 0:
+            raise ValueError(
+                f"front-panel generator {generator} is not assigned to an AWG electrode"
+            )
+        self.output.setCurrentIndex(match)
+        panel_port = values.get("output_panel_port")
+        self.front_panel_status.setText(
+            f"DAC{int(panel_port)} / gen {generator}"
+            if panel_port is not None
+            else f"generator {generator}"
+        )
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
+        self._sync_front_panel_status()
+
+    def _sync_front_panel_status(self, *_args) -> None:
+        generator = self.current_gen_ch()
+        if self._front_panel_configuration is not None:
+            for port in self._front_panel_configuration.outputs:
+                if generator in port.qick_channels:
+                    self.front_panel_status.setText(
+                        f"{port.label} / gen {generator} / {port.board_label}"
+                    )
+                    return
+        self.front_panel_status.setText(
+            "Not identified" if generator < 0 else f"generator {generator}"
+        )
 
     def settings_dict(self) -> dict:
         return {
             "output_name": str(self.output.currentData() or ""),
-            "segment_name": str(self.segment.currentData() or ""),
+            "segment_name": self._segment_name,
             "start_mv": self.start_mv.value(),
             "stop_mv": self.stop_mv.value(),
             "points": self.points.value(),
@@ -706,11 +820,10 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         output_index = self.output.findData(str(settings["output_name"]))
-        segment_index = self.segment.findData(str(settings["segment_name"]))
-        if output_index < 0 or segment_index < 0:
+        if output_index < 0:
             raise ValueError("saved stability electrode is not present")
         self.output.setCurrentIndex(output_index)
-        self.segment.setCurrentIndex(segment_index)
+        self._segment_name = str(settings.get("segment_name", self._segment_name))
         self.start_mv.setValue(float(settings["start_mv"]))
         self.stop_mv.setValue(float(settings["stop_mv"]))
         self.points.setValue(int(settings["points"]))
@@ -718,7 +831,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     def value(self) -> StabilitySweepAxis:
         return StabilitySweepAxis(
             output_name=str(self.output.currentData() or ""),
-            segment_name=str(self.segment.currentData() or ""),
+            segment_name=self._segment_name,
             start_mv=self.start_mv.value(),
             stop_mv=self.stop_mv.value(),
             points=self.points.value(),
@@ -886,6 +999,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     dc_calibration_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
+    electrode_front_panel_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -906,18 +1020,20 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.front_panel_requested.emit
         )
         controls.addWidget(self.path_diagram)
-
-        self.rf_editor_tabs = QtWidgets.QTabWidget(controls_content)
-        self.rf_editor_tabs.setMinimumHeight(520)
-        self.rf_editor_tabs.setToolTip(
-            "RF output and FIR readout settings used only by Stability Diagram"
-        )
-        controls.addWidget(self.rf_editor_tabs)
-        self._rf_outputs_editor = None
-        self._rf_readout_editor = None
+        self._path_aux = {
+            key: value
+            for key, value in DEFAULT_STABILITY_RF_PATH.items()
+            if "filter" in key
+        }
 
         self.x_axis = _StabilityAxisEditor("X Electrode", controls_content)
         self.y_axis = _StabilityAxisEditor("Y Electrode", controls_content)
+        self.x_axis.front_panel_requested.connect(
+            self.electrode_front_panel_requested.emit
+        )
+        self.y_axis.front_panel_requested.connect(
+            self.electrode_front_panel_requested.emit
+        )
         controls.addWidget(self.x_axis)
         controls.addWidget(self.y_axis)
 
@@ -933,6 +1049,23 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "Number of post-FIR 1 MSPS samples stored for every stability "
             "point and repetition"
         )
+        self.modulation_frequency_mhz = QtWidgets.QDoubleSpinBox(acquisition)
+        self.modulation_frequency_mhz.setRange(-10_000.0, 10_000.0)
+        self.modulation_frequency_mhz.setDecimals(9)
+        self.modulation_frequency_mhz.setValue(
+            DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
+        )
+        self.modulation_frequency_mhz.setSuffix(" MHz")
+        self.modulation_frequency_mhz.setToolTip(
+            "Shared DDS/DDC modulation frequency. The same value configures "
+            "the selected RF or DC output and input; use 0 MHz for DC."
+        )
+        self.modulation_gain = QtWidgets.QSpinBox(acquisition)
+        self.modulation_gain.setRange(0, 32767)
+        self.modulation_gain.setValue(DEFAULT_STABILITY_MODULATION_GAIN)
+        self.modulation_gain.setToolTip(
+            "DAC gain code for the measurement modulation output"
+        )
         self.point_count = QtWidgets.QLabel("2,601", acquisition)
         self.point_count.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.dc_measure_mode = QtWidgets.QCheckBox("DC measure mode", acquisition)
@@ -946,6 +1079,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.setSuffix(" V/A")
         acquisition_form.addRow("Repetitions / point:", self.repetitions)
         acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
+        acquisition_form.addRow(
+            "Modulation frequency:",
+            self.modulation_frequency_mhz,
+        )
+        acquisition_form.addRow("Modulation gain:", self.modulation_gain)
         acquisition_form.addRow("Cartesian points:", self.point_count)
         acquisition_form.addRow(self.dc_measure_mode)
         acquisition_form.addRow(
@@ -1199,55 +1337,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)
-        if self._rf_outputs_editor is not None:
-            self._rf_outputs_editor.set_front_panel_configuration(configuration)
-        if self._rf_readout_editor is not None:
-            self._rf_readout_editor.set_front_panel_configuration(configuration)
-
-    def set_rf_editors(self, outputs_editor, readout_editor) -> None:
-        """Attach Stability-only RF controls supplied by the main GUI module."""
-        if self._rf_outputs_editor is not None or self._rf_readout_editor is not None:
-            raise RuntimeError("Stability RF editors are already attached")
-        self._rf_outputs_editor = outputs_editor
-        self._rf_readout_editor = readout_editor
-        self.rf_editor_tabs.addTab(outputs_editor, "RF Outputs")
-        self.rf_editor_tabs.addTab(readout_editor, "RF Readout")
+        self.x_axis.set_front_panel_configuration(configuration)
+        self.y_axis.set_front_panel_configuration(configuration)
 
     def front_panel_values(self) -> Mapping[str, Any]:
-        """Return the complete Stability-only RF path for graphical editing."""
+        """Return the complete Stability-only measurement path."""
         values = self.path_diagram._editor_values()
-        if self._rf_outputs_editor is not None:
-            configured_outputs = self._rf_outputs_editor.configured_specs()
-        else:
-            configured_outputs = ()
-        if configured_outputs:
-            output = configured_outputs[0]
-            values.update(
-                {
-                    "output_ch": output.gen_ch,
-                    "output_board_type": output.output_board_type,
-                    "output_nqz": output.nqz,
-                    "output_att1_db": output.att1_db,
-                    "output_att2_db": output.att2_db,
-                    "output_filter_type": output.filter_type,
-                    "output_filter_cutoff_ghz": output.filter_cutoff,
-                    "output_filter_bandwidth_ghz": output.filter_bandwidth,
-                }
-            )
-        if self._rf_readout_editor is not None:
-            readout = self._rf_readout_editor.configured_spec()
-            values.update(
-                {
-                    "readout_ch": readout.ro_ch,
-                    "input_board_type": readout.input_board_type,
-                    "readout_nqz": readout.nqz,
-                    "readout_attenuation_db": readout.attenuation_db,
-                    "readout_dc_gain_db": readout.dc_gain_db,
-                    "readout_filter_type": readout.filter_type,
-                    "readout_filter_cutoff_ghz": readout.filter_cutoff,
-                    "readout_filter_bandwidth_ghz": readout.filter_bandwidth,
-                }
-            )
+        values.update(self._path_aux)
         return values
 
     def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
@@ -1257,11 +1353,17 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def apply_path_settings(self, values: Mapping[str, Any]) -> None:
         complete = self.front_panel_values()
         complete.update(values)
+        for key in tuple(self._path_aux):
+            if key in complete:
+                self._path_aux[key] = complete[key]
         self.path_diagram.apply_external_settings(complete)
-        if self._rf_outputs_editor is not None:
-            self._rf_outputs_editor.apply_path_settings(complete)
-        if self._rf_readout_editor is not None:
-            self._rf_readout_editor.apply_path_settings(complete)
+        self._dc_input_available = str(complete["input_board_type"]) == "DC_In"
+        if not self._dc_input_available:
+            with QtCore.QSignalBlocker(self.dc_measure_mode):
+                self.dc_measure_mode.setChecked(False)
+            with QtCore.QSignalBlocker(self.dc_calibration_group):
+                self.dc_calibration_group.setChecked(False)
+        self._update_dc_measure_controls()
 
     def _apply_local_path_settings(self, values: Mapping[str, Any]) -> None:
         self.apply_path_settings(values)
@@ -1275,6 +1377,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             y_axis=self.y_axis.value(),
             repetitions_per_point=self.repetitions.value(),
             trace_samples_per_point=self.trace_samples.value(),
+            modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
+            modulation_gain=self.modulation_gain.value(),
         )
         config.validate_full_scale(full_scale_mv)
         return config
@@ -1285,7 +1389,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
-            "rf_path": self.path_diagram.applied_values(),
+            "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
+            "modulation_gain": self.modulation_gain.value(),
+            "rf_path": dict(self.front_panel_values()),
             "database_path": self.database_path_value(),
             "dc_voltage_calibration_enabled": (
                 self.dc_calibration_group.isChecked()
@@ -1309,6 +1415,17 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                     DEFAULT_STABILITY_TRACE_SAMPLES,
                 )
             )
+        )
+        self.modulation_frequency_mhz.setValue(
+            float(
+                settings.get(
+                    "modulation_frequency_mhz",
+                    DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
+                )
+            )
+        )
+        self.modulation_gain.setValue(
+            int(settings.get("modulation_gain", DEFAULT_STABILITY_MODULATION_GAIN))
         )
         self.apply_path_settings(
             settings.get("rf_path", DEFAULT_STABILITY_RF_PATH)
@@ -1345,8 +1462,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             editor.setEnabled(not running)
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
+        self.modulation_frequency_mhz.setEnabled(not running)
+        self.modulation_gain.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
-        self.rf_editor_tabs.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         self._update_dc_measure_controls()
@@ -1399,6 +1517,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 __all__ = [
     "DEFAULT_STABILITY_POINTS",
     "DEFAULT_STABILITY_REPETITIONS",
+    "DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ",
+    "DEFAULT_STABILITY_MODULATION_GAIN",
     "DEFAULT_STABILITY_RF_PATH",
     "DEFAULT_STABILITY_TRACE_SAMPLES",
     "DEFAULT_STABILITY_START_MV",

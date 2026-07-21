@@ -153,8 +153,8 @@ def test_reduce_fir_result_restores_voltage_grid_and_coherent_iq_mean():
         np.degrees(np.arctan2(result.q_mean, result.i_mean)),
     )
     assert result.iteration == 7
-    assert result.x_axis_label == "awg_0 / set_1"
-    assert result.y_axis_label == "awg_1 / set_2"
+    assert result.x_axis_label == "awg_0"
+    assert result.y_axis_label == "awg_1"
     assert result.repetition_count == 2
     assert result.samples_per_trace == 3
     assert result.value_unit == "ADC units"
@@ -283,26 +283,29 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     )
     panel.x_axis.output.setCurrentIndex(panel.x_axis.output.findData("awg_0"))
     panel.y_axis.output.setCurrentIndex(panel.y_axis.output.findData("awg_2"))
-    panel.x_axis.segment.setCurrentIndex(
-        panel.x_axis.segment.findData("set_1")
-    )
     panel.x_axis.start_mv.setValue(-250.0)
     panel.x_axis.stop_mv.setValue(125.0)
     panel.x_axis.points.setValue(11)
     panel.y_axis.points.setValue(7)
     panel.repetitions.setValue(4)
     panel.trace_samples.setValue(321)
+    panel.modulation_frequency_mhz.setValue(12.5)
+    panel.modulation_gain.setValue(12345)
     database_path = tmp_path / "stability_single_shot.db"
     panel.database_path.setText(str(database_path))
     app.processEvents()
 
     config = panel.config(full_scale_mv=2500.0)
     assert config.x_axis.output_name == "awg_0"
-    assert config.x_axis.segment_name == "set_1"
+    assert config.x_axis.segment_name == "set_0"
     assert config.y_axis.output_name == "awg_2"
     assert config.point_count == 77
     assert config.trace_samples_per_point == 321
+    assert config.modulation_frequency_mhz == 12.5
+    assert config.modulation_gain == 12345
     assert panel.point_count.text() == "77"
+    assert not hasattr(panel.x_axis, "segment")
+    assert not hasattr(panel, "rf_editor_tabs")
     assert panel.database_path_value() == str(database_path)
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
 
@@ -361,10 +364,12 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.stop_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is False
     assert panel.trace_samples.isEnabled() is False
+    assert panel.modulation_frequency_mhz.isEnabled() is False
     panel.set_stopping()
     assert panel.stop_button.isEnabled() is False
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
     assert panel.trace_samples.isEnabled() is True
+    assert panel.modulation_frequency_mhz.isEnabled() is True
     panel.close()
     restored.close()

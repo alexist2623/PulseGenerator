@@ -57,6 +57,147 @@ except ImportError:
 
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
 MAX_INPUT_CALIBRATION_PLOT_CURVES = 32
+CALIBRATION_PATH_MODES = ("output", "input", "dc_voltage")
+
+
+def _legacy_calibration_paths(
+    output: OutputPowerCalibrationConfig,
+    input_config: InputPowerCalibrationConfig,
+    dc_voltage: DcVoltageCalibrationConfig,
+) -> dict[str, dict[str, Any]]:
+    """Build independent path defaults from the pre-v22 calibration fields."""
+    common = {
+        "output_ch": int(input_config.output_ch),
+        "readout_ch": int(input_config.readout_ch),
+        "output_nqz": int(input_config.nqz),
+        "readout_nqz": int(input_config.readout_nqz),
+        "output_board_type": str(input_config.output_board_type),
+        "input_board_type": str(input_config.input_board_type),
+        "output_att1_db": float(input_config.output_att1_db),
+        "output_att2_db": float(input_config.output_att2_db),
+        "readout_attenuation_db": float(input_config.input_attenuation_db),
+        "readout_dc_gain_db": float(input_config.input_dc_gain_db),
+        "loss1_db": 0.0,
+        "loss2_db": 0.0,
+        "amplifier_gain_db": 0.0,
+    }
+    output_path = {
+        **common,
+        "output_ch": int(output.output_ch),
+        "output_nqz": int(output.nqz),
+        "output_board_type": str(output.output_board_type),
+        "output_att1_db": float(output.output_att1_db),
+        "output_att2_db": float(output.output_att2_db),
+    }
+    dc_path = {
+        **common,
+        "output_ch": int(dc_voltage.output_ch),
+        "readout_ch": int(dc_voltage.readout_ch),
+        "output_nqz": 1,
+        "readout_nqz": 1,
+        "output_board_type": "DC_Out",
+        "input_board_type": "DC_In",
+        "output_att1_db": 0.0,
+        "output_att2_db": 0.0,
+        "readout_attenuation_db": 0.0,
+        "readout_dc_gain_db": float(dc_voltage.input_dc_gain_db),
+    }
+    return {
+        "output": output_path,
+        "input": dict(common),
+        "dc_voltage": dc_path,
+    }
+
+
+def normalize_calibration_paths(
+    settings: Mapping[str, Any],
+    output: OutputPowerCalibrationConfig,
+    input_config: InputPowerCalibrationConfig,
+    dc_voltage: DcVoltageCalibrationConfig,
+) -> dict[str, dict[str, Any]]:
+    """Validate per-subtab paths and migrate the former shared path."""
+    defaults = _legacy_calibration_paths(output, input_config, dc_voltage)
+    raw_paths = settings.get("paths")
+    if raw_paths is None:
+        return defaults
+    if not isinstance(raw_paths, Mapping):
+        raise TypeError("calibration paths must be a JSON object")
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for mode in CALIBRATION_PATH_MODES:
+        raw_mode = raw_paths.get(mode, {})
+        if not isinstance(raw_mode, Mapping):
+            raise TypeError(f"calibration {mode} path must be a JSON object")
+        values = {**defaults[mode], **dict(raw_mode)}
+
+        for key in ("output_ch", "readout_ch"):
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"calibration {mode} path {key} must be an integer")
+            value = int(value)
+            if not 0 <= value <= 255:
+                raise ValueError(f"calibration {mode} path {key} must be 0..255")
+            values[key] = value
+        for key in ("output_nqz", "readout_nqz"):
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"calibration {mode} path {key} must be an integer")
+            value = int(value)
+            if value not in (1, 2):
+                raise ValueError(f"calibration {mode} path {key} must be 1 or 2")
+            values[key] = value
+
+        output_board = str(values["output_board_type"])
+        input_board = str(values["input_board_type"])
+        if output_board not in OUTPUT_BOARD_TYPES:
+            raise ValueError(
+                f"calibration {mode} output board must be one of {OUTPUT_BOARD_TYPES}"
+            )
+        if input_board not in INPUT_BOARD_TYPES:
+            raise ValueError(
+                f"calibration {mode} input board must be one of {INPUT_BOARD_TYPES}"
+            )
+        values["output_board_type"] = output_board
+        values["input_board_type"] = input_board
+
+        ranges = {
+            "output_att1_db": (0.0, 31.75),
+            "output_att2_db": (0.0, 31.75),
+            "readout_attenuation_db": (0.0, 31.75),
+            "readout_dc_gain_db": (-6.0, 26.0),
+            "loss1_db": (0.0, 200.0),
+            "loss2_db": (0.0, 200.0),
+            "amplifier_gain_db": (-200.0, 200.0),
+        }
+        for key, (minimum, maximum) in ranges.items():
+            value = float(values[key])
+            if not np.isfinite(value) or not minimum <= value <= maximum:
+                raise ValueError(
+                    f"calibration {mode} path {key} must be {minimum:g}..{maximum:g}"
+                )
+            values[key] = value
+        normalized[mode] = values
+    return normalized
+
+
+class _CalibrationPathWidget(RfPathCorrectionWidget):
+    """RF path editor bound to exactly one Calibration sub-tab."""
+
+    def __init__(self, owner, mode: str):
+        super().__init__(owner, compact=True)
+        self._calibration_owner = owner
+        self._calibration_mode = mode
+
+    def front_panel_values(self) -> Mapping[str, Any]:
+        return self._calibration_owner._front_panel_values_for(
+            self._calibration_mode
+        )
+
+    def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
+        self._calibration_owner.apply_path_settings(
+            values,
+            mode=self._calibration_mode,
+        )
 
 
 def input_calibration_plot_data(
@@ -119,6 +260,53 @@ def input_calibration_plot_data(
         np.ascontiguousarray(gains),
         np.ascontiguousarray(input_power_mw),
         np.ascontiguousarray(adc_magnitude),
+    )
+
+
+def dc_voltage_calibration_plot_data(
+    result: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return commanded voltage, measured ADC-I, spread, and fitted ADC-I."""
+    if not isinstance(result, Mapping):
+        raise TypeError("DC voltage calibration result must be a mapping")
+    required = ("voltages_mv", "mean_adc", "std_adc", "calibration")
+    missing = [name for name in required if name not in result]
+    if missing:
+        raise ValueError(
+            "DC voltage calibration result is missing " + ", ".join(missing)
+        )
+    voltages_mv = np.asarray(result["voltages_mv"], dtype=float).reshape(-1)
+    mean_adc = np.asarray(result["mean_adc"], dtype=float).reshape(-1)
+    std_adc = np.asarray(result["std_adc"], dtype=float).reshape(-1)
+    if voltages_mv.size < 2:
+        raise ValueError("DC voltage calibration plot requires at least two points")
+    if mean_adc.shape != voltages_mv.shape or std_adc.shape != voltages_mv.shape:
+        raise ValueError(
+            "voltages_mv, mean_adc, and std_adc must have equal one-dimensional shapes"
+        )
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (voltages_mv, mean_adc, std_adc)
+    ):
+        raise ValueError("DC voltage calibration plot values must be finite")
+    if np.any(std_adc < 0.0):
+        raise ValueError("DC voltage calibration standard deviation must be nonnegative")
+    calibration = result["calibration"]
+    if not isinstance(calibration, Mapping):
+        raise TypeError("DC voltage calibration fit must be a mapping")
+    try:
+        offset_adc = float(calibration["offset_adc"])
+        response_adc_per_v = float(calibration["response_adc_per_v"])
+    except KeyError as exc:
+        raise ValueError(
+            f"DC voltage calibration fit is missing {exc.args[0]}"
+        ) from exc
+    if not np.isfinite(offset_adc) or not np.isfinite(response_adc_per_v):
+        raise ValueError("DC voltage calibration fit coefficients must be finite")
+    fitted_adc = offset_adc + response_adc_per_v * (voltages_mv / 1000.0)
+    return tuple(
+        np.ascontiguousarray(values)
+        for values in (voltages_mv, mean_adc, std_adc, fitted_adc)
     )
 
 
@@ -293,6 +481,112 @@ class InputCalibrationPlotWidget(QtWidgets.QWidget):
             self.canvas.draw_idle()
 
 
+class DcVoltageCalibrationPlotWidget(QtWidgets.QWidget):
+    """Plot measured zero-frequency ADC-I against commanded DC voltage."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.voltages_mv = np.empty(0, dtype=float)
+        self.mean_adc = np.empty(0, dtype=float)
+        self.std_adc = np.empty(0, dtype=float)
+        self.fitted_adc = np.empty(0, dtype=float)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        self.status = QtWidgets.QLabel(
+            "Run a DC voltage calibration to display ADC values",
+            self,
+        )
+        self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.status)
+        if _USE_PYQTGRAPH:
+            self.graph = pg.PlotWidget(self)
+            self.graph.setBackground("w")
+            self.plot_item = self.graph.getPlotItem()
+            self.plot_item.showGrid(x=True, y=True, alpha=0.25)
+            self.legend = self.plot_item.addLegend(offset=(10, 10))
+            self.plot_item.setLabel("bottom", "Commanded DC output", units="mV")
+            self.plot_item.setLabel("left", "Mean ADC-I", units="ADC units")
+            layout.addWidget(self.graph, 1)
+        else:
+            self.figure = Figure(tight_layout=True)
+            self.canvas = Canvas(self.figure)
+            self.plot_item = self.figure.subplots(1, 1)
+            layout.addWidget(self.canvas, 1)
+        self.setMinimumHeight(360)
+
+    def set_result(self, result: Mapping[str, Any]) -> None:
+        (
+            self.voltages_mv,
+            self.mean_adc,
+            self.std_adc,
+            self.fitted_adc,
+        ) = dc_voltage_calibration_plot_data(result)
+        calibration = result["calibration"]
+        r_squared = float(calibration.get("r_squared", float("nan")))
+        response = float(calibration["response_adc_per_v"])
+        offset = float(calibration["offset_adc"])
+        order = np.argsort(self.voltages_mv)
+
+        if _USE_PYQTGRAPH:
+            self.plot_item.clear()
+            self.legend.clear()
+            self.plot_item.plot(
+                self.voltages_mv,
+                self.mean_adc,
+                pen=pg.mkPen("#2563a6", width=2),
+                symbol="o",
+                symbolSize=7,
+                symbolBrush="#2563a6",
+                name="Measured mean ADC-I",
+            )
+            if np.any(self.std_adc > 0.0):
+                error_bars = pg.ErrorBarItem(
+                    x=self.voltages_mv,
+                    y=self.mean_adc,
+                    height=2.0 * self.std_adc,
+                    beam=6.0,
+                    pen=pg.mkPen("#6b8fb3", width=1),
+                )
+                self.plot_item.addItem(error_bars)
+            self.plot_item.plot(
+                self.voltages_mv[order],
+                self.fitted_adc[order],
+                pen=pg.mkPen("#b33a3a", width=2, style=QtCore.Qt.DashLine),
+                name="Linear fit",
+            )
+            self.plot_item.autoRange()
+        else:
+            self.plot_item.clear()
+            self.plot_item.errorbar(
+                self.voltages_mv,
+                self.mean_adc,
+                yerr=self.std_adc,
+                fmt="o-",
+                color="C0",
+                capsize=3,
+                label="Measured mean ADC-I",
+            )
+            self.plot_item.plot(
+                self.voltages_mv[order],
+                self.fitted_adc[order],
+                "--",
+                color="C3",
+                label="Linear fit",
+            )
+            self.plot_item.set_xlabel("Commanded DC output [mV]")
+            self.plot_item.set_ylabel("Mean ADC-I [ADC units]")
+            self.plot_item.grid(True, alpha=0.25)
+            self.plot_item.legend()
+            self.canvas.draw_idle()
+        self.status.setText(
+            f"{self.voltages_mv.size} voltage points | "
+            f"response {response:.9g} ADC/V | offset {offset:.9g} ADC | "
+            f"R^2 {r_squared:.8f}"
+        )
+
+
 class CalibrationPanel(QtWidgets.QWidget):
     """Output-scope and input-ADC calibration controls."""
 
@@ -301,18 +595,13 @@ class CalibrationPanel(QtWidgets.QWidget):
     dc_voltage_requested = QtCore.pyqtSignal()
     dc_application_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
-    front_panel_requested = QtCore.pyqtSignal()
+    front_panel_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
-
-        self.path_diagram = RfPathCorrectionWidget(self, compact=True)
-        self.path_diagram.settings_applied.connect(self._apply_local_path_settings)
-        self.path_diagram.front_panel_requested.connect(
-            self.front_panel_requested.emit
-        )
-        layout.addWidget(self.path_diagram)
+        self._path_diagrams: dict[str, RfPathCorrectionWidget] = {}
+        self._front_panel_mode = "output"
 
         database_group = QtWidgets.QGroupBox("Calibration Database")
         database_form = QtWidgets.QFormLayout(database_group)
@@ -333,6 +622,20 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.tabs.addTab(self._build_output_tab(), "Output / Oscilloscope")
         self.tabs.addTab(self._build_input_tab(), "Input / ADC")
         self.tabs.addTab(self._build_dc_voltage_tab(), "DC Voltage")
+        initial_paths = _legacy_calibration_paths(
+            OutputPowerCalibrationConfig(
+                database_path=DEFAULT_CALIBRATION_DB_PATH
+            ),
+            InputPowerCalibrationConfig(
+                database_path=DEFAULT_CALIBRATION_DB_PATH
+            ),
+            DcVoltageCalibrationConfig(
+                database_path=DEFAULT_CALIBRATION_DB_PATH
+            ),
+        )
+        for mode, values in initial_paths.items():
+            self.path_diagram_for(mode).apply_external_settings(values)
+        self.tabs.currentChanged.connect(self._select_front_panel_mode)
         layout.addWidget(self.tabs, 1)
 
         self.progress = QtWidgets.QProgressBar()
@@ -355,6 +658,49 @@ class CalibrationPanel(QtWidgets.QWidget):
         vertical.addStretch(1)
         scroll.setWidget(content)
         return scroll, form, vertical
+
+    def _new_path_diagram(self, mode: str) -> RfPathCorrectionWidget:
+        if mode not in CALIBRATION_PATH_MODES:
+            raise ValueError(f"unknown calibration path mode {mode!r}")
+        diagram = _CalibrationPathWidget(self, mode)
+        diagram.settings_applied.connect(
+            lambda values, selected=mode: self._apply_local_path_settings(
+                selected,
+                values,
+            )
+        )
+        diagram.front_panel_requested.connect(
+            lambda selected=mode, target=diagram: self._request_front_panel(
+                selected,
+                target,
+            )
+        )
+        self._path_diagrams[mode] = diagram
+        return diagram
+
+    def _select_front_panel_mode(self, index: int) -> None:
+        if 0 <= int(index) < len(CALIBRATION_PATH_MODES):
+            self._front_panel_mode = CALIBRATION_PATH_MODES[int(index)]
+
+    def _request_front_panel(
+        self,
+        mode: str,
+        target: RfPathCorrectionWidget,
+    ) -> None:
+        self._front_panel_mode = mode
+        self.front_panel_requested.emit(target)
+
+    def path_diagram_for(self, mode: str) -> RfPathCorrectionWidget:
+        """Return the independent RF path editor for one calibration sub-tab."""
+        try:
+            return self._path_diagrams[mode]
+        except KeyError as exc:
+            raise ValueError(f"unknown calibration path mode {mode!r}") from exc
+
+    @property
+    def path_diagram(self) -> RfPathCorrectionWidget:
+        """Compatibility alias for the currently selected sub-tab's path."""
+        return self.path_diagram_for(self._front_panel_mode)
 
     @staticmethod
     def _channel(value: int = 0) -> QtWidgets.QSpinBox:
@@ -445,7 +791,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         form.addRow(
             QtWidgets.QLabel(
                 "Board, channel, ATT, filter, and Nyquist settings use this "
-                "Calibration tab's RF path above."
+                "sub-tab's independent RF path above."
             )
         )
         for label, widget in (
@@ -501,6 +847,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.run_output_button.clicked.connect(self.output_requested.emit)
         vertical.insertWidget(2, self.run_output_button)
         self.output_board.currentTextChanged.connect(self._update_board_controls)
+        self.output_path_diagram = self._new_path_diagram("output")
+        vertical.insertWidget(0, self.output_path_diagram)
         return scroll
 
     def _build_input_tab(self) -> QtWidgets.QWidget:
@@ -556,7 +904,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         form.addRow(
             QtWidgets.QLabel(
                 "Board, channel, ATT, filter, and Nyquist settings use this "
-                "Calibration tab's RF path above."
+                "sub-tab's independent RF path above."
             )
         )
         for label, widget in (
@@ -589,6 +937,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_output_board.currentTextChanged.connect(self._update_board_controls)
         self.input_board.currentTextChanged.connect(self._update_board_controls)
         self._update_board_controls()
+        self.input_path_diagram = self._new_path_diagram("input")
+        vertical.insertWidget(0, self.input_path_diagram)
         return scroll
 
     def _build_dc_voltage_tab(self) -> QtWidgets.QWidget:
@@ -715,6 +1065,13 @@ class CalibrationPanel(QtWidgets.QWidget):
             self.dc_voltage_requested.emit
         )
         vertical.insertWidget(2, self.run_dc_voltage_button)
+        dc_plot_group = QtWidgets.QGroupBox("DC Output Voltage / ADC-I Response")
+        dc_plot_layout = QtWidgets.QVBoxLayout(dc_plot_group)
+        self.dc_voltage_response_plot = DcVoltageCalibrationPlotWidget(
+            dc_plot_group
+        )
+        dc_plot_layout.addWidget(self.dc_voltage_response_plot)
+        vertical.insertWidget(3, dc_plot_group)
         self.dc_application_group.toggled.connect(
             self._emit_dc_application_changed
         )
@@ -727,6 +1084,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_application_browse.clicked.connect(
             self._browse_dc_application
         )
+        self.dc_voltage_path_diagram = self._new_path_diagram("dc_voltage")
+        vertical.insertWidget(0, self.dc_voltage_path_diagram)
         return scroll
 
     def _browse_dc_application(self) -> None:
@@ -833,7 +1192,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             output_filter_type=self.output_filter_type.currentText(),
             output_filter_cutoff_ghz=self.output_filter_cutoff.value(),
             output_filter_bandwidth_ghz=self.output_filter_bandwidth.value(),
-            nqz=self.path_diagram.applied_values()["output_nqz"],
+            nqz=self.output_path_diagram.applied_values()["output_nqz"],
             experiment_name=self.output_experiment_name.text().strip(),
             sample_name=self.output_sample_name.text().strip(),
             oscilloscope=OscilloscopeConfig(
@@ -888,8 +1247,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             readout_filter_type=self.input_readout_filter.currentText(),
             readout_filter_cutoff_ghz=self.input_readout_cutoff.value(),
             readout_filter_bandwidth_ghz=self.input_readout_bandwidth.value(),
-            nqz=self.path_diagram.applied_values()["output_nqz"],
-            readout_nqz=self.path_diagram.applied_values()["readout_nqz"],
+            nqz=self.input_path_diagram.applied_values()["output_nqz"],
+            readout_nqz=self.input_path_diagram.applied_values()["readout_nqz"],
             fit_trim_low=self.input_trim_low.value(),
             fit_trim_high=self.input_trim_high.value(),
             experiment_name=self.input_experiment_name.text().strip(),
@@ -915,9 +1274,16 @@ class CalibrationPanel(QtWidgets.QWidget):
             sample_name=self.dc_voltage_sample_name.text().strip(),
         )
 
-    def apply_path_settings(self, values: Mapping[str, Any]) -> None:
-        """Apply this tab's RF path to its calibration modes only."""
-        self.path_diagram.apply_external_settings(values)
+    def apply_path_settings(
+        self,
+        values: Mapping[str, Any],
+        *,
+        mode: str | None = None,
+    ) -> None:
+        """Apply an RF path only to the selected calibration sub-tab."""
+        mode = self._front_panel_mode if mode is None else str(mode)
+        diagram = self.path_diagram_for(mode)
+        diagram.apply_external_settings(values)
         output_ch = int(values["output_ch"])
         readout_ch = int(values["readout_ch"])
         output_board = str(values["output_board_type"])
@@ -927,68 +1293,99 @@ class CalibrationPanel(QtWidgets.QWidget):
         input_att = float(values["readout_attenuation_db"])
         input_gain = float(values["readout_dc_gain_db"])
 
-        self.output_ch.setValue(output_ch)
-        self.output_board.setCurrentText(output_board)
-        self.output_att1.setValue(att1)
-        self.output_att2.setValue(att2)
-
-        self.input_output_ch.setValue(output_ch)
-        self.input_readout_ch.setValue(readout_ch)
-        self.dc_voltage_output_ch.setValue(output_ch)
-        self.dc_voltage_readout_ch.setValue(readout_ch)
-        self.dc_voltage_input_gain.setValue(input_gain)
-        self.input_output_board.setCurrentText(output_board)
-        self.input_board.setCurrentText(input_board)
-        self.input_output_att1.setValue(att1)
-        self.input_output_att2.setValue(att2)
-        self.input_attenuation.setValue(input_att)
-        self.input_dc_gain.setValue(input_gain)
-        if "output_filter_type" in values:
-            self.output_filter_type.setCurrentText(
-                str(values["output_filter_type"])
-            )
-            self.input_output_filter.setCurrentText(
-                str(values["output_filter_type"])
-            )
-        if "output_filter_cutoff_ghz" in values:
-            cutoff = float(values["output_filter_cutoff_ghz"])
-            self.output_filter_cutoff.setValue(cutoff)
-            self.input_output_cutoff.setValue(cutoff)
-        if "output_filter_bandwidth_ghz" in values:
-            bandwidth = float(values["output_filter_bandwidth_ghz"])
-            self.output_filter_bandwidth.setValue(bandwidth)
-            self.input_output_bandwidth.setValue(bandwidth)
-        if "readout_filter_type" in values:
-            self.input_readout_filter.setCurrentText(
-                str(values["readout_filter_type"])
-            )
-        if "readout_filter_cutoff_ghz" in values:
-            self.input_readout_cutoff.setValue(
-                float(values["readout_filter_cutoff_ghz"])
-            )
-        if "readout_filter_bandwidth_ghz" in values:
-            self.input_readout_bandwidth.setValue(
-                float(values["readout_filter_bandwidth_ghz"])
-            )
+        if mode == "output":
+            self.output_ch.setValue(output_ch)
+            self.output_board.setCurrentText(output_board)
+            self.output_att1.setValue(att1)
+            self.output_att2.setValue(att2)
+            if "output_filter_type" in values:
+                self.output_filter_type.setCurrentText(
+                    str(values["output_filter_type"])
+                )
+            if "output_filter_cutoff_ghz" in values:
+                self.output_filter_cutoff.setValue(
+                    float(values["output_filter_cutoff_ghz"])
+                )
+            if "output_filter_bandwidth_ghz" in values:
+                self.output_filter_bandwidth.setValue(
+                    float(values["output_filter_bandwidth_ghz"])
+                )
+        elif mode == "input":
+            self.input_output_ch.setValue(output_ch)
+            self.input_readout_ch.setValue(readout_ch)
+            self.input_output_board.setCurrentText(output_board)
+            self.input_board.setCurrentText(input_board)
+            self.input_output_att1.setValue(att1)
+            self.input_output_att2.setValue(att2)
+            self.input_attenuation.setValue(input_att)
+            self.input_dc_gain.setValue(input_gain)
+            if "output_filter_type" in values:
+                self.input_output_filter.setCurrentText(
+                    str(values["output_filter_type"])
+                )
+            if "output_filter_cutoff_ghz" in values:
+                self.input_output_cutoff.setValue(
+                    float(values["output_filter_cutoff_ghz"])
+                )
+            if "output_filter_bandwidth_ghz" in values:
+                self.input_output_bandwidth.setValue(
+                    float(values["output_filter_bandwidth_ghz"])
+                )
+            if "readout_filter_type" in values:
+                self.input_readout_filter.setCurrentText(
+                    str(values["readout_filter_type"])
+                )
+            if "readout_filter_cutoff_ghz" in values:
+                self.input_readout_cutoff.setValue(
+                    float(values["readout_filter_cutoff_ghz"])
+                )
+            if "readout_filter_bandwidth_ghz" in values:
+                self.input_readout_bandwidth.setValue(
+                    float(values["readout_filter_bandwidth_ghz"])
+                )
+        elif mode == "dc_voltage":
+            self.dc_voltage_output_ch.setValue(output_ch)
+            self.dc_voltage_readout_ch.setValue(readout_ch)
+            self.dc_voltage_input_gain.setValue(input_gain)
+        else:
+            raise ValueError(f"unknown calibration path mode {mode!r}")
         self._update_board_controls()
 
-    def _apply_local_path_settings(self, values: Mapping[str, Any]) -> None:
-        self.apply_path_settings(values)
-        self.path_settings_applied.emit(dict(values))
+    def _apply_local_path_settings(
+        self,
+        mode: str,
+        values: Mapping[str, Any],
+    ) -> None:
+        self.apply_path_settings(values, mode=mode)
+        applied = dict(values)
+        applied["calibration_mode"] = mode
+        self.path_settings_applied.emit(applied)
 
     def front_panel_values(self) -> Mapping[str, Any]:
-        """Return this tab's input-calibration RF path for graphical editing."""
-        values = self.path_diagram._editor_values()
-        values.update(
-            {
-                "output_filter_type": self.input_output_filter.currentText(),
-                "output_filter_cutoff_ghz": self.input_output_cutoff.value(),
-                "output_filter_bandwidth_ghz": self.input_output_bandwidth.value(),
-                "readout_filter_type": self.input_readout_filter.currentText(),
-                "readout_filter_cutoff_ghz": self.input_readout_cutoff.value(),
-                "readout_filter_bandwidth_ghz": self.input_readout_bandwidth.value(),
-            }
-        )
+        """Return the active calibration sub-tab's path for graphical editing."""
+        return self._front_panel_values_for(self._front_panel_mode)
+
+    def _front_panel_values_for(self, mode: str) -> Mapping[str, Any]:
+        values = self.path_diagram_for(mode)._editor_values()
+        if mode == "output":
+            values.update(
+                {
+                    "output_filter_type": self.output_filter_type.currentText(),
+                    "output_filter_cutoff_ghz": self.output_filter_cutoff.value(),
+                    "output_filter_bandwidth_ghz": self.output_filter_bandwidth.value(),
+                }
+            )
+        elif mode == "input":
+            values.update(
+                {
+                    "output_filter_type": self.input_output_filter.currentText(),
+                    "output_filter_cutoff_ghz": self.input_output_cutoff.value(),
+                    "output_filter_bandwidth_ghz": self.input_output_bandwidth.value(),
+                    "readout_filter_type": self.input_readout_filter.currentText(),
+                    "readout_filter_cutoff_ghz": self.input_readout_cutoff.value(),
+                    "readout_filter_bandwidth_ghz": self.input_readout_bandwidth.value(),
+                }
+            )
         return values
 
     def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
@@ -996,7 +1393,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.apply_path_settings(values)
 
     def set_front_panel_configuration(self, configuration) -> None:
-        self.path_diagram.set_front_panel_configuration(configuration)
+        for diagram in self._path_diagrams.values():
+            diagram.set_front_panel_configuration(configuration)
 
     def settings_dict(self) -> Mapping[str, Any]:
         output = asdict(self.output_config())
@@ -1012,6 +1410,10 @@ class CalibrationPanel(QtWidgets.QWidget):
             "output": output,
             "input": input_config,
             "dc_voltage": dc_voltage,
+            "paths": {
+                mode: self.path_diagram_for(mode).applied_values()
+                for mode in CALIBRATION_PATH_MODES
+            },
             "dc_voltage_application": dict(dc_application),
             "input_plot": {
                 "x_scale": self.input_response_plot.x_scale_mode,
@@ -1039,6 +1441,12 @@ class CalibrationPanel(QtWidgets.QWidget):
         dc_voltage = DcVoltageCalibrationConfig(
             database_path=database_path,
             **dc_voltage_values,
+        )
+        path_values = normalize_calibration_paths(
+            settings,
+            output,
+            input_config,
+            dc_voltage,
         )
         self.database_path.setText(database_path)
         assignments = (
@@ -1122,20 +1530,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             str(input_plot.get("x_scale", "log")),
             str(input_plot.get("y_scale", "log")),
         )
-        self.path_diagram.apply_external_settings(
-            {
-                "output_ch": input_config.output_ch,
-                "readout_ch": input_config.readout_ch,
-                "output_nqz": input_config.nqz,
-                "readout_nqz": input_config.readout_nqz,
-                "output_board_type": input_config.output_board_type,
-                "input_board_type": input_config.input_board_type,
-                "output_att1_db": input_config.output_att1_db,
-                "output_att2_db": input_config.output_att2_db,
-                "readout_attenuation_db": input_config.input_attenuation_db,
-                "readout_dc_gain_db": input_config.input_dc_gain_db,
-            }
-        )
+        for mode, values in path_values.items():
+            self.apply_path_settings(values, mode=mode)
         self._update_board_controls()
         self.tabs.setCurrentIndex(max(0, min(2, int(settings.get("selected_tab", 0)))))
 
@@ -1146,7 +1542,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_application_group.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
-        self.path_diagram.setEnabled(not running)
+        for diagram in self._path_diagrams.values():
+            diagram.setEnabled(not running)
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)
@@ -1174,12 +1571,17 @@ class CalibrationPanel(QtWidgets.QWidget):
                 self.tabs.setCurrentIndex(1)
         elif isinstance(result, Mapping) and "calibration" in result:
             calibration = result.get("calibration", {})
+            try:
+                self.dc_voltage_response_plot.set_result(result)
+            except (TypeError, ValueError) as exc:
+                plot_message = f"\nPlot unavailable: {exc}"
             if isinstance(calibration, Mapping):
-                plot_message = (
+                fit_message = (
                     "\n0 MHz DC voltage fit: "
                     f"R^2={float(calibration.get('r_squared', float('nan'))):.8f}, "
                     f"RMSE={float(calibration.get('rmse_adc', float('nan'))):.6g} ADC"
                 )
+                plot_message = fit_message + plot_message
             self.tabs.setCurrentIndex(2)
             self.set_dc_application_selection(
                 True,
@@ -1240,12 +1642,18 @@ def default_calibration_settings() -> Mapping[str, Any]:
     output.pop("database_path")
     input_config.pop("database_path")
     dc_voltage.pop("database_path")
+    paths = _legacy_calibration_paths(
+        OutputPowerCalibrationConfig(database_path=DEFAULT_CALIBRATION_DB_PATH),
+        InputPowerCalibrationConfig(database_path=DEFAULT_CALIBRATION_DB_PATH),
+        DcVoltageCalibrationConfig(database_path=DEFAULT_CALIBRATION_DB_PATH),
+    )
     return {
         "database_path": DEFAULT_CALIBRATION_DB_PATH,
         "selected_tab": 0,
         "output": output,
         "input": input_config,
         "dc_voltage": dc_voltage,
+        "paths": paths,
         "dc_voltage_application": {
             "enabled": False,
             "database_path": DEFAULT_CALIBRATION_DB_PATH,
@@ -1259,10 +1667,14 @@ def default_calibration_settings() -> Mapping[str, Any]:
 
 
 __all__ = [
+    "CALIBRATION_PATH_MODES",
     "CalibrationPanel",
     "CalibrationWorker",
     "DEFAULT_CALIBRATION_DB_PATH",
+    "DcVoltageCalibrationPlotWidget",
     "InputCalibrationPlotWidget",
+    "dc_voltage_calibration_plot_data",
     "default_calibration_settings",
     "input_calibration_plot_data",
+    "normalize_calibration_paths",
 ]

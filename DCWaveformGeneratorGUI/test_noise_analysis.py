@@ -120,6 +120,66 @@ def test_noise_panel_selects_point_and_repetition_and_round_trips_settings():
     restored.close()
 
 
+def test_noise_panel_direct_acquisition_settings_are_self_contained():
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="noise.db")
+    panel.acquisition_host.setText("noise-only-host")
+    panel.acquisition_port.setValue(9444)
+    panel.acquisition_proxy.setText("noise-only-proxy")
+    panel.readout_channel.setValue(3)
+    panel.input_board.setCurrentText("DC_In")
+    panel.input_nqz.setValue(2)
+    panel.fir_samples.setValue(10_000_000)
+    panel.readout_frequency.setValue(1.25)
+    panel.input_dc_gain.setValue(8.0)
+    emitted = []
+    panel.acquire_requested.connect(emitted.append)
+    panel.acquire_button.click()
+
+    assert len(emitted) == 1
+    config = emitted[0]
+    assert config.connection_config.host == "noise-only-host"
+    assert config.connection_config.ns_port == 9444
+    assert config.connection_config.proxy_name == "noise-only-proxy"
+    assert config.ro_ch == 3
+    assert config.input_board_type == "DC_In"
+    assert config.nqz == 2
+    assert config.fir_samples == 10_000_000
+    assert config.readout_frequency_mhz == 1.25
+    assert config.dc_gain_db == 8.0
+    assert panel.capture_duration.text() == "10 s at 1 MSPS"
+    assert panel.database_path.text() == "noise.db"
+    app.processEvents()
+    panel.close()
+
+
+def test_noise_panel_front_panel_selection_updates_only_direct_input():
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="saved-traces.db")
+    panel.database_path.setText("do-not-change.db")
+    panel.apply_front_panel_settings({
+        "readout_ch": 2,
+        "input_board_type": "RF_In",
+        "readout_nqz": 2,
+        "readout_attenuation_db": 17.25,
+        "readout_dc_gain_db": 3.0,
+        "readout_filter_type": "highpass",
+        "readout_filter_cutoff_ghz": 1.75,
+        "readout_filter_bandwidth_ghz": 0.5,
+    })
+
+    assert panel.readout_channel.value() == 2
+    assert panel.input_board.currentText() == "RF_In"
+    assert panel.input_nqz.value() == 2
+    assert panel.input_attenuation.value() == 17.25
+    assert panel.input_filter.currentText() == "highpass"
+    assert panel.filter_cutoff.value() == 1.75
+    assert panel.database_path.text() == "do-not-change.db"
+    assert panel.configured_spec().ro_ch == 2
+    app.processEvents()
+    panel.close()
+
+
 def test_noise_panel_applies_dc_calibration_offset_before_current_conversion(
     monkeypatch,
     tmp_path,

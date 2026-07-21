@@ -43,6 +43,7 @@ def _live_config():
             {"dac": "00", "fullpath": "axis_signal_gen_v6_0"},
             {"dac": "10", "fullpath": "axis_awg_tuning_v1_0"},
             {"dac": "33", "fullpath": "axis_signal_gen_v6_15"},
+            {"dac": "11", "fullpath": "axis_awg_tuning_v1_1"},
         ],
         "readouts": [
             {"adc": "10", "avgbuf_fullpath": "axis_avg_buffer_0"},
@@ -170,8 +171,9 @@ def test_graphical_path_updates_only_requesting_sparameter_tab():
     assert calibration.input_output_ch.value() == 0
     assert calibration.input_readout_ch.value() == 0
     assert calibration.input_attenuation.value() == 0.0
-    assert window._stability_rf_readout_panel.ro_ch.value() == 0
-    assert window._stability_rf_readout_panel.attenuation_db.value() == 20.0
+    stability_path = window._stability_panel.front_panel_values()
+    assert stability_path["readout_ch"] == 0
+    assert stability_path["readout_attenuation_db"] == 20.0
     window.close()
 
 
@@ -208,6 +210,7 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     app.processEvents()
     panel = window._qick_front_panel
     assert panel.scope == "output"
+    assert panel.canvas._scope == "output"
     assert panel.output_group.isVisible()
     assert panel.input_group.isVisible() is False
     panel.canvas.select_port("output", 0)
@@ -224,6 +227,44 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     assert output.filter_type.currentText() == "lowpass"
     assert window._qick_front_panel_dialog.isVisible() is False
     window.close()
+
+
+def test_scoped_front_panel_hides_and_disables_opposite_connector_direction():
+    app = _application()
+    panel = QickFrontPanelControl()
+    panel.set_configuration(identify_qick_front_panel(_live_config()))
+    clicked = []
+    panel.canvas.port_clicked.connect(
+        lambda direction, index: clicked.append((direction, index))
+    )
+
+    panel.set_scope("output")
+    panel.show()
+    app.processEvents()
+    assert panel.output_group.isVisible() is True
+    assert panel.input_group.isVisible() is False
+    panel.canvas.select_port("input", 2)
+    panel.canvas.select_port("output", 0)
+    assert clicked == [("output", 0)]
+    assert panel.canvas._direction_is_visible("input") is False
+
+    clicked.clear()
+    panel.set_scope("input")
+    app.processEvents()
+    assert panel.output_group.isVisible() is False
+    assert panel.input_group.isVisible() is True
+    panel.canvas.select_port("output", 0)
+    panel.canvas.select_port("input", 2)
+    assert clicked == [("input", 2)]
+    assert panel.canvas._direction_is_visible("output") is False
+
+    panel.set_scope("path")
+    app.processEvents()
+    assert panel.output_group.isVisible() is True
+    assert panel.input_group.isVisible() is True
+    assert panel.canvas._direction_is_visible("output") is True
+    assert panel.canvas._direction_is_visible("input") is True
+    panel.close()
 
 
 def test_stability_front_panel_path_is_independent_from_other_tabs():
@@ -245,13 +286,12 @@ def test_stability_front_panel_path_is_independent_from_other_tabs():
     panel.apply_button.click()
     app.processEvents()
 
-    stability_output = window._stability_rf_ports_panel._panels[0]
-    stability_readout = window._stability_rf_readout_panel
-    assert stability_output.gen_ch.value() == 0
-    assert stability_output.att1_db.value() == 4.5
-    assert stability_output.att2_db.value() == 6.75
-    assert stability_readout.ro_ch.value() == 1
-    assert stability_readout.attenuation_db.value() == 8.25
+    stability_path = window._stability_panel.front_panel_values()
+    assert stability_path["output_ch"] == 0
+    assert stability_path["output_att1_db"] == 4.5
+    assert stability_path["output_att2_db"] == 6.75
+    assert stability_path["readout_ch"] == 1
+    assert stability_path["readout_attenuation_db"] == 8.25
     assert awg_output.att1_db.value() == 1.25
     assert window._rf_readout_panel.attenuation_db.value() == 3.0
     assert window._sparameter_panel.output_att1_db.value() == 10.0
@@ -277,13 +317,71 @@ def test_calibration_front_panel_path_is_independent_from_other_tabs():
     calibration = window._calibration_panel
     assert calibration.output_att1.value() == 2.75
     assert calibration.output_att2.value() == 5.0
-    assert calibration.input_output_att1.value() == 2.75
+    assert calibration.input_output_att1.value() == 0.0
+    assert calibration.input_readout_ch.value() == 0
+    assert calibration.input_attenuation.value() == 0.0
+    assert calibration.dc_voltage_output_ch.value() == 1
+
+    calibration.tabs.setCurrentIndex(1)
+    window._show_qick_front_panel("path", calibration)
+    panel.canvas.select_port("output", 0)
+    panel.canvas.select_port("input", 2)
+    panel.output_att1_db.setValue(8.5)
+    panel.input_attenuation_db.setValue(7.25)
+    panel.apply_button.click()
+    app.processEvents()
+    assert calibration.input_output_att1.value() == 8.5
     assert calibration.input_readout_ch.value() == 1
     assert calibration.input_attenuation.value() == 7.25
+    assert calibration.output_att1.value() == 2.75
+    assert calibration.dc_voltage_output_ch.value() == 1
     assert window._rf_ports_panel._panels[0].att1_db.value() == 0.0
     assert window._rf_readout_panel.attenuation_db.value() == 20.0
     assert window._sparameter_panel.output_att1_db.value() == 10.0
-    assert window._stability_rf_ports_panel._panels[0].att1_db.value() == 0.0
+    assert window._stability_panel.front_panel_values()["output_att1_db"] == 10.0
+    window.close()
+
+
+def test_calibration_places_an_independent_front_panel_in_every_subtab():
+    _application()
+    window = gui.MainWindow()
+    calibration = window._calibration_panel
+    diagrams = [
+        calibration.path_diagram_for(mode)
+        for mode in ("output", "input", "dc_voltage")
+    ]
+
+    assert len({id(diagram) for diagram in diagrams}) == 3
+    for index, diagram in enumerate(diagrams):
+        tab = calibration.tabs.widget(index)
+        assert tab.isAncestorOf(diagram)
+    window.close()
+
+
+def test_stability_electrodes_are_selected_from_front_panel_dac_smas():
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    configuration = identify_qick_front_panel(_live_config())
+    window._on_qick_configuration_identified(configuration)
+
+    x_axis = window._stability_panel.x_axis
+    y_axis = window._stability_panel.y_axis
+    window._show_qick_front_panel("output", x_axis)
+    panel = window._qick_front_panel
+    panel.canvas.select_port("output", 4)
+    panel.apply_button.click()
+    app.processEvents()
+    assert x_axis.current_gen_ch() == 1
+    assert "DAC4" in x_axis.front_panel_status.text()
+
+    window._show_qick_front_panel("output", y_axis)
+    panel.canvas.select_port("output", 5)
+    panel.apply_button.click()
+    app.processEvents()
+    assert y_axis.current_gen_ch() == 3
+    assert "DAC5" in y_axis.front_panel_status.text()
+    assert not hasattr(x_axis, "segment")
     window.close()
 
 
@@ -321,7 +419,7 @@ def test_configuration_worker_uses_live_qick_config(monkeypatch):
     app.processEvents()
 
     assert failed == []
-    assert finished[0].mapped_output_count == 3
+    assert finished[0].mapped_output_count == 4
     assert finished[0].mapped_input_count == 3
 
 

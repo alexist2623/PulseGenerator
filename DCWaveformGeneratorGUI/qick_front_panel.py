@@ -215,6 +215,11 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
 
     LOGICAL_WIDTH = 1200.0
     LOGICAL_HEIGHT = 410.0
+    SCOPE_RECTS = {
+        "path": QtCore.QRectF(0.0, 0.0, 1200.0, 410.0),
+        "output": QtCore.QRectF(15.0, 0.0, 785.0, 230.0),
+        "input": QtCore.QRectF(800.0, 0.0, 395.0, 230.0),
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -228,6 +233,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         self._selected_output: Optional[int] = None
         self._selected_input: Optional[int] = None
         self._hover: Optional[Tuple[str, int]] = None
+        self._scope = "path"
         self._port_centers = self._build_port_centers()
 
     @staticmethod
@@ -268,6 +274,22 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         self._configuration = configuration
         self.update()
 
+    def set_scope(self, scope: str) -> None:
+        """Show and activate only the connector direction being edited."""
+        if scope not in self.SCOPE_RECTS:
+            raise ValueError("front-panel scope must be path, output, or input")
+        self._scope = scope
+        if self._hover is not None and not self._direction_is_visible(
+            self._hover[0]
+        ):
+            self._hover = None
+            self.setToolTip("")
+        self.updateGeometry()
+        self.update()
+
+    def _direction_is_visible(self, direction: str) -> bool:
+        return self._scope == "path" or direction == self._scope
+
     def set_selected(self, direction: str, panel_index: Optional[int]) -> None:
         if direction == "output":
             self._selected_output = panel_index
@@ -279,29 +301,36 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         """Select a port programmatically; useful for keyboard flows and tests."""
         if direction not in ("output", "input"):
             raise ValueError("direction must be output or input")
+        if not self._direction_is_visible(direction):
+            return
         self.port_clicked.emit(direction, int(panel_index))
 
-    def _display_transform(self) -> Tuple[float, float, float]:
+    def _display_transform(self) -> Tuple[float, float, float, float, float]:
+        view = self.SCOPE_RECTS[self._scope]
         scale = min(
-            self.width() / self.LOGICAL_WIDTH,
-            self.height() / self.LOGICAL_HEIGHT,
+            self.width() / view.width(),
+            self.height() / view.height(),
         )
         return (
             scale,
-            (self.width() - self.LOGICAL_WIDTH * scale) / 2.0,
-            (self.height() - self.LOGICAL_HEIGHT * scale) / 2.0,
+            (self.width() - view.width() * scale) / 2.0,
+            (self.height() - view.height() * scale) / 2.0,
+            view.left(),
+            view.top(),
         )
 
     def _logical_point(self, point: QtCore.QPoint) -> QtCore.QPointF:
-        scale, offset_x, offset_y = self._display_transform()
+        scale, offset_x, offset_y, origin_x, origin_y = self._display_transform()
         return QtCore.QPointF(
-            (point.x() - offset_x) / max(scale, 1.0e-9),
-            (point.y() - offset_y) / max(scale, 1.0e-9),
+            (point.x() - offset_x) / max(scale, 1.0e-9) + origin_x,
+            (point.y() - offset_y) / max(scale, 1.0e-9) + origin_y,
         )
 
     def _hit_test(self, point: QtCore.QPoint) -> Optional[Tuple[str, int]]:
         logical = self._logical_point(point)
         for key, center in self._port_centers.items():
+            if not self._direction_is_visible(key[0]):
+                continue
             delta = logical - center
             if delta.x() * delta.x() + delta.y() * delta.y() <= 22.0 * 22.0:
                 return key
@@ -443,9 +472,11 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     def paintEvent(self, _event) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        scale, offset_x, offset_y = self._display_transform()
+        scale, offset_x, offset_y, origin_x, origin_y = self._display_transform()
         painter.translate(offset_x, offset_y)
         painter.scale(scale, scale)
+        painter.translate(-origin_x, -origin_y)
+        painter.setClipRect(self.SCOPE_RECTS[self._scope])
 
         panel = QtCore.QRectF(4.0, 4.0, self.LOGICAL_WIDTH - 8.0, self.LOGICAL_HEIGHT - 8.0)
         painter.setPen(QtGui.QPen(QtGui.QColor("#481018"), 3.0))
@@ -456,28 +487,34 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         title_font.setBold(True)
         title_font.setPointSizeF(11.0)
         painter.setFont(title_font)
-        painter.drawText(QtCore.QRectF(20.0, 12.0, 760.0, 26.0), QtCore.Qt.AlignCenter, "DAC OUTPUTS")
-        painter.drawText(QtCore.QRectF(805.0, 12.0, 375.0, 26.0), QtCore.Qt.AlignCenter, "ADC INPUTS")
+        if self._direction_is_visible("output"):
+            painter.drawText(QtCore.QRectF(20.0, 12.0, 760.0, 26.0), QtCore.Qt.AlignCenter, "DAC OUTPUTS")
+        if self._direction_is_visible("input"):
+            painter.drawText(QtCore.QRectF(805.0, 12.0, 375.0, 26.0), QtCore.Qt.AlignCenter, "ADC INPUTS")
 
         body_font = painter.font()
         body_font.setBold(False)
         body_font.setPointSizeF(8.0)
         painter.setFont(body_font)
         for visual_slot in range(4):
-            self._draw_card_group(
-                painter,
-                "output",
-                3 - visual_slot,
-                QtCore.QRectF(30.0 + 190.0 * visual_slot, 42.0, 178.0, 176.0),
-            )
-            self._draw_card_group(
-                painter,
-                "input",
-                3 - visual_slot,
-                QtCore.QRectF(815.0 + 91.0 * visual_slot, 42.0, 84.0, 176.0),
-            )
+            if self._direction_is_visible("output"):
+                self._draw_card_group(
+                    painter,
+                    "output",
+                    3 - visual_slot,
+                    QtCore.QRectF(30.0 + 190.0 * visual_slot, 42.0, 178.0, 176.0),
+                )
+            if self._direction_is_visible("input"):
+                self._draw_card_group(
+                    painter,
+                    "input",
+                    3 - visual_slot,
+                    QtCore.QRectF(815.0 + 91.0 * visual_slot, 42.0, 84.0, 176.0),
+                )
 
         for key, center in self._port_centers.items():
+            if not self._direction_is_visible(key[0]):
+                continue
             self._draw_sma(painter, key, center)
             direction, index = key
             painter.setPen(QtGui.QColor("#f5e4c4"))
@@ -486,6 +523,10 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                 QtCore.Qt.AlignCenter,
                 f"{'DAC' if direction == 'output' else 'ADC'}{index}",
             )
+
+        if self._scope != "path":
+            painter.end()
+            return
 
         painter.setPen(QtGui.QPen(QtGui.QColor("#d49b49"), 1.2))
         painter.drawLine(QtCore.QPointF(20.0, 240.0), QtCore.QPointF(1180.0, 240.0))
@@ -779,6 +820,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         if scope not in {"path", "output", "input"}:
             raise ValueError("front-panel scope must be path, output, or input")
         self._scope = scope
+        self.canvas.set_scope(scope)
         self.output_group.setVisible(scope in {"path", "output"})
         self.input_group.setVisible(scope in {"path", "input"})
         labels = {
