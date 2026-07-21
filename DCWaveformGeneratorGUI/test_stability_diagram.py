@@ -31,6 +31,7 @@ def _config() -> stability.StabilityDiagramConfig:
             "awg_1", "set_2", -50.0, 50.0, 2
         ),
         repetitions_per_point=2,
+        trace_samples_per_point=3,
     )
 
 
@@ -290,6 +291,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.x_axis.points.setValue(11)
     panel.y_axis.points.setValue(7)
     panel.repetitions.setValue(4)
+    panel.trace_samples.setValue(321)
     database_path = tmp_path / "stability_single_shot.db"
     panel.database_path.setText(str(database_path))
     app.processEvents()
@@ -299,6 +301,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert config.x_axis.segment_name == "set_1"
     assert config.y_axis.output_name == "awg_2"
     assert config.point_count == 77
+    assert config.trace_samples_per_point == 321
     assert panel.point_count.text() == "77"
     assert panel.database_path_value() == str(database_path)
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
@@ -357,9 +360,11 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.start_button.isEnabled() is False
     assert panel.stop_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is False
+    assert panel.trace_samples.isEnabled() is False
     panel.set_stopping()
     assert panel.stop_button.isEnabled() is False
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
+    assert panel.trace_samples.isEnabled() is True
     panel.close()
     restored.close()

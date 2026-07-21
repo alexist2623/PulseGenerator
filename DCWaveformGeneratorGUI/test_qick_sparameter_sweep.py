@@ -1237,7 +1237,7 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
     window.close()
 
 
-def test_rf_path_update_commits_sparameter_and_experiment_values():
+def test_rf_path_update_commits_only_sparameter_values():
     app = _application()
     window = gui.MainWindow()
     panel = window._sparameter_panel
@@ -1278,18 +1278,18 @@ def test_rf_path_update_commits_sparameter_and_experiment_values():
     assert panel.path_diagram.update_button.isEnabled() is False
 
     experiment_output = window._rf_ports_panel._panels[0]
-    assert experiment_output.gen_ch.value() == 6
-    assert experiment_output.output_board_type.currentText() == "DC_Out"
-    assert experiment_output.att1_db.value() == 7.0
-    assert experiment_output.att2_db.value() == 8.0
-    assert experiment_output.filter_type.currentText() == "lowpass"
-    assert experiment_output.filter_cutoff.value() == 2.2
+    assert experiment_output.gen_ch.value() == 0
+    assert experiment_output.output_board_type.currentText() == "RF_Out"
+    assert experiment_output.att1_db.value() == 0.0
+    assert experiment_output.att2_db.value() == 0.0
+    assert experiment_output.filter_type.currentText() == "bypass"
+    assert experiment_output.filter_cutoff.value() == 2.5
 
     experiment_input = window._rf_readout_panel
-    assert experiment_input.ro_ch.value() == 3
-    assert experiment_input.input_board_type.currentText() == "DC_In"
-    assert experiment_input.dc_gain_db.value() == 12.0
-    assert experiment_input.filter_type.currentText() == "bandpass"
-    assert experiment_input.filter_cutoff.value() == 1.8
-    assert experiment_input.filter_bandwidth.value() == 0.4
+    assert experiment_input.ro_ch.value() == 0
+    assert experiment_input.input_board_type.currentText() == "RF_In"
+    assert experiment_input.dc_gain_db.value() == 0.0
+    assert experiment_input.filter_type.currentText() == "bypass"
+    assert experiment_input.filter_cutoff.value() == 2.5
+    assert experiment_input.filter_bandwidth.value() == 1.0
     window.close()

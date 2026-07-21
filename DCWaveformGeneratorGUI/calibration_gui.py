@@ -308,7 +308,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         self.path_diagram = RfPathCorrectionWidget(self, compact=True)
-        self.path_diagram.settings_applied.connect(self.path_settings_applied.emit)
+        self.path_diagram.settings_applied.connect(self._apply_local_path_settings)
         self.path_diagram.front_panel_requested.connect(
             self.front_panel_requested.emit
         )
@@ -444,8 +444,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.output_sample_name.setPlaceholderText("Auto: RF_Out_<range>MHz")
         form.addRow(
             QtWidgets.QLabel(
-                "Board, channel, ATT, filter, and Nyquist settings use the shared "
-                "RF path above."
+                "Board, channel, ATT, filter, and Nyquist settings use this "
+                "Calibration tab's RF path above."
             )
         )
         for label, widget in (
@@ -555,8 +555,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_sample_name.setPlaceholderText("Auto: RF_In_<range>MHz")
         form.addRow(
             QtWidgets.QLabel(
-                "Board, channel, ATT, filter, and Nyquist settings use the shared "
-                "RF path above."
+                "Board, channel, ATT, filter, and Nyquist settings use this "
+                "Calibration tab's RF path above."
             )
         )
         for label, widget in (
@@ -623,9 +623,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             "Latest matching channel/gain"
         )
         application_note = QtWidgets.QLabel(
-            "This selection is applied to DC_In Experiment and Stability "
-            "Diagram measurements. Run ID 0 selects the latest calibration "
-            "matching the readout channel and DC input gain."
+            "This selection belongs only to the Calibration tab. Select a "
+            "calibration independently in AWG Tuning, Stability Diagram, and "
+            "Noise Analysis. Run ID 0 selects the latest matching calibration."
         )
         application_note.setWordWrap(True)
         application_form.addRow("Application DB:", application_path_row)
@@ -753,7 +753,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         database_path: str,
         run_id: int,
     ) -> None:
-        """Set the central DC calibration used by measurement tabs."""
+        """Set this Calibration tab's DC calibration selection."""
         with QtCore.QSignalBlocker(self.dc_application_path):
             self.dc_application_path.setText(str(database_path))
         with QtCore.QSignalBlocker(self.dc_application_run_id):
@@ -763,7 +763,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._emit_dc_application_changed()
 
     def dc_application_selection(self) -> Mapping[str, Any]:
-        """Return the central DC calibration application selection."""
+        """Return this Calibration tab's DC calibration selection."""
         path = self.dc_application_path.text().strip()
         if self.dc_application_group.isChecked() and not path:
             raise ValueError(
@@ -916,7 +916,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
 
     def apply_path_settings(self, values: Mapping[str, Any]) -> None:
-        """Apply the shared front-panel RF path to both calibration modes."""
+        """Apply this tab's RF path to its calibration modes only."""
         self.path_diagram.apply_external_settings(values)
         output_ch = int(values["output_ch"])
         readout_ch = int(values["readout_ch"])
@@ -971,6 +971,29 @@ class CalibrationPanel(QtWidgets.QWidget):
                 float(values["readout_filter_bandwidth_ghz"])
             )
         self._update_board_controls()
+
+    def _apply_local_path_settings(self, values: Mapping[str, Any]) -> None:
+        self.apply_path_settings(values)
+        self.path_settings_applied.emit(dict(values))
+
+    def front_panel_values(self) -> Mapping[str, Any]:
+        """Return this tab's input-calibration RF path for graphical editing."""
+        values = self.path_diagram._editor_values()
+        values.update(
+            {
+                "output_filter_type": self.input_output_filter.currentText(),
+                "output_filter_cutoff_ghz": self.input_output_cutoff.value(),
+                "output_filter_bandwidth_ghz": self.input_output_bandwidth.value(),
+                "readout_filter_type": self.input_readout_filter.currentText(),
+                "readout_filter_cutoff_ghz": self.input_readout_cutoff.value(),
+                "readout_filter_bandwidth_ghz": self.input_readout_bandwidth.value(),
+            }
+        )
+        return values
+
+    def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
+        """Apply graphical SMA settings only to this Calibration tab."""
+        self.apply_path_settings(values)
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)

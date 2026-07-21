@@ -51,7 +51,23 @@ DEFAULT_STABILITY_START_MV = -100.0
 DEFAULT_STABILITY_STOP_MV = 100.0
 DEFAULT_STABILITY_POINTS = 51
 DEFAULT_STABILITY_REPETITIONS = 1
+DEFAULT_STABILITY_TRACE_SAMPLES = 64
 DEFAULT_STABILITY_DB_PATH = str(Path.home() / "qick_stability_diagrams.db")
+DEFAULT_STABILITY_RF_PATH = {
+    "output_ch": 0,
+    "readout_ch": 0,
+    "output_nqz": 1,
+    "readout_nqz": 1,
+    "output_board_type": "RF_Out",
+    "input_board_type": "DC_In",
+    "output_att1_db": 10.0,
+    "output_att2_db": 10.0,
+    "readout_attenuation_db": 20.0,
+    "readout_dc_gain_db": 0.0,
+    "loss1_db": 0.0,
+    "loss2_db": 0.0,
+    "amplifier_gain_db": 0.0,
+}
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -110,6 +126,7 @@ class StabilityDiagramConfig:
     x_axis: StabilitySweepAxis
     y_axis: StabilitySweepAxis
     repetitions_per_point: int = DEFAULT_STABILITY_REPETITIONS
+    trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
 
     def __post_init__(self) -> None:
         if self.x_axis.output_name == self.y_axis.output_name:
@@ -125,6 +142,11 @@ class StabilityDiagramConfig:
         _integer(
             self.repetitions_per_point,
             "stability repetitions per point",
+            1,
+        )
+        _integer(
+            self.trace_samples_per_point,
+            "stability FIR trace samples per point",
             1,
         )
 
@@ -202,6 +224,8 @@ def default_stability_settings(
             "points": DEFAULT_STABILITY_POINTS,
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
+        "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
+        "rf_path": dict(DEFAULT_STABILITY_RF_PATH),
         "database_path": DEFAULT_STABILITY_DB_PATH,
         "dc_voltage_calibration_enabled": False,
         "dc_voltage_calibration_database_path": "",
@@ -266,6 +290,38 @@ def normalize_stability_settings(
         "stability repetitions per point",
         1,
     )
+    normalized["trace_samples_per_point"] = _integer(
+        settings.get(
+            "trace_samples_per_point",
+            defaults["trace_samples_per_point"],
+        ),
+        "stability FIR trace samples per point",
+        1,
+    )
+    raw_rf_path = settings.get("rf_path", defaults["rf_path"])
+    if not isinstance(raw_rf_path, Mapping):
+        raise TypeError("stability RF path must be a JSON object")
+    rf_path = dict(defaults["rf_path"])
+    rf_path.update({key: raw_rf_path[key] for key in rf_path.keys() & raw_rf_path.keys()})
+    for key in ("output_ch", "readout_ch"):
+        rf_path[key] = _integer(rf_path[key], f"stability RF path {key}", 0)
+    for key in ("output_nqz", "readout_nqz"):
+        rf_path[key] = _integer(rf_path[key], f"stability RF path {key}", 1)
+        if rf_path[key] > 2:
+            raise ValueError(f"stability RF path {key} must be 1 or 2")
+    for key in (
+        "output_att1_db",
+        "output_att2_db",
+        "readout_attenuation_db",
+        "readout_dc_gain_db",
+        "loss1_db",
+        "loss2_db",
+        "amplifier_gain_db",
+    ):
+        rf_path[key] = _finite_float(rf_path[key], f"stability RF path {key}")
+    rf_path["output_board_type"] = str(rf_path["output_board_type"])
+    rf_path["input_board_type"] = str(rf_path["input_board_type"])
+    normalized["rf_path"] = rf_path
     database_path = str(
         settings.get("database_path", defaults["database_path"])
     ).strip()
@@ -845,11 +901,20 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.setSpacing(6)
 
         self.path_diagram = RfPathCorrectionWidget(controls_content, compact=True)
-        self.path_diagram.settings_applied.connect(self.path_settings_applied.emit)
+        self.path_diagram.settings_applied.connect(self._apply_local_path_settings)
         self.path_diagram.front_panel_requested.connect(
             self.front_panel_requested.emit
         )
         controls.addWidget(self.path_diagram)
+
+        self.rf_editor_tabs = QtWidgets.QTabWidget(controls_content)
+        self.rf_editor_tabs.setMinimumHeight(520)
+        self.rf_editor_tabs.setToolTip(
+            "RF output and FIR readout settings used only by Stability Diagram"
+        )
+        controls.addWidget(self.rf_editor_tabs)
+        self._rf_outputs_editor = None
+        self._rf_readout_editor = None
 
         self.x_axis = _StabilityAxisEditor("X Electrode", controls_content)
         self.y_axis = _StabilityAxisEditor("Y Electrode", controls_content)
@@ -861,6 +926,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.repetitions = QtWidgets.QSpinBox(acquisition)
         self.repetitions.setRange(1, 1_000_000)
         self.repetitions.setValue(DEFAULT_STABILITY_REPETITIONS)
+        self.trace_samples = QtWidgets.QSpinBox(acquisition)
+        self.trace_samples.setRange(1, 10_000_000)
+        self.trace_samples.setValue(DEFAULT_STABILITY_TRACE_SAMPLES)
+        self.trace_samples.setToolTip(
+            "Number of post-FIR 1 MSPS samples stored for every stability "
+            "point and repetition"
+        )
         self.point_count = QtWidgets.QLabel("2,601", acquisition)
         self.point_count.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.dc_measure_mode = QtWidgets.QCheckBox("DC measure mode", acquisition)
@@ -873,6 +945,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.setValue(1.0)
         self.dc_measure_gain_v_per_a.setSuffix(" V/A")
         acquisition_form.addRow("Repetitions / point:", self.repetitions)
+        acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
         acquisition_form.addRow("Cartesian points:", self.point_count)
         acquisition_form.addRow(self.dc_measure_mode)
         acquisition_form.addRow(
@@ -1059,7 +1132,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         calibration_database_path: str = "",
         calibration_run_id: int = 0,
     ) -> None:
-        """Mirror the shared FIR readout measurement settings."""
+        """Mirror this Stability tab's FIR readout settings."""
         self._dc_input_available = str(input_board_type) == "DC_In"
         with QtCore.QSignalBlocker(self.dc_measure_mode):
             self.dc_measure_mode.setChecked(
@@ -1126,9 +1199,73 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)
+        if self._rf_outputs_editor is not None:
+            self._rf_outputs_editor.set_front_panel_configuration(configuration)
+        if self._rf_readout_editor is not None:
+            self._rf_readout_editor.set_front_panel_configuration(configuration)
+
+    def set_rf_editors(self, outputs_editor, readout_editor) -> None:
+        """Attach Stability-only RF controls supplied by the main GUI module."""
+        if self._rf_outputs_editor is not None or self._rf_readout_editor is not None:
+            raise RuntimeError("Stability RF editors are already attached")
+        self._rf_outputs_editor = outputs_editor
+        self._rf_readout_editor = readout_editor
+        self.rf_editor_tabs.addTab(outputs_editor, "RF Outputs")
+        self.rf_editor_tabs.addTab(readout_editor, "RF Readout")
+
+    def front_panel_values(self) -> Mapping[str, Any]:
+        """Return the complete Stability-only RF path for graphical editing."""
+        values = self.path_diagram._editor_values()
+        if self._rf_outputs_editor is not None:
+            configured_outputs = self._rf_outputs_editor.configured_specs()
+        else:
+            configured_outputs = ()
+        if configured_outputs:
+            output = configured_outputs[0]
+            values.update(
+                {
+                    "output_ch": output.gen_ch,
+                    "output_board_type": output.output_board_type,
+                    "output_nqz": output.nqz,
+                    "output_att1_db": output.att1_db,
+                    "output_att2_db": output.att2_db,
+                    "output_filter_type": output.filter_type,
+                    "output_filter_cutoff_ghz": output.filter_cutoff,
+                    "output_filter_bandwidth_ghz": output.filter_bandwidth,
+                }
+            )
+        if self._rf_readout_editor is not None:
+            readout = self._rf_readout_editor.configured_spec()
+            values.update(
+                {
+                    "readout_ch": readout.ro_ch,
+                    "input_board_type": readout.input_board_type,
+                    "readout_nqz": readout.nqz,
+                    "readout_attenuation_db": readout.attenuation_db,
+                    "readout_dc_gain_db": readout.dc_gain_db,
+                    "readout_filter_type": readout.filter_type,
+                    "readout_filter_cutoff_ghz": readout.filter_cutoff,
+                    "readout_filter_bandwidth_ghz": readout.filter_bandwidth,
+                }
+            )
+        return values
+
+    def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
+        """Apply graphical SMA settings only to this Stability tab."""
+        self.apply_path_settings(values)
 
     def apply_path_settings(self, values: Mapping[str, Any]) -> None:
-        self.path_diagram.apply_external_settings(values)
+        complete = self.front_panel_values()
+        complete.update(values)
+        self.path_diagram.apply_external_settings(complete)
+        if self._rf_outputs_editor is not None:
+            self._rf_outputs_editor.apply_path_settings(complete)
+        if self._rf_readout_editor is not None:
+            self._rf_readout_editor.apply_path_settings(complete)
+
+    def _apply_local_path_settings(self, values: Mapping[str, Any]) -> None:
+        self.apply_path_settings(values)
+        self.path_settings_applied.emit(dict(self.front_panel_values()))
 
     def config(self, *, full_scale_mv: float) -> StabilityDiagramConfig:
         if not self._targets_available:
@@ -1137,6 +1274,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             x_axis=self.x_axis.value(),
             y_axis=self.y_axis.value(),
             repetitions_per_point=self.repetitions.value(),
+            trace_samples_per_point=self.trace_samples.value(),
         )
         config.validate_full_scale(full_scale_mv)
         return config
@@ -1146,6 +1284,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "x_axis": self.x_axis.settings_dict(),
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
+            "trace_samples_per_point": self.trace_samples.value(),
+            "rf_path": self.path_diagram.applied_values(),
             "database_path": self.database_path_value(),
             "dc_voltage_calibration_enabled": (
                 self.dc_calibration_group.isChecked()
@@ -1162,6 +1302,17 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.x_axis.load_settings(settings["x_axis"])
         self.y_axis.load_settings(settings["y_axis"])
         self.repetitions.setValue(int(settings["repetitions_per_point"]))
+        self.trace_samples.setValue(
+            int(
+                settings.get(
+                    "trace_samples_per_point",
+                    DEFAULT_STABILITY_TRACE_SAMPLES,
+                )
+            )
+        )
+        self.apply_path_settings(
+            settings.get("rf_path", DEFAULT_STABILITY_RF_PATH)
+        )
         self.database_path.setText(
             str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
         )
@@ -1193,7 +1344,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         for editor in (self.x_axis, self.y_axis):
             editor.setEnabled(not running)
         self.repetitions.setEnabled(not running)
+        self.trace_samples.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
+        self.rf_editor_tabs.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         self._update_dc_measure_controls()
@@ -1246,6 +1399,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 __all__ = [
     "DEFAULT_STABILITY_POINTS",
     "DEFAULT_STABILITY_REPETITIONS",
+    "DEFAULT_STABILITY_RF_PATH",
+    "DEFAULT_STABILITY_TRACE_SAMPLES",
     "DEFAULT_STABILITY_START_MV",
     "DEFAULT_STABILITY_STOP_MV",
     "StabilityDiagramConfig",

@@ -426,6 +426,24 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     readout.dc_gain_db.setValue(12.0)
     readout.dc_measure_mode.setChecked(True)
     readout.dc_measure_gain_v_per_a.setValue(1.0e6)
+    stability_rf = window._stability_rf_ports_panel._panels[0]
+    stability_rf.setChecked(True)
+    stability_rf.gen_ch.setValue(2)
+    stability_rf.segment.setCurrentIndex(
+        stability_rf.segment.findData("set_1")
+    )
+    stability_rf.frequency_mhz.setValue(211.0)
+    stability_rf.att1_db.setValue(12.25)
+    stability_readout = window._stability_rf_readout_panel
+    stability_readout.setChecked(True)
+    stability_readout.ro_ch.setValue(1)
+    stability_readout.segment.setCurrentIndex(
+        stability_readout.segment.findData("set_1")
+    )
+    stability_readout.input_board_type.setCurrentText("RF_In")
+    stability_readout.attenuation_db.setValue(9.5)
+    stability_readout.samples.setValue(777)
+    window._stability_panel.trace_samples.setValue(321)
     experiment = window._experiment_panel
     experiment.qick_host.setText("192.0.2.44")
     experiment.ns_port.setValue(9999)
@@ -466,6 +484,11 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["rf_readout"]["input_board_type"] == "DC_In"
     assert document["rf_readout"]["dc_measure_mode"] is True
     assert document["rf_readout"]["dc_measure_gain_v_per_a"] == 1.0e6
+    assert document["stability_diagram"]["rf_outputs"][0]["gen_ch"] == 2
+    assert document["stability_diagram"]["rf_outputs"][0]["att1_db"] == 12.25
+    assert document["stability_diagram"]["rf_readout"]["ro_ch"] == 1
+    assert document["stability_diagram"]["rf_readout"]["attenuation_db"] == 9.5
+    assert document["stability_diagram"]["trace_samples_per_point"] == 321
 
     restored = gui.MainWindow()
     restored._load_settings_json(saved_path)
@@ -473,6 +496,11 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._settings_to_dict() == expected
     assert restored._ddr_readout_spec == readout.spec()
     assert len(restored._rf_pulse_specs) == 1
+    assert restored._stability_rf_ports_panel.settings()[0]["gen_ch"] == 2
+    assert restored._stability_rf_ports_panel.settings()[0]["att1_db"] == 12.25
+    assert restored._stability_rf_readout_panel.ro_ch.value() == 1
+    assert restored._stability_rf_readout_panel.attenuation_db.value() == 9.5
+    assert restored._stability_panel.trace_samples.value() == 321
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
     assert restored._experiment_panel.tproc_mhz.value() == 275.0
     assert restored._experiment_panel.bias_t_group.isChecked() is True
@@ -526,14 +554,17 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     window._add_port()
     window._rf_readout_panel.setChecked(True)
     window._rf_readout_panel.samples.setValue(16)
-    window._rf_readout_panel.input_board_type.setCurrentText("DC_In")
-    window._rf_readout_panel.dc_measure_mode.setChecked(True)
-    window._rf_readout_panel.dc_measure_gain_v_per_a.setValue(2.0e6)
-    window._calibration_panel.set_dc_application_selection(
-        True,
-        "dc_calibration.db",
-        7,
-    )
+    window._rf_readout_panel.input_board_type.setCurrentText("RF_In")
+    window._rf_readout_panel.attenuation_db.setValue(5.0)
+    stability_readout = window._stability_rf_readout_panel
+    stability_readout.setChecked(True)
+    stability_readout.input_board_type.setCurrentText("DC_In")
+    stability_readout.dc_measure_mode.setChecked(True)
+    stability_readout.dc_measure_gain_v_per_a.setValue(2.0e6)
+    stability_readout.dc_voltage_calibration_enabled.setChecked(True)
+    stability_readout.dc_voltage_calibration_path.setText("dc_calibration.db")
+    stability_readout.dc_voltage_calibration_run_id.setValue(7)
+    window._stability_panel.trace_samples.setValue(96)
     window._stability_panel.x_axis.start_mv.setValue(-200.0)
     window._stability_panel.x_axis.stop_mv.setValue(100.0)
     window._stability_panel.x_axis.points.setValue(5)
@@ -555,9 +586,11 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     window._stability_panel.dc_measure_gain_v_per_a.setValue(3.0e6)
     window._stability_panel.dc_calibration_run_id.setValue(8)
     app.processEvents()
-    assert window._rf_readout_panel.dc_measure_gain_v_per_a.value() == 3.0e6
-    assert window._rf_readout_panel.dc_voltage_calibration_run_id.value() == 8
-    assert window._calibration_panel.dc_application_run_id.value() == 8
+    assert stability_readout.dc_measure_gain_v_per_a.value() == 3.0e6
+    assert stability_readout.dc_voltage_calibration_run_id.value() == 8
+    assert window._rf_readout_panel.input_board_type.currentText() == "RF_In"
+    assert window._rf_readout_panel.attenuation_db.value() == 5.0
+    assert window._rf_readout_panel.dc_measure_mode.isChecked() is False
 
     arguments = window._stability_run_arguments(save=False)
 
@@ -570,7 +603,9 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
         "awg_1",
     ]
     assert arguments["sequence"].sweep_point_count == 15
-    assert arguments["readout_spec"].samples_per_trigger == 16
+    assert arguments["readout_spec"].samples_per_trigger == 96
+    assert window._rf_readout_panel.samples.value() == 16
+    assert arguments["stability_config"].trace_samples_per_point == 96
     assert arguments["readout_spec"].dc_measure_mode is True
     assert arguments["readout_spec"].dc_measure_gain_v_per_a == 3.0e6
     assert arguments["readout_spec"].dc_voltage_calibration_enabled is True
@@ -817,7 +852,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 18
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 20
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"
@@ -826,6 +861,8 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert upgraded["awg"]["sweeps"] == []
     assert upgraded["stability_diagram"]["x_axis"]["output_name"] == "awg_0"
     assert upgraded["stability_diagram"]["y_axis"]["output_name"] == "awg_0"
+    assert upgraded["stability_diagram"]["trace_samples_per_point"] == 64
+    assert upgraded["stability_diagram"]["rf_readout"]["enabled"] is False
     assert upgraded["qick"]["tproc_mhz"] == 300.0
     assert upgraded["qick"]["repetitions_per_sweep"] == 1
     assert upgraded["qick"]["bias_t_compensation"] == {

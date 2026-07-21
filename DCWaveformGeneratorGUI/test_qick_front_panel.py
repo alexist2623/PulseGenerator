@@ -126,7 +126,7 @@ def test_front_panel_control_selects_smas_and_reports_channel_attenuation():
     panel.close()
 
 
-def test_graphical_path_updates_sparameter_experiment_and_calibration():
+def test_graphical_path_updates_only_requesting_sparameter_tab():
     app = _application()
     window = gui.MainWindow()
     panel = window._qick_front_panel
@@ -134,7 +134,9 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     assert window._control_tabs.currentWidget() is window._awg_tuning_page
     assert window._awg_tuning_tabs.currentWidget() is window._multi_ctrl
 
-    panel.set_configuration(identify_qick_front_panel(_live_config()))
+    configuration = identify_qick_front_panel(_live_config())
+    window._on_qick_configuration_identified(configuration)
+    window._show_qick_front_panel("path", window._sparameter_panel)
     panel.canvas.select_port("output", 0)
     panel.canvas.select_port("input", 2)
     panel.output_att1_db.setValue(6.25)
@@ -157,18 +159,19 @@ def test_graphical_path_updates_sparameter_experiment_and_calibration():
     assert sparameter.readout_nqz == 2
 
     experiment_output = window._rf_ports_panel._panels[0]
-    assert experiment_output.gen_ch.value() == 0
-    assert experiment_output.att1_db.value() == 6.25
-    assert window._rf_readout_panel.ro_ch.value() == 1
-    assert window._rf_readout_panel.attenuation_db.value() == 11.75
-    assert window._rf_readout_panel.nqz.value() == 2
+    assert experiment_output.att1_db.value() == 0.0
+    assert window._rf_readout_panel.ro_ch.value() == 0
+    assert window._rf_readout_panel.attenuation_db.value() == 20.0
+    assert window._rf_readout_panel.nqz.value() == 1
 
     calibration = window._calibration_panel
     assert calibration.output_ch.value() == 0
-    assert calibration.output_att1.value() == 6.25
+    assert calibration.output_att1.value() == 0.0
     assert calibration.input_output_ch.value() == 0
-    assert calibration.input_readout_ch.value() == 1
-    assert calibration.input_attenuation.value() == 11.75
+    assert calibration.input_readout_ch.value() == 0
+    assert calibration.input_attenuation.value() == 0.0
+    assert window._stability_rf_readout_panel.ro_ch.value() == 0
+    assert window._stability_rf_readout_panel.attenuation_db.value() == 20.0
     window.close()
 
 
@@ -220,6 +223,67 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     assert output.att2_db.value() == 7.5
     assert output.filter_type.currentText() == "lowpass"
     assert window._qick_front_panel_dialog.isVisible() is False
+    window.close()
+
+
+def test_stability_front_panel_path_is_independent_from_other_tabs():
+    app = _application()
+    window = gui.MainWindow()
+    configuration = identify_qick_front_panel(_live_config())
+    window._on_qick_configuration_identified(configuration)
+    awg_output = window._rf_ports_panel._panels[0]
+    awg_output.att1_db.setValue(1.25)
+    window._rf_readout_panel.attenuation_db.setValue(3.0)
+
+    window._show_qick_front_panel("path", window._stability_panel)
+    panel = window._qick_front_panel
+    panel.canvas.select_port("output", 0)
+    panel.canvas.select_port("input", 2)
+    panel.output_att1_db.setValue(4.5)
+    panel.output_att2_db.setValue(6.75)
+    panel.input_attenuation_db.setValue(8.25)
+    panel.apply_button.click()
+    app.processEvents()
+
+    stability_output = window._stability_rf_ports_panel._panels[0]
+    stability_readout = window._stability_rf_readout_panel
+    assert stability_output.gen_ch.value() == 0
+    assert stability_output.att1_db.value() == 4.5
+    assert stability_output.att2_db.value() == 6.75
+    assert stability_readout.ro_ch.value() == 1
+    assert stability_readout.attenuation_db.value() == 8.25
+    assert awg_output.att1_db.value() == 1.25
+    assert window._rf_readout_panel.attenuation_db.value() == 3.0
+    assert window._sparameter_panel.output_att1_db.value() == 10.0
+    assert window._calibration_panel.output_att1.value() == 0.0
+    window.close()
+
+
+def test_calibration_front_panel_path_is_independent_from_other_tabs():
+    app = _application()
+    window = gui.MainWindow()
+    configuration = identify_qick_front_panel(_live_config())
+    window._on_qick_configuration_identified(configuration)
+    window._show_qick_front_panel("path", window._calibration_panel)
+    panel = window._qick_front_panel
+    panel.canvas.select_port("output", 0)
+    panel.canvas.select_port("input", 2)
+    panel.output_att1_db.setValue(2.75)
+    panel.output_att2_db.setValue(5.0)
+    panel.input_attenuation_db.setValue(7.25)
+    panel.apply_button.click()
+    app.processEvents()
+
+    calibration = window._calibration_panel
+    assert calibration.output_att1.value() == 2.75
+    assert calibration.output_att2.value() == 5.0
+    assert calibration.input_output_att1.value() == 2.75
+    assert calibration.input_readout_ch.value() == 1
+    assert calibration.input_attenuation.value() == 7.25
+    assert window._rf_ports_panel._panels[0].att1_db.value() == 0.0
+    assert window._rf_readout_panel.attenuation_db.value() == 20.0
+    assert window._sparameter_panel.output_att1_db.value() == 10.0
+    assert window._stability_rf_ports_panel._panels[0].att1_db.value() == 0.0
     window.close()
 
 

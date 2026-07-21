@@ -178,8 +178,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
         )
         self.update_button.setToolTip(
-            "Apply this RF path to AWG Tuning, Stability Diagram, "
-            "RF S-Parameter, and Calibration"
+            "Apply this RF path only to the current measurement tab"
         )
         self.apply_status = QtWidgets.QLabel("Applied", self)
         self.apply_status.setAlignment(QtCore.Qt.AlignCenter)
@@ -324,7 +323,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         return dict(self._applied_values)
 
     def apply_external_settings(self, values: Mapping[str, Any]) -> None:
-        """Adopt a committed shared path without emitting another update."""
+        """Adopt a committed path without emitting another update."""
         assignments = (
             (self.output_ch, "output_ch"),
             (self.readout_ch, "readout_ch"),
@@ -352,7 +351,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         """Commit edited path values and optionally notify linked panels."""
         self._applied_values = self._editor_values()
         self.update_button.setEnabled(False)
-        self.apply_status.setText("Applied to all RF measurement tabs")
+        self.apply_status.setText("Applied to this measurement tab")
         self.apply_status.setStyleSheet(
             "QLabel { color: #2f6f4e; background: transparent; font-weight: 600; }"
         )
@@ -560,8 +559,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         content_layout.addWidget(self.path_diagram)
         path_hint = QtWidgets.QLabel(
-            "ATT, RF filters, board selection, and Nyquist zones are shared "
-            "through the RF path above and its HWH-backed front-panel editor."
+            "ATT, RF filters, board selection, and Nyquist zones belong to "
+            "this S-parameter tab and its HWH-backed front-panel editor."
         )
         path_hint.setWordWrap(True)
         path_hint.setStyleSheet("QLabel { color: #4f5b66; padding: 2px 6px; }")
@@ -900,7 +899,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         return str(path)
 
     def _forward_path_settings(self, values: Mapping[str, Any]) -> None:
-        """Include filter settings when applying the path to Experiment."""
+        """Report this tab's committed path without changing another tab."""
         linked = dict(values)
         linked.update(
             {
@@ -919,6 +918,47 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             }
         )
         self.path_settings_applied.emit(linked)
+
+    def front_panel_values(self) -> Mapping[str, Any]:
+        """Return this tab's complete RF path for the graphical editor."""
+        values = self.path_diagram._editor_values()
+        values.update(
+            {
+                "output_filter_type": self.output_filter_type.currentText(),
+                "output_filter_cutoff_ghz": self.output_filter_cutoff_ghz.value(),
+                "output_filter_bandwidth_ghz": (
+                    self.output_filter_bandwidth_ghz.value()
+                ),
+                "readout_filter_type": self.readout_filter_type.currentText(),
+                "readout_filter_cutoff_ghz": (
+                    self.readout_filter_cutoff_ghz.value()
+                ),
+                "readout_filter_bandwidth_ghz": (
+                    self.readout_filter_bandwidth_ghz.value()
+                ),
+            }
+        )
+        return values
+
+    def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
+        """Apply graphical SMA settings only to this S-parameter tab."""
+        self.path_diagram.apply_external_settings(values)
+        self.output_filter_type.setCurrentText(str(values["output_filter_type"]))
+        self.output_filter_cutoff_ghz.setValue(
+            float(values["output_filter_cutoff_ghz"])
+        )
+        self.output_filter_bandwidth_ghz.setValue(
+            float(values["output_filter_bandwidth_ghz"])
+        )
+        self.readout_filter_type.setCurrentText(str(values["readout_filter_type"]))
+        self.readout_filter_cutoff_ghz.setValue(
+            float(values["readout_filter_cutoff_ghz"])
+        )
+        self.readout_filter_bandwidth_ghz.setValue(
+            float(values["readout_filter_bandwidth_ghz"])
+        )
+        self.path_diagram._update_board_controls()
+        self.path_diagram.apply_settings(emit=False)
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)
