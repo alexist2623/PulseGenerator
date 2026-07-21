@@ -199,7 +199,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 23
+SETTINGS_VERSION = 24
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -5175,18 +5175,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_full_scale_mv = values["full_scale_mv"]
         self._qick_awg_channels = values["awg_channels"]
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
-        self._bias_t_compensation_enabled = values[
-            "bias_t_compensation_enabled"
-        ]
-        self._bias_t_compensation_type = values["bias_t_compensation_type"]
-        self._bias_t_compensation_voltage_mv = values[
-            "bias_t_compensation_voltage_mv"
-        ]
-        self._bias_t_compensation_mode = values["bias_t_compensation_mode"]
-        self._bias_t_compensation_duration_us = values[
-            "bias_t_compensation_duration_us"
-        ]
-        self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
         self._refresh_stability_targets()
         stability_config = self._stability_panel.config(
             full_scale_mv=self._qick_full_scale_mv
@@ -5272,12 +5260,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=self._qick_full_scale_mv,
             sweeps=sweeps,
             cross_capacitance=self._cross_capacitance.copy(),
-            bias_t_compensation_enabled=self._bias_t_compensation_enabled,
-            bias_t_compensation_type=self._bias_t_compensation_type,
-            bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
-            bias_t_compensation_mode=self._bias_t_compensation_mode,
-            bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
-            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+            bias_t_compensation_enabled=(
+                stability_config.bias_t_compensation_enabled
+            ),
+            bias_t_compensation_type=(
+                stability_config.bias_t_compensation_type
+            ),
+            bias_t_compensation_voltage_mv=(
+                stability_config.bias_t_compensation_voltage_mv
+                if stability_config.bias_t_compensation_enabled
+                and stability_config.bias_t_compensation_type == "dc"
+                and stability_config.bias_t_compensation_mode == "fixed_voltage"
+                else None
+            ),
+            bias_t_compensation_mode=stability_config.bias_t_compensation_mode,
+            bias_t_compensation_duration_us=(
+                stability_config.bias_t_compensation_duration_us
+            ),
+            bias_t_filter_tau_us=stability_config.bias_t_filter_tau_us,
         )
         return {
             "connection_config": values["connection"],

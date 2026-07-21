@@ -541,6 +541,11 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     )
     window._stability_panel.modulation_frequency_mhz.setValue(211.0)
     window._stability_panel.trace_samples.setValue(321)
+    window._stability_panel.bias_t_group.setChecked(True)
+    window._stability_panel.bias_t_type.setCurrentIndex(
+        window._stability_panel.bias_t_type.findData("filter")
+    )
+    window._stability_panel.bias_t_filter_tau_us.setValue(42.0)
     experiment = window._experiment_panel
     experiment.qick_host.setText("192.0.2.44")
     experiment.ns_port.setValue(9999)
@@ -589,6 +594,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert "rf_outputs" not in document["stability_diagram"]
     assert "rf_readout" not in document["stability_diagram"]
     assert document["stability_diagram"]["trace_samples_per_point"] == 321
+    assert document["stability_diagram"]["bias_t_compensation"] == {
+        "enabled": True,
+        "type": "filter",
+        "mode": "fixed_voltage",
+        "voltage_mv": 250.0,
+        "duration_us": 1.0,
+        "filter_tau_us": 42.0,
+    }
 
     restored = gui.MainWindow()
     restored._load_settings_json(saved_path)
@@ -603,6 +616,9 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored_stability_path["readout_attenuation_db"] == 9.5
     assert restored._stability_panel.modulation_frequency_mhz.value() == 211.0
     assert restored._stability_panel.trace_samples.value() == 321
+    assert restored._stability_panel.bias_t_group.isChecked() is True
+    assert restored._stability_panel.bias_t_type.currentData() == "filter"
+    assert restored._stability_panel.bias_t_filter_tau_us.value() == 42.0
     assert restored._experiment_panel.qick_host.text() == "192.0.2.44"
     assert restored._experiment_panel.tproc_mhz.value() == 275.0
     assert restored._experiment_panel.bias_t_group.isChecked() is True
@@ -680,6 +696,16 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     window._stability_panel.y_axis.stop_mv.setValue(75.0)
     window._stability_panel.y_axis.points.setValue(3)
     window._stability_panel.repetitions.setValue(4)
+    window._experiment_panel.bias_t_group.setChecked(True)
+    window._experiment_panel.bias_t_type.setCurrentIndex(
+        window._experiment_panel.bias_t_type.findData("filter")
+    )
+    window._experiment_panel.bias_t_filter_tau_us.setValue(999.0)
+    window._stability_panel.bias_t_group.setChecked(True)
+    window._stability_panel.bias_t_mode.setCurrentIndex(
+        window._stability_panel.bias_t_mode.findData("fixed_time")
+    )
+    window._stability_panel.bias_t_duration_us.setValue(2.5)
     app.processEvents()
 
     assert window._stability_panel.dc_measure_mode.isChecked() is True
@@ -709,6 +735,9 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
         "awg_1",
     ]
     assert arguments["sequence"].sweep_point_count == 15
+    assert arguments["sequence"].bias_t_compensation.compensation_type == "dc"
+    assert arguments["sequence"].bias_t_compensation.mode == "fixed_time"
+    assert arguments["sequence"].bias_t_compensation.fixed_duration_cycles == 750
     assert arguments["readout_spec"].samples_per_trigger == 96
     assert window._rf_readout_panel.samples.value() == 16
     assert arguments["stability_config"].trace_samples_per_point == 96
@@ -719,6 +748,15 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert arguments["readout_spec"].readout_frequency_mhz == 0.0
     assert arguments["rf_specs"][0].frequency_mhz == 0.0
     assert arguments["rf_specs"][0].output_board_type == "DC_Out"
+
+    window._stability_panel.bias_t_type.setCurrentIndex(
+        window._stability_panel.bias_t_type.findData("filter")
+    )
+    window._stability_panel.bias_t_filter_tau_us.setValue(25.0)
+    filter_arguments = window._stability_run_arguments(save=False)
+    filter_compensation = filter_arguments["sequence"].bias_t_compensation
+    assert filter_compensation.compensation_type == "filter"
+    assert filter_compensation.tau_cycles == 7_500.0
     window.close()
 
 
@@ -961,7 +999,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 23
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 24
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"
@@ -971,6 +1009,14 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert upgraded["stability_diagram"]["x_axis"]["output_name"] == "awg_0"
     assert upgraded["stability_diagram"]["y_axis"]["output_name"] == "awg_0"
     assert upgraded["stability_diagram"]["trace_samples_per_point"] == 64
+    assert upgraded["stability_diagram"]["bias_t_compensation"] == {
+        "enabled": False,
+        "type": "dc",
+        "mode": "fixed_voltage",
+        "voltage_mv": 250.0,
+        "duration_us": 1.0,
+        "filter_tau_us": 100.0,
+    }
     assert "rf_readout" not in upgraded["stability_diagram"]
     assert "rf_outputs" not in upgraded["stability_diagram"]
     assert upgraded["qick"]["tproc_mhz"] == 300.0

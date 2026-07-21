@@ -24,7 +24,16 @@ except ImportError:
     pg = None
 
 try:
-    from .dc_waveform_core import adc_iq_to_voltage, dc_iq_to_current
+    from .dc_waveform_core import (
+        BIAS_T_COMPENSATION_MODES,
+        BIAS_T_COMPENSATION_TYPES,
+        DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_BIAS_T_FILTER_TAU_US,
+        DEFAULT_QICK_FULL_SCALE_MV,
+        adc_iq_to_voltage,
+        dc_iq_to_current,
+    )
     from .dc_voltage_calibration import load_dc_voltage_calibration
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
@@ -35,7 +44,16 @@ try:
     )
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
-    from dc_waveform_core import adc_iq_to_voltage, dc_iq_to_current
+    from dc_waveform_core import (
+        BIAS_T_COMPENSATION_MODES,
+        BIAS_T_COMPENSATION_TYPES,
+        DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+        DEFAULT_BIAS_T_COMPENSATION_FRACTION,
+        DEFAULT_BIAS_T_FILTER_TAU_US,
+        DEFAULT_QICK_FULL_SCALE_MV,
+        adc_iq_to_voltage,
+        dc_iq_to_current,
+    )
     from dc_voltage_calibration import load_dc_voltage_calibration
     from qick_qcodes_experiment import (
         StoredQickExperiment,
@@ -54,6 +72,9 @@ DEFAULT_STABILITY_REPETITIONS = 1
 DEFAULT_STABILITY_TRACE_SAMPLES = 64
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
 DEFAULT_STABILITY_MODULATION_GAIN = 20_000
+DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV = (
+    DEFAULT_QICK_FULL_SCALE_MV * DEFAULT_BIAS_T_COMPENSATION_FRACTION
+)
 DEFAULT_STABILITY_DB_PATH = str(Path.home() / "qick_stability_diagrams.db")
 DEFAULT_STABILITY_RF_PATH = {
     "output_ch": 0,
@@ -137,6 +158,12 @@ class StabilityDiagramConfig:
     trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
     modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
     modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
+    bias_t_compensation_enabled: bool = False
+    bias_t_compensation_type: str = "dc"
+    bias_t_compensation_voltage_mv: float = DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV
+    bias_t_compensation_mode: str = "fixed_voltage"
+    bias_t_compensation_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US
+    bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US
 
     def __post_init__(self) -> None:
         if self.x_axis.output_name == self.y_axis.output_name:
@@ -170,6 +197,31 @@ class StabilityDiagramConfig:
         )
         if modulation_gain > 32767:
             raise ValueError("stability modulation gain must not exceed 32767")
+        if not isinstance(self.bias_t_compensation_enabled, (bool, np.bool_)):
+            raise TypeError("stability Bias-T compensation enabled must be boolean")
+        if self.bias_t_compensation_type not in BIAS_T_COMPENSATION_TYPES:
+            raise ValueError(
+                "stability Bias-T compensation type must be one of "
+                f"{BIAS_T_COMPENSATION_TYPES}"
+            )
+        if self.bias_t_compensation_mode not in BIAS_T_COMPENSATION_MODES:
+            raise ValueError(
+                "stability Bias-T compensation mode must be one of "
+                f"{BIAS_T_COMPENSATION_MODES}"
+            )
+        for value, label in (
+            (
+                self.bias_t_compensation_voltage_mv,
+                "stability Bias-T compensation voltage",
+            ),
+            (
+                self.bias_t_compensation_duration_us,
+                "stability Bias-T compensation duration",
+            ),
+            (self.bias_t_filter_tau_us, "stability Bias-T filter tau"),
+        ):
+            if _finite_float(value, label) <= 0.0:
+                raise ValueError(f"{label} must be positive")
 
     @property
     def point_count(self) -> int:
@@ -185,6 +237,15 @@ class StabilityDiagramConfig:
                     f"{label} stability sweep exceeds +/-{full_scale_mv:g} mV "
                     "AWG full scale"
                 )
+        if (
+            self.bias_t_compensation_enabled
+            and self.bias_t_compensation_type == "dc"
+            and self.bias_t_compensation_mode == "fixed_voltage"
+            and self.bias_t_compensation_voltage_mv > full_scale_mv
+        ):
+            raise ValueError(
+                "stability Bias-T compensation voltage exceeds AWG full scale"
+            )
 
 
 @dataclass(frozen=True)
@@ -248,6 +309,14 @@ def default_stability_settings(
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
+        "bias_t_compensation": {
+            "enabled": False,
+            "type": "dc",
+            "mode": "fixed_voltage",
+            "voltage_mv": DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV,
+            "duration_us": DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+            "filter_tau_us": DEFAULT_BIAS_T_FILTER_TAU_US,
+        },
         "rf_path": dict(DEFAULT_STABILITY_RF_PATH),
         "database_path": DEFAULT_STABILITY_DB_PATH,
         "dc_voltage_calibration_enabled": False,
@@ -335,6 +404,52 @@ def normalize_stability_settings(
     )
     if normalized["modulation_gain"] > 32767:
         raise ValueError("stability modulation gain must not exceed 32767")
+    raw_bias_t = settings.get(
+        "bias_t_compensation",
+        defaults["bias_t_compensation"],
+    )
+    if not isinstance(raw_bias_t, Mapping):
+        raise TypeError("stability Bias-T compensation must be a JSON object")
+    bias_t_enabled = raw_bias_t.get(
+        "enabled",
+        defaults["bias_t_compensation"]["enabled"],
+    )
+    if not isinstance(bias_t_enabled, (bool, np.bool_)):
+        raise TypeError("stability Bias-T compensation enabled must be boolean")
+    bias_t_type = str(
+        raw_bias_t.get("type", defaults["bias_t_compensation"]["type"])
+    )
+    if bias_t_type not in BIAS_T_COMPENSATION_TYPES:
+        raise ValueError(
+            "stability Bias-T compensation type must be one of "
+            f"{BIAS_T_COMPENSATION_TYPES}"
+        )
+    bias_t_mode = str(
+        raw_bias_t.get("mode", defaults["bias_t_compensation"]["mode"])
+    )
+    if bias_t_mode not in BIAS_T_COMPENSATION_MODES:
+        raise ValueError(
+            "stability Bias-T compensation mode must be one of "
+            f"{BIAS_T_COMPENSATION_MODES}"
+        )
+    normalized_bias_t = {
+        "enabled": bool(bias_t_enabled),
+        "type": bias_t_type,
+        "mode": bias_t_mode,
+    }
+    for key, label in (
+        ("voltage_mv", "stability Bias-T compensation voltage"),
+        ("duration_us", "stability Bias-T compensation duration"),
+        ("filter_tau_us", "stability Bias-T filter tau"),
+    ):
+        value = _finite_float(
+            raw_bias_t.get(key, defaults["bias_t_compensation"][key]),
+            label,
+        )
+        if value <= 0.0:
+            raise ValueError(f"{label} must be positive")
+        normalized_bias_t[key] = value
+    normalized["bias_t_compensation"] = normalized_bias_t
     raw_rf_path = settings.get("rf_path", defaults["rf_path"])
     if not isinstance(raw_rf_path, Mapping):
         raise TypeError("stability RF path must be a JSON object")
@@ -1096,6 +1211,47 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         controls.addWidget(acquisition)
 
+        self.bias_t_group = QtWidgets.QGroupBox(
+            "Bias-T compensation",
+            controls_content,
+        )
+        self.bias_t_group.setCheckable(True)
+        self.bias_t_group.setChecked(False)
+        self.bias_t_group.setToolTip(
+            "Apply Stability Diagram-specific compensation to every hardware "
+            "sweep shot"
+        )
+        bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self.bias_t_type = QtWidgets.QComboBox(self.bias_t_group)
+        self.bias_t_type.addItem("DC compensation", "dc")
+        self.bias_t_type.addItem("Filter compensation", "filter")
+        self.bias_t_mode = QtWidgets.QComboBox(self.bias_t_group)
+        self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
+        self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
+        self.bias_t_compensation_mv = QtWidgets.QDoubleSpinBox(self.bias_t_group)
+        self.bias_t_compensation_mv.setRange(0.001, 1.0e6)
+        self.bias_t_compensation_mv.setDecimals(6)
+        self.bias_t_compensation_mv.setSuffix(" mV")
+        self.bias_t_compensation_mv.setValue(
+            DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV
+        )
+        self.bias_t_duration_us = QtWidgets.QDoubleSpinBox(self.bias_t_group)
+        self.bias_t_duration_us.setRange(1.0e-6, 1.0e9)
+        self.bias_t_duration_us.setDecimals(6)
+        self.bias_t_duration_us.setSuffix(" us")
+        self.bias_t_duration_us.setValue(DEFAULT_BIAS_T_COMPENSATION_DURATION_US)
+        self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox(self.bias_t_group)
+        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setDecimals(6)
+        self.bias_t_filter_tau_us.setSuffix(" us")
+        self.bias_t_filter_tau_us.setValue(DEFAULT_BIAS_T_FILTER_TAU_US)
+        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow("DC control mode:", self.bias_t_mode)
+        bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
+        bias_t_form.addRow("DC time:", self.bias_t_duration_us)
+        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
+        controls.addWidget(self.bias_t_group)
+
         self.dc_calibration_group = QtWidgets.QGroupBox(
             "Apply DC Input Voltage Calibration",
             controls_content,
@@ -1225,11 +1381,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_calibration_browse.clicked.connect(
             self._browse_dc_calibration
         )
+        self.bias_t_group.toggled.connect(self._update_bias_t_controls)
+        self.bias_t_type.currentIndexChanged.connect(
+            self._update_bias_t_controls
+        )
+        self.bias_t_mode.currentIndexChanged.connect(
+            self._update_bias_t_controls
+        )
         self._targets_available = False
         self._dc_input_available = False
         self._running = False
         self._update_point_count()
         self._update_dc_measure_controls()
+        self._update_bias_t_controls()
 
     def _update_dc_measure_controls(self) -> None:
         editable = self._dc_input_available and not self._running
@@ -1238,6 +1402,20 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             editable and self.dc_measure_mode.isChecked()
         )
         self.dc_calibration_group.setEnabled(editable)
+
+    def _update_bias_t_controls(self, *_args) -> None:
+        editable = not self._running and self.bias_t_group.isChecked()
+        filter_mode = self.bias_t_type.currentData() == "filter"
+        fixed_time = self.bias_t_mode.currentData() == "fixed_time"
+        self.bias_t_type.setEnabled(editable)
+        self.bias_t_mode.setEnabled(editable and not filter_mode)
+        self.bias_t_compensation_mv.setEnabled(
+            editable and not filter_mode and not fixed_time
+        )
+        self.bias_t_duration_us.setEnabled(
+            editable and not filter_mode and fixed_time
+        )
+        self.bias_t_filter_tau_us.setEnabled(editable and filter_mode)
 
     def _emit_dc_measure_changed(self, *_args) -> None:
         self._update_dc_measure_controls()
@@ -1383,6 +1561,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             trace_samples_per_point=self.trace_samples.value(),
             modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
             modulation_gain=self.modulation_gain.value(),
+            bias_t_compensation_enabled=self.bias_t_group.isChecked(),
+            bias_t_compensation_type=str(self.bias_t_type.currentData()),
+            bias_t_compensation_voltage_mv=self.bias_t_compensation_mv.value(),
+            bias_t_compensation_mode=str(self.bias_t_mode.currentData()),
+            bias_t_compensation_duration_us=self.bias_t_duration_us.value(),
+            bias_t_filter_tau_us=self.bias_t_filter_tau_us.value(),
         )
         config.validate_full_scale(full_scale_mv)
         return config
@@ -1395,6 +1579,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "trace_samples_per_point": self.trace_samples.value(),
             "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
             "modulation_gain": self.modulation_gain.value(),
+            "bias_t_compensation": {
+                "enabled": self.bias_t_group.isChecked(),
+                "type": str(self.bias_t_type.currentData()),
+                "mode": str(self.bias_t_mode.currentData()),
+                "voltage_mv": self.bias_t_compensation_mv.value(),
+                "duration_us": self.bias_t_duration_us.value(),
+                "filter_tau_us": self.bias_t_filter_tau_us.value(),
+            },
             "rf_path": dict(self.front_panel_values()),
             "database_path": self.database_path_value(),
             "dc_voltage_calibration_enabled": (
@@ -1431,6 +1623,29 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_gain.setValue(
             int(settings.get("modulation_gain", DEFAULT_STABILITY_MODULATION_GAIN))
         )
+        bias_t = settings.get(
+            "bias_t_compensation",
+            default_stability_settings()["bias_t_compensation"],
+        )
+        bias_t_type_index = self.bias_t_type.findData(str(bias_t["type"]))
+        if bias_t_type_index < 0:
+            raise ValueError("saved Stability Bias-T compensation type is invalid")
+        bias_t_mode_index = self.bias_t_mode.findData(str(bias_t["mode"]))
+        if bias_t_mode_index < 0:
+            raise ValueError("saved Stability Bias-T compensation mode is invalid")
+        with QtCore.QSignalBlocker(self.bias_t_group), QtCore.QSignalBlocker(
+            self.bias_t_type
+        ), QtCore.QSignalBlocker(self.bias_t_mode), QtCore.QSignalBlocker(
+            self.bias_t_compensation_mv
+        ), QtCore.QSignalBlocker(self.bias_t_duration_us), QtCore.QSignalBlocker(
+            self.bias_t_filter_tau_us
+        ):
+            self.bias_t_group.setChecked(bool(bias_t["enabled"]))
+            self.bias_t_type.setCurrentIndex(bias_t_type_index)
+            self.bias_t_mode.setCurrentIndex(bias_t_mode_index)
+            self.bias_t_compensation_mv.setValue(float(bias_t["voltage_mv"]))
+            self.bias_t_duration_us.setValue(float(bias_t["duration_us"]))
+            self.bias_t_filter_tau_us.setValue(float(bias_t["filter_tau_us"]))
         self.apply_path_settings(
             settings.get("rf_path", DEFAULT_STABILITY_RF_PATH)
         )
@@ -1456,6 +1671,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             )
         self._update_point_count()
         self._update_dc_measure_controls()
+        self._update_bias_t_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
@@ -1468,10 +1684,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.trace_samples.setEnabled(not running)
         self.modulation_frequency_mhz.setEnabled(not running)
         self.modulation_gain.setEnabled(not running)
+        self.bias_t_group.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         self._update_dc_measure_controls()
+        self._update_bias_t_controls()
         self.progress.setVisible(running)
         if not running:
             self.progress.setValue(0)
@@ -1519,6 +1737,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
 
 __all__ = [
+    "DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV",
     "DEFAULT_STABILITY_POINTS",
     "DEFAULT_STABILITY_REPETITIONS",
     "DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ",

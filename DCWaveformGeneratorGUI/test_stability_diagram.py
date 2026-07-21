@@ -126,6 +126,39 @@ def test_stability_config_requires_two_outputs_and_respects_full_scale():
     with pytest.raises(ValueError, match="stability sweep exceeds"):
         config.validate_full_scale(49.0)
 
+    compensated = stability.StabilityDiagramConfig(
+        x_axis=stability.StabilitySweepAxis(
+            "awg_0", "set_1", -100.0, 100.0, 2
+        ),
+        y_axis=stability.StabilitySweepAxis(
+            "awg_1", "set_2", -50.0, 50.0, 2
+        ),
+        bias_t_compensation_enabled=True,
+        bias_t_compensation_voltage_mv=125.0,
+    )
+    with pytest.raises(ValueError, match="compensation voltage exceeds"):
+        compensated.validate_full_scale(100.0)
+
+
+def test_stability_settings_add_backward_compatible_bias_t_defaults():
+    legacy = stability.default_stability_settings(("awg_0", "awg_1"), ("set_0",))
+    legacy.pop("bias_t_compensation")
+
+    normalized = stability.normalize_stability_settings(
+        legacy,
+        output_names=("awg_0", "awg_1"),
+        segment_names=("set_0",),
+    )
+
+    assert normalized["bias_t_compensation"] == {
+        "enabled": False,
+        "type": "dc",
+        "mode": "fixed_voltage",
+        "voltage_mv": stability.DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV,
+        "duration_us": 1.0,
+        "filter_tau_us": 100.0,
+    }
+
 
 def test_reduce_fir_result_restores_voltage_grid_and_coherent_iq_mean():
     raw = _ddr_result()
@@ -311,6 +344,11 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.trace_samples.setValue(321)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
+    panel.bias_t_group.setChecked(True)
+    panel.bias_t_mode.setCurrentIndex(
+        panel.bias_t_mode.findData("fixed_time")
+    )
+    panel.bias_t_duration_us.setValue(2.5)
     database_path = tmp_path / "stability_single_shot.db"
     panel.database_path.setText(str(database_path))
     app.processEvents()
@@ -323,6 +361,12 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert config.trace_samples_per_point == 321
     assert config.modulation_frequency_mhz == 12.5
     assert config.modulation_gain == 12345
+    assert config.bias_t_compensation_enabled is True
+    assert config.bias_t_compensation_type == "dc"
+    assert config.bias_t_compensation_mode == "fixed_time"
+    assert config.bias_t_compensation_duration_us == 2.5
+    assert panel.bias_t_compensation_mv.isEnabled() is False
+    assert panel.bias_t_duration_us.isEnabled() is True
     assert panel.point_count.text() == "77"
     assert not hasattr(panel.x_axis, "segment")
     assert not hasattr(panel, "rf_editor_tabs")
@@ -338,6 +382,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     )
     restored.load_settings(saved)
     assert restored.settings_dict() == saved
+    assert restored.bias_t_group.isChecked() is True
+    assert restored.bias_t_mode.currentData() == "fixed_time"
+    assert restored.bias_t_duration_us.value() == 2.5
 
     dc_changes = []
     calibration_changes = []
@@ -385,11 +432,13 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.single_shot_button.isEnabled() is False
     assert panel.trace_samples.isEnabled() is False
     assert panel.modulation_frequency_mhz.isEnabled() is False
+    assert panel.bias_t_group.isEnabled() is False
     panel.set_stopping()
     assert panel.stop_button.isEnabled() is False
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
     assert panel.trace_samples.isEnabled() is True
     assert panel.modulation_frequency_mhz.isEnabled() is True
+    assert panel.bias_t_group.isEnabled() is True
     panel.close()
     restored.close()
