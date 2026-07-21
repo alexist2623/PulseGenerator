@@ -395,13 +395,30 @@ def analyze_i_trace(
 
 
 def _latest_run_id(database_path: Path) -> int:
+    """Return the latest run containing QICK split/legacy IQ metadata."""
     connection = sqlite3.connect(str(database_path), timeout=30.0)
     try:
-        row = connection.execute("SELECT MAX(run_id) FROM runs").fetchone()
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(runs)")
+        }
+        row = (
+            connection.execute(
+                "SELECT run_id FROM runs "
+                "WHERE qick_experiment_json IS NOT NULL "
+                "AND qick_experiment_json != '' "
+                "ORDER BY run_id DESC LIMIT 1"
+            ).fetchone()
+            if "qick_experiment_json" in columns
+            else None
+        )
     finally:
         connection.close()
-    if row is None or row[0] is None:
-        raise ValueError(f"QCoDeS database contains no runs: {database_path}")
+    if row is None:
+        raise ValueError(
+            "QCoDeS database contains no compatible QICK I-trace runs: "
+            f"{database_path}"
+        )
     return int(row[0])
 
 
@@ -613,6 +630,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         control_scroll = QtWidgets.QScrollArea(self)
         control_scroll.setWidgetResizable(True)
         control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._control_scroll = control_scroll
         control_content = QtWidgets.QWidget(control_scroll)
         outer = QtWidgets.QVBoxLayout(control_content)
         control_scroll.setWidget(control_content)
@@ -641,14 +659,6 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             DEFAULT_NOISE_ANALYSIS_SETTINGS["acquisition_proxy_name"],
             acquisition_group,
         )
-        connection_row = QtWidgets.QHBoxLayout()
-        connection_row.addWidget(QtWidgets.QLabel("Host:"))
-        connection_row.addWidget(self.acquisition_host, 2)
-        connection_row.addWidget(QtWidgets.QLabel("Port:"))
-        connection_row.addWidget(self.acquisition_port)
-        connection_row.addWidget(QtWidgets.QLabel("Proxy:"))
-        connection_row.addWidget(self.acquisition_proxy, 1)
-
         self.front_panel_preview = QickFrontPanelPreview(acquisition_group)
         self.readout_channel = QtWidgets.QSpinBox(acquisition_group)
         self.readout_channel.setRange(0, 255)
@@ -742,8 +752,12 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.acquire_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
-        acquisition_form.addRow("QICK connection:", connection_row)
-        acquisition_form.addRow("Front panel:", self.front_panel_preview)
+        front_panel_row = QtWidgets.QVBoxLayout()
+        front_panel_row.setContentsMargins(0, 0, 0, 0)
+        front_panel_row.setSpacing(2)
+        front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
+        front_panel_row.addWidget(self.front_panel_preview)
+        acquisition_form.addRow(front_panel_row)
         acquisition_form.addRow("Input:", input_row)
         acquisition_form.addRow("Stored FIR samples:", samples_row)
         acquisition_form.addRow("Readout/DDC frequency:", self.readout_frequency)
@@ -761,23 +775,30 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.database_path = QtWidgets.QLineEdit(
             str(default_database_path or DEFAULT_NOISE_ANALYSIS_SETTINGS["database_path"])
         )
-        browse = QtWidgets.QToolButton(source_group)
-        browse.setText("...")
-        browse.setToolTip("Select a QCoDeS database")
+        self.browse_database = QtWidgets.QToolButton(source_group)
+        self.browse_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_database.setToolTip("Select a QCoDeS database")
         database_row = QtWidgets.QHBoxLayout()
         database_row.addWidget(self.database_path, 1)
-        database_row.addWidget(browse)
+        database_row.addWidget(self.browse_database)
         self.run_id = QtWidgets.QSpinBox(source_group)
         self.run_id.setRange(0, 2_147_483_647)
-        self.run_id.setSpecialValueText("Latest")
-        self.load_button = QtWidgets.QPushButton("Load QCoDeS I Trace", source_group)
+        self.run_id.setSpecialValueText("Latest saved I-trace run")
+        self.run_id.setToolTip(
+            "Use 0 for the latest compatible QICK I-trace run, or enter a Run ID"
+        )
+        self.load_button = QtWidgets.QPushButton("Load Saved Run", source_group)
         self.load_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
         )
+        load_row = QtWidgets.QHBoxLayout()
+        load_row.addWidget(self.run_id, 1)
+        load_row.addWidget(self.load_button)
         source_form.addRow("Source:", self.source_status)
         source_form.addRow("QCoDeS DB:", database_row)
-        source_form.addRow("Run ID:", self.run_id)
-        source_form.addRow(self.load_button)
+        source_form.addRow("Saved run:", load_row)
         outer.addWidget(source_group)
 
         selector_group = QtWidgets.QGroupBox("Trace Selection", self)
@@ -915,7 +936,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.readout_channel.valueChanged.connect(
             lambda value: self.front_panel_preview.set_channels(input_ch=value)
         )
-        browse.clicked.connect(self._browse_database)
+        self.browse_database.clicked.connect(self._browse_database)
         self.load_button.clicked.connect(self._request_load)
         self.analyze_button.clicked.connect(self.analyze_selected_trace)
         self.point_index.valueChanged.connect(self._selection_changed)
@@ -944,8 +965,14 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self._update_mode_controls()
 
     def connection_config(self):
-        """Return this tab's own QICK connection, independent of Experiment."""
+        """Return the QICK connection mirrored from the shared Setup menu."""
         return self.acquisition_config().connection_config
+
+    def set_connection_values(self, connection) -> None:
+        """Mirror the application-wide QICK connection into this tab."""
+        self.acquisition_host.setText(str(connection.host))
+        self.acquisition_port.setValue(int(connection.ns_port))
+        self.acquisition_proxy.setText(str(connection.proxy_name))
 
     def acquisition_config(self) -> NoiseAcquisitionConfig:
         return NoiseAcquisitionConfig(
@@ -1241,6 +1268,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
 
     def set_loading(self, loading: bool, message: str = "") -> None:
         self.load_button.setEnabled(not loading)
+        self.run_id.setEnabled(not loading)
+        self.database_path.setEnabled(not loading)
+        self.browse_database.setEnabled(not loading)
         self.acquire_button.setEnabled(not loading)
         self.analyze_button.setEnabled(not loading)
         if message:

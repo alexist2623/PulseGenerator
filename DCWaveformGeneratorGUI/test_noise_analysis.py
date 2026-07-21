@@ -6,11 +6,13 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 import os
+import sqlite3
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt5 import QtWidgets
+import pytest
 
 import noise_analysis as noise_module
 from dc_voltage_calibration import DcVoltageCalibration
@@ -88,6 +90,61 @@ def test_noise_settings_fill_defaults_and_validate_modes():
         raise AssertionError("invalid noise-analysis input mode was accepted")
 
 
+def test_latest_noise_run_skips_incompatible_database_runs(tmp_path):
+    database_path = tmp_path / "mixed-runs.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, qick_experiment_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO runs(run_id, qick_experiment_json) VALUES (?, ?)",
+            (
+                (1, '{"measurement_layout": {}}'),
+                (2, None),
+                (3, ""),
+                (4, '{"measurement_layout": {}}'),
+                (5, None),
+            ),
+        )
+    assert noise_module._latest_run_id(database_path) == 4
+
+    incompatible_path = tmp_path / "other-runs.db"
+    with sqlite3.connect(incompatible_path) as connection:
+        connection.execute("CREATE TABLE runs (run_id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO runs(run_id) VALUES (9)")
+    with pytest.raises(ValueError, match="no compatible QICK I-trace runs"):
+        noise_module._latest_run_id(incompatible_path)
+
+
+def test_noise_saved_run_loader_matches_sparameter_selection_flow():
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="saved-noise.db")
+    panel.resize(720, 900)
+    panel.show()
+    app.processEvents()
+
+    assert panel.run_id.specialValueText() == "Latest saved I-trace run"
+    assert panel.load_button.text() == "Load Saved Run"
+    assert abs(panel.run_id.geometry().center().y() - panel.load_button.geometry().center().y()) <= 2
+
+    emitted = []
+    panel.load_requested.connect(lambda path, run_id: emitted.append((path, run_id)))
+    panel.run_id.setValue(17)
+    panel.load_button.click()
+    assert emitted == [("saved-noise.db", 17)]
+
+    panel.set_loading(True, "Loading saved run")
+    assert panel.run_id.isEnabled() is False
+    assert panel.database_path.isEnabled() is False
+    assert panel.browse_database.isEnabled() is False
+    panel.set_loading(False)
+    assert panel.run_id.isEnabled() is True
+    assert panel.database_path.isEnabled() is True
+    assert panel.browse_database.isEnabled() is True
+    panel.close()
+
+
 def test_noise_panel_selects_point_and_repetition_and_round_trips_settings():
     app = _application()
     panel = NoiseAnalysisPanel(default_database_path="noise.db")
@@ -150,6 +207,19 @@ def test_noise_panel_direct_acquisition_settings_are_self_contained():
     assert panel.capture_duration.text() == "10 s at 1 MSPS"
     assert panel.database_path.text() == "noise.db"
     app.processEvents()
+    panel.close()
+
+
+def test_noise_panel_front_panel_preview_uses_control_panel_width():
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="noise.db")
+    panel.resize(640, 900)
+    panel.show()
+    app.processEvents()
+
+    viewport_width = panel._control_scroll.viewport().width()
+    assert viewport_width - 48 <= panel.front_panel_preview.width() <= viewport_width
+    assert panel.front_panel_preview.height() >= 180
     panel.close()
 
 

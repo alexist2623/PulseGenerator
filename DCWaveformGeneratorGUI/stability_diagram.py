@@ -1019,6 +1019,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.path_diagram.front_panel_requested.connect(
             self.front_panel_requested.emit
         )
+        self.front_panel_preview = self.path_diagram.front_panel_preview
+        self.path_diagram.layout().removeWidget(self.front_panel_preview)
+        self.front_panel_preview.setParent(self)
+        outer.addWidget(self.front_panel_preview)
         controls.addWidget(self.path_diagram)
         self._path_aux = {
             key: value

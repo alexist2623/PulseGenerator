@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from qick.sim import QickSim  # noqa: F401
 from qick.qick_asm import QickConfig
@@ -15,6 +16,7 @@ from qick.qick_asm import QickConfig
 from dc_voltage_calibration import (
     DcVoltageCalibration,
     DcVoltageCalibrationConfig,
+    MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
     build_dc_voltage_calibration_program,
     load_dc_voltage_calibration,
     run_dc_voltage_calibration,
@@ -115,6 +117,30 @@ def test_dc_calibration_program_fixes_readout_frequency_to_zero():
     assert program.sequence.sweep_point_count == 5
     assert program.sequence.segments[-1].name == "return_zero"
     assert program.sequence.segments[-1].amplitudes == (0.0,)
+
+
+def test_dc_calibration_supports_long_periodic_fir_capture():
+    config = DcVoltageCalibrationConfig(
+        database_path="calibration.db",
+        output_ch=0,
+        readout_ch=0,
+        voltage_points=3,
+        samples_per_point=MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
+        repetitions_per_point=1,
+    )
+    program = build_dc_voltage_calibration_program(
+        _dc_soccfg(), config, tproc_mhz=300.0
+    )
+
+    assert program.ddr_readout_config.samples_per_trigger == 1_000_000
+    assert program.ddr_readout_config.readout_period_cycles == 65535
+    assert program.summary()["point_end_tproc_cycles"] < (1 << 31)
+
+    with pytest.raises(ValueError, match="samples_per_point must be <="):
+        DcVoltageCalibrationConfig(
+            database_path="calibration.db",
+            samples_per_point=MAX_DC_VOLTAGE_SAMPLES_PER_POINT + 1,
+        )
 
 
 def test_dc_scalar_adc_fit_recovers_voltage_and_ignores_q():
@@ -226,6 +252,41 @@ def test_dc_voltage_calibration_run_and_qcodes_round_trip(tmp_path, monkeypatch)
         stored_iq[0, 0, :, 0], test_voltage_v, atol=1.0e-12
     )
     np.testing.assert_allclose(stored_iq[0, 0, :, 1], 0.0, atol=1.0e-12)
+
+
+def test_dc_voltage_calibration_rejects_disconnected_loopback(tmp_path):
+    database_path = tmp_path / "disconnected.db"
+    config = DcVoltageCalibrationConfig(
+        database_path=str(database_path),
+        output_ch=1,
+        readout_ch=3,
+        voltage_points=5,
+        samples_per_point=2,
+        repetitions_per_point=1,
+    )
+
+    class FakeSoc:
+        def rfb_set_gen_dc(self, _channel):
+            pass
+
+        def rfb_set_ro_dc(self, _channel, gain):
+            return float(gain)
+
+    def acquire(_soc, _program):
+        iq = np.zeros((5, 1, 2, 2), dtype=float)
+        iq[..., 0] = np.asarray([99.2, 100.5, 99.8, 100.4, 100.0])[:, None, None]
+        return SimpleNamespace(iq=iq)
+
+    with pytest.raises(RuntimeError, match="selected front-panel SMA pair"):
+        run_dc_voltage_calibration(
+            connection_config=QickConnectionConfig(host="127.0.0.1"),
+            calibration_config=config,
+            tproc_mhz=300.0,
+            connector=lambda **_kwargs: (FakeSoc(), object()),
+            program_factory=lambda *_args, **_kwargs: object(),
+            acquisition_callback=acquire,
+        )
+    assert database_path.exists() is False
 
 
 def test_dc_voltage_config_rejects_points_outside_full_scale():

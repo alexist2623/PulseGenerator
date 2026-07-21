@@ -273,6 +273,26 @@ def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
     assert finished[0].diagram.magnitude.shape == (2, 2)
 
 
+def test_stability_front_panel_remains_visible_while_controls_scroll():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.resize(640, 900)
+    panel.show()
+    app.processEvents()
+    app.processEvents()
+
+    scrollbar = panel.controls_scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+    assert scrollbar.value() > 0
+    app.processEvents()
+
+    assert panel.front_panel_preview is panel.path_diagram.front_panel_preview
+    assert panel.front_panel_preview.parentWidget() is panel
+    assert panel.front_panel_preview.isVisible()
+    assert panel.front_panel_preview.y() < panel.controls_scroll.y()
+    panel.close()
+
+
 def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     app = _application()
     panel = stability.StabilityDiagramPanel()

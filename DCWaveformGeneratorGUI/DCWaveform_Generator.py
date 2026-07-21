@@ -1026,7 +1026,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         btn_add.clicked.connect(self._on_add)
         form.addRow(btn_add)
 
-        btn_select_port     = QtWidgets.QPushButton("Select Port")
+        btn_select_port     = QtWidgets.QPushButton("Edit this AWG output")
         btn_select_port.clicked.connect(self._select_port)
         form.addRow(btn_select_port)
 
@@ -1235,7 +1235,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self.port_is_selected.emit(self.idx)
 
 class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
-    """Multi waveform control panel"""
+    """Multi-waveform editor with HWH-backed AWG output mapping."""
+
+    front_panel_requested = QtCore.pyqtSignal(object)
+    awg_channel_changed = QtCore.pyqtSignal(int, int)
 
     def __init__(
             self,
@@ -1243,15 +1246,39 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             initial_color: str,
             add_port: Callable,
             time_unit: str = DEFAULT_TIME_UNIT,
+            awg_channels: Sequence[int] = (DEFAULT_QSTL_AWG_CHANNELS[0],),
             parent=None
         ):
-        super().__init__()
+        super().__init__(parent)
         self._time_unit = time_unit
+        self._selected_index = 0
+        self._awg_channels = tuple(int(channel) for channel in awg_channels)
+        self._front_panel_configuration = None
         self._ctrl_pannels: List[ControlPanel] = [
             ControlPanel(pulse, time_unit=time_unit)
         ]
         self._color_map: List[str]              = [initial_color]
         self.splitter                           = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
+        self.splitter.setChildrenCollapsible(False)
+
+        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.set_scope("output")
+        self.front_panel_preview.setToolTip(
+            "Select the DAC SMA used by the active AWG output"
+        )
+        self.front_panel_preview.activated.connect(
+            lambda: self.front_panel_requested.emit(self)
+        )
+        self.mapping_summary = QtWidgets.QLabel(self)
+        self.mapping_summary.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        front_panel_group = QtWidgets.QGroupBox("AWG Output Channel", self)
+        front_panel_layout = QtWidgets.QVBoxLayout(front_panel_group)
+        front_panel_layout.setContentsMargins(6, 6, 6, 6)
+        front_panel_layout.setSpacing(2)
+        front_panel_layout.addWidget(self.front_panel_preview)
+        front_panel_layout.addWidget(self.mapping_summary)
 
         # Port Add Button
         btn_add_port                            = QtWidgets.QPushButton("Add Port")
@@ -1260,6 +1287,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             QtWidgets.QSizePolicy.Expanding
         )
         btn_widget                              = QtWidgets.QWidget()
+        self._add_port_widget                   = btn_widget
         btn_layout                              = QtWidgets.QVBoxLayout(btn_widget)
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_widget.setFixedWidth(btn_add_port.sizeHint().width())
@@ -1269,9 +1297,23 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self.splitter.addWidget(self._ctrl_pannels[0])
         self.splitter.addWidget(btn_widget)
 
+        self.panel_scroll = QtWidgets.QScrollArea(self)
+        self.panel_scroll.setWidgetResizable(True)
+        self.panel_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.panel_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAsNeeded
+        )
+        self.panel_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
+        self.panel_scroll.setWidget(self.splitter)
+        self.panel_scroll.setMinimumHeight(330)
+
         # Control Panels list
-        self.panel_table                        = QtWidgets.QTableWidget(0, 4)
-        self.panel_table.setHorizontalHeaderLabels(["#", "Color", "set_x", "set_y"])
+        self.panel_table                        = QtWidgets.QTableWidget(0, 5)
+        self.panel_table.setHorizontalHeaderLabels(
+            ["#", "Color", "QICK output", "set_x", "set_y"]
+        )
         self.panel_table.verticalHeader().setVisible(False)
         self.panel_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.panel_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -1280,17 +1322,21 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         panel_table_header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         panel_table_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         panel_table_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        panel_table_header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
 
         self.btn_reset = QtWidgets.QPushButton("Reset highlight")
 
         control_panel_v_splitter                = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
-        control_panel_v_splitter.addWidget(self.splitter)
+        control_panel_v_splitter.addWidget(self.panel_scroll)
         control_panel_v_splitter.addWidget(self.panel_table)
         control_panel_v_splitter.addWidget(self.btn_reset)
 
         layout                                  = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(front_panel_group)
         layout.addWidget(control_panel_v_splitter)
+        self.set_awg_channels(self._awg_channels)
+        self.update_port_strip_geometry()
         self.refresh_table()
 
     def refresh_table(self):
@@ -1302,6 +1348,97 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self._time_unit = unit
         for control in self._ctrl_pannels:
             control.set_time_unit(unit)
+
+    def set_awg_channels(self, channels: Sequence[int]) -> None:
+        channels = tuple(int(channel) for channel in channels)
+        if len(channels) != len(self._ctrl_pannels):
+            raise ValueError("AWG channel count must match the waveform output count")
+        if any(channel < 0 for channel in channels):
+            raise ValueError("AWG channels must be nonnegative")
+        if len(set(channels)) != len(channels):
+            raise ValueError("AWG channels must be unique")
+        self._awg_channels = channels
+        self._selected_index = min(self._selected_index, len(channels) - 1)
+        self._refresh_mapping_summary()
+
+    def set_selected_port(self, index: int) -> None:
+        if not 0 <= int(index) < len(self._ctrl_pannels):
+            raise IndexError("selected AWG output is out of range")
+        self._selected_index = int(index)
+        self._refresh_mapping_summary()
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self.panel_scroll.ensureWidgetVisible(
+                self._ctrl_pannels[self._selected_index], 12, 0
+            ),
+        )
+
+    def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
+        self.front_panel_preview.set_configuration(configuration)
+        self._refresh_mapping_summary()
+
+    def front_panel_values(self) -> dict:
+        return {
+            "output_ch": self._awg_channels[self._selected_index],
+            "output_nqz": 1,
+        }
+
+    def apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
+        channel = int(values["output_ch"])
+        if self._front_panel_configuration is not None:
+            port_index = QickFrontPanelControl._find_port_for_channel(
+                self._front_panel_configuration.outputs,
+                channel,
+            )
+            if port_index is None:
+                raise ValueError(
+                    f"generator {channel} is not mapped to a front-panel DAC"
+                )
+            port = self._front_panel_configuration.port("output", port_index)
+            channel_position = port.qick_channels.index(channel)
+            block_path = port.block_paths[channel_position].lower()
+            if "axis_awg_tuning_v1" not in block_path:
+                raise ValueError(
+                    f"generator {channel} is not an axis_awg_tuning_v1 channel"
+                )
+        self.awg_channel_changed.emit(
+            self._selected_index,
+            channel,
+        )
+
+    def _refresh_mapping_summary(self) -> None:
+        if not self._awg_channels:
+            self.mapping_summary.setText("No AWG output mapping")
+            return
+        channel = self._awg_channels[self._selected_index]
+        details = f"awg_{self._selected_index} | QICK generator {channel}"
+        if self._front_panel_configuration is not None:
+            port_index = QickFrontPanelControl._find_port_for_channel(
+                self._front_panel_configuration.outputs,
+                channel,
+            )
+            if port_index is not None:
+                port = self._front_panel_configuration.port(
+                    "output", port_index
+                )
+                details += f" | {port.label} | {port.board_label}"
+        self.mapping_summary.setText(details)
+        self.front_panel_preview.set_channels(output_ch=channel)
+
+    def update_port_strip_geometry(self) -> None:
+        """Preserve a usable card width and expose overflow via a scrollbar."""
+        card_width = 310
+        for control in self._ctrl_pannels:
+            control.setMinimumWidth(card_width)
+        add_width = max(72, self._add_port_widget.sizeHint().width())
+        total_width = card_width * len(self._ctrl_pannels) + add_width
+        total_width += self.splitter.handleWidth() * len(self._ctrl_pannels)
+        self.splitter.setMinimumWidth(total_width)
+        self.splitter.setSizes(
+            [card_width] * len(self._ctrl_pannels) + [add_width]
+        )
+        self.splitter.updateGeometry()
 
 
 class GridSettingsDialog(QtWidgets.QDialog):
@@ -1842,7 +1979,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
-        form.addRow("Front panel:", self.front_panel_preview)
+        front_panel_row = QtWidgets.QVBoxLayout()
+        front_panel_row.setContentsMargins(0, 0, 0, 0)
+        front_panel_row.setSpacing(2)
+        front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
+        front_panel_row.addWidget(self.front_panel_preview)
+        form.addRow(front_panel_row)
         form.addRow("Generator index:", self.gen_ch)
         form.addRow("Output board:", self.output_board_type)
         form.addRow("Anchor SET:", self.segment)
@@ -2302,6 +2444,16 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.input_condition_stack = QtWidgets.QStackedWidget()
         self.input_condition_stack.addWidget(self.attenuation_db)
         self.input_condition_stack.addWidget(self.dc_gain_db)
+        self.input_condition_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.input_condition_stack.setFixedHeight(
+            max(
+                self.attenuation_db.sizeHint().height(),
+                self.dc_gain_db.sizeHint().height(),
+            )
+        )
         self.filter_type = QtWidgets.QComboBox()
         self.filter_type.addItems(["bypass", "lowpass", "highpass", "bandpass"])
         self.filter_cutoff = QtWidgets.QDoubleSpinBox()
@@ -2353,7 +2505,12 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
-        form.addRow("Front panel:", self.front_panel_preview)
+        front_panel_row = QtWidgets.QVBoxLayout()
+        front_panel_row.setContentsMargins(0, 0, 0, 0)
+        front_panel_row.setSpacing(2)
+        front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
+        front_panel_row.addWidget(self.front_panel_preview)
+        form.addRow(front_panel_row)
         form.addRow("Readout index:", self.ro_ch)
         form.addRow("Input board:", self.input_board_type)
         form.addRow("Anchor SET:", self.segment)
@@ -2747,8 +2904,63 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.spec_changed.emit(spec)
 
 
+class QickSetupDialog(QtWidgets.QDialog):
+    """Edit the QICK connection and timing values shared by every tab."""
+
+    def __init__(
+        self,
+        *,
+        connection: QickConnectionConfig,
+        fabric_mhz: float,
+        tproc_mhz: float,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("QICK Connection and Clocks")
+        self.setMinimumWidth(460)
+        form = QtWidgets.QFormLayout(self)
+
+        self.qick_host = QtWidgets.QLineEdit(connection.host, self)
+        self.ns_port = QtWidgets.QSpinBox(self)
+        self.ns_port.setRange(1, 65535)
+        self.ns_port.setValue(connection.ns_port)
+        self.proxy_name = QtWidgets.QLineEdit(connection.proxy_name, self)
+        self.fabric_mhz = QtWidgets.QDoubleSpinBox(self)
+        self.fabric_mhz.setRange(1.0, 5000.0)
+        self.fabric_mhz.setDecimals(6)
+        self.fabric_mhz.setSuffix(" MHz")
+        self.fabric_mhz.setValue(float(fabric_mhz))
+        self.tproc_mhz = QtWidgets.QDoubleSpinBox(self)
+        self.tproc_mhz.setRange(1.0, 5000.0)
+        self.tproc_mhz.setDecimals(6)
+        self.tproc_mhz.setSuffix(" MHz")
+        self.tproc_mhz.setValue(float(tproc_mhz))
+
+        form.addRow("QICK IP/host:", self.qick_host)
+        form.addRow("Pyro nameserver port:", self.ns_port)
+        form.addRow("Pyro proxy name:", self.proxy_name)
+        form.addRow("AWG fabric clock:", self.fabric_mhz)
+        form.addRow("tProcessor clock:", self.tproc_mhz)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> Tuple[QickConnectionConfig, float, float]:
+        connection = QickConnectionConfig(
+            host=self.qick_host.text().strip(),
+            ns_port=self.ns_port.value(),
+            proxy_name=self.proxy_name.text().strip(),
+        )
+        return connection, self.fabric_mhz.value(), self.tproc_mhz.value()
+
+
 class ExperimentPanel(QtWidgets.QWidget):
-    """QICK connection, QCoDeS database, and direct-run controls."""
+    """QCoDeS database, AWG scale, and direct-run controls."""
 
     run_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
@@ -2874,16 +3086,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             repetitions=repetitions,
         )
 
-        form.addRow("QICK IP/host:", self.qick_host)
-        form.addRow("Pyro nameserver port:", self.ns_port)
-        form.addRow("Pyro proxy name:", self.proxy_name)
         form.addRow("QCoDeS DB file:", database_row)
         form.addRow("Experiment name:", self.experiment_name)
         form.addRow("Sample name:", self.sample_name)
-        form.addRow("AWG fabric clock:", self.fabric_mhz)
-        form.addRow("tProcessor clock:", self.tproc_mhz)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
-        form.addRow("AWG generator indices:", self.awg_channels)
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow(self.bias_t_group)
         form.addRow("Notes:", self.notes)
@@ -3060,6 +3266,12 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.setValue(float(full_scale_mv))
         self.awg_channels.setText(", ".join(str(value) for value in awg_channels))
         self.repetitions.setValue(int(repetitions))
+
+    def set_connection_values(self, connection: QickConnectionConfig) -> None:
+        """Mirror the shared Setup connection into legacy execution fields."""
+        self.qick_host.setText(connection.host)
+        self.ns_port.setValue(connection.ns_port)
+        self.proxy_name.setText(connection.proxy_name)
 
     def set_bias_t_values(
         self,
@@ -3855,6 +4067,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             initial_color,
             self._add_port,
             time_unit=self._time_unit,
+            awg_channels=self._qick_awg_channels,
+            parent=self,
         )
         self._rf_ports_panel = RfPortsPanel(
             self._pulse[0], time_unit=self._time_unit, parent=self
@@ -3940,6 +4154,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_ports_panel.front_panel_requested.connect(
             lambda panel: self._show_qick_front_panel("output", panel)
         )
+        self._multi_ctrl.front_panel_requested.connect(
+            lambda target: self._show_qick_front_panel("output", target)
+        )
+        self._multi_ctrl.awg_channel_changed.connect(
+            self._set_awg_output_channel
+        )
         self._rf_readout_panel.front_panel_requested.connect(
             lambda panel: self._show_qick_front_panel("input", panel)
         )
@@ -3962,6 +4182,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._noise_panel.front_panel_requested.connect(
             lambda target: self._show_qick_front_panel("input", target)
         )
+        self._sync_shared_qick_controls()
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
         )
@@ -4168,16 +4389,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             axis=1,
         )
         ctrl = self._multi_ctrl._ctrl_pannels.pop(idx)
+        ctrl.setParent(None)
         ctrl.deleteLater()
         self._multi_ctrl._color_map.pop(idx)
-        self._multi_ctrl.splitter.widget(idx).deleteLater()
         ControlPanel.port_idx -= 1  # decrement port index counter
         for i, ctrl in enumerate(self._multi_ctrl._ctrl_pannels):
             ctrl.idx = i
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
+        self._multi_ctrl.update_port_strip_geometry()
 
-        if self._selected_port_idx >= len(self._pulse):
+        if idx < self._selected_port_idx:
+            self._selected_port_idx -= 1
+        elif self._selected_port_idx >= len(self._pulse):
             self._selected_port_idx = len(self._pulse) - 1
         self._plot.set_selected_port_idx(self._selected_port_idx)
+        self._multi_ctrl.set_selected_port(self._selected_port_idx)
 
         self._multi_ctrl.refresh_table()
         self.refresh_panel_table()
@@ -4206,6 +4432,96 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     setattr(self._trace, attr, trace_index - 1)
             self._trace.refresh_trace(self._pulse)
 
+    def _shared_qick_connection(self) -> QickConnectionConfig:
+        connection, _run = self._experiment_panel.connection_values(
+            require_run_config=False
+        )
+        return connection
+
+    def _sync_shared_qick_controls(self) -> None:
+        """Keep hidden compatibility fields aligned with the Setup menu."""
+        connection = self._shared_qick_connection()
+        self._noise_panel.set_connection_values(connection)
+
+    def _apply_shared_qick_setup(
+        self,
+        connection: QickConnectionConfig,
+        fabric_mhz: float,
+        tproc_mhz: float,
+    ) -> None:
+        self._qick_fabric_mhz = float(fabric_mhz)
+        self._qick_tproc_mhz = float(tproc_mhz)
+        self._experiment_panel.set_connection_values(connection)
+        self._experiment_panel.set_qick_values(
+            fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            awg_channels=self._qick_awg_channels,
+            repetitions=self._qick_repetitions_per_sweep,
+        )
+        self._noise_panel.set_connection_values(connection)
+
+    def _configure_qick_setup(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish before changing Setup.",
+            )
+            return
+        dialog = QickSetupDialog(
+            connection=self._shared_qick_connection(),
+            fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
+            parent=self,
+        )
+        while dialog.exec_() == QtWidgets.QDialog.Accepted:
+            try:
+                connection, fabric_mhz, tproc_mhz = dialog.values()
+            except (TypeError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid QICK Setup",
+                    str(exc),
+                )
+                continue
+            self._apply_shared_qick_setup(
+                connection,
+                fabric_mhz,
+                tproc_mhz,
+            )
+            self.statusBar().showMessage(
+                f"QICK Setup: {connection.host}:{connection.ns_port} / "
+                f"AWG {fabric_mhz:g} MHz / tProcessor {tproc_mhz:g} MHz"
+            )
+            break
+
+    def _set_awg_output_channel(self, output_index: int, channel: int) -> None:
+        """Apply one front-panel generator mapping without duplicate channels."""
+        output_index = int(output_index)
+        channel = int(channel)
+        if not 0 <= output_index < len(self._qick_awg_channels):
+            raise IndexError("AWG output index is out of range")
+        if channel < 0:
+            raise ValueError("AWG generator channel must be nonnegative")
+        channels = list(self._qick_awg_channels)
+        previous = channels[output_index]
+        if channel in channels and channels.index(channel) != output_index:
+            other_index = channels.index(channel)
+            channels[other_index] = previous
+        channels[output_index] = channel
+        self._qick_awg_channels = tuple(channels)
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
+        self._experiment_panel.set_qick_values(
+            fabric_mhz=self._qick_fabric_mhz,
+            tproc_mhz=self._qick_tproc_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            awg_channels=self._qick_awg_channels,
+            repetitions=self._qick_repetitions_per_sweep,
+        )
+        self.refresh_panel_table()
+        self._refresh_stability_targets()
+
     def _build_menu(self):
         mb          = self.menuBar()
 
@@ -4219,6 +4535,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         load_settings.triggered.connect(self._load_json)
         m_file.addSeparator()
         m_file.addAction("E&xit",       self.close)
+
+        # Setup
+        m_setup = mb.addMenu("&Setup")
+        self._qick_setup_action = m_setup.addAction(
+            "QICK Connection and Clocks..."
+        )
+        self._qick_setup_action.triggered.connect(
+            self._configure_qick_setup
+        )
 
         # Pulse
         m_pulse     = mb.addMenu("&Pulse")
@@ -4779,6 +5104,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_tproc_mhz = values["tproc_mhz"]
         self._qick_full_scale_mv = values["full_scale_mv"]
         self._qick_awg_channels = values["awg_channels"]
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._qick_repetitions_per_sweep = values["repetitions_per_sweep"]
         self._bias_t_compensation_enabled = values[
             "bias_t_compensation_enabled"
@@ -4848,6 +5174,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_tproc_mhz = values["tproc_mhz"]
         self._qick_full_scale_mv = values["full_scale_mv"]
         self._qick_awg_channels = values["awg_channels"]
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._bias_t_compensation_enabled = values[
             "bias_t_compensation_enabled"
         ]
@@ -4988,7 +5315,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "input": "QICK Front Panel - RF Readout",
         }
         self._qick_front_panel_dialog.setWindowTitle(titles[scope])
-        if scope == "output" and not isinstance(target, RfPulsePortPanel):
+        if scope == "output" and isinstance(target, MultiControlPanel):
+            self._qick_front_panel_dialog.setWindowTitle(
+                "QICK Front Panel - AWG Output"
+            )
+            self._qick_front_panel.apply_button.setText("Update AWG Output")
+        elif scope == "output" and not isinstance(target, RfPulsePortPanel):
             self._qick_front_panel_dialog.setWindowTitle(
                 "QICK Front Panel - Stability Electrode"
             )
@@ -5088,6 +5420,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_qick_configuration_identified(self, configuration) -> None:
         self._qick_configuration = configuration
         self._qick_front_panel.set_configuration(configuration)
+        self._multi_ctrl.set_front_panel_configuration(configuration)
         self._sparameter_panel.set_front_panel_configuration(configuration)
         self._stability_panel.set_front_panel_configuration(configuration)
         self._rf_ports_panel.set_front_panel_configuration(configuration)
@@ -5137,7 +5470,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             target_name = (
                 f"RF output {target._index + 1}"
                 if isinstance(target, RfPulsePortPanel)
-                else "Stability electrode"
+                else (
+                    f"AWG output {target._selected_index + 1}"
+                    if isinstance(target, MultiControlPanel)
+                    else "Stability electrode"
+                )
             )
             self.statusBar().showMessage(
                 f"{target_name} mapped to "
@@ -5883,10 +6220,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         experiment_values = self._experiment_panel.values(len(self._pulse))
         connection = experiment_values["connection"]
         run = experiment_values["run"]
+        self._noise_panel.set_connection_values(connection)
         self._qick_fabric_mhz = experiment_values["fabric_mhz"]
         self._qick_tproc_mhz = experiment_values["tproc_mhz"]
         self._qick_full_scale_mv = experiment_values["full_scale_mv"]
         self._qick_awg_channels = experiment_values["awg_channels"]
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._qick_repetitions_per_sweep = experiment_values[
             "repetitions_per_sweep"
         ]
@@ -6855,6 +7194,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_duration_us=self._bias_t_compensation_duration_us,
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._refresh_stability_targets()
         self._stability_panel.load_settings(settings["stability_diagram"])
 
@@ -6879,6 +7219,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
         self._noise_panel.load_settings(settings["noise_analysis"])
+        self._sync_shared_qick_controls()
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()
         )
@@ -7107,6 +7448,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_tproc_mhz = settings["tproc_mhz"]
         self._qick_full_scale_mv = settings["full_scale_mv"]
         self._qick_awg_channels = tuple(settings["awg_channels"])
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._qick_repetitions_per_sweep = settings["repetitions_per_sweep"]
         self._bias_t_compensation_enabled = settings[
             "bias_t_compensation_enabled"
@@ -7260,8 +7602,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._wire_control_panel(new_ctrl)
         self._multi_ctrl._ctrl_pannels.append(new_ctrl)
         self._multi_ctrl.splitter.insertWidget(len(self._multi_ctrl._ctrl_pannels) - 1, new_ctrl)
+        self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
+        self._multi_ctrl.update_port_strip_geometry()
         self._multi_ctrl.refresh_table()
         self.refresh_panel_table()
+        self._port_select(len(self._pulse) - 1)
         self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
 
     def _port_select(self, idx: int) -> None:
@@ -7269,6 +7614,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._selected_port_idx         = idx
         self._plot._selected_port_idx   = idx
         self._plot.set_selected_port_idx(idx)
+        self._multi_ctrl.set_selected_port(idx)
         self._refresh_waveform_plot(idx)
 
     def _refresh_waveform_plot(self, index: Optional[int] = None) -> None:
@@ -7311,13 +7657,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             item_color.setBackground(table_color)
             self._multi_ctrl.panel_table.setItem(idx, 1, item_color)
 
+            item_qick = QtWidgets.QTableWidgetItem(
+                f"gen {self._qick_awg_channels[idx]}"
+            )
+            item_qick.setTextAlignment(QtCore.Qt.AlignCenter)
+            self._multi_ctrl.panel_table.setItem(idx, 2, item_qick)
+
             btn_x = QtWidgets.QPushButton("set_x")
             btn_x.clicked.connect(self._make_row_slot(self._set_x))
-            self._multi_ctrl.panel_table.setCellWidget(idx, 2, btn_x)
+            self._multi_ctrl.panel_table.setCellWidget(idx, 3, btn_x)
 
             btn_y = QtWidgets.QPushButton("set_y")
             btn_y.clicked.connect(self._make_row_slot(self._set_y))
-            self._multi_ctrl.panel_table.setCellWidget(idx, 3, btn_y)
+            self._multi_ctrl.panel_table.setCellWidget(idx, 4, btn_y)
 
         self._refresh_stability_targets()
 

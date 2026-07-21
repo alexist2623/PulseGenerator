@@ -193,6 +193,47 @@ def test_front_panel_visual_order_is_physical_descending_order():
     preview.close()
 
 
+def test_front_panel_preview_height_tracks_available_width():
+    _application()
+    preview = QickFrontPanelPreview()
+
+    assert preview.heightForWidth(300) == 102
+    assert preview.heightForWidth(600) == 205
+    assert preview.heightForWidth(900) == 308
+    assert preview.heightForWidth(1400) == 410
+    assert preview.sizePolicy().verticalPolicy() == QtWidgets.QSizePolicy.Preferred
+    assert preview.maximumHeight() == 410
+
+
+def test_front_panel_preview_tracks_enclosing_scroll_viewport():
+    app = _application()
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    content = QtWidgets.QWidget(scroll)
+    content.setMinimumWidth(1600)
+    layout = QtWidgets.QVBoxLayout(content)
+    preview = QickFrontPanelPreview(content)
+    layout.addWidget(preview)
+    layout.addStretch(1)
+    scroll.setWidget(content)
+    scroll.resize(640, 420)
+    scroll.show()
+    app.processEvents()
+    app.processEvents()
+
+    expected_width = scroll.viewport().width() - 36
+    assert preview.width() == expected_width
+    assert preview.height() == preview.heightForWidth(expected_width)
+
+    scroll.resize(760, 420)
+    app.processEvents()
+    app.processEvents()
+    expected_width = scroll.viewport().width() - 36
+    assert preview.width() == expected_width
+    assert preview.height() == preview.heightForWidth(expected_width)
+    scroll.close()
+
+
 def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     app = _application()
     window = gui.MainWindow()

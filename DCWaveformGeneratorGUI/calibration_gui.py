@@ -16,12 +16,14 @@ from PyQt5 import QtCore, QtWidgets
 try:
     from .dc_voltage_calibration import (
         DcVoltageCalibrationConfig,
+        MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
         run_dc_voltage_calibration,
     )
     import pyqtgraph as pg
 except ImportError:
     from dc_voltage_calibration import (
         DcVoltageCalibrationConfig,
+        MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
         run_dc_voltage_calibration,
     )
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
@@ -1002,7 +1004,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_full_scale_mv.setValue(800.0)
         self.dc_voltage_full_scale_mv.setSuffix(" mV")
         self.dc_voltage_samples = QtWidgets.QSpinBox()
-        self.dc_voltage_samples.setRange(1, 200)
+        self.dc_voltage_samples.setRange(
+            1,
+            MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
+        )
         self.dc_voltage_samples.setValue(128)
         self.dc_voltage_repetitions = QtWidgets.QSpinBox()
         self.dc_voltage_repetitions.setRange(1, 100000)
@@ -1038,16 +1043,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         frequency_note.setWordWrap(True)
         form.addRow(frequency_note)
+        self.dc_voltage_path_note = QtWidgets.QLabel()
+        self.dc_voltage_path_note.setWordWrap(True)
+        form.addRow("Selected DC path:", self.dc_voltage_path_note)
         for label, widget in (
-            ("DC output generator index:", self.dc_voltage_output_ch),
-            ("DC input readout index:", self.dc_voltage_readout_ch),
             ("Start voltage:", self.dc_voltage_start_mv),
             ("Stop voltage:", self.dc_voltage_stop_mv),
             ("Voltage points:", self.dc_voltage_points),
             ("DC output full scale (+/-):", self.dc_voltage_full_scale_mv),
             ("FIR samples / point:", self.dc_voltage_samples),
             ("Repetitions / point:", self.dc_voltage_repetitions),
-            ("DC input gain:", self.dc_voltage_input_gain),
             ("Settle before trigger:", self.dc_voltage_settle_us),
             ("FIR input margin:", self.dc_voltage_margin_samples),
             ("Experiment name:", self.dc_voltage_experiment_name),
@@ -1086,6 +1091,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.dc_voltage_path_diagram = self._new_path_diagram("dc_voltage")
         vertical.insertWidget(0, self.dc_voltage_path_diagram)
+        self._update_dc_voltage_path_note()
         return scroll
 
     def _browse_dc_application(self) -> None:
@@ -1256,17 +1262,25 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
 
     def dc_voltage_config(self) -> DcVoltageCalibrationConfig:
+        path = self._front_panel_values_for("dc_voltage")
+        output_ch = int(path["output_ch"])
+        readout_ch = int(path["readout_ch"])
+        input_gain_db = float(path["readout_dc_gain_db"])
+        self.dc_voltage_output_ch.setValue(output_ch)
+        self.dc_voltage_readout_ch.setValue(readout_ch)
+        self.dc_voltage_input_gain.setValue(input_gain_db)
+        self._update_dc_voltage_path_note()
         return DcVoltageCalibrationConfig(
             database_path=self.database_path_value(),
-            output_ch=self.dc_voltage_output_ch.value(),
-            readout_ch=self.dc_voltage_readout_ch.value(),
+            output_ch=output_ch,
+            readout_ch=readout_ch,
             voltage_start_mv=self.dc_voltage_start_mv.value(),
             voltage_stop_mv=self.dc_voltage_stop_mv.value(),
             voltage_points=self.dc_voltage_points.value(),
             output_full_scale_mv=self.dc_voltage_full_scale_mv.value(),
             samples_per_point=self.dc_voltage_samples.value(),
             repetitions_per_point=self.dc_voltage_repetitions.value(),
-            input_dc_gain_db=self.dc_voltage_input_gain.value(),
+            input_dc_gain_db=input_gain_db,
             settle_us=self.dc_voltage_settle_us.value(),
             margin_input_samples=self.dc_voltage_margin_samples.value(),
             force_overwrite=self.dc_voltage_force_overwrite.isChecked(),
@@ -1347,9 +1361,20 @@ class CalibrationPanel(QtWidgets.QWidget):
             self.dc_voltage_output_ch.setValue(output_ch)
             self.dc_voltage_readout_ch.setValue(readout_ch)
             self.dc_voltage_input_gain.setValue(input_gain)
+            self._update_dc_voltage_path_note()
         else:
             raise ValueError(f"unknown calibration path mode {mode!r}")
         self._update_board_controls()
+
+    def _update_dc_voltage_path_note(self) -> None:
+        if not hasattr(self, "dc_voltage_path_note"):
+            return
+        self.dc_voltage_path_note.setText(
+            f"DC output generator {self.dc_voltage_output_ch.value()} -> "
+            f"DC input readout {self.dc_voltage_readout_ch.value()} | "
+            f"input gain {self.dc_voltage_input_gain.value():g} dB. "
+            "Change this mapping with the front panel above."
+        )
 
     def _apply_local_path_settings(
         self,

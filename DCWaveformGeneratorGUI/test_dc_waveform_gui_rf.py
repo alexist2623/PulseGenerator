@@ -86,6 +86,110 @@ def test_gui_defaults_and_time_unit_round_trip():
     window.close()
 
 
+def test_shared_qick_setup_replaces_duplicate_tab_controls():
+    app = _application()
+    window = gui.MainWindow()
+
+    menu_names = [action.text().replace("&", "") for action in window.menuBar().actions()]
+    assert "Setup" in menu_names
+    setup_menu = next(
+        action.menu()
+        for action in window.menuBar().actions()
+        if action.text().replace("&", "") == "Setup"
+    )
+    assert "QICK Connection and Clocks..." in [
+        action.text() for action in setup_menu.actions()
+    ]
+
+    experiment_labels = {
+        label.text() for label in window._experiment_panel.findChildren(QtWidgets.QLabel)
+    }
+    assert "QICK IP/host:" not in experiment_labels
+    assert "Pyro nameserver port:" not in experiment_labels
+    assert "Pyro proxy name:" not in experiment_labels
+    assert "AWG fabric clock:" not in experiment_labels
+    assert "tProcessor clock:" not in experiment_labels
+    assert "AWG generator indices:" not in experiment_labels
+    noise_labels = {
+        label.text() for label in window._noise_panel.findChildren(QtWidgets.QLabel)
+    }
+    assert "QICK connection:" not in noise_labels
+
+    connection = gui.QickConnectionConfig(
+        host="192.0.2.88",
+        ns_port=9777,
+        proxy_name="shared-qick",
+    )
+    window._apply_shared_qick_setup(connection, 312.5, 287.5)
+    assert window._experiment_panel.qick_host.text() == "192.0.2.88"
+    assert window._experiment_panel.ns_port.value() == 9777
+    assert window._experiment_panel.proxy_name.text() == "shared-qick"
+    assert window._experiment_panel.fabric_mhz.value() == 312.5
+    assert window._experiment_panel.tproc_mhz.value() == 287.5
+    assert window._noise_panel.acquisition_host.text() == "192.0.2.88"
+    assert window._noise_panel.acquisition_port.value() == 9777
+    assert window._noise_panel.acquisition_proxy.text() == "shared-qick"
+    app.processEvents()
+    window.close()
+
+
+def test_awg_front_panel_mapping_and_horizontal_port_scroll():
+    app = _application()
+    window = gui.MainWindow()
+    window.resize(860, 720)
+    window.show()
+    for _ in range(3):
+        window._add_port()
+    app.processEvents()
+
+    multi = window._multi_ctrl
+    assert multi.front_panel_preview._scope == "output"
+    assert multi.panel_table.columnCount() == 5
+    assert multi.splitter.minimumWidth() >= 4 * 310
+    assert multi.panel_scroll.horizontalScrollBar().maximum() > 0
+    assert window._selected_port_idx == 3
+    assert "awg_3" in multi.mapping_summary.text()
+    assert "generator 7" in multi.mapping_summary.text()
+
+    multi.set_selected_port(0)
+    multi.apply_front_panel_settings({"output_ch": 3})
+    assert window._qick_awg_channels == (3, 1, 5, 7)
+    assert multi.panel_table.item(0, 2).text() == "gen 3"
+    assert multi.panel_table.item(1, 2).text() == "gen 1"
+    assert window._experiment_panel.awg_channels.text() == "3, 1, 5, 7"
+    window._port_select(3)
+    window._delete_port(3)
+    assert window._selected_port_idx == 2
+    assert window._qick_awg_channels == (3, 1, 5)
+    assert len(multi._ctrl_pannels) == 3
+    app.processEvents()
+    window.close()
+
+
+def test_rf_readout_input_condition_stays_single_row_height():
+    app = _application()
+    pulse = PulseSequence(100.0, initial_duration_ns=1000.0)
+    panel = gui.RfReadoutPanel(pulse, time_unit="us")
+    panel.setChecked(True)
+    panel.resize(640, 900)
+    panel.show()
+    app.processEvents()
+
+    expected_height = max(
+        panel.attenuation_db.sizeHint().height(),
+        panel.dc_gain_db.sizeHint().height(),
+    )
+    assert panel.input_condition_stack.height() == expected_height
+    assert (
+        panel.input_condition_stack.sizePolicy().verticalPolicy()
+        == QtWidgets.QSizePolicy.Fixed
+    )
+    panel.input_board_type.setCurrentText("DC_In")
+    app.processEvents()
+    assert panel.input_condition_stack.height() == expected_height
+    panel.close()
+
+
 def test_segment_sweep_dialog_uses_voltage_values_but_returns_normalized_spec():
     app = _application()
     dialog = gui.SweepSettingsDialog(

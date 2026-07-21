@@ -34,6 +34,8 @@ DEFAULT_DC_VOLTAGE_START_MV = -800.0
 DEFAULT_DC_VOLTAGE_STOP_MV = 800.0
 DEFAULT_DC_VOLTAGE_POINTS = 33
 DEFAULT_DC_VOLTAGE_FULL_SCALE_MV = 800.0
+MAX_DC_VOLTAGE_SAMPLES_PER_POINT = 1_000_000
+MIN_DC_VOLTAGE_CALIBRATION_R_SQUARED = 0.95
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -119,10 +121,10 @@ class DcVoltageCalibrationConfig:
                 "+/- output full scale"
             )
         samples = _integer(self.samples_per_point, "samples_per_point", 1)
-        if samples > 200:
+        if samples > MAX_DC_VOLTAGE_SAMPLES_PER_POINT:
             raise ValueError(
-                "samples_per_point must be <= 200 so the 300:1 FIR capture "
-                "fits inside one 16-bit periodic-readout window"
+                "samples_per_point must be <= "
+                f"{MAX_DC_VOLTAGE_SAMPLES_PER_POINT}"
             )
         _integer(self.repetitions_per_point, "repetitions_per_point", 1)
         gain = _finite(self.input_dc_gain_db, "input_dc_gain_db")
@@ -293,6 +295,11 @@ def build_dc_voltage_calibration_program(
     )
     hold_fabric_cycles = max(1, int(ceil(capture_hold_us * fabric_mhz)))
     trigger_delay = max(0, int(ceil(float(config.settle_us) * effective_tproc_mhz)))
+    if max(hold_fabric_cycles, trigger_delay) > 0x7FFF_FFFF:
+        raise ValueError(
+            "DC calibration timing exceeds the signed 32-bit tProcessor "
+            "interval; reduce FIR samples per point or settle time"
+        )
 
     sequence = FineTuneSequence(("dc_cal_out",))
     sequence.add_set("dc_calibration", (0.0,), hold_fabric_cycles)
@@ -534,6 +541,15 @@ def run_dc_voltage_calibration(
         readout_ch=adjusted_config.readout_ch,
         input_dc_gain_db=actual_gain,
     )
+    if calibration.r_squared < MIN_DC_VOLTAGE_CALIBRATION_R_SQUARED:
+        raise RuntimeError(
+            "DC voltage calibration did not detect a linear loopback response: "
+            f"output generator {adjusted_config.output_ch} -> readout "
+            f"{adjusted_config.readout_ch}, response "
+            f"{calibration.response_adc_per_v:.6g} ADC/V, "
+            f"R^2={calibration.r_squared:.6f}. Verify the selected front-panel "
+            "SMA pair and cable. The invalid calibration was not saved."
+        )
     _emit_progress(
         progress_callback,
         85,
@@ -644,6 +660,8 @@ def load_dc_voltage_calibration(
 
 __all__ = [
     "DC_VOLTAGE_CALIBRATION_SCHEMA",
+    "MAX_DC_VOLTAGE_SAMPLES_PER_POINT",
+    "MIN_DC_VOLTAGE_CALIBRATION_R_SQUARED",
     "DEFAULT_DC_VOLTAGE_FULL_SCALE_MV",
     "DEFAULT_DC_VOLTAGE_POINTS",
     "DEFAULT_DC_VOLTAGE_START_MV",

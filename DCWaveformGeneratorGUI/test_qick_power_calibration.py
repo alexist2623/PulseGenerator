@@ -290,6 +290,34 @@ def test_calibration_subtab_paths_round_trip_independently(tmp_path):
     migrated.close()
 
 
+def test_dc_voltage_uses_front_panel_path_and_long_sample_count(tmp_path):
+    _application()
+    panel = CalibrationPanel()
+    panel.database_path.setText(str(tmp_path / "gain_pwr_calb.db"))
+    dc_path = panel.path_diagram_for("dc_voltage").applied_values()
+    dc_path.update(
+        output_ch=3,
+        readout_ch=3,
+        readout_dc_gain_db=6.0,
+    )
+    panel.path_diagram_for("dc_voltage").apply_external_settings(dc_path)
+
+    # Stale compatibility widgets must not override the visible front-panel path.
+    panel.dc_voltage_output_ch.setValue(1)
+    panel.dc_voltage_readout_ch.setValue(2)
+    panel.dc_voltage_input_gain.setValue(0.0)
+    panel.dc_voltage_samples.setValue(250_000)
+    config = panel.dc_voltage_config()
+
+    assert config.output_ch == 3
+    assert config.readout_ch == 3
+    assert config.input_dc_gain_db == 6.0
+    assert config.samples_per_point == 250_000
+    assert panel.dc_voltage_samples.maximum() == 1_000_000
+    assert "generator 3 -> DC input readout 3" in panel.dc_voltage_path_note.text()
+    panel.close()
+
+
 def _create_output_calibration(tmp_path, monkeypatch):
     database_path = tmp_path / "gain_pwr_calb.db"
     monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))

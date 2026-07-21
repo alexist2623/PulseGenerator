@@ -586,17 +586,19 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
 
 
 class QickFrontPanelPreview(QickFrontPanelCanvas):
-    """Small clickable front-panel preview used by RF configuration editors."""
+    """Responsive clickable front-panel preview used by RF configuration editors."""
 
     activated = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._width_reference: Optional[QtWidgets.QWidget] = None
+        self._visible_width_margin = 36
         self.setMinimumSize(210, 72)
-        self.setMaximumHeight(112)
+        self.setMaximumHeight(round(self.LOGICAL_HEIGHT))
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Preferred,
         )
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setToolTip(
@@ -604,7 +606,75 @@ class QickFrontPanelPreview(QickFrontPanelCanvas):
         )
 
     def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(270, 92)
+        width = 540
+        return QtCore.QSize(width, self.heightForWidth(width))
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(210, 72)
+
+    def heightForWidth(self, width: int) -> int:
+        panel_height = round(width * self.LOGICAL_HEIGHT / self.LOGICAL_WIDTH)
+        return max(72, min(round(self.LOGICAL_HEIGHT), panel_height))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._bind_visible_width_reference()
+        QtCore.QTimer.singleShot(0, self._fit_visible_width)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is self._width_reference
+            and event.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Show)
+        ):
+            QtCore.QTimer.singleShot(0, self._fit_visible_width)
+        return super().eventFilter(watched, event)
+
+    def _bind_visible_width_reference(self) -> None:
+        reference = self._nearest_scroll_viewport()
+        if reference is None:
+            reference = self.parentWidget()
+        if reference is self._width_reference:
+            return
+        if self._width_reference is not None:
+            self._width_reference.removeEventFilter(self)
+        self._width_reference = reference
+        if reference is not None:
+            reference.installEventFilter(self)
+
+    def _nearest_scroll_viewport(self) -> Optional[QtWidgets.QWidget]:
+        widget = self.parentWidget()
+        while widget is not None:
+            parent = widget.parentWidget()
+            if (
+                isinstance(parent, QtWidgets.QAbstractScrollArea)
+                and parent.viewport() is widget
+            ):
+                return widget
+            widget = parent
+        return None
+
+    def _fit_visible_width(self) -> None:
+        """Limit the preview to the visible width of its enclosing panel."""
+        self._bind_visible_width_reference()
+        if self._width_reference is None:
+            return
+        available_width = self._width_reference.width()
+        ancestor = self.parentWidget()
+        while ancestor is not None and ancestor is not self._width_reference:
+            if ancestor.isVisible() and ancestor.width() > 0:
+                available_width = min(available_width, ancestor.width())
+            ancestor = ancestor.parentWidget()
+        target_width = max(210, available_width - self._visible_width_margin)
+        target_height = self.heightForWidth(target_width)
+        if self.maximumWidth() != target_width:
+            self.setMaximumWidth(target_width)
+        if (
+            self.minimumHeight() != target_height
+            or self.maximumHeight() != target_height
+        ):
+            self.setMinimumHeight(target_height)
+            self.setMaximumHeight(target_height)
+        self.updateGeometry()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == QtCore.Qt.LeftButton:
