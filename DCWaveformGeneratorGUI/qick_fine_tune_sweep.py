@@ -47,6 +47,9 @@ from qick.averager_program import RAveragerProgram
 
 
 MAX_OUTPUTS = 8
+MAX_RF_ONESHOT_CYCLES = 65535
+RF_PERIODIC_WORD_CYCLES = 3
+RF_STOP_WORD_CYCLES = 3
 OP_SET = 0b01
 OP_RAMP = 0b10
 COMMAND_REGISTER_NAMES = (
@@ -297,7 +300,12 @@ class ReadoutConfig:
 
 @dataclass(frozen=True)
 class RfPulseConfig:
-    """One-shot RF pulse emitted during a named SET/gate segment."""
+    """RF pulse emitted during a named SET/gate segment.
+
+    Pulses up to 65,535 generator-fabric cycles use the regular one-shot
+    command. Longer pulses use a short periodic word followed by a timed
+    zero-gain one-shot stop command, avoiding the 16-bit length-field limit.
+    """
 
     gen_ch: int
     at_segment: str
@@ -1680,6 +1688,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.timing = self._build_timing()
         self.aux_timing = {}
 
+        self._rf_runtime = {}
         for rf_config in self.rf_pulse_configs:
             self._configure_rf_pulse(rf_config)
         if self.ddr_readout_config is not None:
@@ -2258,17 +2267,58 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             freq_word = int(round(float(rf.freq_mhz) * (1 << b_dds) / float(gen_cfg["f_dds"])))
             freq_word %= 1 << b_dds
         phase_word = self.deg2reg(rf.phase_degrees, gen_ch=rf.gen_ch)
+        periodic = rf.length_cycles > MAX_RF_ONESHOT_CYCLES
+        self._rf_runtime[rf.gen_ch] = {
+            "freq": int(freq_word),
+            "phase": int(phase_word),
+            "periodic": bool(periodic),
+        }
         self.set_pulse_registers(
             ch=rf.gen_ch,
             style="const",
             freq=freq_word,
             phase=phase_word,
             gain=rf.gain,
-            length=rf.length_cycles,
+            length=(
+                RF_PERIODIC_WORD_CYCLES if periodic else rf.length_cycles
+            ),
             phrst=0,
-            stdysel=rf.stdysel,
+            stdysel="last" if periodic else rf.stdysel,
+            mode="periodic" if periodic else "oneshot",
+        )
+
+    def _emit_rf_start(self, rf: RfPulseConfig, tproc_time: int) -> None:
+        runtime = self._rf_runtime[rf.gen_ch]
+        if runtime["periodic"]:
+            # A previous point leaves the generator configured with the stop
+            # word, so restore the periodic tone before every new start.
+            self.set_pulse_registers(
+                ch=rf.gen_ch,
+                style="const",
+                freq=runtime["freq"],
+                phase=runtime["phase"],
+                gain=rf.gain,
+                length=RF_PERIODIC_WORD_CYCLES,
+                phrst=0,
+                stdysel="last",
+                mode="periodic",
+            )
+        self.pulse(ch=rf.gen_ch, t=tproc_time)
+
+    def _emit_rf_stop(self, rf: RfPulseConfig, tproc_time: int) -> None:
+        runtime = self._rf_runtime[rf.gen_ch]
+        self.set_pulse_registers(
+            ch=rf.gen_ch,
+            style="const",
+            freq=runtime["freq"],
+            phase=runtime["phase"],
+            gain=0,
+            length=RF_STOP_WORD_CYCLES,
+            phrst=0,
+            stdysel="zero",
             mode="oneshot",
         )
+        self.pulse(ch=rf.gen_ch, t=tproc_time)
 
     def _configure_ddr_readout(self):
         ddr = self.ddr_readout_config
@@ -2400,7 +2450,16 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             while rf_start in occupied:
                 rf_start += self.command_spacing_tproc_cycles
             occupied.add(rf_start)
-            rf_end = rf_start + self._fabric_to_tproc(rf.gen_ch, rf.length_cycles)
+            requested_end = rf_start + self._fabric_to_tproc(
+                rf.gen_ch,
+                rf.length_cycles,
+            )
+            periodic = bool(self._rf_runtime[rf.gen_ch]["periodic"])
+            rf_end = int(requested_end)
+            if periodic:
+                while rf_end in occupied:
+                    rf_end += self.command_spacing_tproc_cycles
+                occupied.add(rf_end)
             if rf.require_within_segment and rf_end > self.timing["segment_ends"][segment_index]:
                 raise ValueError(
                     f"RF pulse ends at t={rf_end}, after SET segment {rf.at_segment!r} "
@@ -2411,16 +2470,23 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 "gen_ch": rf.gen_ch,
                 "requested_start": int(requested_start),
                 "start": int(rf_start),
+                "requested_end": int(requested_end),
                 "end": int(rf_end),
+                "mode": "periodic_timed_stop" if periodic else "oneshot",
                 "command_skew_tproc_cycles": int(rf_start - requested_start),
+                "stop_skew_tproc_cycles": int(rf_end - requested_end),
             }
             rf_timings.append(timing)
             self.aux_timing.update({
                 f"rf_{rf_index}_requested_start": timing["requested_start"],
                 f"rf_{rf_index}_start": timing["start"],
                 f"rf_{rf_index}_end": timing["end"],
+                f"rf_{rf_index}_mode": timing["mode"],
                 f"rf_{rf_index}_command_skew_tproc_cycles": (
                     timing["command_skew_tproc_cycles"]
+                ),
+                f"rf_{rf_index}_stop_skew_tproc_cycles": (
+                    timing["stop_skew_tproc_cycles"]
                 ),
             })
             self.timing["point_end"] = max(self.timing["point_end"], rf_end)
@@ -2431,7 +2497,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 "rf_requested_start": timing["requested_start"],
                 "rf_start": timing["start"],
                 "rf_end": timing["end"],
+                "rf_mode": timing["mode"],
                 "rf_command_skew_tproc_cycles": timing["command_skew_tproc_cycles"],
+                "rf_stop_skew_tproc_cycles": timing["stop_skew_tproc_cycles"],
             })
 
     def _build_channel_slots(self) -> Dict[int, int]:
@@ -3149,9 +3217,16 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             schedule(
                 self.aux_timing[f"rf_{rf_index}_start"],
                 10,
-                "rf",
+                "rf_start",
                 rf_config,
             )
+            if self._rf_runtime[rf_config.gen_ch]["periodic"]:
+                schedule(
+                    self.aux_timing[f"rf_{rf_index}_end"],
+                    15,
+                    "rf_stop",
+                    rf_config,
+                )
 
         point_end = int(self.timing["point_end"])
         bias_t_static_end = point_end
@@ -3205,8 +3280,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 self._emit_command(payload, event_time)
             elif kind == "readout":
                 self.readout(ch=payload, t=event_time)
-            elif kind == "rf":
-                self.pulse(ch=payload.gen_ch, t=event_time)
+            elif kind == "rf_start":
+                self._emit_rf_start(payload, event_time)
+            elif kind == "rf_stop":
+                self._emit_rf_stop(payload, event_time)
             elif kind == "ddr_trigger":
                 self.trigger(
                     ddr4=True,

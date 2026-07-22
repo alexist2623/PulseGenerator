@@ -25,10 +25,10 @@ def _application():
 def _config() -> stability.StabilityDiagramConfig:
     return stability.StabilityDiagramConfig(
         x_axis=stability.StabilitySweepAxis(
-            "awg_0", "set_1", -100.0, 100.0, 2
+            "awg_0", -100.0, 100.0, 2
         ),
         y_axis=stability.StabilitySweepAxis(
-            "awg_1", "set_2", -50.0, 50.0, 2
+            "awg_1", -50.0, 50.0, 2
         ),
         repetitions_per_point=2,
         trace_samples_per_point=3,
@@ -39,14 +39,14 @@ def _ddr_result():
     axes = (
         SimpleNamespace(
             output_name="awg_0",
-            segment_name="set_1",
+            segment_name=stability.STABILITY_HOLD_SEGMENT,
             start=-1.0,
             stop=1.0,
             count=2,
         ),
         SimpleNamespace(
             output_name="awg_1",
-            segment_name="set_2",
+            segment_name=stability.STABILITY_HOLD_SEGMENT,
             start=-0.5,
             stop=0.5,
             count=2,
@@ -114,10 +114,10 @@ def test_stability_config_requires_two_outputs_and_respects_full_scale():
     with pytest.raises(ValueError, match="different AWG outputs"):
         stability.StabilityDiagramConfig(
             x_axis=stability.StabilitySweepAxis(
-                "awg_0", "set_0", -10.0, 10.0, 2
+                "awg_0", -10.0, 10.0, 2
             ),
             y_axis=stability.StabilitySweepAxis(
-                "awg_0", "set_1", -10.0, 10.0, 2
+                "awg_0", -10.0, 10.0, 2
             ),
         )
 
@@ -128,10 +128,10 @@ def test_stability_config_requires_two_outputs_and_respects_full_scale():
 
     compensated = stability.StabilityDiagramConfig(
         x_axis=stability.StabilitySweepAxis(
-            "awg_0", "set_1", -100.0, 100.0, 2
+            "awg_0", -100.0, 100.0, 2
         ),
         y_axis=stability.StabilitySweepAxis(
-            "awg_1", "set_2", -50.0, 50.0, 2
+            "awg_1", -50.0, 50.0, 2
         ),
         bias_t_compensation_enabled=True,
         bias_t_compensation_voltage_mv=125.0,
@@ -158,6 +158,37 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
         "duration_us": 1.0,
         "filter_tau_us": 100.0,
     }
+    assert normalized["settle_time_us"] == stability.DEFAULT_STABILITY_SETTLE_US
+    assert "segment_name" not in normalized["x_axis"]
+
+
+def test_stability_builds_dedicated_set_hold_sequence_without_awg_waveform():
+    config = _config()
+    sequence = stability.build_stability_hold_sequence(
+        config,
+        output_names=("awg_0", "awg_1", "awg_2"),
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+        cross_capacitance=np.eye(3),
+    )
+
+    assert len(sequence.segments) == 1
+    segment = sequence.segments[0]
+    assert segment.name == stability.STABILITY_HOLD_SEGMENT
+    assert segment.kind == "set"
+    assert segment.amplitudes == (0.0, 0.0, 0.0)
+    assert segment.duration_cycles == int(
+        np.ceil(
+            (
+                config.settle_time_us
+                + config.trace_samples_per_point
+                + stability.DEFAULT_STABILITY_POINT_GUARD_US
+            )
+            * 300.0
+        )
+    )
+    assert [item.segment_name for item in sequence.sweeps] == ["set_0", "set_0"]
+    assert [item.output_name for item in sequence.sweeps] == ["awg_0", "awg_1"]
 
 
 def test_reduce_fir_result_restores_voltage_grid_and_coherent_iq_mean():
@@ -342,6 +373,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.y_axis.points.setValue(7)
     panel.repetitions.setValue(4)
     panel.trace_samples.setValue(321)
+    panel.settle_time_us.setValue(75.5)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
     panel.bias_t_group.setChecked(True)
@@ -355,10 +387,11 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
 
     config = panel.config(full_scale_mv=2500.0)
     assert config.x_axis.output_name == "awg_0"
-    assert config.x_axis.segment_name == "set_0"
+    assert config.x_axis.segment_name == stability.STABILITY_HOLD_SEGMENT
     assert config.y_axis.output_name == "awg_2"
     assert config.point_count == 77
     assert config.trace_samples_per_point == 321
+    assert config.settle_time_us == 75.5
     assert config.modulation_frequency_mhz == 12.5
     assert config.modulation_gain == 12345
     assert config.bias_t_compensation_enabled is True
@@ -369,6 +402,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.bias_t_duration_us.isEnabled() is True
     assert panel.point_count.text() == "77"
     assert not hasattr(panel.x_axis, "segment")
+    assert "segment_name" not in panel.x_axis.settings_dict()
     assert not hasattr(panel, "rf_editor_tabs")
     assert panel.database_path_value() == str(database_path)
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
@@ -385,6 +419,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert restored.bias_t_group.isChecked() is True
     assert restored.bias_t_mode.currentData() == "fixed_time"
     assert restored.bias_t_duration_us.value() == 2.5
+    assert restored.settle_time_us.value() == 75.5
 
     dc_changes = []
     calibration_changes = []
@@ -431,6 +466,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.stop_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is False
     assert panel.trace_samples.isEnabled() is False
+    assert panel.settle_time_us.isEnabled() is False
     assert panel.modulation_frequency_mhz.isEnabled() is False
     assert panel.bias_t_group.isEnabled() is False
     panel.set_stopping()
@@ -438,6 +474,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
     assert panel.trace_samples.isEnabled() is True
+    assert panel.settle_time_us.isEnabled() is True
     assert panel.modulation_frequency_mhz.isEnabled() is True
     assert panel.bias_t_group.isEnabled() is True
     panel.close()

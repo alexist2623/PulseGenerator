@@ -31,7 +31,10 @@ try:
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
         DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_QICK_FULL_SCALE_MV,
+        PulseSequence,
+        QickSweepSpec,
         adc_iq_to_voltage,
+        build_qick_sequence,
         dc_iq_to_current,
     )
     from .dc_voltage_calibration import load_dc_voltage_calibration
@@ -51,7 +54,10 @@ except ImportError:
         DEFAULT_BIAS_T_COMPENSATION_FRACTION,
         DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_QICK_FULL_SCALE_MV,
+        PulseSequence,
+        QickSweepSpec,
         adc_iq_to_voltage,
+        build_qick_sequence,
         dc_iq_to_current,
     )
     from dc_voltage_calibration import load_dc_voltage_calibration
@@ -70,8 +76,11 @@ DEFAULT_STABILITY_STOP_MV = 100.0
 DEFAULT_STABILITY_POINTS = 51
 DEFAULT_STABILITY_REPETITIONS = 1
 DEFAULT_STABILITY_TRACE_SAMPLES = 64
+DEFAULT_STABILITY_SETTLE_US = 50.0
+DEFAULT_STABILITY_POINT_GUARD_US = 1.0
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
 DEFAULT_STABILITY_MODULATION_GAIN = 20_000
+STABILITY_HOLD_SEGMENT = "set_0"
 DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV = (
     DEFAULT_QICK_FULL_SCALE_MV * DEFAULT_BIAS_T_COMPENSATION_FRACTION
 )
@@ -124,7 +133,6 @@ class StabilitySweepAxis:
     """One virtual-electrode voltage axis of a stability diagram."""
 
     output_name: str
-    segment_name: str
     start_mv: float
     stop_mv: float
     points: int
@@ -132,8 +140,6 @@ class StabilitySweepAxis:
     def __post_init__(self) -> None:
         if not str(self.output_name):
             raise ValueError("stability output name must not be empty")
-        if not str(self.segment_name):
-            raise ValueError("stability SET segment name must not be empty")
         _finite_float(self.start_mv, "stability start voltage")
         _finite_float(self.stop_mv, "stability stop voltage")
         _integer(self.points, "stability point count", 2)
@@ -147,6 +153,11 @@ class StabilitySweepAxis:
             dtype=float,
         )
 
+    @property
+    def segment_name(self) -> str:
+        """Internal SET anchor used by the dedicated Stability sequence."""
+        return STABILITY_HOLD_SEGMENT
+
 
 @dataclass(frozen=True)
 class StabilityDiagramConfig:
@@ -156,6 +167,7 @@ class StabilityDiagramConfig:
     y_axis: StabilitySweepAxis
     repetitions_per_point: int = DEFAULT_STABILITY_REPETITIONS
     trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
+    settle_time_us: float = DEFAULT_STABILITY_SETTLE_US
     modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
     modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
     bias_t_compensation_enabled: bool = False
@@ -168,19 +180,13 @@ class StabilityDiagramConfig:
     def __post_init__(self) -> None:
         if self.x_axis.output_name == self.y_axis.output_name:
             raise ValueError("X and Y stability axes must use different AWG outputs")
-        if (
-            self.x_axis.output_name,
-            self.x_axis.segment_name,
-        ) == (
-            self.y_axis.output_name,
-            self.y_axis.segment_name,
-        ):
-            raise ValueError("X and Y stability axes must use different electrodes")
         _integer(
             self.repetitions_per_point,
             "stability repetitions per point",
             1,
         )
+        if _finite_float(self.settle_time_us, "stability settle time") < 0.0:
+            raise ValueError("stability settle time must not be negative")
         _integer(
             self.trace_samples_per_point,
             "stability FIR trace samples per point",
@@ -287,26 +293,29 @@ def default_stability_settings(
     output_names: Sequence[str] = ("awg_0", "awg_1"),
     segment_names: Sequence[str] = ("set_0",),
 ) -> dict:
-    """Return settings that remain loadable even before two ports exist."""
+    """Return settings that remain loadable even before two ports exist.
+
+    ``segment_names`` is accepted for old callers but intentionally ignored.
+    Stability scans use their own internal SET/hold segment and never reuse an
+    AWG Tuning waveform segment.
+    """
     outputs = tuple(str(value) for value in output_names) or ("awg_0",)
-    segments = tuple(str(value) for value in segment_names) or ("set_0",)
     return {
         "x_axis": {
             "output_name": outputs[0],
-            "segment_name": segments[0],
             "start_mv": DEFAULT_STABILITY_START_MV,
             "stop_mv": DEFAULT_STABILITY_STOP_MV,
             "points": DEFAULT_STABILITY_POINTS,
         },
         "y_axis": {
             "output_name": outputs[1] if len(outputs) > 1 else outputs[0],
-            "segment_name": segments[0],
             "start_mv": DEFAULT_STABILITY_START_MV,
             "stop_mv": DEFAULT_STABILITY_STOP_MV,
             "points": DEFAULT_STABILITY_POINTS,
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
+        "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
         "bias_t_compensation": {
@@ -329,12 +338,16 @@ def normalize_stability_settings(
     settings: Optional[Mapping[str, Any]],
     *,
     output_names: Sequence[str],
-    segment_names: Sequence[str],
+    segment_names: Sequence[str] = (),
 ) -> dict:
-    """Validate a JSON settings object without requiring runnable hardware."""
+    """Validate a JSON settings object without requiring runnable hardware.
+
+    Legacy ``segment_name`` entries and ``segment_names`` are ignored. They
+    referred to AWG Tuning waveform segments, which are no longer part of a
+    Stability Diagram acquisition.
+    """
     outputs = tuple(str(value) for value in output_names)
-    segments = tuple(str(value) for value in segment_names)
-    defaults = default_stability_settings(outputs, segments)
+    defaults = default_stability_settings(outputs)
     if settings is None:
         return defaults
     if not isinstance(settings, Mapping):
@@ -346,20 +359,12 @@ def normalize_stability_settings(
         if not isinstance(raw_axis, Mapping):
             raise TypeError(f"stability {label} axis must be a JSON object")
         output_name = str(raw_axis.get("output_name", defaults[key]["output_name"]))
-        segment_name = str(
-            raw_axis.get("segment_name", defaults[key]["segment_name"])
-        )
         if output_name not in outputs:
             raise ValueError(
                 f"stability {label} output {output_name!r} is not present"
             )
-        if segment_name not in segments:
-            raise ValueError(
-                f"stability {label} SET segment {segment_name!r} is not present"
-            )
         normalized[key] = {
             "output_name": output_name,
-            "segment_name": segment_name,
             "start_mv": _finite_float(
                 raw_axis.get("start_mv", defaults[key]["start_mv"]),
                 f"stability {label} start voltage",
@@ -390,6 +395,12 @@ def normalize_stability_settings(
         "stability FIR trace samples per point",
         1,
     )
+    normalized["settle_time_us"] = _finite_float(
+        settings.get("settle_time_us", defaults["settle_time_us"]),
+        "stability settle time",
+    )
+    if normalized["settle_time_us"] < 0.0:
+        raise ValueError("stability settle time must not be negative")
     normalized["modulation_frequency_mhz"] = _finite_float(
         settings.get(
             "modulation_frequency_mhz",
@@ -517,6 +528,74 @@ def normalize_stability_settings(
         0,
     )
     return normalized
+
+
+def build_stability_hold_sequence(
+    config: StabilityDiagramConfig,
+    *,
+    output_names: Sequence[str],
+    fabric_mhz: float,
+    full_scale_mv: float,
+    cross_capacitance=None,
+):
+    """Build the dedicated SET-and-hold sequence for one Cartesian scan.
+
+    Each hardware sweep point issues one SET on ``set_0`` and holds that
+    voltage through the settle interval and the complete 1 MSPS FIR capture.
+    No RAMP or SET segment from the AWG Tuning tab is copied into this path.
+    """
+    config.validate_full_scale(full_scale_mv)
+    names = tuple(str(name) for name in output_names)
+    if not names:
+        raise ValueError("stability diagram requires AWG output names")
+    for axis in (config.x_axis, config.y_axis):
+        if axis.output_name not in names:
+            raise ValueError(
+                f"stability output {axis.output_name!r} is not present"
+            )
+
+    hold_duration_us = (
+        float(config.settle_time_us)
+        + float(config.trace_samples_per_point)
+        + DEFAULT_STABILITY_POINT_GUARD_US
+    )
+    pulses = tuple(
+        PulseSequence(
+            initial_voltage=0.0,
+            initial_duration_ns=hold_duration_us * 1000.0,
+        )
+        for _name in names
+    )
+    sweeps = tuple(
+        QickSweepSpec(
+            segment_name=STABILITY_HOLD_SEGMENT,
+            output_name=axis.output_name,
+            start=axis.start_mv / full_scale_mv,
+            stop=axis.stop_mv / full_scale_mv,
+            count=axis.points,
+        )
+        for axis in (config.x_axis, config.y_axis)
+    )
+    return build_qick_sequence(
+        pulses,
+        output_names=names,
+        fabric_mhz=fabric_mhz,
+        full_scale_mv=full_scale_mv,
+        sweeps=sweeps,
+        cross_capacitance=cross_capacitance,
+        bias_t_compensation_enabled=config.bias_t_compensation_enabled,
+        bias_t_compensation_type=config.bias_t_compensation_type,
+        bias_t_compensation_voltage_mv=(
+            config.bias_t_compensation_voltage_mv
+            if config.bias_t_compensation_enabled
+            and config.bias_t_compensation_type == "dc"
+            and config.bias_t_compensation_mode == "fixed_voltage"
+            else None
+        ),
+        bias_t_compensation_mode=config.bias_t_compensation_mode,
+        bias_t_compensation_duration_us=config.bias_t_compensation_duration_us,
+        bias_t_filter_tau_us=config.bias_t_filter_tau_us,
+    )
 
 
 def reduce_fir_stability_result(
@@ -806,7 +885,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         super().__init__(title, parent)
         form = QtWidgets.QFormLayout(self)
         self.output = QtWidgets.QComboBox(self)
-        self._segment_name = ""
         self._front_panel_configuration = None
         self.front_panel_button = QtWidgets.QPushButton(
             "Select DAC SMA on Front Panel",
@@ -849,7 +927,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     def refresh_targets(
         self,
         outputs: Sequence[Tuple[str, int]],
-        segments: Sequence[str],
         *,
         preferred_output_index: int,
     ) -> None:
@@ -867,9 +944,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
             if output_index < 0 and self.output.count():
                 output_index = min(preferred_output_index, self.output.count() - 1)
             self.output.setCurrentIndex(output_index)
-        segment_names = tuple(str(name) for name in segments)
-        if self._segment_name not in segment_names:
-            self._segment_name = segment_names[0] if segment_names else ""
         self._sync_front_panel_status()
 
     def current_gen_ch(self) -> int:
@@ -927,7 +1001,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     def settings_dict(self) -> dict:
         return {
             "output_name": str(self.output.currentData() or ""),
-            "segment_name": self._segment_name,
             "start_mv": self.start_mv.value(),
             "stop_mv": self.stop_mv.value(),
             "points": self.points.value(),
@@ -938,7 +1011,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         if output_index < 0:
             raise ValueError("saved stability electrode is not present")
         self.output.setCurrentIndex(output_index)
-        self._segment_name = str(settings.get("segment_name", self._segment_name))
         self.start_mv.setValue(float(settings["start_mv"]))
         self.stop_mv.setValue(float(settings["stop_mv"]))
         self.points.setValue(int(settings["points"]))
@@ -946,7 +1018,6 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     def value(self) -> StabilitySweepAxis:
         return StabilitySweepAxis(
             output_name=str(self.output.currentData() or ""),
-            segment_name=self._segment_name,
             start_mv=self.start_mv.value(),
             stop_mv=self.stop_mv.value(),
             points=self.points.value(),
@@ -1168,6 +1239,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "Number of post-FIR 1 MSPS samples stored for every stability "
             "point and repetition"
         )
+        self.settle_time_us = QtWidgets.QDoubleSpinBox(acquisition)
+        self.settle_time_us.setRange(0.0, 1.0e9)
+        self.settle_time_us.setDecimals(6)
+        self.settle_time_us.setValue(DEFAULT_STABILITY_SETTLE_US)
+        self.settle_time_us.setSuffix(" us")
+        self.settle_time_us.setToolTip(
+            "Time to hold each new X/Y voltage before RF modulation and "
+            "FIR-DDR capture begin"
+        )
         self.modulation_frequency_mhz = QtWidgets.QDoubleSpinBox(acquisition)
         self.modulation_frequency_mhz.setRange(-10_000.0, 10_000.0)
         self.modulation_frequency_mhz.setDecimals(9)
@@ -1198,6 +1278,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.setSuffix(" V/A")
         acquisition_form.addRow("Repetitions / point:", self.repetitions)
         acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
+        acquisition_form.addRow("Settle before readout:", self.settle_time_us)
         acquisition_form.addRow(
             "Modulation frequency:",
             self.modulation_frequency_mhz,
@@ -1474,11 +1555,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self,
         output_names: Sequence[str],
         awg_channels: Sequence[int],
-        segment_names: Sequence[str],
+        segment_names: Sequence[str] = (),
     ) -> None:
+        # ``segment_names`` remains accepted for compatibility with older GUI
+        # callers. Stability scans always use their own internal SET segment.
         outputs = tuple(zip(output_names, awg_channels))
-        self.x_axis.refresh_targets(outputs, segment_names, preferred_output_index=0)
-        self.y_axis.refresh_targets(outputs, segment_names, preferred_output_index=1)
+        self.x_axis.refresh_targets(outputs, preferred_output_index=0)
+        self.y_axis.refresh_targets(outputs, preferred_output_index=1)
         if (
             len(outputs) >= 2
             and self.x_axis.output.currentData() == self.y_axis.output.currentData()
@@ -1490,7 +1573,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 ):
                     self.y_axis.output.setCurrentIndex(index)
                     break
-        self._targets_available = len(outputs) >= 2 and bool(segment_names)
+        self._targets_available = len(outputs) >= 2
         if not self._targets_available:
             self.status.setText("Add at least two AWG outputs to run a stability scan")
         self._set_idle_button_state()
@@ -1559,6 +1642,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             y_axis=self.y_axis.value(),
             repetitions_per_point=self.repetitions.value(),
             trace_samples_per_point=self.trace_samples.value(),
+            settle_time_us=self.settle_time_us.value(),
             modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
             modulation_gain=self.modulation_gain.value(),
             bias_t_compensation_enabled=self.bias_t_group.isChecked(),
@@ -1577,6 +1661,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
+            "settle_time_us": self.settle_time_us.value(),
             "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
             "modulation_gain": self.modulation_gain.value(),
             "bias_t_compensation": {
@@ -1611,6 +1696,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                     DEFAULT_STABILITY_TRACE_SAMPLES,
                 )
             )
+        )
+        self.settle_time_us.setValue(
+            float(settings.get("settle_time_us", DEFAULT_STABILITY_SETTLE_US))
         )
         self.modulation_frequency_mhz.setValue(
             float(
@@ -1682,6 +1770,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             editor.setEnabled(not running)
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
+        self.settle_time_us.setEnabled(not running)
         self.modulation_frequency_mhz.setEnabled(not running)
         self.modulation_gain.setEnabled(not running)
         self.bias_t_group.setEnabled(not running)

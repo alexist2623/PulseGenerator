@@ -126,12 +126,14 @@ try:
     from .stability_diagram import (
         StabilityDiagramPanel,
         StabilityDiagramWorker,
+        build_stability_hold_sequence,
         normalize_stability_settings,
     )
 except ImportError:
     from stability_diagram import (
         StabilityDiagramPanel,
         StabilityDiagramWorker,
+        build_stability_hold_sequence,
         normalize_stability_settings,
     )
 
@@ -199,7 +201,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 24
+SETTINGS_VERSION = 25
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -5181,6 +5183,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         path = dict(self._stability_panel.front_panel_values())
         anchor_segment = stability_config.x_axis.segment_name
+        settle_time_us = float(stability_config.settle_time_us)
         modulation_duration_us = max(
             1.0,
             float(stability_config.trace_samples_per_point),
@@ -5189,7 +5192,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             QickRfPulseSpec(
                 gen_ch=int(path["output_ch"]),
                 segment_name=anchor_segment,
-                delay_us=0.0,
+                delay_us=settle_time_us,
                 duration_us=modulation_duration_us,
                 frequency_mhz=stability_config.modulation_frequency_mhz,
                 gain=stability_config.modulation_gain,
@@ -5207,7 +5210,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         readout_spec = QickDdrReadoutSpec(
             ro_ch=int(path["readout_ch"]),
             segment_name=anchor_segment,
-            delay_us=0.0,
+            delay_us=settle_time_us,
             samples_per_trigger=stability_config.trace_samples_per_point,
             readout_frequency_mhz=stability_config.modulation_frequency_mhz,
             margin_input_samples=1024,
@@ -5243,41 +5246,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 + ", ".join(str(channel) for channel in sorted(overlap))
             )
 
-        sweeps = tuple(
-            QickSweepSpec(
-                segment_name=axis.segment_name,
-                output_name=axis.output_name,
-                start=axis.start_mv / self._qick_full_scale_mv,
-                stop=axis.stop_mv / self._qick_full_scale_mv,
-                count=axis.points,
-            )
-            for axis in (stability_config.x_axis, stability_config.y_axis)
-        )
-        sequence = build_qick_sequence(
-            tuple(pulse.copy() for pulse in self._pulse),
+        sequence = build_stability_hold_sequence(
+            stability_config,
             output_names=self._qick_output_names(),
             fabric_mhz=self._qick_fabric_mhz,
             full_scale_mv=self._qick_full_scale_mv,
-            sweeps=sweeps,
             cross_capacitance=self._cross_capacitance.copy(),
-            bias_t_compensation_enabled=(
-                stability_config.bias_t_compensation_enabled
-            ),
-            bias_t_compensation_type=(
-                stability_config.bias_t_compensation_type
-            ),
-            bias_t_compensation_voltage_mv=(
-                stability_config.bias_t_compensation_voltage_mv
-                if stability_config.bias_t_compensation_enabled
-                and stability_config.bias_t_compensation_type == "dc"
-                and stability_config.bias_t_compensation_mode == "fixed_voltage"
-                else None
-            ),
-            bias_t_compensation_mode=stability_config.bias_t_compensation_mode,
-            bias_t_compensation_duration_us=(
-                stability_config.bias_t_compensation_duration_us
-            ),
-            bias_t_filter_tau_us=stability_config.bias_t_filter_tau_us,
         )
         return {
             "connection_config": values["connection"],
@@ -6635,7 +6609,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         stability_settings = normalize_stability_settings(
             raw_stability_settings,
             output_names=tuple(f"awg_{index}" for index in range(len(pulses))),
-            segment_names=qick_set_segment_names(pulses[0]),
         )
         noise_analysis_settings = normalize_noise_analysis_settings(
             data.get("noise_analysis")
@@ -7676,14 +7649,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _refresh_stability_targets(self) -> None:
         if not hasattr(self, "_stability_panel"):
             return
-        try:
-            segment_names = qick_set_segment_names(self._pulse[0])
-        except ValueError:
-            segment_names = ()
         self._stability_panel.refresh_targets(
             self._qick_output_names(),
             self._qick_awg_channels,
-            segment_names,
         )
 
     def _set_x(self, idx):

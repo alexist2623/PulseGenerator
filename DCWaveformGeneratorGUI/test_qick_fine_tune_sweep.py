@@ -308,6 +308,40 @@ def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
     )
 
 
+def test_long_rf_pulse_uses_periodic_start_and_timed_zero_stop():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("measure", (0.25,), 400_000)
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="measure",
+        length_cycles=300_000,
+        gain=12_000,
+        freq_mhz=10.0,
+        require_within_segment=True,
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulse=rf,
+        repetitions_per_sweep=2,
+    )
+    program.compile()
+
+    assert program.aux_timing["rf_mode"] == "periodic_timed_stop"
+    assert program.aux_timing["rf_end"] - program.aux_timing["rf_start"] == 300_000
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    tproc.run(program.prog_list, max_steps=100_000)
+    rf_events = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and ((event.word >> 152) & 0xFF) == 0
+    ]
+    assert len(rf_events) == 4
+    assert rf_events[1].cycle - rf_events[0].cycle == 300_000
+    assert rf_events[3].cycle - rf_events[2].cycle == 300_000
+
+
 def test_rf_and_readout_phase_reset_are_fixed_off():
     rf = RfPulseConfig(
         gen_ch=0,
