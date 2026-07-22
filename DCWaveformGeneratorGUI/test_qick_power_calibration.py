@@ -13,7 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt5 import QtWidgets
+import qick.asm_v1 as qick_asm_v1
 
+import qick_power_calibration as calibration_module
 from calibration_gui import (
     CalibrationPanel,
     dc_voltage_calibration_plot_data,
@@ -99,6 +101,62 @@ def test_keysight_fft_adapter_uses_original_notebook_scpi(monkeypatch):
     assert ":FUNCtion1:SOURce CHANnel2" in instrument.commands
     assert ":MARKer:X1Position 450000000" in instrument.commands
     assert instrument.commands.count(":MARKer:Y1Position?") == 2
+
+
+def test_output_calibration_clamps_periodic_word_not_total_tone_time(monkeypatch):
+    pulse_registers = []
+
+    class FakeProgram:
+        def __init__(self, _soccfg):
+            pass
+
+        def declare_gen(self, **_kwargs):
+            pass
+
+        def freq2reg(self, frequency_mhz, **_kwargs):
+            return int(round(float(frequency_mhz) * 1000.0))
+
+        def set_pulse_registers(self, **kwargs):
+            pulse_registers.append(dict(kwargs))
+
+        def pulse(self, **_kwargs):
+            pass
+
+        def end(self):
+            pass
+
+        def run(self, _soc):
+            pass
+
+        def reg2freq(self, word, **_kwargs):
+            return float(word) / 1000.0
+
+    monkeypatch.setattr(qick_asm_v1, "QickProgram", FakeProgram)
+
+    actual_frequency = calibration_module._run_tone_program(
+        object(),
+        object(),
+        output_ch=0,
+        nqz=1,
+        frequency_mhz=450.0,
+        gain=20_000,
+        length_cycles=300_000,
+    )
+    calibration_module._run_tone_program(
+        object(),
+        object(),
+        output_ch=0,
+        nqz=1,
+        frequency_mhz=450.0,
+        gain=0,
+        length_cycles=300_000,
+    )
+
+    assert actual_frequency == 450.0
+    assert pulse_registers[0]["mode"] == "periodic"
+    assert pulse_registers[0]["length"] == 65535
+    assert pulse_registers[1]["mode"] == "oneshot"
+    assert pulse_registers[1]["length"] == 3
 
 
 def test_input_calibration_plot_data_restores_positive_linear_quantities():

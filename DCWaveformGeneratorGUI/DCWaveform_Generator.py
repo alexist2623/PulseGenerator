@@ -16,6 +16,78 @@ import numpy as np
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+
+class _ValueInputWheelGuard(QtCore.QObject):
+    """Prevent wheel gestures from changing value-entry widgets."""
+
+    _VALUE_WIDGET_TYPES = (
+        QtWidgets.QAbstractSpinBox,
+        QtWidgets.QComboBox,
+    )
+
+    @classmethod
+    def _value_widget(cls, watched):
+        if isinstance(watched, cls._VALUE_WIDGET_TYPES):
+            return watched
+        if isinstance(watched, QtWidgets.QLineEdit):
+            parent = watched.parentWidget()
+            if isinstance(parent, cls._VALUE_WIDGET_TYPES):
+                return parent
+        return None
+
+    @staticmethod
+    def _scroll_area(widget):
+        parent = widget.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QtWidgets.QAbstractScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def eventFilter(self, watched, event):
+        if event.type() != QtCore.QEvent.Wheel:
+            return False
+
+        value_widget = self._value_widget(watched)
+        if value_widget is None:
+            return False
+
+        scroll_area = self._scroll_area(value_widget)
+        if scroll_area is not None:
+            viewport = scroll_area.viewport()
+            viewport_position = QtCore.QPointF(
+                viewport.mapFromGlobal(event.globalPos())
+            )
+            forwarded = QtGui.QWheelEvent(
+                viewport_position,
+                event.globalPosF(),
+                event.pixelDelta(),
+                event.angleDelta(),
+                event.buttons(),
+                event.modifiers(),
+                event.phase(),
+                event.inverted(),
+                event.source(),
+            )
+            forwarded.setTimestamp(event.timestamp())
+            QtWidgets.QApplication.sendEvent(viewport, forwarded)
+
+        event.accept()
+        return True
+
+
+def _install_value_input_wheel_guard():
+    """Install one application-wide guard and retain its QObject lifetime."""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return None
+    guard = getattr(app, "_qstl_value_input_wheel_guard", None)
+    if guard is None:
+        guard = _ValueInputWheelGuard(app)
+        app.installEventFilter(guard)
+        app._qstl_value_input_wheel_guard = guard
+    return guard
+
 try:
     import pyqtgraph  # noqa: F401
 except ImportError:
@@ -4016,6 +4088,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def __init__(self):
         super().__init__()
+        _install_value_input_wheel_guard()
         self.setWindowTitle("DC Waveform Generator - QCS and QICK")
 
         self._settings_path: Optional[Path] = None

@@ -72,6 +72,8 @@ except ImportError:
 
 ProgressCallback = Callable[[int, str], None]
 ToneRunner = Callable[[Any, Any, int, int, float, int, int], float]
+MAX_RF_PERIODIC_WORD_CYCLES = 65535
+RF_STOP_WORD_CYCLES = 3
 
 
 def _emit_progress(
@@ -491,7 +493,13 @@ def _run_tone_program(
     gain: int,
     length_cycles: int,
 ) -> float:
-    """Start or stop one generator using an ASM-v1 periodic/oneshot command."""
+    """Start or stop one generator using an ASM-v1 periodic/oneshot command.
+
+    A nonzero-gain calibration tone runs periodically until a later stop
+    program is issued. ``length_cycles`` therefore describes only the short
+    repeated word and is clamped to the generator's 16-bit length field; it
+    never limits the total oscilloscope acquisition time.
+    """
     try:
         from qick.asm_v1 import QickProgram
     except ImportError as exc:
@@ -500,13 +508,17 @@ def _run_tone_program(
     program.declare_gen(ch=int(output_ch), nqz=int(nqz))
     frequency_word = program.freq2reg(float(frequency_mhz), gen_ch=int(output_ch))
     periodic = int(gain) != 0
+    periodic_word_cycles = min(
+        max(RF_STOP_WORD_CYCLES, int(length_cycles)),
+        MAX_RF_PERIODIC_WORD_CYCLES,
+    )
     program.set_pulse_registers(
         ch=int(output_ch),
         style="const",
         freq=frequency_word,
         phase=0,
         gain=int(gain),
-        length=int(length_cycles if periodic else 3),
+        length=(periodic_word_cycles if periodic else RF_STOP_WORD_CYCLES),
         phrst=0,
         stdysel="last" if periodic else "zero",
         mode="periodic" if periodic else "oneshot",

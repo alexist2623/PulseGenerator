@@ -11,7 +11,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 import numpy as np
 import pytest
 
@@ -29,6 +29,63 @@ from dc_waveform_core import (
 
 def _application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def _send_wheel(widget, delta=120):
+    local_position = QtCore.QPointF(widget.rect().center())
+    global_position = QtCore.QPointF(
+        widget.mapToGlobal(widget.rect().center())
+    )
+    event = QtGui.QWheelEvent(
+        local_position,
+        global_position,
+        QtCore.QPoint(),
+        QtCore.QPoint(0, delta),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    QtWidgets.QApplication.sendEvent(widget, event)
+
+
+def test_mouse_wheel_does_not_change_value_inputs():
+    app = _application()
+    window = gui.MainWindow()
+
+    spin_box = window._experiment_panel.fabric_mhz
+    spin_box.setValue(300.0)
+    spin_box.setFocus()
+    _send_wheel(spin_box, 120)
+    _send_wheel(spin_box, -120)
+    assert spin_box.value() == 300.0
+
+    combo_box = window._time_unit_combo
+    combo_box.setCurrentText("us")
+    combo_box.setFocus()
+    _send_wheel(combo_box, 120)
+    _send_wheel(combo_box, -120)
+    assert combo_box.currentText() == "us"
+
+    scroll_area = QtWidgets.QScrollArea()
+    scroll_content = QtWidgets.QWidget()
+    scroll_content.resize(180, 1200)
+    nested_spin_box = QtWidgets.QSpinBox(scroll_content)
+    nested_spin_box.move(10, 10)
+    nested_spin_box.setValue(5)
+    scroll_area.setWidget(scroll_content)
+    scroll_area.resize(200, 200)
+    scroll_area.show()
+    app.processEvents()
+
+    _send_wheel(nested_spin_box, -120)
+    app.processEvents()
+    assert nested_spin_box.value() == 5
+    assert scroll_area.verticalScrollBar().value() > 0
+
+    scroll_area.close()
+    app.processEvents()
+    window.close()
 
 
 def test_gui_defaults_and_time_unit_round_trip():
