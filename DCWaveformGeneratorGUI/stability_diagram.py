@@ -9,7 +9,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 import traceback
@@ -38,6 +38,7 @@ try:
         dc_iq_to_current,
     )
     from .dc_voltage_calibration import load_dc_voltage_calibration
+    from .fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -61,6 +62,7 @@ except ImportError:
         dc_iq_to_current,
     )
     from dc_voltage_calibration import load_dc_voltage_calibration
+    from fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
     from qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -271,6 +273,8 @@ class StabilityDiagramResult:
     iteration: int
     repetition_count: int
     samples_per_trace: int
+    sample_rate_hz: float = 1_000_000.0
+    fir_rate_profile: str = "1_msps"
 
 
 @dataclass(frozen=True)
@@ -537,11 +541,13 @@ def build_stability_hold_sequence(
     fabric_mhz: float,
     full_scale_mv: float,
     cross_capacitance=None,
+    sample_period_us: float = 1.0,
+    fpga_trigger_delay_us: float = 0.0,
 ):
     """Build the dedicated SET-and-hold sequence for one Cartesian scan.
 
     Each hardware sweep point issues one SET on ``set_0`` and holds that
-    voltage through the settle interval and the complete 1 MSPS FIR capture.
+    voltage through the settle interval and the complete HWH-selected FIR capture.
     No RAMP or SET segment from the AWG Tuning tab is copied into this path.
     """
     config.validate_full_scale(full_scale_mv)
@@ -554,9 +560,22 @@ def build_stability_hold_sequence(
                 f"stability output {axis.output_name!r} is not present"
             )
 
+    sample_period_us = _finite_float(
+        sample_period_us,
+        "stability FIR sample period",
+    )
+    if sample_period_us <= 0.0:
+        raise ValueError("stability FIR sample period must be positive")
+    fpga_trigger_delay_us = _finite_float(
+        fpga_trigger_delay_us,
+        "stability FPGA trigger delay",
+    )
+    if fpga_trigger_delay_us < 0.0:
+        raise ValueError("stability FPGA trigger delay must be nonnegative")
     hold_duration_us = (
         float(config.settle_time_us)
-        + float(config.trace_samples_per_point)
+        + fpga_trigger_delay_us
+        + float(config.trace_samples_per_point) * sample_period_us
         + DEFAULT_STABILITY_POINT_GUARD_US
     )
     pulses = tuple(
@@ -740,6 +759,12 @@ def reduce_fir_stability_result(
         iteration=_integer(iteration, "stability iteration", 1),
         repetition_count=int(iq.shape[1]),
         samples_per_trace=int(iq.shape[2]),
+        sample_rate_hz=float(
+            getattr(ddr_result, "sample_rate_hz", 1_000_000.0)
+        ),
+        fir_rate_profile=str(
+            getattr(ddr_result, "fir_rate_profile", "1_msps")
+        ),
     )
 
 
@@ -803,9 +828,59 @@ class StabilityDiagramWorker(QtCore.QObject):
         full_scale_mv = float(kwargs.pop("full_scale_mv"))
         sequence = kwargs["sequence"]
         readout_spec = kwargs["readout_spec"]
+        stability_fabric_mhz = float(
+            kwargs.pop("stability_fabric_mhz", 300.0)
+        )
 
         self.progress_changed.emit(1, "Connecting to QICK")
         soc, soccfg = connect_qick(connection_config, connector=connector)
+        fir_profile = resolve_fir_ddr_profile(
+            soccfg,
+            context="stability diagram",
+        )
+        effective_run_config = (
+            None
+            if run_config is None
+            else replace(run_config, sample_rate_hz=fir_profile.sample_rate_hz)
+        )
+        template_sequence = sequence
+        if hasattr(template_sequence, "output_names") and hasattr(
+            template_sequence,
+            "cross_capacitance",
+        ):
+            sequence = build_stability_hold_sequence(
+                stability_config,
+                output_names=template_sequence.output_names,
+                fabric_mhz=stability_fabric_mhz,
+                full_scale_mv=full_scale_mv,
+                cross_capacitance=template_sequence.cross_capacitance,
+                sample_period_us=fir_profile.sample_period_us,
+                fpga_trigger_delay_us=fir_profile.trigger_delay_us,
+            )
+            kwargs["sequence"] = sequence
+        capture_window_us = (
+            fir_profile.trigger_delay_us
+            + stability_config.trace_samples_per_point
+            * fir_profile.sample_period_us
+        )
+        kwargs["rf_specs"] = tuple(
+            replace(
+                spec,
+                duration_us=max(
+                    fir_profile.sample_period_us,
+                    capture_window_us,
+                ),
+            )
+            for spec in kwargs.get("rf_specs", ())
+        )
+        self.progress_changed.emit(
+            2,
+            (
+                f"HWH FIR DDR: {fir_profile.timing_label}; "
+                f"{stability_config.trace_samples_per_point:,} samples = "
+                f"{stability_config.trace_samples_per_point * fir_profile.sample_period_us:g} us"
+            ),
+        )
         if self._stop_event.is_set():
             self.stopped.emit()
             return
@@ -850,9 +925,22 @@ class StabilityDiagramWorker(QtCore.QObject):
                 gui_settings,
                 sequence,
             )
+            stored_qick = dict(stored_settings.get("qick", {}))
+            stored_qick.update({
+                "fir_rate_profile": fir_profile.name,
+                "fir_sample_rate_hz": fir_profile.sample_rate_hz,
+                "fir_sample_period_us": fir_profile.sample_period_us,
+                "fir_fpga_trigger_delay_samples": (
+                    fir_profile.trigger_delay_samples
+                ),
+                "fir_software_warmup_compensation": (
+                    fir_profile.software_warmup_compensation
+                ),
+            })
+            stored_settings["qick"] = stored_qick
             dataset, row_count = store_qick_result(
                 ddr_result,
-                run_config=run_config,
+                run_config=effective_run_config,
                 connection_config=connection_config,
                 program_summary=program.summary(),
                 gui_settings=stored_settings,
@@ -862,7 +950,7 @@ class StabilityDiagramWorker(QtCore.QObject):
             experiment = StoredQickExperiment(
                 run_id=int(dataset.run_id),
                 guid=str(dataset.guid),
-                database_path=run_config.resolved_database_path,
+                database_path=effective_run_config.resolved_database_path,
                 row_count=int(row_count),
                 dataset=dataset,
                 program=program,
@@ -1236,8 +1324,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.trace_samples.setRange(1, 10_000_000)
         self.trace_samples.setValue(DEFAULT_STABILITY_TRACE_SAMPLES)
         self.trace_samples.setToolTip(
-            "Number of post-FIR 1 MSPS samples stored for every stability "
+            "Number of post-FIR samples stored at the HWH-selected rate for every stability "
             "point and repetition"
+        )
+        self._fir_sample_rate_hz: Optional[float] = None
+        self._fir_trigger_delay_us = 0.0
+        self.fir_profile_status = QtWidgets.QLabel(
+            "Identify QICK to show the FIR DDR timing",
+            acquisition,
+        )
+        self.fir_profile_status.setWordWrap(True)
+        self.fir_profile_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
         )
         self.settle_time_us = QtWidgets.QDoubleSpinBox(acquisition)
         self.settle_time_us.setRange(0.0, 1.0e9)
@@ -1285,6 +1383,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         acquisition_form.addRow("Modulation gain:", self.modulation_gain)
         acquisition_form.addRow("Cartesian points:", self.point_count)
+        acquisition_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         acquisition_form.addRow(self.dc_measure_mode)
         acquisition_form.addRow(
             "DC measurement gain:",
@@ -1446,6 +1545,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.fit_button.clicked.connect(self.plot.fit_view)
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
+        self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
         self.dc_measure_mode.toggled.connect(self._emit_dc_measure_changed)
         self.dc_measure_gain_v_per_a.valueChanged.connect(
             self._emit_dc_measure_changed
@@ -1604,6 +1704,34 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.path_diagram.set_front_panel_configuration(configuration)
         self.x_axis.set_front_panel_configuration(configuration)
         self.y_axis.set_front_panel_configuration(configuration)
+        self._fir_sample_rate_hz = getattr(
+            configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._update_fir_trace_duration()
+
+    def _update_fir_trace_duration(self, *_args) -> None:
+        if self._fir_sample_rate_hz is None:
+            self.fir_profile_status.setText(
+                "Identify QICK to show the FIR DDR timing"
+            )
+            return
+        sample_period_us = 1_000_000.0 / self._fir_sample_rate_hz
+        trace_us = self.trace_samples.value() * sample_period_us
+        delay_text = (
+            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
+            if self._fir_trigger_delay_us > 0.0
+            else ""
+        )
+        self.fir_profile_status.setText(
+            f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
+            f"{self.trace_samples.value():,} samples = {trace_us:g} us"
+            f"{delay_text}"
+        )
 
     def front_panel_values(self) -> Mapping[str, Any]:
         """Return the complete Stability-only measurement path."""
@@ -1794,10 +1922,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def show_result(self, result: StabilityDiagramResult) -> None:
         self.plot.set_result(result)
+        rate_label = format_sample_rate_hz(result.sample_rate_hz)
+        trace_us = (
+            result.samples_per_trace * 1_000_000.0 / result.sample_rate_hz
+        )
         self.status.setText(
             f"Scan {result.iteration} complete: "
             f"{result.magnitude.shape[1]} x {result.magnitude.shape[0]} points "
-            f"({result.value_unit})"
+            f"({result.value_unit}); {result.samples_per_trace:,} samples at "
+            f"{rate_label} = {trace_us:g} us / trace"
         )
 
     def show_saved_result(self, stored: StoredStabilityDiagram) -> None:

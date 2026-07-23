@@ -11,6 +11,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+try:
+    from .fir_ddr_profile import resolve_fir_ddr_profile
+except ImportError:
+    from fir_ddr_profile import resolve_fir_ddr_profile
+
 
 OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -54,6 +59,12 @@ class QickFrontPanelConfiguration:
     firmware_timestamp: str
     outputs: Tuple[QickFrontPanelPort, ...]
     inputs: Tuple[QickFrontPanelPort, ...]
+    fir_rate_profile: Optional[str] = None
+    fir_sample_rate_hz: Optional[float] = None
+    fir_sample_period_us: Optional[float] = None
+    fir_trigger_delay_samples: int = 0
+    fir_trigger_delay_us: float = 0.0
+    fir_rate_label: str = "FIR DDR rate unavailable"
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -200,11 +211,29 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         )
         for index in range(8)
     )
+    fir_values = {}
+    try:
+        fir_profile = resolve_fir_ddr_profile(
+            config,
+            context="front-panel identification",
+        )
+    except RuntimeError:
+        pass
+    else:
+        fir_values = {
+            "fir_rate_profile": fir_profile.name,
+            "fir_sample_rate_hz": fir_profile.sample_rate_hz,
+            "fir_sample_period_us": fir_profile.sample_period_us,
+            "fir_trigger_delay_samples": fir_profile.trigger_delay_samples,
+            "fir_trigger_delay_us": fir_profile.trigger_delay_us,
+            "fir_rate_label": fir_profile.timing_label,
+        }
     return QickFrontPanelConfiguration(
         board=board,
         firmware_timestamp=str(config.get("fw_timestamp", "unknown")),
         outputs=outputs,
         inputs=inputs,
+        **fir_values,
     )
 
 

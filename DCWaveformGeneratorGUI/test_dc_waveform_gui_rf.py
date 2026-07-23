@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,6 +26,7 @@ from dc_waveform_core import (
     dc_iq_to_current,
     generate_qick_program_code,
 )
+from stability_diagram import DEFAULT_STABILITY_POINT_GUARD_US
 
 
 def _application():
@@ -814,6 +816,34 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     filter_compensation = filter_arguments["sequence"].bias_t_compensation
     assert filter_compensation.compensation_type == "filter"
     assert filter_compensation.tau_cycles == 7_500.0
+    window.close()
+
+
+def test_stability_run_arguments_use_identified_50ksps_timing():
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    window._qick_configuration = SimpleNamespace(
+        fir_sample_rate_hz=50_000.0,
+        fir_trigger_delay_us=1000.0,
+    )
+    window._stability_panel.trace_samples.setValue(100)
+    window._stability_panel.settle_time_us.setValue(25.0)
+
+    arguments = window._stability_run_arguments(save=False)
+
+    expected_hold_us = (
+        25.0
+        + 1000.0
+        + 100 * 20.0
+        + DEFAULT_STABILITY_POINT_GUARD_US
+    )
+    assert arguments["sequence"].segments[0].duration_cycles == int(
+        np.ceil(expected_hold_us * 300.0)
+    )
+    assert arguments["rf_specs"][0].duration_us == 3000.0
+    assert arguments["stability_fabric_mhz"] == 300.0
+    app.processEvents()
     window.close()
 
 

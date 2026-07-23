@@ -257,12 +257,14 @@ try:
         QickFrontPanelPreview,
         identify_qick_front_panel,
     )
+    from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from qick_front_panel import (
         QickFrontPanelControl,
         QickFrontPanelPreview,
         identify_qick_front_panel,
     )
+    from fir_ddr_profile import format_sample_rate_hz
 
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
@@ -2468,6 +2470,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._pulse = pulse
         self._time_unit = time_unit
         self._front_panel_configuration = None
+        self._fir_sample_rate_hz: Optional[float] = None
+        self._fir_trigger_delay_us = 0.0
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
@@ -2590,7 +2594,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow("Anchor SET:", self.segment)
         self._delay_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
-        form.addRow("Stored 1 MSPS samples:", self.samples)
+        form.addRow("Stored FIR samples:", self.samples)
         form.addRow("Readout/DDC frequency:", self.frequency_mhz)
         self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
         form.addRow(self.input_condition_label, self.input_condition_stack)
@@ -2602,11 +2606,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow("FIR input margin:", self.margin_samples)
         form.addRow("DDR read delay after run:", self.post_run_read_delay)
         form.addRow(self.force_overwrite)
-        note = QtWidgets.QLabel(
-            "The qstl_awg_tuning_fir path stores post-FIR samples at 1 MSPS."
+        self.fir_profile_note = QtWidgets.QLabel(
+            "The loaded HWH selects the post-FIR DDR rate (1 MSPS or 50 kSPS)."
         )
-        note.setWordWrap(True)
-        form.addRow(note)
+        self.fir_profile_note.setWordWrap(True)
+        self.fir_profile_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        form.addRow("HWH FIR DDR:", self.fir_profile_note)
 
         self.refresh_segments(pulse)
         self.set_time_unit(time_unit, force=True)
@@ -2640,6 +2647,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             if signal is None:
                 signal = getattr(widget, "textChanged", None)
             signal.connect(self._emit_spec)
+        self.samples.valueChanged.connect(self._update_fir_profile_note)
         self.toggled.connect(self._emit_spec)
         self.input_board_type.currentTextChanged.connect(
             self._update_board_controls
@@ -2702,7 +2710,36 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
     def set_front_panel_configuration(self, configuration) -> None:
         self._front_panel_configuration = configuration
         self.front_panel_preview.set_configuration(configuration)
+        self._fir_sample_rate_hz = getattr(
+            configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._update_fir_profile_note()
         self._sync_front_panel_selection()
+
+    def _update_fir_profile_note(self, *_args) -> None:
+        if self._fir_sample_rate_hz is None:
+            self.fir_profile_note.setText(
+                "FIR DDR rate is unavailable in the loaded HWH metadata"
+            )
+            return
+        sample_period_us = 1_000_000.0 / float(self._fir_sample_rate_hz)
+        trace_us = self.samples.value() * sample_period_us
+        delay = (
+            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
+            if self._fir_trigger_delay_us
+            else ""
+        )
+        self.fir_profile_note.setText(
+            f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
+            f"{sample_period_us:g} us/sample; "
+            f"{self.samples.value():,} samples = {trace_us:g} us"
+            f"{delay}"
+        )
 
     def _sync_front_panel_selection(self, *_args) -> None:
         self.front_panel_preview.set_channels(input_ch=self.ro_ch.value())
@@ -3452,10 +3489,24 @@ class ExperimentPanel(QtWidgets.QWidget):
                 for item in output_details
             ]
             rf_summary = "\nRF applied: " + "; ".join(entries)
+        fir_summary = ""
+        ddr_result = getattr(result, "ddr_result", None)
+        sample_rate_hz = getattr(ddr_result, "sample_rate_hz", None)
+        iq = getattr(ddr_result, "iq", None)
+        if sample_rate_hz is not None and iq is not None:
+            samples_per_trace = int(np.asarray(iq).shape[-2])
+            trace_time_us = (
+                samples_per_trace * 1_000_000.0 / float(sample_rate_hz)
+            )
+            fir_summary = (
+                f"\nFIR DDR: {format_sample_rate_hz(sample_rate_hz)}, "
+                f"{samples_per_trace:,} samples/trace = "
+                f"{trace_time_us:g} us"
+            )
         self.set_running(
             False,
             f"Run {result.run_id}, {result.row_count} IQ samples\n"
-            f"{result.database_path}{rf_summary}",
+            f"{result.database_path}{fir_summary}{rf_summary}",
         )
 
 
@@ -5110,7 +5161,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif spec.dc_measure_mode:
             self.statusBar().showMessage(
                 f"DC current readout {spec.ro_ch}: "
-                f"{spec.samples_per_trigger} samples at 1 MSPS, "
+                f"{spec.samples_per_trigger} stored FIR samples, "
                 f"gain {spec.dc_measure_gain_v_per_a:g} V/A"
             )
         elif spec.dc_voltage_calibration_enabled:
@@ -5121,11 +5172,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             self.statusBar().showMessage(
                 f"Calibrated DC voltage readout {spec.ro_ch}: "
-                f"{spec.samples_per_trigger} samples at 1 MSPS, {run_label}"
+                f"{spec.samples_per_trigger} stored FIR samples, {run_label}"
             )
         else:
             self.statusBar().showMessage(
-                f"RF readout {spec.ro_ch}: {spec.samples_per_trigger} samples at 1 MSPS"
+                f"RF readout {spec.ro_ch}: "
+                f"{spec.samples_per_trigger} stored FIR samples"
             )
 
     def _on_bias_t_changed(
@@ -5197,7 +5249,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         readout_spec = self._rf_readout_panel.spec()
         if require_readout and readout_spec is None:
             raise ValueError(
-                "enable RF Readout before running so the 1 MSPS IQ trace can be saved"
+                "enable RF Readout before running so the FIR IQ trace can be saved"
             )
         rf_channels = {spec.gen_ch for spec in rf_specs}
         overlap = rf_channels.intersection(self._qick_awg_channels)
@@ -5257,9 +5309,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         path = dict(self._stability_panel.front_panel_values())
         anchor_segment = stability_config.x_axis.segment_name
         settle_time_us = float(stability_config.settle_time_us)
+        identified_rate_hz = getattr(
+            self._qick_configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        identified_sample_period_us = (
+            1.0
+            if identified_rate_hz is None
+            else 1_000_000.0 / float(identified_rate_hz)
+        )
+        identified_fpga_delay_us = float(
+            getattr(
+                self._qick_configuration,
+                "fir_trigger_delay_us",
+                0.0,
+            )
+        )
         modulation_duration_us = max(
-            1.0,
-            float(stability_config.trace_samples_per_point),
+            identified_sample_period_us,
+            identified_fpga_delay_us
+            + float(stability_config.trace_samples_per_point)
+            * identified_sample_period_us,
         )
         rf_specs = (
             QickRfPulseSpec(
@@ -5325,12 +5396,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             fabric_mhz=self._qick_fabric_mhz,
             full_scale_mv=self._qick_full_scale_mv,
             cross_capacitance=self._cross_capacitance.copy(),
+            sample_period_us=identified_sample_period_us,
+            fpga_trigger_delay_us=identified_fpga_delay_us,
         )
         return {
             "connection_config": values["connection"],
             "run_config": values["run"],
             "gui_settings": self._settings_to_dict() if save else None,
             "stability_config": stability_config,
+            "stability_fabric_mhz": self._qick_fabric_mhz,
             "full_scale_mv": self._qick_full_scale_mv,
             "sequence": sequence,
             "awg_channels": self._qick_awg_channels,
@@ -5477,11 +5551,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel.set_identifying(
             False,
             f"{configuration.mapped_output_count} DAC / "
-            f"{configuration.mapped_input_count} ADC ports mapped",
+            f"{configuration.mapped_input_count} ADC ports mapped | "
+            f"{configuration.fir_rate_label}",
         )
         self.statusBar().showMessage(
             f"QICK identified: {configuration.mapped_output_count} DAC and "
-            f"{configuration.mapped_input_count} ADC front-panel mappings"
+            f"{configuration.mapped_input_count} ADC front-panel mappings | "
+            f"{configuration.fir_rate_label}"
         )
 
     def _on_qick_configuration_failed(self, details: str) -> None:
@@ -5574,14 +5650,34 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
 
         config = arguments["sweep_config"]
-        sample_count = max(1, int(np.ceil(config.scan_time_us)))
+        identified_rate = getattr(
+            self._qick_configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        if identified_rate is None:
+            sample_summary = (
+                f"{config.scan_time_us:g} us requested; HWH selects the "
+                "stored FIR sample count"
+            )
+        else:
+            sample_count = max(
+                1,
+                int(np.ceil(config.scan_time_us * identified_rate / 1_000_000.0)),
+            )
+            actual_time_us = sample_count * 1_000_000.0 / identified_rate
+            sample_summary = (
+                f"{sample_count:,} samples at "
+                f"{format_sample_rate_hz(identified_rate)} "
+                f"({actual_time_us:g} us actual)"
+            )
         power_count = int(config.power_gains.size)
         self._sparameter_panel.set_running(
             True,
             (
                 f"0% - Preparing {power_count:,} power point(s) x "
                 f"{config.frequency_points:,} frequency points, "
-                f"about {sample_count:,} FIR samples per point"
+                f"{sample_summary}"
             ),
         )
         self.statusBar().showMessage("RF S-parameter sweep running")

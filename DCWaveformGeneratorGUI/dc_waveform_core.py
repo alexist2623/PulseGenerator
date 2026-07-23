@@ -276,7 +276,7 @@ class QickRfPulseSpec:
 
 @dataclass(frozen=True)
 class QickDdrReadoutSpec:
-    """FIR-decimated 1 MSPS DRAM capture settings."""
+    """FIR-decimated DRAM capture settings; HWH selects the stored rate."""
 
     ro_ch: int
     segment_name: str
@@ -916,7 +916,7 @@ def generate_qick_program_code(
     """Generate a QICK builder/execution module.
 
     The generated ``run_experiment()`` helper optionally configures RF-board
-    attenuators, executes the pulse program, and returns FIR-decimated 1 MSPS
+    attenuators, executes the pulse program, and returns FIR-decimated
     DDR IQ data grouped by sweep point and repetition.
     """
     pulses = tuple(pulses)
@@ -1068,7 +1068,7 @@ def generate_qick_program_code(
         ),
     }
     lines = [
-        '"""Generated QICK AWG-tuning, RF pulse, and 1 MSPS DDR program."""',
+        '"""Generated QICK AWG-tuning, RF pulse, and HWH-rate DDR program."""',
         "",
         "from qick_fine_tune_sweep import (",
         "    DdrFirReadoutConfig,",
@@ -1095,7 +1095,7 @@ def generate_qick_program_code(
         f"CROSS_CAPACITANCE = {cross_capacitance!r}",
         f"RF_CONFIGS = {rf_configs!r}",
         "RF_CONFIG = RF_CONFIGS[0] if len(RF_CONFIGS) == 1 else None",
-        f"DDR_1MSPS_CONFIG = {ddr_config!r}",
+        f"FIR_DDR_CONFIG = {ddr_config!r}",
         "",
         "",
         "def build_sequence() -> FineTuneSequence:",
@@ -1177,9 +1177,9 @@ def generate_qick_program_code(
             "",
             "",
             "def build_ddr_readout(soccfg):",
-            "    if DDR_1MSPS_CONFIG is None:",
+            "    if FIR_DDR_CONFIG is None:",
             "        return None",
-            "    cfg = DDR_1MSPS_CONFIG",
+            "    cfg = FIR_DDR_CONFIG",
             "    return DdrFirReadoutConfig(",
             "        ro_ch=cfg['ro_ch'],",
             "        samples_per_trigger=cfg['samples_per_trigger'],",
@@ -1247,9 +1247,9 @@ def generate_qick_program_code(
             "",
             "",
             "def configure_readout_chain(soc):",
-            "    if DDR_1MSPS_CONFIG is None:",
+            "    if FIR_DDR_CONFIG is None:",
             "        return None",
-            "    cfg = DDR_1MSPS_CONFIG",
+            "    cfg = FIR_DDR_CONFIG",
             "    if cfg['input_board_type'] == 'RF_In':",
             "        configured = soc.rfb_set_ro_rf(cfg['ro_ch'], cfg['attenuation_db'])",
             "    else:",
@@ -1268,7 +1268,7 @@ def generate_qick_program_code(
             "    actual_outputs = configure_rf_chain(soc) if configure_rf else None",
             "    actual_input = configure_readout_chain(soc) if configure_rf else None",
             "    program = build_program(soccfg)",
-            "    if DDR_1MSPS_CONFIG is not None:",
+            "    if FIR_DDR_CONFIG is not None:",
             "        ddr_result = program.acquire_fir_ddr(",
             "            soc, progress=progress, **run_kwargs",
             "        )",

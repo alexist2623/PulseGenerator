@@ -44,6 +44,7 @@ try:
     )
     from .qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
     from .sparameter_gui import RfPathCorrectionWidget
+    from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from qick_power_calibration import (
@@ -55,6 +56,7 @@ except ImportError:
     )
     from qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
     from sparameter_gui import RfPathCorrectionWidget
+    from fir_ddr_profile import format_sample_rate_hz
 
 
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
@@ -601,6 +603,8 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._fir_sample_rate_hz = None
+        self._fir_trigger_delay_us = 0.0
         layout = QtWidgets.QVBoxLayout(self)
         self._path_diagrams: dict[str, RfPathCorrectionWidget] = {}
         self._front_panel_mode = "output"
@@ -618,6 +622,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(self.browse_database)
         database_form.addRow("QCoDeS DB file:", database_row)
+        self.fir_profile_status = QtWidgets.QLabel(
+            "Identify QICK to show the FIR DDR timing"
+        )
+        self.fir_profile_status.setWordWrap(True)
+        self.fir_profile_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        database_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         layout.addWidget(database_group)
 
         self.tabs = QtWidgets.QTabWidget(self)
@@ -1009,6 +1021,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             MAX_DC_VOLTAGE_SAMPLES_PER_POINT,
         )
         self.dc_voltage_samples.setValue(128)
+        self.dc_voltage_samples.valueChanged.connect(
+            self._update_fir_profile_status
+        )
         self.dc_voltage_repetitions = QtWidgets.QSpinBox()
         self.dc_voltage_repetitions.setRange(1, 100000)
         self.dc_voltage_repetitions.setValue(4)
@@ -1039,7 +1054,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         frequency_note = QtWidgets.QLabel(
             "This is a DC voltage sweep only. The readout/DDC frequency is "
-            "fixed to 0 MHz, and the FIR-DDR path stores 1 MSPS samples."
+            "fixed to 0 MHz, and the FIR-DDR path stores at the HWH-selected rate."
         )
         frequency_note.setWordWrap(True)
         form.addRow(frequency_note)
@@ -1420,6 +1435,39 @@ class CalibrationPanel(QtWidgets.QWidget):
     def set_front_panel_configuration(self, configuration) -> None:
         for diagram in self._path_diagrams.values():
             diagram.set_front_panel_configuration(configuration)
+        self._fir_sample_rate_hz = getattr(
+            configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._update_fir_profile_status()
+
+    def _update_fir_profile_status(self, *_args) -> None:
+        if self._fir_sample_rate_hz is None:
+            self.fir_profile_status.setText(
+                "Identify QICK to show the FIR DDR timing"
+            )
+            return
+        sample_period_us = 1_000_000.0 / float(self._fir_sample_rate_hz)
+        delay = (
+            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
+            if self._fir_trigger_delay_us
+            else ""
+        )
+        dc_trace = ""
+        if hasattr(self, "dc_voltage_samples"):
+            dc_trace_us = self.dc_voltage_samples.value() * sample_period_us
+            dc_trace = (
+                f"; DC calibration {self.dc_voltage_samples.value():,} "
+                f"samples = {dc_trace_us:g} us"
+            )
+        self.fir_profile_status.setText(
+            f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
+            f"{sample_period_us:g} us/sample{delay}{dc_trace}"
+        )
 
     def settings_dict(self) -> Mapping[str, Any]:
         output = asdict(self.output_config())

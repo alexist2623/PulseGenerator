@@ -45,6 +45,11 @@ import numpy as np
 
 from qick.averager_program import RAveragerProgram
 
+try:
+    from .fir_ddr_profile import resolve_fir_ddr_profile
+except ImportError:
+    from fir_ddr_profile import resolve_fir_ddr_profile
+
 
 MAX_OUTPUTS = 8
 MAX_RF_ONESHOT_CYCLES = 65535
@@ -337,7 +342,7 @@ class RfPulseConfig:
 
 @dataclass(frozen=True)
 class DdrFirReadoutConfig:
-    """FIR-decimated 1 MSPS DDR capture performed once per repetition."""
+    """HWH-selected FIR-DDR capture performed once per repetition."""
 
     ro_ch: int
     samples_per_trigger: int
@@ -382,6 +387,8 @@ class FineTuneDdrResult:
     sweep_axes: Tuple[AmplitudeSweep, ...] = ()
     sweep_shape: Tuple[int, ...] = (1,)
     cross_capacitance: Optional[np.ndarray] = None
+    sample_rate_hz: float = 1_000_000.0
+    fir_rate_profile: str = "1_msps"
 
     @property
     def mean_iq(self) -> np.ndarray:
@@ -2323,19 +2330,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def _configure_ddr_readout(self):
         ddr = self.ddr_readout_config
         self._segment_index(ddr.at_segment, require_set=True)
-        try:
-            ddr_cfg = self.soccfg["ddr4_buf"]
-        except KeyError as exc:
-            raise RuntimeError("soccfg does not contain a DDR sample buffer") from exc
-        if not ddr_cfg.get("sample_capture", False):
-            raise RuntimeError("DDR readout requires axis_buffer_ddr_sample_v1")
-        if not ddr_cfg.get("fir_enabled", False):
-            raise RuntimeError("DDR readout requires the FIR 300:1 data path")
-        output_rate = float(ddr_cfg.get("fir_output_fs_mhz", 0.0))
-        if not np.isclose(output_rate, 1.0, rtol=0.0, atol=1e-9):
-            raise RuntimeError(
-                f"expected a 1 MSPS FIR output, HWH reports {output_rate} MSPS"
-            )
+        profile = resolve_fir_ddr_profile(
+            self.soccfg,
+            context="AWG/experiment FIR DDR readout",
+        )
+        ddr_cfg = profile.config
         if ddr.ro_ch >= len(self.soccfg["readouts"]):
             raise IndexError("DDR readout channel is out of range")
 
@@ -2368,12 +2367,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             phrst=0,
         )
         self._fir_cfg = {
-            "decimation": int(ddr_cfg.get("fir_decimation", 300)),
-            "group_delay_input_samples": int(
-                ceil(float(ddr_cfg.get("fir_group_delay_input_samples", 8677)))
-            ),
-            "input_fs_mhz": float(ddr_cfg.get("fir_input_fs_mhz", 300.0)),
-            "output_fs_mhz": output_rate,
+            "rate_profile": profile.name,
+            "decimation": profile.decimation,
+            "group_delay_input_samples": int(ceil(profile.group_delay_input_samples)),
+            "input_fs_mhz": profile.input_rate_mhz,
+            "output_fs_mhz": profile.sample_rate_msps,
+            "output_sample_rate_hz": profile.sample_rate_hz,
+            "software_warmup_compensation": profile.software_warmup_compensation,
+            "uses_fpga_trigger_delay": profile.uses_fpga_trigger_delay,
+            "trigger_delay_samples": profile.trigger_delay_samples,
         }
 
     def _shift_timing(self, delta: int):
@@ -2402,27 +2404,57 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             )
             input_fs = self._fir_cfg["input_fs_mhz"]
             group_delay = self._fir_cfg["group_delay_input_samples"]
-            warmup_cycles = int(ceil(group_delay * f_time / input_fs))
-            readout_start = trigger_time - warmup_cycles
-            if readout_start < 0:
-                shift = -readout_start
-                self._shift_timing(shift)
-                trigger_time += shift
-                readout_start += shift
+            decimation = self._fir_cfg["decimation"]
+            if self._fir_cfg["software_warmup_compensation"]:
+                warmup_cycles = int(ceil(group_delay * f_time / input_fs))
+                readout_start = trigger_time - warmup_cycles
+                if readout_start < 0:
+                    shift = -readout_start
+                    self._shift_timing(shift)
+                    trigger_time += shift
+                    readout_start += shift
 
-            feed_input_samples = (
-                ddr.samples_per_trigger * self._fir_cfg["decimation"]
-                + group_delay
-                + ddr.margin_input_samples
-            )
-            feed_tproc_cycles = int(ceil(feed_input_samples * f_time / input_fs))
-            capture_end = readout_start + feed_tproc_cycles
+                feed_input_samples = (
+                    ddr.samples_per_trigger * decimation
+                    + group_delay
+                    + ddr.margin_input_samples
+                )
+                feed_tproc_cycles = int(
+                    ceil(feed_input_samples * f_time / input_fs)
+                )
+                capture_end = readout_start + feed_tproc_cycles
+            else:
+                # The 50 kSPS HWH keeps filtering continuously and delays DDR
+                # storage in axis_buffer_ddr_sample_v2. Do not move any AWG,
+                # readout, or trigger event by the FIR group delay in tProcessor
+                # code. Starting periodic readout at t=0 only feeds the pipeline.
+                warmup_cycles = 0
+                readout_start = 0
+                trigger_delay_samples = self._fir_cfg["trigger_delay_samples"]
+                post_trigger_input_samples = (
+                    (ddr.samples_per_trigger + trigger_delay_samples) * decimation
+                    + ddr.margin_input_samples
+                )
+                filter_ready_cycles = int(ceil(group_delay * f_time / input_fs))
+                post_trigger_cycles = int(
+                    ceil(post_trigger_input_samples * f_time / input_fs)
+                )
+                capture_end = max(trigger_time, filter_ready_cycles) + post_trigger_cycles
+                feed_input_samples = group_delay + post_trigger_input_samples
             self.aux_timing.update({
                 "ddr_readout_start": int(readout_start),
                 "ddr_trigger_time": int(trigger_time),
                 "ddr_capture_end": int(capture_end),
                 "fir_warmup_tproc_cycles": int(warmup_cycles),
                 "fir_feed_input_samples": int(feed_input_samples),
+                "fir_rate_profile": self._fir_cfg["rate_profile"],
+                "fir_output_sample_rate_hz": self._fir_cfg["output_sample_rate_hz"],
+                "fir_software_warmup_compensation": self._fir_cfg[
+                    "software_warmup_compensation"
+                ],
+                "fir_fpga_trigger_delay_samples": self._fir_cfg[
+                    "trigger_delay_samples"
+                ],
             })
             self.timing["point_end"] = max(self.timing["point_end"], capture_end)
 
@@ -3500,7 +3532,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         counter_progress=None,
         **run_kwargs,
     ):
-        """Arm DDR, execute all sweep repetitions, and return grouped 1 MSPS IQ.
+        """Arm DDR and return IQ grouped at the HWH-selected FIR sample rate.
 
         The nested hardware loops run Cartesian-point-major and
         repetition-minor, so the flat DDR stream is reshaped to
@@ -3515,7 +3547,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         n_points = self.sequence.sweep_point_count
         repetitions = int(self.cfg["reps"])
         n_triggers = n_points * repetitions
-        reserved = soc.arm_ddr4_fir_samples(
+        arm_kwargs = dict(
             ch=ddr.ro_ch,
             n_samples=ddr.samples_per_trigger,
             n_triggers=n_triggers,
@@ -3523,6 +3555,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             stride_bytes=ddr.stride_bytes,
             force_overwrite=ddr.force_overwrite,
         )
+        if self._fir_cfg["uses_fpga_trigger_delay"]:
+            arm_kwargs["trigger_delay_samples"] = self._fir_cfg[
+                "trigger_delay_samples"
+            ]
+        reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
         if counter_progress is None:
             self.run_rounds(soc, progress=progress, **run_kwargs)
         else:
@@ -3559,6 +3596,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             sweep_axes=self.sequence.sweep_axes,
             sweep_shape=self.sequence.sweep_shape,
             cross_capacitance=self.sequence.cross_capacitance.copy(),
+            sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
+            fir_rate_profile=self._fir_cfg["rate_profile"],
         )
 
     def summary(self):
@@ -3665,6 +3704,26 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "rf_pulse": bool(self.rf_pulse_configs),
             "rf_pulse_count": len(self.rf_pulse_configs),
             "fir_ddr_readout": self.ddr_readout_config is not None,
+            "fir_rate_profile": (
+                self._fir_cfg["rate_profile"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_output_sample_rate_hz": (
+                self._fir_cfg["output_sample_rate_hz"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_software_warmup_compensation": (
+                self._fir_cfg["software_warmup_compensation"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_fpga_trigger_delay_samples": (
+                self._fir_cfg["trigger_delay_samples"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
             "total_ddr_triggers": (
                 self.sequence.sweep_point_count * self.cfg["reps"]
                 if self.ddr_readout_config is not None

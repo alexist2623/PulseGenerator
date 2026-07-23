@@ -76,6 +76,53 @@ def test_hwh_and_card_detection_build_zcu216_physical_port_map():
     assert configuration.port("input", 7).qick_channels == (2,)
 
 
+@pytest.mark.parametrize(
+    (
+        "rate_profile",
+        "rate_hz",
+        "decimation",
+        "supports_delay",
+        "delay_samples",
+        "expected_label",
+    ),
+    (
+        ("1_msps", 1_000_000.0, 300, False, 0, "1 MSPS"),
+        ("50_ksps", 50_000.0, 6000, True, 50, "50 kSPS"),
+    ),
+)
+def test_hwh_identification_reports_fir_ddr_profile(
+    rate_profile,
+    rate_hz,
+    decimation,
+    supports_delay,
+    delay_samples,
+    expected_label,
+):
+    config = _live_config()
+    config["ddr4_buf"] = {
+        "sample_capture": True,
+        "fir_enabled": True,
+        "fir_rate_profile": rate_profile,
+        "stored_sample_rate_hz": rate_hz,
+        "fir_decimation": decimation,
+        "fir_input_fs_mhz": 300.0,
+        "fir_group_delay_input_samples": 296_677.0,
+        "supports_trigger_delay": supports_delay,
+        "trigger_delay_units": "valid_input_samples",
+        "trigger_delay_default_samples": delay_samples,
+    }
+
+    configuration = identify_qick_front_panel(config)
+
+    assert configuration.fir_rate_profile == rate_profile
+    assert configuration.fir_sample_rate_hz == rate_hz
+    assert expected_label in configuration.fir_rate_label
+    assert configuration.fir_trigger_delay_samples == delay_samples
+    assert configuration.fir_trigger_delay_us == (
+        delay_samples * 1_000_000.0 / rate_hz
+    )
+
+
 def test_front_panel_control_selects_smas_and_reports_channel_attenuation():
     app = _application()
     panel = QickFrontPanelControl()

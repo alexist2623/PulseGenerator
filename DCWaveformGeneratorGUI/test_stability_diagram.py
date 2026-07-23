@@ -5,6 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from types import SimpleNamespace
 
@@ -20,6 +21,25 @@ import stability_diagram as stability
 
 def _application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def _fir_profile(*, is_50_ksps: bool = False):
+    sample_rate_hz = 50_000.0 if is_50_ksps else 1_000_000.0
+    trigger_delay_samples = 50 if is_50_ksps else 0
+    sample_period_us = 1_000_000.0 / sample_rate_hz
+    return SimpleNamespace(
+        name="50_ksps" if is_50_ksps else "1_msps",
+        sample_rate_hz=sample_rate_hz,
+        sample_period_us=sample_period_us,
+        trigger_delay_samples=trigger_delay_samples,
+        trigger_delay_us=trigger_delay_samples * sample_period_us,
+        software_warmup_compensation=not is_50_ksps,
+        timing_label=(
+            "50 kSPS (20 us/sample, FPGA delay 50 samples (1000 us))"
+            if is_50_ksps
+            else "1 MSPS (1 us/sample, tProcessor FIR warm-up compensation)"
+        ),
+    )
 
 
 def _config() -> stability.StabilityDiagramConfig:
@@ -191,6 +211,28 @@ def test_stability_builds_dedicated_set_hold_sequence_without_awg_waveform():
     assert [item.output_name for item in sequence.sweeps] == ["awg_0", "awg_1"]
 
 
+def test_stability_50ksps_hold_covers_trace_and_fpga_delay():
+    config = _config()
+    sequence = stability.build_stability_hold_sequence(
+        config,
+        output_names=("awg_0", "awg_1"),
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+        sample_period_us=20.0,
+        fpga_trigger_delay_us=1000.0,
+    )
+
+    expected_hold_us = (
+        config.settle_time_us
+        + 1000.0
+        + config.trace_samples_per_point * 20.0
+        + stability.DEFAULT_STABILITY_POINT_GUARD_US
+    )
+    assert sequence.segments[0].duration_cycles == int(
+        np.ceil(expected_hold_us * 300.0)
+    )
+
+
 def test_reduce_fir_result_restores_voltage_grid_and_coherent_iq_mean():
     raw = _ddr_result()
     result = stability.reduce_fir_stability_result(
@@ -262,6 +304,11 @@ def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
         "connect_qick",
         lambda *_args, **_kwargs: (object(), object()),
     )
+    monkeypatch.setattr(
+        stability,
+        "resolve_fir_ddr_profile",
+        lambda *_args, **_kwargs: _fir_profile(),
+    )
 
     class FakeProgram:
         def summary(self):
@@ -295,6 +342,69 @@ def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
     assert stopped == [True]
 
 
+def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
+    profile = _fir_profile(is_50_ksps=True)
+    monkeypatch.setattr(
+        stability,
+        "connect_qick",
+        lambda *_args, **_kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(
+        stability,
+        "resolve_fir_ddr_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+
+    template = SimpleNamespace(
+        output_names=("awg_0", "awg_1"),
+        cross_capacitance=np.eye(2),
+    )
+    kwargs = _worker_kwargs()
+    kwargs["sequence"] = template
+    kwargs["stability_fabric_mhz"] = 300.0
+    @dataclass(frozen=True)
+    class FakeRfSpec:
+        duration_us: float
+
+    kwargs["rf_specs"] = (FakeRfSpec(duration_us=1.0),)
+    captured = {}
+
+    class FakeProgram:
+        def summary(self):
+            return {}
+
+    def fake_execute(*_args, **runtime_kwargs):
+        captured.update(runtime_kwargs)
+        worker.request_stop()
+        return FakeProgram(), _ddr_result(), {}
+
+    monkeypatch.setattr(stability, "execute_qick_sequence", fake_execute)
+    monkeypatch.setattr(
+        stability,
+        "store_qick_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("continuous mode must not store")
+        ),
+    )
+    worker = stability.StabilityDiagramWorker(kwargs, continuous=True)
+    worker.run()
+
+    sequence = captured["sequence"]
+    expected_hold_us = (
+        _config().settle_time_us
+        + profile.trigger_delay_us
+        + _config().trace_samples_per_point * profile.sample_period_us
+        + stability.DEFAULT_STABILITY_POINT_GUARD_US
+    )
+    assert sequence.segments[0].duration_cycles == int(
+        np.ceil(expected_hold_us * 300.0)
+    )
+    assert captured["rf_specs"][0].duration_us == (
+        profile.trigger_delay_us
+        + _config().trace_samples_per_point * profile.sample_period_us
+    )
+
+
 def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
     calls = {"store": 0}
 
@@ -302,6 +412,11 @@ def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
         stability,
         "connect_qick",
         lambda *_args, **_kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(
+        stability,
+        "resolve_fir_ddr_profile",
+        lambda *_args, **_kwargs: _fir_profile(),
     )
 
     class FakeProgram:

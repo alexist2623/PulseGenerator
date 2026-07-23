@@ -50,14 +50,25 @@ class _FakeProgram:
         self.calls.append((soc, progress))
 
 
-def _soccfg():
+def _soccfg(*, fir_rate_profile="1_msps"):
+    is_50_ksps = fir_rate_profile == "50_ksps"
     return {
         "ddr4_buf": {
             "sample_capture": True,
             "fir_enabled": True,
-            "fir_output_fs_mhz": 1.0,
+            "fir_rate_profile": fir_rate_profile,
+            "stored_sample_rate_hz": (
+                50_000.0 if is_50_ksps else 1_000_000.0
+            ),
+            "fir_output_fs_mhz": 0.05 if is_50_ksps else 1.0,
+            "fir_decimation": 6000 if is_50_ksps else 300,
             "fir_input_fs_mhz": 300.0,
-            "fir_group_delay_input_samples": 8677,
+            "fir_group_delay_input_samples": (
+                296_677.0 if is_50_ksps else 8677.0
+            ),
+            "supports_trigger_delay": is_50_ksps,
+            "trigger_delay_units": "valid_input_samples",
+            "trigger_delay_default_samples": 50 if is_50_ksps else 0,
         },
         "readouts": [{"buf_maxlen": 4096, "b_dds": 32, "f_dds": 300.0}],
         "tprocs": [{"f_time": 300.0}],
@@ -147,6 +158,33 @@ def test_direct_noise_acquisition_supports_dc_input_without_rf_filter():
     assert not any(call[0] == "filter" for call in soc.calls)
 
 
+def test_direct_noise_acquisition_uses_50_ksps_hwh_and_v2_trigger_delay():
+    config = NoiseAcquisitionConfig(
+        fir_samples=100,
+        post_run_read_delay_seconds=0.0,
+    )
+    soc = _FakeSoc(config.fir_samples)
+    program = _FakeProgram()
+    sleeps = []
+
+    result = acquire_noise_fir_trace(
+        config,
+        connector=lambda **_kwargs: (
+            soc,
+            _soccfg(fir_rate_profile="50_ksps"),
+        ),
+        program_factory=lambda _soccfg, _config: program,
+        sleeper=sleeps.append,
+    )
+
+    arm = next(call[1] for call in soc.calls if call[0] == "arm")
+    assert arm["trigger_delay_samples"] == 50
+    assert result.sample_rate_hz == 50_000.0
+    assert result.iq.shape == (100, 2)
+    assert sleeps[0] > (100 + 50) / 50_000.0
+    assert "50_ksps" in result.source
+
+
 def test_noise_acquisition_rejects_non_fir_hwh():
     config = NoiseAcquisitionConfig(fir_samples=16)
     soccfg = _soccfg()
@@ -158,6 +196,6 @@ def test_noise_acquisition_rejects_non_fir_hwh():
             sleeper=lambda _seconds: None,
         )
     except RuntimeError as exc:
-        assert "FIR 300:1" in str(exc)
+        assert "FIR DDR path" in str(exc)
     else:
         raise AssertionError("non-FIR HWH was accepted")

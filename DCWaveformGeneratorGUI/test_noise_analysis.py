@@ -205,6 +205,8 @@ def test_noise_panel_direct_acquisition_settings_are_self_contained():
     assert config.readout_frequency_mhz == 1.25
     assert config.dc_gain_db == 8.0
     assert panel.capture_duration.text() == "10 s at 1 MSPS"
+    panel.sample_rate.setValue(50_000.0)
+    assert panel.capture_duration.text() == "200 s at 50 kSPS"
     assert panel.database_path.text() == "noise.db"
     app.processEvents()
     panel.close()

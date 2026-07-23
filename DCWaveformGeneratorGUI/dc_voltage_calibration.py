@@ -275,8 +275,10 @@ def build_dc_voltage_calibration_program(
     """Build the hardware amplitude sweep used for DC voltage calibration."""
     try:
         from .qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence
+        from .fir_ddr_profile import resolve_fir_ddr_profile
     except ImportError:
         from qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence
+        from fir_ddr_profile import resolve_fir_ddr_profile
 
     effective_tproc_mhz = (
         float(soccfg["tprocs"][0]["f_time"])
@@ -285,12 +287,19 @@ def build_dc_voltage_calibration_program(
     )
     gen_cfg = soccfg["gens"][int(config.output_ch)]
     fabric_mhz = _finite(gen_cfg["f_fabric"], "AWG fabric clock", positive=True)
-    # Keep the swept SET active through FIR warm-up and the complete 1 MSPS
-    # capture.  The following SET returns the DC output to zero every point.
+    fir_profile = resolve_fir_ddr_profile(
+        soccfg,
+        context="DC voltage calibration",
+    )
+    # Keep the swept SET active through FIR readiness and the complete FIR-DDR
+    # capture. The 50 kSPS HWH additionally delays capture in FPGA valid-sample
+    # units, so the SET must cover that interval without moving the tProcessor
+    # trigger. The following SET returns the DC output to zero every point.
     capture_hold_us = (
         float(config.settle_us)
-        + float(config.samples_per_point)
-        + float(config.margin_input_samples) / 300.0
+        + fir_profile.trigger_delay_us
+        + float(config.samples_per_point) * fir_profile.sample_period_us
+        + float(config.margin_input_samples) / fir_profile.input_rate_mhz
         + 2.0
     )
     hold_fabric_cycles = max(1, int(ceil(capture_hold_us * fabric_mhz)))

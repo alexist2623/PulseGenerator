@@ -25,7 +25,24 @@ from qick_qcodes_experiment import QCODES_STAGING_ENV, QickConnectionConfig
 from qick_qcodes_experiment import _measurement_iq_values
 
 
-def _dc_soccfg():
+def _dc_soccfg(*, is_50_ksps: bool = False):
+    ddr4_buf = {
+        "sample_capture": True,
+        "fir_enabled": True,
+        "fir_output_fs_mhz": 0.05 if is_50_ksps else 1.0,
+        "fir_rate_profile": "50_ksps" if is_50_ksps else "1_msps",
+        "fir_decimation": 6000 if is_50_ksps else 300,
+        "fir_group_delay_input_samples": (
+            296_677 if is_50_ksps else 8677
+        ),
+        "fir_input_fs_mhz": 300.0,
+        "supports_trigger_delay": is_50_ksps,
+        "trigger_delay_units": "valid_input_samples",
+        "trigger_delay_default_samples": 50 if is_50_ksps else 0,
+        "trigger_type": "dport",
+        "trigger_port": 0,
+        "trigger_bit": 1,
+    }
     return QickConfig(
         {
             "sw_version": "0.2.357",
@@ -86,17 +103,7 @@ def _dc_soccfg():
                     "trigger_bit": 0,
                 }
             ],
-            "ddr4_buf": {
-                "sample_capture": True,
-                "fir_enabled": True,
-                "fir_output_fs_mhz": 1.0,
-                "fir_decimation": 300,
-                "fir_group_delay_input_samples": 8677,
-                "fir_input_fs_mhz": 300.0,
-                "trigger_type": "dport",
-                "trigger_port": 0,
-                "trigger_bit": 1,
-            },
+            "ddr4_buf": ddr4_buf,
         }
     )
 
@@ -141,6 +148,49 @@ def test_dc_calibration_supports_long_periodic_fir_capture():
             database_path="calibration.db",
             samples_per_point=MAX_DC_VOLTAGE_SAMPLES_PER_POINT + 1,
         )
+
+
+@pytest.mark.parametrize(
+    ("is_50_ksps", "sample_period_us", "fpga_delay_us"),
+    (
+        (False, 1.0, 0.0),
+        (True, 20.0, 1000.0),
+    ),
+)
+def test_dc_calibration_hold_uses_hwh_fir_timing(
+    is_50_ksps,
+    sample_period_us,
+    fpga_delay_us,
+):
+    config = DcVoltageCalibrationConfig(
+        database_path="calibration.db",
+        output_ch=0,
+        readout_ch=0,
+        voltage_points=3,
+        samples_per_point=100,
+        repetitions_per_point=1,
+        settle_us=7.0,
+        margin_input_samples=600,
+    )
+    program = build_dc_voltage_calibration_program(
+        _dc_soccfg(is_50_ksps=is_50_ksps),
+        config,
+        tproc_mhz=300.0,
+    )
+
+    expected_hold_us = (
+        config.settle_us
+        + fpga_delay_us
+        + config.samples_per_point * sample_period_us
+        + config.margin_input_samples / 300.0
+        + 2.0
+    )
+    assert program.sequence.segments[0].duration_cycles == int(
+        np.ceil(expected_hold_us * 300.0)
+    )
+    assert program.ddr_readout_config.trigger_delay_tproc_cycles == int(
+        np.ceil(config.settle_us * 300.0)
+    )
 
 
 def test_dc_scalar_adc_fit_recovers_voltage_and_ignores_q():

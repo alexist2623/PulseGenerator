@@ -13,7 +13,12 @@ from qick.sim import QickSim  # noqa: F401
 from qick.awg_tuning import TProcV1BehaviorModel
 from qick.qick_asm import QickConfig
 
-from qick_fine_tune_sweep import FineTuneSequence, ReadoutConfig, RfPulseConfig
+from qick_fine_tune_sweep import (
+    DdrFirReadoutConfig,
+    FineTuneSequence,
+    ReadoutConfig,
+    RfPulseConfig,
+)
 
 
 def _mock_soccfg(n_outputs=2):
@@ -96,6 +101,54 @@ def _shared_tmux_soccfg():
     return QickConfig(cfg)
 
 
+def _fir_soccfg(*, fir_rate_profile="1_msps"):
+    cfg = _mock_soccfg(1)._cfg
+    is_50_ksps = fir_rate_profile == "50_ksps"
+    cfg["refclk_freq"] = 300.0
+    cfg["readouts"] = [{
+        "type": "axis_dyn_readout_v1",
+        "ro_type": "axis_dyn_readout_v1",
+        "tproc_ctrl": 1,
+        "tmux_ch": 0,
+        "f_fabric": 300.0,
+        "f_output": 300.0,
+        "f_dds": 300.0,
+        "fs_mult": 1,
+        "fs_div": 1,
+        "fdds_div": 1,
+        "b_dds": 32,
+        "b_phase": 32,
+        "adc": "00",
+        "buf_maxlen": 16384,
+        "has_weights": False,
+        "has_edge_counter": False,
+        "trigger_type": "dport",
+        "trigger_port": 0,
+        "trigger_bit": 0,
+    }]
+    cfg["ddr4_buf"] = {
+        "sample_capture": True,
+        "fir_enabled": True,
+        "fir_rate_profile": fir_rate_profile,
+        "stored_sample_rate_hz": (
+            50_000.0 if is_50_ksps else 1_000_000.0
+        ),
+        "fir_output_fs_mhz": 0.05 if is_50_ksps else 1.0,
+        "fir_decimation": 6000 if is_50_ksps else 300,
+        "fir_group_delay_input_samples": (
+            296_677.0 if is_50_ksps else 8677.0
+        ),
+        "fir_input_fs_mhz": 300.0,
+        "supports_trigger_delay": is_50_ksps,
+        "trigger_delay_units": "valid_input_samples",
+        "trigger_delay_default_samples": 50 if is_50_ksps else 0,
+        "trigger_type": "dport",
+        "trigger_port": 0,
+        "trigger_bit": 1,
+    }
+    return QickConfig(cfg)
+
+
 def _command_word(command):
     return sum(
         (int(word) & 0xFFFFFFFF) << (32 * index)
@@ -158,6 +211,57 @@ def test_set_and_ramp_words_are_updated_by_nested_loop_and_add():
         for field in program._sweep_fields
     }
     assert swept_kinds == {"set", "ramp"}
+
+
+def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("capture", (0.25,), 300)
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=8,
+        at_segment="capture",
+        trigger_delay_tproc_cycles=17,
+        margin_input_samples=0,
+    )
+    baseline = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+    )
+
+    assert program.timing["segment_starts"] == baseline.timing["segment_starts"]
+    assert program.aux_timing["fir_warmup_tproc_cycles"] == 0
+    assert program.aux_timing["ddr_readout_start"] == 0
+    assert program.aux_timing["ddr_trigger_time"] == (
+        baseline.timing["segment_starts"][0] + 17
+    )
+    assert program.summary()["fir_rate_profile"] == "50_ksps"
+    assert program.summary()["fir_software_warmup_compensation"] is False
+
+    raw = np.arange(8 * 2, dtype=np.int32).reshape(8, 2)
+
+    class FakeSoc:
+        def arm_ddr4_fir_samples(self, **kwargs):
+            self.arm_kwargs = kwargs
+            return 16
+
+        def get_ddr4_fir_samples(self, **_kwargs):
+            return raw
+
+    soc = FakeSoc()
+    monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
+    result = program.acquire_fir_ddr(soc, progress=False)
+
+    assert soc.arm_kwargs["trigger_delay_samples"] == 50
+    assert result.iq.shape == (1, 1, 8, 2)
+    assert result.sample_rate_hz == 50_000.0
+    assert result.fir_rate_profile == "50_ksps"
 
 
 def test_pmem_size_does_not_scale_with_sweep_point_count():

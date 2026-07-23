@@ -36,6 +36,7 @@ try:
     )
     from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from .qick_front_panel import QickFrontPanelPreview
+    from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
@@ -48,6 +49,7 @@ except ImportError:
     )
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from qick_front_panel import QickFrontPanelPreview
+    from fir_ddr_profile import format_sample_rate_hz
 
 
 DEFAULT_SPARAMETER_DB_PATH = str(Path.home() / "qick_sparameter_experiments.db")
@@ -531,6 +533,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._fir_sample_rate_hz = None
+        self._fir_trigger_delay_us = 0.0
         outer = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -717,9 +721,17 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.stride_bytes.setRange(0, 2_147_483_647)
         self.stride_bytes.setSpecialValueText("Automatic")
         self.force_overwrite = QtWidgets.QCheckBox("Allow DDR overwrite")
+        self.fir_profile_status = QtWidgets.QLabel(
+            "Identify QICK to show the FIR DDR timing"
+        )
+        self.fir_profile_status.setWordWrap(True)
+        self.fir_profile_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
         capture_form.addRow("FIR input margin:", self.margin_input_samples)
         capture_form.addRow("DDR start address:", self.address)
         capture_form.addRow("Trigger stride (bytes):", self.stride_bytes)
+        capture_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         capture_form.addRow(self.force_overwrite)
         content_layout.addWidget(capture_group)
 
@@ -766,6 +778,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.status = QtWidgets.QLabel("Ready")
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
+        self.scan_time_us.valueChanged.connect(self._update_fir_profile_status)
 
         self._internal_settings = {
             "settle_seconds": 0.05,
@@ -962,6 +975,45 @@ class SParameterSweepPanel(QtWidgets.QWidget):
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)
+        self._fir_sample_rate_hz = getattr(
+            configuration,
+            "fir_sample_rate_hz",
+            None,
+        )
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._update_fir_profile_status()
+
+    def _update_fir_profile_status(self, *_args) -> None:
+        if self._fir_sample_rate_hz is None:
+            self.fir_profile_status.setText(
+                "Identify QICK to show the FIR DDR timing"
+            )
+            return
+        sample_count = max(
+            1,
+            int(
+                np.ceil(
+                    self.scan_time_us.value()
+                    * float(self._fir_sample_rate_hz)
+                    / 1_000_000.0
+                )
+            ),
+        )
+        actual_time_us = (
+            sample_count * 1_000_000.0 / float(self._fir_sample_rate_hz)
+        )
+        delay = (
+            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
+            if self._fir_trigger_delay_us
+            else ""
+        )
+        self.fir_profile_status.setText(
+            f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
+            f"{sample_count:,} samples = {actual_time_us:g} us actual"
+            f"{delay}"
+        )
 
     def config(self) -> SParameterSweepConfig:
         path = self.path_diagram.applied_values()
@@ -1124,12 +1176,18 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         result = stored.result
         self.run_id.setValue(stored.run_id)
         power_count = int(getattr(result, "power_count", 1))
+        sample_rate_hz = float(
+            getattr(result, "sample_rate_hz", 1_000_000.0)
+        )
+        trace_time_us = result.sample_count * 1_000_000.0 / sample_rate_hz
         self.set_running(
             False,
             (
                 f"Run {stored.run_id}: {power_count} power point(s) x "
                 f"{result.frequencies_mhz.size} frequency points, "
-                f"{result.sample_count} FIR samples per point\n"
+                f"{result.sample_count} FIR samples per point at "
+                f"{format_sample_rate_hz(sample_rate_hz)} "
+                f"({trace_time_us:g} us)\n"
                 f"{stored.database_path}"
             ),
         )

@@ -8,7 +8,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -40,6 +40,7 @@ try:
         dc_iq_to_current,
     )
     from .dc_voltage_calibration import load_dc_voltage_calibration
+    from .fir_ddr_profile import resolve_fir_ddr_profile
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_QICK_TPROC_MHZ,
@@ -49,6 +50,7 @@ except ImportError:
         dc_iq_to_current,
     )
     from dc_voltage_calibration import load_dc_voltage_calibration
+    from fir_ddr_profile import resolve_fir_ddr_profile
 
 
 def _runtime_types():
@@ -1320,10 +1322,29 @@ def run_qick_qcodes_experiment(
     _emit_progress(progress_callback, 0, "Starting QICK experiment")
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    fir_profile = resolve_fir_ddr_profile(
+        soccfg,
+        context="QCoDeS experiment",
+    )
+    effective_run_config = replace(
+        run_config,
+        sample_rate_hz=fir_profile.sample_rate_hz,
+    )
     stored_gui_settings = dict(gui_settings)
     qick_settings = gui_settings.get("qick", {})
     if not isinstance(qick_settings, Mapping):
         raise TypeError("gui_settings['qick'] must be a mapping")
+    stored_qick_settings = dict(qick_settings)
+    stored_qick_settings.update({
+        "fir_rate_profile": fir_profile.name,
+        "fir_sample_rate_hz": fir_profile.sample_rate_hz,
+        "fir_sample_period_us": fir_profile.sample_period_us,
+        "fir_fpga_trigger_delay_samples": fir_profile.trigger_delay_samples,
+        "fir_software_warmup_compensation": (
+            fir_profile.software_warmup_compensation
+        ),
+    })
+    stored_gui_settings["qick"] = stored_qick_settings
     tproc_mhz = float(
         qick_settings.get("tproc_mhz", DEFAULT_QICK_TPROC_MHZ)
     )
@@ -1348,7 +1369,7 @@ def run_qick_qcodes_experiment(
     )
     dataset, row_count = store_qick_result(
         ddr_result,
-        run_config=run_config,
+        run_config=effective_run_config,
         connection_config=connection_config,
         program_summary=program.summary(),
         gui_settings=stored_gui_settings,
@@ -1359,7 +1380,7 @@ def run_qick_qcodes_experiment(
     return StoredQickExperiment(
         run_id=int(dataset.run_id),
         guid=str(dataset.guid),
-        database_path=run_config.resolved_database_path,
+        database_path=effective_run_config.resolved_database_path,
         row_count=row_count,
         dataset=dataset,
         program=program,

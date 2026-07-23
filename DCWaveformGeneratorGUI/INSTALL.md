@@ -55,7 +55,8 @@ QCS programs need to be executed.
 ## Direct QICK experiment runs
 
 The **Experiment** tab connects to the configured QICK Pyro nameserver, runs
-the AWG/RF/FIR-DDR sequence, and writes the returned 1 MSPS IQ traces to the
+the AWG/RF/FIR-DDR sequence, and writes IQ traces at the sample rate detected
+from the loaded HWH (currently 1 MSPS or 50 kSPS) to the
 selected QCoDeS SQLite database. The QICK server must already be running and
 reachable from this PC.
 
@@ -84,8 +85,8 @@ The full per-clock AWG trace is not duplicated in the database.
 as QCoDeS parameters, so they do not appear as misleading x/y selectors. The
 sample index is reconstructed from the `i_trace`/`q_trace` array length, and
 trace time is `arange(sample_count) * sample_period_us`. `sample_period_us` and
-the sample rate are stored in `qick_experiment_json` metadata. At 1 MSPS one
-sample step is one microsecond. Magnitude and phase are also derived when reading
+the sample rate are stored in `qick_experiment_json` metadata. A 1 MSPS sample
+step is 1 microsecond and a 50 kSPS sample step is 20 microseconds. Magnitude and phase are also derived when reading
 instead of being duplicated in SQLite. Use `load_qick_iq_arrays(dataset)` to
 reconstruct I, Q, magnitude, phase, sample index, and time arrays. The loader
 also accepts older packed `iq_trace[sample, component]` runs.
@@ -148,7 +149,7 @@ the 65,535-fabric-cycle const-pulse limit; the stop takes effect at the next
 3-cycle periodic boundary. The dynamic readout uses the same short periodic
 word so each hardware-sweep frequency update is accepted promptly.
 
-Each frequency point produces one post-FIR 1 MSPS DDR trace. The trace is saved
+Each frequency point produces one post-FIR DDR trace at the HWH-selected rate. The trace is saved
 as separate `i_trace[sample]` and `q_trace[sample]` QCoDeS arrays, then reduced
 to one complex response using the mean I and mean Q. Without input calibration,
 the stored scalar response uses `20*log10(hypot(mean_i, mean_q))` for magnitude.

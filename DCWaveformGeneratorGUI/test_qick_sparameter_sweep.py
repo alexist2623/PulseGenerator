@@ -49,8 +49,13 @@ def _application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _mock_soccfg(*, generator_type="axis_signal_gen_v6"):
+def _mock_soccfg(
+    *,
+    generator_type="axis_signal_gen_v6",
+    fir_rate_profile="1_msps",
+):
     awg = generator_type == "axis_awg_tuning_v1"
+    is_50_ksps = fir_rate_profile == "50_ksps"
     return QickConfig(
         {
             "sw_version": "0.2.357",
@@ -126,10 +131,19 @@ def _mock_soccfg(*, generator_type="axis_signal_gen_v6"):
             "ddr4_buf": {
                 "sample_capture": True,
                 "fir_enabled": True,
-                "fir_output_fs_mhz": 1.0,
-                "fir_decimation": 300,
-                "fir_group_delay_input_samples": 8677,
+                "fir_rate_profile": fir_rate_profile,
+                "stored_sample_rate_hz": (
+                    50_000.0 if is_50_ksps else 1_000_000.0
+                ),
+                "fir_output_fs_mhz": 0.05 if is_50_ksps else 1.0,
+                "fir_decimation": 6000 if is_50_ksps else 300,
+                "fir_group_delay_input_samples": (
+                    296_677.0 if is_50_ksps else 8677.0
+                ),
                 "fir_input_fs_mhz": 300.0,
+                "supports_trigger_delay": is_50_ksps,
+                "trigger_delay_units": "valid_input_samples",
+                "trigger_delay_default_samples": 50 if is_50_ksps else 0,
                 "trigger_type": "dport",
                 "trigger_port": 0,
                 "trigger_bit": 1,
@@ -645,6 +659,37 @@ def test_fir_ddr_acquisition_keeps_one_trace_per_frequency(monkeypatch):
     assert result.iq_traces.shape == (3, 4, 2)
     np.testing.assert_array_equal(result.iq_traces.reshape(12, 2), raw)
     np.testing.assert_allclose(result.mean_i, raw.reshape(3, 4, 2)[:, :, 0].mean(1))
+
+
+def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
+    monkeypatch,
+):
+    program = SParameterSweepProgram(
+        _mock_soccfg(fir_rate_profile="50_ksps"),
+        _config(frequency_points=3, scan_time_us=1000.0),
+    )
+    raw = np.arange(3 * 50 * 2, dtype=np.int32).reshape(150, 2)
+
+    class FakeSoc:
+        def arm_ddr4_fir_samples(self, **kwargs):
+            self.arm_kwargs = kwargs
+            return 300
+
+        def get_ddr4_fir_samples(self, **kwargs):
+            return raw
+
+    soc = FakeSoc()
+    monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
+    result = program.acquire_fir_ddr(soc)
+
+    assert program.scan_samples == 50
+    assert program.fir_warmup_tproc_cycles == 0
+    assert program.ddr_trigger_time == program.output_command_time
+    assert program.summary()["fir_rate_profile"] == "50_ksps"
+    assert program.summary()["fir_software_warmup_compensation"] is False
+    assert soc.arm_kwargs["trigger_delay_samples"] == 50
+    assert result.sample_rate_hz == 50_000.0
+    assert result.iq_traces.shape == (3, 50, 2)
 
 
 def test_rf_board_output_and_readout_controls_are_applied():

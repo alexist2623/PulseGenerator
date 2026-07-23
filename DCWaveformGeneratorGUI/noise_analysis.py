@@ -32,7 +32,6 @@ try:
     from .qick_qcodes_experiment import load_qick_iq_arrays
     from .dc_voltage_calibration import load_dc_voltage_calibration
     from .noise_acquisition import (
-        FIR_SAMPLE_RATE_HZ,
         NoiseAcquisitionConfig,
         acquire_noise_fir_trace,
     )
@@ -41,7 +40,6 @@ except ImportError:
     from qick_qcodes_experiment import load_qick_iq_arrays
     from dc_voltage_calibration import load_dc_voltage_calibration
     from noise_acquisition import (
-        FIR_SAMPLE_RATE_HZ,
         NoiseAcquisitionConfig,
         acquire_noise_fir_trace,
     )
@@ -930,6 +928,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         )
         self.acquire_button.clicked.connect(self._request_acquisition)
         self.fir_samples.valueChanged.connect(self._update_capture_duration)
+        self.sample_rate.valueChanged.connect(self._update_capture_duration)
         self.input_board.currentTextChanged.connect(
             self._update_input_board_controls
         )
@@ -1032,10 +1031,28 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
     def set_front_panel_configuration(self, configuration) -> None:
         self.front_panel_preview.set_configuration(configuration)
         self.front_panel_preview.set_channels(input_ch=self.readout_channel.value())
+        sample_rate_hz = getattr(configuration, "fir_sample_rate_hz", None)
+        if sample_rate_hz is not None:
+            self.sample_rate.setValue(float(sample_rate_hz))
+            self.acquisition_status.setText(
+                f"HWH FIR DDR: {configuration.fir_rate_label}"
+            )
+        else:
+            self.acquisition_status.setText(
+                "HWH FIR DDR sample rate is unavailable"
+            )
+        self._update_capture_duration()
 
-    def _update_capture_duration(self, _value: int = 0) -> None:
-        seconds = self.fir_samples.value() / FIR_SAMPLE_RATE_HZ
-        self.capture_duration.setText(f"{seconds:g} s at 1 MSPS")
+    def _update_capture_duration(self, _value: float = 0.0) -> None:
+        sample_rate_hz = float(self.sample_rate.value())
+        seconds = self.fir_samples.value() / sample_rate_hz
+        if np.isclose(sample_rate_hz, 1_000_000.0):
+            rate_label = "1 MSPS"
+        elif np.isclose(sample_rate_hz, 50_000.0):
+            rate_label = "50 kSPS"
+        else:
+            rate_label = f"{sample_rate_hz:g} S/s"
+        self.capture_duration.setText(f"{seconds:g} s at {rate_label}")
 
     def _update_input_board_controls(self, _board: str = "") -> None:
         is_rf = self.input_board.currentText() == "RF_In"

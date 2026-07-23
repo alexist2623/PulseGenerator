@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import numpy as np
 from plottr.data.qcodes_dataset import ds_to_datadicts
 
+import qick_qcodes_experiment as experiment_module
 from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
 from qick_fine_tune_sweep import (
     AmplitudeSweep,
@@ -688,6 +690,15 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     soccfg = {
         "tprocs": [{"f_time": 400.0}],
         "gens": [{"f_fabric": 300.0}],
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_rate_profile": "1_msps",
+            "stored_sample_rate_hz": 1_000_000.0,
+            "fir_decimation": 300,
+            "fir_input_fs_mhz": 300.0,
+            "fir_group_delay_input_samples": 8677.0,
+        },
     }
 
     def connector(**kwargs):
@@ -744,6 +755,64 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert any(percent == 32 for percent, _ in progress_updates)
     assert any(percent == 55 for percent, _ in progress_updates)
     assert any(percent == 60 for percent, _ in progress_updates)
+
+
+def test_run_uses_50_ksps_hwh_rate_for_qcodes_time_axis(tmp_path, monkeypatch):
+    captured = {}
+    ddr_result = _ddr_result()
+    soccfg = {
+        "tprocs": [{"f_time": 300.0}],
+        "gens": [{"f_fabric": 300.0}],
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_rate_profile": "50_ksps",
+            "stored_sample_rate_hz": 50_000.0,
+            "fir_decimation": 6000,
+            "fir_input_fs_mhz": 300.0,
+            "fir_group_delay_input_samples": 296_677.0,
+            "supports_trigger_delay": True,
+            "trigger_delay_units": "valid_input_samples",
+            "trigger_delay_default_samples": 50,
+        },
+    }
+
+    class FakeProgram:
+        def summary(self):
+            return {"fir_rate_profile": "50_ksps"}
+
+    monkeypatch.setattr(
+        experiment_module,
+        "connect_qick",
+        lambda *_args, **_kwargs: (object(), soccfg),
+    )
+    monkeypatch.setattr(
+        experiment_module,
+        "execute_qick_sequence",
+        lambda *_args, **_kwargs: (FakeProgram(), ddr_result, {}),
+    )
+
+    def fake_store(_ddr_result, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(run_id=91, guid="rate-guid"), 1
+
+    monkeypatch.setattr(experiment_module, "store_qick_result", fake_store)
+    requested = QcodesRunConfig(str(tmp_path / "rate.db"))
+    result = experiment_module.run_qick_qcodes_experiment(
+        connection_config=QickConnectionConfig("host", 8888, "proxy"),
+        run_config=requested,
+        sequence=object(),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        rf_specs=(),
+        readout_spec=QickDdrReadoutSpec(0, "set_0", 0.0, 3),
+        gui_settings={"qick": {}},
+    )
+
+    assert captured["run_config"].sample_rate_hz == 50_000.0
+    assert captured["gui_settings"]["qick"]["fir_rate_profile"] == "50_ksps"
+    assert captured["gui_settings"]["qick"]["fir_sample_period_us"] == 20.0
+    assert result.database_path == requested.resolved_database_path
 
 
 def test_configure_rf_board_uses_zcu216_dc_chain_apis():

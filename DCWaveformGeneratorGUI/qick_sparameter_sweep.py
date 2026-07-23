@@ -35,6 +35,7 @@ try:
         MAX_DMEM_GAIN_ENTRIES,
         OUTPUT_BOARD_TYPES,
     )
+    from .fir_ddr_profile import resolve_fir_ddr_profile
 except ImportError:
     from power_calibration import (
         CalibrationDatabase,
@@ -46,6 +47,7 @@ except ImportError:
         MAX_DMEM_GAIN_ENTRIES,
         OUTPUT_BOARD_TYPES,
     )
+    from fir_ddr_profile import resolve_fir_ddr_profile
 
 try:
     from qick.averager_program import RAveragerProgram
@@ -1051,27 +1053,12 @@ class SParameterSweepProgram(RAveragerProgram):
                     f"{self.sweep.gain_dmem_base_address}..{table_end - 1}, "
                     f"but tProcessor DMEM depth is {dmem_size}"
                 )
-        try:
-            ddr_cfg = self.soccfg["ddr4_buf"]
-        except KeyError as exc:
-            raise RuntimeError("soccfg does not contain a DDR sample buffer") from exc
-        if not ddr_cfg.get("sample_capture", False):
-            raise RuntimeError("S-parameter sweep requires sample-triggered DDR")
-        if not ddr_cfg.get("fir_enabled", False):
-            raise RuntimeError("S-parameter sweep requires the FIR DDR path")
-        output_rate = float(
-            ddr_cfg.get(
-                "fir_output_fs_mhz",
-                ddr_cfg.get("fir_sample_rate_msps", 0.0),
-            )
+        self._fir_profile = resolve_fir_ddr_profile(
+            self.soccfg,
+            context="S-parameter sweep",
         )
-        if not np.isclose(output_rate, 1.0, rtol=0.0, atol=1.0e-9):
-            raise RuntimeError(
-                f"S-parameter sweep requires 1 MSPS FIR output, got "
-                f"{output_rate:.9g} MSPS"
-            )
-        self._ddr_cfg = ddr_cfg
-        self.fir_output_rate_msps = output_rate
+        self._ddr_cfg = self._fir_profile.config
+        self.fir_output_rate_msps = self._fir_profile.sample_rate_msps
         return gen_cfg, ro_cfg
 
     def _frequency_grid(self, gen_cfg, ro_cfg) -> None:
@@ -1169,34 +1156,68 @@ class SParameterSweepProgram(RAveragerProgram):
             length=max(1, monitor_length),
         )
 
-        decimation = int(self._ddr_cfg.get("fir_decimation", 300))
-        group_delay = int(
-            ceil(float(self._ddr_cfg.get("fir_group_delay_input_samples", 8677)))
-        )
-        input_fs_mhz = float(self._ddr_cfg.get("fir_input_fs_mhz", 300.0))
-        if decimation < 1 or input_fs_mhz <= 0.0:
-            raise RuntimeError("invalid FIR decimation metadata")
+        decimation = self._fir_profile.decimation
+        group_delay = int(ceil(self._fir_profile.group_delay_input_samples))
+        input_fs_mhz = self._fir_profile.input_rate_mhz
         self.fir_decimation = decimation
         self.fir_group_delay_input_samples = group_delay
         self.fir_input_fs_mhz = input_fs_mhz
-        self.fir_warmup_tproc_cycles = int(
-            ceil(group_delay * self.tproc_mhz / input_fs_mhz)
-        )
-        self.fir_feed_input_samples = (
-            self.scan_samples * decimation
-            + group_delay
-            + self.sweep.margin_input_samples
-        )
-        capture_cycles = int(
-            ceil(self.fir_feed_input_samples * self.tproc_mhz / input_fs_mhz)
-        )
 
         gen_port = int(gen_cfg["tproc_ch"])
         ro_port = int(ro_cfg["tproc_ctrl"])
         self.readout_command_time = 0
         self.output_command_time = 1 if gen_port == ro_port else 0
-        self.ddr_trigger_time = self.output_command_time + self.fir_warmup_tproc_cycles
-        self.capture_end_tproc_cycles = self.output_command_time + capture_cycles
+        if self._fir_profile.software_warmup_compensation:
+            self.fir_warmup_tproc_cycles = int(
+                ceil(group_delay * self.tproc_mhz / input_fs_mhz)
+            )
+            self.ddr_trigger_time = (
+                self.output_command_time + self.fir_warmup_tproc_cycles
+            )
+            self.fir_feed_input_samples = (
+                self.scan_samples * decimation
+                + group_delay
+                + self.sweep.margin_input_samples
+            )
+            capture_cycles = int(
+                ceil(
+                    self.fir_feed_input_samples
+                    * self.tproc_mhz
+                    / input_fs_mhz
+                )
+            )
+            self.capture_end_tproc_cycles = (
+                self.output_command_time + capture_cycles
+            )
+        else:
+            # The 50 kSPS HWH continuously filters and decimates. The V2 DDR
+            # buffer delays capture in valid post-filter samples, so the
+            # tProcessor trigger remains aligned with RF output start.
+            self.fir_warmup_tproc_cycles = 0
+            self.ddr_trigger_time = self.output_command_time
+            post_trigger_input_samples = (
+                (
+                    self.scan_samples
+                    + self._fir_profile.trigger_delay_samples
+                )
+                * decimation
+                + self.sweep.margin_input_samples
+            )
+            self.fir_feed_input_samples = group_delay + post_trigger_input_samples
+            filter_ready_cycles = int(
+                ceil(group_delay * self.tproc_mhz / input_fs_mhz)
+            )
+            post_trigger_cycles = int(
+                ceil(
+                    post_trigger_input_samples
+                    * self.tproc_mhz
+                    / input_fs_mhz
+                )
+            )
+            self.capture_end_tproc_cycles = (
+                max(self.output_command_time, filter_ready_cycles)
+                + post_trigger_cycles
+            )
         self.rf_stop_command_time = self.capture_end_tproc_cycles
         self.point_period_tproc_cycles = (
             self.rf_stop_command_time + self.sweep.recovery_tproc_cycles
@@ -1441,7 +1462,7 @@ class SParameterSweepProgram(RAveragerProgram):
         counter_progress: Optional[Callable[[int, int], None]] = None,
     ) -> SParameterSweepResult:
         n_triggers = self.sweep.frequency_points
-        reserved = soc.arm_ddr4_fir_samples(
+        arm_kwargs = dict(
             ch=self.sweep.readout_ch,
             n_samples=self.scan_samples,
             n_triggers=n_triggers,
@@ -1449,6 +1470,11 @@ class SParameterSweepProgram(RAveragerProgram):
             stride_bytes=self.sweep.stride_bytes,
             force_overwrite=self.sweep.force_overwrite,
         )
+        if self._fir_profile.uses_fpga_trigger_delay:
+            arm_kwargs["trigger_delay_samples"] = (
+                self._fir_profile.trigger_delay_samples
+            )
+        reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
         if counter_progress is None and not self._uses_gain_table:
             self.run_rounds(soc, progress=progress)
         else:
@@ -1565,9 +1591,16 @@ class SParameterSweepProgram(RAveragerProgram):
             "scan_samples": self.scan_samples,
             "scan_time_actual_us": (self.scan_samples / self.fir_output_rate_msps),
             "fir_output_rate_msps": self.fir_output_rate_msps,
+            "fir_rate_profile": self._fir_profile.name,
             "fir_decimation": self.fir_decimation,
             "fir_group_delay_input_samples": self.fir_group_delay_input_samples,
             "fir_warmup_tproc_cycles": self.fir_warmup_tproc_cycles,
+            "fir_software_warmup_compensation": (
+                self._fir_profile.software_warmup_compensation
+            ),
+            "fir_fpga_trigger_delay_samples": (
+                self._fir_profile.trigger_delay_samples
+            ),
             "rf_output_mode": "periodic_start_timed_zero_stop",
             "rf_periodic_word_fabric_cycles": self.PERIODIC_WORD_CYCLES,
             "rf_stop_word_fabric_cycles": self.STOP_WORD_CYCLES,

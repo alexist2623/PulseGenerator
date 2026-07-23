@@ -18,6 +18,7 @@ import numpy as np
 
 try:
     from .dc_waveform_core import QickDdrReadoutSpec
+    from .fir_ddr_profile import resolve_fir_ddr_profile
     from .qick_qcodes_experiment import (
         QickConnectionConfig,
         configure_rf_board,
@@ -25,14 +26,12 @@ try:
     )
 except ImportError:
     from dc_waveform_core import QickDdrReadoutSpec
+    from fir_ddr_profile import resolve_fir_ddr_profile
     from qick_qcodes_experiment import (
         QickConnectionConfig,
         configure_rf_board,
         connect_qick,
     )
-
-
-FIR_SAMPLE_RATE_HZ = 1_000_000.0
 
 
 def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -159,23 +158,14 @@ class NoiseAcquisitionResult:
             raise ValueError("noise I/Q must have shape (sample, 2)")
 
 
-def _validate_fir_ddr(soccfg: Any, config: NoiseAcquisitionConfig) -> dict:
-    try:
-        ddr_cfg = dict(soccfg["ddr4_buf"])
-    except KeyError as exc:
-        raise RuntimeError("HWH does not contain a DDR sample buffer") from exc
-    if not ddr_cfg.get("sample_capture", False):
-        raise RuntimeError("noise acquisition requires axis_buffer_ddr_sample_v1")
-    if not ddr_cfg.get("fir_enabled", False):
-        raise RuntimeError("noise acquisition requires the FIR 300:1 DDR path")
-    output_rate_mhz = float(ddr_cfg.get("fir_output_fs_mhz", 0.0))
-    if not np.isclose(output_rate_mhz, 1.0, rtol=0.0, atol=1.0e-9):
-        raise RuntimeError(
-            f"expected 1 MSPS FIR output, HWH reports {output_rate_mhz} MSPS"
-        )
+def _validate_fir_ddr(soccfg: Any, config: NoiseAcquisitionConfig):
+    profile = resolve_fir_ddr_profile(
+        soccfg,
+        context="noise acquisition",
+    )
     if config.ro_ch >= len(soccfg["readouts"]):
         raise IndexError("noise readout channel is out of range")
-    return ddr_cfg
+    return profile
 
 
 def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
@@ -190,14 +180,15 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
                 "QICK Python library is required for direct noise acquisition"
             ) from exc
 
-    ddr_cfg = _validate_fir_ddr(soccfg, config)
+    profile = _validate_fir_ddr(soccfg, config)
     readout_cfg = soccfg["readouts"][config.ro_ch]
     tproc_mhz = float(soccfg["tprocs"][0]["f_time"])
-    input_fs_mhz = float(ddr_cfg.get("fir_input_fs_mhz", 300.0))
-    group_delay = int(ceil(float(
-        ddr_cfg.get("fir_group_delay_input_samples", 8677)
-    )))
-    warmup_cycles = int(ceil(group_delay * tproc_mhz / input_fs_mhz))
+    group_delay = int(ceil(profile.group_delay_input_samples))
+    warmup_cycles = (
+        int(ceil(group_delay * tproc_mhz / profile.input_rate_mhz))
+        if profile.software_warmup_compensation
+        else 0
+    )
     monitor_length = min(
         config.fir_samples,
         int(readout_cfg.get("buf_maxlen", config.fir_samples)),
@@ -244,6 +235,8 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
 
     program = DirectNoiseFirProgram(soccfg, {"reps": 1})
     program.noise_fir_warmup_tproc_cycles = warmup_cycles
+    program.noise_fir_rate_profile = profile.name
+    program.noise_fir_fpga_trigger_delay_samples = profile.trigger_delay_samples
     return program
 
 
@@ -263,26 +256,24 @@ def acquire_noise_fir_trace(
 
     progress(2, "Connecting to QICK")
     soc, soccfg = connect_qick(config.connection_config, connector=connector)
-    ddr_cfg = _validate_fir_ddr(soccfg, config)
+    profile = _validate_fir_ddr(soccfg, config)
     progress(8, "Configuring the selected ADC input")
     configure_rf_board(soc, (), config.readout_spec())
     progress(12, "Compiling the independent FIR-DDR capture program")
     factory = build_noise_fir_program if program_factory is None else program_factory
     program = factory(soccfg, config)
 
-    output_rate_hz = float(ddr_cfg["fir_output_fs_mhz"]) * 1.0e6
-    input_rate_hz = float(ddr_cfg.get("fir_input_fs_mhz", 300.0)) * 1.0e6
-    group_delay_input_samples = float(
-        ddr_cfg.get("fir_group_delay_input_samples", 8677)
-    )
+    output_rate_hz = profile.sample_rate_hz
+    input_rate_hz = profile.input_rate_mhz * 1.0e6
+    group_delay_input_samples = profile.group_delay_input_samples
     capture_seconds = (
-        config.fir_samples / output_rate_hz
+        (config.fir_samples + profile.trigger_delay_samples) / output_rate_hz
         + (group_delay_input_samples + config.margin_input_samples)
         / input_rate_hz
     )
 
     progress(15, "Arming FIR DDR capture")
-    reserved = soc.arm_ddr4_fir_samples(
+    arm_kwargs = dict(
         ch=config.ro_ch,
         n_samples=config.fir_samples,
         n_triggers=1,
@@ -290,6 +281,9 @@ def acquire_noise_fir_trace(
         stride_bytes=None,
         force_overwrite=config.force_overwrite,
     )
+    if profile.uses_fpga_trigger_delay:
+        arm_kwargs["trigger_delay_samples"] = profile.trigger_delay_samples
+    reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
     progress(18, "Starting readout and DDR trigger")
     program.run_rounds(soc, progress=False)
     # The DDR writer runs independently after the short tProcessor program.
@@ -317,13 +311,13 @@ def acquire_noise_fir_trace(
         capture_seconds=capture_seconds,
         source=(
             f"Direct FIR-DDR readout {config.ro_ch} at "
-            f"{config.readout_frequency_mhz:g} MHz"
+            f"{config.readout_frequency_mhz:g} MHz | "
+            f"{profile.sample_rate_hz:g} S/s ({profile.name})"
         ),
     )
 
 
 __all__ = [
-    "FIR_SAMPLE_RATE_HZ",
     "NoiseAcquisitionConfig",
     "NoiseAcquisitionResult",
     "acquire_noise_fir_trace",
