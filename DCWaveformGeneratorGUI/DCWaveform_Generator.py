@@ -164,6 +164,7 @@ try:
         QickConnectionConfig,
         build_qick_program,
         connect_qick,
+        measurement_iq_values,
         run_qick_qcodes_experiment,
     )
 except ImportError:
@@ -172,7 +173,19 @@ except ImportError:
         QickConnectionConfig,
         build_qick_program,
         connect_qick,
+        measurement_iq_values,
         run_qick_qcodes_experiment,
+    )
+
+try:
+    from .awg_sweep_map import (
+        AwgSweepMapPlotWidget,
+        reduce_awg_sweep_map,
+    )
+except ImportError:
+    from awg_sweep_map import (
+        AwgSweepMapPlotWidget,
+        reduce_awg_sweep_map,
     )
 
 try:
@@ -275,7 +288,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 25
+SETTINGS_VERSION = 27
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -291,6 +304,11 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "segment_name": "set_0",
     "delay_us": 0.0,
     "duration_us": 1.0,
+    "duration_sweep_enabled": False,
+    "duration_sweep_start_us": 1.0,
+    "duration_sweep_stop_us": 1.0,
+    "duration_sweep_count": 1,
+    "segment_length_mode": "fixed",
     "frequency_mhz": 50.0,
     "gain": 20000,
     "output_board_type": "RF_Out",
@@ -2014,6 +2032,30 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             editor.setDecimals(9)
         self.duration.setMinimum(1.0e-9)
         self.duration.setValue(_time_from_ns(1000.0, time_unit))
+        self.duration_sweep_enabled = QtWidgets.QCheckBox(
+            "Sweep RF pulse duration"
+        )
+        self.duration_sweep_start = QtWidgets.QDoubleSpinBox()
+        self.duration_sweep_stop = QtWidgets.QDoubleSpinBox()
+        for editor in (
+            self.duration_sweep_start,
+            self.duration_sweep_stop,
+        ):
+            editor.setRange(1.0e-9, 1.0e12)
+            editor.setDecimals(9)
+            editor.setValue(_time_from_ns(1000.0, time_unit))
+        self.duration_sweep_count = QtWidgets.QSpinBox()
+        self.duration_sweep_count.setRange(1, 1_000_000)
+        self.duration_sweep_count.setValue(1)
+        self.segment_length_mode = QtWidgets.QComboBox()
+        self.segment_length_mode.addItem(
+            "Keep AWG segment length fixed",
+            "fixed",
+        )
+        self.segment_length_mode.addItem(
+            "Original AWG segment + RF duration",
+            "extend_by_rf_duration",
+        )
         self.frequency_mhz = QtWidgets.QDoubleSpinBox()
         self.frequency_mhz.setRange(-10000.0, 10000.0)
         self.frequency_mhz.setDecimals(6)
@@ -2068,6 +2110,19 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._duration_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
         form.addRow(self._duration_label, self.duration)
+        form.addRow(self.duration_sweep_enabled)
+        self._duration_sweep_start_label = QtWidgets.QLabel()
+        self._duration_sweep_stop_label = QtWidgets.QLabel()
+        form.addRow(
+            self._duration_sweep_start_label,
+            self.duration_sweep_start,
+        )
+        form.addRow(
+            self._duration_sweep_stop_label,
+            self.duration_sweep_stop,
+        )
+        form.addRow("Duration sweep points:", self.duration_sweep_count)
+        form.addRow("AWG segment timing:", self.segment_length_mode)
         form.addRow("Frequency:", self.frequency_mhz)
         form.addRow("Gain:", self.gain)
         shared_path_note = QtWidgets.QLabel(
@@ -2091,6 +2146,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.segment,
             self.delay,
             self.duration,
+            self.duration_sweep_enabled,
+            self.duration_sweep_start,
+            self.duration_sweep_stop,
+            self.duration_sweep_count,
+            self.segment_length_mode,
             self.frequency_mhz,
             self.gain,
             self.att1_db,
@@ -2113,8 +2173,22 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self._update_board_controls
         )
         self.gen_ch.valueChanged.connect(self._sync_front_panel_selection)
+        self.duration_sweep_enabled.toggled.connect(
+            self._update_duration_sweep_controls
+        )
         self._update_board_controls()
+        self._update_duration_sweep_controls()
         self.set_index(index)
+
+    def _update_duration_sweep_controls(self, *_args) -> None:
+        enabled = self.duration_sweep_enabled.isChecked()
+        for widget in (
+            self.duration_sweep_start,
+            self.duration_sweep_stop,
+            self.duration_sweep_count,
+            self.segment_length_mode,
+        ):
+            widget.setEnabled(enabled)
 
     def _update_board_controls(self, *_args) -> None:
         has_attenuators = self.output_board_type.currentText() == "RF_Out"
@@ -2175,14 +2249,39 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         old_unit = self._time_unit
         delay_ns = _time_to_ns(self.delay.value(), old_unit)
         duration_ns = _time_to_ns(self.duration.value(), old_unit)
+        sweep_start_ns = _time_to_ns(
+            self.duration_sweep_start.value(),
+            old_unit,
+        )
+        sweep_stop_ns = _time_to_ns(
+            self.duration_sweep_stop.value(),
+            old_unit,
+        )
         self._time_unit = unit
-        with QtCore.QSignalBlocker(self.delay), QtCore.QSignalBlocker(self.duration):
+        with QtCore.QSignalBlocker(self.delay), \
+                QtCore.QSignalBlocker(self.duration), \
+                QtCore.QSignalBlocker(self.duration_sweep_start), \
+                QtCore.QSignalBlocker(self.duration_sweep_stop):
             self.delay.setValue(_time_from_ns(delay_ns, unit))
             self.duration.setValue(_time_from_ns(duration_ns, unit))
+            self.duration_sweep_start.setValue(
+                _time_from_ns(sweep_start_ns, unit)
+            )
+            self.duration_sweep_stop.setValue(
+                _time_from_ns(sweep_stop_ns, unit)
+            )
             self.delay.setSuffix(f" {unit}")
             self.duration.setSuffix(f" {unit}")
+            self.duration_sweep_start.setSuffix(f" {unit}")
+            self.duration_sweep_stop.setSuffix(f" {unit}")
         self._delay_label.setText(f"Delay [{unit}]:")
         self._duration_label.setText(f"Duration [{unit}]:")
+        self._duration_sweep_start_label.setText(
+            f"Sweep start [{unit}]:"
+        )
+        self._duration_sweep_stop_label.setText(
+            f"Sweep stop [{unit}]:"
+        )
 
     def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
         if pulse is not None:
@@ -2215,6 +2314,25 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             filter_cutoff=self.filter_cutoff.value(),
             filter_bandwidth=self.filter_bandwidth.value(),
             output_board_type=self.output_board_type.currentText(),
+            duration_sweep_enabled=self.duration_sweep_enabled.isChecked(),
+            duration_sweep_start_us=(
+                _time_to_ns(
+                    self.duration_sweep_start.value(),
+                    self._time_unit,
+                )
+                / 1000.0
+            ),
+            duration_sweep_stop_us=(
+                _time_to_ns(
+                    self.duration_sweep_stop.value(),
+                    self._time_unit,
+                )
+                / 1000.0
+            ),
+            duration_sweep_count=self.duration_sweep_count.value(),
+            segment_length_mode=str(
+                self.segment_length_mode.currentData()
+            ),
         )
 
     def spec(self) -> Optional[QickRfPulseSpec]:
@@ -2241,6 +2359,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "phase_degrees": spec.phase_degrees,
             "nqz": spec.nqz,
             "require_within_segment": spec.require_within_segment,
+            "duration_sweep_enabled": spec.duration_sweep_enabled,
+            "duration_sweep_start_us": spec.duration_sweep_start_us,
+            "duration_sweep_stop_us": spec.duration_sweep_stop_us,
+            "duration_sweep_count": spec.duration_sweep_count,
+            "segment_length_mode": spec.segment_length_mode,
         }
 
     def load_settings(self, data: dict) -> None:
@@ -2248,10 +2371,16 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             raise TypeError("each RF output setting must be a JSON object")
         enabled = data.get("enabled", True)
         require_within = data.get("require_within_segment", True)
+        duration_sweep_enabled = data.get(
+            "duration_sweep_enabled",
+            False,
+        )
         if not isinstance(enabled, bool):
             raise TypeError("RF output enabled must be boolean")
         if not isinstance(require_within, bool):
             raise TypeError("RF require_within_segment must be boolean")
+        if not isinstance(duration_sweep_enabled, bool):
+            raise TypeError("RF duration_sweep_enabled must be boolean")
         spec = QickRfPulseSpec(
             gen_ch=int(data["gen_ch"]),
             segment_name=str(data["segment_name"]),
@@ -2268,6 +2397,25 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             filter_cutoff=float(data.get("filter_cutoff", 2.5)),
             filter_bandwidth=float(data.get("filter_bandwidth", 1.0)),
             output_board_type=str(data.get("output_board_type", "RF_Out")),
+            duration_sweep_enabled=duration_sweep_enabled,
+            duration_sweep_start_us=float(
+                data.get(
+                    "duration_sweep_start_us",
+                    data.get("duration_us", 1.0),
+                )
+            ),
+            duration_sweep_stop_us=float(
+                data.get(
+                    "duration_sweep_stop_us",
+                    data.get("duration_us", 1.0),
+                )
+            ),
+            duration_sweep_count=int(
+                data.get("duration_sweep_count", 1)
+            ),
+            segment_length_mode=str(
+                data.get("segment_length_mode", "fixed")
+            ),
         )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
@@ -2278,6 +2426,27 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.duration.setValue(
             _time_from_ns(spec.duration_us * 1000.0, self._time_unit)
         )
+        self.duration_sweep_enabled.setChecked(
+            spec.duration_sweep_enabled
+        )
+        self.duration_sweep_start.setValue(
+            _time_from_ns(
+                spec.duration_sweep_start_us * 1000.0,
+                self._time_unit,
+            )
+        )
+        self.duration_sweep_stop.setValue(
+            _time_from_ns(
+                spec.duration_sweep_stop_us * 1000.0,
+                self._time_unit,
+            )
+        )
+        self.duration_sweep_count.setValue(spec.duration_sweep_count)
+        mode_index = self.segment_length_mode.findData(
+            spec.segment_length_mode
+        )
+        if mode_index >= 0:
+            self.segment_length_mode.setCurrentIndex(mode_index)
         self.frequency_mhz.setValue(spec.frequency_mhz)
         self.gain.setValue(spec.gain)
         self.output_board_type.setCurrentText(spec.output_board_type)
@@ -2290,6 +2459,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.nqz.setValue(spec.nqz)
         self.require_within.setChecked(spec.require_within_segment)
         self._update_board_controls()
+        self._update_duration_sweep_controls()
         self.setChecked(enabled)
 
 
@@ -3075,6 +3245,7 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     run_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
+    sweep_axes_changed = QtCore.pyqtSignal()
     bias_t_changed = QtCore.pyqtSignal(bool, str, float, str, float, float)
 
     def __init__(
@@ -3140,6 +3311,24 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
+        self._map_sweep_specs: Tuple[QickSweepSpec, ...] = ()
+        self.sweep_map_group = QtWidgets.QGroupBox("AWG 2D sweep map")
+        sweep_map_form = QtWidgets.QFormLayout(self.sweep_map_group)
+        self.sweep_map_x = QtWidgets.QComboBox()
+        self.sweep_map_y = QtWidgets.QComboBox()
+        self.sweep_map_status = QtWidgets.QLabel(
+            "Add at least two AWG sweep variables to enable the map."
+        )
+        self.sweep_map_status.setWordWrap(True)
+        sweep_map_form.addRow("X sweep variable:", self.sweep_map_x)
+        sweep_map_form.addRow("Y sweep variable:", self.sweep_map_y)
+        sweep_map_form.addRow(self.sweep_map_status)
+        self.sweep_map_x.currentIndexChanged.connect(
+            self._on_sweep_axis_changed
+        )
+        self.sweep_map_y.currentIndexChanged.connect(
+            self._on_sweep_axis_changed
+        )
         self.bias_t_group = QtWidgets.QGroupBox("Bias-T compensation")
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(bias_t_enabled))
@@ -3202,10 +3391,14 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("Sample name:", self.sample_name)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
+        form.addRow(self.sweep_map_group)
         form.addRow(self.bias_t_group)
         form.addRow("Notes:", self.notes)
 
         self.full_scale_mv.valueChanged.connect(self._update_bias_t_range)
+        self.full_scale_mv.valueChanged.connect(
+            lambda _value: self.set_sweep_specs(self._map_sweep_specs)
+        )
         self.bias_t_group.toggled.connect(self._emit_bias_t_changed)
         self.bias_t_compensation_mv.valueChanged.connect(self._emit_bias_t_changed)
         self.bias_t_duration_us.valueChanged.connect(self._emit_bias_t_changed)
@@ -3277,6 +3470,158 @@ class ExperimentPanel(QtWidgets.QWidget):
             if Path(path).suffix.lower() != ".db":
                 path = str(Path(path).with_suffix(".db"))
             self.database_path.setText(path)
+
+    @staticmethod
+    def _sweep_axis_key(value) -> Optional[Tuple[str, str]]:
+        if value is None:
+            return None
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise TypeError("AWG sweep axis key must contain output and segment")
+        return str(value[0]), str(value[1])
+
+    def _sweep_axis_label(self, spec) -> str:
+        if getattr(spec, "axis_kind", "amplitude") == "rf_duration":
+            return (
+                f"RF gen {spec.gen_ch} / {spec.segment_name} duration | "
+                f"{spec.start:.6g} to {spec.stop:.6g} us | "
+                f"{spec.count} points"
+            )
+        scale_mv = self.full_scale_mv.value()
+        return (
+            f"{spec.output_name} / {spec.segment_name} | "
+            f"{spec.start * scale_mv:.6g} to "
+            f"{spec.stop * scale_mv:.6g} mV | {spec.count} points"
+        )
+
+    def selected_sweep_axis_keys(
+        self,
+        *,
+        require_two: bool = False,
+    ) -> Optional[Tuple[Tuple[str, str], Tuple[str, str]]]:
+        if self.sweep_map_x.count() < 2 or self.sweep_map_y.count() < 2:
+            if require_two:
+                raise ValueError(
+                    "configure at least two AWG sweep variables for a 2D map"
+                )
+            return None
+        x_key = self._sweep_axis_key(self.sweep_map_x.currentData())
+        y_key = self._sweep_axis_key(self.sweep_map_y.currentData())
+        if x_key is None or y_key is None:
+            if require_two:
+                raise ValueError(
+                    "configure at least two AWG sweep variables for a 2D map"
+                )
+            return None
+        if x_key == y_key:
+            raise ValueError("X and Y sweep variables must be different")
+        return x_key, y_key
+
+    def sweep_map_settings(self) -> dict:
+        selected = self.selected_sweep_axis_keys()
+        if selected is None:
+            return {}
+        return {
+            "x_axis": {
+                "output_name": selected[0][0],
+                "segment_name": selected[0][1],
+            },
+            "y_axis": {
+                "output_name": selected[1][0],
+                "segment_name": selected[1][1],
+            },
+        }
+
+    def set_sweep_specs(
+        self,
+        specs: Sequence,
+        *,
+        selected_keys: Optional[
+            Tuple[Tuple[str, str], Tuple[str, str]]
+        ] = None,
+    ) -> None:
+        """Refresh selectable AWG sweep axes while preserving valid choices."""
+        previous = self.selected_sweep_axis_keys()
+        self._map_sweep_specs = tuple(specs)
+        available = tuple(
+            (str(spec.output_name), str(spec.segment_name))
+            for spec in self._map_sweep_specs
+        )
+        desired = selected_keys if selected_keys is not None else previous
+        if desired is not None:
+            desired = (
+                self._sweep_axis_key(desired[0]),
+                self._sweep_axis_key(desired[1]),
+            )
+        if (
+            desired is None
+            or desired[0] not in available
+            or desired[1] not in available
+            or desired[0] == desired[1]
+        ):
+            desired = (available[0], available[1]) if len(available) >= 2 else None
+
+        with QtCore.QSignalBlocker(self.sweep_map_x), QtCore.QSignalBlocker(
+            self.sweep_map_y
+        ):
+            self.sweep_map_x.clear()
+            self.sweep_map_y.clear()
+            for spec, key in zip(self._map_sweep_specs, available):
+                label = self._sweep_axis_label(spec)
+                self.sweep_map_x.addItem(label, key)
+                self.sweep_map_y.addItem(label, key)
+            if desired is not None:
+                self.sweep_map_x.setCurrentIndex(available.index(desired[0]))
+                self.sweep_map_y.setCurrentIndex(available.index(desired[1]))
+
+        enabled = len(available) >= 2
+        self.sweep_map_x.setEnabled(enabled)
+        self.sweep_map_y.setEnabled(enabled)
+        self._update_sweep_map_status()
+        current = self.selected_sweep_axis_keys()
+        if current != previous:
+            self.sweep_axes_changed.emit()
+
+    def _on_sweep_axis_changed(self, _index: int) -> None:
+        if self.sweep_map_x.count() >= 2:
+            x_key = self._sweep_axis_key(self.sweep_map_x.currentData())
+            y_key = self._sweep_axis_key(self.sweep_map_y.currentData())
+            if x_key == y_key:
+                target = (
+                    self.sweep_map_y
+                    if self.sender() is self.sweep_map_x
+                    else self.sweep_map_x
+                )
+                other_key = (
+                    x_key if target is self.sweep_map_y else y_key
+                )
+                replacement = next(
+                    index
+                    for index in range(target.count())
+                    if self._sweep_axis_key(target.itemData(index)) != other_key
+                )
+                with QtCore.QSignalBlocker(target):
+                    target.setCurrentIndex(replacement)
+        self._update_sweep_map_status()
+        self.sweep_axes_changed.emit()
+
+    def _update_sweep_map_status(self) -> None:
+        selected = self.selected_sweep_axis_keys()
+        if selected is None:
+            self.sweep_map_status.setText(
+                "Add at least two AWG sweep variables to enable the map."
+            )
+            return
+        omitted = max(0, len(self._map_sweep_specs) - 2)
+        point_count = prod(spec.count for spec in self._map_sweep_specs)
+        suffix = (
+            f" The other {omitted} sweep axis/axes will be coherently averaged."
+            if omitted
+            else ""
+        )
+        self.sweep_map_status.setText(
+            f"{point_count:,} Cartesian points; I/Q are averaged over "
+            f"repetitions and FIR samples.{suffix}"
+        )
 
     def _parse_awg_channels(self, output_count: int) -> Tuple[int, ...]:
         fields = [field.strip() for field in self.awg_channels.text().split(",")]
@@ -4175,6 +4520,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_filter_tau_us = float(DEFAULT_BIAS_T_FILTER_TAU_US)
         self._experiment_thread: Optional[QtCore.QThread] = None
         self._experiment_worker: Optional[QtCore.QObject] = None
+        self._last_experiment_result = None
         self._grid_time_ns = 1000.0
         self._grid_voltage_mv = 100.0
         self._grid_snap_enabled = False
@@ -4251,6 +4597,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
+        )
+        self._experiment_panel.sweep_axes_changed.connect(
+            self._refresh_awg_sweep_map_from_last_result
         )
         self._experiment_panel.bias_t_changed.connect(self._on_bias_t_changed)
         self._stability_panel.start_requested.connect(
@@ -4400,6 +4749,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._dock_stability.setWidget(self._stability_plot)
 
+        self._awg_sweep_plot = AwgSweepMapPlotWidget(self)
+        self._dock_awg_sweep = QtWidgets.QDockWidget(
+            "AWG Tuning - I / Q / Magnitude / Angle",
+            self,
+        )
+        self._dock_awg_sweep.setWidget(self._awg_sweep_plot)
+
         self._sparameter_plot = SParameterPlotWidget(self)
         self._dock_sparameter = QtWidgets.QDockWidget(
             "RF S-Parameter", self
@@ -4417,6 +4773,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._dock_plot,
             self._dock_trace,
             self._dock_stability,
+            self._dock_awg_sweep,
             self._dock_sparameter,
             self._dock_noise,
         ):
@@ -4430,6 +4787,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.splitDockWidget(self._dock_ctrl, self._dock_plot, QtCore.Qt.Horizontal)
         self.splitDockWidget(self._dock_plot, self._dock_trace, QtCore.Qt.Horizontal)
         self.tabifyDockWidget(self._dock_trace, self._dock_stability)
+        self.tabifyDockWidget(self._dock_trace, self._dock_awg_sweep)
         self.tabifyDockWidget(self._dock_trace, self._dock_sparameter)
         self.tabifyDockWidget(self._dock_trace, self._dock_noise)
         self.resizeDocks(
@@ -4924,6 +5282,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         fit_view: bool = False,
         sync_rows: bool = False,
     ) -> None:
+        if hasattr(self, "_experiment_panel"):
+            self._experiment_panel.set_sweep_specs(
+                self._active_map_sweep_specs()
+            )
         self._refresh_physical_waveforms()
         envelopes = []
         sweeps_by_segment = {}
@@ -5108,6 +5470,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if self._trace is not None:
             self._trace.fit_view()
         self._stability_panel.plot.fit_view()
+        self._awg_sweep_plot.fit_view()
         self._sparameter_plot.fit_view()
         self._noise_plot.fit_view()
 
@@ -5152,7 +5515,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_rf_specs_changed(self, specs) -> None:
         self._rf_pulse_specs = list(specs)
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._experiment_panel.set_sweep_specs(
+            self._active_map_sweep_specs()
+        )
         self._refresh_rf_timeline()
+
+    def _active_map_sweep_specs(self) -> tuple:
+        return tuple(self._sweep_specs) + tuple(
+            spec
+            for spec in getattr(self, "_rf_pulse_specs", ())
+            if spec.duration_sweep_enabled
+        )
 
     def _on_readout_spec_changed(self, spec) -> None:
         self._ddr_readout_spec = spec
@@ -5268,6 +5641,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=self._qick_full_scale_mv,
             sweep=sweep,
             sweeps=sweeps,
+            rf_pulse_specs=rf_specs,
             cross_capacitance=self._cross_capacitance.copy(),
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_type=self._bias_t_compensation_type,
@@ -5319,17 +5693,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if identified_rate_hz is None
             else 1_000_000.0 / float(identified_rate_hz)
         )
-        identified_fpga_delay_us = float(
-            getattr(
-                self._qick_configuration,
-                "fir_trigger_delay_us",
-                0.0,
-            )
-        )
         modulation_duration_us = max(
             identified_sample_period_us,
-            identified_fpga_delay_us
-            + float(stability_config.trace_samples_per_point)
+            float(stability_config.trace_samples_per_point)
             * identified_sample_period_us,
         )
         rf_specs = (
@@ -5380,6 +5746,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._stability_panel.dc_calibration_run_id.value()
             ),
             nqz=int(path["readout_nqz"]),
+            fpga_trigger_delay_samples=0,
         )
         overlap = {spec.gen_ch for spec in rf_specs}.intersection(
             self._qick_awg_channels
@@ -5397,7 +5764,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=self._qick_full_scale_mv,
             cross_capacitance=self._cross_capacitance.copy(),
             sample_period_us=identified_sample_period_us,
-            fpga_trigger_delay_us=identified_fpga_delay_us,
         )
         return {
             "connection_config": values["connection"],
@@ -6199,11 +6565,48 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.update_progress(percent, message)
         self.statusBar().showMessage(f"QICK experiment {percent}%: {message}")
 
+    def _refresh_awg_sweep_map_from_last_result(self) -> Optional[str]:
+        result = self._last_experiment_result
+        if result is None:
+            return None
+        selected = self._experiment_panel.selected_sweep_axis_keys()
+        if selected is None:
+            return None
+        try:
+            iq_values, unit, mode, _metadata = measurement_iq_values(
+                result.ddr_result.iq,
+                result.rf_settings,
+            )
+            map_result = reduce_awg_sweep_map(
+                result.ddr_result,
+                x_axis_key=selected[0],
+                y_axis_key=selected[1],
+                full_scale_mv=self._qick_full_scale_mv,
+                iq_values=iq_values,
+                value_unit=unit,
+                measurement_mode=mode,
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(
+                f"QCoDeS run {result.run_id} saved; "
+                f"AWG 2D map unavailable: {exc}"
+            )
+            return str(exc)
+        self._awg_sweep_plot.set_result(map_result)
+        self._dock_awg_sweep.show()
+        self._dock_awg_sweep.raise_()
+        return None
+
     def _on_experiment_finished(self, result) -> None:
+        self._last_experiment_result = result
         self._experiment_panel.show_result(result)
-        self.statusBar().showMessage(
+        map_error = self._refresh_awg_sweep_map_from_last_result()
+        message = (
             f"QCoDeS run {result.run_id} saved to {result.database_path}"
         )
+        if map_error:
+            message += f"; AWG 2D map unavailable: {map_error}"
+        self.statusBar().showMessage(message)
 
     def _on_experiment_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
@@ -6443,6 +6846,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "experiment_name": run.experiment_name,
                 "sample_name": run.sample_name,
                 "notes": run.notes,
+                "sweep_map": self._experiment_panel.sweep_map_settings(),
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
@@ -6501,6 +6905,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["require_within_segment"],
                 f"{label} require_within_segment",
             )
+            duration_sweep_enabled = self._json_bool(
+                entry["duration_sweep_enabled"],
+                f"{label} duration_sweep_enabled",
+            )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], f"{label} generator channel"),
                 segment_name=str(entry["segment_name"]),
@@ -6517,6 +6925,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 filter_cutoff=float(entry["filter_cutoff"]),
                 filter_bandwidth=float(entry["filter_bandwidth"]),
                 output_board_type=str(entry["output_board_type"]),
+                duration_sweep_enabled=duration_sweep_enabled,
+                duration_sweep_start_us=float(
+                    entry["duration_sweep_start_us"]
+                ),
+                duration_sweep_stop_us=float(
+                    entry["duration_sweep_stop_us"]
+                ),
+                duration_sweep_count=int(
+                    entry["duration_sweep_count"]
+                ),
+                segment_length_mode=str(entry["segment_length_mode"]),
             )
             if spec.segment_name not in set_names:
                 raise ValueError(f"unknown {label} anchor {spec.segment_name!r}")
@@ -6538,6 +6957,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "phase_degrees": spec.phase_degrees,
                     "nqz": spec.nqz,
                     "require_within_segment": spec.require_within_segment,
+                    "duration_sweep_enabled": spec.duration_sweep_enabled,
+                    "duration_sweep_start_us": spec.duration_sweep_start_us,
+                    "duration_sweep_stop_us": spec.duration_sweep_stop_us,
+                    "duration_sweep_count": spec.duration_sweep_count,
+                    "segment_length_mode": spec.segment_length_mode,
                 }
             )
         return tuple(decoded)
@@ -6854,6 +7278,43 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         experiment = data.get("experiment", {})
         if not isinstance(experiment, dict):
             raise TypeError("experiment must be a JSON object")
+        raw_sweep_map = experiment.get("sweep_map", {})
+        if raw_sweep_map is None:
+            raw_sweep_map = {}
+        if not isinstance(raw_sweep_map, dict):
+            raise TypeError("experiment sweep_map must be a JSON object")
+        available_sweep_axes = tuple(
+            (spec.output_name, spec.segment_name) for spec in sweeps
+        )
+
+        def decode_sweep_map_axis(name: str):
+            raw_axis = raw_sweep_map.get(name)
+            if raw_axis is None:
+                return None
+            if not isinstance(raw_axis, dict):
+                raise TypeError(f"experiment sweep_map {name} must be an object")
+            key = (
+                str(raw_axis.get("output_name", "")),
+                str(raw_axis.get("segment_name", "")),
+            )
+            if key not in available_sweep_axes:
+                raise ValueError(
+                    f"experiment sweep_map {name} {key!r} is not an AWG sweep"
+                )
+            return key
+
+        sweep_map_x = decode_sweep_map_axis("x_axis")
+        sweep_map_y = decode_sweep_map_axis("y_axis")
+        if len(available_sweep_axes) >= 2:
+            if sweep_map_x is None:
+                sweep_map_x = available_sweep_axes[0]
+            if sweep_map_y is None or sweep_map_y == sweep_map_x:
+                sweep_map_y = next(
+                    key for key in available_sweep_axes if key != sweep_map_x
+                )
+            sweep_map_axes = (sweep_map_x, sweep_map_y)
+        else:
+            sweep_map_axes = None
         connection_config = QickConnectionConfig(
             host=str(experiment.get("qick_host", DEFAULT_QICK_HOST)),
             ns_port=self._json_int(
@@ -7040,6 +7501,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["require_within_segment"],
                 "RF require_within_segment",
             )
+            duration_sweep_enabled = self._json_bool(
+                entry["duration_sweep_enabled"],
+                "RF duration_sweep_enabled",
+            )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], "RF generator channel"),
                 segment_name=str(entry["segment_name"]),
@@ -7056,6 +7521,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 filter_cutoff=float(entry["filter_cutoff"]),
                 filter_bandwidth=float(entry["filter_bandwidth"]),
                 output_board_type=str(entry["output_board_type"]),
+                duration_sweep_enabled=duration_sweep_enabled,
+                duration_sweep_start_us=float(
+                    entry["duration_sweep_start_us"]
+                ),
+                duration_sweep_stop_us=float(
+                    entry["duration_sweep_stop_us"]
+                ),
+                duration_sweep_count=int(
+                    entry["duration_sweep_count"]
+                ),
+                segment_length_mode=str(entry["segment_length_mode"]),
             )
             if spec.segment_name not in set_names:
                 raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
@@ -7075,6 +7551,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "phase_degrees": spec.phase_degrees,
                 "nqz": spec.nqz,
                 "require_within_segment": spec.require_within_segment,
+                "duration_sweep_enabled": spec.duration_sweep_enabled,
+                "duration_sweep_start_us": spec.duration_sweep_start_us,
+                "duration_sweep_stop_us": spec.duration_sweep_stop_us,
+                "duration_sweep_count": spec.duration_sweep_count,
+                "segment_length_mode": spec.segment_length_mode,
             }})
 
         raw_readout = data.get("rf_readout", {})
@@ -7282,6 +7763,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias_t_filter_tau_us": bias_t_filter_tau_us,
             "connection_config": connection_config,
             "run_config": run_config,
+            "sweep_map_axes": sweep_map_axes,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
             "stability_diagram": stability_settings,
@@ -7357,6 +7839,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_readout_panel.load_settings(settings["rf_readout"])
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._experiment_panel.set_sweep_specs(
+            self._active_map_sweep_specs(),
+            selected_keys=settings["sweep_map_axes"],
+        )
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
@@ -7844,6 +8330,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             event.ignore()
             return
+        if hasattr(self, "_awg_sweep_plot"):
+            self._awg_sweep_plot.close()
         super().closeEvent(event)
 
 def main():

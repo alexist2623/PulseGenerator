@@ -98,6 +98,11 @@ def _ddr_result():
     )
 
 
+@dataclass(frozen=True)
+class _FakeReadoutSpec:
+    fpga_trigger_delay_samples: int = 50
+
+
 def _worker_kwargs(tmp_path=None):
     return {
         "connection_config": QickConnectionConfig(
@@ -125,7 +130,7 @@ def _worker_kwargs(tmp_path=None):
         "repetitions_per_sweep": 2,
         "tproc_mhz": 300.0,
         "rf_specs": (),
-        "readout_spec": object(),
+        "readout_spec": _FakeReadoutSpec(),
         "progress": False,
     }
 
@@ -211,7 +216,7 @@ def test_stability_builds_dedicated_set_hold_sequence_without_awg_waveform():
     assert [item.output_name for item in sequence.sweeps] == ["awg_0", "awg_1"]
 
 
-def test_stability_50ksps_hold_covers_trace_and_fpga_delay():
+def test_stability_50ksps_hold_covers_only_immediate_trace():
     config = _config()
     sequence = stability.build_stability_hold_sequence(
         config,
@@ -219,12 +224,10 @@ def test_stability_50ksps_hold_covers_trace_and_fpga_delay():
         fabric_mhz=300.0,
         full_scale_mv=100.0,
         sample_period_us=20.0,
-        fpga_trigger_delay_us=1000.0,
     )
 
     expected_hold_us = (
         config.settle_time_us
-        + 1000.0
         + config.trace_samples_per_point * 20.0
         + stability.DEFAULT_STABILITY_POINT_GUARD_US
     )
@@ -392,7 +395,6 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
     sequence = captured["sequence"]
     expected_hold_us = (
         _config().settle_time_us
-        + profile.trigger_delay_us
         + _config().trace_samples_per_point * profile.sample_period_us
         + stability.DEFAULT_STABILITY_POINT_GUARD_US
     )
@@ -400,9 +402,9 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
         np.ceil(expected_hold_us * 300.0)
     )
     assert captured["rf_specs"][0].duration_us == (
-        profile.trigger_delay_us
-        + _config().trace_samples_per_point * profile.sample_period_us
+        _config().trace_samples_per_point * profile.sample_period_us
     )
+    assert captured["readout_spec"].fpga_trigger_delay_samples == 0
 
 
 def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):

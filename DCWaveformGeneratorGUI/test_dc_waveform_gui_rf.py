@@ -352,6 +352,96 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
     window.close()
 
 
+def test_rf_duration_sweep_controls_build_sequence_axis_and_round_trip():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.setChecked(True)
+    panel.gen_ch.setValue(0)
+    panel.segment.setCurrentIndex(panel.segment.findData("set_0"))
+    panel.duration_sweep_enabled.setChecked(True)
+    panel.duration_sweep_start.setValue(0.25)
+    panel.duration_sweep_stop.setValue(1.25)
+    panel.duration_sweep_count.setValue(5)
+    panel.segment_length_mode.setCurrentIndex(
+        panel.segment_length_mode.findData("extend_by_rf_duration")
+    )
+    app.processEvents()
+
+    arguments = window._experiment_run_arguments(
+        require_readout=False,
+        require_run_config=False,
+    )
+    axes = arguments["sequence"].sweep_axes
+    assert len(axes) == 1
+    assert axes[0].axis_kind == "rf_duration"
+    assert axes[0].gen_ch == 0
+    assert axes[0].start == 0.25
+    assert axes[0].stop == 1.25
+    assert axes[0].count == 5
+    assert axes[0].segment_length_mode == "extend_by_rf_duration"
+    assert window._experiment_panel.sweep_map_x.itemText(0).startswith(
+        "RF gen 0"
+    )
+
+    settings = panel.settings_dict()
+    restored = gui.RfPulsePortPanel(
+        window._pulse[0],
+        0,
+        time_unit="us",
+    )
+    restored.load_settings(settings)
+    restored_spec = restored.spec()
+    assert restored_spec is not None
+    assert restored_spec.duration_sweep_enabled is True
+    assert restored_spec.duration_sweep_start_us == 0.25
+    assert restored_spec.duration_sweep_stop_us == 1.25
+    assert restored_spec.duration_sweep_count == 5
+    assert restored_spec.segment_length_mode == "extend_by_rf_duration"
+    window.close()
+
+
+def test_generated_qick_module_preserves_rf_duration_sweep_mode():
+    pulse = PulseSequence(0.0, initial_duration_ns=10_000.0)
+    rf_spec = QickRfPulseSpec(
+        0,
+        "set_0",
+        0.5,
+        1.0,
+        50.0,
+        12_000,
+        10.0,
+        12.0,
+        duration_sweep_enabled=True,
+        duration_sweep_start_us=1.0,
+        duration_sweep_stop_us=4.0,
+        duration_sweep_count=4,
+        segment_length_mode="extend_by_rf_duration",
+    )
+    code = generate_qick_program_code(
+        (pulse,),
+        output_names=("awg_0",),
+        awg_channels=(1,),
+        tproc_mhz=300.0,
+        rf_pulse_specs=(rf_spec,),
+    )
+    ast.parse(code)
+    namespace = {}
+    exec(compile(code, "<rf-duration-generated>", "exec"), namespace)
+
+    sequence = namespace["build_sequence"]()
+    assert len(sequence.sweep_axes) == 1
+    axis = sequence.sweep_axes[0]
+    assert axis.axis_kind == "rf_duration"
+    assert axis.points == (1.0, 2.0, 3.0, 4.0)
+    assert axis.segment_length_mode == "extend_by_rf_duration"
+    runtime_rf = namespace["build_rf_pulses"]({
+        "gens": [{"f_fabric": 300.0}],
+    })
+    assert len(runtime_rf) == 1
+    assert runtime_rf[0].length_cycles == 300
+
+
 def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     app = _application()
     window = gui.MainWindow()
@@ -834,14 +924,14 @@ def test_stability_run_arguments_use_identified_50ksps_timing():
 
     expected_hold_us = (
         25.0
-        + 1000.0
         + 100 * 20.0
         + DEFAULT_STABILITY_POINT_GUARD_US
     )
     assert arguments["sequence"].segments[0].duration_cycles == int(
         np.ceil(expected_hold_us * 300.0)
     )
-    assert arguments["rf_specs"][0].duration_us == 3000.0
+    assert arguments["rf_specs"][0].duration_us == 2000.0
+    assert arguments["readout_spec"].fpga_trigger_delay_samples == 0
     assert arguments["stability_fabric_mhz"] == 300.0
     app.processEvents()
     window.close()
@@ -1086,7 +1176,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 25
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 27
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

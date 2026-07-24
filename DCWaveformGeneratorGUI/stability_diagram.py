@@ -542,12 +542,13 @@ def build_stability_hold_sequence(
     full_scale_mv: float,
     cross_capacitance=None,
     sample_period_us: float = 1.0,
-    fpga_trigger_delay_us: float = 0.0,
 ):
     """Build the dedicated SET-and-hold sequence for one Cartesian scan.
 
     Each hardware sweep point issues one SET on ``set_0`` and holds that
     voltage through the settle interval and the complete HWH-selected FIR capture.
+    Stability capture reads the continuously running FIR stream immediately;
+    it does not add the DDR V2 event-alignment delay to every point.
     No RAMP or SET segment from the AWG Tuning tab is copied into this path.
     """
     config.validate_full_scale(full_scale_mv)
@@ -566,15 +567,8 @@ def build_stability_hold_sequence(
     )
     if sample_period_us <= 0.0:
         raise ValueError("stability FIR sample period must be positive")
-    fpga_trigger_delay_us = _finite_float(
-        fpga_trigger_delay_us,
-        "stability FPGA trigger delay",
-    )
-    if fpga_trigger_delay_us < 0.0:
-        raise ValueError("stability FPGA trigger delay must be nonnegative")
     hold_duration_us = (
         float(config.settle_time_us)
-        + fpga_trigger_delay_us
         + float(config.trace_samples_per_point) * sample_period_us
         + DEFAULT_STABILITY_POINT_GUARD_US
     )
@@ -855,12 +849,10 @@ class StabilityDiagramWorker(QtCore.QObject):
                 full_scale_mv=full_scale_mv,
                 cross_capacitance=template_sequence.cross_capacitance,
                 sample_period_us=fir_profile.sample_period_us,
-                fpga_trigger_delay_us=fir_profile.trigger_delay_us,
             )
             kwargs["sequence"] = sequence
         capture_window_us = (
-            fir_profile.trigger_delay_us
-            + stability_config.trace_samples_per_point
+            stability_config.trace_samples_per_point
             * fir_profile.sample_period_us
         )
         kwargs["rf_specs"] = tuple(
@@ -873,12 +865,19 @@ class StabilityDiagramWorker(QtCore.QObject):
             )
             for spec in kwargs.get("rf_specs", ())
         )
+        if hasattr(kwargs["readout_spec"], "__dataclass_fields__"):
+            kwargs["readout_spec"] = replace(
+                kwargs["readout_spec"],
+                fpga_trigger_delay_samples=0,
+            )
         self.progress_changed.emit(
             2,
             (
-                f"HWH FIR DDR: {fir_profile.timing_label}; "
+                f"HWH FIR DDR: "
+                f"{getattr(fir_profile, 'rate_label', format_sample_rate_hz(fir_profile.sample_rate_hz))} "
+                f"({fir_profile.sample_period_us:g} us/sample); "
                 f"{stability_config.trace_samples_per_point:,} samples = "
-                f"{stability_config.trace_samples_per_point * fir_profile.sample_period_us:g} us"
+                f"{capture_window_us:g} us; Stability capture delay 0 samples"
             ),
         )
         if self._stop_event.is_set():
@@ -930,9 +929,11 @@ class StabilityDiagramWorker(QtCore.QObject):
                 "fir_rate_profile": fir_profile.name,
                 "fir_sample_rate_hz": fir_profile.sample_rate_hz,
                 "fir_sample_period_us": fir_profile.sample_period_us,
-                "fir_fpga_trigger_delay_samples": (
+                "fir_fpga_trigger_delay_samples": 0,
+                "fir_profile_default_trigger_delay_samples": (
                     fir_profile.trigger_delay_samples
                 ),
+                "fir_stability_capture_mode": "immediate_continuous_fir_output",
                 "fir_software_warmup_compensation": (
                     fir_profile.software_warmup_compensation
                 ),
@@ -1709,9 +1710,6 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "fir_sample_rate_hz",
             None,
         )
-        self._fir_trigger_delay_us = float(
-            getattr(configuration, "fir_trigger_delay_us", 0.0)
-        )
         self._update_fir_trace_duration()
 
     def _update_fir_trace_duration(self, *_args) -> None:
@@ -1722,15 +1720,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             return
         sample_period_us = 1_000_000.0 / self._fir_sample_rate_hz
         trace_us = self.trace_samples.value() * sample_period_us
-        delay_text = (
-            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
-            if self._fir_trigger_delay_us > 0.0
-            else ""
-        )
         self.fir_profile_status.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{self.trace_samples.value():,} samples = {trace_us:g} us"
-            f"{delay_text}"
+            "; Stability capture delay 0 samples"
         )
 
     def front_panel_values(self) -> Mapping[str, Any]:

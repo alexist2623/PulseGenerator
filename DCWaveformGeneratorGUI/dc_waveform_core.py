@@ -35,6 +35,7 @@ DEFAULT_BIAS_T_COMPENSATION_DURATION_US = 1.0
 DEFAULT_BIAS_T_FILTER_TAU_US = 100.0
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
+RF_SEGMENT_LENGTH_MODES = ("fixed", "extend_by_rf_duration")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -175,6 +176,14 @@ class QickSweepSpec:
             raise ValueError("sweep endpoints must be inside [-1.0, 1.0]")
         _positive_int(self.count, "sweep count")
 
+    @property
+    def axis_kind(self) -> str:
+        return "amplitude"
+
+    @property
+    def coordinate_unit(self) -> str:
+        return "normalized"
+
 
 def _coerce_sweep_specs(
     sweep: Optional[QickSweepSpec],
@@ -237,6 +246,11 @@ class QickRfPulseSpec:
     filter_cutoff: float = 2.5
     filter_bandwidth: float = 1.0
     output_board_type: str = "RF_Out"
+    duration_sweep_enabled: bool = False
+    duration_sweep_start_us: float = 1.0
+    duration_sweep_stop_us: float = 1.0
+    duration_sweep_count: int = 1
+    segment_length_mode: str = "fixed"
 
     def __post_init__(self) -> None:
         _bounded_int(self.gen_ch, "RF generator channel", 0, 1_000_000)
@@ -264,6 +278,22 @@ class QickRfPulseSpec:
             raise ValueError(
                 f"output_board_type must be one of {QICK_OUTPUT_BOARD_TYPES}"
             )
+        if not isinstance(self.duration_sweep_enabled, bool):
+            raise TypeError("RF duration_sweep_enabled must be bool")
+        _positive_real(
+            self.duration_sweep_start_us,
+            "RF duration_sweep_start_us",
+        )
+        _positive_real(
+            self.duration_sweep_stop_us,
+            "RF duration_sweep_stop_us",
+        )
+        _positive_int(self.duration_sweep_count, "RF duration_sweep_count")
+        if self.segment_length_mode not in RF_SEGMENT_LENGTH_MODES:
+            raise ValueError(
+                "RF segment_length_mode must be one of "
+                f"{RF_SEGMENT_LENGTH_MODES}"
+            )
 
     @property
     def effective_att1_db(self) -> float:
@@ -272,6 +302,31 @@ class QickRfPulseSpec:
     @property
     def effective_att2_db(self) -> float:
         return float(self.att2_db) if self.output_board_type == "RF_Out" else 0.0
+
+    @property
+    def output_name(self) -> str:
+        """Stable sweep-axis name used by QCoDeS and the 2-D map."""
+        return f"rf_gen_{int(self.gen_ch)}"
+
+    @property
+    def start(self) -> float:
+        return float(self.duration_sweep_start_us)
+
+    @property
+    def stop(self) -> float:
+        return float(self.duration_sweep_stop_us)
+
+    @property
+    def count(self) -> int:
+        return int(self.duration_sweep_count)
+
+    @property
+    def axis_kind(self) -> str:
+        return "rf_duration"
+
+    @property
+    def coordinate_unit(self) -> str:
+        return "us"
 
 
 @dataclass(frozen=True)
@@ -299,6 +354,7 @@ class QickDdrReadoutSpec:
     dc_voltage_calibration_database_path: str = ""
     dc_voltage_calibration_run_id: int = 0
     nqz: int = 1
+    fpga_trigger_delay_samples: Optional[int] = None
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -306,6 +362,13 @@ class QickDdrReadoutSpec:
             raise ValueError("DDR segment_name must not be empty")
         _nonnegative_real(self.delay_us, "DDR delay_us")
         _positive_int(self.samples_per_trigger, "DDR samples_per_trigger")
+        if self.fpga_trigger_delay_samples is not None:
+            _bounded_int(
+                self.fpga_trigger_delay_samples,
+                "DDR fpga_trigger_delay_samples",
+                0,
+                (1 << 32) - 1,
+            )
         _finite_real(self.readout_frequency_mhz, "DDR readout_frequency_mhz")
         _bounded_int(self.nqz, "DDR readout nqz", 1, 2)
         _bounded_int(self.margin_input_samples, "DDR margin_input_samples", 0, 1 << 30)
@@ -671,6 +734,7 @@ def build_qick_sequence(
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
     sweep: Optional[QickSweepSpec] = None,
     sweeps: Optional[Sequence[QickSweepSpec]] = None,
+    rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
     bias_t_compensation_type: str = "dc",
@@ -758,6 +822,21 @@ def build_qick_sequence(
             start=sweep_spec.start,
             stop=sweep_spec.stop,
             count=sweep_spec.count,
+        )
+    normalized_rf_specs = tuple(rf_pulse_specs or ())
+    if any(not isinstance(spec, QickRfPulseSpec) for spec in normalized_rf_specs):
+        raise TypeError("every RF pulse entry must be a QickRfPulseSpec")
+    for rf_spec in normalized_rf_specs:
+        if not rf_spec.duration_sweep_enabled:
+            continue
+        sequence.add_rf_duration_sweep(
+            segment=rf_spec.segment_name,
+            gen_ch=rf_spec.gen_ch,
+            start_us=rf_spec.duration_sweep_start_us,
+            stop_us=rf_spec.duration_sweep_stop_us,
+            count=rf_spec.duration_sweep_count,
+            segment_length_mode=rf_spec.segment_length_mode,
+            sequence_fabric_mhz=fabric_mhz,
         )
     sequence._validate()
     return sequence
@@ -1032,6 +1111,15 @@ def generate_qick_program_code(
             "filter_cutoff": float(spec.filter_cutoff),
             "filter_bandwidth": float(spec.filter_bandwidth),
             "output_board_type": str(spec.output_board_type),
+            "duration_sweep_enabled": bool(spec.duration_sweep_enabled),
+            "duration_sweep_start_us": float(
+                spec.duration_sweep_start_us
+            ),
+            "duration_sweep_stop_us": float(
+                spec.duration_sweep_stop_us
+            ),
+            "duration_sweep_count": int(spec.duration_sweep_count),
+            "segment_length_mode": str(spec.segment_length_mode),
         }
         for spec in normalized_rf_specs
     )
@@ -1140,6 +1228,22 @@ def generate_qick_program_code(
                 "    )",
             ]
         )
+    for rf_spec in normalized_rf_specs:
+        if not rf_spec.duration_sweep_enabled:
+            continue
+        lines.extend(
+            [
+                "    sequence.add_rf_duration_sweep(",
+                f"        segment={rf_spec.segment_name!r},",
+                f"        gen_ch={int(rf_spec.gen_ch)},",
+                f"        start_us={float(rf_spec.duration_sweep_start_us)!r},",
+                f"        stop_us={float(rf_spec.duration_sweep_stop_us)!r},",
+                f"        count={int(rf_spec.duration_sweep_count)},",
+                f"        segment_length_mode={rf_spec.segment_length_mode!r},",
+                "        sequence_fabric_mhz=FABRIC_MHZ,",
+                "    )",
+            ]
+        )
     lines.extend(
         [
             "    return sequence",
@@ -1157,7 +1261,10 @@ def generate_qick_program_code(
             "            gen_ch=cfg['gen_ch'],",
             "            at_segment=cfg['segment_name'],",
             "            length_cycles=cycles_from_us(",
-            "                cfg['duration_us'], gen_cfg['f_fabric']",
+            "                (cfg['duration_sweep_start_us']",
+            "                 if cfg['duration_sweep_enabled']",
+            "                 else cfg['duration_us']),",
+            "                gen_cfg['f_fabric']",
             "            ),",
             "            gain=cfg['gain'],",
             "            freq_mhz=cfg['frequency_mhz'],",

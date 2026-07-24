@@ -84,6 +84,8 @@ def test_all_fir_gui_tabs_display_hwh_selected_rate(
     stability.set_front_panel_configuration(configuration)
     assert rate_text in stability.fir_profile_status.text()
     assert f"100 samples = {trace_time_us:g} us" in stability.fir_profile_status.text()
+    assert "Stability capture delay 0 samples" in stability.fir_profile_status.text()
+    assert "FPGA delay 1000 us" not in stability.fir_profile_status.text()
 
     sparameter = SParameterSweepPanel()
     sparameter.scan_time_us.setValue(101.0)

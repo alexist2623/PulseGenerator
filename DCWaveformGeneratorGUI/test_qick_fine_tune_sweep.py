@@ -446,6 +446,110 @@ def test_long_rf_pulse_uses_periodic_start_and_timed_zero_stop():
     assert rf_events[3].cycle - rf_events[2].cycle == 300_000
 
 
+@pytest.mark.parametrize(
+    ("segment_length_mode", "expected_ramp_offsets"),
+    [
+        ("fixed", [92, 92, 92]),
+        ("extend_by_rf_duration", [102, 112, 122]),
+    ],
+)
+def test_rf_duration_sweep_updates_stop_and_selected_segment_timing(
+    segment_length_mode,
+    expected_ramp_offsets,
+):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 100)
+    sequence.add_ramp("to_end", 20)
+    sequence.add_set("end", (0.25,), 100)
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        10 / 300,
+        30 / 300,
+        3,
+        segment_length_mode=segment_length_mode,
+        sequence_fabric_mhz=300.0,
+    )
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="gate",
+        length_cycles=10,
+        gain=12_000,
+        require_within_segment=True,
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulse=rf,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    tproc.run(program.prog_list, max_steps=100_000)
+    rf_events = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and ((event.word >> 152) & 0xFF) == 0
+    ]
+    assert len(rf_events) == 6
+    assert [
+        rf_events[index + 1].cycle - rf_events[index].cycle
+        for index in range(0, len(rf_events), 2)
+    ] == [10, 20, 30]
+
+    awg_ramps = [
+        event
+        for event in tproc.output_events
+        if (
+            event.tproc_ch == 0
+            and ((event.word >> 152) & 0xFF) == 1
+            and ((event.word >> 144) & 0x3) == 0b10
+        )
+    ]
+    assert len(awg_ramps) == 3
+    assert [
+        ramp.cycle - rf_events[2 * index].cycle
+        for index, ramp in enumerate(awg_ramps)
+    ] == expected_ramp_offsets
+    expected_segment_lengths = (
+        [100, 100, 100]
+        if segment_length_mode == "fixed"
+        else [110, 120, 130]
+    )
+    assert [
+        sequence.segment_duration_cycles_at(point_index, 0)
+        for point_index in range(3)
+    ] == expected_segment_lengths
+
+
+def test_rf_duration_is_a_cartesian_axis_with_amplitude_sweep():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 100)
+    sequence.add_amplitude_sweep("gate", "awg_0", -0.25, 0.25, 2)
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        10 / 300,
+        30 / 300,
+        3,
+        sequence_fabric_mhz=300.0,
+    )
+    assert sequence.sweep_shape == (2, 3)
+    np.testing.assert_allclose(
+        sequence.sweep_coordinates,
+        [
+            [-0.25, 10 / 300],
+            [-0.25, 20 / 300],
+            [-0.25, 30 / 300],
+            [0.25, 10 / 300],
+            [0.25, 20 / 300],
+            [0.25, 30 / 300],
+        ],
+    )
+
+
 def test_rf_and_readout_phase_reset_are_fixed_off():
     rf = RfPulseConfig(
         gen_ch=0,

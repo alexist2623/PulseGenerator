@@ -18,6 +18,7 @@ from qick_fine_tune_sweep import (
     AmplitudeSweep,
     FineTuneDdrResult,
     FineTuneSequence,
+    RfDurationSweep,
 )
 from qick_qcodes_experiment import (
     I_TRACE_PARAMETER,
@@ -49,6 +50,27 @@ def test_sweep_parameter_names_identify_output_segment_and_voltage_unit():
     assert _sweep_parameter_names(axes) == (
         "awg_0_set_1_voltage_mv",
         "awg_3_gate_hold_voltage_mv",
+    )
+
+
+def test_sweep_parameter_names_preserve_rf_duration_units():
+    axes = (
+        AmplitudeSweep("gate", "awg_0", -0.5, 0.5, 3),
+        RfDurationSweep(
+            segment_name="gate",
+            output_name="rf_gen_2",
+            gen_ch=2,
+            start=1.0,
+            stop=5.0,
+            count=5,
+            segment_length_mode="extend_by_rf_duration",
+            sequence_fabric_mhz=300.0,
+        ),
+    )
+
+    assert _sweep_parameter_names(axes) == (
+        "awg_0_gate_voltage_mv",
+        "rf_gen_2_gate_duration_us",
     )
 
 
@@ -572,6 +594,43 @@ def test_awg_vertex_metadata_stores_all_sweep_points_in_both_spaces():
     assert virtual["value_shape"] == [3, 2, 4]
     assert virtual["values_mv"][0][0] == [0.0, 0.0, -20.0, -20.0]
     assert physical["values_mv"][0][1] == [0.0, 0.0, -20.0, -20.0]
+
+
+def test_awg_vertex_metadata_tracks_segment_extension_per_rf_duration():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.25,), 300)
+    sequence.add_ramp("to_end", 30)
+    sequence.add_set("end", (0.0,), 30)
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        1.0,
+        3.0,
+        3,
+        segment_length_mode="extend_by_rf_duration",
+        sequence_fabric_mhz=300.0,
+    )
+
+    metadata = build_awg_vertex_metadata(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+    )
+    virtual = metadata["virtual"]
+    assert virtual["schema"] == "qick-awg-waveform-vertices-v2"
+    assert virtual["time_cycles"] == [
+        [0.0, 600.0, 630.0, 660.0],
+        [0.0, 900.0, 930.0, 960.0],
+        [0.0, 1200.0, 1230.0, 1260.0],
+    ]
+    np.testing.assert_allclose(
+        virtual["time_us"],
+        [
+            [0.0, 2.0, 2.1, 2.2],
+            [0.0, 3.0, 3.1, 3.2],
+            [0.0, 4.0, 4.1, 4.2],
+        ],
+    )
 
 
 def test_runtime_configs_accept_manual_tproc_clock_override():
