@@ -180,11 +180,13 @@ except ImportError:
 try:
     from .awg_sweep_map import (
         AwgSweepMapPlotWidget,
+        normalize_awg_sweep_color_ranges,
         reduce_awg_sweep_map,
     )
 except ImportError:
     from awg_sweep_map import (
         AwgSweepMapPlotWidget,
+        normalize_awg_sweep_color_ranges,
         reduce_awg_sweep_map,
     )
 
@@ -288,7 +290,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 27
+SETTINGS_VERSION = 29
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -337,6 +339,7 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "dc_gain_db": 0.0,
     "dc_measure_mode": False,
     "dc_measure_gain_v_per_a": DEFAULT_DC_MEASURE_GAIN_V_PER_A,
+    "measurement_representation": "adc",
     "dc_voltage_calibration_enabled": False,
     "dc_voltage_calibration_database_path": "",
     "dc_voltage_calibration_run_id": 0,
@@ -2678,6 +2681,15 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "DC_In only: use identity ADC-to-voltage conversion, then divide "
             "I and Q by the measurement gain"
         )
+        self.measurement_unit = QtWidgets.QComboBox()
+        self.measurement_unit.addItem("ADC units", "adc")
+        self.measurement_unit.addItem("Voltage", "voltage")
+        self.measurement_unit.addItem("Current", "current")
+        self.measurement_unit.setToolTip(
+            "Select the stored and plotted FIR I/Q representation. Voltage "
+            "and current are available for DC_In; current divides calibrated "
+            "voltage by the measurement gain."
+        )
         self.dc_measure_gain_v_per_a = QtWidgets.QDoubleSpinBox()
         self.dc_measure_gain_v_per_a.setRange(1.0e-9, 1.0e15)
         self.dc_measure_gain_v_per_a.setDecimals(6)
@@ -2748,6 +2760,10 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.dc_voltage_calibration_run_id.setSpecialValueText(
             "Latest matching channel/gain"
         )
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.setContentsMargins(0, 0, 0, 0)
+        calibration_path_row.addWidget(self.dc_voltage_calibration_path, 1)
+        calibration_path_row.addWidget(self.dc_voltage_calibration_browse)
 
         self.front_panel_preview = QickFrontPanelPreview(self)
         self.front_panel_preview.activated.connect(
@@ -2768,8 +2784,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow("Readout/DDC frequency:", self.frequency_mhz)
         self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
         form.addRow(self.input_condition_label, self.input_condition_stack)
-        form.addRow(self.dc_measure_mode)
+        form.addRow("Stored/display unit:", self.measurement_unit)
         form.addRow("DC measurement gain:", self.dc_measure_gain_v_per_a)
+        form.addRow(self.dc_voltage_calibration_enabled)
+        form.addRow("Calibration DB:", calibration_path_row)
+        form.addRow("Calibration Run ID:", self.dc_voltage_calibration_run_id)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
@@ -2796,6 +2815,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.frequency_mhz,
             self.attenuation_db,
             self.dc_gain_db,
+            self.measurement_unit,
             self.dc_measure_mode,
             self.dc_measure_gain_v_per_a,
             self.dc_voltage_calibration_enabled,
@@ -2822,9 +2842,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.input_board_type.currentTextChanged.connect(
             self._update_board_controls
         )
-        self.dc_measure_mode.toggled.connect(self._update_board_controls)
+        self.measurement_unit.currentIndexChanged.connect(
+            self._measurement_representation_changed
+        )
+        self.dc_measure_mode.toggled.connect(
+            self._legacy_dc_measure_mode_changed
+        )
         self.dc_voltage_calibration_enabled.toggled.connect(
-            self._update_board_controls
+            self._calibration_toggled
         )
         self.dc_voltage_calibration_browse.clicked.connect(
             self._browse_dc_voltage_calibration
@@ -2834,12 +2859,17 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
 
     def _update_board_controls(self, *_args) -> None:
         rf_input = self.input_board_type.currentText() == "RF_In"
-        if rf_input and self.dc_measure_mode.isChecked():
-            with QtCore.QSignalBlocker(self.dc_measure_mode):
-                self.dc_measure_mode.setChecked(False)
+        if rf_input and self.measurement_unit.currentData() != "adc":
+            with QtCore.QSignalBlocker(self.measurement_unit):
+                self.measurement_unit.setCurrentIndex(
+                    self.measurement_unit.findData("adc")
+                )
         if rf_input and self.dc_voltage_calibration_enabled.isChecked():
             with QtCore.QSignalBlocker(self.dc_voltage_calibration_enabled):
                 self.dc_voltage_calibration_enabled.setChecked(False)
+        representation = str(self.measurement_unit.currentData())
+        with QtCore.QSignalBlocker(self.dc_measure_mode):
+            self.dc_measure_mode.setChecked(representation == "current")
         self.input_condition_stack.setCurrentIndex(0 if rf_input else 1)
         self.input_condition_label.setText(
             "Input attenuation:" if rf_input else "DC input gain:"
@@ -2847,9 +2877,10 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_type.setEnabled(rf_input)
         self.filter_cutoff.setEnabled(rf_input)
         self.filter_bandwidth.setEnabled(rf_input)
+        self.measurement_unit.setEnabled(not rf_input)
         self.dc_measure_mode.setEnabled(not rf_input)
         self.dc_measure_gain_v_per_a.setEnabled(
-            not rf_input and self.dc_measure_mode.isChecked()
+            not rf_input and representation == "current"
         )
         calibration_enabled = (
             not rf_input and self.dc_voltage_calibration_enabled.isChecked()
@@ -2866,6 +2897,40 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.filter_type.setToolTip(tooltip)
         self.filter_cutoff.setToolTip(tooltip)
         self.filter_bandwidth.setToolTip(tooltip)
+
+    def _measurement_representation_changed(self, *_args) -> None:
+        self._update_board_controls()
+        self._emit_spec()
+
+    def _legacy_dc_measure_mode_changed(self, checked: bool) -> None:
+        representation = (
+            "current"
+            if checked
+            else (
+                "voltage"
+                if self.dc_voltage_calibration_enabled.isChecked()
+                else "adc"
+            )
+        )
+        with QtCore.QSignalBlocker(self.measurement_unit):
+            self.measurement_unit.setCurrentIndex(
+                self.measurement_unit.findData(representation)
+            )
+        self._update_board_controls()
+        self._emit_spec()
+
+    def _calibration_toggled(self, checked: bool) -> None:
+        if (
+            checked
+            and self.input_board_type.currentText() == "DC_In"
+            and self.measurement_unit.currentData() == "adc"
+        ):
+            with QtCore.QSignalBlocker(self.measurement_unit):
+                self.measurement_unit.setCurrentIndex(
+                    self.measurement_unit.findData("voltage")
+                )
+        self._update_board_controls()
+        self._emit_spec()
 
     def _browse_dc_voltage_calibration(self) -> None:
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -2980,6 +3045,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             dc_gain_db=self.dc_gain_db.value(),
             dc_measure_mode=self.dc_measure_mode.isChecked(),
             dc_measure_gain_v_per_a=self.dc_measure_gain_v_per_a.value(),
+            measurement_representation=str(
+                self.measurement_unit.currentData()
+            ),
             dc_voltage_calibration_enabled=(
                 self.dc_voltage_calibration_enabled.isChecked()
             ),
@@ -3003,6 +3071,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             raise ValueError("DC measure mode requires the DC_In input board")
         with QtCore.QSignalBlocker(self.dc_measure_mode):
             self.dc_measure_mode.setChecked(bool(enabled))
+        representation = "current" if enabled else "adc"
+        with QtCore.QSignalBlocker(self.measurement_unit):
+            self.measurement_unit.setCurrentIndex(
+                self.measurement_unit.findData(representation)
+            )
         with QtCore.QSignalBlocker(self.dc_measure_gain_v_per_a):
             self.dc_measure_gain_v_per_a.setValue(float(gain_v_per_a))
         self._update_board_controls()
@@ -3037,6 +3110,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.dc_voltage_calibration_run_id.setValue(int(run_id))
         with QtCore.QSignalBlocker(self.dc_voltage_calibration_enabled):
             self.dc_voltage_calibration_enabled.setChecked(bool(enabled))
+        if enabled and self.measurement_unit.currentData() == "adc":
+            with QtCore.QSignalBlocker(self.measurement_unit):
+                self.measurement_unit.setCurrentIndex(
+                    self.measurement_unit.findData("voltage")
+                )
         self._update_board_controls()
         self._emit_spec()
 
@@ -3057,6 +3135,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "dc_gain_db": spec.dc_gain_db,
             "dc_measure_mode": spec.dc_measure_mode,
             "dc_measure_gain_v_per_a": spec.dc_measure_gain_v_per_a,
+            "measurement_representation": (
+                spec.effective_measurement_representation
+            ),
             "dc_voltage_calibration_enabled": (
                 spec.dc_voltage_calibration_enabled
             ),
@@ -3084,6 +3165,22 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         dc_measure_mode = data.get("dc_measure_mode", False)
         if not isinstance(dc_measure_mode, bool):
             raise TypeError("RF readout dc_measure_mode must be boolean")
+        raw_representation = data.get("measurement_representation")
+        if raw_representation is None or raw_representation == "auto":
+            raw_representation = (
+                "current"
+                if dc_measure_mode
+                else (
+                    "voltage"
+                    if bool(
+                        data.get(
+                            "dc_voltage_calibration_enabled",
+                            False,
+                        )
+                    )
+                    else "adc"
+                )
+            )
         spec = QickDdrReadoutSpec(
             ro_ch=int(data["ro_ch"]),
             segment_name=str(data["segment_name"]),
@@ -3108,6 +3205,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                     DEFAULT_DC_MEASURE_GAIN_V_PER_A,
                 )
             ),
+            measurement_representation=str(raw_representation),
             dc_voltage_calibration_enabled=bool(
                 data.get("dc_voltage_calibration_enabled", False)
             ),
@@ -3142,6 +3240,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.attenuation_db.setValue(spec.attenuation_db)
             self.dc_gain_db.setValue(spec.dc_gain_db)
             self.dc_measure_mode.setChecked(spec.dc_measure_mode)
+            self.measurement_unit.setCurrentIndex(
+                self.measurement_unit.findData(
+                    spec.effective_measurement_representation
+                )
+            )
             self.dc_measure_gain_v_per_a.setValue(
                 spec.dc_measure_gain_v_per_a
             )
@@ -5531,21 +5634,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec = spec
         if spec is None:
             self.statusBar().showMessage("RF readout disabled")
-        elif spec.dc_measure_mode:
+        elif spec.effective_measurement_representation == "current":
             self.statusBar().showMessage(
                 f"DC current readout {spec.ro_ch}: "
                 f"{spec.samples_per_trigger} stored FIR samples, "
                 f"gain {spec.dc_measure_gain_v_per_a:g} V/A"
             )
-        elif spec.dc_voltage_calibration_enabled:
+        elif spec.effective_measurement_representation == "voltage":
             run_label = (
                 "latest matching"
                 if spec.dc_voltage_calibration_run_id == 0
                 else f"Run {spec.dc_voltage_calibration_run_id}"
             )
+            calibration_label = (
+                run_label
+                if spec.dc_voltage_calibration_enabled
+                else "identity ADC-to-voltage"
+            )
             self.statusBar().showMessage(
-                f"Calibrated DC voltage readout {spec.ro_ch}: "
-                f"{spec.samples_per_trigger} stored FIR samples, {run_label}"
+                f"DC voltage readout {spec.ro_ch}: "
+                f"{spec.samples_per_trigger} stored FIR samples, "
+                f"{calibration_label}"
             )
         else:
             self.statusBar().showMessage(
@@ -5735,6 +5844,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             dc_measure_mode=self._stability_panel.dc_measure_mode.isChecked(),
             dc_measure_gain_v_per_a=(
                 self._stability_panel.dc_measure_gain_v_per_a.value()
+            ),
+            measurement_representation=str(
+                self._stability_panel.measurement_unit.currentData()
             ),
             dc_voltage_calibration_enabled=(
                 self._stability_panel.dc_calibration_group.isChecked()
@@ -6792,6 +6904,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._bias_t_filter_tau_us = experiment_values["bias_t_filter_tau_us"]
         stability_settings = self._stability_panel.settings_dict()
+        sweep_map_settings = self._experiment_panel.sweep_map_settings()
+        sweep_map_settings["color_ranges"] = (
+            self._awg_sweep_plot.color_range_settings()
+        )
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
@@ -6846,7 +6962,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "experiment_name": run.experiment_name,
                 "sample_name": run.sample_name,
                 "notes": run.notes,
-                "sweep_map": self._experiment_panel.sweep_map_settings(),
+                "sweep_map": sweep_map_settings,
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
             "rf_readout": self._rf_readout_panel.settings_dict(),
@@ -6978,7 +7094,23 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_entry = {}
         if not isinstance(raw_entry, dict):
             raise TypeError(f"{label} must be a JSON object")
+        representation_explicit = "measurement_representation" in raw_entry
         entry = {**DEFAULT_RF_READOUT_SETTINGS, **raw_entry}
+        if not representation_explicit:
+            entry["measurement_representation"] = (
+                "current"
+                if bool(entry.get("dc_measure_mode", False))
+                else (
+                    "voltage"
+                    if bool(
+                        entry.get(
+                            "dc_voltage_calibration_enabled",
+                            False,
+                        )
+                    )
+                    else "adc"
+                )
+            )
         enabled = self._json_bool(entry["enabled"], f"{label} enabled")
         spec = QickDdrReadoutSpec(
             ro_ch=self._json_int(entry["ro_ch"], f"{label} channel"),
@@ -7017,6 +7149,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"{label} dc_measure_gain_v_per_a",
                 positive=True,
             ),
+            measurement_representation=str(
+                entry.get("measurement_representation", "auto")
+            ),
             dc_voltage_calibration_enabled=self._json_bool(
                 entry.get("dc_voltage_calibration_enabled", False),
                 f"{label} dc_voltage_calibration_enabled",
@@ -7047,6 +7182,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "dc_gain_db": spec.dc_gain_db,
             "dc_measure_mode": spec.dc_measure_mode,
             "dc_measure_gain_v_per_a": spec.dc_measure_gain_v_per_a,
+            "measurement_representation": (
+                spec.effective_measurement_representation
+            ),
             "dc_voltage_calibration_enabled": (
                 spec.dc_voltage_calibration_enabled
             ),
@@ -7283,6 +7421,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_sweep_map = {}
         if not isinstance(raw_sweep_map, dict):
             raise TypeError("experiment sweep_map must be a JSON object")
+        sweep_map_color_ranges = normalize_awg_sweep_color_ranges(
+            raw_sweep_map.get("color_ranges")
+        )
         available_sweep_axes = tuple(
             (spec.output_name, spec.segment_name) for spec in sweeps
         )
@@ -7563,7 +7704,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_readout = {}
         if not isinstance(raw_readout, dict):
             raise TypeError("rf_readout must be a JSON object")
+        representation_explicit = (
+            "measurement_representation" in raw_readout
+        )
         raw_readout = {**DEFAULT_RF_READOUT_SETTINGS, **raw_readout}
+        if not representation_explicit:
+            raw_readout["measurement_representation"] = (
+                "current"
+                if bool(raw_readout.get("dc_measure_mode", False))
+                else (
+                    "voltage"
+                    if bool(
+                        raw_readout.get(
+                            "dc_voltage_calibration_enabled",
+                            False,
+                        )
+                    )
+                    else "adc"
+                )
+            )
         readout_enabled = self._json_bool(
             raw_readout["enabled"], "RF readout enabled"
         )
@@ -7605,6 +7764,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "RF readout dc_measure_gain_v_per_a",
                 positive=True,
             ),
+            measurement_representation=str(
+                raw_readout.get("measurement_representation", "auto")
+            ),
             dc_voltage_calibration_enabled=self._json_bool(
                 raw_readout.get("dc_voltage_calibration_enabled", False),
                 "RF readout dc_voltage_calibration_enabled",
@@ -7639,6 +7801,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "dc_gain_db": readout_spec.dc_gain_db,
             "dc_measure_mode": readout_spec.dc_measure_mode,
             "dc_measure_gain_v_per_a": readout_spec.dc_measure_gain_v_per_a,
+            "measurement_representation": (
+                readout_spec.effective_measurement_representation
+            ),
             "dc_voltage_calibration_enabled": (
                 readout_spec.dc_voltage_calibration_enabled
             ),
@@ -7764,6 +7929,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "connection_config": connection_config,
             "run_config": run_config,
             "sweep_map_axes": sweep_map_axes,
+            "sweep_map_color_ranges": sweep_map_color_ranges,
             "rf_outputs": tuple(rf_outputs),
             "rf_readout": rf_readout,
             "stability_diagram": stability_settings,
@@ -7842,6 +8008,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.set_sweep_specs(
             self._active_map_sweep_specs(),
             selected_keys=settings["sweep_map_axes"],
+        )
+        self._awg_sweep_plot.load_color_range_settings(
+            settings["sweep_map_color_ranges"]
         )
         self._ddr_readout_spec = self._rf_readout_panel.spec()
         self._sparameter_panel.load_settings(settings["s_parameter"])

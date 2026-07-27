@@ -168,6 +168,7 @@ def test_stability_config_requires_two_outputs_and_respects_full_scale():
 def test_stability_settings_add_backward_compatible_bias_t_defaults():
     legacy = stability.default_stability_settings(("awg_0", "awg_1"), ("set_0",))
     legacy.pop("bias_t_compensation")
+    legacy.pop("color_ranges")
 
     normalized = stability.normalize_stability_settings(
         legacy,
@@ -185,6 +186,33 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     }
     assert normalized["settle_time_us"] == stability.DEFAULT_STABILITY_SETTLE_US
     assert "segment_name" not in normalized["x_axis"]
+    assert normalized["color_ranges"] == {
+        "magnitude": {
+            "auto": True,
+            "minimum": 0.0,
+            "maximum": 1.0,
+        },
+        "phase": {
+            "auto": False,
+            "minimum": -180.0,
+            "maximum": 180.0,
+        },
+    }
+
+    invalid = dict(normalized)
+    invalid["color_ranges"] = {
+        "magnitude": {
+            "auto": False,
+            "minimum": 10.0,
+            "maximum": 10.0,
+        },
+        "phase": normalized["color_ranges"]["phase"],
+    }
+    with pytest.raises(ValueError, match="minimum must be below maximum"):
+        stability.normalize_stability_settings(
+            invalid,
+            output_names=("awg_0", "awg_1"),
+        )
 
 
 def test_stability_builds_dedicated_set_hold_sequence_without_awg_waveform():
@@ -270,6 +298,68 @@ def test_reduce_fir_result_restores_voltage_grid_and_coherent_iq_mean():
     assert result.measurement_mode == "raw_iq"
 
 
+@pytest.mark.skipif(stability.pg is None, reason="pyqtgraph is not installed")
+def test_stability_plot_exposes_and_applies_color_ranges():
+    app = _application()
+    result = stability.reduce_fir_stability_result(
+        _ddr_result(),
+        _config(),
+        full_scale_mv=100.0,
+        iteration=3,
+    )
+    plot = stability.StabilityDiagramPlotWidget()
+    plot.set_result(result)
+    app.processEvents()
+
+    magnitude_levels = plot._levels(result.magnitude)
+    np.testing.assert_allclose(
+        plot.magnitude_image.getLevels(),
+        magnitude_levels,
+    )
+    np.testing.assert_allclose(
+        plot.phase_image.getLevels(),
+        (-180.0, 180.0),
+    )
+    assert plot.magnitude_range_control.auto_range.isChecked() is True
+    assert plot.phase_range_control.auto_range.isChecked() is False
+    assert plot.magnitude_color_bar is not None
+    assert plot.phase_color_bar is not None
+    assert "Applied:" in plot.magnitude_range_control.range_status.text()
+    assert "Data:" in plot.magnitude_range_control.range_status.text()
+
+    plot.load_color_range_settings({
+        "magnitude": {
+            "auto": False,
+            "minimum": 5.0,
+            "maximum": 50.0,
+        },
+        "phase": {
+            "auto": False,
+            "minimum": -45.0,
+            "maximum": 90.0,
+        },
+    })
+    app.processEvents()
+    np.testing.assert_allclose(plot.magnitude_image.getLevels(), (5.0, 50.0))
+    np.testing.assert_allclose(plot.phase_image.getLevels(), (-45.0, 90.0))
+    assert plot.color_range_settings() == {
+        "magnitude": {
+            "auto": False,
+            "minimum": 5.0,
+            "maximum": 50.0,
+        },
+        "phase": {
+            "auto": False,
+            "minimum": -45.0,
+            "maximum": 90.0,
+        },
+    }
+
+    plot.close()
+    plot.deleteLater()
+    app.processEvents()
+
+
 def test_reduce_fir_result_converts_dc_input_iq_to_current():
     raw = _ddr_result()
     raw_result = stability.reduce_fir_stability_result(
@@ -297,6 +387,56 @@ def test_reduce_fir_result_converts_dc_input_iq_to_current():
     np.testing.assert_allclose(current_result.phase_deg, raw_result.phase_deg)
     assert current_result.value_unit == "A"
     assert current_result.measurement_mode == "dc_current_iq"
+
+
+def test_reduce_fir_result_auto_scales_nanoamp_current():
+    raw = _ddr_result()
+    raw.iq = raw.iq.astype(np.float64) * 1.0e-9
+    current_result = stability.reduce_fir_stability_result(
+        raw,
+        _config(),
+        full_scale_mv=100.0,
+        readout_spec=SimpleNamespace(
+            input_board_type="DC_In",
+            effective_measurement_representation="current",
+            dc_measure_gain_v_per_a=1.0,
+            dc_voltage_calibration_enabled=False,
+        ),
+    )
+
+    assert current_result.value_unit == "nA"
+    assert current_result.base_value_unit == "A"
+    assert current_result.display_scale == 1.0e9
+    assert current_result.measurement_mode == "dc_current_iq"
+    assert np.nanmax(np.abs(current_result.i_mean)) > 1.0
+
+
+def test_stability_panel_measurement_representation_round_trip():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.apply_path_settings({
+        **stability.DEFAULT_STABILITY_RF_PATH,
+        "input_board_type": "DC_In",
+    })
+    panel.measurement_unit.setCurrentIndex(
+        panel.measurement_unit.findData("current")
+    )
+    panel.dc_measure_gain_v_per_a.setValue(1.0e8)
+    settings = panel.settings_dict()
+
+    assert settings["measurement_representation"] == "current"
+    assert panel.dc_measure_mode.isChecked() is True
+    restored = stability.StabilityDiagramPanel()
+    restored.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    restored.load_settings(settings)
+    app.processEvents()
+    assert restored.measurement_unit.currentData() == "current"
+    assert restored.dc_measure_mode.isChecked() is True
+    assert restored.dc_measure_gain_v_per_a.value() == 1.0e8
+
+    restored.close()
+    panel.close()
 
 
 def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
@@ -493,6 +633,8 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.settle_time_us.setValue(75.5)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
+    panel.plot.magnitude_range_control.set_manual_levels(10.0, 100.0)
+    panel.plot.phase_range_control.set_manual_levels(-90.0, 45.0)
     panel.bias_t_group.setChecked(True)
     panel.bias_t_mode.setCurrentIndex(
         panel.bias_t_mode.findData("fixed_time")
@@ -537,6 +679,18 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert restored.bias_t_mode.currentData() == "fixed_time"
     assert restored.bias_t_duration_us.value() == 2.5
     assert restored.settle_time_us.value() == 75.5
+    assert restored.plot.color_range_settings() == {
+        "magnitude": {
+            "auto": False,
+            "minimum": 10.0,
+            "maximum": 100.0,
+        },
+        "phase": {
+            "auto": False,
+            "minimum": -90.0,
+            "maximum": 45.0,
+        },
+    }
 
     dc_changes = []
     calibration_changes = []

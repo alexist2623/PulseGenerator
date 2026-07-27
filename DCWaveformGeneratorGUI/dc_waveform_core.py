@@ -39,6 +39,7 @@ RF_SEGMENT_LENGTH_MODES = ("fixed", "extend_by_rf_duration")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
+MEASUREMENT_REPRESENTATIONS = ("auto", "adc", "voltage", "current")
 
 
 def _finite_real(value: Real, name: str) -> float:
@@ -353,6 +354,7 @@ class QickDdrReadoutSpec:
     dc_voltage_calibration_enabled: bool = False
     dc_voltage_calibration_database_path: str = ""
     dc_voltage_calibration_run_id: int = 0
+    measurement_representation: str = "auto"
     nqz: int = 1
     fpga_trigger_delay_samples: Optional[int] = None
 
@@ -416,6 +418,18 @@ class QickDdrReadoutSpec:
                 raise ValueError("DC voltage calibration requires the DC_In input board")
             if not str(self.dc_voltage_calibration_database_path).strip():
                 raise ValueError("DC voltage calibration database path must not be empty")
+        if self.measurement_representation not in MEASUREMENT_REPRESENTATIONS:
+            raise ValueError(
+                "measurement_representation must be one of "
+                f"{MEASUREMENT_REPRESENTATIONS}"
+            )
+        if (
+            self.effective_measurement_representation != "adc"
+            and self.input_board_type != "DC_In"
+        ):
+            raise ValueError(
+                "voltage/current measurement representation requires DC_In"
+            )
 
     @property
     def effective_attenuation_db(self) -> float:
@@ -426,12 +440,22 @@ class QickDdrReadoutSpec:
         return float(self.dc_gain_db) if self.input_board_type == "DC_In" else 0.0
 
     @property
-    def measurement_unit(self) -> str:
+    def effective_measurement_representation(self) -> str:
+        if self.measurement_representation != "auto":
+            return self.measurement_representation
         if self.dc_measure_mode:
-            return "A"
+            return "current"
         if self.dc_voltage_calibration_enabled:
-            return "V"
-        return "ADC units"
+            return "voltage"
+        return "adc"
+
+    @property
+    def measurement_unit(self) -> str:
+        return {
+            "adc": "ADC units",
+            "voltage": "V",
+            "current": "A",
+        }[self.effective_measurement_representation]
 
 
 @dataclass(frozen=True)

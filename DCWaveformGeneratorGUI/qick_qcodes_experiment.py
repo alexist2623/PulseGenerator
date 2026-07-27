@@ -550,6 +550,9 @@ def configure_rf_board(
             "dc_voltage_calibration_run_id": int(
                 readout_spec.dc_voltage_calibration_run_id
             ),
+            "measurement_representation": str(
+                readout_spec.effective_measurement_representation
+            ),
             "post_run_read_delay_seconds": float(
                 readout_spec.post_run_read_delay_seconds
             ),
@@ -868,11 +871,32 @@ def _measurement_iq_values(
     readout_details = rf_settings.get("readout_details", {})
     if not isinstance(readout_details, Mapping):
         readout_details = {}
-    dc_measure_mode = bool(readout_details.get("dc_measure_mode", False))
+    representation = str(
+        readout_details.get("measurement_representation", "auto")
+    )
+    if representation == "auto":
+        representation = (
+            "current"
+            if bool(readout_details.get("dc_measure_mode", False))
+            else (
+                "voltage"
+                if bool(
+                    readout_details.get(
+                        "dc_voltage_calibration_enabled",
+                        False,
+                    )
+                )
+                else "adc"
+            )
+        )
+    if representation not in {"adc", "voltage", "current"}:
+        raise ValueError(
+            "readout measurement representation must be adc, voltage, or current"
+        )
     calibration_enabled = bool(
         readout_details.get("dc_voltage_calibration_enabled", False)
     )
-    if not dc_measure_mode and not calibration_enabled:
+    if representation == "adc":
         return raw_iq, "ADC units", "raw_iq", {
             "adc_to_voltage": "not_applied",
             "voltage_to_current": "not_applied",
@@ -904,7 +928,7 @@ def _measurement_iq_values(
             "dc_voltage_calibration_formula": calibration.as_dict()["formula"],
         }
     voltage_iq = adc_iq_to_voltage(raw_iq, calibration=calibration)
-    if not dc_measure_mode:
+    if representation == "voltage":
         return voltage_iq, "V", "dc_voltage_iq", {
             "adc_to_voltage": (
                 "fitted_scalar_adc_i" if calibration is not None else "identity"

@@ -11,7 +11,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
@@ -21,8 +21,61 @@ try:
 except ImportError:
     pg = None
 
+try:
+    from .measurement_display import (
+        ColorRangeControl,
+        attach_color_bar,
+        scale_iq_for_display,
+    )
+except ImportError:
+    from measurement_display import (
+        ColorRangeControl,
+        attach_color_bar,
+        scale_iq_for_display,
+    )
+
 
 SweepAxisKey = Tuple[str, str]
+DEFAULT_AWG_SWEEP_COLOR_RANGES = {
+    "i": {"auto": True, "minimum": -1.0, "maximum": 1.0},
+    "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},
+    "magnitude": {"auto": True, "minimum": 0.0, "maximum": 1.0},
+    "angle": {"auto": False, "minimum": -180.0, "maximum": 180.0},
+}
+
+
+def normalize_awg_sweep_color_ranges(
+    settings: Optional[Mapping[str, Any]],
+) -> dict:
+    """Validate persisted AWG map color ranges with backward-safe defaults."""
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, Mapping):
+        raise TypeError("AWG sweep color_ranges must be a JSON object")
+    normalized = {}
+    for name, defaults in DEFAULT_AWG_SWEEP_COLOR_RANGES.items():
+        raw = settings.get(name, defaults)
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"AWG sweep {name} color range must be an object")
+        auto = raw.get("auto", defaults["auto"])
+        if not isinstance(auto, (bool, np.bool_)):
+            raise TypeError(f"AWG sweep {name} auto range must be boolean")
+        minimum = float(raw.get("minimum", defaults["minimum"]))
+        maximum = float(raw.get("maximum", defaults["maximum"]))
+        if (
+            not np.isfinite(minimum)
+            or not np.isfinite(maximum)
+            or minimum >= maximum
+        ):
+            raise ValueError(
+                f"AWG sweep {name} color minimum must be finite and below maximum"
+            )
+        normalized[name] = {
+            "auto": bool(auto),
+            "minimum": minimum,
+            "maximum": maximum,
+        }
+    return normalized
 
 
 def sweep_axis_key(axis: Any) -> SweepAxisKey:
@@ -65,6 +118,8 @@ class AwgSweepMapResult:
     x_unit: str
     y_unit: str
     value_unit: str
+    base_value_unit: str
+    display_scale: float
     measurement_mode: str
     repetition_count: int
     samples_per_trace: int
@@ -137,6 +192,12 @@ def reduce_awg_sweep_map(
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
     if not np.all(np.isfinite(point_iq)):
         raise ValueError("AWG sweep I/Q contains NaN or infinity")
+    display_i, display_q, display_scale = scale_iq_for_display(
+        point_iq[:, 0],
+        point_iq[:, 1],
+        value_unit,
+    )
+    point_iq = np.column_stack((display_i, display_q))
 
     x_coordinates, x_unit = _axis_display_values(
         coordinates[:, x_column],
@@ -192,7 +253,9 @@ def reduce_awg_sweep_map(
         y_axis_label=sweep_axis_label(axes[y_column]),
         x_unit=x_unit,
         y_unit=y_unit,
-        value_unit=str(value_unit),
+        value_unit=display_scale.unit,
+        base_value_unit=display_scale.base_unit,
+        display_scale=display_scale.factor,
         measurement_mode=str(measurement_mode),
         repetition_count=int(iq.shape[1]),
         samples_per_trace=int(iq.shape[2]),
@@ -227,19 +290,59 @@ if pg is not None:
 
             self.plots = {}
             self.images = {}
+            self.range_controls = {}
+            self.color_bars = {}
+            self.color_maps = {}
             self._mouse_connections = []
             for index, (key, title, color_map) in enumerate(self._PLOT_SPECS):
-                plot = pg.PlotWidget(self)
+                cell = QtWidgets.QWidget(self)
+                cell_layout = QtWidgets.QVBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setSpacing(2)
+                defaults = DEFAULT_AWG_SWEEP_COLOR_RANGES[key]
+                unit = "deg" if key == "angle" else "ADC units"
+                range_control = ColorRangeControl(
+                    f"{title} color range",
+                    auto=defaults["auto"],
+                    minimum=defaults["minimum"],
+                    maximum=defaults["maximum"],
+                    unit=unit,
+                    parent=cell,
+                )
+                plot = pg.PlotWidget(cell)
                 image = pg.ImageItem(axisOrder="row-major")
                 plot.addItem(image)
                 plot.setTitle(title)
                 plot.setLabel("bottom", "X sweep", units="mV")
                 plot.setLabel("left", "Y sweep", units="mV")
                 plot.showGrid(x=True, y=True, alpha=0.18)
-                self._set_colormap(image, color_map)
-                plot_grid.addWidget(plot, index // 2, index % 2)
+                selected_map = self._color_map(color_map)
+                image.setColorMap(selected_map)
+                color_bar = attach_color_bar(
+                    plot,
+                    image,
+                    selected_map,
+                    unit=unit,
+                    levels=(
+                        defaults["minimum"],
+                        defaults["maximum"],
+                    ),
+                )
+                cell_layout.addWidget(range_control)
+                cell_layout.addWidget(plot, 1)
+                plot_grid.addWidget(cell, index // 2, index % 2)
                 self.plots[key] = plot
                 self.images[key] = image
+                self.range_controls[key] = range_control
+                self.color_bars[key] = color_bar
+                self.color_maps[key] = selected_map
+                range_control.levels_changed.connect(
+                    lambda minimum, maximum, name=key: self._set_color_levels(
+                        name,
+                        minimum,
+                        maximum,
+                    )
+                )
                 slot = lambda event, source=plot: self._mouse_moved(
                     event, source
                 )
@@ -260,12 +363,37 @@ if pg is not None:
             self._result: Optional[AwgSweepMapResult] = None
 
         @staticmethod
-        def _set_colormap(image, name: str) -> None:
+        def _color_map(name: str):
             try:
-                color_map = pg.colormap.get(name)
+                return pg.colormap.get(name)
             except (FileNotFoundError, KeyError):
-                color_map = pg.colormap.get("viridis")
-            image.setColorMap(color_map)
+                return pg.colormap.get("viridis")
+
+        def _set_color_levels(
+            self,
+            name: str,
+            minimum: float,
+            maximum: float,
+        ) -> None:
+            color_bar = self.color_bars[name]
+            if color_bar is None:
+                self.images[name].setLevels((minimum, maximum))
+                return
+            color_bar.setLevels((minimum, maximum))
+
+        def color_range_settings(self) -> dict:
+            return {
+                name: control.settings_dict()
+                for name, control in self.range_controls.items()
+            }
+
+        def load_color_range_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            normalized = normalize_awg_sweep_color_ranges(settings)
+            for name, control in self.range_controls.items():
+                control.load_settings(normalized[name])
 
         @staticmethod
         def _axis_edges(values: np.ndarray) -> Tuple[float, float]:
@@ -338,8 +466,13 @@ if pg is not None:
                 self.images[key].setImage(
                     values,
                     autoLevels=False,
-                    levels=levels[key],
                 )
+                unit = "deg" if key == "angle" else result.value_unit
+                self.range_controls[key].set_unit(unit)
+                self.range_controls[key].set_data_levels(*levels[key])
+                color_bar = self.color_bars[key]
+                if color_bar is not None:
+                    color_bar.setLabel("right", text=unit)
                 self.images[key].setRect(rect)
             self.fit_view()
 
@@ -351,6 +484,8 @@ if pg is not None:
             self.hover_status.setText(
                 f"{result.repetition_count} repetitions x "
                 f"{result.samples_per_trace} FIR samples; "
+                f"display {result.value_unit} "
+                f"({result.display_scale:g} x {result.base_value_unit}); "
                 f"other averaged sweep axes: {averaged}"
             )
 
@@ -407,6 +542,7 @@ else:
                 parent,
             )
             self.setAlignment(QtCore.Qt.AlignCenter)
+            self._color_ranges = normalize_awg_sweep_color_ranges(None)
 
         def set_result(self, _result: AwgSweepMapResult) -> None:
             return
@@ -414,11 +550,25 @@ else:
         def fit_view(self) -> None:
             return
 
+        def color_range_settings(self) -> dict:
+            return {
+                name: dict(values)
+                for name, values in self._color_ranges.items()
+            }
+
+        def load_color_range_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            self._color_ranges = normalize_awg_sweep_color_ranges(settings)
+
 
 __all__ = [
     "AwgSweepMapPlotWidget",
     "AwgSweepMapResult",
+    "DEFAULT_AWG_SWEEP_COLOR_RANGES",
     "SweepAxisKey",
+    "normalize_awg_sweep_color_ranges",
     "reduce_awg_sweep_map",
     "sweep_axis_key",
     "sweep_axis_label",

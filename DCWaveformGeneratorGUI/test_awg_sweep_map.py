@@ -195,6 +195,33 @@ def test_reduce_three_axes_averages_unselected_axis():
     assert result.averaged_axis_labels == ("awg_2 / set_3",)
 
 
+def test_reduce_awg_map_auto_scales_current_to_nanoamps():
+    ddr_result = _two_axis_result()
+    current_iq = ddr_result.iq.astype(np.float64) * 1.0e-9
+    result = awg_map.reduce_awg_sweep_map(
+        ddr_result,
+        x_axis_key=("awg_0", "set_1"),
+        y_axis_key=("awg_1", "set_2"),
+        full_scale_mv=800.0,
+        iq_values=current_iq,
+        value_unit="A",
+        measurement_mode="dc_current_iq",
+    )
+
+    assert result.value_unit == "nA"
+    assert result.base_value_unit == "A"
+    assert result.display_scale == 1.0e9
+    np.testing.assert_allclose(
+        result.i_mean,
+        awg_map.reduce_awg_sweep_map(
+            ddr_result,
+            x_axis_key=("awg_0", "set_1"),
+            y_axis_key=("awg_1", "set_2"),
+            full_scale_mv=800.0,
+        ).i_mean,
+    )
+
+
 def test_reduce_awg_map_rejects_duplicate_or_unknown_axes():
     ddr_result = _two_axis_result()
     with pytest.raises(ValueError, match="different"):
@@ -256,6 +283,16 @@ def test_experiment_panel_axis_selection_and_result_plot():
             "magnitude",
             "angle",
         }
+        assert set(window._awg_sweep_plot.color_bars) == {
+            "i",
+            "q",
+            "magnitude",
+            "angle",
+        }
+        assert all(
+            color_bar is not None
+            for color_bar in window._awg_sweep_plot.color_bars.values()
+        )
     window.close()
 
 
@@ -269,6 +306,12 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
     ]
     window._refresh_sweep_overlay()
     window._experiment_panel.sweep_map_x.setCurrentIndex(1)
+    window._awg_sweep_plot.load_color_range_settings({
+        "i": {"auto": False, "minimum": -4.0, "maximum": 5.0},
+        "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},
+        "magnitude": {"auto": False, "minimum": 0.0, "maximum": 8.0},
+        "angle": {"auto": False, "minimum": -90.0, "maximum": 90.0},
+    })
     app.processEvents()
     assert window._experiment_panel.selected_sweep_axis_keys() == (
         ("awg_1", "set_0"),
@@ -283,6 +326,12 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
         ("awg_1", "set_0"),
         ("awg_0", "set_0"),
     )
+    assert restored._awg_sweep_plot.color_range_settings() == {
+        "i": {"auto": False, "minimum": -4.0, "maximum": 5.0},
+        "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},
+        "magnitude": {"auto": False, "minimum": 0.0, "maximum": 8.0},
+        "angle": {"auto": False, "minimum": -90.0, "maximum": 90.0},
+    }
 
     restored.close()
     window.close()

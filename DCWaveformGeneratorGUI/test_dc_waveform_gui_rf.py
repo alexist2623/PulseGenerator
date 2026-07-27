@@ -460,7 +460,8 @@ def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     calibration_row, _role = panel.layout().getWidgetPosition(
         panel.dc_voltage_calibration_enabled
     )
-    assert calibration_row == -1
+    assert calibration_row >= 0
+    assert panel.measurement_unit.currentData() == "adc"
 
     spec = panel.spec()
     assert spec == QickDdrReadoutSpec(
@@ -474,6 +475,7 @@ def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
         filter_type="lowpass",
         filter_cutoff=2.5,
         filter_bandwidth=0.75,
+        measurement_representation="adc",
     )
     window.close()
 
@@ -502,7 +504,9 @@ def test_dc_measure_mode_converts_iq_and_is_available_only_for_dc_input():
     panel = window._rf_readout_panel
     panel.setChecked(True)
     panel.input_board_type.setCurrentText("DC_In")
-    panel.dc_measure_mode.setChecked(True)
+    panel.measurement_unit.setCurrentIndex(
+        panel.measurement_unit.findData("current")
+    )
     panel.dc_measure_gain_v_per_a.setValue(2.0)
     app.processEvents()
 
@@ -510,6 +514,7 @@ def test_dc_measure_mode_converts_iq_and_is_available_only_for_dc_input():
     assert spec is not None
     assert spec.input_board_type == "DC_In"
     assert spec.dc_measure_mode is True
+    assert spec.measurement_representation == "current"
     assert spec.dc_measure_gain_v_per_a == 2.0
     assert spec.measurement_unit == "A"
     assert panel.dc_measure_gain_v_per_a.isEnabled() is True
@@ -518,7 +523,42 @@ def test_dc_measure_mode_converts_iq_and_is_available_only_for_dc_input():
     app.processEvents()
     assert panel.dc_measure_mode.isChecked() is False
     assert panel.dc_measure_mode.isEnabled() is False
+    assert panel.measurement_unit.currentData() == "adc"
+    assert panel.measurement_unit.isEnabled() is False
     assert panel.dc_measure_gain_v_per_a.isEnabled() is False
+    window.close()
+
+
+def test_awg_tuning_rf_readout_exposes_calibration_and_unit_selection(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_readout_panel
+    panel.setChecked(True)
+    panel.input_board_type.setCurrentText("DC_In")
+    panel.measurement_unit.setCurrentIndex(
+        panel.measurement_unit.findData("voltage")
+    )
+    panel.dc_voltage_calibration_enabled.setChecked(True)
+    panel.dc_voltage_calibration_path.setText(str(tmp_path / "calibration.db"))
+    panel.dc_voltage_calibration_run_id.setValue(17)
+    app.processEvents()
+
+    spec = panel.spec()
+    assert spec is not None
+    assert spec.effective_measurement_representation == "voltage"
+    assert spec.measurement_unit == "V"
+    assert spec.dc_voltage_calibration_enabled is True
+    assert spec.dc_voltage_calibration_run_id == 17
+    assert panel.dc_voltage_calibration_path.isHidden() is False
+    settings = panel.settings_dict()
+    assert settings["measurement_representation"] == "voltage"
+
+    restored = gui.RfReadoutPanel(window._pulse[0], time_unit="us")
+    restored.load_settings(settings)
+    assert restored.measurement_unit.currentData() == "voltage"
+    assert restored.dc_voltage_calibration_enabled.isChecked() is True
+    assert restored.dc_voltage_calibration_run_id.value() == 17
+    restored.close()
     window.close()
 
 
@@ -1176,7 +1216,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 27
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 29
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

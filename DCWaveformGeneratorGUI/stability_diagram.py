@@ -39,6 +39,7 @@ try:
     )
     from .dc_voltage_calibration import load_dc_voltage_calibration
     from .fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
+    from .measurement_display import attach_color_bar, scale_iq_for_display
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -63,6 +64,7 @@ except ImportError:
     )
     from dc_voltage_calibration import load_dc_voltage_calibration
     from fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
+    from measurement_display import attach_color_bar, scale_iq_for_display
     from qick_qcodes_experiment import (
         StoredQickExperiment,
         build_awg_vertex_metadata,
@@ -108,6 +110,18 @@ DEFAULT_STABILITY_RF_PATH = {
     "readout_filter_cutoff_ghz": 2.5,
     "readout_filter_bandwidth_ghz": 1.0,
 }
+DEFAULT_STABILITY_COLOR_RANGES = {
+    "magnitude": {
+        "auto": True,
+        "minimum": 0.0,
+        "maximum": 1.0,
+    },
+    "phase": {
+        "auto": False,
+        "minimum": -180.0,
+        "maximum": 180.0,
+    },
+}
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -128,6 +142,36 @@ def _integer(value: Any, name: str, minimum: int) -> int:
     if result < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return result
+
+
+def _normalize_color_range(
+    settings: Any,
+    *,
+    defaults: Mapping[str, Any],
+    label: str,
+) -> dict:
+    if not isinstance(settings, Mapping):
+        raise TypeError(f"stability {label} color range must be a JSON object")
+    auto = settings.get("auto", defaults["auto"])
+    if not isinstance(auto, (bool, np.bool_)):
+        raise TypeError(f"stability {label} color auto range must be boolean")
+    minimum = _finite_float(
+        settings.get("minimum", defaults["minimum"]),
+        f"stability {label} color minimum",
+    )
+    maximum = _finite_float(
+        settings.get("maximum", defaults["maximum"]),
+        f"stability {label} color maximum",
+    )
+    if minimum >= maximum:
+        raise ValueError(
+            f"stability {label} color minimum must be below maximum"
+        )
+    return {
+        "auto": bool(auto),
+        "minimum": minimum,
+        "maximum": maximum,
+    }
 
 
 @dataclass(frozen=True)
@@ -269,6 +313,8 @@ class StabilityDiagramResult:
     x_axis_label: str
     y_axis_label: str
     value_unit: str
+    base_value_unit: str
+    display_scale: float
     measurement_mode: str
     iteration: int
     repetition_count: int
@@ -331,7 +377,13 @@ def default_stability_settings(
             "filter_tau_us": DEFAULT_BIAS_T_FILTER_TAU_US,
         },
         "rf_path": dict(DEFAULT_STABILITY_RF_PATH),
+        "color_ranges": {
+            name: dict(values)
+            for name, values in DEFAULT_STABILITY_COLOR_RANGES.items()
+        },
         "database_path": DEFAULT_STABILITY_DB_PATH,
+        "measurement_representation": "adc",
+        "dc_measure_gain_v_per_a": 1.0,
         "dc_voltage_calibration_enabled": False,
         "dc_voltage_calibration_database_path": "",
         "dc_voltage_calibration_run_id": 0,
@@ -497,12 +549,47 @@ def normalize_stability_settings(
     rf_path["output_board_type"] = str(rf_path["output_board_type"])
     rf_path["input_board_type"] = str(rf_path["input_board_type"])
     normalized["rf_path"] = rf_path
+    raw_color_ranges = settings.get(
+        "color_ranges",
+        defaults["color_ranges"],
+    )
+    if not isinstance(raw_color_ranges, Mapping):
+        raise TypeError("stability color_ranges must be a JSON object")
+    normalized["color_ranges"] = {
+        name: _normalize_color_range(
+            raw_color_ranges.get(name, defaults["color_ranges"][name]),
+            defaults=defaults["color_ranges"][name],
+            label=name,
+        )
+        for name in ("magnitude", "phase")
+    }
     database_path = str(
         settings.get("database_path", defaults["database_path"])
     ).strip()
     if not database_path:
         raise ValueError("stability database path must not be empty")
     normalized["database_path"] = database_path
+    representation = str(
+        settings.get(
+            "measurement_representation",
+            defaults["measurement_representation"],
+        )
+    )
+    if representation not in {"adc", "voltage", "current"}:
+        raise ValueError(
+            "stability measurement_representation must be adc, voltage, or current"
+        )
+    normalized["measurement_representation"] = representation
+    measurement_gain = _finite_float(
+        settings.get(
+            "dc_measure_gain_v_per_a",
+            defaults["dc_measure_gain_v_per_a"],
+        ),
+        "stability DC measurement gain",
+    )
+    if measurement_gain <= 0.0:
+        raise ValueError("stability DC measurement gain must be positive")
+    normalized["dc_measure_gain_v_per_a"] = measurement_gain
     calibration_enabled = settings.get(
         "dc_voltage_calibration_enabled",
         defaults["dc_voltage_calibration_enabled"],
@@ -662,13 +749,39 @@ def reduce_fir_stability_result(
         raise ValueError("stability sweep-coordinate shape does not match FIR IQ")
 
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
-    dc_measure_mode = bool(getattr(readout_spec, "dc_measure_mode", False))
+    representation = str(
+        getattr(
+            readout_spec,
+            "effective_measurement_representation",
+            "auto",
+        )
+    )
+    if representation == "auto":
+        representation = (
+            "current"
+            if bool(getattr(readout_spec, "dc_measure_mode", False))
+            else (
+                "voltage"
+                if bool(
+                    getattr(
+                        readout_spec,
+                        "dc_voltage_calibration_enabled",
+                        False,
+                    )
+                )
+                else "adc"
+            )
+        )
+    if representation not in {"adc", "voltage", "current"}:
+        raise ValueError(
+            "stability measurement representation must be adc, voltage, or current"
+        )
     calibration_enabled = bool(
         getattr(readout_spec, "dc_voltage_calibration_enabled", False)
     )
-    if dc_measure_mode or calibration_enabled:
+    if representation != "adc":
         if getattr(readout_spec, "input_board_type", None) != "DC_In":
-            raise ValueError("DC measure mode requires a DC_In readout")
+            raise ValueError("voltage/current display requires a DC_In readout")
         calibration = None
         if calibration_enabled:
             calibration = load_dc_voltage_calibration(
@@ -685,7 +798,7 @@ def reduce_fir_stability_result(
                     getattr(readout_spec, "dc_voltage_calibration_run_id", 0)
                 ),
             )
-        if dc_measure_mode:
+        if representation == "current":
             point_iq = dc_iq_to_current(
                 point_iq,
                 getattr(readout_spec, "dc_measure_gain_v_per_a", 1.0),
@@ -737,6 +850,11 @@ def reduce_fir_stability_result(
     if not np.all(populated):
         raise ValueError("FIR result does not cover the full stability grid")
 
+    i_mean, q_mean, display_scale = scale_iq_for_display(
+        i_mean,
+        q_mean,
+        value_unit,
+    )
     magnitude = np.hypot(i_mean, q_mean)
     phase_deg = np.degrees(np.arctan2(q_mean, i_mean))
     return StabilityDiagramResult(
@@ -748,7 +866,9 @@ def reduce_fir_stability_result(
         phase_deg=phase_deg,
         x_axis_label=config.x_axis.output_name,
         y_axis_label=config.y_axis.output_name,
-        value_unit=value_unit,
+        value_unit=display_scale.unit,
+        base_value_unit=display_scale.base_unit,
+        display_scale=display_scale.factor,
         measurement_mode=measurement_mode,
         iteration=_integer(iteration, "stability iteration", 1),
         repetition_count=int(iq.shape[1]),
@@ -1115,6 +1235,190 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
 if pg is not None:
 
+    class _StabilityColorRangeControl(QtWidgets.QGroupBox):
+        """Compact numeric editor for one image's applied color levels."""
+
+        levels_changed = QtCore.pyqtSignal(float, float)
+
+        def __init__(
+            self,
+            title: str,
+            *,
+            auto: bool,
+            minimum: float,
+            maximum: float,
+            unit: str,
+            parent=None,
+        ):
+            super().__init__(title, parent)
+            self._unit = str(unit)
+            self._data_levels = (float(minimum), float(maximum))
+            grid = QtWidgets.QGridLayout(self)
+            grid.setContentsMargins(6, 4, 6, 4)
+            grid.setHorizontalSpacing(6)
+            grid.setVerticalSpacing(2)
+
+            self.auto_range = QtWidgets.QCheckBox("Auto from data", self)
+            self.minimum = self._level_spin(minimum)
+            self.maximum = self._level_spin(maximum)
+            self.range_status = QtWidgets.QLabel(self)
+            self.range_status.setTextInteractionFlags(
+                QtCore.Qt.TextSelectableByMouse
+            )
+            self.range_status.setWordWrap(True)
+            grid.addWidget(self.auto_range, 0, 0, 1, 4)
+            grid.addWidget(QtWidgets.QLabel("Min:", self), 1, 0)
+            grid.addWidget(self.minimum, 1, 1)
+            grid.addWidget(QtWidgets.QLabel("Max:", self), 1, 2)
+            grid.addWidget(self.maximum, 1, 3)
+            grid.addWidget(self.range_status, 2, 0, 1, 4)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
+
+            self.auto_range.setChecked(bool(auto))
+            self.auto_range.toggled.connect(self._auto_toggled)
+            self.minimum.editingFinished.connect(self._manual_edited)
+            self.maximum.editingFinished.connect(self._manual_edited)
+            self._update_editable()
+            self._refresh_status()
+
+        def _level_spin(self, value: float) -> QtWidgets.QDoubleSpinBox:
+            spin = QtWidgets.QDoubleSpinBox(self)
+            spin.setRange(-1.0e15, 1.0e15)
+            spin.setDecimals(12)
+            spin.setValue(float(value))
+            spin.setKeyboardTracking(False)
+            spin.setMinimumWidth(90)
+            spin.setMaximumWidth(150)
+            spin.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+            if hasattr(
+                QtWidgets.QAbstractSpinBox,
+                "AdaptiveDecimalStepType",
+            ):
+                spin.setStepType(
+                    QtWidgets.QAbstractSpinBox.AdaptiveDecimalStepType
+                )
+            return spin
+
+        @staticmethod
+        def _format(value: float) -> str:
+            return f"{float(value):.8g}"
+
+        def _set_editor_levels(self, minimum: float, maximum: float) -> None:
+            with QtCore.QSignalBlocker(self.minimum), QtCore.QSignalBlocker(
+                self.maximum
+            ):
+                self.minimum.setValue(float(minimum))
+                self.maximum.setValue(float(maximum))
+
+        def _update_editable(self) -> None:
+            manual = not self.auto_range.isChecked()
+            self.minimum.setEnabled(manual)
+            self.maximum.setEnabled(manual)
+
+        def _valid_levels(self) -> Optional[Tuple[float, float]]:
+            minimum = float(self.minimum.value())
+            maximum = float(self.maximum.value())
+            if not np.isfinite(minimum) or not np.isfinite(maximum):
+                return None
+            if minimum >= maximum:
+                return None
+            return minimum, maximum
+
+        def _refresh_status(self) -> None:
+            levels = self._valid_levels()
+            if levels is None:
+                self.range_status.setText("Min must be below Max")
+                self.range_status.setStyleSheet("QLabel { color: #b3261e; }")
+                return
+            self.range_status.setStyleSheet("")
+            minimum, maximum = levels
+            data_minimum, data_maximum = self._data_levels
+            self.range_status.setText(
+                f"Applied: {self._format(minimum)} to "
+                f"{self._format(maximum)} {self._unit} | "
+                f"Data: {self._format(data_minimum)} to "
+                f"{self._format(data_maximum)} {self._unit}"
+            )
+
+        def _emit_levels(self) -> None:
+            levels = self._valid_levels()
+            self._refresh_status()
+            if levels is not None:
+                self.levels_changed.emit(*levels)
+
+        def _auto_toggled(self, checked: bool) -> None:
+            self._update_editable()
+            if checked:
+                self._set_editor_levels(*self._data_levels)
+            self._emit_levels()
+
+        def _manual_edited(self) -> None:
+            self._emit_levels()
+
+        def set_unit(self, unit: str) -> None:
+            self._unit = str(unit)
+            self._refresh_status()
+
+        def set_data_levels(self, minimum: float, maximum: float) -> None:
+            self._data_levels = (float(minimum), float(maximum))
+            if self.auto_range.isChecked():
+                self._set_editor_levels(minimum, maximum)
+            self._emit_levels()
+
+        def set_manual_levels(
+            self,
+            minimum: float,
+            maximum: float,
+            *,
+            emit: bool = True,
+        ) -> None:
+            minimum = float(minimum)
+            maximum = float(maximum)
+            if (
+                not np.isfinite(minimum)
+                or not np.isfinite(maximum)
+                or minimum >= maximum
+            ):
+                raise ValueError("color minimum must be finite and below maximum")
+            with QtCore.QSignalBlocker(self.auto_range):
+                self.auto_range.setChecked(False)
+            self._set_editor_levels(minimum, maximum)
+            self._update_editable()
+            self._refresh_status()
+            if emit:
+                self.levels_changed.emit(minimum, maximum)
+
+        def levels(self) -> Tuple[float, float]:
+            levels = self._valid_levels()
+            if levels is None:
+                raise ValueError("color minimum must be below maximum")
+            return levels
+
+        def settings_dict(self) -> dict:
+            minimum, maximum = self.levels()
+            return {
+                "auto": self.auto_range.isChecked(),
+                "minimum": minimum,
+                "maximum": maximum,
+            }
+
+        def load_settings(self, settings: Mapping[str, Any]) -> None:
+            with QtCore.QSignalBlocker(self.auto_range):
+                self.auto_range.setChecked(bool(settings["auto"]))
+            self._set_editor_levels(
+                float(settings["minimum"]),
+                float(settings["maximum"]),
+            )
+            self._update_editable()
+            if self.auto_range.isChecked():
+                self._set_editor_levels(*self._data_levels)
+            self._emit_levels()
+
+
     class StabilityDiagramPlotWidget(QtWidgets.QWidget):
         """Side-by-side magnitude and wrapped-phase image plots."""
 
@@ -1122,6 +1426,29 @@ if pg is not None:
             super().__init__(parent)
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
+
+            range_layout = QtWidgets.QHBoxLayout()
+            range_layout.setContentsMargins(0, 0, 0, 0)
+            self.magnitude_range_control = _StabilityColorRangeControl(
+                "Magnitude color range",
+                auto=True,
+                minimum=0.0,
+                maximum=1.0,
+                unit="ADC units",
+                parent=self,
+            )
+            self.phase_range_control = _StabilityColorRangeControl(
+                "Phase color range",
+                auto=False,
+                minimum=-180.0,
+                maximum=180.0,
+                unit="deg",
+                parent=self,
+            )
+            range_layout.addWidget(self.magnitude_range_control, 1)
+            range_layout.addWidget(self.phase_range_control, 1)
+            layout.addLayout(range_layout)
+
             splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
             self.magnitude_plot = pg.PlotWidget(splitter)
             self.phase_plot = pg.PlotWidget(splitter)
@@ -1135,8 +1462,24 @@ if pg is not None:
                 plot.setLabel("bottom", "X electrode", units="mV")
                 plot.setLabel("left", "Y electrode", units="mV")
                 plot.showGrid(x=True, y=True, alpha=0.18)
-            self._set_colormap(self.magnitude_image, "viridis")
-            self._set_colormap(self.phase_image, "CET-C7")
+            magnitude_map = self._color_map("viridis")
+            phase_map = self._color_map("CET-C7")
+            self.magnitude_image.setColorMap(magnitude_map)
+            self.phase_image.setColorMap(phase_map)
+            self.magnitude_color_bar = attach_color_bar(
+                self.magnitude_plot,
+                self.magnitude_image,
+                magnitude_map,
+                unit="ADC units",
+                levels=(0.0, 1.0),
+            )
+            self.phase_color_bar = attach_color_bar(
+                self.phase_plot,
+                self.phase_image,
+                phase_map,
+                unit="deg",
+                levels=(-180.0, 180.0),
+            )
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 1)
             layout.addWidget(splitter, 1)
@@ -1146,6 +1489,21 @@ if pg is not None:
             )
             layout.addWidget(self.hover_status)
             self._result: Optional[StabilityDiagramResult] = None
+            self._setting_color_levels = False
+            self.magnitude_range_control.levels_changed.connect(
+                lambda minimum, maximum: self._set_color_levels(
+                    "magnitude",
+                    minimum,
+                    maximum,
+                )
+            )
+            self.phase_range_control.levels_changed.connect(
+                lambda minimum, maximum: self._set_color_levels(
+                    "phase",
+                    minimum,
+                    maximum,
+                )
+            )
             self._magnitude_proxy = pg.SignalProxy(
                 self.magnitude_plot.scene().sigMouseMoved,
                 rateLimit=30,
@@ -1158,12 +1516,55 @@ if pg is not None:
             )
 
         @staticmethod
-        def _set_colormap(image, name: str) -> None:
+        def _color_map(name: str):
             try:
-                color_map = pg.colormap.get(name)
+                return pg.colormap.get(name)
             except (FileNotFoundError, KeyError):
-                color_map = pg.colormap.get("viridis")
-            image.setColorMap(color_map)
+                return pg.colormap.get("viridis")
+
+        def _color_items(self, name: str):
+            if name == "magnitude":
+                return (
+                    self.magnitude_image,
+                    self.magnitude_range_control,
+                    self.magnitude_color_bar,
+                )
+            if name == "phase":
+                return (
+                    self.phase_image,
+                    self.phase_range_control,
+                    self.phase_color_bar,
+                )
+            raise KeyError(f"unknown stability color range {name!r}")
+
+        def _set_color_levels(
+            self,
+            name: str,
+            minimum: float,
+            maximum: float,
+        ) -> None:
+            image, _control, color_bar = self._color_items(name)
+            self._setting_color_levels = True
+            try:
+                if color_bar is None:
+                    image.setLevels((minimum, maximum))
+                else:
+                    color_bar.setLevels((minimum, maximum))
+            finally:
+                self._setting_color_levels = False
+
+        def color_range_settings(self) -> dict:
+            return {
+                "magnitude": self.magnitude_range_control.settings_dict(),
+                "phase": self.phase_range_control.settings_dict(),
+            }
+
+        def load_color_range_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            self.magnitude_range_control.load_settings(settings["magnitude"])
+            self.phase_range_control.load_settings(settings["phase"])
 
         @staticmethod
         def _levels(values: np.ndarray) -> Tuple[float, float]:
@@ -1202,19 +1603,31 @@ if pg is not None:
             self.magnitude_image.setImage(
                 result.magnitude,
                 autoLevels=False,
-                levels=self._levels(result.magnitude),
             )
             self.phase_image.setImage(
                 result.phase_deg,
                 autoLevels=False,
-                levels=(-180.0, 180.0),
+            )
+            self.magnitude_range_control.set_unit(result.value_unit)
+            if self.magnitude_color_bar is not None:
+                self.magnitude_color_bar.setLabel(
+                    "right",
+                    text=result.value_unit,
+                )
+            self.magnitude_range_control.set_data_levels(
+                *self._levels(result.magnitude)
+            )
+            self.phase_range_control.set_data_levels(
+                *self._levels(result.phase_deg)
             )
             self.magnitude_image.setRect(rect)
             self.phase_image.setRect(rect)
             self.fit_view()
             self.hover_status.setText(
                 f"Scan {result.iteration}: {result.repetition_count} repetitions, "
-                f"{result.samples_per_trace} FIR samples per point"
+                f"{result.samples_per_trace} FIR samples per point; "
+                f"display {result.value_unit} "
+                f"({result.display_scale:g} x {result.base_value_unit})"
             )
 
         def fit_view(self) -> None:
@@ -1256,12 +1669,31 @@ else:
         def __init__(self, parent=None):
             super().__init__("pyqtgraph is required for stability-diagram plots", parent)
             self.setAlignment(QtCore.Qt.AlignCenter)
+            self._color_ranges = {
+                name: dict(values)
+                for name, values in DEFAULT_STABILITY_COLOR_RANGES.items()
+            }
 
         def set_result(self, _result: StabilityDiagramResult) -> None:
             return
 
         def fit_view(self) -> None:
             return
+
+        def color_range_settings(self) -> dict:
+            return {
+                name: dict(values)
+                for name, values in self._color_ranges.items()
+            }
+
+        def load_color_range_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            self._color_ranges = {
+                name: dict(settings[name])
+                for name in ("magnitude", "phase")
+            }
 
 
 class StabilityDiagramPanel(QtWidgets.QWidget):
@@ -1370,6 +1802,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_mode.setToolTip(
             "DC_In only: convert FIR I/Q to current using voltage / gain"
         )
+        self.measurement_unit = QtWidgets.QComboBox(acquisition)
+        self.measurement_unit.addItem("ADC units", "adc")
+        self.measurement_unit.addItem("Voltage", "voltage")
+        self.measurement_unit.addItem("Current", "current")
+        self.measurement_unit.setToolTip(
+            "Choose the Stability Diagram map representation. Voltage and "
+            "current require a DC_In path; current divides voltage by the "
+            "measurement gain."
+        )
         self.dc_measure_gain_v_per_a = QtWidgets.QDoubleSpinBox(acquisition)
         self.dc_measure_gain_v_per_a.setRange(1.0e-9, 1.0e15)
         self.dc_measure_gain_v_per_a.setDecimals(6)
@@ -1385,7 +1826,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         acquisition_form.addRow("Modulation gain:", self.modulation_gain)
         acquisition_form.addRow("Cartesian points:", self.point_count)
         acquisition_form.addRow("HWH FIR DDR:", self.fir_profile_status)
-        acquisition_form.addRow(self.dc_measure_mode)
+        acquisition_form.addRow("Display unit:", self.measurement_unit)
         acquisition_form.addRow(
             "DC measurement gain:",
             self.dc_measure_gain_v_per_a,
@@ -1547,7 +1988,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
         self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
-        self.dc_measure_mode.toggled.connect(self._emit_dc_measure_changed)
+        self.measurement_unit.currentIndexChanged.connect(
+            self._measurement_representation_changed
+        )
+        self.dc_measure_mode.toggled.connect(
+            self._legacy_dc_measure_mode_changed
+        )
         self.dc_measure_gain_v_per_a.valueChanged.connect(
             self._emit_dc_measure_changed
         )
@@ -1579,9 +2025,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def _update_dc_measure_controls(self) -> None:
         editable = self._dc_input_available and not self._running
+        self.measurement_unit.setEnabled(editable)
         self.dc_measure_mode.setEnabled(editable)
         self.dc_measure_gain_v_per_a.setEnabled(
-            editable and self.dc_measure_mode.isChecked()
+            editable and self.measurement_unit.currentData() == "current"
         )
         self.dc_calibration_group.setEnabled(editable)
 
@@ -1602,17 +2049,50 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def _emit_dc_measure_changed(self, *_args) -> None:
         self._update_dc_measure_controls()
         self.dc_measure_changed.emit(
-            self.dc_measure_mode.isChecked(),
+            self.measurement_unit.currentData() == "current",
             self.dc_measure_gain_v_per_a.value(),
         )
 
     def _emit_dc_calibration_changed(self, *_args) -> None:
+        if (
+            self.dc_calibration_group.isChecked()
+            and self._dc_input_available
+            and self.measurement_unit.currentData() == "adc"
+        ):
+            with QtCore.QSignalBlocker(self.measurement_unit):
+                self.measurement_unit.setCurrentIndex(
+                    self.measurement_unit.findData("voltage")
+                )
+            with QtCore.QSignalBlocker(self.dc_measure_mode):
+                self.dc_measure_mode.setChecked(False)
         self._update_dc_measure_controls()
         self.dc_calibration_changed.emit(
             self.dc_calibration_group.isChecked(),
             self.dc_calibration_path.text().strip(),
             self.dc_calibration_run_id.value(),
         )
+
+    def _measurement_representation_changed(self, *_args) -> None:
+        representation = str(self.measurement_unit.currentData())
+        with QtCore.QSignalBlocker(self.dc_measure_mode):
+            self.dc_measure_mode.setChecked(representation == "current")
+        self._emit_dc_measure_changed()
+
+    def _legacy_dc_measure_mode_changed(self, checked: bool) -> None:
+        representation = (
+            "current"
+            if checked
+            else (
+                "voltage"
+                if self.dc_calibration_group.isChecked()
+                else "adc"
+            )
+        )
+        with QtCore.QSignalBlocker(self.measurement_unit):
+            self.measurement_unit.setCurrentIndex(
+                self.measurement_unit.findData(representation)
+            )
+        self._emit_dc_measure_changed()
 
     def _browse_dc_calibration(self) -> None:
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -1639,6 +2119,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(self.dc_measure_mode):
             self.dc_measure_mode.setChecked(
                 bool(enabled) if self._dc_input_available else False
+            )
+        representation = (
+            "current"
+            if self._dc_input_available and enabled
+            else (
+                "voltage"
+                if self._dc_input_available and calibration_enabled
+                else "adc"
+            )
+        )
+        with QtCore.QSignalBlocker(self.measurement_unit):
+            self.measurement_unit.setCurrentIndex(
+                self.measurement_unit.findData(representation)
             )
         with QtCore.QSignalBlocker(self.dc_measure_gain_v_per_a):
             self.dc_measure_gain_v_per_a.setValue(float(gain_v_per_a))
@@ -1747,6 +2240,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         if not self._dc_input_available:
             with QtCore.QSignalBlocker(self.dc_measure_mode):
                 self.dc_measure_mode.setChecked(False)
+            with QtCore.QSignalBlocker(self.measurement_unit):
+                self.measurement_unit.setCurrentIndex(
+                    self.measurement_unit.findData("adc")
+                )
             with QtCore.QSignalBlocker(self.dc_calibration_group):
                 self.dc_calibration_group.setChecked(False)
         self._update_dc_measure_controls()
@@ -1794,7 +2291,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 "filter_tau_us": self.bias_t_filter_tau_us.value(),
             },
             "rf_path": dict(self.front_panel_values()),
+            "color_ranges": self.plot.color_range_settings(),
             "database_path": self.database_path_value(),
+            "measurement_representation": str(
+                self.measurement_unit.currentData()
+            ),
+            "dc_measure_gain_v_per_a": (
+                self.dc_measure_gain_v_per_a.value()
+            ),
             "dc_voltage_calibration_enabled": (
                 self.dc_calibration_group.isChecked()
             ),
@@ -1858,9 +2362,45 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.apply_path_settings(
             settings.get("rf_path", DEFAULT_STABILITY_RF_PATH)
         )
+        self.plot.load_color_range_settings(
+            settings.get(
+                "color_ranges",
+                default_stability_settings()["color_ranges"],
+            )
+        )
         self.database_path.setText(
             str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
         )
+        representation = str(
+            settings.get(
+                "measurement_representation",
+                (
+                    "current"
+                    if self.dc_measure_mode.isChecked()
+                    else (
+                        "voltage"
+                        if settings.get(
+                            "dc_voltage_calibration_enabled",
+                            False,
+                        )
+                        else "adc"
+                    )
+                ),
+            )
+        )
+        unit_index = self.measurement_unit.findData(representation)
+        if unit_index < 0:
+            raise ValueError(
+                "saved Stability measurement representation is invalid"
+            )
+        with QtCore.QSignalBlocker(self.measurement_unit):
+            self.measurement_unit.setCurrentIndex(unit_index)
+        with QtCore.QSignalBlocker(self.dc_measure_mode):
+            self.dc_measure_mode.setChecked(representation == "current")
+        with QtCore.QSignalBlocker(self.dc_measure_gain_v_per_a):
+            self.dc_measure_gain_v_per_a.setValue(
+                float(settings.get("dc_measure_gain_v_per_a", 1.0))
+            )
         with QtCore.QSignalBlocker(self.dc_calibration_group):
             self.dc_calibration_group.setChecked(
                 bool(settings.get("dc_voltage_calibration_enabled", False))
@@ -1953,6 +2493,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
 __all__ = [
     "DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV",
+    "DEFAULT_STABILITY_COLOR_RANGES",
     "DEFAULT_STABILITY_POINTS",
     "DEFAULT_STABILITY_REPETITIONS",
     "DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ",
