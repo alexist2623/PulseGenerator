@@ -17,7 +17,7 @@ import pytest
 
 import awg_sweep_map as awg_map
 import DCWaveform_Generator as gui
-from dc_waveform_core import QickSweepSpec
+from dc_waveform_core import QickRampRateSweepSpec, QickSweepSpec
 
 
 def _application():
@@ -157,6 +157,48 @@ def test_reduce_map_preserves_rf_duration_axis_in_microseconds():
     assert result.y_axis_label == "awg_0 / gate"
 
 
+def test_reduce_map_preserves_ramp_duration_axis_and_derived_rate_label():
+    duration_points = (0.08, 0.10, 0.12)
+    voltage_points = (-0.5, 0.5)
+    coordinates = np.asarray(
+        tuple(product(duration_points, voltage_points)),
+        dtype=float,
+    )
+    iq = np.zeros((coordinates.shape[0], 1, 2, 2), dtype=np.int16)
+    for point_index, (duration_us, voltage) in enumerate(coordinates):
+        iq[point_index, ..., 0] = int(100 * voltage + 10 * duration_us)
+        iq[point_index, ..., 1] = int(-100 * voltage + 10 * duration_us)
+    result = awg_map.reduce_awg_sweep_map(
+        SimpleNamespace(
+            sweep_axes=(
+                SimpleNamespace(
+                    output_name="all_awg_outputs",
+                    segment_name="ramp_0_to_1",
+                    start=duration_points[0],
+                    stop=duration_points[-1],
+                    count=len(duration_points),
+                    axis_kind="ramp_duration",
+                ),
+                _axis("awg_0", "set_1", voltage_points),
+            ),
+            sweep_points=coordinates,
+            iq=iq,
+            sample_rate_hz=50_000.0,
+        ),
+        x_axis_key=("all_awg_outputs", "ramp_0_to_1"),
+        y_axis_key=("awg_0", "set_1"),
+        full_scale_mv=800.0,
+    )
+
+    np.testing.assert_allclose(result.x_values, duration_points)
+    np.testing.assert_allclose(result.y_values, (-400.0, 400.0))
+    assert result.x_unit == "us"
+    assert result.y_unit == "mV"
+    assert result.x_axis_label == (
+        "ramp_0_to_1 RAMP duration (rate derived)"
+    )
+
+
 def test_reduce_three_axes_averages_unselected_axis():
     x_points = (-1.0, 1.0)
     y_points = (-0.5, 0.5)
@@ -293,6 +335,26 @@ def test_experiment_panel_axis_selection_and_result_plot():
             color_bar is not None
             for color_bar in window._awg_sweep_plot.color_bars.values()
         )
+    window.close()
+
+
+def test_experiment_panel_lists_ramp_rate_axis_for_2d_map():
+    app = _application()
+    window = gui.MainWindow()
+    window._sweep_specs = [
+        QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3),
+        QickSweepSpec("set_1", "awg_0", -0.5, 0.5, 2),
+    ]
+    window._refresh_sweep_overlay()
+    panel = window._experiment_panel
+
+    assert panel.sweep_map_x.count() == 2
+    assert "RAMP duration (rate derived)" in panel.sweep_map_x.itemText(0)
+    assert panel.selected_sweep_axis_keys() == (
+        ("all_awg_outputs", "ramp_0_to_1"),
+        ("awg_0", "set_1"),
+    )
+    app.processEvents()
     window.close()
 
 

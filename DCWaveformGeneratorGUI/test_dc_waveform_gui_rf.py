@@ -20,6 +20,7 @@ import DCWaveform_Generator as gui
 from dc_waveform_core import (
     PulseSequence,
     QickDdrReadoutSpec,
+    QickRampRateSweepSpec,
     QickRfPulseSpec,
     QickSweepSpec,
     adc_iq_to_voltage,
@@ -272,6 +273,28 @@ def test_segment_sweep_dialog_uses_voltage_values_but_returns_normalized_spec():
     dialog.close()
 
 
+def test_ramp_rate_sweep_dialog_uses_duration_and_reports_derived_rate():
+    app = _application()
+    initial = QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 5)
+    dialog = gui.RampRateSweepSettingsDialog(
+        segment_name="ramp_0_to_1",
+        current_duration_us=0.1,
+        voltage_delta_mv=200.0,
+        initial=initial,
+        cartesian_base_count=7,
+    )
+
+    assert dialog.start.value() == 0.08
+    assert dialog.stop.value() == 0.12
+    assert dialog.count.value() == 5
+    assert "2500" in dialog.rate_summary.text()
+    assert "1666.666" in dialog.rate_summary.text()
+    assert dialog.cartesian_summary.text() == "7 x 5 = 35 points"
+    assert dialog.value() == initial
+    app.processEvents()
+    dialog.close()
+
+
 def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
     app = _application()
     dialog = gui.QickExportDialog(
@@ -296,6 +319,27 @@ def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
     assert dialog.sweep_stop.value() == 120.0
     assert dialog._current_sweep_spec().start == -0.2
     assert dialog._current_sweep_spec().stop == 0.3
+    dialog.close()
+
+
+def test_export_dialog_preserves_global_ramp_rate_axis():
+    app = _application()
+    ramp = QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3)
+    voltage = QickSweepSpec("set_1", "awg_0", -0.5, 0.5, 5)
+    dialog = gui.QickExportDialog(
+        pulse_count=1,
+        set_names=("set_0", "set_1"),
+        initial_full_scale_mv=200.0,
+        initial_sweeps=(ramp, voltage),
+    )
+    app.processEvents()
+
+    assert dialog._effective_sweeps() == (ramp, voltage)
+    assert dialog.sweep_total.text() == "3 x 5 = 15 combinations"
+    dialog.sweep_group.setChecked(False)
+    app.processEvents()
+    assert dialog._effective_sweeps() == (ramp,)
+    assert dialog.sweep_total.text() == "3 = 3 combinations"
     dialog.close()
 
 
@@ -440,6 +484,35 @@ def test_generated_qick_module_preserves_rf_duration_sweep_mode():
     })
     assert len(runtime_rf) == 1
     assert runtime_rf[0].length_cycles == 300
+
+
+def test_generated_qick_module_preserves_ramp_rate_sweep():
+    pulse = PulseSequence(0.0, initial_duration_ns=100.0)
+    pulse.add_flat_ramp(100.0, 200.0, 200.0)
+    ramp_sweep = QickRampRateSweepSpec(
+        "ramp_0_to_1",
+        0.08,
+        0.12,
+        3,
+    )
+    code = generate_qick_program_code(
+        (pulse,),
+        output_names=("awg_0",),
+        awg_channels=(1,),
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        sweeps=(ramp_sweep,),
+    )
+    ast.parse(code)
+    namespace = {}
+    exec(compile(code, "<ramp-rate-generated>", "exec"), namespace)
+
+    sequence = namespace["build_sequence"]()
+    assert len(sequence.sweep_axes) == 1
+    axis = sequence.sweep_axes[0]
+    assert axis.axis_kind == "ramp_duration"
+    assert axis.segment_name == "ramp_0_to_1"
+    assert axis.points == (0.08, 0.1, 0.12)
 
 
 def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
@@ -664,7 +737,8 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         ((1.0, 0.2), (-0.15, 1.0)), dtype=float
     )
     window._sweep_specs = [
-        QickSweepSpec("set_1", "awg_0", -0.4, 0.6, 7)
+        QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3),
+        QickSweepSpec("set_1", "awg_0", -0.4, 0.6, 7),
     ]
     window._qick_fabric_mhz = 300.0
     window._qick_full_scale_mv = 2000.0
@@ -768,6 +842,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         "filter_tau_us": 100.0,
     }
     assert len(document["awg"]["outputs"]) == 2
+    assert document["awg"]["sweeps"][0] == {
+        "axis_kind": "ramp_duration",
+        "segment_name": "ramp_0_to_1",
+        "output_name": "all_awg_outputs",
+        "start": 0.08,
+        "stop": 0.12,
+        "count": 3,
+    }
     assert len(document["rf_outputs"]) == 2
     assert document["rf_outputs"][0]["filter_type"] == "highpass"
     assert document["rf_outputs"][0]["filter_cutoff"] == 1.75
@@ -1216,7 +1298,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 29
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 30
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

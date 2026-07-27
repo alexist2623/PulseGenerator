@@ -15,7 +15,7 @@ from math import ceil, isfinite
 from numbers import Integral, Real
 import keyword
 import re
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -186,10 +186,47 @@ class QickSweepSpec:
         return "normalized"
 
 
+@dataclass(frozen=True)
+class QickRampRateSweepSpec:
+    """Sweep one RAMP's duration while deriving its rate from adjacent SETs.
+
+    ``start`` and ``stop`` are RAMP durations in microseconds.  The AWG target
+    remains the following SET value, so every voltage-sweep point automatically
+    receives the corresponding signed 24-bit RAMP step.
+    """
+
+    segment_name: str
+    start: float
+    stop: float
+    count: int
+
+    def __post_init__(self) -> None:
+        if not str(self.segment_name):
+            raise ValueError("RAMP segment_name must not be empty")
+        _positive_real(self.start, "RAMP duration sweep start")
+        _positive_real(self.stop, "RAMP duration sweep stop")
+        _positive_int(self.count, "RAMP duration sweep count")
+
+    @property
+    def output_name(self) -> str:
+        return "all_awg_outputs"
+
+    @property
+    def axis_kind(self) -> str:
+        return "ramp_duration"
+
+    @property
+    def coordinate_unit(self) -> str:
+        return "us"
+
+
+QickSweepAxisSpec = Union[QickSweepSpec, QickRampRateSweepSpec]
+
+
 def _coerce_sweep_specs(
-    sweep: Optional[QickSweepSpec],
-    sweeps: Optional[Sequence[QickSweepSpec]],
-) -> Tuple[QickSweepSpec, ...]:
+    sweep: Optional[QickSweepAxisSpec],
+    sweeps: Optional[Sequence[QickSweepAxisSpec]],
+) -> Tuple[QickSweepAxisSpec, ...]:
     """Normalize legacy singular and Cartesian multi-sweep arguments."""
     if sweep is not None and sweeps is not None:
         raise ValueError("use either sweep or sweeps, not both")
@@ -197,12 +234,29 @@ def _coerce_sweep_specs(
         normalized = () if sweep is None else (sweep,)
     else:
         normalized = tuple(sweeps)
-    if any(not isinstance(item, QickSweepSpec) for item in normalized):
-        raise TypeError("every sweep entry must be a QickSweepSpec")
-    targets = [(item.segment_name, item.output_name) for item in normalized]
+    allowed = (QickSweepSpec, QickRampRateSweepSpec)
+    if any(not isinstance(item, allowed) for item in normalized):
+        raise TypeError(
+            "every sweep entry must be a QickSweepSpec or "
+            "QickRampRateSweepSpec"
+        )
+    ramp_sweeps = [
+        item for item in normalized if isinstance(item, QickRampRateSweepSpec)
+    ]
+    if len(ramp_sweeps) > 1:
+        raise ValueError("only one RAMP duration/rate sweep may be active")
+    targets = [
+        (item.segment_name, item.output_name)
+        for item in normalized
+        if isinstance(item, QickSweepSpec)
+    ]
     if len(set(targets)) != len(targets):
         raise ValueError("each (segment, output) sweep target must be unique")
-    return normalized
+    # The duration axis is deliberately outermost.  Its DMEM coefficient row
+    # is loaded once, then all inner voltage combinations use register adds.
+    return tuple(ramp_sweeps) + tuple(
+        item for item in normalized if isinstance(item, QickSweepSpec)
+    )
 
 
 def _coerce_cross_capacitance(matrix, output_count: int) -> Tuple[Tuple[float, ...], ...]:
@@ -756,8 +810,8 @@ def build_qick_sequence(
     output_names: Optional[Sequence[str]] = None,
     fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ,
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
-    sweep: Optional[QickSweepSpec] = None,
-    sweeps: Optional[Sequence[QickSweepSpec]] = None,
+    sweep: Optional[QickSweepAxisSpec] = None,
+    sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
@@ -840,13 +894,22 @@ def build_qick_sequence(
         else:
             sequence.add_ramp(spec.name, spec.duration_cycles)
     for sweep_spec in _coerce_sweep_specs(sweep, sweeps):
-        sequence.add_amplitude_sweep(
-            segment=sweep_spec.segment_name,
-            output=sweep_spec.output_name,
-            start=sweep_spec.start,
-            stop=sweep_spec.stop,
-            count=sweep_spec.count,
-        )
+        if isinstance(sweep_spec, QickRampRateSweepSpec):
+            sequence.add_ramp_duration_sweep(
+                segment=sweep_spec.segment_name,
+                start_us=sweep_spec.start,
+                stop_us=sweep_spec.stop,
+                count=sweep_spec.count,
+                sequence_fabric_mhz=fabric_mhz,
+            )
+        else:
+            sequence.add_amplitude_sweep(
+                segment=sweep_spec.segment_name,
+                output=sweep_spec.output_name,
+                start=sweep_spec.start,
+                stop=sweep_spec.stop,
+                count=sweep_spec.count,
+            )
     normalized_rf_specs = tuple(rf_pulse_specs or ())
     if any(not isinstance(spec, QickRfPulseSpec) for spec in normalized_rf_specs):
         raise TypeError("every RF pulse entry must be a QickRfPulseSpec")
@@ -1003,8 +1066,8 @@ def generate_qick_program_code(
     tproc_mhz: Real = DEFAULT_QICK_TPROC_MHZ,
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
     repetitions_per_sweep: Integral = 1,
-    sweep: Optional[QickSweepSpec] = None,
-    sweeps: Optional[Sequence[QickSweepSpec]] = None,
+    sweep: Optional[QickSweepAxisSpec] = None,
+    sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
     cross_capacitance=None,
     rf_pulse_spec: Optional[QickRfPulseSpec] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
@@ -1093,11 +1156,22 @@ def generate_qick_program_code(
         pulses, fabric_mhz=fabric_mhz, full_scale_mv=full_scale_mv
     )
     valid_set_names = {spec.name for spec in specs if spec.kind == "set"}
+    valid_ramp_names = {spec.name for spec in specs if spec.kind == "ramp"}
     for sweep_spec in sweep_specs:
-        if sweep_spec.segment_name not in valid_set_names:
-            raise ValueError(f"unknown QICK SET segment {sweep_spec.segment_name!r}")
-        if sweep_spec.output_name not in output_names:
-            raise ValueError(f"unknown QICK output {sweep_spec.output_name!r}")
+        if isinstance(sweep_spec, QickRampRateSweepSpec):
+            if sweep_spec.segment_name not in valid_ramp_names:
+                raise ValueError(
+                    f"unknown QICK RAMP segment {sweep_spec.segment_name!r}"
+                )
+        else:
+            if sweep_spec.segment_name not in valid_set_names:
+                raise ValueError(
+                    f"unknown QICK SET segment {sweep_spec.segment_name!r}"
+                )
+            if sweep_spec.output_name not in output_names:
+                raise ValueError(
+                    f"unknown QICK output {sweep_spec.output_name!r}"
+                )
     for rf_spec in normalized_rf_specs:
         if rf_spec.segment_name not in valid_set_names:
             raise ValueError(f"unknown RF SET segment {rf_spec.segment_name!r}")
@@ -1109,13 +1183,14 @@ def generate_qick_program_code(
 
     channel_map = dict(zip(output_names, awg_channels))
     sweep_config = tuple(
-        (
-            item.segment_name,
-            item.output_name,
-            float(item.start),
-            float(item.stop),
-            int(item.count),
-        )
+        {
+            "axis_kind": item.axis_kind,
+            "segment_name": item.segment_name,
+            "output_name": item.output_name,
+            "start": float(item.start),
+            "stop": float(item.stop),
+            "count": int(item.count),
+        }
         for item in sweep_specs
     )
     rf_configs = tuple(
@@ -1241,17 +1316,30 @@ def generate_qick_program_code(
                 f"    sequence.add_ramp({spec.name!r}, duration_cycles={spec.duration_cycles})"
             )
     for sweep_spec in sweep_specs:
-        lines.extend(
-            [
-                "    sequence.add_amplitude_sweep(",
-                f"        segment={sweep_spec.segment_name!r},",
-                f"        output={sweep_spec.output_name!r},",
-                f"        start={float(sweep_spec.start)!r},",
-                f"        stop={float(sweep_spec.stop)!r},",
-                f"        count={int(sweep_spec.count)},",
-                "    )",
-            ]
-        )
+        if isinstance(sweep_spec, QickRampRateSweepSpec):
+            lines.extend(
+                [
+                    "    sequence.add_ramp_duration_sweep(",
+                    f"        segment={sweep_spec.segment_name!r},",
+                    f"        start_us={float(sweep_spec.start)!r},",
+                    f"        stop_us={float(sweep_spec.stop)!r},",
+                    f"        count={int(sweep_spec.count)},",
+                    "        sequence_fabric_mhz=FABRIC_MHZ,",
+                    "    )",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "    sequence.add_amplitude_sweep(",
+                    f"        segment={sweep_spec.segment_name!r},",
+                    f"        output={sweep_spec.output_name!r},",
+                    f"        start={float(sweep_spec.start)!r},",
+                    f"        stop={float(sweep_spec.stop)!r},",
+                    f"        count={int(sweep_spec.count)},",
+                    "    )",
+                ]
+            )
     for rf_spec in normalized_rf_specs:
         if not rf_spec.duration_sweep_enabled:
             continue
@@ -1431,8 +1519,10 @@ __all__ = [
     "DEFAULT_QICK_FULL_SCALE_MV",
     "PulseSequence",
     "QickDdrReadoutSpec",
+    "QickRampRateSweepSpec",
     "QickRfPulseSpec",
     "QickSegmentSpec",
+    "QickSweepAxisSpec",
     "QickSweepSpec",
     "WaveformInterval",
     "adc_iq_to_voltage",

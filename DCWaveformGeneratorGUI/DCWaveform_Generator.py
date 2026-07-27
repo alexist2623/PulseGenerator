@@ -9,6 +9,7 @@ import json
 from dataclasses import asdict, replace
 from math import prod
 from pathlib import Path
+import re
 import sys
 import traceback
 from typing import Tuple, Optional, List, Callable, Mapping, Sequence
@@ -124,7 +125,9 @@ try:
         QICK_INPUT_BOARD_TYPES,
         QICK_OUTPUT_BOARD_TYPES,
         QickDdrReadoutSpec,
+        QickRampRateSweepSpec,
         QickRfPulseSpec,
+        QickSweepAxisSpec,
         QickSweepSpec,
         build_qick_sequence,
         generate_qcs_program_code,
@@ -149,7 +152,9 @@ except ImportError:
         QICK_INPUT_BOARD_TYPES,
         QICK_OUTPUT_BOARD_TYPES,
         QickDdrReadoutSpec,
+        QickRampRateSweepSpec,
         QickRfPulseSpec,
+        QickSweepAxisSpec,
         QickSweepSpec,
         build_qick_sequence,
         generate_qcs_program_code,
@@ -290,7 +295,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 29
+SETTINGS_VERSION = 30
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -1080,6 +1085,8 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     port_is_selected    = QtCore.pyqtSignal(int)
     sweep_requested     = QtCore.pyqtSignal(int, int)
     sweep_remove_requested = QtCore.pyqtSignal(int, int)
+    ramp_sweep_requested = QtCore.pyqtSignal(int, int)
+    ramp_sweep_remove_requested = QtCore.pyqtSignal(int, int)
     segment_structure_changed = QtCore.pyqtSignal(int)
     port_idx: int       = 0
 
@@ -1096,6 +1103,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self._sweep_row: Optional[int] = None
         self._sweep_rows = set()
         self._sweep_color: Optional[QtGui.QColor] = None
+        self._ramp_sweep_rows = set()
         self._time_unit = time_unit
 
         v_splitter          = QtWidgets.QSplitter(QtCore.Qt.Vertical, self)
@@ -1174,6 +1182,11 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         act_sweep = sweep_menu.addAction("Configure sweep...")
         act_remove_sweep = sweep_menu.addAction("Remove sweep")
         act_remove_sweep.setEnabled(row in self._sweep_rows)
+        ramp_sweep_menu = menu.addMenu("RAMP rate sweep")
+        ramp_sweep_menu.setEnabled(row > 0)
+        act_ramp_sweep = ramp_sweep_menu.addAction("Configure sweep...")
+        act_remove_ramp_sweep = ramp_sweep_menu.addAction("Remove sweep")
+        act_remove_ramp_sweep.setEnabled(row in self._ramp_sweep_rows)
         menu.addSeparator()
         act_del       = menu.addAction("Delete segment")
 
@@ -1183,6 +1196,12 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             return
         if chosen == act_remove_sweep:
             self.sweep_remove_requested.emit(self.idx, row)
+            return
+        if chosen == act_ramp_sweep:
+            self.ramp_sweep_requested.emit(self.idx, row)
+            return
+        if chosen == act_remove_ramp_sweep:
+            self.ramp_sweep_remove_requested.emit(self.idx, row)
             return
         if chosen == act_ins_above:
             ok = self._pulse.insert_flat_ramp(row * 2)
@@ -1220,6 +1239,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self._sweep_rows = {int(row) for row in rows}
         self._sweep_row = min(self._sweep_rows) if self._sweep_rows else None
         self._sweep_color = QtGui.QColor(color) if color is not None else None
+        self.refresh_table()
+
+    def set_ramp_sweep_rows(self, rows) -> None:
+        self._ramp_sweep_rows = {int(row) for row in rows}
         self.refresh_table()
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
@@ -1323,6 +1346,14 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                         highlight.setAlpha(42)
                         item.setBackground(QtGui.QBrush(highlight))
                         item.setToolTip("Voltage sweep target")
+                    if row in self._ramp_sweep_rows:
+                        highlight = QtGui.QColor("#3978c5")
+                        highlight.setAlpha(52)
+                        item.setBackground(QtGui.QBrush(highlight))
+                        tooltip = "RAMP duration/rate sweep target"
+                        if row in self._sweep_rows:
+                            tooltip += "; voltage sweep target"
+                        item.setToolTip(tooltip)
                     if col == 0 or (col == 1 and row == 0):
                         item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                     self.table.setItem(row, col, item)
@@ -1761,6 +1792,99 @@ class SweepSettingsDialog(QtWidgets.QDialog):
             output_name=self._output_name,
             start=self.start.value() / self._full_scale_mv,
             stop=self.stop.value() / self._full_scale_mv,
+            count=self.count.value(),
+        )
+
+
+class RampRateSweepSettingsDialog(QtWidgets.QDialog):
+    """Configure a RAMP rate by sweeping its duration in microseconds."""
+
+    def __init__(
+        self,
+        *,
+        segment_name: str,
+        current_duration_us: float,
+        voltage_delta_mv: float,
+        initial: Optional[QickRampRateSweepSpec] = None,
+        cartesian_base_count: int = 1,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("RAMP rate sweep settings")
+        self._segment_name = str(segment_name)
+        self._voltage_delta_mv = float(voltage_delta_mv)
+        self._cartesian_base_count = int(cartesian_base_count)
+        form = QtWidgets.QFormLayout(self)
+
+        form.addRow("RAMP segment:", QtWidgets.QLabel(self._segment_name))
+        form.addRow(
+            "Current duration:",
+            QtWidgets.QLabel(f"{float(current_duration_us):.9g} us"),
+        )
+        form.addRow(
+            "Nominal voltage change:",
+            QtWidgets.QLabel(f"{self._voltage_delta_mv:.9g} mV"),
+        )
+
+        default_start = max(float(current_duration_us) * 0.5, 1.0e-6)
+        default_stop = max(float(current_duration_us) * 1.5, 2.0e-6)
+        if initial is not None:
+            default_start = float(initial.start)
+            default_stop = float(initial.stop)
+
+        self.start = QtWidgets.QDoubleSpinBox()
+        self.stop = QtWidgets.QDoubleSpinBox()
+        for widget, value in ((self.start, default_start), (self.stop, default_stop)):
+            widget.setRange(1.0e-6, 1.0e9)
+            widget.setDecimals(9)
+            widget.setSingleStep(max(1.0e-6, float(current_duration_us) / 20.0))
+            widget.setSuffix(" us")
+            widget.setValue(value)
+        self.count = QtWidgets.QSpinBox()
+        self.count.setRange(2, 1_000_000)
+        self.count.setValue(initial.count if initial is not None else 9)
+        self.rate_summary = QtWidgets.QLabel()
+        self.rate_summary.setWordWrap(True)
+        self.cartesian_summary = QtWidgets.QLabel()
+
+        form.addRow("Start duration:", self.start)
+        form.addRow("Stop duration:", self.stop)
+        form.addRow("Sweep point count:", self.count)
+        form.addRow("Nominal RAMP rates:", self.rate_summary)
+        form.addRow("Cartesian total:", self.cartesian_summary)
+        self.rate_summary.setToolTip(
+            "The following SET remains the RAMP target. Voltage sweeps on "
+            "either endpoint automatically update the signed hardware step."
+        )
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.start.valueChanged.connect(self._refresh_summary)
+        self.stop.valueChanged.connect(self._refresh_summary)
+        self.count.valueChanged.connect(self._refresh_summary)
+        self._refresh_summary()
+
+    def _refresh_summary(self, *_args) -> None:
+        start_rate = self._voltage_delta_mv / self.start.value()
+        stop_rate = self._voltage_delta_mv / self.stop.value()
+        self.rate_summary.setText(
+            f"{start_rate:.9g} to {stop_rate:.9g} mV/us "
+            "(nominal endpoint levels)"
+        )
+        self.cartesian_summary.setText(
+            f"{self._cartesian_base_count} x {self.count.value()} = "
+            f"{self._cartesian_base_count * self.count.value()} points"
+        )
+
+    def value(self) -> QickRampRateSweepSpec:
+        return QickRampRateSweepSpec(
+            segment_name=self._segment_name,
+            start=self.start.value(),
+            stop=self.stop.value(),
             count=self.count.value(),
         )
 
@@ -3414,7 +3538,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
-        self._map_sweep_specs: Tuple[QickSweepSpec, ...] = ()
+        self._map_sweep_specs: Tuple[QickSweepAxisSpec, ...] = ()
         self.sweep_map_group = QtWidgets.QGroupBox("AWG 2D sweep map")
         sweep_map_form = QtWidgets.QFormLayout(self.sweep_map_group)
         self.sweep_map_x = QtWidgets.QComboBox()
@@ -3583,9 +3707,16 @@ class ExperimentPanel(QtWidgets.QWidget):
         return str(value[0]), str(value[1])
 
     def _sweep_axis_label(self, spec) -> str:
-        if getattr(spec, "axis_kind", "amplitude") == "rf_duration":
+        axis_kind = getattr(spec, "axis_kind", "amplitude")
+        if axis_kind == "rf_duration":
             return (
                 f"RF gen {spec.gen_ch} / {spec.segment_name} duration | "
+                f"{spec.start:.6g} to {spec.stop:.6g} us | "
+                f"{spec.count} points"
+            )
+        if axis_kind == "ramp_duration":
+            return (
+                f"{spec.segment_name} RAMP duration (rate derived) | "
                 f"{spec.start:.6g} to {spec.stop:.6g} us | "
                 f"{spec.count} points"
             )
@@ -4130,8 +4261,8 @@ class QickExportDialog(QtWidgets.QDialog):
         initial_rf_spec: Optional[QickRfPulseSpec] = None,
         initial_rf_specs: Optional[Sequence[QickRfPulseSpec]] = None,
         initial_ddr_readout_spec: Optional[QickDdrReadoutSpec] = None,
-        initial_sweep: Optional[QickSweepSpec] = None,
-        initial_sweeps: Optional[Sequence[QickSweepSpec]] = None,
+        initial_sweep: Optional[QickSweepAxisSpec] = None,
+        initial_sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
         initial_cross_capacitance=None,
         initial_fabric_mhz: float = DEFAULT_QICK_FABRIC_MHZ,
         initial_tproc_mhz: float = DEFAULT_QICK_TPROC_MHZ,
@@ -4159,11 +4290,24 @@ class QickExportDialog(QtWidgets.QDialog):
         self._ddr_readout_spec = initial_ddr_readout_spec
         if initial_sweep is not None and initial_sweeps is not None:
             raise ValueError("use either initial_sweep or initial_sweeps, not both")
-        self._dialog_sweep_specs = list(
+        supplied_sweeps = list(
             initial_sweeps
             if initial_sweeps is not None
             else (() if initial_sweep is None else (initial_sweep,))
         )
+        self._dialog_ramp_sweep = next(
+            (
+                spec
+                for spec in supplied_sweeps
+                if isinstance(spec, QickRampRateSweepSpec)
+            ),
+            None,
+        )
+        self._dialog_sweep_specs = [
+            spec
+            for spec in supplied_sweeps
+            if isinstance(spec, QickSweepSpec)
+        ]
         self._cross_capacitance = np.asarray(
             np.eye(pulse_count)
             if initial_cross_capacitance is None
@@ -4467,11 +4611,16 @@ class QickExportDialog(QtWidgets.QDialog):
             )
         )
 
-    def _effective_sweeps(self) -> Tuple[QickSweepSpec, ...]:
+    def _effective_sweeps(self) -> Tuple[QickSweepAxisSpec, ...]:
+        ramp_prefix = (
+            ()
+            if self._dialog_ramp_sweep is None
+            else (self._dialog_ramp_sweep,)
+        )
         if not self.sweep_group.isChecked():
-            return ()
+            return ramp_prefix
         if not self._dialog_sweep_specs:
-            return (self._current_sweep_spec(),)
+            return ramp_prefix + (self._current_sweep_spec(),)
         specs = list(self._dialog_sweep_specs)
         row = self.sweep_table.currentRow()
         if 0 <= row < len(specs):
@@ -4479,18 +4628,25 @@ class QickExportDialog(QtWidgets.QDialog):
         targets = [(spec.segment_name, spec.output_name) for spec in specs]
         if len(set(targets)) != len(targets):
             raise ValueError("each Cartesian voltage sweep must target a unique output/SET")
-        return tuple(specs)
+        return ramp_prefix + tuple(specs)
 
     def _refresh_sweep_total(self, *_args) -> None:
-        if not self.sweep_group.isChecked():
+        counts = (
+            []
+            if self._dialog_ramp_sweep is None
+            else [self._dialog_ramp_sweep.count]
+        )
+        if self.sweep_group.isChecked():
+            voltage_counts = [spec.count for spec in self._dialog_sweep_specs]
+            row = self.sweep_table.currentRow()
+            if 0 <= row < len(voltage_counts):
+                voltage_counts[row] = self.sweep_count.value()
+            elif not voltage_counts:
+                voltage_counts = [self.sweep_count.value()]
+            counts.extend(voltage_counts)
+        if not counts:
             self.sweep_total.setText("disabled")
             return
-        counts = [spec.count for spec in self._dialog_sweep_specs]
-        row = self.sweep_table.currentRow()
-        if 0 <= row < len(counts):
-            counts[row] = self.sweep_count.value()
-        elif not counts:
-            counts = [self.sweep_count.value()]
         self.sweep_total.setText(
             " x ".join(str(count) for count in counts)
             + f" = {prod(counts)} combinations"
@@ -4579,7 +4735,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     @property
     def _sweep_spec(self) -> Optional[QickSweepSpec]:
         """Legacy single-sweep view used by older tests and callers."""
-        return self._sweep_specs[0] if self._sweep_specs else None
+        return next(
+            (
+                spec
+                for spec in self._sweep_specs
+                if isinstance(spec, QickSweepSpec)
+            ),
+            None,
+        )
 
     @_sweep_spec.setter
     def _sweep_spec(self, value: Optional[QickSweepSpec]) -> None:
@@ -4604,7 +4767,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
         self._rf_panel: Optional[RfPulseEditorPanel] = None
         self._dock_rf: Optional[QtWidgets.QDockWidget] = None
-        self._sweep_specs: List[QickSweepSpec] = []
+        self._sweep_specs: List[QickSweepAxisSpec] = []
         self._cross_capacitance = np.eye(1, dtype=float)
         self._qick_fabric_mhz = float(DEFAULT_QICK_FABRIC_MHZ)
         self._qick_tproc_mhz = float(DEFAULT_QICK_TPROC_MHZ)
@@ -4935,6 +5098,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         control.port_is_selected.connect(self._port_select)
         control.sweep_requested.connect(self._configure_segment_sweep)
         control.sweep_remove_requested.connect(self._remove_segment_sweep)
+        control.ramp_sweep_requested.connect(self._configure_ramp_rate_sweep)
+        control.ramp_sweep_remove_requested.connect(
+            self._remove_ramp_rate_sweep
+        )
         control.segment_structure_changed.connect(self._on_segment_structure_changed)
 
     def _on_port_menu(self, pos: QtCore.QPoint) -> None:
@@ -4996,6 +5163,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.refresh_panel_table()
         updated_sweeps = []
         for spec, target in sweep_entries:
+            if isinstance(spec, QickRampRateSweepSpec):
+                updated_sweeps.append(spec)
+                continue
             if target is None or target[0] == idx:
                 continue
             if target[0] > idx:
@@ -5154,9 +5324,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         # Sweep
         m_sweep = mb.addMenu("&Sweep")
-        clear_sweeps = m_sweep.addAction("Clear all amplitude sweeps")
+        clear_sweeps = m_sweep.addAction("Clear all sweeps")
         clear_sweeps.triggered.connect(
-            lambda: self._clear_sweep("All amplitude sweeps removed")
+            lambda: self._clear_sweep("All voltage and RAMP-rate sweeps removed")
         )
 
         # Grid
@@ -5342,11 +5512,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _sweep_target_indices(
         self,
-        spec: Optional[QickSweepSpec] = None,
+        spec: Optional[QickSweepAxisSpec] = None,
     ) -> Optional[Tuple[int, int]]:
         if spec is None:
             spec = self._sweep_spec
-        if spec is None:
+        if spec is None or not isinstance(spec, QickSweepSpec):
             return None
         try:
             port_index = self._qick_output_names().index(spec.output_name)
@@ -5359,11 +5529,32 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return None
         return port_index, segment_index
 
+    @staticmethod
+    def _ramp_sweep_row(
+        spec: QickSweepAxisSpec,
+    ) -> Optional[int]:
+        if not isinstance(spec, QickRampRateSweepSpec):
+            return None
+        match = re.fullmatch(r"ramp_(\d+)_to_(\d+)", spec.segment_name)
+        if match is None:
+            return None
+        source_row, destination_row = map(int, match.groups())
+        if destination_row != source_row + 1:
+            return None
+        return destination_row
+
     def _sweep_cartesian_count(self) -> int:
         return prod(spec.count for spec in self._sweep_specs) if self._sweep_specs else 1
 
     def _sync_sweep_rows(self) -> None:
         rows_by_port = {index: set() for index in range(len(self._pulse))}
+        ramp_rows = {
+            row
+            for row in (
+                self._ramp_sweep_row(spec) for spec in self._sweep_specs
+            )
+            if row is not None
+        }
         for spec in self._sweep_specs:
             target = self._sweep_target_indices(spec)
             if target is not None:
@@ -5378,6 +5569,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     else QtGui.QColor(self._multi_ctrl._color_map[port_index])
                 )
             control.set_sweep_rows(rows, color)
+            control.set_ramp_sweep_rows(ramp_rows)
 
     def _refresh_sweep_overlay(
         self,
@@ -5393,6 +5585,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         envelopes = []
         sweeps_by_segment = {}
         for spec in self._sweep_specs:
+            if not isinstance(spec, QickSweepSpec):
+                continue
             target = self._sweep_target_indices(spec)
             if target is None:
                 continue
@@ -5449,6 +5643,68 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         physical_upper[destination_port],
                     )
                 )
+
+        ramp_sweep = next(
+            (
+                spec
+                for spec in self._sweep_specs
+                if isinstance(spec, QickRampRateSweepSpec)
+            ),
+            None,
+        )
+        if ramp_sweep is not None:
+            ramp_row = self._ramp_sweep_row(ramp_sweep)
+            if ramp_row is not None and all(
+                ramp_row < len(pulse.flat_segments()) for pulse in self._pulse
+            ):
+                point_index = ramp_row * 2
+                endpoint_waveforms = []
+                for duration_us in (ramp_sweep.start, ramp_sweep.stop):
+                    endpoint_pulses = [pulse.copy() for pulse in self._pulse]
+                    desired_duration_ns = float(duration_us) * 1000.0
+                    for pulse in endpoint_pulses:
+                        current_duration_ns = (
+                            pulse.t[point_index] - pulse.t[point_index - 1]
+                        )
+                        pulse.t[point_index:] += (
+                            desired_duration_ns - current_duration_ns
+                        )
+                    endpoint_waveforms.append(
+                        transform_virtual_waveforms(
+                            endpoint_pulses,
+                            self._cross_capacitance,
+                        )
+                    )
+                time_a, _virtual_a, physical_a = endpoint_waveforms[0]
+                time_b, _virtual_b, physical_b = endpoint_waveforms[1]
+                common_time = np.unique(
+                    np.concatenate((
+                        np.asarray(time_a, dtype=float),
+                        np.asarray(time_b, dtype=float),
+                    ))
+                )
+                for destination_port in range(len(self._pulse)):
+                    endpoint_a = np.interp(
+                        common_time,
+                        time_a,
+                        physical_a[destination_port],
+                    )
+                    endpoint_b = np.interp(
+                        common_time,
+                        time_b,
+                        physical_b[destination_port],
+                    )
+                    envelopes.append((
+                        (
+                            f"awg_{destination_port}",
+                            ramp_sweep.segment_name,
+                            "ramp_rate",
+                        ),
+                        destination_port,
+                        common_time,
+                        endpoint_a,
+                        endpoint_b,
+                    ))
         self._plot.set_sweep_envelopes(envelopes)
         if sync_rows:
             self._sync_sweep_rows()
@@ -5531,11 +5787,108 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "Cartesian combinations remain"
             )
 
+    def _configure_ramp_rate_sweep(
+        self,
+        port_index: int,
+        segment_index: int,
+    ) -> None:
+        if not 0 <= int(port_index) < len(self._pulse):
+            return
+        if segment_index <= 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No incoming RAMP",
+                "The first SET has no preceding RAMP to sweep.",
+            )
+            return
+        pulse = self._pulse[int(port_index)]
+        if segment_index >= len(pulse.flat_segments()):
+            return
+        point_index = int(segment_index) * 2
+        current_duration_us = (
+            float(pulse.t[point_index] - pulse.t[point_index - 1]) / 1000.0
+        )
+        voltage_delta_mv = float(
+            pulse.v[point_index] - pulse.v[point_index - 2]
+        )
+        segment_name = (
+            f"ramp_{int(segment_index) - 1}_to_{int(segment_index)}"
+        )
+        initial = next(
+            (
+                spec
+                for spec in self._sweep_specs
+                if isinstance(spec, QickRampRateSweepSpec)
+            ),
+            None,
+        )
+        other_point_count = prod(
+            spec.count
+            for spec in self._sweep_specs
+            if not isinstance(spec, QickRampRateSweepSpec)
+        )
+        dialog = RampRateSweepSettingsDialog(
+            segment_name=segment_name,
+            current_duration_us=current_duration_us,
+            voltage_delta_mv=voltage_delta_mv,
+            initial=(
+                initial
+                if initial is not None
+                and initial.segment_name == segment_name
+                else None
+            ),
+            cartesian_base_count=other_point_count,
+            parent=self,
+        )
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        new_spec = dialog.value()
+        self._sweep_specs = [new_spec] + [
+            spec
+            for spec in self._sweep_specs
+            if not isinstance(spec, QickRampRateSweepSpec)
+        ]
+        self._port_select(int(port_index))
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self.statusBar().showMessage(
+            f"RAMP-rate sweep applied to {segment_name}: "
+            f"{new_spec.start:.9g} to {new_spec.stop:.9g} us, "
+            f"{new_spec.count} axis points; "
+            f"{self._sweep_cartesian_count()} Cartesian combinations"
+        )
+
+    def _remove_ramp_rate_sweep(
+        self,
+        _port_index: int,
+        segment_index: int,
+    ) -> None:
+        segment_name = f"ramp_{int(segment_index) - 1}_to_{int(segment_index)}"
+        remaining = [
+            spec
+            for spec in self._sweep_specs
+            if not (
+                isinstance(spec, QickRampRateSweepSpec)
+                and spec.segment_name == segment_name
+            )
+        ]
+        if len(remaining) == len(self._sweep_specs):
+            return
+        self._sweep_specs = remaining
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self.statusBar().showMessage(
+            f"RAMP-rate sweep removed; {self._sweep_cartesian_count()} "
+            "Cartesian combinations remain"
+        )
+
     def _on_segment_structure_changed(self, port_index: int) -> None:
         remaining = [
             spec
             for spec in self._sweep_specs
-            if (self._sweep_target_indices(spec) or (-1, -1))[0] != port_index
+            if (
+                not isinstance(spec, QickRampRateSweepSpec)
+                and (self._sweep_target_indices(spec) or (-1, -1))[0]
+                != port_index
+            )
         ]
         if len(remaining) != len(self._sweep_specs):
             self._sweep_specs = remaining
@@ -6930,6 +7283,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "cross_capacitance": self._cross_capacitance.tolist(),
                 "sweeps": [
                     {
+                        "axis_kind": spec.axis_kind,
                         "segment_name": spec.segment_name,
                         "output_name": spec.output_name,
                         "start": spec.start,
@@ -7293,18 +7647,61 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         raw_sweeps = awg.get("sweeps", [])
         if not isinstance(raw_sweeps, list):
             raise TypeError("AWG sweeps must be a JSON array")
-        sweeps = tuple(
-            QickSweepSpec(
-                segment_name=str(entry["segment_name"]),
-                output_name=str(entry["output_name"]),
-                start=float(entry["start"]),
-                stop=float(entry["stop"]),
-                count=self._json_int(entry["count"], "sweep count", minimum=1),
-            )
-            for entry in raw_sweeps
+        decoded_sweeps = []
+        for entry in raw_sweeps:
+            if not isinstance(entry, dict):
+                raise TypeError("each AWG sweep must be a JSON object")
+            axis_kind = str(entry.get("axis_kind", "amplitude"))
+            if axis_kind == "ramp_duration":
+                decoded_sweeps.append(QickRampRateSweepSpec(
+                    segment_name=str(entry["segment_name"]),
+                    start=float(entry["start"]),
+                    stop=float(entry["stop"]),
+                    count=self._json_int(
+                        entry["count"],
+                        "RAMP duration sweep count",
+                        minimum=1,
+                    ),
+                ))
+            elif axis_kind in {"amplitude", "voltage"}:
+                decoded_sweeps.append(QickSweepSpec(
+                    segment_name=str(entry["segment_name"]),
+                    output_name=str(entry["output_name"]),
+                    start=float(entry["start"]),
+                    stop=float(entry["stop"]),
+                    count=self._json_int(
+                        entry["count"],
+                        "sweep count",
+                        minimum=1,
+                    ),
+                ))
+            else:
+                raise ValueError(f"unknown AWG sweep axis_kind {axis_kind!r}")
+        ramp_sweeps = [
+            spec
+            for spec in decoded_sweeps
+            if isinstance(spec, QickRampRateSweepSpec)
+        ]
+        if len(ramp_sweeps) > 1:
+            raise ValueError("only one RAMP duration/rate sweep may be stored")
+        sweeps = tuple(ramp_sweeps) + tuple(
+            spec
+            for spec in decoded_sweeps
+            if isinstance(spec, QickSweepSpec)
         )
         sweep_targets = set()
         for spec in sweeps:
+            if isinstance(spec, QickRampRateSweepSpec):
+                ramp_row = self._ramp_sweep_row(spec)
+                if ramp_row is None:
+                    raise ValueError(
+                        f"invalid RAMP sweep segment {spec.segment_name!r}"
+                    )
+                if any(ramp_row >= pulse.set_count for pulse in pulses):
+                    raise ValueError(
+                        f"unknown RAMP sweep segment {spec.segment_name!r}"
+                    )
+                continue
             target = (spec.output_name, spec.segment_name)
             if target in sweep_targets:
                 raise ValueError("each AWG output/SET may have only one sweep")

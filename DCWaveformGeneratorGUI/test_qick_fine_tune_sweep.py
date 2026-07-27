@@ -16,6 +16,7 @@ from qick.qick_asm import QickConfig
 from qick_fine_tune_sweep import (
     DdrFirReadoutConfig,
     FineTuneSequence,
+    RampDurationSweep,
     ReadoutConfig,
     RfPulseConfig,
 )
@@ -214,6 +215,112 @@ def test_set_and_ramp_words_are_updated_by_nested_loop_and_add():
         for field in program._sweep_fields
     }
     assert swept_kinds == {"set", "ramp"}
+
+
+def test_ramp_rate_sweep_recomputes_steps_for_adjacent_voltage_axes():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.set_cross_capacitance(((1.0, 0.2), (-0.15, 1.0)))
+    sequence.add_set("start", (-0.2, 0.1), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("gate", (0.35, -0.25), 24)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.08,
+        stop_us=0.12,
+        count=4,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_amplitude_sweep("start", "awg_0", -0.3, 0.3, 3)
+    sequence.add_amplitude_sweep("gate", "awg_1", -0.4, 0.4, 5)
+
+    assert isinstance(sequence.sweep_axes[0], RampDurationSweep)
+    assert sequence.sweep_shape == (4, 3, 5)
+
+    program = sequence.make_program(
+        _mock_soccfg(2),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=2,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=2_000_000)
+
+    assert [event.word for event in tproc.output_events] == _expected_words(program)
+    assert tproc.timing_conflicts == []
+    summary = program.summary()
+    assert summary["sweep_execution"] == (
+        "tproc_loop_add_with_ramp_rate_coefficients"
+    )
+    assert summary["sweep_uses_point_table"] is False
+    assert summary["ramp_rate_coefficient_table_words"] > 0
+    assert summary["ramp_rate_coefficient_table_words"] < np.prod(
+        sequence.sweep_shape
+    )
+    assert summary["sweep_max_duration_quantization_error"] == 0
+
+    ramp_durations = {
+        command.duration_samples
+        for point in program.compiled_points
+        for command in point.segment_commands[1]
+    }
+    assert ramp_durations == {24 * 16, 28 * 16, 32 * 16, 36 * 16}
+    ramp_steps = {
+        command.step
+        for point in program.compiled_points
+        for command in point.segment_commands[1]
+    }
+    assert len(ramp_steps) > len(ramp_durations)
+
+
+def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("capture", (0.4,), 60)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.08,
+        stop_us=0.12,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=8,
+        at_segment="capture",
+        trigger_delay_tproc_cycles=17,
+        margin_input_samples=0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=500_000)
+
+    awg_events = [
+        event for event in tproc.output_events if event.tproc_ch == 0
+    ]
+    trigger_high = [
+        event
+        for event in tproc.output_pin_events
+        if event["word"] == 1 << 1
+    ]
+    assert [event.word for event in awg_events] == _expected_words(program)
+    assert len(trigger_high) == 3
+    assert len(awg_events) == 3 * 3
+    for point_index, trigger_event in enumerate(trigger_high):
+        capture_set_event = awg_events[point_index * 3 + 2]
+        assert trigger_event["cycle"] - capture_set_event.cycle == 17
+    assert program.summary()["fir_software_warmup_compensation"] is False
+    assert tproc.timing_conflicts == []
 
 
 def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch):

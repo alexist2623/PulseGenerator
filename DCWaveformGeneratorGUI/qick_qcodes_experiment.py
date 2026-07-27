@@ -662,11 +662,11 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
     used = set()
     names = []
     for axis in axes:
-        suffix = (
-            "duration_us"
-            if getattr(axis, "axis_kind", "amplitude") == "rf_duration"
-            else "voltage_mv"
-        )
+        axis_kind = getattr(axis, "axis_kind", "amplitude")
+        suffix = {
+            "rf_duration": "duration_us",
+            "ramp_duration": "ramp_duration_us",
+        }.get(axis_kind, "voltage_mv")
         base = (
             f"{_qcodes_identifier(axis.output_name)}_"
             f"{_qcodes_identifier(axis.segment_name)}_{suffix}"
@@ -682,8 +682,11 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
 
 
 def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, float]:
-    if getattr(axis, "axis_kind", "amplitude") == "rf_duration":
+    axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_duration":
         return "RF pulse duration", "us", 1.0
+    if axis_kind == "ramp_duration":
+        return "RAMP duration (rate derived)", "us", 1.0
     return "voltage", "mV", float(full_scale_mv)
 
 
@@ -1147,11 +1150,21 @@ def store_qick_result(
             "stop": float(axis.stop) * scale,
             "count": int(axis.count),
         }
-        if getattr(axis, "axis_kind", "amplitude") == "rf_duration":
+        axis_kind = getattr(axis, "axis_kind", "amplitude")
+        if axis_kind == "rf_duration":
             axis_metadata.update({
                 "duration_start_us": float(axis.start),
                 "duration_stop_us": float(axis.stop),
                 "segment_length_mode": axis.segment_length_mode,
+            })
+        elif axis_kind == "ramp_duration":
+            axis_metadata.update({
+                "duration_start_us": float(axis.start),
+                "duration_stop_us": float(axis.stop),
+                "rate_semantics": (
+                    "The following SET is the target; the signed RAMP step is "
+                    "derived for every duration and voltage-sweep coordinate."
+                ),
             })
         else:
             axis_metadata.update({
@@ -1169,8 +1182,14 @@ def store_qick_result(
                 if getattr(axis, "axis_kind", "amplitude")
                 == "rf_duration"
                 else (
-                    f"Voltage applied to {axis.output_name}/"
-                    f"{axis.segment_name}"
+                    f"RAMP duration for {axis.segment_name}; RAMP rate is "
+                    "derived from its adjacent SET voltages"
+                    if getattr(axis, "axis_kind", "amplitude")
+                    == "ramp_duration"
+                    else (
+                        f"Voltage applied to {axis.output_name}/"
+                        f"{axis.segment_name}"
+                    )
                 )
             )
             + "; this is a directly selectable Cartesian sweep axis."

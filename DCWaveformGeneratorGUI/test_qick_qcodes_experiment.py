@@ -18,6 +18,7 @@ from qick_fine_tune_sweep import (
     AmplitudeSweep,
     FineTuneDdrResult,
     FineTuneSequence,
+    RampDurationSweep,
     RfDurationSweep,
 )
 from qick_qcodes_experiment import (
@@ -71,6 +72,24 @@ def test_sweep_parameter_names_preserve_rf_duration_units():
     assert _sweep_parameter_names(axes) == (
         "awg_0_gate_voltage_mv",
         "rf_gen_2_gate_duration_us",
+    )
+
+
+def test_sweep_parameter_names_preserve_ramp_duration_units():
+    axes = (
+        RampDurationSweep(
+            segment_name="ramp_0_to_1",
+            start=0.08,
+            stop=0.12,
+            count=3,
+            sequence_fabric_mhz=300.0,
+        ),
+        AmplitudeSweep("gate", "awg_0", -0.5, 0.5, 3),
+    )
+
+    assert _sweep_parameter_names(axes) == (
+        "all_awg_outputs_ramp_0_to_1_ramp_duration_us",
+        "awg_0_gate_voltage_mv",
     )
 
 
@@ -630,6 +649,36 @@ def test_awg_vertex_metadata_tracks_segment_extension_per_rf_duration():
             [0.0, 3.0, 3.1, 3.2],
             [0.0, 4.0, 4.1, 4.2],
         ],
+    )
+
+
+def test_awg_vertex_metadata_tracks_ramp_duration_rate_sweep():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("gate", (0.4,), 60)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        0.08,
+        0.12,
+        3,
+        sequence_fabric_mhz=300.0,
+    )
+
+    metadata = build_awg_vertex_metadata(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+    )
+    virtual = metadata["virtual"]
+    assert virtual["time_cycles"] == [
+        [0.0, 18.0, 42.0, 102.0],
+        [0.0, 18.0, 48.0, 108.0],
+        [0.0, 18.0, 54.0, 114.0],
+    ]
+    np.testing.assert_allclose(
+        virtual["time_us"],
+        np.asarray(virtual["time_cycles"]) / 300.0,
     )
 
 

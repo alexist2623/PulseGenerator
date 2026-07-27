@@ -86,8 +86,11 @@ def sweep_axis_key(axis: Any) -> SweepAxisKey:
 def sweep_axis_label(axis: Any) -> str:
     """Return the compact user-facing name for one sweep variable."""
     output_name, segment_name = sweep_axis_key(axis)
-    if getattr(axis, "axis_kind", "amplitude") == "rf_duration":
+    axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
+    if axis_kind == "ramp_duration":
+        return f"{segment_name} RAMP duration (rate derived)"
     return f"{output_name} / {segment_name}"
 
 
@@ -96,7 +99,10 @@ def _axis_display_values(
     axis: Any,
     full_scale_mv: float,
 ) -> Tuple[np.ndarray, str]:
-    if getattr(axis, "axis_kind", "amplitude") == "rf_duration":
+    if getattr(axis, "axis_kind", "amplitude") in {
+        "rf_duration",
+        "ramp_duration",
+    }:
         return np.asarray(coordinates, dtype=np.float64), "us"
     return np.asarray(coordinates, dtype=np.float64) * full_scale_mv, "mV"
 
