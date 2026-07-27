@@ -2767,23 +2767,36 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         for register_map in (self._gen_regmap, self._ro_regmap):
             for page, register in register_map.values():
                 occupied[int(page)].add(int(register))
-        # These are used below for the shot count, repetition loop, and trigger.
-        occupied[0].update((13, 15, 16))
+        # These are used below for the shot count and repetition loop.
+        occupied[0].update((13, 15))
         for field in fields:
-            if not field.pop("allocate_command_register", False):
-                continue
             page = int(field["page"])
-            available = [
-                register
-                for register in range(1, 32)
-                if register not in occupied[page]
-            ]
-            if not available:
-                raise RuntimeError(
-                    f"register page {page} has no dynamic event-time register"
-                )
-            field["command_register"] = int(available[0])
-            occupied[page].add(int(available[0]))
+            allocations = (
+                (
+                    "allocate_command_register",
+                    "command_register",
+                    "dynamic event-time",
+                ),
+                (
+                    "allocate_output_register",
+                    "output_register",
+                    "dynamic output-data",
+                ),
+            )
+            for flag, destination, description in allocations:
+                if not field.pop(flag, False):
+                    continue
+                available = [
+                    register
+                    for register in range(1, 32)
+                    if register not in occupied[page]
+                ]
+                if not available:
+                    raise RuntimeError(
+                        f"register page {page} has no {description} register"
+                    )
+                field[destination] = int(available[0])
+                occupied[page].add(int(available[0]))
 
         dmem_size = int(self.tproccfg.get("dmem_size", 0))
         next_dmem_addr = dmem_size - 1
@@ -3604,12 +3617,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 include_current=False,
             )
             if any(trigger_deltas):
-                trigger_port = int(self.soccfg["ddr4_buf"]["trigger_port"])
-                if trigger_port != 0:
-                    raise ValueError(
-                        "dynamic RAMP-duration DDR triggering requires "
-                        "tProcessor digital output port 0"
-                    )
                 models.append({
                     "key": ("event_time", "ddr_trigger"),
                     "register_name": "event_time",
@@ -3618,6 +3625,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     "page": 0,
                     "command_register": None,
                     "allocate_command_register": True,
+                    "allocate_output_register": True,
                 })
                 if int(self.aux_timing["ddr_readout_start"]) != 0:
                     page, time_register = self._ro_regmap[(ddr.ro_ch, "t")]
@@ -4141,13 +4149,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         trigger_cfg = self.soccfg["ddr4_buf"]
         trigger_port = int(trigger_cfg["trigger_port"])
-        if trigger_port != 0:
-            raise RuntimeError(
-                "register-timed DDR trigger supports tProcessor output port 0"
-            )
         page = int(field["page"])
         time_register = int(field["command_register"])
-        output_register = 16
+        output_register = int(field["output_register"])
         self._write_swept_or_static_register(
             field_key,
             page,
@@ -4162,9 +4166,17 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             trigger_word,
             "assert DDR trigger",
         )
-        self.setb(
+        # SET carries an explicit tProcessor output port, unlike SETB. The
+        # remaining words stay zero because qick_vec2bit consumes the low bits
+        # of the 160-bit axis_set_reg word.
+        self.set(
+            trigger_port,
             page,
             output_register,
+            0,
+            0,
+            0,
+            0,
             time_register,
             "register-timed DDR trigger high",
         )
@@ -4176,8 +4188,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             int(ddr.trigger_width_tproc_cycles),
             "DDR trigger falling edge t",
         )
-        self.setb(
+        self.set(
+            trigger_port,
             page,
+            0,
+            0,
+            0,
+            0,
             0,
             time_register,
             "register-timed DDR trigger low",

@@ -168,6 +168,7 @@ try:
         QcodesRunConfig,
         QickConnectionConfig,
         build_qick_program,
+        configure_rf_output,
         connect_qick,
         measurement_iq_values,
         run_qick_qcodes_experiment,
@@ -177,6 +178,7 @@ except ImportError:
         QcodesRunConfig,
         QickConnectionConfig,
         build_qick_program,
+        configure_rf_output,
         connect_qick,
         measurement_iq_values,
         run_qick_qcodes_experiment,
@@ -4067,7 +4069,10 @@ class ExperimentPanel(QtWidgets.QWidget):
                 )
                 for item in output_details
             ]
-            rf_summary = "\nRF applied: " + "; ".join(entries)
+            rf_summary = (
+                "\nRF output retained from Front Panel Update: "
+                + "; ".join(entries)
+            )
         fir_summary = ""
         ddr_result = getattr(result, "ddr_result", None)
         sample_rate_hz = getattr(ddr_result, "sample_rate_hz", None)
@@ -4162,6 +4167,28 @@ class QickConfigurationWorker(QtCore.QObject):
             self.failed.emit(traceback.format_exc())
             return
         self.finished.emit(configuration)
+
+
+class QickRfOutputConfigurationWorker(QtCore.QObject):
+    """Apply one committed RF output path without running an experiment."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, connection_config, spec: QickRfPulseSpec, parent=None):
+        super().__init__(parent)
+        self._connection_config = connection_config
+        self._spec = spec
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            soc, _soccfg = connect_qick(self._connection_config)
+            details = configure_rf_output(soc, self._spec)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(details)
 
 
 class DetailedErrorMessageBox(QtWidgets.QMessageBox):
@@ -6404,6 +6431,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             target = self._qick_front_panel_target
             if target is None or not hasattr(target, "apply_front_panel_settings"):
                 raise RuntimeError("RF output front-panel target is no longer available")
+            if (
+                isinstance(target, RfPulsePortPanel)
+                and self._experiment_thread is not None
+                and self._experiment_thread.isRunning()
+            ):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "QICK task running",
+                    "Wait for the current QICK task before updating RF output hardware.",
+                )
+                return
             try:
                 target.apply_front_panel_settings(values)
             except (TypeError, ValueError) as exc:
@@ -6412,6 +6450,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "Invalid output selection",
                     str(exc),
                 )
+                return
+            if isinstance(target, RfPulsePortPanel):
+                try:
+                    connection, _run = self._experiment_panel.connection_values(
+                        require_run_config=False
+                    )
+                except (TypeError, ValueError) as exc:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Cannot update RF output",
+                        str(exc),
+                    )
+                    return
+                self._start_rf_output_hardware_update(
+                    connection,
+                    target.configured_spec(),
+                )
+                self._qick_front_panel_dialog.close()
                 return
             self._qick_front_panel_dialog.close()
             target_name = (
@@ -6456,6 +6512,59 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage(
             f"Front-panel RF path applied only to {target.__class__.__name__}"
         )
+
+    def _start_rf_output_hardware_update(
+        self,
+        connection: QickConnectionConfig,
+        spec: QickRfPulseSpec,
+    ) -> None:
+        """Apply committed RF output settings in a non-blocking worker."""
+        self.statusBar().showMessage(
+            f"Applying RF output {spec.gen_ch} attenuator and filter settings"
+        )
+        thread = QtCore.QThread(self)
+        worker = QickRfOutputConfigurationWorker(connection, spec)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_rf_output_hardware_updated)
+        worker.failed.connect(self._on_rf_output_hardware_update_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_rf_output_hardware_updated(
+        self,
+        details: Mapping[str, object],
+    ) -> None:
+        gen_ch = int(details["gen_ch"])
+        if bool(details["attenuators_present"]):
+            message = (
+                f"RF output {gen_ch} applied: ATT1/ATT2 "
+                f"{float(details['commanded_att1_db']):.2f}/"
+                f"{float(details['commanded_att2_db']):.2f} dB, "
+                f"{details['filter_type']} filter"
+            )
+        else:
+            message = f"DC output {gen_ch} enabled"
+        self.statusBar().showMessage(message)
+
+    def _on_rf_output_hardware_update_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown RF output configuration error"
+        self.statusBar().showMessage("RF output hardware update failed")
+        dialog = DetailedErrorMessageBox(
+            "RF output hardware update failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
 
     def _run_sparameter_sweep(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():

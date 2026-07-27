@@ -35,6 +35,7 @@ from qick_qcodes_experiment import (
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
     configure_rf_board,
+    configure_rf_output,
     connect_qick,
     load_qick_iq_arrays,
     run_qick_qcodes_experiment,
@@ -846,10 +847,7 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
 
     assert result.row_count == 12
     assert result.database_path.exists()
-    assert calls.count(("gen", 0, 5.0, 6.0)) == 1
-    assert calls.count(("gen_filter", 0, {
-        "fc": 2.5, "bw": 1.0, "ftype": "bypass"
-    })) == 1
+    assert not any(call[0] in {"gen", "gen_filter"} for call in calls)
     assert result.rf_settings["output_details"] == ({
         "gen_ch": 0,
         "board_type": "RF_Out",
@@ -871,6 +869,45 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert any(percent == 32 for percent, _ in progress_updates)
     assert any(percent == 55 for percent, _ in progress_updates)
     assert any(percent == 60 for percent, _ in progress_updates)
+
+
+def test_configure_rf_output_applies_attenuators_and_filter_explicitly():
+    calls = []
+
+    class FakeSoc:
+        def rfb_set_gen_rf(self, gen_ch, att1, att2):
+            calls.append(("gen", gen_ch, att1, att2))
+            return 5.25, 7.5
+
+        def rfb_set_gen_filter(self, gen_ch, **kwargs):
+            calls.append(("filter", gen_ch, kwargs))
+
+    spec = QickRfPulseSpec(
+        2,
+        "set_0",
+        0.0,
+        1.0,
+        100.0,
+        12_000,
+        5.25,
+        7.5,
+        filter_type="lowpass",
+        filter_cutoff=2.25,
+        filter_bandwidth=0.75,
+    )
+
+    details = configure_rf_output(FakeSoc(), spec)
+
+    assert calls == [
+        ("gen", 2, 5.25, 7.5),
+        (
+            "filter",
+            2,
+            {"fc": 2.25, "bw": 0.75, "ftype": "lowpass"},
+        ),
+    ]
+    assert details["commanded_att1_db"] == 5.25
+    assert details["commanded_att2_db"] == 7.5
 
 
 def test_run_uses_50_ksps_hwh_rate_for_qcodes_time_axis(tmp_path, monkeypatch):

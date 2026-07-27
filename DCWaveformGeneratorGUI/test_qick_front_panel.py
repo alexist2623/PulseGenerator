@@ -311,9 +311,17 @@ def test_front_panel_preview_tracks_enclosing_scroll_viewport():
     scroll.close()
 
 
-def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
+def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings(
+    monkeypatch,
+):
     app = _application()
     window = gui.MainWindow()
+    hardware_updates = []
+    monkeypatch.setattr(
+        window,
+        "_start_rf_output_hardware_update",
+        lambda connection, spec: hardware_updates.append((connection, spec)),
+    )
     configuration = identify_qick_front_panel(_live_config())
     window._on_qick_configuration_identified(configuration)
     output = window._rf_ports_panel._panels[0]
@@ -343,6 +351,11 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings():
     assert output.att1_db.value() == 5.25
     assert output.att2_db.value() == 7.5
     assert output.filter_type.currentText() == "lowpass"
+    assert len(hardware_updates) == 1
+    assert hardware_updates[0][1].gen_ch == 0
+    assert hardware_updates[0][1].att1_db == 5.25
+    assert hardware_updates[0][1].att2_db == 7.5
+    assert hardware_updates[0][1].filter_type == "lowpass"
     assert window._qick_front_panel_dialog.isVisible() is False
     window.close()
 

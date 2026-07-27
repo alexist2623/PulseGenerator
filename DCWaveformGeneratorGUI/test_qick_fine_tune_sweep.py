@@ -102,7 +102,7 @@ def _shared_tmux_soccfg():
     return QickConfig(cfg)
 
 
-def _fir_soccfg(*, fir_rate_profile="1_msps"):
+def _fir_soccfg(*, fir_rate_profile="1_msps", ddr_trigger_port=0):
     cfg = _mock_soccfg(1)._cfg
     is_50_ksps = fir_rate_profile == "50_ksps"
     cfg["refclk_freq"] = 300.0
@@ -147,7 +147,7 @@ def _fir_soccfg(*, fir_rate_profile="1_msps"):
         "trigger_delay_default_cycles": 50 if is_50_ksps else 0,
         "trigger_delay_default_samples": 0,
         "trigger_type": "dport",
-        "trigger_port": 0,
+        "trigger_port": int(ddr_trigger_port),
         "trigger_bit": 1,
     }
     return QickConfig(cfg)
@@ -412,7 +412,10 @@ def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
         margin_input_samples=0,
     )
     program = sequence.make_program(
-        _fir_soccfg(fir_rate_profile="50_ksps"),
+        _fir_soccfg(
+            fir_rate_profile="50_ksps",
+            ddr_trigger_port=7,
+        ),
         awg_channels=(0,),
         repetitions_per_sweep=1,
         ddr_readout=ddr,
@@ -428,15 +431,29 @@ def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
     ]
     trigger_high = [
         event
-        for event in tproc.output_pin_events
-        if event["word"] == 1 << 1
+        for event in tproc.output_events
+        if event.tproc_ch == 7 and event.word == 1 << 1
+    ]
+    trigger_low = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 7 and event.word == 0
     ]
     assert [event.word for event in awg_events] == _expected_words(program)
     assert len(trigger_high) == 3
+    assert len(trigger_low) == 3
     assert len(awg_events) == 3 * 3
-    for point_index, trigger_event in enumerate(trigger_high):
+    for point_index, (trigger_event, low_event) in enumerate(
+        zip(trigger_high, trigger_low)
+    ):
         capture_set_event = awg_events[point_index * 3 + 2]
-        assert trigger_event["cycle"] - capture_set_event.cycle == 17
+        assert trigger_event.cycle - capture_set_event.cycle == 17
+        assert low_event.cycle - trigger_event.cycle == ddr.trigger_width_tproc_cycles
+    assert all(
+        instruction.get("name") != "setb"
+        for instruction in program.prog_list
+        if isinstance(instruction, dict)
+    )
     assert program.summary()["fir_software_warmup_compensation"] is False
     assert tproc.timing_conflicts == []
 
@@ -482,21 +499,37 @@ def test_two_ramp_rate_axes_move_50_ksps_ddr_trigger_additively():
     tproc.run(program.prog_list, max_steps=1_000_000)
 
     awg_events = [
-        event for event in tproc.output_events if event.tproc_ch == 0
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and event.word not in (0, 1 << 1)
     ]
     trigger_high = [
         event
-        for event in tproc.output_pin_events
-        if event["word"] == 1 << 1
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and event.word == 1 << 1
+    ]
+    trigger_low = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and event.word == 0
     ]
     commands_per_point = 5
     assert len(trigger_high) == 6
+    assert len(trigger_low) == 6
     assert [event.word for event in awg_events] == _expected_words(program)
-    for point_index, trigger_event in enumerate(trigger_high):
+    for point_index, (trigger_event, low_event) in enumerate(
+        zip(trigger_high, trigger_low)
+    ):
         capture_set_event = awg_events[
             point_index * commands_per_point + commands_per_point - 1
         ]
-        assert trigger_event["cycle"] - capture_set_event.cycle == 17
+        assert trigger_event.cycle - capture_set_event.cycle == 17
+        assert low_event.cycle - trigger_event.cycle == ddr.trigger_width_tproc_cycles
+    assert all(
+        instruction.get("name") != "setb"
+        for instruction in program.prog_list
+        if isinstance(instruction, dict)
+    )
     assert tproc.timing_conflicts == []
 
 
@@ -785,6 +818,12 @@ def test_rf_duration_sweep_updates_stop_and_selected_segment_timing(
         rf_events[index + 1].cycle - rf_events[index].cycle
         for index in range(0, len(rf_events), 2)
     ] == [10, 20, 30]
+    rf_gain_words = [
+        (event.word >> 96) & 0xFFFFFFFF
+        for event in rf_events
+    ]
+    assert rf_gain_words[::2] == [12_000, 12_000, 12_000]
+    assert rf_gain_words[1::2] == [0, 0, 0]
 
     awg_ramps = [
         event

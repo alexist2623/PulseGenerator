@@ -433,54 +433,73 @@ def build_qick_program(
     return sequence.make_program(soccfg, **program_kwargs)
 
 
-def configure_rf_board(
+def _rf_output_details(
+    spec: QickRfPulseSpec,
+    actual_att1: float,
+    actual_att2: float,
+) -> Mapping[str, Any]:
+    return {
+        "gen_ch": int(spec.gen_ch),
+        "board_type": str(spec.output_board_type),
+        "attenuators_present": spec.output_board_type == "RF_Out",
+        "requested_att1_db": float(spec.att1_db),
+        "requested_att2_db": float(spec.att2_db),
+        "commanded_att1_db": float(actual_att1),
+        "commanded_att2_db": float(actual_att2),
+        "filter_type": str(spec.filter_type),
+        "filter_cutoff_ghz": float(spec.filter_cutoff),
+        "filter_bandwidth_ghz": float(spec.filter_bandwidth),
+    }
+
+
+def describe_rf_output(spec: QickRfPulseSpec) -> Mapping[str, Any]:
+    """Describe an output setting without writing the RF-board hardware."""
+    if spec.output_board_type == "RF_Out":
+        actual_att1 = float(spec.att1_db)
+        actual_att2 = float(spec.att2_db)
+    else:
+        actual_att1 = 0.0
+        actual_att2 = 0.0
+    return _rf_output_details(spec, actual_att1, actual_att2)
+
+
+def configure_rf_output(
     soc,
-    rf_specs: Sequence[QickRfPulseSpec],
+    spec: QickRfPulseSpec,
+) -> Mapping[str, Any]:
+    """Apply one RF-board output setting when the user commits it."""
+    if spec.output_board_type == "RF_Out":
+        actual_attenuation = soc.rfb_set_gen_rf(
+            spec.gen_ch, spec.att1_db, spec.att2_db
+        )
+        try:
+            actual_att1, actual_att2 = (
+                float(actual_attenuation[0]),
+                float(actual_attenuation[1]),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"RF generator {spec.gen_ch} returned an invalid attenuation "
+                f"result: {actual_attenuation!r}"
+            ) from exc
+        soc.rfb_set_gen_filter(
+            spec.gen_ch,
+            fc=spec.filter_cutoff,
+            bw=spec.filter_bandwidth,
+            ftype=spec.filter_type,
+        )
+    else:
+        soc.rfb_set_gen_dc(spec.gen_ch)
+        actual_att1 = 0.0
+        actual_att2 = 0.0
+    return _rf_output_details(spec, actual_att1, actual_att2)
+
+
+def configure_rf_readout(
+    soc,
     readout_spec: QickDdrReadoutSpec,
 ) -> Mapping[str, Any]:
-    """Apply RF-board output/input attenuation and programmable filters."""
-    outputs = []
-    output_details = []
-    for spec in rf_specs:
-        if spec.output_board_type == "RF_Out":
-            actual_attenuation = soc.rfb_set_gen_rf(
-                spec.gen_ch, spec.att1_db, spec.att2_db
-            )
-            try:
-                actual_att1, actual_att2 = (
-                    float(actual_attenuation[0]),
-                    float(actual_attenuation[1]),
-                )
-            except (IndexError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"RF generator {spec.gen_ch} returned an invalid attenuation "
-                    f"result: {actual_attenuation!r}"
-                ) from exc
-        else:
-            soc.rfb_set_gen_dc(spec.gen_ch)
-            actual_att1 = 0.0
-            actual_att2 = 0.0
-        outputs.append((actual_att1, actual_att2))
-
-        if spec.output_board_type == "RF_Out":
-            soc.rfb_set_gen_filter(
-                spec.gen_ch,
-                fc=spec.filter_cutoff,
-                bw=spec.filter_bandwidth,
-                ftype=spec.filter_type,
-            )
-        output_details.append({
-            "gen_ch": int(spec.gen_ch),
-            "board_type": str(spec.output_board_type),
-            "attenuators_present": spec.output_board_type == "RF_Out",
-            "requested_att1_db": float(spec.att1_db),
-            "requested_att2_db": float(spec.att2_db),
-            "commanded_att1_db": actual_att1,
-            "commanded_att2_db": actual_att2,
-            "filter_type": str(spec.filter_type),
-            "filter_cutoff_ghz": float(spec.filter_cutoff),
-            "filter_bandwidth_ghz": float(spec.filter_bandwidth),
-        })
+    """Apply ADC-side Nyquist, gain/attenuation, and filter settings."""
     set_nyquist = getattr(soc, "set_nyquist", None)
     if set_nyquist is None:
         if readout_spec.nqz != 1:
@@ -525,8 +544,6 @@ def configure_rf_board(
             ftype=readout_spec.filter_type,
         )
     return {
-        "outputs": tuple(outputs),
-        "output_details": tuple(output_details),
         "readout": readout_setting,
         "readout_details": {
             "ro_ch": int(readout_spec.ro_ch),
@@ -569,6 +586,29 @@ def configure_rf_board(
     }
 
 
+def configure_rf_board(
+    soc,
+    rf_specs: Sequence[QickRfPulseSpec],
+    readout_spec: QickDdrReadoutSpec,
+) -> Mapping[str, Any]:
+    """Apply RF-board output and input settings explicitly."""
+    output_details = tuple(
+        configure_rf_output(soc, spec) for spec in rf_specs
+    )
+    readout_settings = configure_rf_readout(soc, readout_spec)
+    return {
+        "outputs": tuple(
+            (
+                float(details["commanded_att1_db"]),
+                float(details["commanded_att2_db"]),
+            )
+            for details in output_details
+        ),
+        "output_details": output_details,
+        **readout_settings,
+    }
+
+
 def execute_qick_sequence(
     soc,
     soccfg,
@@ -582,9 +622,21 @@ def execute_qick_sequence(
     progress: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
-    """Configure RF hardware, execute the tProcessor program, and read DDR."""
-    _emit_progress(progress_callback, 5, "Configuring RF hardware")
-    rf_settings = configure_rf_board(soc, rf_specs, readout_spec)
+    """Configure the readout, execute the tProcessor program, and read DDR."""
+    _emit_progress(progress_callback, 5, "Configuring RF readout hardware")
+    readout_settings = configure_rf_readout(soc, readout_spec)
+    output_details = tuple(describe_rf_output(spec) for spec in rf_specs)
+    rf_settings = {
+        "outputs": tuple(
+            (
+                float(details["commanded_att1_db"]),
+                float(details["commanded_att2_db"]),
+            )
+            for details in output_details
+        ),
+        "output_details": output_details,
+        **readout_settings,
+    }
     _emit_progress(progress_callback, 8, "Compiling the tProcessor program")
     program = build_qick_program(
         soccfg,
@@ -1548,7 +1600,10 @@ __all__ = [
     "build_runtime_ddr_readout",
     "build_runtime_rf_pulses",
     "configure_rf_board",
+    "configure_rf_output",
+    "configure_rf_readout",
     "connect_qick",
+    "describe_rf_output",
     "execute_qick_sequence",
     "load_qick_iq_arrays",
     "measurement_iq_values",
