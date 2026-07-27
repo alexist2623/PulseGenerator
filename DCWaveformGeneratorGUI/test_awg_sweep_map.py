@@ -387,6 +387,24 @@ def test_experiment_panel_axis_selection_and_result_plot():
             color_bar is not None
             for color_bar in window._awg_sweep_plot.color_bars.values()
         )
+        magnitude_bar = window._awg_sweep_plot.color_bars["magnitude"]
+        assert magnitude_bar.interactive is True
+        magnitude_bar.setLevels((2.5, 25.0))
+        magnitude_bar.sigLevelsChanged.emit(magnitude_bar)
+        app.processEvents()
+        magnitude_control = window._awg_sweep_plot.range_controls["magnitude"]
+        assert magnitude_control.auto_range.isChecked() is False
+        np.testing.assert_allclose(
+            (
+                magnitude_control.minimum.value(),
+                magnitude_control.maximum.value(),
+            ),
+            (2.5, 25.0),
+        )
+        np.testing.assert_allclose(
+            window._awg_sweep_plot.images["magnitude"].getLevels(),
+            (2.5, 25.0),
+        )
     window.close()
 
 

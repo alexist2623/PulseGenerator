@@ -282,19 +282,43 @@ def attach_color_bar(
     *,
     unit: str,
     levels: Tuple[float, float],
+    range_control=None,
 ):
-    """Attach a noninteractive pyqtgraph color bar to a PlotWidget."""
+    """Attach a draggable color bar and optionally synchronize its editor."""
     if pg is None:
         return None
     color_bar = pg.ColorBarItem(
         values=tuple(map(float, levels)),
-        width=18,
+        width=22,
         colorMap=color_map,
-        interactive=False,
+        interactive=True,
+        rounding=1.0e-12,
         colorMapMenu=False,
     )
     color_bar.setImageItem(image, insert_in=plot.getPlotItem())
     color_bar.setLabel("right", text=str(unit))
+    color_bar.setToolTip(
+        "Drag the lower or upper handle to set the color minimum or maximum. "
+        "Drag between the handles to move both limits."
+    )
+    if range_control is not None:
+        def sync_range_control(source) -> None:
+            minimum, maximum = map(float, source.levels())
+            if (
+                np.isfinite(minimum)
+                and np.isfinite(maximum)
+                and minimum < maximum
+            ):
+                range_control.set_manual_levels(
+                    minimum,
+                    maximum,
+                    emit=False,
+                )
+
+        color_bar.sigLevelsChanged.connect(sync_range_control)
+        # Keep an explicit reference for bindings where Python callable
+        # lifetime is not retained by the Qt signal connection.
+        color_bar._range_control_sync_slot = sync_range_control
     return color_bar
 
 

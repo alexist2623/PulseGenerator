@@ -324,8 +324,26 @@ def test_stability_plot_exposes_and_applies_color_ranges():
     assert plot.phase_range_control.auto_range.isChecked() is False
     assert plot.magnitude_color_bar is not None
     assert plot.phase_color_bar is not None
+    assert plot.magnitude_color_bar.interactive is True
+    assert plot.phase_color_bar.interactive is True
     assert "Applied:" in plot.magnitude_range_control.range_status.text()
     assert "Data:" in plot.magnitude_range_control.range_status.text()
+
+    plot.magnitude_color_bar.setLevels((7.5, 42.5))
+    plot.magnitude_color_bar.sigLevelsChanged.emit(plot.magnitude_color_bar)
+    app.processEvents()
+    assert plot.magnitude_range_control.auto_range.isChecked() is False
+    np.testing.assert_allclose(
+        (
+            plot.magnitude_range_control.minimum.value(),
+            plot.magnitude_range_control.maximum.value(),
+        ),
+        (7.5, 42.5),
+    )
+    np.testing.assert_allclose(
+        plot.magnitude_image.getLevels(),
+        (7.5, 42.5),
+    )
 
     plot.load_color_range_settings({
         "magnitude": {

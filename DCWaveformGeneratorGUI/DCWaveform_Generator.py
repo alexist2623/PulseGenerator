@@ -371,6 +371,30 @@ def _time_to_ns(value: float, unit: str) -> float:
     return float(value) * TIME_UNIT_NS[unit]
 
 
+def _remap_set_segment_name(
+    segment_name: str,
+    operation: str,
+    segment_index: int,
+) -> Optional[str]:
+    """Keep a SET reference attached to the same logical voltage segment."""
+    match = re.fullmatch(r"set_(\d+)", str(segment_name))
+    if match is None:
+        return str(segment_name)
+    current_index = int(match.group(1))
+    segment_index = int(segment_index)
+    if operation == "insert":
+        if current_index >= segment_index:
+            current_index += 1
+    elif operation == "delete":
+        if current_index == segment_index:
+            return None
+        if current_index > segment_index:
+            current_index -= 1
+    else:
+        raise ValueError(f"unsupported segment structure operation {operation!r}")
+    return f"set_{current_index}"
+
+
 def rf_pulse_absolute_times_us(
     pulse: PulseSequence,
     spec: QickRfPulseSpec,
@@ -1089,7 +1113,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     sweep_remove_requested = QtCore.pyqtSignal(int, int)
     ramp_sweep_requested = QtCore.pyqtSignal(int, int)
     ramp_sweep_remove_requested = QtCore.pyqtSignal(int, int)
-    segment_structure_changed = QtCore.pyqtSignal(int)
+    segment_structure_changed = QtCore.pyqtSignal(int, str, int)
     port_idx: int       = 0
 
     def __init__(
@@ -1205,26 +1229,47 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         if chosen == act_remove_ramp_sweep:
             self.ramp_sweep_remove_requested.emit(self.idx, row)
             return
-        if chosen == act_ins_above:
-            ok = self._pulse.insert_flat_ramp(row * 2)
-        elif chosen == act_ins_below:
-            ok = self._pulse.insert_flat_ramp(row * 2 + 2)
-        elif chosen == act_del:
-            ok = self._pulse.delete_flat_ramp(row * 2)
-        else:
+        action = {
+            act_ins_above: "insert_above",
+            act_ins_below: "insert_below",
+            act_del: "delete",
+        }.get(chosen)
+        if action is None:
             return
-
-        if not ok:
+        if not self._edit_segment_structure(action, row):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Edit failed",
                 "The requested insertion or deletion is not valid for this segment.",
             )
-            return
 
+    def _edit_segment_structure(self, action: str, row: int) -> bool:
+        """Apply one table structure edit and report its logical SET index."""
+        row = int(row)
+        if action == "insert_above":
+            operation = "insert"
+            segment_index = row
+            ok = self._pulse.insert_flat_ramp(row * 2)
+        elif action == "insert_below":
+            operation = "insert"
+            segment_index = row + 1
+            ok = self._pulse.insert_flat_ramp(row * 2 + 2)
+        elif action == "delete":
+            operation = "delete"
+            segment_index = row
+            ok = self._pulse.delete_flat_ramp(row * 2)
+        else:
+            raise ValueError(f"unknown segment structure action {action!r}")
+        if not ok:
+            return False
         self.refresh_table()
-        self.segment_structure_changed.emit(self.idx)
+        self.segment_structure_changed.emit(
+            self.idx,
+            operation,
+            segment_index,
+        )
         self.update_plot.emit()
+        return True
 
     def set_sweep_row(
         self,
@@ -5592,10 +5637,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         *,
         fit_view: bool = False,
         sync_rows: bool = False,
+        selected_map_keys: Optional[
+            Tuple[Tuple[str, str], Tuple[str, str]]
+        ] = None,
     ) -> None:
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_sweep_specs(
-                self._active_map_sweep_specs()
+                self._active_map_sweep_specs(),
+                selected_keys=selected_map_keys,
             )
         self._refresh_physical_waveforms()
         envelopes = []
@@ -5900,22 +5949,87 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Cartesian combinations remain"
         )
 
-    def _on_segment_structure_changed(self, port_index: int) -> None:
-        remaining = [
-            spec
-            for spec in self._sweep_specs
+    def _on_segment_structure_changed(
+        self,
+        port_index: int,
+        operation: str,
+        segment_index: int,
+    ) -> None:
+        output_name = f"awg_{int(port_index)}"
+        previous_map_keys = (
+            self._experiment_panel.selected_sweep_axis_keys()
+            if hasattr(self, "_experiment_panel")
+            else None
+        )
+        updated_sweeps = []
+        remapped_count = 0
+        removed_count = 0
+        for spec in self._sweep_specs:
+            if isinstance(spec, QickSweepSpec):
+                if spec.output_name != output_name:
+                    updated_sweeps.append(spec)
+                    continue
+                remapped_name = _remap_set_segment_name(
+                    spec.segment_name,
+                    operation,
+                    segment_index,
+                )
+                if remapped_name is None:
+                    removed_count += 1
+                    continue
+                if remapped_name != spec.segment_name:
+                    spec = replace(spec, segment_name=remapped_name)
+                    remapped_count += 1
+                updated_sweeps.append(spec)
+                continue
+
+            ramp_row = self._ramp_sweep_row(spec)
+            if ramp_row is not None and ramp_row >= int(segment_index):
+                # RAMP-rate sweeps are shared by every AWG output. A structural
+                # edit to only one output makes the affected transition
+                # ambiguous, so retain earlier transitions and remove only the
+                # affected and following ones.
+                removed_count += 1
+                continue
+            updated_sweeps.append(spec)
+
+        self._sweep_specs = updated_sweeps
+
+        selected_map_keys = None
+        if previous_map_keys is not None:
+            remapped_keys = []
+            for key_output, key_segment in previous_map_keys:
+                if key_output == output_name:
+                    key_segment = _remap_set_segment_name(
+                        key_segment,
+                        operation,
+                        segment_index,
+                    )
+                if key_segment is None:
+                    remapped_keys = []
+                    break
+                remapped_keys.append((key_output, key_segment))
+            available_keys = {
+                (str(spec.output_name), str(spec.segment_name))
+                for spec in self._active_map_sweep_specs()
+            }
             if (
-                not isinstance(spec, QickRampRateSweepSpec)
-                and (self._sweep_target_indices(spec) or (-1, -1))[0]
-                != port_index
-            )
-        ]
-        if len(remaining) != len(self._sweep_specs):
-            self._sweep_specs = remaining
-            self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
-            self.statusBar().showMessage(
-                "Sweeps for the modified port were removed after segment structure changed"
-            )
+                len(remapped_keys) == 2
+                and remapped_keys[0] != remapped_keys[1]
+                and all(key in available_keys for key in remapped_keys)
+            ):
+                selected_map_keys = tuple(remapped_keys)
+
+        self._refresh_sweep_overlay(
+            fit_view=True,
+            sync_rows=True,
+            selected_map_keys=selected_map_keys,
+        )
+        action = "inserted" if operation == "insert" else "deleted"
+        self.statusBar().showMessage(
+            f"Segment {segment_index} {action}: remapped {remapped_count} "
+            f"sweep target(s), removed {removed_count} invalid sweep(s)"
+        )
         self._refresh_stability_targets()
 
     def _build_toolbar(self):

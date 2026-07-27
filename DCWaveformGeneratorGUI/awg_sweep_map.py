@@ -333,6 +333,7 @@ if pg is not None:
                         defaults["minimum"],
                         defaults["maximum"],
                     ),
+                    range_control=range_control,
                 )
                 cell_layout.addWidget(range_control)
                 cell_layout.addWidget(plot, 1)

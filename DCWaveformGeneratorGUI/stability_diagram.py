@@ -1472,6 +1472,7 @@ if pg is not None:
                 magnitude_map,
                 unit="ADC units",
                 levels=(0.0, 1.0),
+                range_control=self.magnitude_range_control,
             )
             self.phase_color_bar = attach_color_bar(
                 self.phase_plot,
@@ -1479,6 +1480,7 @@ if pg is not None:
                 phase_map,
                 unit="deg",
                 levels=(-180.0, 180.0),
+                range_control=self.phase_range_control,
             )
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 1)
