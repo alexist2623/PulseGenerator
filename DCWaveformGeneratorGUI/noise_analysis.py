@@ -657,6 +657,15 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             DEFAULT_NOISE_ANALYSIS_SETTINGS["acquisition_proxy_name"],
             acquisition_group,
         )
+        # QICK connection values are edited in the shared Setup dialog. Keep
+        # these widgets as synchronized storage for acquisition_config(), but
+        # do not leave unlayouted child widgets floating over this group box.
+        for connection_widget in (
+            self.acquisition_host,
+            self.acquisition_port,
+            self.acquisition_proxy,
+        ):
+            connection_widget.hide()
         self.front_panel_preview = QickFrontPanelPreview(acquisition_group)
         self.readout_channel = QtWidgets.QSpinBox(acquisition_group)
         self.readout_channel.setRange(0, 255)

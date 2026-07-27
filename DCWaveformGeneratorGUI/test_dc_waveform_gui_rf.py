@@ -174,6 +174,9 @@ def test_shared_qick_setup_replaces_duplicate_tab_controls():
         label.text() for label in window._noise_panel.findChildren(QtWidgets.QLabel)
     }
     assert "QICK connection:" not in noise_labels
+    assert window._noise_panel.acquisition_host.isHidden()
+    assert window._noise_panel.acquisition_port.isHidden()
+    assert window._noise_panel.acquisition_proxy.isHidden()
 
     connection = gui.QickConnectionConfig(
         host="192.0.2.88",
