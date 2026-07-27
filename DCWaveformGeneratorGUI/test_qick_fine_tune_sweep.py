@@ -350,6 +350,205 @@ def test_independent_ramp_rate_sweeps_use_nested_tables_without_point_table():
     assert len(summary["ramp_duration_sweeps"]) == 2
 
 
+def test_two_ramp_rate_axes_drive_exact_dc_bias_t_duration_table():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.4,), 18)
+    sequence.add_ramp("positive_ramp", 30)
+    sequence.add_set("middle", (0.2,), 18)
+    sequence.add_ramp("negative_ramp", 40)
+    sequence.add_set("finish", (-0.6,), 18)
+    sequence.add_ramp_duration_sweep(
+        "positive_ramp",
+        start_us=0.08,
+        stop_us=0.16,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "negative_ramp",
+        start_us=0.08,
+        stop_us=0.34,
+        count=4,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.set_bias_t_compensation(0.1)
+
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    assert program._bias_t_max_duration_q_error == 0
+    assert np.array_equal(
+        program._bias_t_duration_q_actual,
+        program._bias_t_duration_q_requested,
+    )
+    assert {
+        tuple(int(axis) for axis in group["axis_indices"])
+        for group in program._ramp_duration_table_groups.values()
+    } >= {(0,), (1,), (0, 1)}
+    bias_field = program._bias_t_fields[0]
+    assert tuple(bias_field["duration_axis_indices"]) == (0, 1)
+    assert tuple(bias_field["duration_table_shape"]) == (3, 4)
+    assert len(bias_field["duration_table_bases"]) == 12
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=2_000_000)
+
+    positive = int(bias_field["positive_code"])
+    negative = int(bias_field["negative_code"])
+    compensation_events = []
+    for event in tproc.output_events:
+        target = event.word & 0xFFFFFFFF
+        target = target - (1 << 32) if target & (1 << 31) else target
+        if target in {positive, negative}:
+            compensation_events.append((event, target))
+    expected_q = [
+        int(value)
+        for value in program._bias_t_duration_q_actual[:, 0]
+    ]
+    assert len(compensation_events) == len(expected_q)
+    assert {np.sign(value) for value in expected_q} == {-1, 1}
+    for (event, target), duration_q in zip(compensation_events, expected_q):
+        expected_target = negative if duration_q > 0 else positive
+        assert target == expected_target
+        following_zero = next(
+            candidate
+            for candidate in tproc.output_events
+            if candidate.tproc_ch == event.tproc_ch
+            and candidate.cycle > event.cycle
+            and (candidate.word & 0xFFFFFFFF) == 0
+        )
+        expected_duration = (abs(duration_q) + (1 << 7)) >> 8
+        assert following_zero.cycle - event.cycle == expected_duration
+    assert tproc.timing_conflicts == []
+
+
+def test_two_ramp_rate_axes_support_fixed_time_dc_bias_t_compensation():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.1,), 18)
+    sequence.add_ramp("first_ramp", 12)
+    sequence.add_set("middle", (0.3,), 18)
+    sequence.add_ramp("second_ramp", 18)
+    sequence.add_set("finish", (-0.2,), 18)
+    sequence.add_ramp_duration_sweep(
+        "first_ramp",
+        start_us=0.04,
+        stop_us=0.08,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "second_ramp",
+        start_us=0.06,
+        stop_us=0.12,
+        count=2,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.set_bias_t_compensation(
+        0.1,
+        mode="fixed_time",
+        fixed_duration_cycles=128,
+    )
+
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    assert program.summary()["bias_t_compensation_mode"] == "fixed_time"
+    assert program._bias_t_max_target_code_error == 0
+    assert np.array_equal(
+        program._bias_t_target_code_actual,
+        program._bias_t_target_code_requested,
+    )
+    assert tuple(program._bias_t_fields[0]["duration_axis_indices"]) == (0, 1)
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=2_000_000)
+    assert tproc.timing_conflicts == []
+
+
+def test_two_ramp_rate_bias_t_table_refreshes_inner_voltage_axis_delta():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.1,), 18)
+    sequence.add_ramp("first_ramp", 30)
+    sequence.add_set("middle", (0.2,), 18)
+    sequence.add_ramp("second_ramp", 36)
+    sequence.add_set("finish", (0.3,), 18)
+    sequence.add_ramp_duration_sweep(
+        "first_ramp",
+        start_us=0.08,
+        stop_us=0.16,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "second_ramp",
+        start_us=0.10,
+        stop_us=0.20,
+        count=2,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_amplitude_sweep(
+        "finish",
+        "awg_0",
+        0.2,
+        0.4,
+        3,
+    )
+    sequence.set_bias_t_compensation(0.125)
+
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    bias_field = program._bias_t_fields[0]
+    assert tuple(bias_field["duration_axis_indices"]) == (0, 1)
+    assert set(bias_field["duration_delta_slots"]) == {2}
+    assert program._bias_t_max_duration_q_error <= 1
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=3_000_000)
+
+    positive = int(bias_field["positive_code"])
+    negative = int(bias_field["negative_code"])
+    compensation_events = []
+    for event in tproc.output_events:
+        target = event.word & 0xFFFFFFFF
+        target = target - (1 << 32) if target & (1 << 31) else target
+        if target in {positive, negative}:
+            compensation_events.append(event)
+    expected_q = [
+        int(value)
+        for value in program._bias_t_duration_q_actual[:, 0]
+    ]
+    assert len(compensation_events) == len(expected_q)
+    for event, duration_q in zip(compensation_events, expected_q):
+        following_zero = next(
+            candidate
+            for candidate in tproc.output_events
+            if candidate.tproc_ch == event.tproc_ch
+            and candidate.cycle > event.cycle
+            and (candidate.word & 0xFFFFFFFF) == 0
+        )
+        assert following_zero.cycle - event.cycle == (
+            abs(duration_q) + (1 << 7)
+        ) >> 8
+    assert tproc.timing_conflicts == []
+
+
 def test_ramp_rate_sweep_replaces_and_clears_only_its_target_segment():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("start", (0.0,), 18)
@@ -582,6 +781,74 @@ def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch)
     assert result.iq.shape == (1, 1, 8, 2)
     assert result.sample_rate_hz == 50_000.0
     assert result.fir_rate_profile == "50_ksps"
+
+
+def test_50_ksps_ddr_does_not_repeat_fir_group_delay_between_points():
+    sequence = FineTuneSequence(("awg_0",))
+    # Stability-style point: ten 50 kSPS samples plus one microsecond guard.
+    sequence.add_set("capture", (0.0,), 60_300)
+    sequence.set_amplitude_sweep("capture", "awg_0", -0.25, 0.25, 2)
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=10,
+        at_segment="capture",
+        margin_input_samples=0,
+        fpga_trigger_delay_samples=0,
+    )
+    baseline = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        recovery_tproc_cycles=0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+        recovery_tproc_cycles=0,
+    )
+
+    assert program._fir_cfg["trigger_delay_arm_kwargs"] == {
+        "trigger_delay_cycles": 0
+    }
+    assert program.aux_timing["ddr_capture_end"] == 60_000
+    assert program.timing["point_end"] == baseline.timing["point_end"] == 60_300
+    assert program.timing["point_end"] < int(
+        np.ceil(program._fir_cfg["group_delay_input_samples"])
+    )
+
+
+def test_legacy_50_ksps_fpga_delay_does_not_serialize_awg_sweep_points():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("capture", (0.0,), 60_300)
+    sequence.set_amplitude_sweep("capture", "awg_0", -0.25, 0.25, 2)
+    soccfg = _fir_soccfg(fir_rate_profile="50_ksps")
+    ddr_cfg = soccfg._cfg["ddr4_buf"]
+    ddr_cfg["trigger_delay_units"] = "valid_input_samples"
+    ddr_cfg.pop("trigger_delay_default_cycles", None)
+    ddr_cfg["trigger_delay_default_samples"] = 50
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=10,
+        at_segment="capture",
+        margin_input_samples=0,
+    )
+
+    program = sequence.make_program(
+        soccfg,
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+        recovery_tproc_cycles=0,
+    )
+
+    assert program._fir_cfg["trigger_delay_input_cycles"] == 300_000
+    assert program._fir_cfg["trigger_delay_arm_kwargs"] == {
+        "trigger_delay_samples": 50
+    }
+    assert program.aux_timing["ddr_capture_end"] == 60_000
+    assert program.timing["point_end"] == 60_300
 
 
 def test_pmem_size_does_not_scale_with_sweep_point_count():
