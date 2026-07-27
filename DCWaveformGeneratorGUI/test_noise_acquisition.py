@@ -67,8 +67,13 @@ def _soccfg(*, fir_rate_profile="1_msps"):
                 296_677.0 if is_50_ksps else 8677.0
             ),
             "supports_trigger_delay": is_50_ksps,
-            "trigger_delay_units": "valid_input_samples",
-            "trigger_delay_default_samples": 50 if is_50_ksps else 0,
+            "trigger_delay_units": (
+                "s_axis_aclk_cycles"
+                if is_50_ksps
+                else "valid_input_samples"
+            ),
+            "trigger_delay_default_cycles": 50 if is_50_ksps else 0,
+            "trigger_delay_default_samples": 0,
         },
         "readouts": [{"buf_maxlen": 4096, "b_dds": 32, "f_dds": 300.0}],
         "tprocs": [{"f_time": 300.0}],
@@ -178,10 +183,15 @@ def test_direct_noise_acquisition_uses_50_ksps_hwh_and_v2_trigger_delay():
     )
 
     arm = next(call[1] for call in soc.calls if call[0] == "arm")
-    assert arm["trigger_delay_samples"] == 50
+    assert arm["trigger_delay_cycles"] == 50
     assert result.sample_rate_hz == 50_000.0
     assert result.iq.shape == (100, 2)
-    assert sleeps[0] > (100 + 50) / 50_000.0
+    expected_sleep = (
+        100 / 50_000.0
+        + 50 / 300_000_000.0
+        + (296_677.0 + config.margin_input_samples) / 300_000_000.0
+    )
+    assert abs(sleeps[0] - expected_sleep) < 1.0e-12
     assert "50_ksps" in result.source
 
 

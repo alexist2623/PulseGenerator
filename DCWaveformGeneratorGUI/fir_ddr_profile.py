@@ -31,10 +31,63 @@ class FirDdrProfile:
     trigger_delay_samples: int
     software_warmup_compensation: bool
     config: Mapping[str, Any]
+    trigger_delay_units: str = "valid_input_samples"
+
+    def trigger_delay_us_for(self, value: int) -> float:
+        """Convert a trigger-delay register value to microseconds."""
+
+        delay = int(value)
+        if delay < 0:
+            raise ValueError("trigger delay must be nonnegative")
+        if self.trigger_delay_units == "s_axis_aclk_cycles":
+            return delay / self.input_rate_mhz
+        if self.trigger_delay_units == "valid_input_samples":
+            return delay * self.sample_period_us
+        if self.trigger_delay_units == "none" and delay == 0:
+            return 0.0
+        raise RuntimeError(
+            f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
+        )
+
+    def trigger_delay_input_cycles_for(self, value: int) -> int:
+        """Return the delay as 300 MSPS source/readout-clock cycles."""
+
+        delay = int(value)
+        if delay < 0:
+            raise ValueError("trigger delay must be nonnegative")
+        if self.trigger_delay_units == "s_axis_aclk_cycles":
+            return delay
+        if self.trigger_delay_units == "valid_input_samples":
+            return delay * self.decimation
+        if self.trigger_delay_units == "none" and delay == 0:
+            return 0
+        raise RuntimeError(
+            f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
+        )
+
+    def trigger_delay_arm_kwargs(self, value: Any = None) -> dict[str, int]:
+        """Build the unit-correct QICK arm keyword for this HWH generation."""
+
+        if not self.uses_fpga_trigger_delay:
+            return {}
+        delay = self.trigger_delay_samples if value is None else int(value)
+        if delay < 0:
+            raise ValueError("trigger delay must be nonnegative")
+        if self.trigger_delay_units == "s_axis_aclk_cycles":
+            return {"trigger_delay_cycles": delay}
+        if self.trigger_delay_units == "valid_input_samples":
+            return {"trigger_delay_samples": delay}
+        raise RuntimeError(
+            f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
+        )
 
     @property
     def trigger_delay_us(self) -> float:
-        return self.trigger_delay_samples * self.sample_period_us
+        return self.trigger_delay_us_for(self.trigger_delay_samples)
+
+    @property
+    def trigger_delay_input_cycles(self) -> int:
+        return self.trigger_delay_input_cycles_for(self.trigger_delay_samples)
 
     @property
     def rate_label(self) -> str:
@@ -42,12 +95,18 @@ class FirDdrProfile:
 
     @property
     def timing_label(self) -> str:
-        delay = (
-            f", FPGA delay {self.trigger_delay_samples} samples "
-            f"({self.trigger_delay_us:g} us)"
-            if self.uses_fpga_trigger_delay
-            else ", tProcessor FIR warm-up compensation"
-        )
+        if self.uses_fpga_trigger_delay:
+            unit_label = (
+                "source-clock cycles"
+                if self.trigger_delay_units == "s_axis_aclk_cycles"
+                else "valid input samples"
+            )
+            delay = (
+                f", FPGA delay {self.trigger_delay_samples} {unit_label} "
+                f"({self.trigger_delay_us:g} us)"
+            )
+        else:
+            delay = ", tProcessor FIR warm-up compensation"
         return (
             f"{self.rate_label} ({self.sample_period_us:g} us/sample{delay})"
         )
@@ -123,8 +182,10 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
     """Resolve one supported capture profile from ``soccfg['ddr4_buf']``.
 
     The 50 kSPS firmware must expose the V2 programmable trigger-delay
-    register. Its delay is applied in FPGA valid-sample units, so software must
-    not move the tProcessor trigger by the FIR group delay.
+    register. Legacy V2 firmware counts valid input samples; current V2
+    firmware uses source AXIS clock cycles. Software must preserve the
+    HWH-reported unit and must not move the tProcessor trigger by the FIR group
+    delay.
     """
 
     try:
@@ -152,21 +213,32 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
 
     uses_fpga_trigger_delay = profile_name == "50_ksps"
     trigger_delay_samples = 0
+    trigger_delay_units = "none"
     if uses_fpga_trigger_delay:
         if not ddr_cfg.get("supports_trigger_delay", False):
             raise RuntimeError(
                 "50 kSPS FIR-DDR HWH requires axis_buffer_ddr_sample_v2 "
                 "programmable trigger delay"
             )
-        if ddr_cfg.get("trigger_delay_units") not in (None, "valid_input_samples"):
-            raise RuntimeError(
-                "50 kSPS DDR trigger delay must use valid_input_samples units"
-            )
-        trigger_delay_samples = int(
-            ddr_cfg.get("trigger_delay_default_samples", 0)
+        trigger_delay_units = str(
+            ddr_cfg.get("trigger_delay_units") or "valid_input_samples"
         )
+        if trigger_delay_units not in (
+            "valid_input_samples",
+            "s_axis_aclk_cycles",
+        ):
+            raise RuntimeError(
+                "50 kSPS DDR trigger delay must use valid_input_samples or "
+                "s_axis_aclk_cycles units"
+            )
+        default_key = (
+            "trigger_delay_default_cycles"
+            if trigger_delay_units == "s_axis_aclk_cycles"
+            else "trigger_delay_default_samples"
+        )
+        trigger_delay_samples = int(ddr_cfg.get(default_key, 0))
         if trigger_delay_samples < 0:
-            raise RuntimeError("HWH trigger_delay_default_samples must be nonnegative")
+            raise RuntimeError(f"HWH {default_key} must be nonnegative")
 
     return FirDdrProfile(
         name=profile_name,
@@ -180,6 +252,7 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
         trigger_delay_samples=trigger_delay_samples,
         software_warmup_compensation=not uses_fpga_trigger_delay,
         config=ddr_cfg,
+        trigger_delay_units=trigger_delay_units,
     )
 
 

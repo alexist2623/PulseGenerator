@@ -2706,6 +2706,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     "fpga_trigger_delay_samples requires 50 kSPS DDR V2 firmware"
                 )
             trigger_delay_samples = 0
+        trigger_delay_input_cycles = profile.trigger_delay_input_cycles_for(
+            trigger_delay_samples
+        )
+        trigger_delay_arm_kwargs = profile.trigger_delay_arm_kwargs(
+            trigger_delay_samples
+        )
         self._fir_cfg = {
             "rate_profile": profile.name,
             "decimation": profile.decimation,
@@ -2716,6 +2722,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "software_warmup_compensation": profile.software_warmup_compensation,
             "uses_fpga_trigger_delay": profile.uses_fpga_trigger_delay,
             "trigger_delay_samples": trigger_delay_samples,
+            "trigger_delay_units": profile.trigger_delay_units,
+            "trigger_delay_input_cycles": trigger_delay_input_cycles,
+            "trigger_delay_arm_kwargs": trigger_delay_arm_kwargs,
             "profile_default_trigger_delay_samples": profile.trigger_delay_samples,
         }
 
@@ -2771,9 +2780,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 # code. Starting periodic readout at t=0 only feeds the pipeline.
                 warmup_cycles = 0
                 readout_start = 0
-                trigger_delay_samples = self._fir_cfg["trigger_delay_samples"]
                 post_trigger_input_samples = (
-                    (ddr.samples_per_trigger + trigger_delay_samples) * decimation
+                    ddr.samples_per_trigger * decimation
+                    + self._fir_cfg["trigger_delay_input_cycles"]
                     + ddr.margin_input_samples
                 )
                 filter_ready_cycles = int(ceil(group_delay * f_time / input_fs))
@@ -2795,6 +2804,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 ],
                 "fir_fpga_trigger_delay_samples": self._fir_cfg[
                     "trigger_delay_samples"
+                ],
+                "fir_fpga_trigger_delay_units": self._fir_cfg[
+                    "trigger_delay_units"
                 ],
             })
             self.timing["point_end"] = max(self.timing["point_end"], capture_end)
@@ -4261,9 +4273,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             force_overwrite=ddr.force_overwrite,
         )
         if self._fir_cfg["uses_fpga_trigger_delay"]:
-            arm_kwargs["trigger_delay_samples"] = self._fir_cfg[
-                "trigger_delay_samples"
-            ]
+            arm_kwargs.update(self._fir_cfg["trigger_delay_arm_kwargs"])
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
         if counter_progress is None:
             self.run_rounds(soc, progress=progress, **run_kwargs)
@@ -4438,6 +4448,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             ),
             "fir_fpga_trigger_delay_samples": (
                 self._fir_cfg["trigger_delay_samples"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_fpga_trigger_delay_units": (
+                self._fir_cfg["trigger_delay_units"]
                 if self.ddr_readout_config is not None
                 else None
             ),

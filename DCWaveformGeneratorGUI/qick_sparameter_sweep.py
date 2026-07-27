@@ -1196,11 +1196,8 @@ class SParameterSweepProgram(RAveragerProgram):
             self.fir_warmup_tproc_cycles = 0
             self.ddr_trigger_time = self.output_command_time
             post_trigger_input_samples = (
-                (
-                    self.scan_samples
-                    + self._fir_profile.trigger_delay_samples
-                )
-                * decimation
+                self.scan_samples * decimation
+                + self._fir_profile.trigger_delay_input_cycles
                 + self.sweep.margin_input_samples
             )
             self.fir_feed_input_samples = group_delay + post_trigger_input_samples
@@ -1471,9 +1468,7 @@ class SParameterSweepProgram(RAveragerProgram):
             force_overwrite=self.sweep.force_overwrite,
         )
         if self._fir_profile.uses_fpga_trigger_delay:
-            arm_kwargs["trigger_delay_samples"] = (
-                self._fir_profile.trigger_delay_samples
-            )
+            arm_kwargs.update(self._fir_profile.trigger_delay_arm_kwargs())
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
         if counter_progress is None and not self._uses_gain_table:
             self.run_rounds(soc, progress=progress)
@@ -1600,6 +1595,9 @@ class SParameterSweepProgram(RAveragerProgram):
             ),
             "fir_fpga_trigger_delay_samples": (
                 self._fir_profile.trigger_delay_samples
+            ),
+            "fir_fpga_trigger_delay_units": (
+                self._fir_profile.trigger_delay_units
             ),
             "rf_output_mode": "periodic_start_timed_zero_stop",
             "rf_periodic_word_fabric_cycles": self.PERIODIC_WORD_CYCLES,

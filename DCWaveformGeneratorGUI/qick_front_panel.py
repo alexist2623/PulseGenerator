@@ -63,6 +63,7 @@ class QickFrontPanelConfiguration:
     fir_sample_rate_hz: Optional[float] = None
     fir_sample_period_us: Optional[float] = None
     fir_trigger_delay_samples: int = 0
+    fir_trigger_delay_units: str = "none"
     fir_trigger_delay_us: float = 0.0
     fir_rate_label: str = "FIR DDR rate unavailable"
 
@@ -225,6 +226,7 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             "fir_sample_rate_hz": fir_profile.sample_rate_hz,
             "fir_sample_period_us": fir_profile.sample_period_us,
             "fir_trigger_delay_samples": fir_profile.trigger_delay_samples,
+            "fir_trigger_delay_units": fir_profile.trigger_delay_units,
             "fir_trigger_delay_us": fir_profile.trigger_delay_us,
             "fir_rate_label": fir_profile.timing_label,
         }

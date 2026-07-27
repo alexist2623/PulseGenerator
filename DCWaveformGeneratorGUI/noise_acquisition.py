@@ -237,6 +237,7 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
     program.noise_fir_warmup_tproc_cycles = warmup_cycles
     program.noise_fir_rate_profile = profile.name
     program.noise_fir_fpga_trigger_delay_samples = profile.trigger_delay_samples
+    program.noise_fir_fpga_trigger_delay_units = profile.trigger_delay_units
     return program
 
 
@@ -267,7 +268,8 @@ def acquire_noise_fir_trace(
     input_rate_hz = profile.input_rate_mhz * 1.0e6
     group_delay_input_samples = profile.group_delay_input_samples
     capture_seconds = (
-        (config.fir_samples + profile.trigger_delay_samples) / output_rate_hz
+        config.fir_samples / output_rate_hz
+        + profile.trigger_delay_us / 1.0e6
         + (group_delay_input_samples + config.margin_input_samples)
         / input_rate_hz
     )
@@ -282,7 +284,7 @@ def acquire_noise_fir_trace(
         force_overwrite=config.force_overwrite,
     )
     if profile.uses_fpga_trigger_delay:
-        arm_kwargs["trigger_delay_samples"] = profile.trigger_delay_samples
+        arm_kwargs.update(profile.trigger_delay_arm_kwargs())
     reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
     progress(18, "Starting readout and DDR trigger")
     program.run_rounds(soc, progress=False)

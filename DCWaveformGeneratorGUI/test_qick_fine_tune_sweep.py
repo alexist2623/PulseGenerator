@@ -140,8 +140,11 @@ def _fir_soccfg(*, fir_rate_profile="1_msps"):
         ),
         "fir_input_fs_mhz": 300.0,
         "supports_trigger_delay": is_50_ksps,
-        "trigger_delay_units": "valid_input_samples",
-        "trigger_delay_default_samples": 50 if is_50_ksps else 0,
+        "trigger_delay_units": (
+            "s_axis_aclk_cycles" if is_50_ksps else "valid_input_samples"
+        ),
+        "trigger_delay_default_cycles": 50 if is_50_ksps else 0,
+        "trigger_delay_default_samples": 0,
         "trigger_type": "dport",
         "trigger_port": 0,
         "trigger_bit": 1,
@@ -258,7 +261,7 @@ def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch)
     monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
     result = program.acquire_fir_ddr(soc, progress=False)
 
-    assert soc.arm_kwargs["trigger_delay_samples"] == 50
+    assert soc.arm_kwargs["trigger_delay_cycles"] == 50
     assert result.iq.shape == (1, 1, 8, 2)
     assert result.sample_rate_hz == 50_000.0
     assert result.fir_rate_profile == "50_ksps"

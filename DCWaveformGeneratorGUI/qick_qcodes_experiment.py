@@ -1440,6 +1440,7 @@ def run_qick_qcodes_experiment(
         "fir_sample_rate_hz": fir_profile.sample_rate_hz,
         "fir_sample_period_us": fir_profile.sample_period_us,
         "fir_fpga_trigger_delay_samples": fir_profile.trigger_delay_samples,
+        "fir_fpga_trigger_delay_units": fir_profile.trigger_delay_units,
         "fir_software_warmup_compensation": (
             fir_profile.software_warmup_compensation
         ),

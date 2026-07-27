@@ -10,7 +10,11 @@ import pytest
 from fir_ddr_profile import resolve_fir_ddr_profile
 
 
-def _soccfg(rate_profile: str):
+def _soccfg(
+    rate_profile: str,
+    *,
+    trigger_delay_units: str = "valid_input_samples",
+):
     if rate_profile == "1_msps":
         ddr = {
             "sample_capture": True,
@@ -31,11 +35,14 @@ def _soccfg(rate_profile: str):
             "fir_input_fs_mhz": 300.0,
             "fir_group_delay_input_samples": 296_677.0,
             "supports_trigger_delay": True,
-            "trigger_delay_units": "valid_input_samples",
-            "trigger_delay_default_samples": 50,
+            "trigger_delay_units": trigger_delay_units,
             "filter_state_continuous": True,
             "decimation_phase_continuous": True,
         }
+        if trigger_delay_units == "s_axis_aclk_cycles":
+            ddr["trigger_delay_default_cycles"] = 50
+        else:
+            ddr["trigger_delay_default_samples"] = 50
     return {"ddr4_buf": ddr}
 
 
@@ -61,7 +68,30 @@ def test_50_ksps_profile_uses_hwh_v2_delay_without_software_compensation():
     assert profile.software_warmup_compensation is False
     assert profile.uses_fpga_trigger_delay is True
     assert profile.trigger_delay_samples == 50
+    assert profile.trigger_delay_units == "valid_input_samples"
+    assert profile.trigger_delay_input_cycles == 300_000
     assert profile.trigger_delay_us == 1000.0
+    assert profile.trigger_delay_arm_kwargs() == {
+        "trigger_delay_samples": 50
+    }
+
+
+def test_50_ksps_profile_supports_shift_line_clock_cycle_delay():
+    profile = resolve_fir_ddr_profile(
+        _soccfg(
+            "50_ksps",
+            trigger_delay_units="s_axis_aclk_cycles",
+        )
+    )
+
+    assert profile.trigger_delay_samples == 50
+    assert profile.trigger_delay_units == "s_axis_aclk_cycles"
+    assert profile.trigger_delay_input_cycles == 50
+    assert profile.trigger_delay_us == pytest.approx(50.0 / 300.0)
+    assert profile.trigger_delay_arm_kwargs() == {
+        "trigger_delay_cycles": 50
+    }
+    assert "source-clock cycles" in profile.timing_label
 
 
 def test_50_ksps_profile_rejects_hwh_without_v2_trigger_delay():

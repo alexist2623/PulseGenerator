@@ -142,8 +142,13 @@ def _mock_soccfg(
                 ),
                 "fir_input_fs_mhz": 300.0,
                 "supports_trigger_delay": is_50_ksps,
-                "trigger_delay_units": "valid_input_samples",
-                "trigger_delay_default_samples": 50 if is_50_ksps else 0,
+                "trigger_delay_units": (
+                    "s_axis_aclk_cycles"
+                    if is_50_ksps
+                    else "valid_input_samples"
+                ),
+                "trigger_delay_default_cycles": 50 if is_50_ksps else 0,
+                "trigger_delay_default_samples": 0,
                 "trigger_type": "dport",
                 "trigger_port": 0,
                 "trigger_bit": 1,
@@ -687,7 +692,7 @@ def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
     assert program.ddr_trigger_time == program.output_command_time
     assert program.summary()["fir_rate_profile"] == "50_ksps"
     assert program.summary()["fir_software_warmup_compensation"] is False
-    assert soc.arm_kwargs["trigger_delay_samples"] == 50
+    assert soc.arm_kwargs["trigger_delay_cycles"] == 50
     assert result.sample_rate_hz == 50_000.0
     assert result.iq_traces.shape == (3, 50, 2)
 

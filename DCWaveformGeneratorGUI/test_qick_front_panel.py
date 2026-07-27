@@ -83,11 +83,31 @@ def test_hwh_and_card_detection_build_zcu216_physical_port_map():
         "decimation",
         "supports_delay",
         "delay_samples",
+        "delay_units",
+        "expected_delay_us",
         "expected_label",
     ),
     (
-        ("1_msps", 1_000_000.0, 300, False, 0, "1 MSPS"),
-        ("50_ksps", 50_000.0, 6000, True, 50, "50 kSPS"),
+        (
+            "1_msps",
+            1_000_000.0,
+            300,
+            False,
+            0,
+            "valid_input_samples",
+            0.0,
+            "1 MSPS",
+        ),
+        (
+            "50_ksps",
+            50_000.0,
+            6000,
+            True,
+            50,
+            "s_axis_aclk_cycles",
+            50.0 / 300.0,
+            "50 kSPS",
+        ),
     ),
 )
 def test_hwh_identification_reports_fir_ddr_profile(
@@ -96,6 +116,8 @@ def test_hwh_identification_reports_fir_ddr_profile(
     decimation,
     supports_delay,
     delay_samples,
+    delay_units,
+    expected_delay_us,
     expected_label,
 ):
     config = _live_config()
@@ -108,8 +130,13 @@ def test_hwh_identification_reports_fir_ddr_profile(
         "fir_input_fs_mhz": 300.0,
         "fir_group_delay_input_samples": 296_677.0,
         "supports_trigger_delay": supports_delay,
-        "trigger_delay_units": "valid_input_samples",
-        "trigger_delay_default_samples": delay_samples,
+        "trigger_delay_units": delay_units,
+        "trigger_delay_default_samples": (
+            delay_samples if delay_units == "valid_input_samples" else 0
+        ),
+        "trigger_delay_default_cycles": (
+            delay_samples if delay_units == "s_axis_aclk_cycles" else 0
+        ),
     }
 
     configuration = identify_qick_front_panel(config)
@@ -118,8 +145,11 @@ def test_hwh_identification_reports_fir_ddr_profile(
     assert configuration.fir_sample_rate_hz == rate_hz
     assert expected_label in configuration.fir_rate_label
     assert configuration.fir_trigger_delay_samples == delay_samples
-    assert configuration.fir_trigger_delay_us == (
-        delay_samples * 1_000_000.0 / rate_hz
+    assert configuration.fir_trigger_delay_units == (
+        delay_units if supports_delay else "none"
+    )
+    assert configuration.fir_trigger_delay_us == pytest.approx(
+        expected_delay_us
     )
 
 
