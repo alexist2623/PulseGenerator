@@ -243,8 +243,9 @@ def _coerce_sweep_specs(
     ramp_sweeps = [
         item for item in normalized if isinstance(item, QickRampRateSweepSpec)
     ]
-    if len(ramp_sweeps) > 1:
-        raise ValueError("only one RAMP duration/rate sweep may be active")
+    ramp_targets = [item.segment_name for item in ramp_sweeps]
+    if len(set(ramp_targets)) != len(ramp_targets):
+        raise ValueError("each RAMP segment may have only one duration/rate sweep")
     targets = [
         (item.segment_name, item.output_name)
         for item in normalized
@@ -252,8 +253,9 @@ def _coerce_sweep_specs(
     ]
     if len(set(targets)) != len(targets):
         raise ValueError("each (segment, output) sweep target must be unique")
-    # The duration axis is deliberately outermost.  Its DMEM coefficient row
-    # is loaded once, then all inner voltage combinations use register adds.
+    # RAMP duration axes are deliberately outermost. Each RAMP owns an
+    # independent DMEM coefficient table, while inner voltage combinations use
+    # register adds without storing a full Cartesian point table.
     return tuple(ramp_sweeps) + tuple(
         item for item in normalized if isinstance(item, QickSweepSpec)
     )

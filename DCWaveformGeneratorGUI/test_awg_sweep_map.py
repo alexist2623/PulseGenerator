@@ -199,6 +199,58 @@ def test_reduce_map_preserves_ramp_duration_axis_and_derived_rate_label():
     )
 
 
+def test_reduce_map_supports_two_independent_ramp_duration_axes():
+    first_points = (0.08, 0.10, 0.12)
+    second_points = (0.10, 0.12, 0.14, 0.16)
+    coordinates = np.asarray(
+        tuple(product(first_points, second_points)),
+        dtype=float,
+    )
+    iq = np.zeros((coordinates.shape[0], 1, 1, 2), dtype=np.int32)
+    for point_index, (first, second) in enumerate(coordinates):
+        iq[point_index, 0, 0, 0] = int(first * 1000 + second * 100)
+        iq[point_index, 0, 0, 1] = int(first * 200 - second * 500)
+    result = awg_map.reduce_awg_sweep_map(
+        SimpleNamespace(
+            sweep_axes=(
+                SimpleNamespace(
+                    output_name="all_awg_outputs",
+                    segment_name="ramp_0_to_1",
+                    start=first_points[0],
+                    stop=first_points[-1],
+                    count=len(first_points),
+                    axis_kind="ramp_duration",
+                ),
+                SimpleNamespace(
+                    output_name="all_awg_outputs",
+                    segment_name="ramp_1_to_2",
+                    start=second_points[0],
+                    stop=second_points[-1],
+                    count=len(second_points),
+                    axis_kind="ramp_duration",
+                ),
+            ),
+            sweep_points=coordinates,
+            iq=iq,
+            sample_rate_hz=50_000.0,
+        ),
+        x_axis_key=("all_awg_outputs", "ramp_0_to_1"),
+        y_axis_key=("all_awg_outputs", "ramp_1_to_2"),
+        full_scale_mv=800.0,
+    )
+
+    np.testing.assert_allclose(result.x_values, first_points)
+    np.testing.assert_allclose(result.y_values, second_points)
+    assert result.x_unit == "us"
+    assert result.y_unit == "us"
+    assert result.x_axis_label == (
+        "ramp_0_to_1 RAMP duration (rate derived)"
+    )
+    assert result.y_axis_label == (
+        "ramp_1_to_2 RAMP duration (rate derived)"
+    )
+
+
 def test_reduce_three_axes_averages_unselected_axis():
     x_points = (-1.0, 1.0)
     y_points = (-0.5, 0.5)

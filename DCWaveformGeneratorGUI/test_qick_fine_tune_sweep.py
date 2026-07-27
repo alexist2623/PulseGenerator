@@ -274,6 +274,124 @@ def test_ramp_rate_sweep_recomputes_steps_for_adjacent_voltage_axes():
     assert len(ramp_steps) > len(ramp_durations)
 
 
+def test_independent_ramp_rate_sweeps_use_nested_tables_without_point_table():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.set_cross_capacitance(((1.0, 0.2), (-0.15, 1.0)))
+    sequence.add_set("start", (-0.2, 0.1), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("gate", (0.35, -0.25), 24)
+    sequence.add_ramp("ramp_1_to_2", 36)
+    sequence.add_set("measure", (0.1, 0.4), 20)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.08,
+        stop_us=0.12,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "ramp_1_to_2",
+        start_us=0.10,
+        stop_us=0.16,
+        count=4,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_amplitude_sweep("start", "awg_0", -0.3, 0.3, 2)
+    sequence.add_amplitude_sweep("measure", "awg_1", -0.4, 0.4, 3)
+
+    assert tuple(
+        axis.segment_name
+        for axis in sequence.sweep_axes
+        if isinstance(axis, RampDurationSweep)
+    ) == ("ramp_0_to_1", "ramp_1_to_2")
+    assert sequence.sweep_shape == (3, 4, 2, 3)
+
+    program = sequence.make_program(
+        _mock_soccfg(2),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=1,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=4_000_000)
+
+    assert [event.word for event in tproc.output_events] == _expected_words(program)
+    assert tproc.timing_conflicts == []
+    assert {
+        int(group["axis_index"])
+        for group in program._ramp_duration_table_groups.values()
+    } == {0, 1}
+    assert len({
+        int(group["pointer_state_addr"])
+        for group in program._ramp_duration_table_groups.values()
+    }) == len(program._ramp_duration_table_groups)
+
+    first_durations = {
+        command.duration_samples
+        for point in program.compiled_points
+        for command in point.segment_commands[1]
+    }
+    second_durations = {
+        command.duration_samples
+        for point in program.compiled_points
+        for command in point.segment_commands[3]
+    }
+    assert first_durations == {24 * 16, 30 * 16, 36 * 16}
+    assert second_durations == {30 * 16, 36 * 16, 42 * 16, 48 * 16}
+
+    summary = program.summary()
+    assert summary["sweep_uses_point_table"] is False
+    assert summary["ramp_rate_coefficient_table_words"] > 0
+    assert summary["ramp_rate_coefficient_table_words"] < (
+        sequence.sweep_point_count * 2
+    )
+    assert len(summary["ramp_duration_sweeps"]) == 2
+
+
+def test_ramp_rate_sweep_replaces_and_clears_only_its_target_segment():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("gate", (0.4,), 24)
+    sequence.add_ramp("ramp_1_to_2", 36)
+    sequence.add_set("measure", (-0.2,), 60)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.08,
+        stop_us=0.12,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "ramp_1_to_2",
+        start_us=0.10,
+        stop_us=0.16,
+        count=4,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.20,
+        stop_us=0.24,
+        count=2,
+        sequence_fabric_mhz=300.0,
+    )
+
+    assert tuple(axis.segment_name for axis in sequence.sweep_axes) == (
+        "ramp_0_to_1",
+        "ramp_1_to_2",
+    )
+    assert sequence.sweep_axes[0].points == (0.20, 0.24)
+    assert sequence.sweep_axes[1].points == (0.10, 0.12, 0.14, 0.16)
+
+    sequence.clear_ramp_duration_sweep("ramp_0_to_1")
+    assert tuple(axis.segment_name for axis in sequence.sweep_axes) == (
+        "ramp_1_to_2",
+    )
+
+
 def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("start", (0.0,), 18)
@@ -320,6 +438,65 @@ def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
         capture_set_event = awg_events[point_index * 3 + 2]
         assert trigger_event["cycle"] - capture_set_event.cycle == 17
     assert program.summary()["fir_software_warmup_compensation"] is False
+    assert tproc.timing_conflicts == []
+
+
+def test_two_ramp_rate_axes_move_50_ksps_ddr_trigger_additively():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 18)
+    sequence.add_ramp("ramp_0_to_1", 30)
+    sequence.add_set("gate", (0.4,), 24)
+    sequence.add_ramp("ramp_1_to_2", 36)
+    sequence.add_set("capture", (-0.2,), 60)
+    sequence.add_ramp_duration_sweep(
+        "ramp_0_to_1",
+        start_us=0.08,
+        stop_us=0.12,
+        count=2,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_ramp_duration_sweep(
+        "ramp_1_to_2",
+        start_us=0.10,
+        stop_us=0.16,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=8,
+        at_segment="capture",
+        trigger_delay_tproc_cycles=17,
+        margin_input_samples=0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=1_000_000)
+
+    awg_events = [
+        event for event in tproc.output_events if event.tproc_ch == 0
+    ]
+    trigger_high = [
+        event
+        for event in tproc.output_pin_events
+        if event["word"] == 1 << 1
+    ]
+    commands_per_point = 5
+    assert len(trigger_high) == 6
+    assert [event.word for event in awg_events] == _expected_words(program)
+    for point_index, trigger_event in enumerate(trigger_high):
+        capture_set_event = awg_events[
+            point_index * commands_per_point + commands_per_point - 1
+        ]
+        assert trigger_event["cycle"] - capture_set_event.cycle == 17
     assert tproc.timing_conflicts == []
 
 

@@ -930,11 +930,11 @@ class FineTuneSequence:
         *,
         sequence_fabric_mhz: Real = 300.0,
     ):
-        """Add the single supported RAMP duration/rate sweep axis.
+        """Add or replace one RAMP segment's duration/rate sweep axis.
 
-        This axis is always placed first (outermost).  For each duration the
-        tProcessor loads only the RAMP step coefficients needed by the inner
-        voltage axes; it never stores the full Cartesian point table.
+        All RAMP duration axes are kept before voltage and RF-duration axes.
+        Each RAMP owns an independent coefficient table, so the tProcessor
+        never stores the full Cartesian point table.
         """
         segment_name = str(segment)
         by_name = {item.name: item for item in self.segments}
@@ -949,29 +949,35 @@ class FineTuneSequence:
             count=_require_int(count, "RAMP duration sweep count", 1),
             sequence_fabric_mhz=float(sequence_fabric_mhz),
         )
-        existing = [
+        ramp_axes = [
             sweep
             for sweep in self.sweeps
             if isinstance(sweep, RampDurationSweep)
         ]
-        if existing and existing[0].segment_name != segment_name:
-            raise ValueError(
-                "only one RAMP duration/rate sweep may be active"
-            )
-        self.sweeps = [
+        for index, sweep in enumerate(ramp_axes):
+            if sweep.segment_name == segment_name:
+                ramp_axes[index] = new_sweep
+                break
+        else:
+            ramp_axes.append(new_sweep)
+        self.sweeps = ramp_axes + [
             sweep
             for sweep in self.sweeps
             if not isinstance(sweep, RampDurationSweep)
         ]
-        self.sweeps.insert(0, new_sweep)
         self._sweep_coordinate_cache = None
         return self
 
-    def clear_ramp_duration_sweep(self):
+    def clear_ramp_duration_sweep(self, segment: Optional[str] = None):
+        segment_name = None if segment is None else str(segment)
         self.sweeps = [
             sweep
             for sweep in self.sweeps
             if not isinstance(sweep, RampDurationSweep)
+            or (
+                segment_name is not None
+                and sweep.segment_name != segment_name
+            )
         ]
         self._sweep_coordinate_cache = None
         return self
@@ -1069,13 +1075,18 @@ class FineTuneSequence:
             for axis in self.sweeps
             if isinstance(axis, RampDurationSweep)
         ]
-        if len(ramp_duration_axes) > 1:
-            raise ValueError("only one RAMP duration/rate sweep may be active")
-        if ramp_duration_axes and not isinstance(
-            self.sweeps[0], RampDurationSweep
+        ramp_targets = [axis.segment_name for axis in ramp_duration_axes]
+        if len(set(ramp_targets)) != len(ramp_targets):
+            raise ValueError(
+                "each RAMP segment may have only one duration/rate sweep"
+            )
+        ramp_axis_count = len(ramp_duration_axes)
+        if any(
+            not isinstance(axis, RampDurationSweep)
+            for axis in self.sweeps[:ramp_axis_count]
         ):
             raise ValueError(
-                "RAMP duration/rate sweep must be the outermost sweep axis"
+                "RAMP duration/rate sweeps must be the outermost sweep axes"
             )
         first = self.segments[0]
         if first.kind != "set" or any(value is None for value in first.amplitudes):
@@ -2171,19 +2182,29 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         return tuple(area2)
 
     @staticmethod
-    def _ramp_duration_axis_index(sweep_axes) -> Optional[int]:
-        matches = [
+    def _ramp_duration_axis_indices(sweep_axes) -> Tuple[int, ...]:
+        matches = tuple(
             index
             for index, axis in enumerate(sweep_axes)
             if isinstance(axis, RampDurationSweep)
-        ]
-        if len(matches) > 1:
-            raise RuntimeError("more than one RAMP duration sweep axis exists")
-        if matches and matches[0] != 0:
+        )
+        if matches != tuple(range(len(matches))):
             raise RuntimeError(
-                "RAMP duration sweep must be the outermost sweep axis"
+                "RAMP duration sweeps must be the outermost sweep axes"
             )
-        return matches[0] if matches else None
+        segments = [sweep_axes[index].segment_name for index in matches]
+        if len(set(segments)) != len(segments):
+            raise RuntimeError(
+                "each RAMP segment may have only one duration sweep axis"
+            )
+        return matches
+
+    @classmethod
+    def _ramp_duration_axis_by_segment(cls, sweep_axes) -> Dict[str, int]:
+        return {
+            str(sweep_axes[index].segment_name): int(index)
+            for index in cls._ramp_duration_axis_indices(sweep_axes)
+        }
 
     @staticmethod
     def _duration_conditioned_values(
@@ -2191,6 +2212,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         sweep_axes,
         sweep_shape,
         *,
+        duration_axis_index: int,
         quantum: int = 1,
     ):
         """Compress one nonlinear duration-dependent field into coefficients.
@@ -2200,12 +2222,14 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         is O(duration points * affected axes), rather than O(all combinations).
         """
         requested = np.asarray(requested_values, dtype=np.int64).reshape(-1)
-        duration_axis_index = (
-            FineTuneAmplitudeSweepProgram._ramp_duration_axis_index(sweep_axes)
-        )
-        if duration_axis_index is None:
-            raise ValueError("duration-conditioned model requires a RAMP axis")
+        duration_axis_index = int(duration_axis_index)
+        if not 0 <= duration_axis_index < len(sweep_axes):
+            raise IndexError("duration_axis_index is out of range")
         duration_axis = sweep_axes[duration_axis_index]
+        if not isinstance(duration_axis, RampDurationSweep):
+            raise ValueError(
+                "duration-conditioned model requires a RAMP duration axis"
+            )
         bases = []
         axis_rows = {
             axis_index: []
@@ -2273,7 +2297,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         metadata,
     ):
         """Represent a linear per-output Bias-T state with sweep-axis adds."""
-        duration_axis_index = self._ramp_duration_axis_index(sweep_axes)
+        duration_axis_indices = self._ramp_duration_axis_indices(sweep_axes)
+        duration_axis_index = (
+            duration_axis_indices[0] if duration_axis_indices else None
+        )
         models = []
         actual = np.empty_like(requested_array)
         max_error = 0
@@ -2285,6 +2312,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         requested_array[:, output_index],
                         sweep_axes,
                         sweep_shape,
+                        duration_axis_index=duration_axis_index,
                         quantum=quantum,
                     )
                 )
@@ -2371,6 +2399,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         if config is None or isinstance(config, BiasTFilterCompensationConfig):
             self._bias_t_fields = ()
             return ()
+        duration_axis_indices = self._ramp_duration_axis_indices(sweep_axes)
+        if len(duration_axis_indices) > 1:
+            raise ValueError(
+                "DC Bias-T compensation with multiple independent RAMP-rate "
+                "sweeps is not supported; disable DC compensation or use one "
+                "RAMP-rate axis"
+            )
 
         if config.mode == "fixed_time":
             duration = int(config.fixed_duration_cycles)
@@ -2527,22 +2562,17 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         sweep_axes = self.sequence.sweep_axes
         sweep_shape = tuple(axis.count for axis in sweep_axes)
-        ramp_duration_axis_index = self._ramp_duration_axis_index(sweep_axes)
-        ramp_duration_axis = (
-            None
-            if ramp_duration_axis_index is None
-            else sweep_axes[ramp_duration_axis_index]
-        )
+        ramp_duration_axes = self._ramp_duration_axis_by_segment(sweep_axes)
         models = {}
         for key in command_order:
             first_command = command_maps[0][key]
-            selected_ramp = (
-                isinstance(ramp_duration_axis, RampDurationSweep)
-                and first_command.kind == "ramp"
-                and first_command.segment_name == ramp_duration_axis.segment_name
+            selected_ramp_axis_index = (
+                ramp_duration_axes.get(first_command.segment_name)
+                if first_command.kind == "ramp"
+                else None
             )
             field_specs = [("target", 0), ("step", 3)]
-            if selected_ramp:
+            if selected_ramp_axis_index is not None:
                 field_specs.append(("duration", 2))
             for register_name, word_index in field_specs:
                 if register_name == "target":
@@ -2575,7 +2605,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     dtype=np.int64,
                 )
 
-                if selected_ramp and register_name == "step":
+                if selected_ramp_axis_index is not None and register_name == "step":
                     (
                         table_bases,
                         table_axis_deltas,
@@ -2585,6 +2615,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         requested_values,
                         sweep_axes,
                         sweep_shape,
+                        duration_axis_index=selected_ramp_axis_index,
                         quantum=quantum,
                     )
                     models[(*key, register_name)] = {
@@ -2596,7 +2627,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         "axis_deltas": tuple(0 for _axis in sweep_axes),
                         "duration_table_bases": table_bases,
                         "duration_table_axis_deltas": table_axis_deltas,
-                        "duration_axis_index": ramp_duration_axis_index,
+                        "duration_axis_index": selected_ramp_axis_index,
                     }
                     continue
 
@@ -2837,14 +2868,20 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     "reset": int(reset_addr),
                 }
 
-        table_pages = {}
+        table_groups = {}
         for field in dynamic_duration_fields:
             page = int(field["page"])
-            page_info = table_pages.setdefault(
-                page,
-                {"columns": []},
+            duration_axis_index = int(field["duration_axis_index"])
+            group_key = (duration_axis_index, page)
+            group_info = table_groups.setdefault(
+                group_key,
+                {
+                    "axis_index": duration_axis_index,
+                    "page": page,
+                    "columns": [],
+                },
             )
-            page_info["columns"].append({
+            group_info["columns"].append({
                 "kind": "base",
                 "field": field,
                 "values": tuple(field["duration_table_bases"]),
@@ -2856,14 +2893,20 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                         "duration_table_axis_deltas"
                     ][axis_index]
                 )
-                page_info["columns"].append({
+                if axis_index < duration_axis_index and any(deltas):
+                    raise ValueError(
+                        "a RAMP-rate coefficient table depends on an outer "
+                        "RAMP duration axis; use independent RAMP segments "
+                        "without cross-duration coefficient coupling"
+                    )
+                group_info["columns"].append({
                     "kind": "delta",
                     "field": field,
                     "axis_index": int(axis_index),
                     "slot": int(slots["advance"]),
                     "values": deltas,
                 })
-                page_info["columns"].append({
+                group_info["columns"].append({
                     "kind": "reset_delta",
                     "field": field,
                     "axis_index": int(axis_index),
@@ -2874,7 +2917,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     ),
                 })
 
-        for page, page_info in table_pages.items():
+        table_page_resources = {}
+        for page in sorted({key[1] for key in table_groups}):
             available = [
                 register
                 for register in range(1, 32)
@@ -2901,7 +2945,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 available = [pointer_register]
             pointer_register = int(available[0])
             occupied[page].add(pointer_register)
-            page_info["pointer_register"] = pointer_register
             scratch_candidates = [
                 int(register)
                 for (gen_ch, name), (reg_page, register) in self._gen_regmap.items()
@@ -2912,21 +2955,32 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     f"register page {page} has no AWG scratch register for "
                     "RAMP-rate coefficient loading"
                 )
-            page_info["scratch_register"] = scratch_candidates[0]
+            table_page_resources[page] = {
+                "pointer_register": pointer_register,
+                "scratch_register": scratch_candidates[0],
+            }
+
+        for group_key in sorted(table_groups):
+            if next_dmem_addr <= 1:
+                raise RuntimeError(
+                    "tProcessor DMEM has no room for RAMP-rate table pointers"
+                )
+            group_info = table_groups[group_key]
+            group_info["pointer_state_addr"] = int(next_dmem_addr)
+            next_dmem_addr -= 1
+            group_info.update(table_page_resources[int(group_info["page"])])
 
         runtime_table_base = 16
         runtime_table_words = []
-        duration_count = (
-            0
-            if ramp_duration_axis_index is None
-            else int(sweep_axes[ramp_duration_axis_index].count)
-        )
         table_cursor = runtime_table_base
-        for page in sorted(table_pages):
-            page_info = table_pages[page]
-            columns = page_info["columns"]
-            page_info["base_address"] = table_cursor
-            page_info["row_width"] = len(columns)
+        for group_key in sorted(table_groups):
+            group_info = table_groups[group_key]
+            columns = group_info["columns"]
+            duration_count = int(
+                sweep_axes[int(group_info["axis_index"])].count
+            )
+            group_info["base_address"] = table_cursor
+            group_info["row_width"] = len(columns)
             for duration_index in range(duration_count):
                 runtime_table_words.extend(
                     int(column["values"][duration_index])
@@ -2975,8 +3029,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if str(field.get("register_name", "")).startswith("bias_t_")
         )
         self._sweep_axis_runtime = axis_runtime
-        self._ramp_duration_axis_index_runtime = ramp_duration_axis_index
-        self._ramp_duration_table_pages = table_pages
+        self._ramp_duration_axis_indices_runtime = (
+            self._ramp_duration_axis_indices(sweep_axes)
+        )
+        self._ramp_duration_table_groups = table_groups
+        self._ramp_duration_table_page_resources = table_page_resources
         self._runtime_dmem_base = (
             runtime_table_base if runtime_table_words else None
         )
@@ -4762,13 +4819,40 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     "post Bias-T shot recovery",
                 )
 
-    def _emit_ramp_duration_table_load(self) -> None:
-        """Load one duration row into state and per-axis delta slots."""
-        for page in sorted(self._ramp_duration_table_pages):
-            page_info = self._ramp_duration_table_pages[page]
-            pointer = int(page_info["pointer_register"])
-            scratch = int(page_info["scratch_register"])
-            for column_index, column in enumerate(page_info["columns"]):
+    def _emit_ramp_duration_table_load(
+        self,
+        axis_index: int,
+        *,
+        reset: bool = False,
+    ) -> None:
+        """Load one row from every coefficient table owned by a RAMP axis."""
+        axis_index = int(axis_index)
+        groups = [
+            group
+            for (group_axis, _page), group in sorted(
+                self._ramp_duration_table_groups.items()
+            )
+            if int(group_axis) == axis_index
+        ]
+        for group in groups:
+            page = int(group["page"])
+            pointer = int(group["pointer_register"])
+            scratch = int(group["scratch_register"])
+            if reset:
+                self.safe_regwi(
+                    page,
+                    pointer,
+                    int(group["base_address"]),
+                    f"reset RAMP-rate axis {axis_index} table pointer",
+                )
+            else:
+                self.memri(
+                    page,
+                    pointer,
+                    int(group["pointer_state_addr"]),
+                    f"load RAMP-rate axis {axis_index} table pointer",
+                )
+            for column_index, column in enumerate(group["columns"]):
                 field = column["field"]
                 if column["kind"] == "base":
                     if field.get("storage") == "dmem":
@@ -4807,8 +4891,14 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     pointer,
                     "+",
                     1,
-                    f"advance RAMP-rate table column {column_index}",
+                    f"advance RAMP-rate axis {axis_index} column {column_index}",
                 )
+            self.memwi(
+                page,
+                pointer,
+                int(group["pointer_state_addr"]),
+                f"store RAMP-rate axis {axis_index} table pointer",
+            )
 
     def _emit_axis_adds(self, axis_index: int, *, reset: bool = False):
         """Advance or reset one Cartesian axis using register-immediate adds."""
@@ -4824,7 +4914,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     continue
                 page = int(field["page"])
                 scratch = int(
-                    self._ramp_duration_table_pages[page]["scratch_register"]
+                    self._ramp_duration_table_page_resources[page][
+                        "scratch_register"
+                    ]
                 )
                 self.memri(
                     page,
@@ -4903,14 +4995,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 f"{action} axis {axis_index} {field['key']}",
             )
         if (
-            axis_index == self._ramp_duration_axis_index_runtime
-            and self._ramp_duration_table_pages
+            axis_index in self._ramp_duration_axis_indices_runtime
+            and self._ramp_duration_table_groups
         ):
-            if reset:
-                raise RuntimeError(
-                    "outer RAMP duration axis must never be reset as an inner axis"
-                )
-            self._emit_ramp_duration_table_load()
+            self._emit_ramp_duration_table_load(
+                axis_index,
+                reset=reset,
+            )
 
     def make_program(self):
         """Emit nested point/repetition loops and register-add sweep updates."""
@@ -4941,16 +5032,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     int(field["base"]),
                     f"initialize direct sweep state {field['key']}",
                 )
-        for page in sorted(self._ramp_duration_table_pages):
-            page_info = self._ramp_duration_table_pages[page]
-            self.safe_regwi(
-                int(page),
-                int(page_info["pointer_register"]),
-                int(page_info["base_address"]),
-                "initialize RAMP-rate coefficient table pointer",
-            )
-        if self._ramp_duration_table_pages:
-            self._emit_ramp_duration_table_load()
+        for axis_index in self._ramp_duration_axis_indices_runtime:
+            self._emit_ramp_duration_table_load(axis_index, reset=True)
         active_axes = tuple(sorted(self._sweep_axis_runtime))
         for axis_index in active_axes:
             runtime = self._sweep_axis_runtime[axis_index]

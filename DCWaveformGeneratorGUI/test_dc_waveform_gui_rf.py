@@ -322,24 +322,25 @@ def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
     dialog.close()
 
 
-def test_export_dialog_preserves_global_ramp_rate_axis():
+def test_export_dialog_preserves_multiple_ramp_rate_axes():
     app = _application()
-    ramp = QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3)
-    voltage = QickSweepSpec("set_1", "awg_0", -0.5, 0.5, 5)
+    ramp_a = QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3)
+    ramp_b = QickRampRateSweepSpec("ramp_1_to_2", 0.10, 0.16, 4)
+    voltage = QickSweepSpec("set_2", "awg_0", -0.5, 0.5, 5)
     dialog = gui.QickExportDialog(
         pulse_count=1,
-        set_names=("set_0", "set_1"),
+        set_names=("set_0", "set_1", "set_2"),
         initial_full_scale_mv=200.0,
-        initial_sweeps=(ramp, voltage),
+        initial_sweeps=(ramp_a, ramp_b, voltage),
     )
     app.processEvents()
 
-    assert dialog._effective_sweeps() == (ramp, voltage)
-    assert dialog.sweep_total.text() == "3 x 5 = 15 combinations"
+    assert dialog._effective_sweeps() == (ramp_a, ramp_b, voltage)
+    assert dialog.sweep_total.text() == "3 x 4 x 5 = 60 combinations"
     dialog.sweep_group.setChecked(False)
     app.processEvents()
-    assert dialog._effective_sweeps() == (ramp,)
-    assert dialog.sweep_total.text() == "3 = 3 combinations"
+    assert dialog._effective_sweeps() == (ramp_a, ramp_b)
+    assert dialog.sweep_total.text() == "3 x 4 = 12 combinations"
     dialog.close()
 
 
@@ -486,14 +487,21 @@ def test_generated_qick_module_preserves_rf_duration_sweep_mode():
     assert runtime_rf[0].length_cycles == 300
 
 
-def test_generated_qick_module_preserves_ramp_rate_sweep():
+def test_generated_qick_module_preserves_multiple_ramp_rate_sweeps():
     pulse = PulseSequence(0.0, initial_duration_ns=100.0)
     pulse.add_flat_ramp(100.0, 200.0, 200.0)
-    ramp_sweep = QickRampRateSweepSpec(
+    pulse.add_flat_ramp(120.0, 150.0, -100.0)
+    ramp_sweep_a = QickRampRateSweepSpec(
         "ramp_0_to_1",
         0.08,
         0.12,
         3,
+    )
+    ramp_sweep_b = QickRampRateSweepSpec(
+        "ramp_1_to_2",
+        0.10,
+        0.16,
+        4,
     )
     code = generate_qick_program_code(
         (pulse,),
@@ -501,18 +509,20 @@ def test_generated_qick_module_preserves_ramp_rate_sweep():
         awg_channels=(1,),
         fabric_mhz=300.0,
         tproc_mhz=300.0,
-        sweeps=(ramp_sweep,),
+        sweeps=(ramp_sweep_a, ramp_sweep_b),
     )
     ast.parse(code)
     namespace = {}
     exec(compile(code, "<ramp-rate-generated>", "exec"), namespace)
 
     sequence = namespace["build_sequence"]()
-    assert len(sequence.sweep_axes) == 1
-    axis = sequence.sweep_axes[0]
-    assert axis.axis_kind == "ramp_duration"
-    assert axis.segment_name == "ramp_0_to_1"
-    assert axis.points == (0.08, 0.1, 0.12)
+    assert len(sequence.sweep_axes) == 2
+    assert tuple(axis.segment_name for axis in sequence.sweep_axes) == (
+        "ramp_0_to_1",
+        "ramp_1_to_2",
+    )
+    assert sequence.sweep_axes[0].points == (0.08, 0.1, 0.12)
+    assert sequence.sweep_axes[1].points == (0.1, 0.12, 0.14, 0.16)
 
 
 def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
@@ -731,14 +741,16 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     app = _application()
     window = gui.MainWindow()
     window._add_segment(500.0, 2000.0, -250.0)
+    window._add_segment(750.0, 1500.0, 125.0)
     window._add_port()
-    window._pulse[1].v[:] = [300.0, 300.0, 450.0, 450.0]
+    window._pulse[1].v[:] = [300.0, 300.0, 450.0, 450.0, -125.0, -125.0]
     window._cross_capacitance = np.asarray(
         ((1.0, 0.2), (-0.15, 1.0)), dtype=float
     )
     window._sweep_specs = [
         QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3),
-        QickSweepSpec("set_1", "awg_0", -0.4, 0.6, 7),
+        QickRampRateSweepSpec("ramp_1_to_2", 0.10, 0.16, 4),
+        QickSweepSpec("set_2", "awg_0", -0.4, 0.6, 7),
     ]
     window._qick_fabric_mhz = 300.0
     window._qick_full_scale_mv = 2000.0
@@ -849,6 +861,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         "start": 0.08,
         "stop": 0.12,
         "count": 3,
+    }
+    assert document["awg"]["sweeps"][1] == {
+        "axis_kind": "ramp_duration",
+        "segment_name": "ramp_1_to_2",
+        "output_name": "all_awg_outputs",
+        "start": 0.10,
+        "stop": 0.16,
+        "count": 4,
     }
     assert len(document["rf_outputs"]) == 2
     assert document["rf_outputs"][0]["filter_type"] == "highpass"

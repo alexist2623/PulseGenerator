@@ -4295,14 +4295,11 @@ class QickExportDialog(QtWidgets.QDialog):
             if initial_sweeps is not None
             else (() if initial_sweep is None else (initial_sweep,))
         )
-        self._dialog_ramp_sweep = next(
-            (
-                spec
-                for spec in supplied_sweeps
-                if isinstance(spec, QickRampRateSweepSpec)
-            ),
-            None,
-        )
+        self._dialog_ramp_sweeps = [
+            spec
+            for spec in supplied_sweeps
+            if isinstance(spec, QickRampRateSweepSpec)
+        ]
         self._dialog_sweep_specs = [
             spec
             for spec in supplied_sweeps
@@ -4612,11 +4609,7 @@ class QickExportDialog(QtWidgets.QDialog):
         )
 
     def _effective_sweeps(self) -> Tuple[QickSweepAxisSpec, ...]:
-        ramp_prefix = (
-            ()
-            if self._dialog_ramp_sweep is None
-            else (self._dialog_ramp_sweep,)
-        )
+        ramp_prefix = tuple(self._dialog_ramp_sweeps)
         if not self.sweep_group.isChecked():
             return ramp_prefix
         if not self._dialog_sweep_specs:
@@ -4631,11 +4624,7 @@ class QickExportDialog(QtWidgets.QDialog):
         return ramp_prefix + tuple(specs)
 
     def _refresh_sweep_total(self, *_args) -> None:
-        counts = (
-            []
-            if self._dialog_ramp_sweep is None
-            else [self._dialog_ramp_sweep.count]
-        )
+        counts = [spec.count for spec in self._dialog_ramp_sweeps]
         if self.sweep_group.isChecked():
             voltage_counts = [spec.count for spec in self._dialog_sweep_specs]
             row = self.sweep_table.currentRow()
@@ -5644,15 +5633,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     )
                 )
 
-        ramp_sweep = next(
-            (
-                spec
-                for spec in self._sweep_specs
-                if isinstance(spec, QickRampRateSweepSpec)
-            ),
-            None,
-        )
-        if ramp_sweep is not None:
+        ramp_sweeps = [
+            spec
+            for spec in self._sweep_specs
+            if isinstance(spec, QickRampRateSweepSpec)
+        ]
+        for ramp_sweep in ramp_sweeps:
             ramp_row = self._ramp_sweep_row(ramp_sweep)
             if ramp_row is not None and all(
                 ramp_row < len(pulse.flat_segments()) for pulse in self._pulse
@@ -5819,31 +5805,38 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 spec
                 for spec in self._sweep_specs
                 if isinstance(spec, QickRampRateSweepSpec)
+                and spec.segment_name == segment_name
             ),
             None,
         )
         other_point_count = prod(
             spec.count
             for spec in self._sweep_specs
-            if not isinstance(spec, QickRampRateSweepSpec)
+            if spec is not initial
         )
         dialog = RampRateSweepSettingsDialog(
             segment_name=segment_name,
             current_duration_us=current_duration_us,
             voltage_delta_mv=voltage_delta_mv,
-            initial=(
-                initial
-                if initial is not None
-                and initial.segment_name == segment_name
-                else None
-            ),
+            initial=initial,
             cartesian_base_count=other_point_count,
             parent=self,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
         new_spec = dialog.value()
-        self._sweep_specs = [new_spec] + [
+        ramp_specs = [
+            spec
+            for spec in self._sweep_specs
+            if isinstance(spec, QickRampRateSweepSpec)
+        ]
+        for index, spec in enumerate(ramp_specs):
+            if spec.segment_name == segment_name:
+                ramp_specs[index] = new_spec
+                break
+        else:
+            ramp_specs.append(new_spec)
+        self._sweep_specs = ramp_specs + [
             spec
             for spec in self._sweep_specs
             if not isinstance(spec, QickRampRateSweepSpec)
@@ -7682,8 +7675,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             for spec in decoded_sweeps
             if isinstance(spec, QickRampRateSweepSpec)
         ]
-        if len(ramp_sweeps) > 1:
-            raise ValueError("only one RAMP duration/rate sweep may be stored")
+        ramp_targets = [spec.segment_name for spec in ramp_sweeps]
+        if len(set(ramp_targets)) != len(ramp_targets):
+            raise ValueError(
+                "each RAMP segment may have only one duration/rate sweep"
+            )
         sweeps = tuple(ramp_sweeps) + tuple(
             spec
             for spec in decoded_sweeps

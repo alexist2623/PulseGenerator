@@ -84,11 +84,19 @@ def test_sweep_parameter_names_preserve_ramp_duration_units():
             count=3,
             sequence_fabric_mhz=300.0,
         ),
+        RampDurationSweep(
+            segment_name="ramp_1_to_2",
+            start=0.10,
+            stop=0.16,
+            count=4,
+            sequence_fabric_mhz=300.0,
+        ),
         AmplitudeSweep("gate", "awg_0", -0.5, 0.5, 3),
     )
 
     assert _sweep_parameter_names(axes) == (
         "all_awg_outputs_ramp_0_to_1_ramp_duration_us",
+        "all_awg_outputs_ramp_1_to_2_ramp_duration_us",
         "awg_0_gate_voltage_mv",
     )
 
