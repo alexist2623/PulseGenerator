@@ -968,6 +968,9 @@ def default_stability_settings(
         },
         "visible_data": list(DEFAULT_STABILITY_VISIBLE_DATA),
         "database_path": DEFAULT_STABILITY_DB_PATH,
+        "saved_plot_database_path": DEFAULT_STABILITY_DB_PATH,
+        "saved_plot_run_id": 0,
+        "saved_plot_data": "magnitude",
         "measurement_representation": "adc",
         "dc_measure_gain_v_per_a": 1.0,
         "dc_voltage_calibration_enabled": False,
@@ -1151,6 +1154,34 @@ def normalize_stability_settings(
     if not database_path:
         raise ValueError("stability database path must not be empty")
     normalized["database_path"] = database_path
+    saved_plot_database_path = str(
+        settings.get("saved_plot_database_path", database_path)
+    ).strip()
+    if not saved_plot_database_path:
+        raise ValueError(
+            "saved Stability Diagram database path must not be empty"
+        )
+    normalized["saved_plot_database_path"] = saved_plot_database_path
+    normalized["saved_plot_run_id"] = _integer(
+        settings.get(
+            "saved_plot_run_id",
+            defaults["saved_plot_run_id"],
+        ),
+        "saved Stability Diagram Run ID",
+        0,
+    )
+    saved_plot_data = str(
+        settings.get(
+            "saved_plot_data",
+            defaults["saved_plot_data"],
+        )
+    )
+    if saved_plot_data not in {"i", "q", "magnitude", "phase"}:
+        raise ValueError(
+            "saved Stability Diagram plot data must be "
+            "i, q, magnitude, or phase"
+        )
+    normalized["saved_plot_data"] = saved_plot_data
     representation = str(
         settings.get(
             "measurement_representation",
@@ -2580,7 +2611,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.addWidget(self.dc_calibration_group)
 
         database_group = QtWidgets.QGroupBox(
-            "Stability Diagram Database",
+            "Single Shot Save Database",
             controls_content,
         )
         database_form = QtWidgets.QFormLayout(database_group)
@@ -2598,14 +2629,43 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(self.browse_database)
         database_form.addRow("QCoDeS DB file:", database_row)
-        self.saved_run_combo = QtWidgets.QComboBox(database_group)
+        controls.addWidget(database_group)
+
+        saved_plot_group = QtWidgets.QGroupBox(
+            "Plot Saved Stability Diagram",
+            controls_content,
+        )
+        saved_plot_form = QtWidgets.QFormLayout(saved_plot_group)
+        self.saved_database_path = QtWidgets.QLineEdit(
+            DEFAULT_STABILITY_DB_PATH,
+            saved_plot_group,
+        )
+        self.saved_database_path.setPlaceholderText(
+            "QCoDeS DB containing saved Stability Diagram runs"
+        )
+        self.browse_saved_database = QtWidgets.QToolButton(saved_plot_group)
+        self.browse_saved_database.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_saved_database.setToolTip(
+            "Choose a database to inspect without changing the save DB"
+        )
+        self.browse_saved_database.clicked.connect(
+            self._browse_saved_database
+        )
+        saved_database_row = QtWidgets.QHBoxLayout()
+        saved_database_row.addWidget(self.saved_database_path, 1)
+        saved_database_row.addWidget(self.browse_saved_database)
+        saved_plot_form.addRow("Source DB:", saved_database_row)
+
+        self.saved_run_combo = QtWidgets.QComboBox(saved_plot_group)
         self.saved_run_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.saved_run_combo.setMinimumContentsLength(28)
         self.refresh_saved_runs_button = QtWidgets.QPushButton(
             "Refresh Runs",
-            database_group,
+            saved_plot_group,
         )
         self.refresh_saved_runs_button.clicked.connect(
             self.refresh_saved_runs
@@ -2613,10 +2673,26 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         saved_run_row = QtWidgets.QHBoxLayout()
         saved_run_row.addWidget(self.saved_run_combo, 1)
         saved_run_row.addWidget(self.refresh_saved_runs_button)
-        database_form.addRow("Saved diagram:", saved_run_row)
+        saved_plot_form.addRow("Run:", saved_run_row)
+        self.saved_plot_data = QtWidgets.QComboBox(saved_plot_group)
+        for label, key in (
+            ("I", "i"),
+            ("Q", "q"),
+            ("Magnitude", "magnitude"),
+            ("Angle", "phase"),
+        ):
+            self.saved_plot_data.addItem(label, key)
+        self.saved_plot_data.setCurrentIndex(
+            self.saved_plot_data.findData("magnitude")
+        )
+        self.saved_plot_data.setToolTip(
+            "Select the map shown after loading. Additional maps can be "
+            "enabled with the checkboxes above the Stability Diagram plot."
+        )
+        saved_plot_form.addRow("Plot data:", self.saved_plot_data)
         self.load_saved_run_button = QtWidgets.QPushButton(
             "Load Saved Diagram",
-            database_group,
+            saved_plot_group,
         )
         self.load_saved_run_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
@@ -2624,17 +2700,17 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.load_saved_run_button.clicked.connect(
             self._request_saved_run
         )
-        database_form.addRow(self.load_saved_run_button)
+        saved_plot_form.addRow(self.load_saved_run_button)
         self.saved_run_status = QtWidgets.QLabel(
             "Choose a DB and refresh its Stability Diagram runs.",
-            database_group,
+            saved_plot_group,
         )
         self.saved_run_status.setWordWrap(True)
         self.saved_run_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        database_form.addRow(self.saved_run_status)
-        controls.addWidget(database_group)
+        saved_plot_form.addRow(self.saved_run_status)
+        controls.addWidget(saved_plot_group)
 
         self.start_button = QtWidgets.QPushButton("Start", controls_content)
         self.start_button.setIcon(
@@ -2725,6 +2801,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._dc_input_available = False
         self._running = False
         self._saved_run_loading = False
+        self._preferred_saved_run_id = 0
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
@@ -2890,8 +2967,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             if selected.suffix.lower() != ".db":
                 selected = selected.with_suffix(".db")
             self.database_path.setText(str(selected))
-            if selected.is_file():
-                self.refresh_saved_runs()
+
+    def _browse_saved_database(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose saved Stability Diagram database",
+            self.saved_database_path.text().strip()
+            or self.database_path.text().strip()
+            or DEFAULT_STABILITY_DB_PATH,
+            "QCoDeS SQLite database (*.db);;All files (*)",
+        )
+        if path:
+            self.saved_database_path.setText(path)
+            self.refresh_saved_runs()
 
     def database_path_value(self) -> str:
         value = self.database_path.text().strip()
@@ -2902,10 +2990,24 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             path = path.with_suffix(".db")
         return str(path)
 
+    def saved_database_path_value(self) -> str:
+        value = self.saved_database_path.text().strip()
+        if not value:
+            raise ValueError(
+                "saved Stability Diagram database path must not be empty"
+            )
+        return str(Path(value).expanduser())
+
     def refresh_saved_runs(self) -> None:
-        previous_run_id = self.saved_run_combo.currentData()
+        previous_run_id = (
+            self.saved_run_combo.currentData()
+            if self.saved_run_combo.currentData() is not None
+            else self._preferred_saved_run_id
+        )
         try:
-            summaries = list_stability_runs(self.database_path_value())
+            summaries = list_stability_runs(
+                self.saved_database_path_value()
+            )
         except Exception as exc:
             self.saved_run_combo.clear()
             self.saved_run_status.setText(str(exc))
@@ -2920,6 +3022,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             previous_index = self.saved_run_combo.findData(previous_run_id)
             if previous_index >= 0:
                 self.saved_run_combo.setCurrentIndex(previous_index)
+        self._preferred_saved_run_id = int(
+            self.saved_run_combo.currentData() or 0
+        )
         if summaries:
             self.saved_run_status.setText(
                 f"Found {len(summaries)} saved Stability Diagram run(s)."
@@ -2936,8 +3041,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 "Refresh the DB and select a saved Stability Diagram first."
             )
             return
+        plot_data = str(self.saved_plot_data.currentData())
+        self.plot.load_visible_data((plot_data,))
+        self._preferred_saved_run_id = int(run_id)
         self.saved_run_requested.emit(
-            self.database_path_value(),
+            self.saved_database_path_value(),
             int(run_id),
         )
 
@@ -2951,9 +3059,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.start_button.setEnabled(idle_enabled)
         self.single_shot_button.setEnabled(idle_enabled)
         for widget in (
-            self.database_path,
-            self.browse_database,
+            self.saved_database_path,
+            self.browse_saved_database,
             self.saved_run_combo,
+            self.saved_plot_data,
             self.refresh_saved_runs_button,
             self.load_saved_run_button,
         ):
@@ -3063,6 +3172,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "color_ranges": self.plot.color_range_settings(),
             "visible_data": list(self.plot.visible_data()),
             "database_path": self.database_path_value(),
+            "saved_plot_database_path": (
+                self.saved_database_path_value()
+            ),
+            "saved_plot_run_id": int(
+                self.saved_run_combo.currentData()
+                or self._preferred_saved_run_id
+            ),
+            "saved_plot_data": str(self.saved_plot_data.currentData()),
             "measurement_representation": str(
                 self.measurement_unit.currentData()
             ),
@@ -3147,6 +3264,28 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.database_path.setText(
             str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
         )
+        self.saved_database_path.setText(
+            str(
+                settings.get(
+                    "saved_plot_database_path",
+                    settings.get(
+                        "database_path",
+                        DEFAULT_STABILITY_DB_PATH,
+                    ),
+                )
+            )
+        )
+        self._preferred_saved_run_id = int(
+            settings.get("saved_plot_run_id", 0)
+        )
+        saved_plot_data_index = self.saved_plot_data.findData(
+            str(settings.get("saved_plot_data", "magnitude"))
+        )
+        if saved_plot_data_index < 0:
+            raise ValueError(
+                "saved Stability Diagram plot data is invalid"
+            )
+        self.saved_plot_data.setCurrentIndex(saved_plot_data_index)
         representation = str(
             settings.get(
                 "measurement_representation",
@@ -3221,7 +3360,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         for widget in (
             self.database_path,
             self.browse_database,
+            self.saved_database_path,
+            self.browse_saved_database,
             self.saved_run_combo,
+            self.saved_plot_data,
             self.refresh_saved_runs_button,
             self.load_saved_run_button,
         ):

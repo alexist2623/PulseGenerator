@@ -178,6 +178,9 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     legacy.pop("bias_t_compensation")
     legacy.pop("color_ranges")
     legacy.pop("visible_data")
+    legacy.pop("saved_plot_database_path")
+    legacy.pop("saved_plot_run_id")
+    legacy.pop("saved_plot_data")
 
     normalized = stability.normalize_stability_settings(
         legacy,
@@ -218,6 +221,9 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
         },
     }
     assert normalized["visible_data"] == ["magnitude", "phase"]
+    assert normalized["saved_plot_database_path"] == normalized["database_path"]
+    assert normalized["saved_plot_run_id"] == 0
+    assert normalized["saved_plot_data"] == "magnitude"
 
     invalid = dict(normalized)
     invalid["color_ranges"] = {
@@ -709,7 +715,13 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     )
     panel.bias_t_duration_us.setValue(2.5)
     database_path = tmp_path / "stability_single_shot.db"
+    saved_plot_path = tmp_path / "saved_stability.db"
     panel.database_path.setText(str(database_path))
+    panel.saved_database_path.setText(str(saved_plot_path))
+    panel._preferred_saved_run_id = 29
+    panel.saved_plot_data.setCurrentIndex(
+        panel.saved_plot_data.findData("q")
+    )
     app.processEvents()
 
     config = panel.config(full_scale_mv=2500.0)
@@ -732,6 +744,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert "segment_name" not in panel.x_axis.settings_dict()
     assert not hasattr(panel, "rf_editor_tabs")
     assert panel.database_path_value() == str(database_path)
+    assert panel.saved_database_path_value() == str(saved_plot_path)
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
 
     saved = panel.settings_dict()
@@ -770,6 +783,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
         },
     }
     assert restored.plot.visible_data() == ("i", "q", "magnitude")
+    assert restored.saved_database_path.text() == str(saved_plot_path)
+    assert restored._preferred_saved_run_id == 29
+    assert restored.saved_plot_data.currentData() == "q"
 
     dc_changes = []
     calibration_changes = []
@@ -993,6 +1009,7 @@ def test_stability_overlay_selector_lists_run_and_emits_selection(tmp_path):
 def test_stability_panel_selects_and_requests_saved_diagram(tmp_path):
     app = _application()
     database_path = tmp_path / "stability.db"
+    save_database_path = tmp_path / "new_stability.db"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "CREATE TABLE runs ("
@@ -1005,25 +1022,33 @@ def test_stability_panel_selects_and_requests_saved_diagram(tmp_path):
         )
 
     panel = stability.StabilityDiagramPanel()
-    panel.database_path.setText(str(database_path))
+    panel.database_path.setText(str(save_database_path))
+    panel.saved_database_path.setText(str(database_path))
     requested = []
     panel.saved_run_requested.connect(
         lambda path, run_id: requested.append((path, run_id))
     )
     panel.refresh_saved_runs()
+    panel.saved_plot_data.setCurrentIndex(
+        panel.saved_plot_data.findData("phase")
+    )
     panel.load_saved_run_button.click()
     app.processEvents()
 
     assert panel.saved_run_combo.count() == 1
     assert panel.saved_run_combo.currentData() == 41
     assert requested == [(str(database_path), 41)]
+    assert panel.database_path_value() == str(save_database_path)
+    assert panel.plot.visible_data() == ("phase",)
 
     panel.set_saved_run_loading(True, run_id=41)
-    assert panel.database_path.isEnabled() is False
+    assert panel.database_path.isEnabled() is True
+    assert panel.saved_database_path.isEnabled() is False
     assert panel.refresh_saved_runs_button.isEnabled() is False
     assert panel.load_saved_run_button.isEnabled() is False
     panel.set_saved_run_loading(False)
     assert panel.database_path.isEnabled() is True
+    assert panel.saved_database_path.isEnabled() is True
     assert panel.refresh_saved_runs_button.isEnabled() is True
     assert panel.load_saved_run_button.isEnabled() is True
     panel.close()
