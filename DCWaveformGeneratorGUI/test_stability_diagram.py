@@ -6,7 +6,9 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+import sqlite3
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,7 +17,13 @@ import numpy as np
 from PyQt5 import QtWidgets
 import pytest
 
-from qick_qcodes_experiment import QcodesRunConfig, QickConnectionConfig
+from qick_fine_tune_sweep import AmplitudeSweep, FineTuneDdrResult
+from qick_qcodes_experiment import (
+    QCODES_STAGING_ENV,
+    QcodesRunConfig,
+    QickConnectionConfig,
+    store_qick_result,
+)
 import stability_diagram as stability
 
 
@@ -821,3 +829,290 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.bias_t_group.isEnabled() is True
     panel.close()
     restored.close()
+
+
+def _stored_stability_metadata():
+    return {
+        "created_at_utc": "2026-07-27T12:34:56+00:00",
+        "gui_settings": {
+            "qick": {
+                "full_scale_mv": 800.0,
+                "fir_rate_profile": "50_ksps",
+                "fir_stability_capture_mode": (
+                    "immediate_continuous_fir_output"
+                ),
+            },
+            "stability_diagram": {
+                "x_axis": {"output_name": "awg_0"},
+                "y_axis": {"output_name": "awg_1"},
+            },
+        },
+        "measurement_layout": {
+            "iq_shape": [4, 2, 3, 2],
+            "iq_unit": "ADC units",
+            "measurement_mode": "raw_iq",
+            "sample_rate_hz": 50_000.0,
+            "sample_period_us": 20.0,
+            "sweep_axes": [
+                {
+                    "parameter": "awg_0_set_0_voltage_mv",
+                    "output_name": "awg_0",
+                    "segment_name": stability.STABILITY_HOLD_SEGMENT,
+                    "axis_kind": "amplitude",
+                    "unit": "mV",
+                    "count": 2,
+                },
+                {
+                    "parameter": "awg_1_set_0_voltage_mv",
+                    "output_name": "awg_1",
+                    "segment_name": stability.STABILITY_HOLD_SEGMENT,
+                    "axis_kind": "amplitude",
+                    "unit": "mV",
+                    "count": 2,
+                },
+            ],
+        },
+    }
+
+
+def test_saved_stability_run_listing_filters_other_qick_runs(tmp_path):
+    database_path = tmp_path / "stability.db"
+    metadata = _stored_stability_metadata()
+    non_stability = json.loads(json.dumps(metadata))
+    non_stability["gui_settings"]["qick"].pop("fir_stability_capture_mode")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, "
+            "qick_experiment_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (10, json.dumps(non_stability)),
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (11, json.dumps(metadata)),
+        )
+
+    summaries = stability.list_stability_runs(database_path)
+
+    assert len(summaries) == 1
+    assert summaries[0].run_id == 11
+    assert summaries[0].x_axis_label == "awg_0"
+    assert summaries[0].y_axis_label == "awg_1"
+    assert summaries[0].sample_rate_hz == 50_000.0
+    assert "Run 11" in summaries[0].display_label
+    assert "50 kSPS" in summaries[0].display_label
+
+
+def test_saved_stability_iq_arrays_restore_cartesian_grid(tmp_path):
+    metadata = _stored_stability_metadata()
+    iq = np.empty((4, 2, 3, 2), dtype=np.int32)
+    for point_index in range(4):
+        iq[point_index, :, :, 0] = point_index + 1
+        iq[point_index, :, :, 1] = -(point_index + 1)
+    arrays = {
+        "metadata": metadata,
+        "iq": iq,
+        "iq_unit": "ADC units",
+        "measurement_mode": "raw_iq",
+        "sweep_coordinates": {
+            "awg_0_set_0_voltage_mv": np.asarray(
+                [
+                    [-100.0, -100.0],
+                    [-100.0, -100.0],
+                    [100.0, 100.0],
+                    [100.0, 100.0],
+                ]
+            ),
+            "awg_1_set_0_voltage_mv": np.asarray(
+                [
+                    [-50.0, -50.0],
+                    [50.0, 50.0],
+                    [-50.0, -50.0],
+                    [50.0, 50.0],
+                ]
+            ),
+        },
+    }
+
+    result = stability.stability_result_from_stored_arrays(
+        arrays,
+        database_path=tmp_path / "stability.db",
+        run_id=23,
+    )
+
+    np.testing.assert_allclose(result.x_voltage_mv, [-100.0, 100.0])
+    np.testing.assert_allclose(result.y_voltage_mv, [-50.0, 50.0])
+    np.testing.assert_allclose(result.i_mean, [[1.0, 3.0], [2.0, 4.0]])
+    np.testing.assert_allclose(result.q_mean, [[-1.0, -3.0], [-2.0, -4.0]])
+    assert result.repetition_count == 2
+    assert result.samples_per_trace == 3
+    assert result.sample_rate_hz == 50_000.0
+    assert result.fir_rate_profile == "50_ksps"
+    assert result.source_label == "QCoDeS Run 23"
+    assert result.run_id == 23
+
+
+def test_stability_overlay_selector_lists_run_and_emits_selection(tmp_path):
+    app = _application()
+    database_path = tmp_path / "stability.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, "
+            "qick_experiment_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (31, json.dumps(_stored_stability_metadata())),
+        )
+
+    selector = stability.StabilityOverlaySelector()
+    selector.database_path.setText(str(database_path))
+    selector.refresh_runs()
+    emitted = []
+    selector.load_requested.connect(
+        lambda path, run_id, quantity: emitted.append(
+            (path, run_id, quantity)
+        )
+    )
+    selector.quantity_combo.setCurrentIndex(
+        selector.quantity_combo.findData("phase")
+    )
+    selector.load_button.click()
+    app.processEvents()
+
+    assert selector.run_combo.count() == 1
+    assert selector.run_combo.currentData() == 31
+    assert emitted == [(str(database_path), 31, "phase")]
+    selector.close()
+
+
+def test_stability_panel_selects_and_requests_saved_diagram(tmp_path):
+    app = _application()
+    database_path = tmp_path / "stability.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, "
+            "qick_experiment_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (41, json.dumps(_stored_stability_metadata())),
+        )
+
+    panel = stability.StabilityDiagramPanel()
+    panel.database_path.setText(str(database_path))
+    requested = []
+    panel.saved_run_requested.connect(
+        lambda path, run_id: requested.append((path, run_id))
+    )
+    panel.refresh_saved_runs()
+    panel.load_saved_run_button.click()
+    app.processEvents()
+
+    assert panel.saved_run_combo.count() == 1
+    assert panel.saved_run_combo.currentData() == 41
+    assert requested == [(str(database_path), 41)]
+
+    panel.set_saved_run_loading(True, run_id=41)
+    assert panel.database_path.isEnabled() is False
+    assert panel.refresh_saved_runs_button.isEnabled() is False
+    assert panel.load_saved_run_button.isEnabled() is False
+    panel.set_saved_run_loading(False)
+    assert panel.database_path.isEnabled() is True
+    assert panel.refresh_saved_runs_button.isEnabled() is True
+    assert panel.load_saved_run_button.isEnabled() is True
+    panel.close()
+
+
+def test_saved_stability_run_loads_from_real_qcodes_database(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "stability_qcodes.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    axes = (
+        AmplitudeSweep(
+            stability.STABILITY_HOLD_SEGMENT,
+            "awg_0",
+            -0.5,
+            0.5,
+            2,
+        ),
+        AmplitudeSweep(
+            stability.STABILITY_HOLD_SEGMENT,
+            "awg_1",
+            -0.25,
+            0.25,
+            2,
+        ),
+    )
+    iq = np.empty((4, 1, 2, 2), dtype=np.int32)
+    for point_index in range(4):
+        iq[point_index, :, :, 0] = 10 + point_index
+        iq[point_index, :, :, 1] = -20 - point_index
+    ddr_result = FineTuneDdrResult(
+        sweep_points=np.asarray(
+            [
+                [-0.5, -0.25],
+                [-0.5, 0.25],
+                [0.5, -0.25],
+                [0.5, 0.25],
+            ]
+        ),
+        iq=iq,
+        sweep_axes=axes,
+        sweep_shape=(2, 2),
+        cross_capacitance=np.eye(2),
+    )
+    gui_settings = {
+        "qick": {
+            "fabric_mhz": 300.0,
+            "tproc_mhz": 300.0,
+            "full_scale_mv": 800.0,
+            "fir_rate_profile": "50_ksps",
+            "fir_stability_capture_mode": (
+                "immediate_continuous_fir_output"
+            ),
+        },
+        "stability_diagram": {
+            "x_axis": {"output_name": "awg_0"},
+            "y_axis": {"output_name": "awg_1"},
+        },
+        "awg": {"cross_capacitance": np.eye(2).tolist()},
+    }
+    dataset, _row_count = store_qick_result(
+        ddr_result,
+        run_config=QcodesRunConfig(
+            database_path=str(database_path),
+            experiment_name="Stability loader test",
+            sample_name="simulated device",
+            sample_rate_hz=50_000.0,
+        ),
+        connection_config=QickConnectionConfig(
+            "192.0.2.10",
+            8888,
+            "myqick",
+        ),
+        program_summary={},
+        gui_settings=gui_settings,
+        rf_settings={},
+    )
+
+    summaries = stability.list_stability_runs(database_path)
+    result = stability.load_stability_diagram_run(
+        database_path,
+        dataset.run_id,
+    )
+
+    assert [summary.run_id for summary in summaries] == [dataset.run_id]
+    np.testing.assert_allclose(result.x_voltage_mv, [-400.0, 400.0])
+    np.testing.assert_allclose(result.y_voltage_mv, [-200.0, 200.0])
+    np.testing.assert_allclose(result.i_mean, [[10.0, 12.0], [11.0, 13.0]])
+    np.testing.assert_allclose(result.q_mean, [[-20.0, -22.0], [-21.0, -23.0]])
+    assert result.source_label == f"QCoDeS Run {dataset.run_id}"
+    assert result.sample_rate_hz == 50_000.0

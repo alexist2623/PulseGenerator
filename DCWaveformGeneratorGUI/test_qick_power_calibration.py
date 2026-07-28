@@ -437,6 +437,19 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
     frequencies = np.asarray([400.0, 410.0, 420.0])
     catalog = CalibrationDatabase(database_path)
     output_calibration = catalog.output_calibration("RF_Out", frequencies)
+    strict_output_calibration = catalog.output_calibration(
+        "RF_Out",
+        frequencies,
+        run_id=output_stored.run_id,
+        nqz=1,
+        output_filter_type="bypass",
+        output_filter_cutoff_ghz=2.5,
+        output_filter_bandwidth_ghz=1.0,
+    )
+    assert strict_output_calibration.summary.output_nqz == 1
+    assert strict_output_calibration.summary.output_filter_type == "bypass"
+    assert strict_output_calibration.summary.output_filter_cutoff_ghz == 2.5
+    assert strict_output_calibration.summary.output_filter_bandwidth_ghz == 1.0
     np.testing.assert_allclose(
         output_calibration.output_power_dbm(frequencies, MAX_QICK_GAIN),
         [-10.0, -10.2, -10.4],

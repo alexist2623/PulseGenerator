@@ -10,8 +10,13 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from dataclasses import dataclass, replace
+import json
+from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
+import traceback
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
@@ -22,20 +27,27 @@ except ImportError:
     pg = None
 
 try:
+    from .dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
+    from .fir_ddr_profile import format_sample_rate_hz
     from .measurement_display import (
         ColorRangeControl,
         attach_color_bar,
         scale_iq_for_display,
     )
+    from .qick_qcodes_experiment import load_qick_iq_arrays
 except ImportError:
+    from dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
+    from fir_ddr_profile import format_sample_rate_hz
     from measurement_display import (
         ColorRangeControl,
         attach_color_bar,
         scale_iq_for_display,
     )
+    from qick_qcodes_experiment import load_qick_iq_arrays
 
 
 SweepAxisKey = Tuple[str, str]
+DEFAULT_AWG_SWEEP_DB_PATH = str(Path.home() / "qick_experiments.db")
 DEFAULT_AWG_SWEEP_COLOR_RANGES = {
     "i": {"auto": True, "minimum": -1.0, "maximum": 1.0},
     "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},
@@ -152,6 +164,9 @@ class AwgSweepMapResult:
     averaged_axis_labels: Tuple[str, ...]
     source_points_per_cell: int
     sample_rate_hz: float
+    source_label: str = ""
+    database_path: str = ""
+    run_id: int = 0
 
     @property
     def x_values_mv(self) -> np.ndarray:
@@ -162,6 +177,539 @@ class AwgSweepMapResult:
     def y_values_mv(self) -> np.ndarray:
         """Backward-compatible alias for pre-duration-sweep callers."""
         return self.y_values
+
+
+@dataclass(frozen=True)
+class AwgSweepRunSummary:
+    """Metadata-only description of one saved AWG Cartesian sweep."""
+
+    database_path: str
+    run_id: int
+    created_at_utc: str
+    x_axis_label: str
+    y_axis_label: str
+    x_points: int
+    y_points: int
+    sweep_axis_count: int
+    iq_unit: str
+    sample_rate_hz: float
+
+    @property
+    def display_label(self) -> str:
+        timestamp = self.created_at_utc.replace("T", " ")[:19]
+        timestamp_text = f" | {timestamp}" if timestamp else ""
+        averaged_count = max(0, self.sweep_axis_count - 2)
+        averaged_text = (
+            f" | +{averaged_count} averaged axis/axes"
+            if averaged_count
+            else ""
+        )
+        return (
+            f"Run {self.run_id}{timestamp_text} | "
+            f"{self.x_axis_label} x {self.y_axis_label} | "
+            f"{self.x_points} x {self.y_points}{averaged_text} | "
+            f"{format_sample_rate_hz(self.sample_rate_hz)} | {self.iq_unit}"
+        )
+
+
+def _stored_sweep_axes(
+    metadata: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], ...]:
+    layout = metadata.get("measurement_layout", {})
+    if not isinstance(layout, Mapping):
+        raise ValueError("stored QICK measurement layout is missing")
+    raw_axes = layout.get("sweep_axes", ())
+    if not isinstance(raw_axes, Sequence) or isinstance(raw_axes, (str, bytes)):
+        raise ValueError("stored QICK sweep-axis metadata is invalid")
+    axes = tuple(axis for axis in raw_axes if isinstance(axis, Mapping))
+    if len(axes) < 2:
+        raise ValueError("a saved AWG 2D map requires at least two sweep axes")
+    return axes
+
+
+def _stored_axis_key(axis: Mapping[str, Any]) -> SweepAxisKey:
+    return str(axis.get("output_name", "")), str(axis.get("segment_name", ""))
+
+
+def _stored_axis_label(axis: Mapping[str, Any]) -> str:
+    output_name, segment_name = _stored_axis_key(axis)
+    axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind == "rf_duration":
+        return f"{output_name} / {segment_name} RF duration"
+    if axis_kind == "ramp_duration":
+        return f"{segment_name} RAMP duration (rate derived)"
+    return f"{output_name} / {segment_name}"
+
+
+def _stored_selected_axes(
+    metadata: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Resolve the X/Y axes selected when the QCoDeS run was saved."""
+    axes = _stored_sweep_axes(metadata)
+    by_key = {_stored_axis_key(axis): axis for axis in axes}
+    gui_settings = metadata.get("gui_settings", {})
+    experiment_settings = (
+        gui_settings.get("experiment", {})
+        if isinstance(gui_settings, Mapping)
+        else {}
+    )
+    sweep_map_settings = (
+        experiment_settings.get("sweep_map", {})
+        if isinstance(experiment_settings, Mapping)
+        else {}
+    )
+    if not isinstance(sweep_map_settings, Mapping):
+        sweep_map_settings = {}
+
+    requested = []
+    for name in ("x_axis", "y_axis"):
+        axis_settings = sweep_map_settings.get(name, {})
+        if not isinstance(axis_settings, Mapping):
+            requested.append(("", ""))
+            continue
+        requested.append(
+            (
+                str(axis_settings.get("output_name", "")),
+                str(axis_settings.get("segment_name", "")),
+            )
+        )
+    if (
+        len(requested) == 2
+        and requested[0] != requested[1]
+        and all(key in by_key for key in requested)
+    ):
+        return by_key[requested[0]], by_key[requested[1]]
+    return axes[0], axes[1]
+
+
+def _is_awg_sweep_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Return true for regular AWG experiments with a plottable 2D sweep."""
+    try:
+        _stored_sweep_axes(metadata)
+    except (TypeError, ValueError):
+        return False
+    gui_settings = metadata.get("gui_settings", {})
+    qick_settings = (
+        gui_settings.get("qick", {})
+        if isinstance(gui_settings, Mapping)
+        else {}
+    )
+    return not (
+        isinstance(qick_settings, Mapping)
+        and qick_settings.get("fir_stability_capture_mode")
+        == "immediate_continuous_fir_output"
+    )
+
+
+def list_awg_sweep_runs(
+    database_path: Any,
+) -> Tuple[AwgSweepRunSummary, ...]:
+    """List compatible saved AWG sweep runs without loading trace arrays."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"QCoDeS database does not exist: {path}")
+
+    connection = sqlite3.connect(str(path), timeout=30.0)
+    try:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(runs)")
+        }
+        if "qick_experiment_json" not in columns:
+            return ()
+        rows = connection.execute(
+            "SELECT run_id, qick_experiment_json FROM runs "
+            "WHERE qick_experiment_json IS NOT NULL "
+            "AND qick_experiment_json != '' "
+            "ORDER BY run_id DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    summaries = []
+    for run_id, payload_text in rows:
+        try:
+            metadata = json.loads(payload_text)
+            if not isinstance(metadata, Mapping) or not _is_awg_sweep_metadata(
+                metadata
+            ):
+                continue
+            axes = _stored_sweep_axes(metadata)
+            x_axis, y_axis = _stored_selected_axes(metadata)
+            layout = metadata.get("measurement_layout", {})
+            sample_rate_hz = float(
+                layout.get(
+                    "sample_rate_hz",
+                    1.0e6 / float(layout.get("sample_period_us", 1.0)),
+                )
+            )
+            summaries.append(
+                AwgSweepRunSummary(
+                    database_path=str(path),
+                    run_id=int(run_id),
+                    created_at_utc=str(metadata.get("created_at_utc", "")),
+                    x_axis_label=_stored_axis_label(x_axis),
+                    y_axis_label=_stored_axis_label(y_axis),
+                    x_points=int(x_axis.get("count", 0)),
+                    y_points=int(y_axis.get("count", 0)),
+                    sweep_axis_count=len(axes),
+                    iq_unit=str(layout.get("iq_unit", "ADC units")),
+                    sample_rate_hz=sample_rate_hz,
+                )
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return tuple(summaries)
+
+
+def _stored_full_scale_mv(metadata: Mapping[str, Any]) -> float:
+    gui_settings = metadata.get("gui_settings", {})
+    qick_settings = (
+        gui_settings.get("qick", {})
+        if isinstance(gui_settings, Mapping)
+        else {}
+    )
+    full_scale_mv = float(
+        qick_settings.get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
+    )
+    if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
+        raise ValueError("stored AWG full scale must be positive and finite")
+    return full_scale_mv
+
+
+def _stored_axis_native_values(
+    values: Any,
+    axis: Mapping[str, Any],
+    *,
+    full_scale_mv: float,
+) -> np.ndarray:
+    """Convert QCoDeS display units back to the in-memory sweep convention."""
+    coordinates = np.asarray(values, dtype=np.float64)
+    unit = str(axis.get("unit", "")).strip().lower()
+    axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind in {"rf_duration", "ramp_duration"}:
+        duration_scales = {
+            "": 1.0,
+            "us": 1.0,
+            "µs": 1.0,
+            "ns": 1.0e-3,
+            "ms": 1.0e3,
+            "s": 1.0e6,
+        }
+        try:
+            return coordinates * duration_scales[unit]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported stored AWG duration unit {axis.get('unit')!r}"
+            ) from exc
+
+    if unit == "mv":
+        return coordinates / full_scale_mv
+    if unit == "v":
+        return coordinates * 1_000.0 / full_scale_mv
+    if unit in {"", "normalized", "fraction"}:
+        return coordinates
+    raise ValueError(
+        f"unsupported stored AWG voltage unit {axis.get('unit')!r}"
+    )
+
+
+def awg_sweep_result_from_stored_arrays(
+    arrays: Mapping[str, Any],
+    *,
+    database_path: Any,
+    run_id: int,
+) -> AwgSweepMapResult:
+    """Reconstruct an AWG I/Q map from one split-array QCoDeS run."""
+    metadata = arrays.get("metadata", {})
+    if not isinstance(metadata, Mapping) or not _is_awg_sweep_metadata(metadata):
+        raise ValueError(f"QCoDeS Run {run_id} is not an AWG 2D sweep run")
+    axes_metadata = _stored_sweep_axes(metadata)
+    selected_x, selected_y = _stored_selected_axes(metadata)
+    sweep_coordinates = arrays.get("sweep_coordinates", {})
+    if not isinstance(sweep_coordinates, Mapping):
+        raise ValueError("stored AWG sweep coordinates are missing")
+
+    iq = np.asarray(arrays["iq"])
+    if iq.ndim != 4 or iq.shape[-1] != 2:
+        raise ValueError(
+            "stored AWG sweep IQ must have "
+            "(point, repetition, sample, 2) shape"
+        )
+    full_scale_mv = _stored_full_scale_mv(metadata)
+    coordinate_columns = []
+    axis_objects = []
+    for axis in axes_metadata:
+        parameter_name = str(axis.get("parameter", ""))
+        if not parameter_name or parameter_name not in sweep_coordinates:
+            raise ValueError(
+                "stored AWG coordinate parameters do not match metadata"
+            )
+        per_repetition = np.asarray(
+            sweep_coordinates[parameter_name],
+            dtype=np.float64,
+        )
+        if per_repetition.shape != iq.shape[:2]:
+            raise ValueError(
+                "stored AWG coordinate shape does not match I/Q traces"
+            )
+        if not np.allclose(per_repetition, per_repetition[:, :1]):
+            raise ValueError(
+                "stored AWG sweep coordinates change between repetitions"
+            )
+        native_values = _stored_axis_native_values(
+            per_repetition[:, 0],
+            axis,
+            full_scale_mv=full_scale_mv,
+        )
+        coordinate_columns.append(native_values)
+        axis_objects.append(
+            SimpleNamespace(
+                output_name=str(axis.get("output_name", "")),
+                segment_name=str(axis.get("segment_name", "")),
+                axis_kind=str(axis.get("axis_kind", "amplitude")),
+                start=float(np.min(native_values)),
+                stop=float(np.max(native_values)),
+                count=int(axis.get("count", np.unique(native_values).size)),
+            )
+        )
+
+    layout = metadata.get("measurement_layout", {})
+    sample_rate_hz = float(
+        layout.get(
+            "sample_rate_hz",
+            1.0e6 / float(layout.get("sample_period_us", 1.0)),
+        )
+    )
+    ddr_result = SimpleNamespace(
+        sweep_axes=tuple(axis_objects),
+        sweep_points=np.column_stack(coordinate_columns),
+        iq=iq,
+        sample_rate_hz=sample_rate_hz,
+    )
+    result = reduce_awg_sweep_map(
+        ddr_result,
+        x_axis_key=_stored_axis_key(selected_x),
+        y_axis_key=_stored_axis_key(selected_y),
+        full_scale_mv=full_scale_mv,
+        iq_values=iq,
+        value_unit=str(arrays.get("iq_unit", "ADC units")),
+        measurement_mode=str(arrays.get("measurement_mode", "raw_iq")),
+    )
+    path = Path(database_path).expanduser().resolve()
+    return replace(
+        result,
+        source_label=f"QCoDeS Run {int(run_id)}",
+        database_path=str(path),
+        run_id=int(run_id),
+    )
+
+
+def load_awg_sweep_run(
+    database_path: Any,
+    run_id: int,
+) -> AwgSweepMapResult:
+    """Load and reduce one saved AWG 2D sweep QCoDeS run."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"QCoDeS database does not exist: {path}")
+    if isinstance(run_id, bool):
+        raise TypeError("AWG sweep Run ID must be an integer")
+    run_id = int(run_id)
+    if run_id < 1:
+        raise ValueError("AWG sweep Run ID must be at least 1")
+    try:
+        from qcodes import initialise_or_create_database_at, load_by_id
+    except ImportError as exc:
+        raise RuntimeError(
+            "QCoDeS==0.58.0 is required to load AWG sweep runs"
+        ) from exc
+    initialise_or_create_database_at(str(path))
+    dataset = load_by_id(run_id)
+    arrays = load_qick_iq_arrays(dataset)
+    return awg_sweep_result_from_stored_arrays(
+        arrays,
+        database_path=path,
+        run_id=run_id,
+    )
+
+
+class AwgSweepMapLoadWorker(QtCore.QObject):
+    """Load one saved AWG sweep without blocking the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, database_path: str, run_id: int, parent=None):
+        super().__init__(parent)
+        self._database_path = str(database_path)
+        self._run_id = int(run_id)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_awg_sweep_run(
+                self._database_path,
+                self._run_id,
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
+class AwgSweepRunSelector(QtWidgets.QGroupBox):
+    """Select the database and saved run displayed in the AWG map dock."""
+
+    load_requested = QtCore.pyqtSignal(str, int)
+    latest_requested = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        default_database_path: str = DEFAULT_AWG_SWEEP_DB_PATH,
+    ):
+        super().__init__("Saved AWG Sweep", parent)
+        self._summaries: Tuple[AwgSweepRunSummary, ...] = ()
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(4)
+
+        database_row = QtWidgets.QHBoxLayout()
+        database_row.addWidget(QtWidgets.QLabel("QCoDeS DB:", self))
+        self.database_path = QtWidgets.QLineEdit(
+            str(default_database_path),
+            self,
+        )
+        self.database_path.setPlaceholderText(
+            "Select a QCoDeS database containing AWG sweep runs"
+        )
+        database_row.addWidget(self.database_path, 1)
+        self.browse_button = QtWidgets.QToolButton(self)
+        self.browse_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_button.setToolTip("Choose an AWG sweep QCoDeS database")
+        self.browse_button.clicked.connect(self._browse_database)
+        database_row.addWidget(self.browse_button)
+        self.refresh_button = QtWidgets.QPushButton("Refresh Runs", self)
+        self.refresh_button.clicked.connect(self.refresh_runs)
+        database_row.addWidget(self.refresh_button)
+        outer.addLayout(database_row)
+
+        selection_row = QtWidgets.QHBoxLayout()
+        selection_row.addWidget(QtWidgets.QLabel("Run:", self))
+        self.run_combo = QtWidgets.QComboBox(self)
+        self.run_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.run_combo.setMinimumContentsLength(38)
+        selection_row.addWidget(self.run_combo, 1)
+        self.load_button = QtWidgets.QPushButton("Load Saved Map", self)
+        self.load_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.load_button.clicked.connect(self._emit_load_requested)
+        selection_row.addWidget(self.load_button)
+        self.latest_button = QtWidgets.QPushButton(
+            "Use Latest Experiment",
+            self,
+        )
+        self.latest_button.clicked.connect(self.latest_requested.emit)
+        selection_row.addWidget(self.latest_button)
+        outer.addLayout(selection_row)
+
+        self.status = QtWidgets.QLabel(
+            "The map follows the latest in-memory AWG experiment.",
+            self,
+        )
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        outer.addWidget(self.status)
+
+    def _browse_database(self) -> None:
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select AWG sweep QCoDeS database",
+            self.database_path.text().strip(),
+            "SQLite databases (*.db *.sqlite *.sqlite3);;All files (*)",
+        )
+        if not selected:
+            return
+        self.database_path.setText(selected)
+        self.refresh_runs()
+
+    def refresh_runs(self) -> None:
+        previous_run_id = self.run_combo.currentData()
+        try:
+            summaries = list_awg_sweep_runs(
+                self.database_path.text().strip()
+            )
+        except Exception as exc:
+            self._summaries = ()
+            self.run_combo.clear()
+            self.status.setText(str(exc))
+            return
+        self._summaries = summaries
+        self.run_combo.clear()
+        for summary in summaries:
+            self.run_combo.addItem(summary.display_label, summary.run_id)
+        if previous_run_id is not None:
+            previous_index = self.run_combo.findData(previous_run_id)
+            if previous_index >= 0:
+                self.run_combo.setCurrentIndex(previous_index)
+        if summaries:
+            self.status.setText(
+                f"Found {len(summaries)} compatible AWG sweep run(s)."
+            )
+        else:
+            self.status.setText(
+                "This database contains no compatible AWG 2D sweep runs."
+            )
+
+    def _emit_load_requested(self) -> None:
+        run_id = self.run_combo.currentData()
+        if run_id is None:
+            self.status.setText("Refresh the DB and select a saved run first.")
+            return
+        self.load_requested.emit(
+            self.database_path.text().strip(),
+            int(run_id),
+        )
+
+    def set_loading(self, loading: bool, *, run_id: int = 0) -> None:
+        for widget in (
+            self.database_path,
+            self.browse_button,
+            self.refresh_button,
+            self.run_combo,
+            self.load_button,
+            self.latest_button,
+        ):
+            widget.setEnabled(not loading)
+        if loading:
+            self.status.setText(f"Loading QCoDeS Run {run_id}...")
+
+    def show_loaded_result(self, result: AwgSweepMapResult) -> None:
+        self.set_loading(False)
+        self.status.setText(
+            f"Displaying {result.source_label or 'saved AWG sweep'} from "
+            f"{result.database_path}."
+        )
+
+    def show_latest_result(
+        self,
+        result: Optional[AwgSweepMapResult],
+    ) -> None:
+        self.set_loading(False)
+        if result is None:
+            self.status.setText(
+                "Following latest experiment; no AWG 2D map is available yet."
+            )
+        else:
+            source = result.source_label or "latest in-memory experiment"
+            self.status.setText(f"Displaying {source}.")
 
 
 def reduce_awg_sweep_map(
@@ -664,12 +1212,19 @@ else:
 
 
 __all__ = [
+    "AwgSweepMapLoadWorker",
     "AwgSweepMapPlotWidget",
     "AwgSweepMapResult",
+    "AwgSweepRunSelector",
+    "AwgSweepRunSummary",
     "AWG_SWEEP_DATA_KEYS",
+    "DEFAULT_AWG_SWEEP_DB_PATH",
     "DEFAULT_AWG_SWEEP_COLOR_RANGES",
     "DEFAULT_AWG_SWEEP_VISIBLE_DATA",
     "SweepAxisKey",
+    "awg_sweep_result_from_stored_arrays",
+    "list_awg_sweep_runs",
+    "load_awg_sweep_run",
     "normalize_awg_sweep_color_ranges",
     "normalize_awg_sweep_visible_data",
     "reduce_awg_sweep_map",

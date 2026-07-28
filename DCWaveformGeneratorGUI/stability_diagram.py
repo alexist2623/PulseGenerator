@@ -10,7 +10,9 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
+import sqlite3
 from threading import Event
 import traceback
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -45,6 +47,7 @@ try:
         build_awg_vertex_metadata,
         connect_qick,
         execute_qick_sequence,
+        load_qick_iq_arrays,
         store_qick_result,
     )
     from .sparameter_gui import RfPathCorrectionWidget
@@ -70,6 +73,7 @@ except ImportError:
         build_awg_vertex_metadata,
         connect_qick,
         execute_qick_sequence,
+        load_qick_iq_arrays,
         store_qick_result,
     )
     from sparameter_gui import RfPathCorrectionWidget
@@ -374,6 +378,9 @@ class StabilityDiagramResult:
     samples_per_trace: int
     sample_rate_hz: float = 1_000_000.0
     fir_rate_profile: str = "1_msps"
+    source_label: str = ""
+    database_path: str = ""
+    run_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -390,6 +397,531 @@ class StoredStabilityDiagram:
     @property
     def database_path(self):
         return self.experiment.database_path
+
+
+@dataclass(frozen=True)
+class StabilityRunSummary:
+    """Small metadata-only description used by the Trace Plot run selector."""
+
+    database_path: str
+    run_id: int
+    created_at_utc: str
+    x_axis_label: str
+    y_axis_label: str
+    x_points: int
+    y_points: int
+    iq_unit: str
+    sample_rate_hz: float
+
+    @property
+    def display_label(self) -> str:
+        timestamp = self.created_at_utc.replace("T", " ")[:19]
+        timestamp_text = f" | {timestamp}" if timestamp else ""
+        return (
+            f"Run {self.run_id}{timestamp_text} | "
+            f"{self.x_axis_label} x {self.y_axis_label} | "
+            f"{self.x_points} x {self.y_points} | "
+            f"{format_sample_rate_hz(self.sample_rate_hz)} | {self.iq_unit}"
+        )
+
+
+def _stability_axis_metadata(
+    metadata: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Return the stored X/Y axis metadata in the original GUI order."""
+    layout = metadata.get("measurement_layout", {})
+    if not isinstance(layout, Mapping):
+        raise ValueError("stored QICK measurement layout is missing")
+    raw_axes = layout.get("sweep_axes", ())
+    if not isinstance(raw_axes, Sequence) or isinstance(raw_axes, (str, bytes)):
+        raise ValueError("stored QICK sweep-axis metadata is invalid")
+    axes = tuple(axis for axis in raw_axes if isinstance(axis, Mapping))
+    if len(axes) != 2:
+        raise ValueError(
+            "a Stability Diagram overlay requires exactly two stored sweep axes"
+        )
+
+    gui_settings = metadata.get("gui_settings", {})
+    stability_settings = (
+        gui_settings.get("stability_diagram", {})
+        if isinstance(gui_settings, Mapping)
+        else {}
+    )
+    requested_names = []
+    if isinstance(stability_settings, Mapping):
+        for key in ("x_axis", "y_axis"):
+            axis_settings = stability_settings.get(key, {})
+            requested_names.append(
+                str(axis_settings.get("output_name", ""))
+                if isinstance(axis_settings, Mapping)
+                else ""
+            )
+    if len(requested_names) == 2 and all(requested_names):
+        by_output = {
+            str(axis.get("output_name", "")): axis
+            for axis in axes
+        }
+        if (
+            requested_names[0] in by_output
+            and requested_names[1] in by_output
+            and requested_names[0] != requested_names[1]
+        ):
+            return by_output[requested_names[0]], by_output[requested_names[1]]
+    return axes[0], axes[1]
+
+
+def _is_stability_metadata(metadata: Mapping[str, Any]) -> bool:
+    gui_settings = metadata.get("gui_settings", {})
+    if not isinstance(gui_settings, Mapping):
+        return False
+    qick_settings = gui_settings.get("qick", {})
+    return (
+        isinstance(qick_settings, Mapping)
+        and qick_settings.get("fir_stability_capture_mode")
+        == "immediate_continuous_fir_output"
+    )
+
+
+def list_stability_runs(database_path: Any) -> Tuple[StabilityRunSummary, ...]:
+    """List saved Stability Diagram runs without loading their I/Q arrays."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"QCoDeS database does not exist: {path}")
+
+    connection = sqlite3.connect(str(path), timeout=30.0)
+    try:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(runs)")
+        }
+        if "qick_experiment_json" not in columns:
+            return ()
+        rows = connection.execute(
+            "SELECT run_id, qick_experiment_json FROM runs "
+            "WHERE qick_experiment_json IS NOT NULL "
+            "AND qick_experiment_json != '' "
+            "ORDER BY run_id DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    summaries = []
+    for run_id, payload_text in rows:
+        try:
+            metadata = json.loads(payload_text)
+            if not isinstance(metadata, Mapping) or not _is_stability_metadata(
+                metadata
+            ):
+                continue
+            x_axis, y_axis = _stability_axis_metadata(metadata)
+            layout = metadata.get("measurement_layout", {})
+            sample_rate_hz = float(
+                layout.get(
+                    "sample_rate_hz",
+                    1.0e6 / float(layout.get("sample_period_us", 1.0)),
+                )
+            )
+            summaries.append(
+                StabilityRunSummary(
+                    database_path=str(path),
+                    run_id=int(run_id),
+                    created_at_utc=str(metadata.get("created_at_utc", "")),
+                    x_axis_label=str(x_axis.get("output_name", "X")),
+                    y_axis_label=str(y_axis.get("output_name", "Y")),
+                    x_points=int(x_axis.get("count", 0)),
+                    y_points=int(y_axis.get("count", 0)),
+                    iq_unit=str(layout.get("iq_unit", "ADC units")),
+                    sample_rate_hz=sample_rate_hz,
+                )
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return tuple(summaries)
+
+
+def _stored_coordinate_mv(
+    values: Any,
+    axis: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> np.ndarray:
+    coordinates = np.asarray(values, dtype=np.float64)
+    unit = str(axis.get("unit", "")).strip().lower()
+    if unit == "mv":
+        return coordinates
+    if unit == "v":
+        return coordinates * 1_000.0
+    if unit in {"", "normalized", "fraction"}:
+        gui_settings = metadata.get("gui_settings", {})
+        qick_settings = (
+            gui_settings.get("qick", {})
+            if isinstance(gui_settings, Mapping)
+            else {}
+        )
+        full_scale_mv = float(
+            qick_settings.get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
+        )
+        return coordinates * full_scale_mv
+    raise ValueError(
+        f"unsupported stored Stability Diagram voltage unit {axis.get('unit')!r}"
+    )
+
+
+def stability_result_from_stored_arrays(
+    arrays: Mapping[str, Any],
+    *,
+    database_path: Any,
+    run_id: int,
+) -> StabilityDiagramResult:
+    """Reduce a saved split-array QCoDeS run into a Stability Diagram grid."""
+    metadata = arrays.get("metadata", {})
+    if not isinstance(metadata, Mapping) or not _is_stability_metadata(metadata):
+        raise ValueError(f"QCoDeS Run {run_id} is not a Stability Diagram run")
+    x_axis, y_axis = _stability_axis_metadata(metadata)
+    sweep_coordinates = arrays.get("sweep_coordinates", {})
+    if not isinstance(sweep_coordinates, Mapping):
+        raise ValueError("stored Stability Diagram sweep coordinates are missing")
+
+    x_parameter = str(x_axis["parameter"])
+    y_parameter = str(y_axis["parameter"])
+    try:
+        x_per_repetition = np.asarray(
+            sweep_coordinates[x_parameter],
+            dtype=np.float64,
+        )
+        y_per_repetition = np.asarray(
+            sweep_coordinates[y_parameter],
+            dtype=np.float64,
+        )
+    except KeyError as exc:
+        raise ValueError(
+            "stored Stability Diagram coordinate parameters do not match metadata"
+        ) from exc
+    if (
+        x_per_repetition.ndim != 2
+        or y_per_repetition.shape != x_per_repetition.shape
+    ):
+        raise ValueError(
+            "stored Stability Diagram coordinates must have "
+            "(point, repetition) shape"
+        )
+    if not (
+        np.allclose(x_per_repetition, x_per_repetition[:, :1])
+        and np.allclose(y_per_repetition, y_per_repetition[:, :1])
+    ):
+        raise ValueError(
+            "stored Stability Diagram coordinates change between repetitions"
+        )
+
+    x_point_mv = _stored_coordinate_mv(
+        x_per_repetition[:, 0],
+        x_axis,
+        metadata,
+    )
+    y_point_mv = _stored_coordinate_mv(
+        y_per_repetition[:, 0],
+        y_axis,
+        metadata,
+    )
+    iq = np.asarray(arrays["iq"])
+    if iq.ndim != 4 or iq.shape[-1] != 2:
+        raise ValueError(
+            "stored Stability Diagram IQ must have "
+            "(point, repetition, sample, 2) shape"
+        )
+    if iq.shape[:2] != x_per_repetition.shape:
+        raise ValueError(
+            "stored Stability Diagram IQ and sweep-coordinate shapes differ"
+        )
+    point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
+    x_voltage_mv = np.unique(x_point_mv)
+    y_voltage_mv = np.unique(y_point_mv)
+    expected_points = int(x_voltage_mv.size * y_voltage_mv.size)
+    if expected_points != iq.shape[0]:
+        raise ValueError(
+            "stored Stability Diagram coordinates do not form one complete "
+            "Cartesian grid"
+        )
+
+    i_mean = np.full((y_voltage_mv.size, x_voltage_mv.size), np.nan)
+    q_mean = np.full_like(i_mean, np.nan)
+    populated = np.zeros_like(i_mean, dtype=bool)
+    for point_index, (x_mv, y_mv) in enumerate(
+        zip(x_point_mv, y_point_mv)
+    ):
+        x_index = int(np.argmin(np.abs(x_voltage_mv - x_mv)))
+        y_index = int(np.argmin(np.abs(y_voltage_mv - y_mv)))
+        if populated[y_index, x_index]:
+            raise ValueError(
+                "stored Stability Diagram contains a duplicate Cartesian point"
+            )
+        populated[y_index, x_index] = True
+        i_mean[y_index, x_index] = point_iq[point_index, 0]
+        q_mean[y_index, x_index] = point_iq[point_index, 1]
+    if not np.all(populated):
+        raise ValueError("stored Stability Diagram Cartesian grid is incomplete")
+
+    iq_unit = str(arrays.get("iq_unit", "ADC units"))
+    i_mean, q_mean, display_scale = scale_iq_for_display(
+        i_mean,
+        q_mean,
+        iq_unit,
+    )
+    layout = metadata.get("measurement_layout", {})
+    sample_rate_hz = float(
+        layout.get(
+            "sample_rate_hz",
+            1.0e6 / float(layout.get("sample_period_us", 1.0)),
+        )
+    )
+    gui_settings = metadata.get("gui_settings", {})
+    qick_settings = (
+        gui_settings.get("qick", {})
+        if isinstance(gui_settings, Mapping)
+        else {}
+    )
+    path = Path(database_path).expanduser().resolve()
+    return StabilityDiagramResult(
+        x_voltage_mv=x_voltage_mv,
+        y_voltage_mv=y_voltage_mv,
+        i_mean=i_mean,
+        q_mean=q_mean,
+        magnitude=np.hypot(i_mean, q_mean),
+        phase_deg=np.degrees(np.arctan2(q_mean, i_mean)),
+        x_axis_label=str(x_axis.get("output_name", "X")),
+        y_axis_label=str(y_axis.get("output_name", "Y")),
+        value_unit=display_scale.unit,
+        base_value_unit=display_scale.base_unit,
+        display_scale=display_scale.factor,
+        measurement_mode=str(arrays.get("measurement_mode", "raw_iq")),
+        iteration=1,
+        repetition_count=int(iq.shape[1]),
+        samples_per_trace=int(iq.shape[2]),
+        sample_rate_hz=sample_rate_hz,
+        fir_rate_profile=str(
+            qick_settings.get(
+                "fir_rate_profile",
+                "50_ksps" if np.isclose(sample_rate_hz, 50_000.0) else "1_msps",
+            )
+        ),
+        source_label=f"QCoDeS Run {int(run_id)}",
+        database_path=str(path),
+        run_id=int(run_id),
+    )
+
+
+def load_stability_diagram_run(
+    database_path: Any,
+    run_id: int,
+) -> StabilityDiagramResult:
+    """Load one saved Stability Diagram QCoDeS run."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"QCoDeS database does not exist: {path}")
+    run_id = _integer(run_id, "Stability Diagram Run ID", 1)
+    try:
+        from qcodes import initialise_or_create_database_at, load_by_id
+    except ImportError as exc:
+        raise RuntimeError(
+            "QCoDeS==0.58.0 is required to load Stability Diagram runs"
+        ) from exc
+    initialise_or_create_database_at(str(path))
+    dataset = load_by_id(run_id)
+    arrays = load_qick_iq_arrays(dataset)
+    return stability_result_from_stored_arrays(
+        arrays,
+        database_path=path,
+        run_id=run_id,
+    )
+
+
+class StabilityOverlayLoadWorker(QtCore.QObject):
+    """Load one saved Stability Diagram without blocking the GUI."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, database_path: str, run_id: int, parent=None):
+        super().__init__(parent)
+        self._database_path = str(database_path)
+        self._run_id = int(run_id)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_stability_diagram_run(
+                self._database_path,
+                self._run_id,
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
+class StabilityOverlaySelector(QtWidgets.QGroupBox):
+    """Choose the saved Stability Diagram rendered below the AWG trace."""
+
+    load_requested = QtCore.pyqtSignal(str, int, str)
+    latest_requested = QtCore.pyqtSignal()
+    quantity_changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__("Stability Diagram Overlay", parent)
+        self._summaries: Tuple[StabilityRunSummary, ...] = ()
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(4)
+
+        database_row = QtWidgets.QHBoxLayout()
+        database_row.addWidget(QtWidgets.QLabel("DB:"))
+        self.database_path = QtWidgets.QLineEdit(DEFAULT_STABILITY_DB_PATH, self)
+        self.database_path.setPlaceholderText(
+            "Select a QCoDeS database containing Stability Diagram runs"
+        )
+        database_row.addWidget(self.database_path, 1)
+        self.browse_button = QtWidgets.QToolButton(self)
+        self.browse_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_button.setToolTip("Choose a Stability Diagram QCoDeS database")
+        self.browse_button.clicked.connect(self._browse_database)
+        database_row.addWidget(self.browse_button)
+        self.refresh_button = QtWidgets.QPushButton("Refresh Runs", self)
+        self.refresh_button.clicked.connect(self.refresh_runs)
+        database_row.addWidget(self.refresh_button)
+        outer.addLayout(database_row)
+
+        selection_row = QtWidgets.QHBoxLayout()
+        selection_row.addWidget(QtWidgets.QLabel("Saved data:"))
+        self.run_combo = QtWidgets.QComboBox(self)
+        self.run_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.run_combo.setMinimumContentsLength(32)
+        selection_row.addWidget(self.run_combo, 1)
+        selection_row.addWidget(QtWidgets.QLabel("Plot:"))
+        self.quantity_combo = QtWidgets.QComboBox(self)
+        for label, key in (
+            ("I", "i"),
+            ("Q", "q"),
+            ("Magnitude", "magnitude"),
+            ("Phase", "phase"),
+        ):
+            self.quantity_combo.addItem(label, key)
+        self.quantity_combo.setCurrentIndex(
+            self.quantity_combo.findData("magnitude")
+        )
+        self.quantity_combo.currentIndexChanged.connect(
+            self._emit_quantity_changed
+        )
+        selection_row.addWidget(self.quantity_combo)
+        self.load_button = QtWidgets.QPushButton("Load Overlay", self)
+        self.load_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.load_button.clicked.connect(self._emit_load_requested)
+        selection_row.addWidget(self.load_button)
+        self.latest_button = QtWidgets.QPushButton("Use Latest Scan", self)
+        self.latest_button.clicked.connect(self.latest_requested.emit)
+        selection_row.addWidget(self.latest_button)
+        outer.addLayout(selection_row)
+
+        self.status = QtWidgets.QLabel(
+            "Using the latest in-memory Stability Diagram scan.",
+            self,
+        )
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        outer.addWidget(self.status)
+
+    @property
+    def quantity(self) -> str:
+        return str(self.quantity_combo.currentData())
+
+    def _browse_database(self) -> None:
+        current = self.database_path.text().strip()
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Stability Diagram QCoDeS database",
+            current,
+            "SQLite databases (*.db *.sqlite *.sqlite3);;All files (*)",
+        )
+        if not selected:
+            return
+        self.database_path.setText(selected)
+        self.refresh_runs()
+
+    def refresh_runs(self) -> None:
+        previous_run_id = self.run_combo.currentData()
+        try:
+            summaries = list_stability_runs(self.database_path.text().strip())
+        except Exception as exc:
+            self._summaries = ()
+            self.run_combo.clear()
+            self.status.setText(str(exc))
+            return
+        self._summaries = summaries
+        self.run_combo.clear()
+        for summary in summaries:
+            self.run_combo.addItem(summary.display_label, summary.run_id)
+        if previous_run_id is not None:
+            previous_index = self.run_combo.findData(previous_run_id)
+            if previous_index >= 0:
+                self.run_combo.setCurrentIndex(previous_index)
+        if summaries:
+            self.status.setText(
+                f"Found {len(summaries)} saved Stability Diagram run(s)."
+            )
+        else:
+            self.status.setText(
+                "This database contains no saved Stability Diagram runs."
+            )
+
+    def _emit_quantity_changed(self) -> None:
+        self.quantity_changed.emit(self.quantity)
+
+    def _emit_load_requested(self) -> None:
+        run_id = self.run_combo.currentData()
+        if run_id is None:
+            self.status.setText("Refresh the DB and select a saved run first.")
+            return
+        self.load_requested.emit(
+            self.database_path.text().strip(),
+            int(run_id),
+            self.quantity,
+        )
+
+    def set_loading(self, loading: bool, *, run_id: int = 0) -> None:
+        for widget in (
+            self.database_path,
+            self.browse_button,
+            self.refresh_button,
+            self.run_combo,
+            self.load_button,
+            self.latest_button,
+        ):
+            widget.setEnabled(not loading)
+        if loading:
+            self.status.setText(f"Loading QCoDeS Run {run_id}...")
+
+    def show_loaded_result(self, result: StabilityDiagramResult) -> None:
+        self.set_loading(False)
+        self.status.setText(
+            f"Pinned {result.source_label or 'saved Stability Diagram'} from "
+            f"{result.database_path}; new scans will not replace it."
+        )
+
+    def show_latest_result(self, result: Optional[StabilityDiagramResult]) -> None:
+        self.set_loading(False)
+        if result is None:
+            self.status.setText(
+                "Using latest scan; no Stability Diagram has been acquired yet."
+            )
+        else:
+            self.status.setText(
+                f"Using latest in-memory Stability Diagram scan "
+                f"{result.iteration}."
+            )
 
 
 def default_stability_settings(
@@ -1735,8 +2267,11 @@ if pg is not None:
                     color_bar.setLabel("right", text=unit)
                 self.images[key].setRect(rect)
             self.fit_view()
+            source_label = (
+                result.source_label or f"Scan {result.iteration}"
+            )
             self.hover_status.setText(
-                f"Scan {result.iteration}: {result.repetition_count} repetitions, "
+                f"{source_label}: {result.repetition_count} repetitions, "
                 f"{result.samples_per_trace} FIR samples per point; "
                 f"display {result.value_unit} "
                 f"({result.display_scale:g} x {result.base_value_unit})"
@@ -1835,6 +2370,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     start_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
     single_shot_requested = QtCore.pyqtSignal()
+    saved_run_requested = QtCore.pyqtSignal(str, int)
     dc_measure_changed = QtCore.pyqtSignal(bool, float)
     dc_calibration_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
@@ -2044,7 +2580,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.addWidget(self.dc_calibration_group)
 
         database_group = QtWidgets.QGroupBox(
-            "Single-Shot Database",
+            "Stability Diagram Database",
             controls_content,
         )
         database_form = QtWidgets.QFormLayout(database_group)
@@ -2062,6 +2598,42 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(self.browse_database)
         database_form.addRow("QCoDeS DB file:", database_row)
+        self.saved_run_combo = QtWidgets.QComboBox(database_group)
+        self.saved_run_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.saved_run_combo.setMinimumContentsLength(28)
+        self.refresh_saved_runs_button = QtWidgets.QPushButton(
+            "Refresh Runs",
+            database_group,
+        )
+        self.refresh_saved_runs_button.clicked.connect(
+            self.refresh_saved_runs
+        )
+        saved_run_row = QtWidgets.QHBoxLayout()
+        saved_run_row.addWidget(self.saved_run_combo, 1)
+        saved_run_row.addWidget(self.refresh_saved_runs_button)
+        database_form.addRow("Saved diagram:", saved_run_row)
+        self.load_saved_run_button = QtWidgets.QPushButton(
+            "Load Saved Diagram",
+            database_group,
+        )
+        self.load_saved_run_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.load_saved_run_button.clicked.connect(
+            self._request_saved_run
+        )
+        database_form.addRow(self.load_saved_run_button)
+        self.saved_run_status = QtWidgets.QLabel(
+            "Choose a DB and refresh its Stability Diagram runs.",
+            database_group,
+        )
+        self.saved_run_status.setWordWrap(True)
+        self.saved_run_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        database_form.addRow(self.saved_run_status)
         controls.addWidget(database_group)
 
         self.start_button = QtWidgets.QPushButton("Start", controls_content)
@@ -2152,6 +2724,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._targets_available = False
         self._dc_input_available = False
         self._running = False
+        self._saved_run_loading = False
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
@@ -2317,6 +2890,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             if selected.suffix.lower() != ".db":
                 selected = selected.with_suffix(".db")
             self.database_path.setText(str(selected))
+            if selected.is_file():
+                self.refresh_saved_runs()
 
     def database_path_value(self) -> str:
         value = self.database_path.text().strip()
@@ -2326,6 +2901,67 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         if path.suffix.lower() != ".db":
             path = path.with_suffix(".db")
         return str(path)
+
+    def refresh_saved_runs(self) -> None:
+        previous_run_id = self.saved_run_combo.currentData()
+        try:
+            summaries = list_stability_runs(self.database_path_value())
+        except Exception as exc:
+            self.saved_run_combo.clear()
+            self.saved_run_status.setText(str(exc))
+            return
+        self.saved_run_combo.clear()
+        for summary in summaries:
+            self.saved_run_combo.addItem(
+                summary.display_label,
+                summary.run_id,
+            )
+        if previous_run_id is not None:
+            previous_index = self.saved_run_combo.findData(previous_run_id)
+            if previous_index >= 0:
+                self.saved_run_combo.setCurrentIndex(previous_index)
+        if summaries:
+            self.saved_run_status.setText(
+                f"Found {len(summaries)} saved Stability Diagram run(s)."
+            )
+        else:
+            self.saved_run_status.setText(
+                "This database contains no saved Stability Diagram runs."
+            )
+
+    def _request_saved_run(self) -> None:
+        run_id = self.saved_run_combo.currentData()
+        if run_id is None:
+            self.saved_run_status.setText(
+                "Refresh the DB and select a saved Stability Diagram first."
+            )
+            return
+        self.saved_run_requested.emit(
+            self.database_path_value(),
+            int(run_id),
+        )
+
+    def set_saved_run_loading(self, loading: bool, *, run_id: int = 0) -> None:
+        self._saved_run_loading = bool(loading)
+        idle_enabled = (
+            not self._saved_run_loading
+            and not self._running
+            and self._targets_available
+        )
+        self.start_button.setEnabled(idle_enabled)
+        self.single_shot_button.setEnabled(idle_enabled)
+        for widget in (
+            self.database_path,
+            self.browse_database,
+            self.saved_run_combo,
+            self.refresh_saved_runs_button,
+            self.load_saved_run_button,
+        ):
+            widget.setEnabled(not loading and not self._running)
+        if loading:
+            self.saved_run_status.setText(
+                f"Loading QCoDeS Run {int(run_id)}..."
+            )
 
     def set_front_panel_configuration(self, configuration) -> None:
         self.path_diagram.set_front_panel_configuration(configuration)
@@ -2564,8 +3200,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
-        self.start_button.setEnabled(not running and self._targets_available)
-        self.single_shot_button.setEnabled(not running and self._targets_available)
+        idle_enabled = (
+            not running
+            and not self._saved_run_loading
+            and self._targets_available
+        )
+        self.start_button.setEnabled(idle_enabled)
+        self.single_shot_button.setEnabled(idle_enabled)
         self.stop_button.setEnabled(running)
         for editor in (self.x_axis, self.y_axis):
             editor.setEnabled(not running)
@@ -2576,8 +3217,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_gain.setEnabled(not running)
         self.bias_t_group.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
-        self.database_path.setEnabled(not running)
-        self.browse_database.setEnabled(not running)
+        database_enabled = not running and not self._saved_run_loading
+        for widget in (
+            self.database_path,
+            self.browse_database,
+            self.saved_run_combo,
+            self.refresh_saved_runs_button,
+            self.load_saved_run_button,
+        ):
+            widget.setEnabled(database_enabled)
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
         self.progress.setVisible(running)
@@ -2600,10 +3248,23 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             result.samples_per_trace * 1_000_000.0 / result.sample_rate_hz
         )
         self.status.setText(
-            f"Scan {result.iteration} complete: "
+            f"{result.source_label or f'Scan {result.iteration}'} complete: "
             f"{result.magnitude.shape[1]} x {result.magnitude.shape[0]} points "
             f"({result.value_unit}); {result.samples_per_trace:,} samples at "
             f"{rate_label} = {trace_us:g} us / trace"
+        )
+
+    def show_loaded_run(self, result: StabilityDiagramResult) -> None:
+        self.set_saved_run_loading(False)
+        self.plot.set_result(result)
+        self.saved_run_status.setText(
+            f"Loaded {result.source_label} from {result.database_path}."
+        )
+        self.status.setText(
+            f"Displaying {result.source_label}: "
+            f"{result.magnitude.shape[1]} x {result.magnitude.shape[0]} points, "
+            f"{result.repetition_count} repetitions x "
+            f"{result.samples_per_trace} FIR samples."
         )
 
     def show_saved_result(self, stored: StoredStabilityDiagram) -> None:
@@ -2648,12 +3309,18 @@ __all__ = [
     "StabilityDiagramPlotWidget",
     "StabilityDiagramResult",
     "StabilityDiagramWorker",
+    "StabilityOverlayLoadWorker",
+    "StabilityOverlaySelector",
+    "StabilityRunSummary",
     "StabilitySweepAxis",
     "STABILITY_DATA_KEYS",
     "StoredStabilityDiagram",
     "default_stability_settings",
+    "list_stability_runs",
+    "load_stability_diagram_run",
     "normalize_stability_settings",
     "normalize_stability_color_ranges",
     "normalize_stability_visible_data",
     "reduce_fir_stability_result",
+    "stability_result_from_stored_arrays",
 ]

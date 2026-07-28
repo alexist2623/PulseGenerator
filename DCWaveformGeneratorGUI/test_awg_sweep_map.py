@@ -6,7 +6,9 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from itertools import product
+import json
 import os
+import sqlite3
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,6 +20,17 @@ import pytest
 import awg_sweep_map as awg_map
 import DCWaveform_Generator as gui
 from dc_waveform_core import QickRampRateSweepSpec, QickSweepSpec
+from qick_fine_tune_sweep import (
+    AmplitudeSweep,
+    FineTuneDdrResult,
+    RampDurationSweep,
+)
+from qick_qcodes_experiment import (
+    QCODES_STAGING_ENV,
+    QcodesRunConfig,
+    QickConnectionConfig,
+    store_qick_result,
+)
 
 
 def _application():
@@ -332,6 +345,300 @@ def test_reduce_awg_map_rejects_duplicate_or_unknown_axes():
             y_axis_key=("awg_7", "set_7"),
             full_scale_mv=800.0,
         )
+
+
+def _stored_awg_metadata():
+    return {
+        "created_at_utc": "2026-07-27T13:45:00+00:00",
+        "gui_settings": {
+            "qick": {
+                "full_scale_mv": 800.0,
+                "fir_rate_profile": "50_ksps",
+            },
+            "experiment": {
+                "sweep_map": {
+                    "x_axis": {
+                        "output_name": "all_awg_outputs",
+                        "segment_name": "ramp_0_to_1",
+                    },
+                    "y_axis": {
+                        "output_name": "awg_0",
+                        "segment_name": "set_1",
+                    },
+                },
+            },
+        },
+        "measurement_layout": {
+            "iq_shape": [12, 2, 3, 2],
+            "iq_unit": "ADC units",
+            "measurement_mode": "raw_iq",
+            "sample_rate_hz": 50_000.0,
+            "sample_period_us": 20.0,
+            "sweep_axes": [
+                {
+                    "parameter": "awg_0_set_1_voltage_mv",
+                    "output_name": "awg_0",
+                    "segment_name": "set_1",
+                    "axis_kind": "amplitude",
+                    "unit": "mV",
+                    "count": 2,
+                },
+                {
+                    "parameter": "awg_1_set_2_voltage_mv",
+                    "output_name": "awg_1",
+                    "segment_name": "set_2",
+                    "axis_kind": "amplitude",
+                    "unit": "mV",
+                    "count": 2,
+                },
+                {
+                    "parameter": "ramp_0_to_1_duration_us",
+                    "output_name": "all_awg_outputs",
+                    "segment_name": "ramp_0_to_1",
+                    "axis_kind": "ramp_duration",
+                    "unit": "us",
+                    "count": 3,
+                },
+            ],
+        },
+    }
+
+
+def test_saved_awg_run_listing_filters_stability_and_uses_saved_axes(tmp_path):
+    database_path = tmp_path / "awg_sweeps.db"
+    metadata = _stored_awg_metadata()
+    stability_metadata = json.loads(json.dumps(metadata))
+    stability_metadata["gui_settings"]["qick"][
+        "fir_stability_capture_mode"
+    ] = "immediate_continuous_fir_output"
+    one_axis_metadata = json.loads(json.dumps(metadata))
+    one_axis_metadata["measurement_layout"]["sweep_axes"] = (
+        one_axis_metadata["measurement_layout"]["sweep_axes"][:1]
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, "
+            "qick_experiment_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (20, json.dumps(stability_metadata)),
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (21, json.dumps(one_axis_metadata)),
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (22, json.dumps(metadata)),
+        )
+
+    summaries = awg_map.list_awg_sweep_runs(database_path)
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.run_id == 22
+    assert summary.x_axis_label == (
+        "ramp_0_to_1 RAMP duration (rate derived)"
+    )
+    assert summary.y_axis_label == "awg_0 / set_1"
+    assert summary.x_points == 3
+    assert summary.y_points == 2
+    assert summary.sweep_axis_count == 3
+    assert "Run 22" in summary.display_label
+    assert "+1 averaged axis" in summary.display_label
+    assert "50 kSPS" in summary.display_label
+
+
+def test_saved_awg_arrays_restore_selected_axes_and_average_other_axis(
+    tmp_path,
+):
+    metadata = _stored_awg_metadata()
+    voltage_x = (-400.0, 400.0)
+    voltage_other = (-200.0, 200.0)
+    ramp_duration = (0.08, 0.10, 0.12)
+    coordinates = np.asarray(
+        tuple(product(voltage_x, voltage_other, ramp_duration)),
+        dtype=np.float64,
+    )
+    iq = np.empty((coordinates.shape[0], 2, 3, 2), dtype=np.int32)
+    for point_index, (voltage, other, duration_us) in enumerate(coordinates):
+        iq[point_index, ..., 0] = int(voltage / 10 + other / 20)
+        iq[point_index, ..., 1] = int(duration_us * 1000 + other / 20)
+    arrays = {
+        "metadata": metadata,
+        "iq": iq,
+        "iq_unit": "ADC units",
+        "measurement_mode": "raw_iq",
+        "sweep_coordinates": {
+            "awg_0_set_1_voltage_mv": np.repeat(
+                coordinates[:, 0, None],
+                2,
+                axis=1,
+            ),
+            "awg_1_set_2_voltage_mv": np.repeat(
+                coordinates[:, 1, None],
+                2,
+                axis=1,
+            ),
+            "ramp_0_to_1_duration_us": np.repeat(
+                coordinates[:, 2, None],
+                2,
+                axis=1,
+            ),
+        },
+    }
+
+    result = awg_map.awg_sweep_result_from_stored_arrays(
+        arrays,
+        database_path=tmp_path / "awg_sweeps.db",
+        run_id=37,
+    )
+
+    np.testing.assert_allclose(result.x_values, ramp_duration)
+    np.testing.assert_allclose(result.y_values, voltage_x)
+    assert result.x_unit == "us"
+    assert result.y_unit == "mV"
+    assert result.i_mean.shape == (2, 3)
+    assert result.q_mean.shape == (2, 3)
+    np.testing.assert_allclose(result.i_mean, [[-40.0] * 3, [40.0] * 3])
+    np.testing.assert_allclose(
+        result.q_mean,
+        [[80.0, 100.0, 120.0], [80.0, 100.0, 120.0]],
+    )
+    assert result.source_points_per_cell == 2
+    assert result.averaged_axis_labels == ("awg_1 / set_2",)
+    assert result.source_label == "QCoDeS Run 37"
+    assert result.run_id == 37
+    assert result.sample_rate_hz == 50_000.0
+
+
+def test_awg_sweep_selector_lists_run_and_emits_selection(tmp_path):
+    app = _application()
+    database_path = tmp_path / "awg_sweeps.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id INTEGER PRIMARY KEY, "
+            "qick_experiment_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (42, json.dumps(_stored_awg_metadata())),
+        )
+
+    selector = awg_map.AwgSweepRunSelector(
+        default_database_path=str(database_path)
+    )
+    selector.refresh_runs()
+    emitted = []
+    selector.load_requested.connect(
+        lambda path, run_id: emitted.append((path, run_id))
+    )
+    selector.load_button.click()
+    app.processEvents()
+
+    assert selector.run_combo.count() == 1
+    assert selector.run_combo.currentData() == 42
+    assert emitted == [(str(database_path), 42)]
+    selector.set_loading(True, run_id=42)
+    assert selector.database_path.isEnabled() is False
+    assert selector.load_button.isEnabled() is False
+    selector.set_loading(False)
+    assert selector.database_path.isEnabled() is True
+    assert selector.load_button.isEnabled() is True
+    selector.close()
+
+
+def test_saved_awg_run_loads_from_real_qcodes_database(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "awg_qcodes.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    axes = (
+        AmplitudeSweep("set_1", "awg_0", -0.5, 0.5, 2),
+        RampDurationSweep(
+            "ramp_0_to_1",
+            0.08,
+            0.12,
+            3,
+            sequence_fabric_mhz=300.0,
+        ),
+    )
+    coordinates = np.asarray(
+        tuple(product((-0.5, 0.5), (0.08, 0.10, 0.12))),
+        dtype=np.float64,
+    )
+    iq = np.empty((coordinates.shape[0], 2, 2, 2), dtype=np.int32)
+    for point_index, (voltage, duration_us) in enumerate(coordinates):
+        iq[point_index, ..., 0] = int(voltage * 100)
+        iq[point_index, ..., 1] = int(duration_us * 1000)
+    ddr_result = FineTuneDdrResult(
+        sweep_points=coordinates,
+        iq=iq,
+        sweep_axes=axes,
+        sweep_shape=(2, 3),
+        cross_capacitance=np.eye(1),
+        sample_rate_hz=50_000.0,
+        fir_rate_profile="50_ksps",
+    )
+    gui_settings = {
+        "qick": {
+            "fabric_mhz": 300.0,
+            "tproc_mhz": 300.0,
+            "full_scale_mv": 800.0,
+            "fir_rate_profile": "50_ksps",
+        },
+        "experiment": {
+            "sweep_map": {
+                "x_axis": {
+                    "output_name": "all_awg_outputs",
+                    "segment_name": "ramp_0_to_1",
+                },
+                "y_axis": {
+                    "output_name": "awg_0",
+                    "segment_name": "set_1",
+                },
+            },
+        },
+        "awg": {"cross_capacitance": np.eye(1).tolist()},
+    }
+    dataset, _row_count = store_qick_result(
+        ddr_result,
+        run_config=QcodesRunConfig(
+            database_path=str(database_path),
+            experiment_name="AWG loader test",
+            sample_name="simulated device",
+            sample_rate_hz=50_000.0,
+        ),
+        connection_config=QickConnectionConfig(
+            "192.0.2.10",
+            8888,
+            "myqick",
+        ),
+        program_summary={},
+        gui_settings=gui_settings,
+        rf_settings={},
+    )
+
+    summaries = awg_map.list_awg_sweep_runs(database_path)
+    result = awg_map.load_awg_sweep_run(database_path, dataset.run_id)
+
+    assert [summary.run_id for summary in summaries] == [dataset.run_id]
+    np.testing.assert_allclose(result.x_values, [0.08, 0.10, 0.12])
+    np.testing.assert_allclose(result.y_values, [-400.0, 400.0])
+    np.testing.assert_allclose(
+        result.i_mean,
+        [[-50.0, -50.0, -50.0], [50.0, 50.0, 50.0]],
+    )
+    np.testing.assert_allclose(
+        result.q_mean,
+        [[80.0, 100.0, 120.0], [80.0, 100.0, 120.0]],
+    )
+    assert result.source_label == f"QCoDeS Run {dataset.run_id}"
+    assert result.sample_rate_hz == 50_000.0
 
 
 def test_experiment_panel_axis_selection_and_result_plot():

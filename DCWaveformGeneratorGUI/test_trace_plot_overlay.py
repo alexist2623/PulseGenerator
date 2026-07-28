@@ -93,12 +93,13 @@ def _trace_widget() -> TracePlotWidget:
     return widget
 
 
-def test_trace_points_include_hold_and_incoming_ramp_timing():
+def test_trace_points_show_hold_and_ramps_above_their_segments():
     app = _application()
     widget = _trace_widget()
 
     assert len(widget._point_records) == 3
     assert len(widget._point_labels) == 3
+    assert len(widget._ramp_labels) == 2
     assert len(widget._point_scatter.points()) == 3
     point_one = widget._point_records[1]
     assert point_one["point_index"] == 1
@@ -108,12 +109,32 @@ def test_trace_points_include_hold_and_incoming_ramp_timing():
     assert point_one["hold_y_ns"] == 2_500.0
     label = widget._point_labels[1].textItem.toPlainText()
     assert "P1" in label
-    assert "Ramp X 0.5 / Y 0.75 us" in label
     assert "Hold X 2 / Y 2.5 us" in label
+    assert "Ramp" not in label
+    ramp_label = widget._ramp_labels[0]
+    assert (
+        ramp_label.textItem.toPlainText()
+        == "Ramp X 0.5 / Y 0.75 us"
+    )
+    np.testing.assert_allclose(
+        [ramp_label.pos().x(), ramp_label.pos().y()],
+        [50.0, -20.0],
+    )
     tooltip = widget._point_tooltip(0.0, 0.0, point_one)
     assert "P1" in tooltip
-    assert "Ramp X 0.5 / Y 0.75 us" in tooltip
+    assert "X 100 mV" in tooltip
+    assert "Y -50 mV" in tooltip
     assert "Hold X 2 / Y 2.5 us" in tooltip
+    assert "Ramp" not in tooltip
+
+    hovered_point = widget._point_scatter.points()[1]
+    widget._points_hovered(widget._point_scatter, [hovered_point], None)
+    hover_text = widget._hover_label.textItem.toPlainText()
+    assert widget._hover_label.isVisible()
+    assert "X 100 mV" in hover_text
+    assert "Y -50 mV" in hover_text
+    widget._points_hovered(widget._point_scatter, [], None)
+    assert not widget._hover_label.isVisible()
 
     widget.set_time_unit("ns")
     tooltip_ns = widget._point_tooltip(
@@ -121,8 +142,11 @@ def test_trace_points_include_hold_and_incoming_ramp_timing():
         0.0,
         widget._point_records[1],
     )
-    assert "Ramp X 500 / Y 750 ns" in tooltip_ns
     assert "Hold X 2000 / Y 2500 ns" in tooltip_ns
+    assert (
+        widget._ramp_labels[0].textItem.toPlainText()
+        == "Ramp X 500 / Y 750 ns"
+    )
     app.processEvents()
     widget.close()
 
@@ -139,6 +163,50 @@ def test_last_stability_magnitude_is_drawn_below_matching_trace():
     assert widget._stability_color_bar is None
     np.testing.assert_allclose(widget._stability_image.image, result.magnitude)
     assert "Stability scan 7" in widget._default_title
+    app.processEvents()
+    widget.close()
+
+
+def test_trace_fit_uses_exact_stability_overlay_cell_edges():
+    app = _application()
+    widget = _trace_widget()
+    widget.set_stability_overlay(_result())
+
+    widget.fit_view()
+    app.processEvents()
+
+    view_range = widget.getPlotItem().vb.viewRange()
+    np.testing.assert_allclose(view_range[0], [-150.0, 150.0])
+    np.testing.assert_allclose(view_range[1], [-100.0, 100.0])
+    widget.close()
+
+
+def test_stability_overlay_can_select_i_q_magnitude_or_phase():
+    app = _application()
+    widget = _trace_widget()
+    result = _result()
+    q_values = result.magnitude * -2.0
+    phase_values = np.asarray(
+        [[-180.0, -90.0, 0.0], [45.0, 90.0, 180.0]],
+        dtype=float,
+    )
+    result = replace(
+        result,
+        q_mean=q_values,
+        phase_deg=phase_values,
+        source_label="QCoDeS Run 42",
+        database_path="stability.db",
+        run_id=42,
+    )
+
+    widget.set_stability_overlay(result, "q")
+    np.testing.assert_allclose(widget._stability_image.image, q_values)
+    assert "QCoDeS Run 42 Q" in widget._default_title
+    assert "[nA]" in widget._default_title
+
+    widget.set_stability_overlay(result, "phase")
+    np.testing.assert_allclose(widget._stability_image.image, phase_values)
+    assert "Phase [deg]" in widget._default_title
     app.processEvents()
     widget.close()
 
@@ -188,10 +256,12 @@ def test_main_window_retains_and_forwards_latest_stability_result():
     class _Trace:
         def __init__(self):
             self.result = None
+            self.quantity = None
             self.fit_count = 0
 
-        def set_stability_overlay(self, value):
+        def set_stability_overlay(self, value, quantity="magnitude"):
             self.result = value
+            self.quantity = quantity
 
         def fit_view(self):
             self.fit_count += 1
@@ -217,4 +287,48 @@ def test_main_window_retains_and_forwards_latest_stability_result():
     window._trace = _Trace()
     gui.MainWindow._on_stability_scan_ready(window, result)
     assert window._trace.result is result
+    assert window._trace.quantity == "magnitude"
     assert window._trace.fit_count == 1
+
+
+def test_pinned_saved_overlay_is_not_replaced_by_new_scan():
+    class _Panel:
+        def __init__(self):
+            self.result = None
+
+        def show_result(self, value):
+            self.result = value
+
+    class _Trace:
+        def __init__(self, result):
+            self.result = result
+            self.fit_count = 0
+
+        def set_stability_overlay(self, value, quantity="magnitude"):
+            self.result = value
+
+        def fit_view(self):
+            self.fit_count += 1
+
+    class _Window:
+        def __init__(self, pinned):
+            self._last_stability_result = None
+            self._trace_overlay_result = pinned
+            self._trace_overlay_pinned = True
+            self._trace_overlay_quantity = "magnitude"
+            self._stability_panel = _Panel()
+            self._trace = _Trace(pinned)
+
+        def statusBar(self):
+            return type("_Status", (), {"showMessage": lambda *_args: None})()
+
+    pinned = replace(_result(), source_label="QCoDeS Run 8", run_id=8)
+    latest = replace(_result(), iteration=9)
+    window = _Window(pinned)
+
+    gui.MainWindow._on_stability_scan_ready(window, latest)
+
+    assert window._last_stability_result is latest
+    assert window._stability_panel.result is latest
+    assert window._trace.result is pinned
+    assert window._trace.fit_count == 0

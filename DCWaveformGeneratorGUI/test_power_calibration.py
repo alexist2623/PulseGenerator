@@ -170,6 +170,82 @@ def test_selects_same_board_and_covering_frequency_run(tmp_path):
     assert catalog.matching_input_run("RF_In", [410.0, 490.0]) is None
 
 
+def test_output_calibration_requires_matching_nyquist_and_filter_settings(
+    tmp_path,
+):
+    path = tmp_path / "gain_pwr_calb.db"
+    _calibration_database(path)
+    metadata = {
+        "schema": "qstl-qick-output-power-calibration-v2",
+        "configuration": {
+            "nqz": 1,
+            "output_filter_type": "lowpass",
+            "output_filter_cutoff_ghz": 2.5,
+            "output_filter_bandwidth_ghz": 1.0,
+        },
+        "rf_settings_actual": {
+            "filter_type": "lowpass",
+            "filter_cutoff_ghz": 2.5,
+            "filter_bandwidth_ghz": 1.0,
+        },
+    }
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE runs ADD COLUMN Calibration_Config TEXT")
+        connection.execute(
+            "UPDATE runs SET Calibration_Config = ? WHERE run_id = 2",
+            (json.dumps(metadata),),
+        )
+
+    catalog = CalibrationDatabase(path)
+    calibration = catalog.output_calibration(
+        "RF_Out",
+        [450.0],
+        run_id=2,
+        nqz=1,
+        output_filter_type="lowpass",
+        output_filter_cutoff_ghz=2.5,
+        output_filter_bandwidth_ghz=1.0,
+    )
+    assert calibration.summary.run_id == 2
+    assert calibration.summary.output_nqz == 1
+    assert calibration.summary.output_filter_type == "lowpass"
+
+    response = float(calibration.frequency_response_dbm([450.0])[0])
+    attenuated_power = float(
+        calibration.output_power_dbm(
+            [450.0],
+            [1000],
+            output_att1_db=10.0,
+        )[0]
+    )
+    assert calibration.nominal_gain_for_power(
+        attenuated_power,
+        reference_response_dbm=response,
+        output_att1_db=10.0,
+    ) == 1000
+
+    with pytest.raises(LookupError, match="Nyquist zone 1 != 2"):
+        catalog.output_calibration(
+            "RF_Out",
+            [450.0],
+            run_id=2,
+            nqz=2,
+            output_filter_type="lowpass",
+            output_filter_cutoff_ghz=2.5,
+            output_filter_bandwidth_ghz=1.0,
+        )
+    with pytest.raises(LookupError, match="filter lowpass != highpass"):
+        catalog.output_calibration(
+            "RF_Out",
+            [450.0],
+            run_id=2,
+            nqz=1,
+            output_filter_type="highpass",
+            output_filter_cutoff_ghz=2.5,
+            output_filter_bandwidth_ghz=1.0,
+        )
+
+
 def test_schedule_uses_linear_nominal_gain_and_relative_frequency_correction(
     tmp_path,
 ):

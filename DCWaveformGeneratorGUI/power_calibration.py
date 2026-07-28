@@ -91,6 +91,10 @@ class CalibrationRunSummary:
     source_output_run_id: int = 0
     path_loss_db: float = 0.0
     purpose: str = "output_power"
+    output_nqz: Optional[int] = None
+    output_filter_type: str = ""
+    output_filter_cutoff_ghz: Optional[float] = None
+    output_filter_bandwidth_ghz: Optional[float] = None
 
     def as_dict(self) -> Mapping[str, Any]:
         return {
@@ -111,6 +115,10 @@ class CalibrationRunSummary:
             "source_output_run_id": self.source_output_run_id,
             "path_loss_db": self.path_loss_db,
             "purpose": self.purpose,
+            "output_nqz": self.output_nqz,
+            "output_filter_type": self.output_filter_type,
+            "output_filter_cutoff_ghz": self.output_filter_cutoff_ghz,
+            "output_filter_bandwidth_ghz": self.output_filter_bandwidth_ghz,
         }
 
 
@@ -600,20 +608,158 @@ class CalibrationDatabase:
                     return metadata
         return {}
 
+    def _output_path_settings(
+        self,
+        row: sqlite3.Row,
+    ) -> Tuple[Optional[int], str, Optional[float], Optional[float]]:
+        metadata = self._metadata(row, "Calibration_Config")
+        configuration = metadata.get("configuration", metadata)
+        if not isinstance(configuration, Mapping):
+            configuration = {}
+        actual = metadata.get("rf_settings_actual", {})
+        if not isinstance(actual, Mapping):
+            actual = {}
+
+        def first(*values):
+            return next((value for value in values if value is not None), None)
+
+        raw_nqz = first(
+            actual.get("nqz"),
+            actual.get("nyquist_zone"),
+            configuration.get("nqz"),
+            configuration.get("output_nqz"),
+        )
+        try:
+            nqz = None if raw_nqz is None else int(raw_nqz)
+        except (TypeError, ValueError):
+            nqz = None
+        filter_type = str(
+            first(
+                actual.get("filter_type"),
+                actual.get("output_filter_type"),
+                configuration.get("output_filter_type"),
+            )
+            or ""
+        )
+
+        def optional_float(*values):
+            raw = first(*values)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+
+        cutoff = optional_float(
+            actual.get("filter_cutoff_ghz"),
+            actual.get("output_filter_cutoff_ghz"),
+            configuration.get("output_filter_cutoff_ghz"),
+        )
+        bandwidth = optional_float(
+            actual.get("filter_bandwidth_ghz"),
+            actual.get("output_filter_bandwidth_ghz"),
+            configuration.get("output_filter_bandwidth_ghz"),
+        )
+        return nqz, filter_type, cutoff, bandwidth
+
+    @staticmethod
+    def _output_setting_mismatches(
+        actual: Tuple[Optional[int], str, Optional[float], Optional[float]],
+        *,
+        nqz: Optional[int],
+        output_filter_type: Optional[str],
+        output_filter_cutoff_ghz: Optional[float],
+        output_filter_bandwidth_ghz: Optional[float],
+    ) -> Tuple[str, ...]:
+        actual_nqz, actual_filter, actual_cutoff, actual_bandwidth = actual
+        mismatches = []
+        if nqz is not None and actual_nqz != int(nqz):
+            actual_text = "unknown" if actual_nqz is None else str(actual_nqz)
+            mismatches.append(f"Nyquist zone {actual_text} != {int(nqz)}")
+        if (
+            output_filter_type is not None
+            and actual_filter != str(output_filter_type)
+        ):
+            mismatches.append(
+                f"filter {actual_filter or 'unknown'} != {output_filter_type}"
+            )
+        for label, actual_value, requested_value in (
+            (
+                "filter cutoff",
+                actual_cutoff,
+                output_filter_cutoff_ghz,
+            ),
+            (
+                "filter bandwidth",
+                actual_bandwidth,
+                output_filter_bandwidth_ghz,
+            ),
+        ):
+            if requested_value is None:
+                continue
+            if actual_value is None or not np.isclose(
+                actual_value,
+                float(requested_value),
+                rtol=0.0,
+                atol=1.0e-9,
+            ):
+                actual_text = (
+                    "unknown" if actual_value is None else f"{actual_value:.9g} GHz"
+                )
+                mismatches.append(
+                    f"{label} {actual_text} != {float(requested_value):.9g} GHz"
+                )
+        return tuple(mismatches)
+
     def output_calibration(
         self,
         board_type: str,
         requested_frequencies_mhz: Any,
+        *,
+        run_id: Optional[int] = None,
+        nqz: Optional[int] = None,
+        output_filter_type: Optional[str] = None,
+        output_filter_cutoff_ghz: Optional[float] = None,
+        output_filter_bandwidth_ghz: Optional[float] = None,
     ) -> GainPowerCalibration:
         board_type = _validate_board_type(board_type, output=True)
+        if run_id is not None:
+            if isinstance(run_id, (bool, np.bool_)) or not isinstance(
+                run_id, (int, np.integer)
+            ):
+                raise TypeError("run_id must be an integer")
+            run_id = int(run_id)
+            if run_id < 1:
+                raise ValueError("run_id must be positive")
+        if nqz is not None and int(nqz) not in (1, 2):
+            raise ValueError("nqz must be 1 or 2")
+        if output_filter_type is not None and str(output_filter_type) not in {
+            "bypass",
+            "lowpass",
+            "highpass",
+            "bandpass",
+        }:
+            raise ValueError("unsupported output filter type")
+        for value, name in (
+            (output_filter_cutoff_ghz, "output filter cutoff"),
+            (output_filter_bandwidth_ghz, "output filter bandwidth"),
+        ):
+            if value is not None and (
+                not np.isfinite(float(value)) or float(value) <= 0.0
+            ):
+                raise ValueError(f"{name} must be positive and finite")
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         if requested.size < 1 or not np.all(np.isfinite(requested)):
             raise ValueError("requested frequencies must be a nonempty finite array")
         requested_min = float(np.min(requested))
         requested_max = float(np.max(requested))
         candidates = []
+        incompatible_settings = []
         with self._connect() as connection:
             for row in self._candidate_rows(connection, board_type):
+                candidate_run_id = int(row["run_id"])
+                if run_id is not None and candidate_run_id != run_id:
+                    continue
                 table_name = str(row["result_table_name"])
                 columns = self._table_columns(connection, table_name)
                 if not {"gain", "freq", "pwr"}.issubset(columns):
@@ -644,23 +790,47 @@ class CalibrationDatabase:
                     and requested_max <= frequency_max + frequency_tolerance_mhz
                 )
                 att1, att2 = self._attenuation(row)
+                output_settings = self._output_path_settings(row)
+                setting_mismatches = self._output_setting_mismatches(
+                    output_settings,
+                    nqz=nqz,
+                    output_filter_type=output_filter_type,
+                    output_filter_cutoff_ghz=output_filter_cutoff_ghz,
+                    output_filter_bandwidth_ghz=output_filter_bandwidth_ghz,
+                )
+                if setting_mismatches:
+                    incompatible_settings.append(
+                        (candidate_run_id, setting_mismatches)
+                    )
+                    continue
                 candidates.append(
                     (
                         full_coverage,
                         overlap,
-                        int(row["run_id"]),
+                        candidate_run_id,
                         row,
                         raw[:, 0],
                         frequencies,
                         raw[:, 2],
                         att1,
                         att2,
+                        output_settings,
                     )
                 )
         if not candidates:
+            if incompatible_settings:
+                details = "; ".join(
+                    f"Run {candidate_run_id}: {', '.join(reasons)}"
+                    for candidate_run_id, reasons in incompatible_settings
+                )
+                raise LookupError(
+                    f"no compatible {board_type} output calibration for the "
+                    f"selected Nyquist/filter settings; {details}"
+                )
+            run_text = "" if run_id is None else f" Run {run_id}"
             raise LookupError(
-                f"no gain/frequency/power calibration run exists for {board_type} "
-                f"in {self.database_path}"
+                f"no gain/frequency/power calibration{run_text} exists for "
+                f"{board_type} in {self.database_path}"
             )
         candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
         selected = candidates[0]
@@ -674,7 +844,18 @@ class CalibrationDatabase:
                 f"no {board_type} calibration run fully covers requested "
                 f"{requested_min:.6g}..{requested_max:.6g} MHz; available {available}"
             )
-        _, _, run_id, row, gains, frequencies, powers, att1, att2 = selected
+        (
+            _,
+            _,
+            selected_run_id,
+            row,
+            gains,
+            frequencies,
+            powers,
+            att1,
+            att2,
+            output_settings,
+        ) = selected
         curves: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
         for frequency in np.unique(frequencies):
             mask = np.isclose(frequencies, frequency, rtol=0.0, atol=1.0e-9)
@@ -694,7 +875,7 @@ class CalibrationDatabase:
             )
         summary = CalibrationRunSummary(
             database_path=self.database_path,
-            run_id=int(run_id),
+            run_id=int(selected_run_id),
             experiment_id=int(row["exp_id"]),
             board_type=board_type,
             sample_name=str(row["sample_name"]),
@@ -706,6 +887,10 @@ class CalibrationDatabase:
             calibration_att1_db=float(att1),
             calibration_att2_db=float(att2),
             purpose="output_power",
+            output_nqz=output_settings[0],
+            output_filter_type=output_settings[1],
+            output_filter_cutoff_ghz=output_settings[2],
+            output_filter_bandwidth_ghz=output_settings[3],
         )
         return GainPowerCalibration(summary, curves)
 

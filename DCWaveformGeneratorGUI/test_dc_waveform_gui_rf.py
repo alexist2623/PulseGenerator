@@ -449,6 +449,139 @@ def test_rf_duration_sweep_controls_build_sequence_axis_and_round_trip():
     window.close()
 
 
+def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.setChecked(True)
+    panel.output_board_type.setCurrentText("RF_Out")
+    panel.frequency_mhz.setValue(450.0)
+    panel.att1_db.setValue(10.0)
+    panel.att2_db.setValue(5.0)
+    panel.nqz.setValue(2)
+    panel.filter_type.setCurrentText("highpass")
+    panel.filter_cutoff.setValue(1.5)
+    panel.filter_bandwidth.setValue(0.4)
+    panel.power_calibration_database_path.setText("calibration.db")
+    panel.power_calibration_run_id.setValue(42)
+    panel.target_output_power_dbm.setValue(-25.0)
+    panel.power_calibration_group.setChecked(True)
+    app.processEvents()
+
+    calls = {}
+
+    class FakeCalibration:
+        summary = SimpleNamespace(run_id=42)
+
+        def frequency_response_dbm(self, frequencies):
+            calls["response_frequencies"] = list(frequencies)
+            return np.asarray([-5.0])
+
+        def nominal_gain_for_power(self, target, **kwargs):
+            calls["nominal"] = (target, kwargs)
+            return 1234
+
+        def output_power_dbm(self, frequencies, gains, **kwargs):
+            calls["predicted"] = (list(frequencies), list(gains), kwargs)
+            return np.asarray([-25.0])
+
+    class FakeCalibrationDatabase:
+        def __init__(self, path):
+            calls["database_path"] = path
+
+        def output_calibration(self, board_type, frequencies, **kwargs):
+            calls["lookup"] = (board_type, list(frequencies), kwargs)
+            return FakeCalibration()
+
+    monkeypatch.setattr(gui, "CalibrationDatabase", FakeCalibrationDatabase)
+
+    assert panel._apply_calibrated_output_power() == 1234
+    assert panel.gain.value() == 1234
+    assert calls["database_path"] == "calibration.db"
+    board_type, frequencies, lookup = calls["lookup"]
+    assert board_type == "RF_Out"
+    assert frequencies == [450.0]
+    assert lookup == {
+        "run_id": 42,
+        "nqz": 2,
+        "output_filter_type": "highpass",
+        "output_filter_cutoff_ghz": 1.5,
+        "output_filter_bandwidth_ghz": 0.4,
+    }
+    assert calls["nominal"] == (
+        -25.0,
+        {
+            "reference_response_dbm": -5.0,
+            "output_att1_db": 10.0,
+            "output_att2_db": 5.0,
+        },
+    )
+    assert calls["predicted"] == (
+        [450.0],
+        [1234],
+        {
+            "output_att1_db": 10.0,
+            "output_att2_db": 5.0,
+        },
+    )
+    assert "Run 42" in panel.power_calibration_status.text()
+
+    settings = panel.settings_dict()
+    restored = gui.RfPulsePortPanel(
+        window._pulse[0],
+        0,
+        time_unit="us",
+    )
+    restored.load_settings(settings)
+    assert restored.power_calibration_group.isChecked() is True
+    assert restored.power_calibration_database_path.text() == "calibration.db"
+    assert restored.power_calibration_run_id.value() == 42
+    assert restored.target_output_power_dbm.value() == -25.0
+
+    panel.validate_power_calibration()
+    panel.gain.setValue(1235)
+    with pytest.raises(ValueError, match="click Apply calibrated gain"):
+        panel.validate_power_calibration()
+    restored.close()
+    window.close()
+
+
+def test_rf_output_power_calibration_mismatch_preserves_gain(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.output_board_type.setCurrentText("RF_Out")
+    panel.gain.setValue(20_000)
+    panel.power_calibration_database_path.setText("calibration.db")
+    panel.power_calibration_group.setChecked(True)
+    app.processEvents()
+
+    class FakeCalibrationDatabase:
+        def __init__(self, _path):
+            pass
+
+        def output_calibration(self, *_args, **_kwargs):
+            raise LookupError(
+                "no compatible calibration: Nyquist zone or filter mismatch"
+            )
+
+    warnings = []
+    monkeypatch.setattr(gui, "CalibrationDatabase", FakeCalibrationDatabase)
+    monkeypatch.setattr(
+        gui.QtWidgets.QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    assert panel._apply_calibrated_output_power() is None
+    assert panel.gain.value() == 20_000
+    assert "filter mismatch" in panel.power_calibration_status.text()
+    assert len(warnings) == 1
+    window.close()
+
+
 def test_generated_qick_module_preserves_rf_duration_sweep_mode():
     pulse = PulseSequence(0.0, initial_duration_ns=10_000.0)
     rf_spec = QickRfPulseSpec(
@@ -1321,7 +1454,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 30
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 31
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

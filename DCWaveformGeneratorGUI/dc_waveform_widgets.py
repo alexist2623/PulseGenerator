@@ -127,8 +127,23 @@ class TracePlotWidget(pg.PlotWidget):
         self._time_unit = "us"
         self._point_records: Tuple[dict, ...] = ()
         self._point_labels: List[pg.TextItem] = []
+        self._ramp_labels: List[pg.TextItem] = []
+        self._hover_label = pg.TextItem(
+            text="",
+            color=(18, 18, 18),
+            anchor=(0.5, 1.0),
+            border=pg.mkPen((45, 45, 45, 190)),
+            fill=pg.mkBrush(255, 255, 230, 235),
+        )
+        self._hover_label.setZValue(20)
+        self.addItem(self._hover_label, ignoreBounds=True)
+        self._hover_label.hide()
         self._stability_result = None
+        self._stability_quantity = "magnitude"
         self._stability_overlay_active = False
+        self._stability_bounds: Optional[
+            Tuple[float, float, float, float]
+        ] = None
         self._default_title = "Select X/Y outputs"
 
     @property
@@ -150,19 +165,8 @@ class TracePlotWidget(pg.PlotWidget):
         if self._pulses:
             self.refresh_trace(self._pulses)
 
-    def _point_timing_text(self, record: dict, *, multiline: bool) -> str:
-        separator = "\n" if multiline else " | "
-        timing = []
-        if record["point_index"]:
-            timing.append(
-                "Ramp "
-                + _duration_pair_text(
-                    record["ramp_x_ns"],
-                    record["ramp_y_ns"],
-                    self._time_unit,
-                )
-            )
-        timing.append(
+    def _point_timing_text(self, record: dict) -> str:
+        return (
             "Hold "
             + _duration_pair_text(
                 record["hold_x_ns"],
@@ -170,7 +174,16 @@ class TracePlotWidget(pg.PlotWidget):
                 self._time_unit,
             )
         )
-        return separator.join(timing)
+
+    def _ramp_timing_text(self, record: dict) -> str:
+        return (
+            "Ramp "
+            + _duration_pair_text(
+                record["ramp_x_ns"],
+                record["ramp_y_ns"],
+                self._time_unit,
+            )
+        )
 
     def _point_tooltip(self, _x, _y, data) -> str:
         if not isinstance(data, dict):
@@ -178,25 +191,40 @@ class TracePlotWidget(pg.PlotWidget):
         return (
             f"P{data['point_index']} | "
             f"X {data['x_mv']:.6g} mV | Y {data['y_mv']:.6g} mV | "
-            f"{self._point_timing_text(data, multiline=False)}"
+            f"{self._point_timing_text(data)}"
         )
 
     def _points_hovered(self, _item, points, _event) -> None:
         if points:
-            self.setTitle(
-                self._point_tooltip(
-                    points[0].pos().x(),
-                    points[0].pos().y(),
-                    points[0].data(),
-                )
+            point = points[0]
+            data = point.data()
+            tooltip = self._point_tooltip(
+                point.pos().x(),
+                point.pos().y(),
+                data,
             )
+            self.setTitle(tooltip)
+            if isinstance(data, dict):
+                self._hover_label.setText(
+                    f"P{data['point_index']}\n"
+                    f"X {data['x_mv']:.6g} mV\n"
+                    f"Y {data['y_mv']:.6g} mV\n"
+                    f"{self._point_timing_text(data)}"
+                )
+                self._hover_label.setPos(point.pos().x(), point.pos().y())
+                self._hover_label.show()
         else:
+            self._hover_label.hide()
             self.setTitle(self._default_title)
 
     def _clear_point_labels(self) -> None:
         for label in self._point_labels:
             self.removeItem(label)
         self._point_labels.clear()
+        for label in self._ramp_labels:
+            self.removeItem(label)
+        self._ramp_labels.clear()
+        self._hover_label.hide()
 
     def _refresh_point_items(
         self,
@@ -214,7 +242,7 @@ class TracePlotWidget(pg.PlotWidget):
             label = pg.TextItem(
                 text=(
                     f"P{record['point_index']}\n"
-                    + self._point_timing_text(record, multiline=True)
+                    + self._point_timing_text(record)
                 ),
                 color=(18, 18, 18),
                 anchor=(0.0, 1.0),
@@ -223,8 +251,24 @@ class TracePlotWidget(pg.PlotWidget):
             )
             label.setZValue(14)
             label.setPos(record["x_mv"], record["y_mv"])
-            self.addItem(label)
+            self.addItem(label, ignoreBounds=True)
             self._point_labels.append(label)
+            if record["point_index"]:
+                previous = self._point_records[record["point_index"] - 1]
+                ramp_label = pg.TextItem(
+                    text=self._ramp_timing_text(record),
+                    color=(18, 18, 18),
+                    anchor=(0.5, 1.0),
+                    border=pg.mkPen((125, 90, 0, 150)),
+                    fill=pg.mkBrush(255, 248, 205, 205),
+                )
+                ramp_label.setZValue(15)
+                ramp_label.setPos(
+                    0.5 * (previous["x_mv"] + record["x_mv"]),
+                    0.5 * (previous["y_mv"] + record["y_mv"]),
+                )
+                self.addItem(ramp_label, ignoreBounds=True)
+                self._ramp_labels.append(ramp_label)
         self._point_scatter.setData(spots)
 
     @staticmethod
@@ -249,17 +293,38 @@ class TracePlotWidget(pg.PlotWidget):
             high += delta
         return low, high
 
-    def set_stability_overlay(self, result) -> None:
-        """Show the newest matching stability magnitude below the trace."""
+    def set_stability_overlay(self, result, quantity: str = "magnitude") -> None:
+        """Show one selected Stability Diagram quantity below the trace."""
+        if quantity not in {"i", "q", "magnitude", "phase"}:
+            raise ValueError(f"unsupported Stability overlay data {quantity!r}")
         self._stability_result = result
+        self._stability_quantity = quantity
         self._refresh_stability_overlay()
+
+    def _stability_values(self, result) -> Tuple[np.ndarray, str, str]:
+        if self._stability_quantity == "i":
+            return np.asarray(result.i_mean, dtype=float), "I", result.value_unit
+        if self._stability_quantity == "q":
+            return np.asarray(result.q_mean, dtype=float), "Q", result.value_unit
+        if self._stability_quantity == "phase":
+            return (
+                np.asarray(result.phase_deg, dtype=float),
+                "Phase",
+                "deg",
+            )
+        return (
+            np.asarray(result.magnitude, dtype=float),
+            "Magnitude",
+            result.value_unit,
+        )
 
     def _refresh_stability_overlay(self) -> None:
         self._stability_overlay_active = False
+        self._stability_bounds = None
         self._stability_image.hide()
         result = self._stability_result
         if result is None:
-            self._default_title = "Hover a P# marker for hold/ramp timing"
+            self._default_title = "Hover a P# marker for X/Y values and hold time"
             self.setTitle(self._default_title)
             return
         if not self.has_selection:
@@ -269,14 +334,14 @@ class TracePlotWidget(pg.PlotWidget):
 
         trace_axes = (f"awg_{self.x_idx}", f"awg_{self.y_idx}")
         result_axes = (str(result.x_axis_label), str(result.y_axis_label))
+        overlay, quantity_label, quantity_unit = self._stability_values(result)
         if result_axes == trace_axes:
             x_values = np.asarray(result.x_voltage_mv, dtype=float)
             y_values = np.asarray(result.y_voltage_mv, dtype=float)
-            magnitude = np.asarray(result.magnitude, dtype=float)
         elif result_axes == trace_axes[::-1]:
             x_values = np.asarray(result.y_voltage_mv, dtype=float)
             y_values = np.asarray(result.x_voltage_mv, dtype=float)
-            magnitude = np.asarray(result.magnitude, dtype=float).T
+            overlay = overlay.T
         else:
             self._default_title = (
                 "Last stability scan axes "
@@ -288,7 +353,7 @@ class TracePlotWidget(pg.PlotWidget):
 
         x_low, x_high = self._axis_edges(x_values)
         y_low, y_high = self._axis_edges(y_values)
-        self._stability_image.setImage(magnitude, autoLevels=False)
+        self._stability_image.setImage(overlay, autoLevels=False)
         self._stability_image.setRect(
             QtCore.QRectF(
                 x_low,
@@ -297,13 +362,17 @@ class TracePlotWidget(pg.PlotWidget):
                 y_high - y_low,
             )
         )
-        levels = self._finite_levels(magnitude)
+        levels = self._finite_levels(overlay)
         self._stability_image.setLevels(levels)
         self._stability_image.show()
         self._stability_overlay_active = True
+        self._stability_bounds = (x_low, x_high, y_low, y_high)
+        source_label = (
+            str(getattr(result, "source_label", "")).strip()
+            or f"Stability scan {result.iteration}"
+        )
         self._default_title = (
-            f"Trace over Stability scan {result.iteration} magnitude "
-            f"[{result.value_unit}]"
+            f"Trace over {source_label} {quantity_label} [{quantity_unit}]"
         )
         self.setTitle(self._default_title)
 
@@ -330,8 +399,17 @@ class TracePlotWidget(pg.PlotWidget):
         self._refresh_stability_overlay()
 
     def fit_view(self) -> None:
-        if self.has_selection:
-            self.getPlotItem().autoRange(padding=0.08)
+        if not self.has_selection:
+            return
+        if (
+            self._stability_overlay_active
+            and self._stability_bounds is not None
+        ):
+            x_low, x_high, y_low, y_high = self._stability_bounds
+            self.setXRange(x_low, x_high, padding=0.0)
+            self.setYRange(y_low, y_high, padding=0.0)
+            return
+        self.getPlotItem().autoRange(padding=0.08)
 
 
 class RfPulsePreviewWidget(pg.PlotWidget):

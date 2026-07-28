@@ -10,6 +10,7 @@ from dataclasses import asdict, replace
 from math import prod
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import traceback
 from typing import Tuple, Optional, List, Callable, Mapping, Sequence
@@ -186,14 +187,18 @@ except ImportError:
 
 try:
     from .awg_sweep_map import (
+        AwgSweepMapLoadWorker,
         AwgSweepMapPlotWidget,
+        AwgSweepRunSelector,
         normalize_awg_sweep_color_ranges,
         normalize_awg_sweep_visible_data,
         reduce_awg_sweep_map,
     )
 except ImportError:
     from awg_sweep_map import (
+        AwgSweepMapLoadWorker,
         AwgSweepMapPlotWidget,
+        AwgSweepRunSelector,
         normalize_awg_sweep_color_ranges,
         normalize_awg_sweep_visible_data,
         reduce_awg_sweep_map,
@@ -222,6 +227,8 @@ try:
     from .stability_diagram import (
         StabilityDiagramPanel,
         StabilityDiagramWorker,
+        StabilityOverlayLoadWorker,
+        StabilityOverlaySelector,
         build_stability_hold_sequence,
         normalize_stability_settings,
     )
@@ -229,6 +236,8 @@ except ImportError:
     from stability_diagram import (
         StabilityDiagramPanel,
         StabilityDiagramWorker,
+        StabilityOverlayLoadWorker,
+        StabilityOverlaySelector,
         build_stability_hold_sequence,
         normalize_stability_settings,
     )
@@ -260,6 +269,7 @@ try:
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
     )
+    from .power_calibration import CalibrationDatabase
     from .dc_voltage_calibration import DcVoltageCalibrationConfig
 except ImportError:
     from calibration_gui import (
@@ -273,6 +283,7 @@ except ImportError:
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
     )
+    from power_calibration import CalibrationDatabase
     from dc_voltage_calibration import DcVoltageCalibrationConfig
 
 try:
@@ -299,12 +310,13 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 30
+SETTINGS_VERSION = 31
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
 DEFAULT_QCODES_DB_PATH = str(Path.home() / "qick_experiments.db")
+DEFAULT_POWER_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
 DEFAULT_BIAS_T_COMPENSATION_MV = (
     DEFAULT_QICK_FULL_SCALE_MV * DEFAULT_BIAS_T_COMPENSATION_FRACTION
 )
@@ -331,6 +343,10 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "phase_degrees": 0.0,
     "nqz": 1,
     "require_within_segment": True,
+    "power_calibration_enabled": False,
+    "power_calibration_database_path": DEFAULT_POWER_CALIBRATION_DB_PATH,
+    "power_calibration_run_id": 0,
+    "target_output_power_dbm": -20.0,
 }
 
 DEFAULT_RF_READOUT_SETTINGS = {
@@ -435,6 +451,10 @@ class _MatplotlibTracePlotWidget(Canvas):
         self._pan_origin: Optional[Tuple[float, float]] = None
         self._time_unit = "us"
         self._stability_result = None
+        self._stability_quantity = "magnitude"
+        self._stability_bounds: Optional[
+            Tuple[float, float, float, float]
+        ] = None
 
         self.mpl_connect("motion_notify_event",  self._on_move)
         self.mpl_connect("button_press_event",   self._on_press)
@@ -460,10 +480,30 @@ class _MatplotlibTracePlotWidget(Canvas):
         if self._pulse:
             self.refresh_trace(self._pulse)
 
-    def set_stability_overlay(self, result) -> None:
+    def set_stability_overlay(self, result, quantity: str = "magnitude") -> None:
+        if quantity not in {"i", "q", "magnitude", "phase"}:
+            raise ValueError(f"unsupported Stability overlay data {quantity!r}")
         self._stability_result = result
+        self._stability_quantity = quantity
         if self._pulse:
             self.refresh_trace(self._pulse)
+
+    def _stability_values(self, result) -> Tuple[np.ndarray, str, str]:
+        if self._stability_quantity == "i":
+            return np.asarray(result.i_mean, dtype=float), "I", result.value_unit
+        if self._stability_quantity == "q":
+            return np.asarray(result.q_mean, dtype=float), "Q", result.value_unit
+        if self._stability_quantity == "phase":
+            return (
+                np.asarray(result.phase_deg, dtype=float),
+                "Phase",
+                "deg",
+            )
+        return (
+            np.asarray(result.magnitude, dtype=float),
+            "Magnitude",
+            result.value_unit,
+        )
 
     def _duration_pair_text(
         self,
@@ -490,19 +530,20 @@ class _MatplotlibTracePlotWidget(Canvas):
         return float(values[0] - step / 2.0), float(values[-1] + step / 2.0)
 
     def _draw_stability_overlay(self) -> None:
+        self._stability_bounds = None
         result = self._stability_result
         if result is None or self.x_idx is None or self.y_idx is None:
             return
         trace_axes = (f"awg_{self.x_idx}", f"awg_{self.y_idx}")
         result_axes = (str(result.x_axis_label), str(result.y_axis_label))
+        overlay, quantity_label, quantity_unit = self._stability_values(result)
         if result_axes == trace_axes:
             x_values = np.asarray(result.x_voltage_mv, dtype=float)
             y_values = np.asarray(result.y_voltage_mv, dtype=float)
-            magnitude = np.asarray(result.magnitude, dtype=float)
         elif result_axes == trace_axes[::-1]:
             x_values = np.asarray(result.y_voltage_mv, dtype=float)
             y_values = np.asarray(result.x_voltage_mv, dtype=float)
-            magnitude = np.asarray(result.magnitude, dtype=float).T
+            overlay = overlay.T
         else:
             self.ax.set_title(
                 "Last stability scan axes do not match selected trace"
@@ -511,7 +552,7 @@ class _MatplotlibTracePlotWidget(Canvas):
         x_low, x_high = self._axis_edges(x_values)
         y_low, y_high = self._axis_edges(y_values)
         self.ax.imshow(
-            magnitude,
+            overlay,
             extent=(x_low, x_high, y_low, y_high),
             origin="lower",
             aspect="auto",
@@ -519,9 +560,13 @@ class _MatplotlibTracePlotWidget(Canvas):
             cmap="viridis",
             zorder=0,
         )
+        self._stability_bounds = (x_low, x_high, y_low, y_high)
+        source_label = (
+            str(getattr(result, "source_label", "")).strip()
+            or f"Stability scan {result.iteration}"
+        )
         self.ax.set_title(
-            f"Trace over Stability scan {result.iteration} magnitude "
-            f"[{result.value_unit}]"
+            f"Trace over {source_label} {quantity_label} [{quantity_unit}]"
         )
 
     def _draw_point_timing(
@@ -537,12 +582,6 @@ class _MatplotlibTracePlotWidget(Canvas):
                 pulse_y.t[flat_index + 1] - pulse_y.t[flat_index],
             )
             lines = [f"P{point_index}", f"Hold {hold_text}"]
-            if point_index:
-                ramp_text = self._duration_pair_text(
-                    pulse_x.t[flat_index] - pulse_x.t[flat_index - 1],
-                    pulse_y.t[flat_index] - pulse_y.t[flat_index - 1],
-                )
-                lines.insert(1, f"Ramp {ramp_text}")
             self.ax.annotate(
                 "\n".join(lines),
                 (
@@ -560,6 +599,37 @@ class _MatplotlibTracePlotWidget(Canvas):
                     "alpha": 0.78,
                 },
             )
+            if point_index:
+                ramp_text = self._duration_pair_text(
+                    pulse_x.t[flat_index] - pulse_x.t[flat_index - 1],
+                    pulse_y.t[flat_index] - pulse_y.t[flat_index - 1],
+                )
+                previous_flat_index = flat_index - 2
+                self.ax.annotate(
+                    f"Ramp {ramp_text}",
+                    (
+                        0.5 * (
+                            float(pulse_x.v[previous_flat_index])
+                            + float(pulse_x.v[flat_index])
+                        ),
+                        0.5 * (
+                            float(pulse_y.v[previous_flat_index])
+                            + float(pulse_y.v[flat_index])
+                        ),
+                    ),
+                    xytext=(0, 7),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    zorder=4,
+                    bbox={
+                        "boxstyle": "round,pad=0.2",
+                        "facecolor": "#fff8cd",
+                        "edgecolor": "#7d5a00",
+                        "alpha": 0.82,
+                    },
+                )
 
     def refresh_trace(self, pulses: list[PulseSequence]):
         """Refresh the trace plot with the selected pulses."""
@@ -602,6 +672,12 @@ class _MatplotlibTracePlotWidget(Canvas):
             self.y_idx >= len(self._pulse)
         ):
             self.ax.cla()
+            self.draw_idle()
+            return
+        if self._stability_bounds is not None:
+            x_low, x_high, y_low, y_high = self._stability_bounds
+            self.ax.set_xlim(x_low, x_high)
+            self.ax.set_ylim(y_low, y_high)
             self.draw_idle()
             return
         margin_x = max(0.5, 0.03 * float(np.ptp(self._pulse[self.x_idx].v)))
@@ -2364,6 +2440,71 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.gain = QtWidgets.QSpinBox()
         self.gain.setRange(-32768, 32767)
         self.gain.setValue(20000)
+        self._power_calibration_resolved_signature = None
+        self.power_calibration_group = QtWidgets.QGroupBox(
+            "Calibrated output power"
+        )
+        self.power_calibration_group.setCheckable(True)
+        self.power_calibration_group.setChecked(False)
+        power_calibration_form = QtWidgets.QFormLayout(
+            self.power_calibration_group
+        )
+        self.power_calibration_database_path = QtWidgets.QLineEdit(
+            DEFAULT_POWER_CALIBRATION_DB_PATH
+        )
+        self.power_calibration_database_path.setPlaceholderText(
+            "Select gain_pwr_calb.db"
+        )
+        browse_power_calibration = QtWidgets.QToolButton()
+        browse_power_calibration.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        browse_power_calibration.setToolTip(
+            "Choose an RF output power calibration database"
+        )
+        browse_power_calibration.clicked.connect(
+            self._browse_power_calibration_database
+        )
+        power_calibration_database_row = QtWidgets.QHBoxLayout()
+        power_calibration_database_row.addWidget(
+            self.power_calibration_database_path,
+            1,
+        )
+        power_calibration_database_row.addWidget(browse_power_calibration)
+        self.power_calibration_run_id = QtWidgets.QSpinBox()
+        self.power_calibration_run_id.setRange(0, 2_147_483_647)
+        self.power_calibration_run_id.setSpecialValueText(
+            "Latest compatible"
+        )
+        self.target_output_power_dbm = QtWidgets.QDoubleSpinBox()
+        self.target_output_power_dbm.setRange(-200.0, 100.0)
+        self.target_output_power_dbm.setDecimals(6)
+        self.target_output_power_dbm.setSuffix(" dBm")
+        self.target_output_power_dbm.setValue(-20.0)
+        self.apply_power_calibration = QtWidgets.QPushButton(
+            "Apply calibrated gain"
+        )
+        self.apply_power_calibration.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+        )
+        self.power_calibration_status = QtWidgets.QLabel(
+            "Select a calibration database and target connector power."
+        )
+        self.power_calibration_status.setWordWrap(True)
+        power_calibration_form.addRow(
+            "Calibration DB:",
+            power_calibration_database_row,
+        )
+        power_calibration_form.addRow(
+            "Calibration Run ID:",
+            self.power_calibration_run_id,
+        )
+        power_calibration_form.addRow(
+            "Target output power:",
+            self.target_output_power_dbm,
+        )
+        power_calibration_form.addRow(self.apply_power_calibration)
+        power_calibration_form.addRow("Status:", self.power_calibration_status)
         self.att1_db = QtWidgets.QDoubleSpinBox()
         self.att2_db = QtWidgets.QDoubleSpinBox()
         for attenuator in (self.att1_db, self.att2_db):
@@ -2425,6 +2566,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow("AWG segment timing:", self.segment_length_mode)
         form.addRow("Frequency:", self.frequency_mhz)
         form.addRow("Gain:", self.gain)
+        form.addRow(self.power_calibration_group)
         shared_path_note = QtWidgets.QLabel(
             "ATT and filter settings are edited from the HWH-backed Front Panel."
         )
@@ -2476,8 +2618,38 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.duration_sweep_enabled.toggled.connect(
             self._update_duration_sweep_controls
         )
+        self.apply_power_calibration.clicked.connect(
+            self._apply_calibrated_output_power
+        )
+        self.power_calibration_group.toggled.connect(
+            self._update_power_calibration_controls
+        )
+        for calibration_input in (
+            self.power_calibration_database_path,
+            self.power_calibration_run_id,
+            self.target_output_power_dbm,
+            self.frequency_mhz,
+            self.gain,
+            self.att1_db,
+            self.att2_db,
+            self.filter_type,
+            self.filter_cutoff,
+            self.filter_bandwidth,
+            self.nqz,
+        ):
+            signal = getattr(calibration_input, "textChanged", None)
+            if signal is None:
+                signal = getattr(calibration_input, "valueChanged", None)
+            if signal is None:
+                signal = getattr(
+                    calibration_input,
+                    "currentTextChanged",
+                    None,
+                )
+            signal.connect(self._mark_power_calibration_stale)
         self._update_board_controls()
         self._update_duration_sweep_controls()
+        self._update_power_calibration_controls()
         self.set_index(index)
 
     def _update_duration_sweep_controls(self, *_args) -> None:
@@ -2489,6 +2661,165 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.segment_length_mode,
         ):
             widget.setEnabled(enabled)
+
+    def _set_power_calibration_status(
+        self,
+        message: str,
+        *,
+        state: str = "neutral",
+    ) -> None:
+        colors = {
+            "neutral": "#4f5b66",
+            "stale": "#9a6700",
+            "success": "#1a7f37",
+            "error": "#cf222e",
+        }
+        self.power_calibration_status.setText(str(message))
+        self.power_calibration_status.setStyleSheet(
+            f"QLabel {{ color: {colors[state]}; }}"
+        )
+
+    def _update_power_calibration_controls(self, *_args) -> None:
+        rf_output = self.output_board_type.currentText() == "RF_Out"
+        self.power_calibration_group.setEnabled(rf_output)
+        self.apply_power_calibration.setEnabled(
+            rf_output
+            and self.power_calibration_group.isChecked()
+            and bool(self.power_calibration_database_path.text().strip())
+        )
+        if not rf_output:
+            self._set_power_calibration_status(
+                "Calibrated power selection requires an RF_Out board.",
+                state="error",
+            )
+        elif not self.power_calibration_group.isChecked():
+            self._set_power_calibration_status(
+                "Enable this group to select output power from calibration.",
+            )
+
+    def _mark_power_calibration_stale(self, *_args) -> None:
+        self._power_calibration_resolved_signature = None
+        self._update_power_calibration_controls()
+        if (
+            self.output_board_type.currentText() == "RF_Out"
+            and self.power_calibration_group.isChecked()
+        ):
+            self._set_power_calibration_status(
+                "Calibration inputs changed. Apply the calibrated gain again.",
+                state="stale",
+            )
+
+    def _browse_power_calibration_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose RF output power calibration database",
+            self.power_calibration_database_path.text().strip()
+            or DEFAULT_POWER_CALIBRATION_DB_PATH,
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.power_calibration_database_path.setText(path)
+
+    def _apply_calibrated_output_power(self) -> Optional[int]:
+        try:
+            if self.output_board_type.currentText() != "RF_Out":
+                raise ValueError(
+                    "calibrated output power is available only for RF_Out"
+                )
+            if not self.power_calibration_group.isChecked():
+                raise ValueError("enable Calibrated output power first")
+            database_path = self.power_calibration_database_path.text().strip()
+            if not database_path:
+                raise ValueError("select a calibration database")
+            frequency_mhz = self.frequency_mhz.value()
+            selected_run_id = self.power_calibration_run_id.value()
+            calibration = CalibrationDatabase(
+                database_path
+            ).output_calibration(
+                "RF_Out",
+                [frequency_mhz],
+                run_id=selected_run_id or None,
+                nqz=self.nqz.value(),
+                output_filter_type=self.filter_type.currentText(),
+                output_filter_cutoff_ghz=self.filter_cutoff.value(),
+                output_filter_bandwidth_ghz=self.filter_bandwidth.value(),
+            )
+            response_dbm = float(
+                calibration.frequency_response_dbm([frequency_mhz])[0]
+            )
+            target_power_dbm = self.target_output_power_dbm.value()
+            gain = calibration.nominal_gain_for_power(
+                target_power_dbm,
+                reference_response_dbm=response_dbm,
+                output_att1_db=self.att1_db.value(),
+                output_att2_db=self.att2_db.value(),
+            )
+            predicted_power_dbm = float(
+                calibration.output_power_dbm(
+                    [frequency_mhz],
+                    [gain],
+                    output_att1_db=self.att1_db.value(),
+                    output_att2_db=self.att2_db.value(),
+                )[0]
+            )
+        except (
+            LookupError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            self._power_calibration_resolved_signature = None
+            self._set_power_calibration_status(str(exc), state="error")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No compatible output calibration",
+                str(exc),
+            )
+            return None
+
+        with QtCore.QSignalBlocker(self.gain):
+            self.gain.setValue(int(gain))
+        self._power_calibration_resolved_signature = (
+            str(Path(database_path).expanduser()),
+            int(calibration.summary.run_id),
+            float(frequency_mhz),
+            int(self.nqz.value()),
+            str(self.filter_type.currentText()),
+            float(self.filter_cutoff.value()),
+            float(self.filter_bandwidth.value()),
+            float(self.att1_db.value()),
+            float(self.att2_db.value()),
+            float(target_power_dbm),
+            int(gain),
+        )
+        self._set_power_calibration_status(
+            f"Run {calibration.summary.run_id}: gain {gain} gives "
+            f"{predicted_power_dbm:.6g} dBm at {frequency_mhz:.6g} MHz. "
+            f"Current ATT1/ATT2 {self.att1_db.value():.2f}/"
+            f"{self.att2_db.value():.2f} dB; Nyquist zone and "
+            f"{self.filter_type.currentText()} filter matched.",
+            state="success",
+        )
+        self.changed.emit()
+        return int(gain)
+
+    def validate_power_calibration(self) -> None:
+        """Reject an enabled calibrated-power request that is not current."""
+        if not self.isChecked() or not self.power_calibration_group.isChecked():
+            return
+        if self.output_board_type.currentText() != "RF_Out":
+            raise ValueError(
+                f"RF Output {self._index + 1} calibrated power requires "
+                "an RF_Out board"
+            )
+        if self._power_calibration_resolved_signature is None:
+            raise ValueError(
+                f"RF Output {self._index + 1} calibrated power is not applied "
+                "for the current frequency, ATT, Nyquist zone, and filter "
+                "settings; click Apply calibrated gain"
+            )
 
     def _update_board_controls(self, *_args) -> None:
         has_attenuators = self.output_board_type.currentText() == "RF_Out"
@@ -2506,6 +2837,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.filter_type.setToolTip(tooltip)
         self.filter_cutoff.setToolTip(tooltip)
         self.filter_bandwidth.setToolTip(tooltip)
+        self._mark_power_calibration_stale()
 
     def set_front_panel_configuration(self, configuration) -> None:
         self._front_panel_configuration = configuration
@@ -2664,6 +2996,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "duration_sweep_stop_us": spec.duration_sweep_stop_us,
             "duration_sweep_count": spec.duration_sweep_count,
             "segment_length_mode": spec.segment_length_mode,
+            "power_calibration_enabled": (
+                self.power_calibration_group.isChecked()
+            ),
+            "power_calibration_database_path": (
+                self.power_calibration_database_path.text().strip()
+            ),
+            "power_calibration_run_id": self.power_calibration_run_id.value(),
+            "target_output_power_dbm": self.target_output_power_dbm.value(),
         }
 
     def load_settings(self, data: dict) -> None:
@@ -2681,6 +3021,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             raise TypeError("RF require_within_segment must be boolean")
         if not isinstance(duration_sweep_enabled, bool):
             raise TypeError("RF duration_sweep_enabled must be boolean")
+        power_calibration_enabled = data.get(
+            "power_calibration_enabled",
+            False,
+        )
+        if not isinstance(power_calibration_enabled, bool):
+            raise TypeError("RF power_calibration_enabled must be boolean")
         spec = QickRfPulseSpec(
             gen_ch=int(data["gen_ch"]),
             segment_name=str(data["segment_name"]),
@@ -2758,8 +3104,26 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.phase_degrees.setValue(spec.phase_degrees)
         self.nqz.setValue(spec.nqz)
         self.require_within.setChecked(spec.require_within_segment)
+        self.power_calibration_database_path.setText(
+            str(
+                data.get(
+                    "power_calibration_database_path",
+                    DEFAULT_POWER_CALIBRATION_DB_PATH,
+                )
+            )
+        )
+        self.power_calibration_run_id.setValue(
+            int(data.get("power_calibration_run_id", 0))
+        )
+        self.target_output_power_dbm.setValue(
+            float(data.get("target_output_power_dbm", -20.0))
+        )
+        self.power_calibration_group.setChecked(
+            power_calibration_enabled
+        )
         self._update_board_controls()
         self._update_duration_sweep_controls()
+        self._update_power_calibration_controls()
         self.setChecked(enabled)
 
 
@@ -5272,6 +5636,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_worker: Optional[QtCore.QObject] = None
         self._last_experiment_result = None
         self._last_stability_result = None
+        self._trace_overlay_result = None
+        self._trace_overlay_pinned = False
+        self._trace_overlay_quantity = "magnitude"
+        self._stability_overlay_thread: Optional[QtCore.QThread] = None
+        self._stability_overlay_worker: Optional[QtCore.QObject] = None
+        self._stability_plot_load_thread: Optional[QtCore.QThread] = None
+        self._stability_plot_load_worker: Optional[QtCore.QObject] = None
+        self._awg_sweep_load_thread: Optional[QtCore.QThread] = None
+        self._awg_sweep_load_worker: Optional[QtCore.QObject] = None
+        self._last_awg_sweep_map_result = None
         self._grid_time_ns = 1000.0
         self._grid_voltage_mv = 100.0
         self._grid_snap_enabled = False
@@ -5367,6 +5741,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._stability_panel.single_shot_requested.connect(
             lambda: self._run_stability_diagram(continuous=False)
+        )
+        self._stability_panel.saved_run_requested.connect(
+            self._load_stability_saved_run
         )
         self._stability_panel.front_panel_requested.connect(
             lambda: self._show_qick_front_panel("path", self._stability_panel)
@@ -5470,6 +5847,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._trace_placeholder.setAlignment(QtCore.Qt.AlignCenter)
         self._trace_placeholder.setWordWrap(True)
+        self._trace_overlay_selector = StabilityOverlaySelector(self)
+        self._trace_overlay_selector.load_requested.connect(
+            self._load_trace_stability_overlay
+        )
+        self._trace_overlay_selector.latest_requested.connect(
+            self._use_latest_trace_stability_overlay
+        )
+        self._trace_overlay_selector.quantity_changed.connect(
+            self._set_trace_stability_quantity
+        )
+        self._trace_container = QtWidgets.QWidget(self)
+        self._trace_layout = QtWidgets.QVBoxLayout(self._trace_container)
+        self._trace_layout.setContentsMargins(2, 2, 2, 2)
+        self._trace_layout.setSpacing(2)
+        self._trace_layout.addWidget(self._trace_overlay_selector)
+        self._trace_layout.addWidget(self._trace_placeholder, 1)
 
         self._rf_timelines = []
         self._rf_timeline = None
@@ -5497,7 +5890,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_plot.setWidget(self._waveform_splitter)
 
         self._dock_trace = QtWidgets.QDockWidget("Trace Plot", self)
-        self._dock_trace.setWidget(self._trace_placeholder)
+        self._dock_trace.setWidget(self._trace_container)
 
         self._stability_plot = self._stability_panel.detach_plot()
         self._dock_stability = QtWidgets.QDockWidget(
@@ -5506,12 +5899,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._dock_stability.setWidget(self._stability_plot)
 
-        self._awg_sweep_plot = AwgSweepMapPlotWidget(self)
+        self._awg_sweep_container = QtWidgets.QWidget(self)
+        awg_sweep_layout = QtWidgets.QVBoxLayout(
+            self._awg_sweep_container
+        )
+        awg_sweep_layout.setContentsMargins(0, 0, 0, 0)
+        awg_sweep_layout.setSpacing(4)
+        self._awg_sweep_run_selector = AwgSweepRunSelector(
+            self._awg_sweep_container,
+            default_database_path=(
+                self._experiment_panel.database_path.text().strip()
+                or DEFAULT_QCODES_DB_PATH
+            ),
+        )
+        self._awg_sweep_run_selector.load_requested.connect(
+            self._load_awg_sweep_saved_run
+        )
+        self._awg_sweep_run_selector.latest_requested.connect(
+            self._use_latest_awg_sweep_result
+        )
+        awg_sweep_layout.addWidget(self._awg_sweep_run_selector)
+        self._awg_sweep_plot = AwgSweepMapPlotWidget(
+            self._awg_sweep_container
+        )
+        awg_sweep_layout.addWidget(self._awg_sweep_plot, 1)
         self._dock_awg_sweep = QtWidgets.QDockWidget(
             "AWG Tuning - I / Q / Magnitude / Angle",
             self,
         )
-        self._dock_awg_sweep.setWidget(self._awg_sweep_plot)
+        self._dock_awg_sweep.setWidget(self._awg_sweep_container)
 
         self._sparameter_plot = SParameterPlotWidget(self)
         self._dock_sparameter = QtWidgets.QDockWidget(
@@ -6815,6 +7231,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias_t_compensation_duration_us"
         ]
         self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
+        for panel in self._rf_ports_panel._panels:
+            panel.validate_power_calibration()
         rf_specs = self._rf_ports_panel.specs()
         readout_spec = self._rf_readout_panel.spec()
         if require_readout and readout_spec is None:
@@ -7628,6 +8046,64 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _load_stability_saved_run(
+        self,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        thread = self._stability_plot_load_thread
+        if thread is not None and thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Stability Diagram loading",
+                "Wait for the selected saved diagram to finish loading.",
+            )
+            return
+        self._stability_panel.set_saved_run_loading(True, run_id=run_id)
+        self.statusBar().showMessage(
+            f"Loading Stability Diagram QCoDeS Run {run_id}"
+        )
+        thread = QtCore.QThread(self)
+        worker = StabilityOverlayLoadWorker(database_path, run_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_stability_saved_run_loaded)
+        worker.failed.connect(self._on_stability_saved_run_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_stability_plot_load_thread)
+        self._stability_plot_load_thread = thread
+        self._stability_plot_load_worker = worker
+        thread.start()
+
+    def _on_stability_saved_run_loaded(self, result) -> None:
+        self._stability_panel.show_loaded_run(result)
+        self._dock_stability.raise_()
+        self.statusBar().showMessage(
+            f"Displaying {result.source_label} from {result.database_path}"
+        )
+
+    def _on_stability_saved_run_failed(self, details: str) -> None:
+        self._stability_panel.set_saved_run_loading(False)
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown Stability Diagram load error"
+        self._stability_panel.saved_run_status.setText(f"Failed: {summary}")
+        self.statusBar().showMessage("Saved Stability Diagram load failed")
+        dialog = DetailedErrorMessageBox(
+            "Saved Stability Diagram load failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
+    def _clear_stability_plot_load_thread(self) -> None:
+        self._stability_plot_load_thread = None
+        self._stability_plot_load_worker = None
+
     def _run_stability_diagram(self, *, continuous: bool) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -7695,12 +8171,109 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             f"Stability diagram {percent}%: {message}"
         )
 
+    def _active_trace_stability_result(self):
+        if getattr(self, "_trace_overlay_pinned", False):
+            return getattr(self, "_trace_overlay_result", None)
+        return self._last_stability_result
+
+    def _apply_trace_stability_overlay(self, *, fit: bool = False) -> None:
+        if self._trace is None:
+            return
+        self._trace.set_stability_overlay(
+            MainWindow._active_trace_stability_result(self),
+            getattr(self, "_trace_overlay_quantity", "magnitude"),
+        )
+        if fit:
+            self._trace.fit_view()
+
+    def _set_trace_stability_quantity(self, quantity: str) -> None:
+        if quantity not in {"i", "q", "magnitude", "phase"}:
+            return
+        self._trace_overlay_quantity = quantity
+        self._apply_trace_stability_overlay()
+
+    def _use_latest_trace_stability_overlay(self) -> None:
+        self._trace_overlay_pinned = False
+        self._trace_overlay_result = None
+        self._trace_overlay_selector.show_latest_result(
+            self._last_stability_result
+        )
+        self._apply_trace_stability_overlay(fit=True)
+        self.statusBar().showMessage(
+            "Trace Plot now follows the latest Stability Diagram scan"
+        )
+
+    def _load_trace_stability_overlay(
+        self,
+        database_path: str,
+        run_id: int,
+        quantity: str,
+    ) -> None:
+        thread = self._stability_overlay_thread
+        if thread is not None and thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Stability overlay loading",
+                "Wait for the selected Stability Diagram run to finish loading.",
+            )
+            return
+        self._trace_overlay_quantity = quantity
+        self._trace_overlay_selector.set_loading(True, run_id=run_id)
+        self.statusBar().showMessage(
+            f"Loading Stability Diagram QCoDeS Run {run_id}"
+        )
+        thread = QtCore.QThread(self)
+        worker = StabilityOverlayLoadWorker(database_path, run_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_trace_stability_overlay_loaded)
+        worker.failed.connect(self._on_trace_stability_overlay_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_stability_overlay_thread)
+        self._stability_overlay_thread = thread
+        self._stability_overlay_worker = worker
+        thread.start()
+
+    def _on_trace_stability_overlay_loaded(self, result) -> None:
+        self._trace_overlay_result = result
+        self._trace_overlay_pinned = True
+        self._trace_overlay_selector.show_loaded_result(result)
+        self._apply_trace_stability_overlay(fit=True)
+        self.statusBar().showMessage(
+            f"Trace Plot pinned to {result.source_label} from "
+            f"{result.database_path}"
+        )
+
+    def _on_trace_stability_overlay_failed(self, details: str) -> None:
+        self._trace_overlay_selector.set_loading(False)
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown Stability overlay error"
+        self._trace_overlay_selector.status.setText(f"Failed: {summary}")
+        self.statusBar().showMessage("Stability Diagram overlay load failed")
+        dialog = DetailedErrorMessageBox(
+            "Stability Diagram overlay load failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
+    def _clear_stability_overlay_thread(self) -> None:
+        self._stability_overlay_thread = None
+        self._stability_overlay_worker = None
+
     def _on_stability_scan_ready(self, result) -> None:
         self._last_stability_result = result
         self._stability_panel.show_result(result)
-        if self._trace is not None:
-            self._trace.set_stability_overlay(result)
-            self._trace.fit_view()
+        if not getattr(self, "_trace_overlay_pinned", False):
+            MainWindow._apply_trace_stability_overlay(self, fit=True)
+            selector = getattr(self, "_trace_overlay_selector", None)
+            if selector is not None:
+                selector.show_latest_result(result)
         self.statusBar().showMessage(
             f"Stability diagram scan {result.iteration} complete"
         )
@@ -7708,9 +8281,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_stability_single_finished(self, stored) -> None:
         self._last_stability_result = stored.diagram
         self._stability_panel.show_saved_result(stored)
-        if self._trace is not None:
-            self._trace.set_stability_overlay(stored.diagram)
-            self._trace.fit_view()
+        if not getattr(self, "_trace_overlay_pinned", False):
+            MainWindow._apply_trace_stability_overlay(self, fit=True)
+            selector = getattr(self, "_trace_overlay_selector", None)
+            if selector is not None:
+                selector.show_latest_result(stored.diagram)
         self.statusBar().showMessage(
             f"Stability diagram QCoDeS Run {stored.run_id} saved to "
             f"{stored.database_path}"
@@ -7855,6 +8430,81 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.update_progress(percent, message)
         self.statusBar().showMessage(f"QICK experiment {percent}%: {message}")
 
+    def _load_awg_sweep_saved_run(
+        self,
+        database_path: str,
+        run_id: int,
+    ) -> None:
+        thread = self._awg_sweep_load_thread
+        if thread is not None and thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "AWG sweep loading",
+                "Wait for the selected AWG sweep run to finish loading.",
+            )
+            return
+        self._awg_sweep_run_selector.set_loading(True, run_id=run_id)
+        self.statusBar().showMessage(
+            f"Loading AWG sweep QCoDeS Run {run_id}"
+        )
+        thread = QtCore.QThread(self)
+        worker = AwgSweepMapLoadWorker(database_path, run_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_awg_sweep_saved_run_loaded)
+        worker.failed.connect(self._on_awg_sweep_saved_run_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_awg_sweep_load_thread)
+        self._awg_sweep_load_thread = thread
+        self._awg_sweep_load_worker = worker
+        thread.start()
+
+    def _on_awg_sweep_saved_run_loaded(self, result) -> None:
+        self._awg_sweep_plot.set_result(result)
+        self._awg_sweep_run_selector.show_loaded_result(result)
+        self._dock_awg_sweep.show()
+        self._dock_awg_sweep.raise_()
+        self.statusBar().showMessage(
+            f"Displaying {result.source_label} from {result.database_path}"
+        )
+
+    def _on_awg_sweep_saved_run_failed(self, details: str) -> None:
+        self._awg_sweep_run_selector.set_loading(False)
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown AWG sweep load error"
+        self._awg_sweep_run_selector.status.setText(f"Failed: {summary}")
+        self.statusBar().showMessage("Saved AWG sweep load failed")
+        dialog = DetailedErrorMessageBox(
+            "Saved AWG sweep load failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
+
+    def _clear_awg_sweep_load_thread(self) -> None:
+        self._awg_sweep_load_thread = None
+        self._awg_sweep_load_worker = None
+
+    def _use_latest_awg_sweep_result(self) -> None:
+        result = self._last_awg_sweep_map_result
+        self._awg_sweep_run_selector.show_latest_result(result)
+        if result is None:
+            self.statusBar().showMessage(
+                "No in-memory AWG 2D sweep result is available"
+            )
+            return
+        self._awg_sweep_plot.set_result(result)
+        self._dock_awg_sweep.show()
+        self._dock_awg_sweep.raise_()
+        self.statusBar().showMessage(
+            f"Displaying {result.source_label or 'latest AWG experiment'}"
+        )
+
     def _refresh_awg_sweep_map_from_last_result(self) -> Optional[str]:
         result = self._last_experiment_result
         if result is None:
@@ -7876,13 +8526,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 value_unit=unit,
                 measurement_mode=mode,
             )
+            map_result = replace(
+                map_result,
+                source_label=f"QCoDeS Run {int(result.run_id)}",
+                database_path=str(result.database_path),
+                run_id=int(result.run_id),
+            )
         except Exception as exc:
             self.statusBar().showMessage(
                 f"QCoDeS run {result.run_id} saved; "
                 f"AWG 2D map unavailable: {exc}"
             )
             return str(exc)
+        self._last_awg_sweep_map_result = map_result
         self._awg_sweep_plot.set_result(map_result)
+        self._awg_sweep_run_selector.show_latest_result(map_result)
         self._dock_awg_sweep.show()
         self._dock_awg_sweep.raise_()
         return None
@@ -8045,9 +8703,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._trace.set_time_unit(self._time_unit)
             if hasattr(self._trace, "set_stability_overlay"):
                 self._trace.set_stability_overlay(
-                    self._last_stability_result
+                    self._active_trace_stability_result(),
+                    self._trace_overlay_quantity,
                 )
-            self._dock_trace.setWidget(self._trace)
+            self._trace_layout.replaceWidget(
+                self._trace_placeholder,
+                self._trace,
+            )
+            self._trace_placeholder.hide()
             self._trace_placeholder.deleteLater()
         return self._trace
 
@@ -8213,6 +8876,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["duration_sweep_enabled"],
                 f"{label} duration_sweep_enabled",
             )
+            power_calibration_enabled = self._json_bool(
+                entry["power_calibration_enabled"],
+                f"{label} power_calibration_enabled",
+            )
+            power_calibration_database_path = str(
+                entry["power_calibration_database_path"]
+            )
+            power_calibration_run_id = self._json_int(
+                entry["power_calibration_run_id"],
+                f"{label} power_calibration_run_id",
+            )
+            target_output_power_dbm = self._json_finite_float(
+                entry["target_output_power_dbm"],
+                f"{label} target_output_power_dbm",
+            )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], f"{label} generator channel"),
                 segment_name=str(entry["segment_name"]),
@@ -8266,6 +8944,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "duration_sweep_stop_us": spec.duration_sweep_stop_us,
                     "duration_sweep_count": spec.duration_sweep_count,
                     "segment_length_mode": spec.segment_length_mode,
+                    "power_calibration_enabled": power_calibration_enabled,
+                    "power_calibration_database_path": (
+                        power_calibration_database_path
+                    ),
+                    "power_calibration_run_id": power_calibration_run_id,
+                    "target_output_power_dbm": target_output_power_dbm,
                 }
             )
         return tuple(decoded)
@@ -8883,6 +9567,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["duration_sweep_enabled"],
                 "RF duration_sweep_enabled",
             )
+            power_calibration_enabled = self._json_bool(
+                entry["power_calibration_enabled"],
+                "RF power_calibration_enabled",
+            )
+            power_calibration_database_path = str(
+                entry["power_calibration_database_path"]
+            )
+            power_calibration_run_id = self._json_int(
+                entry["power_calibration_run_id"],
+                "RF power_calibration_run_id",
+            )
+            target_output_power_dbm = self._json_finite_float(
+                entry["target_output_power_dbm"],
+                "RF target_output_power_dbm",
+            )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], "RF generator channel"),
                 segment_name=str(entry["segment_name"]),
@@ -8934,6 +9633,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "duration_sweep_stop_us": spec.duration_sweep_stop_us,
                 "duration_sweep_count": spec.duration_sweep_count,
                 "segment_length_mode": spec.segment_length_mode,
+                "power_calibration_enabled": power_calibration_enabled,
+                "power_calibration_database_path": (
+                    power_calibration_database_path
+                ),
+                "power_calibration_run_id": power_calibration_run_id,
+                "target_output_power_dbm": target_output_power_dbm,
             }})
 
         raw_readout = data.get("rf_readout", {})
@@ -9732,6 +10437,39 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         trace.fit_view()
 
     def closeEvent(self, event) -> None:
+        if (
+            self._awg_sweep_load_thread is not None
+            and self._awg_sweep_load_thread.isRunning()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "AWG sweep loading",
+                "Wait for the saved AWG sweep run to finish loading.",
+            )
+            event.ignore()
+            return
+        if (
+            self._stability_plot_load_thread is not None
+            and self._stability_plot_load_thread.isRunning()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Stability Diagram loading",
+                "Wait for the saved Stability Diagram run to finish loading.",
+            )
+            event.ignore()
+            return
+        if (
+            self._stability_overlay_thread is not None
+            and self._stability_overlay_thread.isRunning()
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Stability overlay loading",
+                "Wait for the saved Stability Diagram run to finish loading.",
+            )
+            event.ignore()
+            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.warning(
                 self,
