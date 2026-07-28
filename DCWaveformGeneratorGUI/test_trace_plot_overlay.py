@@ -133,7 +133,11 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
     assert widget._hover_label.isVisible()
     assert "X 100 mV" in hover_text
     assert "Y -50 mV" in hover_text
-    widget._points_hovered(widget._point_scatter, [], None)
+    widget._points_hovered(
+        widget._point_scatter,
+        np.asarray([], dtype=object),
+        None,
+    )
     assert not widget._hover_label.isVisible()
 
     widget.set_time_unit("ns")
@@ -158,6 +162,13 @@ def test_trace_hold_and_ramp_labels_emit_edit_requests():
     ramp_requests = []
     widget.hold_edit_requested.connect(hold_requests.append)
     widget.ramp_edit_requested.connect(ramp_requests.append)
+
+    widget._points_clicked(
+        widget._point_scatter,
+        np.asarray([], dtype=object),
+        None,
+    )
+    assert hold_requests == []
 
     class _ClickEvent:
         accepted = False

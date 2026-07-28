@@ -218,7 +218,7 @@ class TracePlotWidget(pg.PlotWidget):
         )
 
     def _points_hovered(self, _item, points, _event) -> None:
-        if points:
+        if len(points) > 0:
             point = points[0]
             data = point.data()
             tooltip = self._point_tooltip(
@@ -241,7 +241,7 @@ class TracePlotWidget(pg.PlotWidget):
             self.setTitle(self._default_title)
 
     def _points_clicked(self, _item, points, event) -> None:
-        if not points:
+        if len(points) == 0:
             return
         record = points[0].data()
         if not isinstance(record, dict):
