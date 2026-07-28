@@ -94,6 +94,22 @@ def test_50_ksps_profile_supports_shift_line_clock_cycle_delay():
     assert "source-clock cycles" in profile.timing_label
 
 
+def test_gui_corrects_legacy_400_mhz_default_for_300_mhz_hwh():
+    soccfg = _soccfg(
+        "50_ksps",
+        trigger_delay_units="s_axis_aclk_cycles",
+    )
+    soccfg["ddr4_buf"]["trigger_delay_default_cycles"] = 281_970
+
+    profile = resolve_fir_ddr_profile(soccfg)
+
+    assert profile.trigger_delay_samples == 211_478
+    assert profile.trigger_delay_us == pytest.approx(211_478 / 300.0)
+    assert profile.trigger_delay_arm_kwargs() == {
+        "trigger_delay_cycles": 211_478
+    }
+
+
 def test_user_delay_microseconds_convert_to_hwh_reported_units():
     sample_profile = resolve_fir_ddr_profile(_soccfg("50_ksps"))
     cycle_profile = resolve_fir_ddr_profile(

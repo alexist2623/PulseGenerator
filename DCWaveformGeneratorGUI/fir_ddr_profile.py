@@ -15,6 +15,9 @@ _KNOWN_RATES_HZ = {
     "50_ksps": 50_000.0,
 }
 
+_DEFAULT_50_KSPS_TRIGGER_DELAY_US = 704.925
+_LEGACY_400_MHZ_TRIGGER_DELAY_CYCLES = 281_970
+
 
 @dataclass(frozen=True)
 class FirDdrProfile:
@@ -277,6 +280,18 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
         trigger_delay_samples = int(ddr_cfg.get(default_key, 0))
         if trigger_delay_samples < 0:
             raise RuntimeError(f"HWH {default_key} must be nonnegative")
+        if (
+            trigger_delay_units == "s_axis_aclk_cycles"
+            and trigger_delay_samples
+            == _LEGACY_400_MHZ_TRIGGER_DELAY_CYCLES
+            and abs(input_rate_mhz - 300.0) <= 1.0e-9
+        ):
+            # The deployed HWH default was calculated with a 400 MHz clock.
+            # Keep the bitstream untouched and apply the requested 704.925 us
+            # default using the actual 300 MHz source clock in the GUI.
+            trigger_delay_samples = int(
+                round(_DEFAULT_50_KSPS_TRIGGER_DELAY_US * input_rate_mhz)
+            )
 
     return FirDdrProfile(
         name=profile_name,
