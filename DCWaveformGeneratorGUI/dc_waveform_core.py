@@ -28,7 +28,7 @@ DEFAULT_MIN_DURATION_NS = 1.0e-6
 DEFAULT_QCS_FULL_SCALE_V = 5.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
-DEFAULT_QICK_FULL_SCALE_MV = 2500.0
+DEFAULT_QICK_FULL_SCALE_MV = 800.0
 DEFAULT_DC_MEASURE_GAIN_V_PER_A = 1.0
 DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
 DEFAULT_BIAS_T_COMPENSATION_DURATION_US = 1.0
@@ -541,7 +541,10 @@ class PulseSequence:
         initial_duration_ns = _positive_real(initial_duration_ns, "initial_duration_ns")
         self.t = np.asarray([0.0, initial_duration_ns], dtype=float)
         self.v = np.asarray([initial_voltage, initial_voltage], dtype=float)
-        self.v_bounds = (-2500.0, 2500.0)
+        self.v_bounds = (
+            -DEFAULT_QICK_FULL_SCALE_MV,
+            DEFAULT_QICK_FULL_SCALE_MV,
+        )
 
     @property
     def duration_ns(self) -> float:

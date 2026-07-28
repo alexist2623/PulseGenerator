@@ -33,6 +33,7 @@ SAMPLE_INDEX_PARAMETER = "sample_index"
 
 try:
     from .dc_waveform_core import (
+        DEFAULT_QICK_FULL_SCALE_MV,
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
@@ -43,6 +44,7 @@ try:
     from .fir_ddr_profile import resolve_fir_ddr_profile
 except ImportError:
     from dc_waveform_core import (
+        DEFAULT_QICK_FULL_SCALE_MV,
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
@@ -746,7 +748,9 @@ def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
     qick_settings = gui_settings.get("qick", {})
     if not isinstance(qick_settings, Mapping):
         raise ValueError("GUI qick settings must be a mapping")
-    value = float(qick_settings.get("full_scale_mv", 100.0))
+    value = float(
+        qick_settings.get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
+    )
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError("QICK full_scale_mv must be finite and positive")
     return value
@@ -1549,7 +1553,12 @@ def run_qick_qcodes_experiment(
         stored_gui_settings["awg_waveform_vertices"] = build_awg_vertex_metadata(
             sequence,
             fabric_mhz=float(qick_settings.get("fabric_mhz", 300.0)),
-            full_scale_mv=float(qick_settings.get("full_scale_mv", 100.0)),
+            full_scale_mv=float(
+                qick_settings.get(
+                    "full_scale_mv",
+                    DEFAULT_QICK_FULL_SCALE_MV,
+                )
+            ),
         )
     program, ddr_result, rf_settings = execute_qick_sequence(
         soc,

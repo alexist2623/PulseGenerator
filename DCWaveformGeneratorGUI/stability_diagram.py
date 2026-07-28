@@ -1508,7 +1508,12 @@ def _stored_gui_settings_with_vertices(
     stored["awg_waveform_vertices"] = build_awg_vertex_metadata(
         sequence,
         fabric_mhz=float(qick_settings.get("fabric_mhz", 300.0)),
-        full_scale_mv=float(qick_settings.get("full_scale_mv", 2500.0)),
+        full_scale_mv=float(
+            qick_settings.get(
+                "full_scale_mv",
+                DEFAULT_QICK_FULL_SCALE_MV,
+            )
+        ),
     )
     return stored
 

@@ -6036,7 +6036,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 initial_duration_ns=DEFAULT_GUI_DURATION_NS,
             )
         ]
-        self._pulse[0].v_bounds             = (-2500, 2500)
+        self._pulse[0].v_bounds = (
+            -DEFAULT_QICK_FULL_SCALE_MV,
+            DEFAULT_QICK_FULL_SCALE_MV,
+        )
         self._rf_pulse_spec: Optional[QickRfPulseSpec] = None
         self._rf_pulse_specs: List[QickRfPulseSpec] = []
         self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None

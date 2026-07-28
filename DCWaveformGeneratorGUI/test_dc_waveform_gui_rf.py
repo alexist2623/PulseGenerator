@@ -18,6 +18,7 @@ import pytest
 
 import DCWaveform_Generator as gui
 from dc_waveform_core import (
+    DEFAULT_QICK_FULL_SCALE_MV,
     PulseSequence,
     QickDdrReadoutSpec,
     QickRampRateSweepSpec,
@@ -99,10 +100,14 @@ def test_gui_defaults_and_time_unit_round_trip():
     assert window._time_unit == "us"
     assert window._experiment_panel.fabric_mhz.value() == 300.0
     assert window._experiment_panel.tproc_mhz.value() == 300.0
+    assert DEFAULT_QICK_FULL_SCALE_MV == 800.0
+    assert window._experiment_panel.full_scale_mv.value() == 800.0
+    assert window._qick_full_scale_mv == 800.0
+    assert window._pulse[0].v_bounds == (-800.0, 800.0)
     assert window._experiment_panel.bias_t_group.isChecked() is False
     assert window._experiment_panel.bias_t_type.currentData() == "dc"
     assert window._experiment_panel.bias_t_mode.currentData() == "fixed_voltage"
-    assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
+    assert window._experiment_panel.bias_t_compensation_mv.value() == 80.0
     assert window._experiment_panel.bias_t_duration_us.value() == 1.0
     assert window._experiment_panel.bias_t_filter_tau_us.value() == 100.0
     assert window._experiment_panel.bias_t_compensation_mv.isEnabledTo(
@@ -926,7 +931,7 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
     assert namespace["BIAS_T_COMPENSATION_MODE"] == "fixed_time"
     assert namespace["BIAS_T_COMPENSATION_DURATION_CYCLES"] == 750
     bias_t_config = namespace["build_sequence"]().bias_t_compensation
-    assert bias_t_config.amplitude == 0.05
+    assert bias_t_config.amplitude == 0.15625
     assert bias_t_config.mode == "fixed_time"
     assert bias_t_config.fixed_duration_cycles == 750
     stale_hwh_soccfg = {
@@ -1129,7 +1134,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         "enabled": True,
         "type": "filter",
         "mode": "fixed_voltage",
-        "voltage_mv": 250.0,
+        "voltage_mv": 80.0,
         "duration_us": 1.0,
         "filter_tau_us": 42.0,
     }
@@ -1181,7 +1186,7 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert arguments["awg_channels"] == (1,)
     assert arguments["readout_spec"].samples_per_trigger == 32
     assert arguments["gui_settings"]["qick"]["tproc_mhz"] == 300.0
-    assert arguments["sequence"].bias_t_compensation.amplitude == 0.08
+    assert arguments["sequence"].bias_t_compensation.amplitude == 0.25
     assert "waveforms" not in arguments["gui_settings"]
     assert arguments["gui_settings"]["awg"]["outputs"][0]["time_ns"] == [
         0.0,
@@ -1542,7 +1547,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._experiment_panel.repetitions.value() == 1
     assert window._experiment_panel.bias_t_group.isChecked() is False
-    assert window._experiment_panel.bias_t_compensation_mv.value() == 250.0
+    assert window._experiment_panel.bias_t_compensation_mv.value() == 80.0
     assert window._control_tabs.currentWidget() is window._awg_tuning_page
     assert window._awg_tuning_tabs.currentWidget() is window._rf_readout_panel
     assert len(window._rf_ports_panel._panels) == 1
@@ -1572,7 +1577,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
         "enabled": False,
         "type": "dc",
         "mode": "fixed_voltage",
-        "voltage_mv": 250.0,
+        "voltage_mv": 80.0,
         "duration_us": 1.0,
         "filter_tau_us": 100.0,
     }
@@ -1584,7 +1589,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
         "enabled": False,
         "type": "dc",
         "mode": "fixed_voltage",
-        "voltage_mv": 250.0,
+        "voltage_mv": 80.0,
         "duration_us": 1.0,
         "filter_tau_us": 100.0,
     }
