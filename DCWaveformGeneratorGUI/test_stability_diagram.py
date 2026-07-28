@@ -169,6 +169,7 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     legacy = stability.default_stability_settings(("awg_0", "awg_1"), ("set_0",))
     legacy.pop("bias_t_compensation")
     legacy.pop("color_ranges")
+    legacy.pop("visible_data")
 
     normalized = stability.normalize_stability_settings(
         legacy,
@@ -187,6 +188,16 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     assert normalized["settle_time_us"] == stability.DEFAULT_STABILITY_SETTLE_US
     assert "segment_name" not in normalized["x_axis"]
     assert normalized["color_ranges"] == {
+        "i": {
+            "auto": True,
+            "minimum": -1.0,
+            "maximum": 1.0,
+        },
+        "q": {
+            "auto": True,
+            "minimum": -1.0,
+            "maximum": 1.0,
+        },
         "magnitude": {
             "auto": True,
             "minimum": 0.0,
@@ -198,6 +209,7 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
             "maximum": 180.0,
         },
     }
+    assert normalized["visible_data"] == ["magnitude", "phase"]
 
     invalid = dict(normalized)
     invalid["color_ranges"] = {
@@ -326,6 +338,11 @@ def test_stability_plot_exposes_and_applies_color_ranges():
     assert plot.phase_color_bar is not None
     assert plot.magnitude_color_bar.interactive is True
     assert plot.phase_color_bar.interactive is True
+    assert plot.visible_data() == ("magnitude", "phase")
+    assert plot.plot_cells["i"].isHidden() is True
+    assert plot.plot_cells["q"].isHidden() is True
+    assert plot.plot_cells["magnitude"].isHidden() is False
+    assert plot.plot_cells["phase"].isHidden() is False
     assert "Applied:" in plot.magnitude_range_control.range_status.text()
     assert "Data:" in plot.magnitude_range_control.range_status.text()
 
@@ -361,6 +378,16 @@ def test_stability_plot_exposes_and_applies_color_ranges():
     np.testing.assert_allclose(plot.magnitude_image.getLevels(), (5.0, 50.0))
     np.testing.assert_allclose(plot.phase_image.getLevels(), (-45.0, 90.0))
     assert plot.color_range_settings() == {
+        "i": {
+            "auto": True,
+            "minimum": plot._symmetric_levels(result.i_mean)[0],
+            "maximum": plot._symmetric_levels(result.i_mean)[1],
+        },
+        "q": {
+            "auto": True,
+            "minimum": plot._symmetric_levels(result.q_mean)[0],
+            "maximum": plot._symmetric_levels(result.q_mean)[1],
+        },
         "magnitude": {
             "auto": False,
             "minimum": 5.0,
@@ -372,6 +399,20 @@ def test_stability_plot_exposes_and_applies_color_ranges():
             "maximum": 90.0,
         },
     }
+    plot.load_visible_data(["i", "angle"])
+    app.processEvents()
+    assert plot.visible_data() == ("i", "phase")
+    assert plot.plot_cells["i"].isHidden() is False
+    assert plot.plot_cells["q"].isHidden() is True
+    assert plot.plot_cells["magnitude"].isHidden() is True
+    assert plot.plot_cells["phase"].isHidden() is False
+    np.testing.assert_allclose(plot.images["i"].image, result.i_mean)
+    np.testing.assert_allclose(plot.images["phase"].image, result.phase_deg)
+
+    plot.data_selectors["i"].setChecked(False)
+    plot.data_selectors["phase"].setChecked(False)
+    app.processEvents()
+    assert len(plot.visible_data()) == 1
 
     plot.close()
     plot.deleteLater()
@@ -653,6 +694,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.modulation_gain.setValue(12345)
     panel.plot.magnitude_range_control.set_manual_levels(10.0, 100.0)
     panel.plot.phase_range_control.set_manual_levels(-90.0, 45.0)
+    panel.plot.load_visible_data(["i", "q", "magnitude"])
     panel.bias_t_group.setChecked(True)
     panel.bias_t_mode.setCurrentIndex(
         panel.bias_t_mode.findData("fixed_time")
@@ -698,6 +740,16 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert restored.bias_t_duration_us.value() == 2.5
     assert restored.settle_time_us.value() == 75.5
     assert restored.plot.color_range_settings() == {
+        "i": {
+            "auto": True,
+            "minimum": -1.0,
+            "maximum": 1.0,
+        },
+        "q": {
+            "auto": True,
+            "minimum": -1.0,
+            "maximum": 1.0,
+        },
         "magnitude": {
             "auto": False,
             "minimum": 10.0,
@@ -709,6 +761,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
             "maximum": 45.0,
         },
     }
+    assert restored.plot.visible_data() == ("i", "q", "magnitude")
 
     dc_changes = []
     calibration_changes = []

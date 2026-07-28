@@ -35,6 +35,140 @@ def _add_segments(window, count):
         )
 
 
+def _sweep_parameter_row(panel, axis_kind):
+    for row in range(panel.sweep_parameter_table.rowCount()):
+        key = panel.sweep_parameter_table.item(row, 0).data(
+            gui.QtCore.Qt.UserRole
+        )
+        if key[0] == axis_kind:
+            return row
+    raise AssertionError(f"missing {axis_kind!r} sweep parameter row")
+
+
+def test_awg_sweep_parameter_table_edits_all_supported_sweep_types():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 2)
+    window._sweep_specs = [
+        QickSweepSpec("set_1", "awg_0", -0.25, 0.5, 5),
+        QickRampRateSweepSpec("ramp_0_to_1", 0.1, 0.3, 4),
+    ]
+    window._experiment_panel.full_scale_mv.setValue(800.0)
+
+    rf_panel = window._rf_ports_panel._panels[0]
+    with gui.QtCore.QSignalBlocker(rf_panel):
+        rf_panel.setChecked(True)
+        rf_panel.segment.setCurrentIndex(
+            rf_panel.segment.findData("set_2")
+        )
+        rf_panel.duration_sweep_enabled.setChecked(True)
+        rf_panel.duration_sweep_start.setValue(
+            gui._time_from_ns(1500.0, rf_panel._time_unit)
+        )
+        rf_panel.duration_sweep_stop.setValue(
+            gui._time_from_ns(3500.0, rf_panel._time_unit)
+        )
+        rf_panel.duration_sweep_count.setValue(8)
+    window._rf_ports_panel._emit_specs()
+    window._refresh_sweep_overlay(sync_rows=True)
+    app.processEvents()
+
+    experiment = window._experiment_panel
+    assert experiment.sweep_parameter_table.rowCount() == 3
+    assert {
+        experiment.sweep_parameter_table.item(row, 0).text()
+        for row in range(3)
+    } == {"Voltage", "RAMP duration", "RF duration"}
+
+    voltage_row = _sweep_parameter_row(experiment, "amplitude")
+    experiment.sweep_parameter_table.selectRow(voltage_row)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_1"
+    assert experiment.sweep_parameter_start.suffix() == " mV"
+    assert experiment.sweep_parameter_start.value() == -200.0
+    assert experiment.sweep_parameter_stop.value() == 400.0
+    experiment.sweep_parameter_start.setValue(-100.0)
+    experiment.sweep_parameter_stop.setValue(240.0)
+    experiment.sweep_parameter_count.setValue(7)
+    experiment.sweep_parameter_apply.click()
+    app.processEvents()
+
+    voltage_spec = next(
+        spec
+        for spec in window._sweep_specs
+        if isinstance(spec, QickSweepSpec)
+    )
+    assert voltage_spec.start == -0.125
+    assert voltage_spec.stop == 0.3
+    assert voltage_spec.count == 7
+
+    ramp_row = _sweep_parameter_row(experiment, "ramp_duration")
+    experiment.sweep_parameter_table.selectRow(ramp_row)
+    app.processEvents()
+    assert experiment.sweep_parameter_start.suffix() == " us"
+    experiment.sweep_parameter_start.setValue(0.2)
+    experiment.sweep_parameter_stop.setValue(0.8)
+    experiment.sweep_parameter_count.setValue(6)
+    experiment.sweep_parameter_apply.click()
+    app.processEvents()
+
+    ramp_spec = next(
+        spec
+        for spec in window._sweep_specs
+        if isinstance(spec, QickRampRateSweepSpec)
+    )
+    assert ramp_spec.start == 0.2
+    assert ramp_spec.stop == 0.8
+    assert ramp_spec.count == 6
+
+    rf_row = _sweep_parameter_row(experiment, "rf_duration")
+    experiment.sweep_parameter_table.selectRow(rf_row)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "RF gen 0 / set_2"
+    experiment.sweep_parameter_start.setValue(2.0)
+    experiment.sweep_parameter_stop.setValue(4.0)
+    experiment.sweep_parameter_count.setValue(9)
+    experiment.sweep_parameter_apply.click()
+    app.processEvents()
+
+    rf_spec = window._rf_pulse_specs[0]
+    assert rf_spec.duration_sweep_start_us == 2.0
+    assert rf_spec.duration_sweep_stop_us == 4.0
+    assert rf_spec.duration_sweep_count == 9
+    assert rf_panel.duration_sweep_enabled.isChecked()
+
+    rf_row = _sweep_parameter_row(experiment, "rf_duration")
+    experiment.sweep_parameter_table.selectRow(rf_row)
+    experiment.sweep_parameter_remove.click()
+    app.processEvents()
+    assert rf_panel.isChecked()
+    assert not rf_panel.duration_sweep_enabled.isChecked()
+    assert all(
+        getattr(spec, "axis_kind", "") != "rf_duration"
+        for spec in window._active_map_sweep_specs()
+    )
+    assert experiment.sweep_parameter_table.rowCount() == 2
+
+    ramp_row = _sweep_parameter_row(experiment, "ramp_duration")
+    experiment.sweep_parameter_table.selectRow(ramp_row)
+    experiment.sweep_parameter_remove.click()
+    app.processEvents()
+    assert not any(
+        isinstance(spec, QickRampRateSweepSpec)
+        for spec in window._sweep_specs
+    )
+
+    voltage_row = _sweep_parameter_row(experiment, "amplitude")
+    experiment.sweep_parameter_table.selectRow(voltage_row)
+    experiment.sweep_parameter_remove.click()
+    app.processEvents()
+    assert window._sweep_specs == []
+    assert experiment.sweep_parameter_table.rowCount() == 0
+    assert experiment.sweep_parameter_table.isHidden()
+    assert not experiment.sweep_parameter_editor.isEnabled()
+    window.close()
+
+
 def test_appending_voltage_segments_preserves_existing_sweeps():
     app = _application()
     window = gui.MainWindow()
@@ -150,4 +284,71 @@ def test_deleting_one_target_keeps_other_sweeps_on_same_port():
     )
     assert tuple(spec.count for spec in window._sweep_specs) == (2, 3, 5, 6)
     assert control._sweep_rows == {0, 1, 2, 3}
+    window.close()
+
+
+def test_insert_keeps_voltage_sweep_on_original_physical_segment():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 4)
+    window._sweep_specs = [
+        QickSweepSpec("set_3", "awg_0", -0.2, 0.2, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+    original_voltage = float(window._pulse[0].v[6])
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._edit_segment_structure("insert_above", 2)
+    app.processEvents()
+
+    assert _sweep_targets(window) == (("awg_0", "set_4"),)
+    assert window._sweep_target_indices(window._sweep_specs[0]) == (0, 4)
+    assert float(window._pulse[0].v[8]) == original_voltage
+    assert control._sweep_rows == {4}
+    window.close()
+
+
+def test_insert_remaps_rf_duration_sweep_anchor_and_selected_map_axis():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._sweep_specs = [
+        QickSweepSpec("set_3", "awg_0", -0.2, 0.2, 5),
+    ]
+
+    rf_panel = window._rf_ports_panel._panels[0]
+    with gui.QtCore.QSignalBlocker(rf_panel):
+        rf_panel.setChecked(True)
+        rf_panel.segment.setCurrentIndex(
+            rf_panel.segment.findData("set_2")
+        )
+        rf_panel.duration_sweep_enabled.setChecked(True)
+        rf_panel.duration_sweep_start.setValue(1.0)
+        rf_panel.duration_sweep_stop.setValue(2.0)
+        rf_panel.duration_sweep_count.setValue(7)
+    window._rf_ports_panel._emit_specs()
+    window._experiment_panel.set_sweep_specs(
+        window._active_map_sweep_specs(),
+        selected_keys=(
+            ("awg_0", "set_3"),
+            ("rf_gen_0", "set_2"),
+        ),
+    )
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._edit_segment_structure("insert_above", 1)
+    app.processEvents()
+
+    assert len(window._rf_pulse_specs) == 1
+    rf_spec = window._rf_pulse_specs[0]
+    assert rf_spec.segment_name == "set_3"
+    assert rf_spec.duration_sweep_enabled is True
+    assert rf_spec.duration_sweep_start_us == 1.0
+    assert rf_spec.duration_sweep_stop_us == 2.0
+    assert rf_spec.duration_sweep_count == 7
+    assert rf_panel.segment.currentData() == "set_3"
+    assert window._experiment_panel.selected_sweep_axis_keys() == (
+        ("awg_0", "set_4"),
+        ("rf_gen_0", "set_3"),
+    )
     window.close()

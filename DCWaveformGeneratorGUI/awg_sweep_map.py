@@ -42,6 +42,8 @@ DEFAULT_AWG_SWEEP_COLOR_RANGES = {
     "magnitude": {"auto": True, "minimum": 0.0, "maximum": 1.0},
     "angle": {"auto": False, "minimum": -180.0, "maximum": 180.0},
 }
+AWG_SWEEP_DATA_KEYS = ("i", "q", "magnitude", "angle")
+DEFAULT_AWG_SWEEP_VISIBLE_DATA = AWG_SWEEP_DATA_KEYS
 
 
 def normalize_awg_sweep_color_ranges(
@@ -76,6 +78,24 @@ def normalize_awg_sweep_color_ranges(
             "maximum": maximum,
         }
     return normalized
+
+
+def normalize_awg_sweep_visible_data(values: Any) -> Tuple[str, ...]:
+    """Validate the ordered set of maps shown in the AWG 2-D result dock."""
+    if values is None:
+        return DEFAULT_AWG_SWEEP_VISIBLE_DATA
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("AWG sweep visible_data must be a JSON array")
+    normalized = []
+    for value in values:
+        key = str(value).strip().lower()
+        if key not in AWG_SWEEP_DATA_KEYS:
+            raise ValueError(f"unknown AWG sweep plot data {value!r}")
+        if key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        raise ValueError("at least one AWG sweep plot must be visible")
+    return tuple(normalized)
 
 
 def sweep_axis_key(axis: Any) -> SweepAxisKey:
@@ -289,13 +309,32 @@ if pg is not None:
             super().__init__(parent)
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
+            selector_layout = QtWidgets.QHBoxLayout()
+            selector_layout.setContentsMargins(4, 2, 4, 2)
+            selector_layout.addWidget(QtWidgets.QLabel("Displayed data:", self))
+            self.data_selectors = {}
+            for key, title, _color_map in self._PLOT_SPECS:
+                selector = QtWidgets.QCheckBox(title, self)
+                selector.setChecked(True)
+                selector.toggled.connect(
+                    lambda checked, name=key: self._set_plot_visible(
+                        name,
+                        checked,
+                    )
+                )
+                selector_layout.addWidget(selector)
+                self.data_selectors[key] = selector
+            selector_layout.addStretch(1)
+            layout.addLayout(selector_layout)
             plot_grid = QtWidgets.QGridLayout()
             plot_grid.setContentsMargins(0, 0, 0, 0)
             plot_grid.setSpacing(4)
             layout.addLayout(plot_grid, 1)
+            self.plot_grid = plot_grid
 
             self.plots = {}
             self.images = {}
+            self.plot_cells = {}
             self.range_controls = {}
             self.color_bars = {}
             self.color_maps = {}
@@ -338,6 +377,7 @@ if pg is not None:
                 cell_layout.addWidget(range_control)
                 cell_layout.addWidget(plot, 1)
                 plot_grid.addWidget(cell, index // 2, index % 2)
+                self.plot_cells[key] = cell
                 self.plots[key] = plot
                 self.images[key] = image
                 self.range_controls[key] = range_control
@@ -368,6 +408,52 @@ if pg is not None:
             )
             layout.addWidget(self.hover_status)
             self._result: Optional[AwgSweepMapResult] = None
+
+        def _set_plot_visible(self, name: str, checked: bool) -> None:
+            if not checked and not any(
+                selector.isChecked()
+                for key, selector in self.data_selectors.items()
+                if key != name
+            ):
+                with QtCore.QSignalBlocker(self.data_selectors[name]):
+                    self.data_selectors[name].setChecked(True)
+                checked = True
+            self.plot_cells[name].setVisible(checked)
+            self._reflow_visible_plots()
+            if checked and self._result is not None:
+                self.plots[name].enableAutoRange(x=True, y=True)
+
+        def _reflow_visible_plots(self) -> None:
+            visible = [
+                key
+                for key, _title, _color_map in self._PLOT_SPECS
+                if self.data_selectors[key].isChecked()
+            ]
+            for cell in self.plot_cells.values():
+                self.plot_grid.removeWidget(cell)
+            columns = 2 if len(visible) > 1 else 1
+            for index, key in enumerate(visible):
+                self.plot_grid.addWidget(
+                    self.plot_cells[key],
+                    index // columns,
+                    index % columns,
+                )
+
+        def visible_data(self) -> Tuple[str, ...]:
+            return tuple(
+                key
+                for key, _title, _color_map in self._PLOT_SPECS
+                if self.data_selectors[key].isChecked()
+            )
+
+        def load_visible_data(self, values: Any) -> None:
+            visible = set(normalize_awg_sweep_visible_data(values))
+            for key, selector in self.data_selectors.items():
+                with QtCore.QSignalBlocker(selector):
+                    selector.setChecked(key in visible)
+                self.plot_cells[key].setVisible(key in visible)
+            self._reflow_visible_plots()
+            self.fit_view()
 
         @staticmethod
         def _color_map(name: str):
@@ -550,6 +636,7 @@ else:
             )
             self.setAlignment(QtCore.Qt.AlignCenter)
             self._color_ranges = normalize_awg_sweep_color_ranges(None)
+            self._visible_data = DEFAULT_AWG_SWEEP_VISIBLE_DATA
 
         def set_result(self, _result: AwgSweepMapResult) -> None:
             return
@@ -569,13 +656,22 @@ else:
         ) -> None:
             self._color_ranges = normalize_awg_sweep_color_ranges(settings)
 
+        def visible_data(self) -> Tuple[str, ...]:
+            return self._visible_data
+
+        def load_visible_data(self, values: Any) -> None:
+            self._visible_data = normalize_awg_sweep_visible_data(values)
+
 
 __all__ = [
     "AwgSweepMapPlotWidget",
     "AwgSweepMapResult",
+    "AWG_SWEEP_DATA_KEYS",
     "DEFAULT_AWG_SWEEP_COLOR_RANGES",
+    "DEFAULT_AWG_SWEEP_VISIBLE_DATA",
     "SweepAxisKey",
     "normalize_awg_sweep_color_ranges",
+    "normalize_awg_sweep_visible_data",
     "reduce_awg_sweep_map",
     "sweep_axis_key",
     "sweep_axis_label",

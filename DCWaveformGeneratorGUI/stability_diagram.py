@@ -111,6 +111,16 @@ DEFAULT_STABILITY_RF_PATH = {
     "readout_filter_bandwidth_ghz": 1.0,
 }
 DEFAULT_STABILITY_COLOR_RANGES = {
+    "i": {
+        "auto": True,
+        "minimum": -1.0,
+        "maximum": 1.0,
+    },
+    "q": {
+        "auto": True,
+        "minimum": -1.0,
+        "maximum": 1.0,
+    },
     "magnitude": {
         "auto": True,
         "minimum": 0.0,
@@ -122,6 +132,8 @@ DEFAULT_STABILITY_COLOR_RANGES = {
         "maximum": 180.0,
     },
 }
+STABILITY_DATA_KEYS = ("i", "q", "magnitude", "phase")
+DEFAULT_STABILITY_VISIBLE_DATA = ("magnitude", "phase")
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -172,6 +184,47 @@ def _normalize_color_range(
         "minimum": minimum,
         "maximum": maximum,
     }
+
+
+def normalize_stability_color_ranges(settings: Any) -> dict:
+    """Validate map ranges while accepting ``angle`` as a UI-name alias."""
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, Mapping):
+        raise TypeError("stability color_ranges must be a JSON object")
+    normalized = {}
+    for name, defaults in DEFAULT_STABILITY_COLOR_RANGES.items():
+        raw = settings.get(name)
+        if raw is None and name == "phase":
+            raw = settings.get("angle")
+        if raw is None:
+            raw = defaults
+        normalized[name] = _normalize_color_range(
+            raw,
+            defaults=defaults,
+            label=name,
+        )
+    return normalized
+
+
+def normalize_stability_visible_data(values: Any) -> Tuple[str, ...]:
+    """Validate the ordered set of maps shown in the Stability result dock."""
+    if values is None:
+        return DEFAULT_STABILITY_VISIBLE_DATA
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("stability visible_data must be a JSON array")
+    normalized = []
+    for value in values:
+        key = str(value).strip().lower()
+        if key == "angle":
+            key = "phase"
+        if key not in STABILITY_DATA_KEYS:
+            raise ValueError(f"unknown Stability plot data {value!r}")
+        if key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        raise ValueError("at least one Stability plot must be visible")
+    return tuple(normalized)
 
 
 @dataclass(frozen=True)
@@ -381,6 +434,7 @@ def default_stability_settings(
             name: dict(values)
             for name, values in DEFAULT_STABILITY_COLOR_RANGES.items()
         },
+        "visible_data": list(DEFAULT_STABILITY_VISIBLE_DATA),
         "database_path": DEFAULT_STABILITY_DB_PATH,
         "measurement_representation": "adc",
         "dc_measure_gain_v_per_a": 1.0,
@@ -553,16 +607,12 @@ def normalize_stability_settings(
         "color_ranges",
         defaults["color_ranges"],
     )
-    if not isinstance(raw_color_ranges, Mapping):
-        raise TypeError("stability color_ranges must be a JSON object")
-    normalized["color_ranges"] = {
-        name: _normalize_color_range(
-            raw_color_ranges.get(name, defaults["color_ranges"][name]),
-            defaults=defaults["color_ranges"][name],
-            label=name,
-        )
-        for name in ("magnitude", "phase")
-    }
+    normalized["color_ranges"] = normalize_stability_color_ranges(
+        raw_color_ranges
+    )
+    normalized["visible_data"] = list(
+        normalize_stability_visible_data(settings.get("visible_data"))
+    )
     database_path = str(
         settings.get("database_path", defaults["database_path"])
     ).strip()
@@ -1420,71 +1470,111 @@ if pg is not None:
 
 
     class StabilityDiagramPlotWidget(QtWidgets.QWidget):
-        """Side-by-side magnitude and wrapped-phase image plots."""
+        """Selectable I, Q, magnitude, and angle image plots."""
+
+        _PLOT_SPECS = (
+            ("i", "I", "CET-D1"),
+            ("q", "Q", "CET-D1"),
+            ("magnitude", "Magnitude", "viridis"),
+            ("phase", "Angle", "CET-C7"),
+        )
 
         def __init__(self, parent=None):
             super().__init__(parent)
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
+            selector_layout = QtWidgets.QHBoxLayout()
+            selector_layout.setContentsMargins(4, 2, 4, 2)
+            selector_layout.addWidget(QtWidgets.QLabel("Displayed data:", self))
+            self.data_selectors = {}
+            for key, title, _color_map in self._PLOT_SPECS:
+                selector = QtWidgets.QCheckBox(title, self)
+                selector.setChecked(key in DEFAULT_STABILITY_VISIBLE_DATA)
+                selector.toggled.connect(
+                    lambda checked, name=key: self._set_plot_visible(
+                        name,
+                        checked,
+                    )
+                )
+                selector_layout.addWidget(selector)
+                self.data_selectors[key] = selector
+            selector_layout.addStretch(1)
+            layout.addLayout(selector_layout)
 
-            range_layout = QtWidgets.QHBoxLayout()
-            range_layout.setContentsMargins(0, 0, 0, 0)
-            self.magnitude_range_control = _StabilityColorRangeControl(
-                "Magnitude color range",
-                auto=True,
-                minimum=0.0,
-                maximum=1.0,
-                unit="ADC units",
-                parent=self,
-            )
-            self.phase_range_control = _StabilityColorRangeControl(
-                "Phase color range",
-                auto=False,
-                minimum=-180.0,
-                maximum=180.0,
-                unit="deg",
-                parent=self,
-            )
-            range_layout.addWidget(self.magnitude_range_control, 1)
-            range_layout.addWidget(self.phase_range_control, 1)
-            layout.addLayout(range_layout)
-
-            splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
-            self.magnitude_plot = pg.PlotWidget(splitter)
-            self.phase_plot = pg.PlotWidget(splitter)
-            self.magnitude_image = pg.ImageItem(axisOrder="row-major")
-            self.phase_image = pg.ImageItem(axisOrder="row-major")
-            self.magnitude_plot.addItem(self.magnitude_image)
-            self.phase_plot.addItem(self.phase_image)
-            self.magnitude_plot.setTitle("Magnitude")
-            self.phase_plot.setTitle("Phase")
-            for plot in (self.magnitude_plot, self.phase_plot):
+            self.plot_grid = QtWidgets.QGridLayout()
+            self.plot_grid.setContentsMargins(0, 0, 0, 0)
+            self.plot_grid.setSpacing(4)
+            layout.addLayout(self.plot_grid, 1)
+            self.plots = {}
+            self.images = {}
+            self.range_controls = {}
+            self.color_bars = {}
+            self.plot_cells = {}
+            self._mouse_connections = []
+            for key, title, color_map_name in self._PLOT_SPECS:
+                defaults = DEFAULT_STABILITY_COLOR_RANGES[key]
+                unit = "deg" if key == "phase" else "ADC units"
+                cell = QtWidgets.QWidget(self)
+                cell_layout = QtWidgets.QVBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setSpacing(2)
+                range_control = _StabilityColorRangeControl(
+                    f"{title} color range",
+                    auto=defaults["auto"],
+                    minimum=defaults["minimum"],
+                    maximum=defaults["maximum"],
+                    unit=unit,
+                    parent=cell,
+                )
+                plot = pg.PlotWidget(cell)
+                image = pg.ImageItem(axisOrder="row-major")
+                plot.addItem(image)
+                plot.setTitle(title)
                 plot.setLabel("bottom", "X electrode", units="mV")
                 plot.setLabel("left", "Y electrode", units="mV")
                 plot.showGrid(x=True, y=True, alpha=0.18)
-            magnitude_map = self._color_map("viridis")
-            phase_map = self._color_map("CET-C7")
-            self.magnitude_image.setColorMap(magnitude_map)
-            self.phase_image.setColorMap(phase_map)
-            self.magnitude_color_bar = attach_color_bar(
-                self.magnitude_plot,
-                self.magnitude_image,
-                magnitude_map,
-                unit="ADC units",
-                levels=(0.0, 1.0),
-                range_control=self.magnitude_range_control,
-            )
-            self.phase_color_bar = attach_color_bar(
-                self.phase_plot,
-                self.phase_image,
-                phase_map,
-                unit="deg",
-                levels=(-180.0, 180.0),
-                range_control=self.phase_range_control,
-            )
-            splitter.setStretchFactor(0, 1)
-            splitter.setStretchFactor(1, 1)
-            layout.addWidget(splitter, 1)
+                color_map = self._color_map(color_map_name)
+                image.setColorMap(color_map)
+                color_bar = attach_color_bar(
+                    plot,
+                    image,
+                    color_map,
+                    unit=unit,
+                    levels=(defaults["minimum"], defaults["maximum"]),
+                    range_control=range_control,
+                )
+                cell_layout.addWidget(range_control)
+                cell_layout.addWidget(plot, 1)
+                self.plots[key] = plot
+                self.images[key] = image
+                self.range_controls[key] = range_control
+                self.color_bars[key] = color_bar
+                self.plot_cells[key] = cell
+                range_control.levels_changed.connect(
+                    lambda minimum, maximum, name=key: self._set_color_levels(
+                        name,
+                        minimum,
+                        maximum,
+                    )
+                )
+                slot = lambda event, source=plot: self._mouse_moved(
+                    event,
+                    source,
+                )
+                plot.scene().sigMouseMoved.connect(slot)
+                self._mouse_connections.append(
+                    (plot.scene().sigMouseMoved, slot)
+                )
+
+            self.magnitude_range_control = self.range_controls["magnitude"]
+            self.phase_range_control = self.range_controls["phase"]
+            self.magnitude_plot = self.plots["magnitude"]
+            self.phase_plot = self.plots["phase"]
+            self.magnitude_image = self.images["magnitude"]
+            self.phase_image = self.images["phase"]
+            self.magnitude_color_bar = self.color_bars["magnitude"]
+            self.phase_color_bar = self.color_bars["phase"]
+            self._reflow_visible_plots()
             self.hover_status = QtWidgets.QLabel("No stability scan acquired", self)
             self.hover_status.setTextInteractionFlags(
                 QtCore.Qt.TextSelectableByMouse
@@ -1492,30 +1582,52 @@ if pg is not None:
             layout.addWidget(self.hover_status)
             self._result: Optional[StabilityDiagramResult] = None
             self._setting_color_levels = False
-            self.magnitude_range_control.levels_changed.connect(
-                lambda minimum, maximum: self._set_color_levels(
-                    "magnitude",
-                    minimum,
-                    maximum,
+
+        def _set_plot_visible(self, name: str, checked: bool) -> None:
+            if not checked and not any(
+                selector.isChecked()
+                for key, selector in self.data_selectors.items()
+                if key != name
+            ):
+                with QtCore.QSignalBlocker(self.data_selectors[name]):
+                    self.data_selectors[name].setChecked(True)
+                checked = True
+            self.plot_cells[name].setVisible(checked)
+            self._reflow_visible_plots()
+            if checked and getattr(self, "_result", None) is not None:
+                self.plots[name].enableAutoRange(x=True, y=True)
+
+        def _reflow_visible_plots(self) -> None:
+            visible = [
+                key
+                for key, _title, _color_map in self._PLOT_SPECS
+                if self.data_selectors[key].isChecked()
+            ]
+            for cell in self.plot_cells.values():
+                self.plot_grid.removeWidget(cell)
+                cell.setVisible(cell in [self.plot_cells[key] for key in visible])
+            columns = 2 if len(visible) > 1 else 1
+            for index, key in enumerate(visible):
+                self.plot_grid.addWidget(
+                    self.plot_cells[key],
+                    index // columns,
+                    index % columns,
                 )
+
+        def visible_data(self) -> Tuple[str, ...]:
+            return tuple(
+                key
+                for key, _title, _color_map in self._PLOT_SPECS
+                if self.data_selectors[key].isChecked()
             )
-            self.phase_range_control.levels_changed.connect(
-                lambda minimum, maximum: self._set_color_levels(
-                    "phase",
-                    minimum,
-                    maximum,
-                )
-            )
-            self._magnitude_proxy = pg.SignalProxy(
-                self.magnitude_plot.scene().sigMouseMoved,
-                rateLimit=30,
-                slot=lambda event: self._mouse_moved(event, self.magnitude_plot),
-            )
-            self._phase_proxy = pg.SignalProxy(
-                self.phase_plot.scene().sigMouseMoved,
-                rateLimit=30,
-                slot=lambda event: self._mouse_moved(event, self.phase_plot),
-            )
+
+        def load_visible_data(self, values: Any) -> None:
+            visible = set(normalize_stability_visible_data(values))
+            for key, selector in self.data_selectors.items():
+                with QtCore.QSignalBlocker(selector):
+                    selector.setChecked(key in visible)
+            self._reflow_visible_plots()
+            self.fit_view()
 
         @staticmethod
         def _color_map(name: str):
@@ -1525,19 +1637,15 @@ if pg is not None:
                 return pg.colormap.get("viridis")
 
         def _color_items(self, name: str):
-            if name == "magnitude":
-                return (
-                    self.magnitude_image,
-                    self.magnitude_range_control,
-                    self.magnitude_color_bar,
-                )
-            if name == "phase":
-                return (
-                    self.phase_image,
-                    self.phase_range_control,
-                    self.phase_color_bar,
-                )
-            raise KeyError(f"unknown stability color range {name!r}")
+            if name == "angle":
+                name = "phase"
+            if name not in self.images:
+                raise KeyError(f"unknown stability color range {name!r}")
+            return (
+                self.images[name],
+                self.range_controls[name],
+                self.color_bars[name],
+            )
 
         def _set_color_levels(
             self,
@@ -1557,16 +1665,17 @@ if pg is not None:
 
         def color_range_settings(self) -> dict:
             return {
-                "magnitude": self.magnitude_range_control.settings_dict(),
-                "phase": self.phase_range_control.settings_dict(),
+                name: control.settings_dict()
+                for name, control in self.range_controls.items()
             }
 
         def load_color_range_settings(
             self,
             settings: Mapping[str, Any],
         ) -> None:
-            self.magnitude_range_control.load_settings(settings["magnitude"])
-            self.phase_range_control.load_settings(settings["phase"])
+            normalized = normalize_stability_color_ranges(settings)
+            for name, control in self.range_controls.items():
+                control.load_settings(normalized[name])
 
         @staticmethod
         def _levels(values: np.ndarray) -> Tuple[float, float]:
@@ -1587,11 +1696,13 @@ if pg is not None:
 
         def set_result(self, result: StabilityDiagramResult) -> None:
             self._result = result
-            self.magnitude_plot.setTitle(
+            self.plots["i"].setTitle(f"I [{result.value_unit}]")
+            self.plots["q"].setTitle(f"Q [{result.value_unit}]")
+            self.plots["magnitude"].setTitle(
                 f"Magnitude [{result.value_unit}]"
             )
-            self.phase_plot.setTitle("Phase [deg]")
-            for plot in (self.magnitude_plot, self.phase_plot):
+            self.plots["phase"].setTitle("Angle [deg]")
+            for plot in self.plots.values():
                 plot.setLabel("bottom", result.x_axis_label, units="mV")
                 plot.setLabel("left", result.y_axis_label, units="mV")
             x_low, x_high = self._axis_edges(result.x_voltage_mv)
@@ -1602,28 +1713,27 @@ if pg is not None:
                 x_high - x_low,
                 y_high - y_low,
             )
-            self.magnitude_image.setImage(
-                result.magnitude,
-                autoLevels=False,
-            )
-            self.phase_image.setImage(
-                result.phase_deg,
-                autoLevels=False,
-            )
-            self.magnitude_range_control.set_unit(result.value_unit)
-            if self.magnitude_color_bar is not None:
-                self.magnitude_color_bar.setLabel(
-                    "right",
-                    text=result.value_unit,
-                )
-            self.magnitude_range_control.set_data_levels(
-                *self._levels(result.magnitude)
-            )
-            self.phase_range_control.set_data_levels(
-                *self._levels(result.phase_deg)
-            )
-            self.magnitude_image.setRect(rect)
-            self.phase_image.setRect(rect)
+            image_values = {
+                "i": result.i_mean,
+                "q": result.q_mean,
+                "magnitude": result.magnitude,
+                "phase": result.phase_deg,
+            }
+            levels = {
+                "i": self._symmetric_levels(result.i_mean),
+                "q": self._symmetric_levels(result.q_mean),
+                "magnitude": self._levels(result.magnitude),
+                "phase": (-180.0, 180.0),
+            }
+            for key, values in image_values.items():
+                self.images[key].setImage(values, autoLevels=False)
+                unit = "deg" if key == "phase" else result.value_unit
+                self.range_controls[key].set_unit(unit)
+                self.range_controls[key].set_data_levels(*levels[key])
+                color_bar = self.color_bars[key]
+                if color_bar is not None:
+                    color_bar.setLabel("right", text=unit)
+                self.images[key].setRect(rect)
             self.fit_view()
             self.hover_status.setText(
                 f"Scan {result.iteration}: {result.repetition_count} repetitions, "
@@ -1633,8 +1743,25 @@ if pg is not None:
             )
 
         def fit_view(self) -> None:
-            for plot in (self.magnitude_plot, self.phase_plot):
-                plot.enableAutoRange(x=True, y=True)
+            for key, plot in self.plots.items():
+                if self.data_selectors[key].isChecked():
+                    plot.enableAutoRange(x=True, y=True)
+
+        @staticmethod
+        def _symmetric_levels(values: np.ndarray) -> Tuple[float, float]:
+            limit = float(np.nanmax(np.abs(values)))
+            if np.isclose(limit, 0.0):
+                limit = 1.0
+            return -limit, limit
+
+        def closeEvent(self, event) -> None:
+            for signal, slot in self._mouse_connections:
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            self._mouse_connections.clear()
+            super().closeEvent(event)
 
         def _mouse_moved(self, event, plot) -> None:
             if self._result is None:
@@ -1675,6 +1802,7 @@ else:
                 name: dict(values)
                 for name, values in DEFAULT_STABILITY_COLOR_RANGES.items()
             }
+            self._visible_data = DEFAULT_STABILITY_VISIBLE_DATA
 
         def set_result(self, _result: StabilityDiagramResult) -> None:
             return
@@ -1692,10 +1820,13 @@ else:
             self,
             settings: Mapping[str, Any],
         ) -> None:
-            self._color_ranges = {
-                name: dict(settings[name])
-                for name in ("magnitude", "phase")
-            }
+            self._color_ranges = normalize_stability_color_ranges(settings)
+
+        def visible_data(self) -> Tuple[str, ...]:
+            return self._visible_data
+
+        def load_visible_data(self, values: Any) -> None:
+            self._visible_data = normalize_stability_visible_data(values)
 
 
 class StabilityDiagramPanel(QtWidgets.QWidget):
@@ -2294,6 +2425,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             },
             "rf_path": dict(self.front_panel_values()),
             "color_ranges": self.plot.color_range_settings(),
+            "visible_data": list(self.plot.visible_data()),
             "database_path": self.database_path_value(),
             "measurement_representation": str(
                 self.measurement_unit.currentData()
@@ -2368,6 +2500,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             settings.get(
                 "color_ranges",
                 default_stability_settings()["color_ranges"],
+            )
+        )
+        self.plot.load_visible_data(
+            settings.get(
+                "visible_data",
+                default_stability_settings()["visible_data"],
             )
         )
         self.database_path.setText(
@@ -2496,6 +2634,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 __all__ = [
     "DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV",
     "DEFAULT_STABILITY_COLOR_RANGES",
+    "DEFAULT_STABILITY_VISIBLE_DATA",
     "DEFAULT_STABILITY_POINTS",
     "DEFAULT_STABILITY_REPETITIONS",
     "DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ",
@@ -2510,8 +2649,11 @@ __all__ = [
     "StabilityDiagramResult",
     "StabilityDiagramWorker",
     "StabilitySweepAxis",
+    "STABILITY_DATA_KEYS",
     "StoredStabilityDiagram",
     "default_stability_settings",
     "normalize_stability_settings",
+    "normalize_stability_color_ranges",
+    "normalize_stability_visible_data",
     "reduce_fir_stability_result",
 ]

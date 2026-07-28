@@ -30,8 +30,56 @@ def _plot_color(index: int) -> QtGui.QColor:
     return QtGui.QColor(pg.intColor(index, hues=8, values=1, minValue=110, maxValue=220))
 
 
+def _trace_point_records(
+    pulse_x: PulseSequence,
+    pulse_y: PulseSequence,
+) -> Tuple[dict, ...]:
+    """Return logical SET points and their per-axis timing metadata."""
+    point_count = min(pulse_x.set_count, pulse_y.set_count)
+    records = []
+    for point_index in range(point_count):
+        flat_index = 2 * point_index
+        record = {
+            "point_index": point_index,
+            "x_mv": float(pulse_x.v[flat_index]),
+            "y_mv": float(pulse_y.v[flat_index]),
+            "hold_x_ns": float(
+                pulse_x.t[flat_index + 1] - pulse_x.t[flat_index]
+            ),
+            "hold_y_ns": float(
+                pulse_y.t[flat_index + 1] - pulse_y.t[flat_index]
+            ),
+            "ramp_x_ns": None,
+            "ramp_y_ns": None,
+        }
+        if point_index:
+            record["ramp_x_ns"] = float(
+                pulse_x.t[flat_index] - pulse_x.t[flat_index - 1]
+            )
+            record["ramp_y_ns"] = float(
+                pulse_y.t[flat_index] - pulse_y.t[flat_index - 1]
+            )
+        records.append(record)
+    return tuple(records)
+
+
+def _duration_pair_text(
+    x_ns: Optional[float],
+    y_ns: Optional[float],
+    unit: str,
+) -> str:
+    if x_ns is None or y_ns is None:
+        return "initial"
+    scale = TIME_UNIT_SCALE[unit]
+    x_value = float(x_ns) * scale
+    y_value = float(y_ns) * scale
+    if np.isclose(x_value, y_value, rtol=0.0, atol=1.0e-12):
+        return f"{x_value:.6g} {unit}"
+    return f"X {x_value:.6g} / Y {y_value:.6g} {unit}"
+
+
 class TracePlotWidget(pg.PlotWidget):
-    """Voltage-voltage trace for two selected waveform outputs."""
+    """Voltage trace with point timing and a last-stability-map underlay."""
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -40,18 +88,48 @@ class TracePlotWidget(pg.PlotWidget):
         self.setLabel("bottom", "Pulse-X", units="mV")
         self.setLabel("left", "Pulse-Y", units="mV")
         self.getPlotItem().hideButtons()
+        self._stability_color_map = pg.colormap.get("viridis")
+        self._stability_image = pg.ImageItem(axisOrder="row-major")
+        self._stability_image.setColorMap(self._stability_color_map)
+        self._stability_image.setOpacity(0.52)
+        self._stability_image.setZValue(-20)
+        self.addItem(self._stability_image)
+        self._stability_color_bar = None
+        self._stability_image.hide()
+        self._trace_shadow = self.plot(
+            [],
+            [],
+            pen=pg.mkPen((20, 20, 20, 190), width=4.0),
+        )
+        self._trace_shadow.setZValue(8)
         self._curve = self.plot(
             [],
             [],
             pen=pg.mkPen(_plot_color(0), width=1.8),
-            symbol="o",
-            symbolSize=6,
-            symbolPen=pg.mkPen(_plot_color(0)),
-            symbolBrush=pg.mkBrush(_plot_color(0)),
         )
+        self._curve.setZValue(9)
+        point_color = _plot_color(0)
+        self._point_scatter = pg.ScatterPlotItem(
+            pen=pg.mkPen((20, 20, 20), width=1.2),
+            brush=pg.mkBrush(point_color),
+            symbolSize=6,
+            hoverable=True,
+            hoverBrush=pg.mkBrush(255, 215, 0),
+            hoverSize=10,
+            tip=self._point_tooltip,
+        )
+        self._point_scatter.setZValue(12)
+        self.addItem(self._point_scatter)
+        self._point_scatter.sigHovered.connect(self._points_hovered)
         self.x_idx: Optional[int] = None
         self.y_idx: Optional[int] = None
         self._pulses: Sequence[PulseSequence] = ()
+        self._time_unit = "us"
+        self._point_records: Tuple[dict, ...] = ()
+        self._point_labels: List[pg.TextItem] = []
+        self._stability_result = None
+        self._stability_overlay_active = False
+        self._default_title = "Select X/Y outputs"
 
     @property
     def has_selection(self) -> bool:
@@ -65,20 +143,191 @@ class TracePlotWidget(pg.PlotWidget):
     def uses_port(self, index: int) -> bool:
         return index == self.x_idx or index == self.y_idx
 
+    def set_time_unit(self, unit: str) -> None:
+        if unit not in TIME_UNIT_SCALE:
+            raise ValueError(f"unsupported trace time unit {unit!r}")
+        self._time_unit = unit
+        if self._pulses:
+            self.refresh_trace(self._pulses)
+
+    def _point_timing_text(self, record: dict, *, multiline: bool) -> str:
+        separator = "\n" if multiline else " | "
+        timing = []
+        if record["point_index"]:
+            timing.append(
+                "Ramp "
+                + _duration_pair_text(
+                    record["ramp_x_ns"],
+                    record["ramp_y_ns"],
+                    self._time_unit,
+                )
+            )
+        timing.append(
+            "Hold "
+            + _duration_pair_text(
+                record["hold_x_ns"],
+                record["hold_y_ns"],
+                self._time_unit,
+            )
+        )
+        return separator.join(timing)
+
+    def _point_tooltip(self, _x, _y, data) -> str:
+        if not isinstance(data, dict):
+            return ""
+        return (
+            f"P{data['point_index']} | "
+            f"X {data['x_mv']:.6g} mV | Y {data['y_mv']:.6g} mV | "
+            f"{self._point_timing_text(data, multiline=False)}"
+        )
+
+    def _points_hovered(self, _item, points, _event) -> None:
+        if points:
+            self.setTitle(
+                self._point_tooltip(
+                    points[0].pos().x(),
+                    points[0].pos().y(),
+                    points[0].data(),
+                )
+            )
+        else:
+            self.setTitle(self._default_title)
+
+    def _clear_point_labels(self) -> None:
+        for label in self._point_labels:
+            self.removeItem(label)
+        self._point_labels.clear()
+
+    def _refresh_point_items(
+        self,
+        pulse_x: PulseSequence,
+        pulse_y: PulseSequence,
+    ) -> None:
+        self._point_records = _trace_point_records(pulse_x, pulse_y)
+        self._clear_point_labels()
+        spots = []
+        for record in self._point_records:
+            spots.append({
+                "pos": (record["x_mv"], record["y_mv"]),
+                "data": record,
+            })
+            label = pg.TextItem(
+                text=(
+                    f"P{record['point_index']}\n"
+                    + self._point_timing_text(record, multiline=True)
+                ),
+                color=(18, 18, 18),
+                anchor=(0.0, 1.0),
+                border=pg.mkPen((45, 45, 45, 150)),
+                fill=pg.mkBrush(255, 255, 255, 185),
+            )
+            label.setZValue(14)
+            label.setPos(record["x_mv"], record["y_mv"])
+            self.addItem(label)
+            self._point_labels.append(label)
+        self._point_scatter.setData(spots)
+
+    @staticmethod
+    def _axis_edges(values: np.ndarray) -> Tuple[float, float]:
+        values = np.asarray(values, dtype=float)
+        if values.size == 1:
+            return float(values[0] - 0.5), float(values[0] + 0.5)
+        step = float(np.median(np.diff(values)))
+        return float(values[0] - step / 2.0), float(values[-1] + step / 2.0)
+
+    @staticmethod
+    def _finite_levels(values: np.ndarray) -> Tuple[float, float]:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        low = float(np.min(finite))
+        high = float(np.max(finite))
+        if np.isclose(low, high):
+            delta = max(1.0, abs(low) * 0.01)
+            low -= delta
+            high += delta
+        return low, high
+
+    def set_stability_overlay(self, result) -> None:
+        """Show the newest matching stability magnitude below the trace."""
+        self._stability_result = result
+        self._refresh_stability_overlay()
+
+    def _refresh_stability_overlay(self) -> None:
+        self._stability_overlay_active = False
+        self._stability_image.hide()
+        result = self._stability_result
+        if result is None:
+            self._default_title = "Hover a P# marker for hold/ramp timing"
+            self.setTitle(self._default_title)
+            return
+        if not self.has_selection:
+            self._default_title = "Select X/Y outputs to overlay the last stability scan"
+            self.setTitle(self._default_title)
+            return
+
+        trace_axes = (f"awg_{self.x_idx}", f"awg_{self.y_idx}")
+        result_axes = (str(result.x_axis_label), str(result.y_axis_label))
+        if result_axes == trace_axes:
+            x_values = np.asarray(result.x_voltage_mv, dtype=float)
+            y_values = np.asarray(result.y_voltage_mv, dtype=float)
+            magnitude = np.asarray(result.magnitude, dtype=float)
+        elif result_axes == trace_axes[::-1]:
+            x_values = np.asarray(result.y_voltage_mv, dtype=float)
+            y_values = np.asarray(result.x_voltage_mv, dtype=float)
+            magnitude = np.asarray(result.magnitude, dtype=float).T
+        else:
+            self._default_title = (
+                "Last stability scan axes "
+                f"{result_axes[0]}/{result_axes[1]} do not match "
+                f"{trace_axes[0]}/{trace_axes[1]}"
+            )
+            self.setTitle(self._default_title)
+            return
+
+        x_low, x_high = self._axis_edges(x_values)
+        y_low, y_high = self._axis_edges(y_values)
+        self._stability_image.setImage(magnitude, autoLevels=False)
+        self._stability_image.setRect(
+            QtCore.QRectF(
+                x_low,
+                y_low,
+                x_high - x_low,
+                y_high - y_low,
+            )
+        )
+        levels = self._finite_levels(magnitude)
+        self._stability_image.setLevels(levels)
+        self._stability_image.show()
+        self._stability_overlay_active = True
+        self._default_title = (
+            f"Trace over Stability scan {result.iteration} magnitude "
+            f"[{result.value_unit}]"
+        )
+        self.setTitle(self._default_title)
+
     def refresh_trace(self, pulses: Sequence[PulseSequence]) -> None:
         """Update the existing curve; interpolation runs only when X/Y exist."""
         self._pulses = pulses
         if not self.has_selection:
+            self._trace_shadow.setData([], [])
             self._curve.setData([], [])
+            self._point_scatter.setData([])
+            self._clear_point_labels()
+            self._refresh_stability_overlay()
             return
         pulse_x = pulses[self.x_idx]
         pulse_y = pulses[self.y_idx]
         time_union = np.union1d(pulse_x.t, pulse_y.t)
         voltage_x = np.interp(time_union, pulse_x.t, pulse_x.v)
         voltage_y = np.interp(time_union, pulse_y.t, pulse_y.v)
+        self._trace_shadow.setData(voltage_x, voltage_y)
         self._curve.setData(voltage_x, voltage_y)
+        self._refresh_point_items(pulse_x, pulse_y)
         self.setLabel("bottom", f"Pulse {self.x_idx + 1}", units="mV")
         self.setLabel("left", f"Pulse {self.y_idx + 1}", units="mV")
+        self._refresh_stability_overlay()
 
     def fit_view(self) -> None:
         if self.has_selection:

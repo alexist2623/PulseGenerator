@@ -387,6 +387,22 @@ def test_experiment_panel_axis_selection_and_result_plot():
             color_bar is not None
             for color_bar in window._awg_sweep_plot.color_bars.values()
         )
+        assert window._awg_sweep_plot.visible_data() == (
+            "i",
+            "q",
+            "magnitude",
+            "angle",
+        )
+        window._awg_sweep_plot.load_visible_data(["q", "magnitude"])
+        app.processEvents()
+        assert window._awg_sweep_plot.visible_data() == ("q", "magnitude")
+        assert window._awg_sweep_plot.plot_cells["i"].isHidden() is True
+        assert window._awg_sweep_plot.plot_cells["q"].isHidden() is False
+        assert (
+            window._awg_sweep_plot.plot_cells["magnitude"].isHidden()
+            is False
+        )
+        assert window._awg_sweep_plot.plot_cells["angle"].isHidden() is True
         magnitude_bar = window._awg_sweep_plot.color_bars["magnitude"]
         assert magnitude_bar.interactive is True
         magnitude_bar.setLevels((2.5, 25.0))
@@ -444,6 +460,7 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
         "magnitude": {"auto": False, "minimum": 0.0, "maximum": 8.0},
         "angle": {"auto": False, "minimum": -90.0, "maximum": 90.0},
     })
+    window._awg_sweep_plot.load_visible_data(["i", "angle"])
     app.processEvents()
     assert window._experiment_panel.selected_sweep_axis_keys() == (
         ("awg_1", "set_0"),
@@ -464,6 +481,7 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
         "magnitude": {"auto": False, "minimum": 0.0, "maximum": 8.0},
         "angle": {"auto": False, "minimum": -90.0, "maximum": 90.0},
     }
+    assert restored._awg_sweep_plot.visible_data() == ("i", "angle")
 
     restored.close()
     window.close()
