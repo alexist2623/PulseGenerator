@@ -489,6 +489,10 @@ def test_saved_awg_run_listing_filters_stability_and_uses_saved_axes(tmp_path):
     stability_metadata["gui_settings"]["qick"][
         "fir_stability_capture_mode"
     ] = "immediate_continuous_fir_output"
+    programmable_stability_metadata = json.loads(json.dumps(metadata))
+    programmable_stability_metadata["gui_settings"]["qick"][
+        "fir_stability_capture_mode"
+    ] = "programmable_fpga_delay"
     one_axis_metadata = json.loads(json.dumps(metadata))
     one_axis_metadata["measurement_layout"]["sweep_axes"] = (
         one_axis_metadata["measurement_layout"]["sweep_axes"][:1]
@@ -510,6 +514,10 @@ def test_saved_awg_run_listing_filters_stability_and_uses_saved_axes(tmp_path):
         connection.execute(
             "INSERT INTO runs VALUES (?, ?)",
             (22, json.dumps(metadata)),
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (23, json.dumps(programmable_stability_metadata)),
         )
 
     summaries = awg_map.list_awg_sweep_runs(database_path)

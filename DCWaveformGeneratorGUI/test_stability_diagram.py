@@ -900,6 +900,10 @@ def _stored_stability_metadata():
 def test_saved_stability_run_listing_filters_other_qick_runs(tmp_path):
     database_path = tmp_path / "stability.db"
     metadata = _stored_stability_metadata()
+    programmable_delay = json.loads(json.dumps(metadata))
+    programmable_delay["gui_settings"]["qick"][
+        "fir_stability_capture_mode"
+    ] = "programmable_fpga_delay"
     non_stability = json.loads(json.dumps(metadata))
     non_stability["gui_settings"]["qick"].pop("fir_stability_capture_mode")
     with sqlite3.connect(database_path) as connection:
@@ -916,20 +920,26 @@ def test_saved_stability_run_listing_filters_other_qick_runs(tmp_path):
             "INSERT INTO runs VALUES (?, ?)",
             (11, json.dumps(metadata)),
         )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?)",
+            (12, json.dumps(programmable_delay)),
+        )
 
     summaries = stability.list_stability_runs(database_path)
 
-    assert len(summaries) == 1
-    assert summaries[0].run_id == 11
+    assert [summary.run_id for summary in summaries] == [12, 11]
     assert summaries[0].x_axis_label == "awg_0"
     assert summaries[0].y_axis_label == "awg_1"
     assert summaries[0].sample_rate_hz == 50_000.0
-    assert "Run 11" in summaries[0].display_label
+    assert "Run 12" in summaries[0].display_label
     assert "50 kSPS" in summaries[0].display_label
 
 
 def test_saved_stability_iq_arrays_restore_cartesian_grid(tmp_path):
     metadata = _stored_stability_metadata()
+    metadata["gui_settings"]["qick"][
+        "fir_stability_capture_mode"
+    ] = "programmable_fpga_delay"
     iq = np.empty((4, 2, 3, 2), dtype=np.int32)
     for point_index in range(4):
         iq[point_index, :, :, 0] = point_index + 1
@@ -1107,7 +1117,7 @@ def test_saved_stability_run_loads_from_real_qcodes_database(
             "full_scale_mv": 800.0,
             "fir_rate_profile": "50_ksps",
             "fir_stability_capture_mode": (
-                "immediate_continuous_fir_output"
+                "programmable_fpga_delay"
             ),
         },
         "stability_diagram": {

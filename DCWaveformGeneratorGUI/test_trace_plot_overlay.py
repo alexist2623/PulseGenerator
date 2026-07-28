@@ -411,3 +411,59 @@ def test_pinned_saved_overlay_is_not_replaced_by_new_scan():
     assert window._stability_panel.result is latest
     assert window._trace.result is pinned
     assert window._trace.fit_count == 0
+
+
+def test_saved_stability_run_refreshes_trace_overlay_selector(tmp_path):
+    class _Panel:
+        def __init__(self):
+            self.stored = None
+
+        def show_saved_result(self, stored):
+            self.stored = stored
+
+    class _DatabasePath:
+        def __init__(self):
+            self.value = ""
+
+        def setText(self, value):
+            self.value = value
+
+    class _Selector:
+        def __init__(self):
+            self.database_path = _DatabasePath()
+            self.refresh_count = 0
+            self.latest = None
+
+        def refresh_runs(self):
+            self.refresh_count += 1
+
+        def show_latest_result(self, result):
+            self.latest = result
+
+    class _Stored:
+        def __init__(self, diagram, database_path):
+            self.diagram = diagram
+            self.database_path = database_path
+            self.run_id = 57
+
+    class _Window:
+        def __init__(self):
+            self._last_stability_result = None
+            self._trace_overlay_pinned = False
+            self._stability_panel = _Panel()
+            self._trace_overlay_selector = _Selector()
+            self._trace = None
+
+        def statusBar(self):
+            return type("_Status", (), {"showMessage": lambda *_args: None})()
+
+    database_path = tmp_path / "new_stability.db"
+    stored = _Stored(_result(), database_path)
+    window = _Window()
+
+    gui.MainWindow._on_stability_single_finished(window, stored)
+
+    assert window._stability_panel.stored is stored
+    assert window._trace_overlay_selector.database_path.value == str(database_path)
+    assert window._trace_overlay_selector.refresh_count == 1
+    assert window._trace_overlay_selector.latest is stored.diagram

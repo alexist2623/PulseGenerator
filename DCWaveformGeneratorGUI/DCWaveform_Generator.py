@@ -8809,9 +8809,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_stability_single_finished(self, stored) -> None:
         self._last_stability_result = stored.diagram
         self._stability_panel.show_saved_result(stored)
+        selector = getattr(self, "_trace_overlay_selector", None)
+        if selector is not None:
+            selector.database_path.setText(str(stored.database_path))
+            selector.refresh_runs()
         if not getattr(self, "_trace_overlay_pinned", False):
             MainWindow._apply_trace_stability_overlay(self, fit=True)
-            selector = getattr(self, "_trace_overlay_selector", None)
             if selector is not None:
                 selector.show_latest_result(stored.diagram)
         self.statusBar().showMessage(

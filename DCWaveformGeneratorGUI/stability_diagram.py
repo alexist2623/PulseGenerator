@@ -483,14 +483,14 @@ def _stability_axis_metadata(
 
 
 def _is_stability_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Recognize every saved Stability capture implementation revision."""
     gui_settings = metadata.get("gui_settings", {})
     if not isinstance(gui_settings, Mapping):
         return False
     qick_settings = gui_settings.get("qick", {})
     return (
         isinstance(qick_settings, Mapping)
-        and qick_settings.get("fir_stability_capture_mode")
-        == "immediate_continuous_fir_output"
+        and bool(qick_settings.get("fir_stability_capture_mode"))
     )
 
 

@@ -316,8 +316,7 @@ def _is_awg_sweep_metadata(metadata: Mapping[str, Any]) -> bool:
     )
     return not (
         isinstance(qick_settings, Mapping)
-        and qick_settings.get("fir_stability_capture_mode")
-        == "immediate_continuous_fir_output"
+        and bool(qick_settings.get("fir_stability_capture_mode"))
     )
 
 
