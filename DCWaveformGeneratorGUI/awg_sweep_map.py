@@ -1,9 +1,10 @@
-"""Two-dimensional maps reduced from Cartesian AWG tuning sweeps.
+"""Interactive two-dimensional maps from Cartesian AWG tuning sweeps.
 
 The hardware acquisition stores one I/Q trace for every Cartesian sweep point
 and repetition. This module coherently averages I and Q over repetitions and
-FIR samples, then arranges two user-selected sweep variables on X and Y.
-Additional sweep variables are averaged at each selected X/Y coordinate.
+FIR samples, then arranges two user-selected sweep variables on X and Y. Every
+remaining sweep variable can either be fixed to one acquired value or averaged
+independently at each selected X/Y coordinate.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -140,6 +141,22 @@ def _axis_display_values(
 
 
 @dataclass(frozen=True)
+class AwgSweepMapSource:
+    """Unreduced Cartesian sweep data used for interactive reprojection."""
+
+    sweep_axes: Tuple[Any, ...]
+    sweep_points: np.ndarray
+    iq_values: np.ndarray
+    full_scale_mv: float
+    value_unit: str
+    measurement_mode: str
+    sample_rate_hz: float
+    source_label: str = ""
+    database_path: str = ""
+    run_id: int = 0
+
+
+@dataclass(frozen=True)
 class AwgSweepMapResult:
     """I/Q and derived values on two selected AWG sweep axes."""
 
@@ -167,6 +184,9 @@ class AwgSweepMapResult:
     source_label: str = ""
     database_path: str = ""
     run_id: int = 0
+    fixed_axis_values: Tuple[Tuple[SweepAxisKey, float], ...] = ()
+    fixed_axis_labels: Tuple[str, ...] = ()
+    source: Optional[AwgSweepMapSource] = None
 
     @property
     def x_values_mv(self) -> np.ndarray:
@@ -497,11 +517,20 @@ def awg_sweep_result_from_stored_arrays(
         measurement_mode=str(arrays.get("measurement_mode", "raw_iq")),
     )
     path = Path(database_path).expanduser().resolve()
+    result_source = result.source
+    if result_source is not None:
+        result_source = replace(
+            result_source,
+            source_label=f"QCoDeS Run {int(run_id)}",
+            database_path=str(path),
+            run_id=int(run_id),
+        )
     return replace(
         result,
         source_label=f"QCoDeS Run {int(run_id)}",
         database_path=str(path),
         run_id=int(run_id),
+        source=result_source,
     )
 
 
@@ -721,12 +750,15 @@ def reduce_awg_sweep_map(
     iq_values: Optional[Any] = None,
     value_unit: str = "ADC units",
     measurement_mode: str = "raw_iq",
+    fixed_axis_values: Optional[Mapping[SweepAxisKey, float]] = None,
+    source: Optional[AwgSweepMapSource] = None,
 ) -> AwgSweepMapResult:
     """Reduce one Cartesian FIR acquisition to a selected two-axis map.
 
-    I and Q are averaged coherently over repetitions, FIR samples, and any
-    non-selected sweep axes. Magnitude and angle are calculated only after
-    this complex averaging.
+    I and Q are averaged coherently over repetitions and FIR samples. A
+    non-selected sweep axis can be fixed to one acquired value; all remaining
+    non-selected axes are averaged. Magnitude and angle are calculated only
+    after this complex averaging.
     """
     full_scale_mv = float(full_scale_mv)
     if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
@@ -763,6 +795,36 @@ def reduce_awg_sweep_map(
     if not np.all(np.isfinite(coordinates)):
         raise ValueError("AWG sweep coordinates must be finite")
 
+    normalized_fixed = {}
+    if fixed_axis_values is not None:
+        if not isinstance(fixed_axis_values, Mapping):
+            raise TypeError("fixed_axis_values must be a mapping")
+        for raw_key, raw_value in fixed_axis_values.items():
+            key = tuple(map(str, raw_key))
+            if len(key) != 2:
+                raise ValueError("fixed sweep-axis keys must contain two names")
+            if key in (x_axis_key, y_axis_key):
+                raise ValueError("X and Y sweep axes cannot also be fixed")
+            if key not in axis_keys:
+                raise ValueError(f"fixed AWG sweep axis {key!r} is not present")
+            value = float(raw_value)
+            if not np.isfinite(value):
+                raise ValueError("fixed AWG sweep values must be finite")
+            normalized_fixed[key] = value
+
+    if source is None:
+        source = AwgSweepMapSource(
+            sweep_axes=axes,
+            sweep_points=coordinates,
+            iq_values=iq,
+            full_scale_mv=full_scale_mv,
+            value_unit=str(value_unit),
+            measurement_mode=str(measurement_mode),
+            sample_rate_hz=float(
+                getattr(ddr_result, "sample_rate_hz", 1_000_000.0)
+            ),
+        )
+
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
     if not np.all(np.isfinite(point_iq)):
         raise ValueError("AWG sweep I/Q contains NaN or infinity")
@@ -772,6 +834,26 @@ def reduce_awg_sweep_map(
         value_unit,
     )
     point_iq = np.column_stack((display_i, display_q))
+
+    selected_points = np.ones(coordinates.shape[0], dtype=bool)
+    for key, value in normalized_fixed.items():
+        column = axis_keys.index(key)
+        column_values = coordinates[:, column]
+        matching = np.isclose(
+            column_values,
+            value,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+        if not np.any(matching):
+            raise ValueError(
+                f"fixed value {value:g} is not present on sweep axis {key!r}"
+            )
+        selected_points &= matching
+    if not np.any(selected_points):
+        raise ValueError("fixed sweep-axis values select no acquired points")
+    coordinates = coordinates[selected_points]
+    point_iq = point_iq[selected_points]
 
     x_coordinates, x_unit = _axis_display_values(
         coordinates[:, x_column],
@@ -811,8 +893,28 @@ def reduce_awg_sweep_map(
     averaged_axis_labels = tuple(
         sweep_axis_label(axis)
         for index, axis in enumerate(axes)
-        if index not in (x_column, y_column)
+        if (
+            index not in (x_column, y_column)
+            and axis_keys[index] not in normalized_fixed
+        )
     )
+    ordered_fixed_axis_values = tuple(
+        (axis_keys[index], normalized_fixed[axis_keys[index]])
+        for index in range(len(axes))
+        if axis_keys[index] in normalized_fixed
+    )
+    fixed_axis_labels = []
+    for key, native_value in ordered_fixed_axis_values:
+        index = axis_keys.index(key)
+        display_value, unit = _axis_display_values(
+            np.asarray([native_value], dtype=np.float64),
+            axes[index],
+            full_scale_mv,
+        )
+        fixed_axis_labels.append(
+            f"{sweep_axis_label(axes[index])} = "
+            f"{float(display_value[0]):.9g} {unit}"
+        )
 
     return AwgSweepMapResult(
         x_values=x_values,
@@ -838,6 +940,42 @@ def reduce_awg_sweep_map(
         sample_rate_hz=float(
             getattr(ddr_result, "sample_rate_hz", 1_000_000.0)
         ),
+        fixed_axis_values=ordered_fixed_axis_values,
+        fixed_axis_labels=tuple(fixed_axis_labels),
+        source=source,
+    )
+
+
+def reduce_awg_sweep_source(
+    source: AwgSweepMapSource,
+    *,
+    x_axis_key: SweepAxisKey,
+    y_axis_key: SweepAxisKey,
+    fixed_axis_values: Optional[Mapping[SweepAxisKey, float]] = None,
+) -> AwgSweepMapResult:
+    """Reproject one retained Cartesian acquisition without reacquiring it."""
+    ddr_result = SimpleNamespace(
+        sweep_axes=source.sweep_axes,
+        sweep_points=source.sweep_points,
+        iq=source.iq_values,
+        sample_rate_hz=source.sample_rate_hz,
+    )
+    result = reduce_awg_sweep_map(
+        ddr_result,
+        x_axis_key=x_axis_key,
+        y_axis_key=y_axis_key,
+        full_scale_mv=source.full_scale_mv,
+        iq_values=source.iq_values,
+        value_unit=source.value_unit,
+        measurement_mode=source.measurement_mode,
+        fixed_axis_values=fixed_axis_values,
+        source=source,
+    )
+    return replace(
+        result,
+        source_label=source.source_label,
+        database_path=source.database_path,
+        run_id=source.run_id,
     )
 
 
@@ -845,6 +983,8 @@ if pg is not None:
 
     class AwgSweepMapPlotWidget(QtWidgets.QWidget):
         """Four synchronized image plots for I, Q, magnitude, and angle."""
+
+        selection_changed = QtCore.pyqtSignal(object)
 
         _PLOT_SPECS = (
             ("i", "I", "CET-D1"),
@@ -855,8 +995,63 @@ if pg is not None:
 
         def __init__(self, parent=None):
             super().__init__(parent)
+            self._result: Optional[AwgSweepMapResult] = None
+            self._source: Optional[AwgSweepMapSource] = None
+            self._updating_axis_controls = False
+            self._current_axis_keys: Optional[
+                Tuple[SweepAxisKey, SweepAxisKey]
+            ] = None
+            self._preferred_axis_keys: Optional[
+                Tuple[SweepAxisKey, SweepAxisKey]
+            ] = None
+            self._slice_selections = {}
+            self._preferred_slice_selections = {}
+
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
+            axis_layout = QtWidgets.QHBoxLayout()
+            axis_layout.setContentsMargins(4, 2, 4, 2)
+            axis_layout.addWidget(QtWidgets.QLabel("Plot axes:", self))
+            axis_layout.addWidget(QtWidgets.QLabel("X", self))
+            self.axis_x = QtWidgets.QComboBox(self)
+            self.axis_x.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.AdjustToContents
+            )
+            axis_layout.addWidget(self.axis_x, 1)
+            axis_layout.addWidget(QtWidgets.QLabel("Y", self))
+            self.axis_y = QtWidgets.QComboBox(self)
+            self.axis_y.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.AdjustToContents
+            )
+            axis_layout.addWidget(self.axis_y, 1)
+            layout.addLayout(axis_layout)
+
+            self.slice_scroll = QtWidgets.QScrollArea(self)
+            self.slice_scroll.setWidgetResizable(True)
+            self.slice_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.slice_scroll.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarAlwaysOff
+            )
+            self.slice_scroll.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarAsNeeded
+            )
+            self.slice_scroll.setMaximumHeight(62)
+            self.slice_widget = QtWidgets.QWidget(self.slice_scroll)
+            self.slice_layout = QtWidgets.QHBoxLayout(self.slice_widget)
+            self.slice_layout.setContentsMargins(4, 0, 4, 2)
+            self.slice_layout.setSpacing(8)
+            self.slice_scroll.setWidget(self.slice_widget)
+            self.slice_controls = {}
+            self.slice_scroll.setVisible(False)
+            layout.addWidget(self.slice_scroll)
+
+            self.axis_x.currentIndexChanged.connect(
+                lambda _index: self._on_axis_changed("x")
+            )
+            self.axis_y.currentIndexChanged.connect(
+                lambda _index: self._on_axis_changed("y")
+            )
+
             selector_layout = QtWidgets.QHBoxLayout()
             selector_layout.setContentsMargins(4, 2, 4, 2)
             selector_layout.addWidget(QtWidgets.QLabel("Displayed data:", self))
@@ -955,7 +1150,290 @@ if pg is not None:
                 QtCore.Qt.TextSelectableByMouse
             )
             layout.addWidget(self.hover_status)
-            self._result: Optional[AwgSweepMapResult] = None
+
+        @staticmethod
+        def _setting_axis_key(value: Any) -> Optional[SweepAxisKey]:
+            if value is None:
+                return None
+            if isinstance(value, Mapping):
+                key = (
+                    str(value.get("output_name", "")),
+                    str(value.get("segment_name", "")),
+                )
+            elif (
+                isinstance(value, Sequence)
+                and not isinstance(value, (str, bytes))
+                and len(value) == 2
+            ):
+                key = str(value[0]), str(value[1])
+            else:
+                raise TypeError("AWG plot axis must identify output and segment")
+            if not all(key):
+                raise ValueError("AWG plot axis names cannot be empty")
+            return key
+
+        def _selected_axis_keys(
+            self,
+        ) -> Optional[Tuple[SweepAxisKey, SweepAxisKey]]:
+            if self.axis_x.count() < 2 or self.axis_y.count() < 2:
+                return None
+            x_key = self._setting_axis_key(self.axis_x.currentData())
+            y_key = self._setting_axis_key(self.axis_y.currentData())
+            if x_key is None or y_key is None or x_key == y_key:
+                return None
+            return x_key, y_key
+
+        def _axis_index(self, combo: QtWidgets.QComboBox, key) -> int:
+            for index in range(combo.count()):
+                if self._setting_axis_key(combo.itemData(index)) == key:
+                    return index
+            return -1
+
+        def _populate_axis_controls(
+            self,
+            default_axes: Tuple[SweepAxisKey, SweepAxisKey],
+        ) -> None:
+            if self._source is None:
+                return
+            axes = tuple(self._source.sweep_axes)
+            keys = tuple(sweep_axis_key(axis) for axis in axes)
+            desired = self._preferred_axis_keys or default_axes
+            if (
+                desired[0] not in keys
+                or desired[1] not in keys
+                or desired[0] == desired[1]
+            ):
+                desired = (keys[0], keys[1])
+
+            self._updating_axis_controls = True
+            try:
+                with QtCore.QSignalBlocker(
+                    self.axis_x
+                ), QtCore.QSignalBlocker(self.axis_y):
+                    self.axis_x.clear()
+                    self.axis_y.clear()
+                    for axis, key in zip(axes, keys):
+                        label = sweep_axis_label(axis)
+                        self.axis_x.addItem(label, key)
+                        self.axis_y.addItem(label, key)
+                    self.axis_x.setCurrentIndex(keys.index(desired[0]))
+                    self.axis_y.setCurrentIndex(keys.index(desired[1]))
+                self._current_axis_keys = desired
+                self._preferred_axis_keys = desired
+                self._rebuild_slice_controls()
+            finally:
+                self._updating_axis_controls = False
+
+        def _clear_slice_controls(self) -> None:
+            while self.slice_layout.count():
+                item = self.slice_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            self.slice_controls.clear()
+
+        def _rebuild_slice_controls(self) -> None:
+            if self._source is None:
+                self._clear_slice_controls()
+                self.slice_scroll.setVisible(False)
+                return
+            selected = self._selected_axis_keys()
+            if selected is None:
+                return
+            for key, combo in self.slice_controls.items():
+                self._slice_selections[key] = combo.currentData()
+            self._clear_slice_controls()
+
+            coordinates = np.asarray(
+                self._source.sweep_points,
+                dtype=np.float64,
+            )
+            for column, axis in enumerate(self._source.sweep_axes):
+                key = sweep_axis_key(axis)
+                if key in selected:
+                    continue
+                label = QtWidgets.QLabel(sweep_axis_label(axis), self.slice_widget)
+                combo = QtWidgets.QComboBox(self.slice_widget)
+                combo.addItem("Average all", None)
+                native_values = np.unique(coordinates[:, column])
+                display_values, unit = _axis_display_values(
+                    native_values,
+                    axis,
+                    self._source.full_scale_mv,
+                )
+                for native_value, display_value in zip(
+                    native_values,
+                    display_values,
+                ):
+                    combo.addItem(
+                        f"{float(display_value):.9g} {unit}",
+                        float(native_value),
+                    )
+                desired = self._slice_selections.get(
+                    key,
+                    self._preferred_slice_selections.get(key),
+                )
+                if desired is not None:
+                    for index in range(1, combo.count()):
+                        if np.isclose(
+                            float(combo.itemData(index)),
+                            float(desired),
+                            rtol=1.0e-10,
+                            atol=1.0e-12,
+                        ):
+                            combo.setCurrentIndex(index)
+                            break
+                combo.currentIndexChanged.connect(
+                    lambda _index, axis_key=key: self._on_slice_changed(
+                        axis_key
+                    )
+                )
+                self.slice_layout.addWidget(label)
+                self.slice_layout.addWidget(combo)
+                self.slice_controls[key] = combo
+            self.slice_layout.addStretch(1)
+            self.slice_scroll.setVisible(bool(self.slice_controls))
+
+        def _on_axis_changed(self, changed_axis: str) -> None:
+            if self._updating_axis_controls:
+                return
+            x_key = self._setting_axis_key(self.axis_x.currentData())
+            y_key = self._setting_axis_key(self.axis_y.currentData())
+            if x_key is None or y_key is None:
+                return
+            if x_key == y_key:
+                old_axes = self._current_axis_keys
+                replacement = None
+                if old_axes is not None:
+                    replacement = old_axes[0 if changed_axis == "x" else 1]
+                    if replacement == x_key:
+                        replacement = None
+                target = self.axis_y if changed_axis == "x" else self.axis_x
+                if replacement is None:
+                    replacement = next(
+                        self._setting_axis_key(target.itemData(index))
+                        for index in range(target.count())
+                        if self._setting_axis_key(target.itemData(index)) != x_key
+                    )
+                with QtCore.QSignalBlocker(target):
+                    target.setCurrentIndex(self._axis_index(target, replacement))
+                x_key = self._setting_axis_key(self.axis_x.currentData())
+                y_key = self._setting_axis_key(self.axis_y.currentData())
+            self._current_axis_keys = (x_key, y_key)
+            self._preferred_axis_keys = (x_key, y_key)
+            self._rebuild_slice_controls()
+            self._reproject()
+
+        def _on_slice_changed(self, key: SweepAxisKey) -> None:
+            if self._updating_axis_controls:
+                return
+            combo = self.slice_controls.get(key)
+            if combo is None:
+                return
+            self._slice_selections[key] = combo.currentData()
+            self._preferred_slice_selections[key] = combo.currentData()
+            self._reproject()
+
+        def _reproject(self, *, emit: bool = True) -> None:
+            if self._source is None:
+                return
+            selected = self._selected_axis_keys()
+            if selected is None:
+                return
+            fixed = {
+                key: float(combo.currentData())
+                for key, combo in self.slice_controls.items()
+                if combo.currentData() is not None
+            }
+            try:
+                result = reduce_awg_sweep_source(
+                    self._source,
+                    x_axis_key=selected[0],
+                    y_axis_key=selected[1],
+                    fixed_axis_values=fixed,
+                )
+            except (TypeError, ValueError) as exc:
+                self.hover_status.setText(f"Cannot update AWG map: {exc}")
+                return
+            self._display_result(result)
+            if emit:
+                self.selection_changed.emit(result)
+
+        def axis_selection_settings(self) -> dict:
+            selected = self._selected_axis_keys() or self._preferred_axis_keys
+            if selected is None:
+                return {}
+            settings = {
+                "x_axis": {
+                    "output_name": selected[0][0],
+                    "segment_name": selected[0][1],
+                },
+                "y_axis": {
+                    "output_name": selected[1][0],
+                    "segment_name": selected[1][1],
+                },
+                "slice_axes": [],
+            }
+            if self.slice_controls:
+                slice_values = {
+                    key: combo.currentData()
+                    for key, combo in self.slice_controls.items()
+                }
+            else:
+                slice_values = dict(self._preferred_slice_selections)
+            for key, value in slice_values.items():
+                entry = {
+                    "output_name": key[0],
+                    "segment_name": key[1],
+                    "mode": "average" if value is None else "value",
+                }
+                if value is not None:
+                    entry["value"] = float(value)
+                settings["slice_axes"].append(entry)
+            return settings
+
+        def load_axis_selection_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            if not isinstance(settings, Mapping):
+                raise TypeError("AWG plot axis settings must be an object")
+            x_key = self._setting_axis_key(settings.get("x_axis"))
+            y_key = self._setting_axis_key(settings.get("y_axis"))
+            if x_key is not None and y_key is not None:
+                if x_key == y_key:
+                    raise ValueError("AWG plot X and Y axes must differ")
+                self._preferred_axis_keys = (x_key, y_key)
+            raw_slices = settings.get("slice_axes", ())
+            if not isinstance(raw_slices, Sequence) or isinstance(
+                raw_slices,
+                (str, bytes),
+            ):
+                raise TypeError("AWG plot slice_axes must be an array")
+            preferred_slices = {}
+            for raw_slice in raw_slices:
+                if not isinstance(raw_slice, Mapping):
+                    raise TypeError("each AWG plot slice must be an object")
+                key = self._setting_axis_key(raw_slice)
+                mode = str(raw_slice.get("mode", "average")).lower()
+                if mode == "average":
+                    preferred_slices[key] = None
+                elif mode == "value":
+                    value = float(raw_slice["value"])
+                    if not np.isfinite(value):
+                        raise ValueError("AWG plot slice values must be finite")
+                    preferred_slices[key] = value
+                else:
+                    raise ValueError(
+                        "AWG plot slice mode must be 'average' or 'value'"
+                    )
+            self._preferred_slice_selections = preferred_slices
+            self._slice_selections.update(preferred_slices)
+            if self._source is not None and self._result is not None:
+                self._populate_axis_controls(
+                    (self._result.x_axis_key, self._result.y_axis_key)
+                )
+                self._reproject()
 
         def _set_plot_visible(self, name: str, checked: bool) -> None:
             if not checked and not any(
@@ -1064,6 +1542,21 @@ if pg is not None:
             return -limit, limit
 
         def set_result(self, result: AwgSweepMapResult) -> None:
+            current_axes = self._selected_axis_keys()
+            if current_axes is not None:
+                self._preferred_axis_keys = current_axes
+            self._source = result.source
+            if self._source is not None and len(self._source.sweep_axes) >= 2:
+                for key, value in result.fixed_axis_values:
+                    self._slice_selections.setdefault(key, value)
+                self._populate_axis_controls(
+                    (result.x_axis_key, result.y_axis_key)
+                )
+                self._reproject(emit=False)
+                return
+            self._display_result(result)
+
+        def _display_result(self, result: AwgSweepMapResult) -> None:
             self._result = result
             for plot in self.plots.values():
                 plot.setLabel(
@@ -1122,12 +1615,18 @@ if pg is not None:
                 if not result.averaged_axis_labels
                 else ", ".join(result.averaged_axis_labels)
             )
+            fixed = (
+                "none"
+                if not result.fixed_axis_labels
+                else ", ".join(result.fixed_axis_labels)
+            )
             self.hover_status.setText(
                 f"{result.repetition_count} repetitions x "
                 f"{result.samples_per_trace} FIR samples; "
                 f"display {result.value_unit} "
                 f"({result.display_scale:g} x {result.base_value_unit}); "
-                f"other averaged sweep axes: {averaged}"
+                f"fixed sweep axes: {fixed}; "
+                f"averaged sweep axes: {averaged}"
             )
 
         def fit_view(self) -> None:
@@ -1185,9 +1684,20 @@ else:
             self.setAlignment(QtCore.Qt.AlignCenter)
             self._color_ranges = normalize_awg_sweep_color_ranges(None)
             self._visible_data = DEFAULT_AWG_SWEEP_VISIBLE_DATA
+            self._axis_settings = {}
+            self._result = None
 
-        def set_result(self, _result: AwgSweepMapResult) -> None:
-            return
+        def set_result(self, result: AwgSweepMapResult) -> None:
+            self._result = result
+
+        def axis_selection_settings(self) -> dict:
+            return dict(self._axis_settings)
+
+        def load_axis_selection_settings(
+            self,
+            settings: Mapping[str, Any],
+        ) -> None:
+            self._axis_settings = dict(settings)
 
         def fit_view(self) -> None:
             return
@@ -1215,6 +1725,7 @@ __all__ = [
     "AwgSweepMapLoadWorker",
     "AwgSweepMapPlotWidget",
     "AwgSweepMapResult",
+    "AwgSweepMapSource",
     "AwgSweepRunSelector",
     "AwgSweepRunSummary",
     "AWG_SWEEP_DATA_KEYS",
@@ -1228,6 +1739,7 @@ __all__ = [
     "normalize_awg_sweep_color_ranges",
     "normalize_awg_sweep_visible_data",
     "reduce_awg_sweep_map",
+    "reduce_awg_sweep_source",
     "sweep_axis_key",
     "sweep_axis_label",
 ]

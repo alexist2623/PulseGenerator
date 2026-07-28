@@ -74,6 +74,44 @@ def _two_axis_result():
     )
 
 
+def _four_axis_result():
+    x_points = (-1.0, 1.0)
+    y_points = (-0.5, 0.5)
+    z_points = (-0.25, 0.25)
+    w_points = (-1.0, 1.0)
+    coordinates = np.asarray(
+        tuple(product(x_points, y_points, z_points, w_points)),
+        dtype=float,
+    )
+    iq = np.empty((coordinates.shape[0], 2, 2, 2), dtype=np.float64)
+    for point_index, (x_value, y_value, z_value, w_value) in enumerate(
+        coordinates
+    ):
+        iq[point_index, ..., 0] = (
+            100.0 * x_value
+            + 40.0 * y_value
+            + 20.0 * z_value
+            + 8.0 * w_value
+        )
+        iq[point_index, ..., 1] = (
+            -80.0 * x_value
+            + 30.0 * y_value
+            - 12.0 * z_value
+            + 4.0 * w_value
+        )
+    return SimpleNamespace(
+        sweep_axes=(
+            _axis("awg_0", "set_x", x_points),
+            _axis("awg_1", "set_y", y_points),
+            _axis("awg_2", "set_z", z_points),
+            _axis("awg_3", "set_w", w_points),
+        ),
+        sweep_points=coordinates,
+        iq=iq,
+        sample_rate_hz=50_000.0,
+    )
+
+
 def test_reduce_two_axis_awg_map_and_axis_swap():
     ddr_result = _two_axis_result()
     result = awg_map.reduce_awg_sweep_map(
@@ -302,6 +340,46 @@ def test_reduce_three_axes_averages_unselected_axis():
     assert result.averaged_axis_labels == ("awg_2 / set_3",)
 
 
+def test_reduce_four_axes_supports_fixed_and_averaged_axes_independently():
+    ddr_result = _four_axis_result()
+    result = awg_map.reduce_awg_sweep_map(
+        ddr_result,
+        x_axis_key=("awg_0", "set_x"),
+        y_axis_key=("awg_1", "set_y"),
+        full_scale_mv=100.0,
+        fixed_axis_values={("awg_2", "set_z"): 0.25},
+    )
+
+    np.testing.assert_allclose(result.x_values, (-100.0, 100.0))
+    np.testing.assert_allclose(result.y_values, (-50.0, 50.0))
+    np.testing.assert_allclose(
+        result.i_mean,
+        ((-115.0, 85.0), (-75.0, 125.0)),
+    )
+    np.testing.assert_allclose(
+        result.q_mean,
+        ((62.0, -98.0), (92.0, -68.0)),
+    )
+    assert result.source_points_per_cell == 2
+    assert result.fixed_axis_values == ((("awg_2", "set_z"), 0.25),)
+    assert result.fixed_axis_labels == ("awg_2 / set_z = 25 mV",)
+    assert result.averaged_axis_labels == ("awg_3 / set_w",)
+    assert result.source is not None
+
+    fully_sliced = awg_map.reduce_awg_sweep_source(
+        result.source,
+        x_axis_key=("awg_0", "set_x"),
+        y_axis_key=("awg_1", "set_y"),
+        fixed_axis_values={
+            ("awg_2", "set_z"): 0.25,
+            ("awg_3", "set_w"): 1.0,
+        },
+    )
+    assert fully_sliced.source_points_per_cell == 1
+    assert fully_sliced.averaged_axis_labels == ()
+    assert len(fully_sliced.fixed_axis_labels) == 2
+
+
 def test_reduce_awg_map_auto_scales_current_to_nanoamps():
     ddr_result = _two_axis_result()
     current_iq = ddr_result.iq.astype(np.float64) * 1.0e-9
@@ -512,6 +590,18 @@ def test_saved_awg_arrays_restore_selected_axes_and_average_other_axis(
     assert result.source_label == "QCoDeS Run 37"
     assert result.run_id == 37
     assert result.sample_rate_hz == 50_000.0
+    assert result.source is not None
+    sliced = awg_map.reduce_awg_sweep_source(
+        result.source,
+        x_axis_key=("all_awg_outputs", "ramp_0_to_1"),
+        y_axis_key=("awg_0", "set_1"),
+        fixed_axis_values={("awg_1", "set_2"): 0.25},
+    )
+    assert sliced.source_points_per_cell == 1
+    assert sliced.database_path == str(
+        (tmp_path / "awg_sweeps.db").resolve()
+    )
+    assert sliced.run_id == 37
 
 
 def test_awg_sweep_selector_lists_run_and_emits_selection(tmp_path):
@@ -651,6 +741,7 @@ def test_experiment_panel_axis_selection_and_result_plot():
     window._refresh_sweep_overlay()
     panel = window._experiment_panel
 
+    assert panel.sweep_map_group.isHidden() is True
     assert panel.sweep_map_x.count() == 2
     assert panel.sweep_map_y.count() == 2
     assert panel.selected_sweep_axis_keys() == (
@@ -731,6 +822,103 @@ def test_experiment_panel_axis_selection_and_result_plot():
     window.close()
 
 
+def test_plot_widget_reprojects_axes_and_slices_without_reacquisition():
+    app = _application()
+    ddr_result = _four_axis_result()
+    result = awg_map.reduce_awg_sweep_map(
+        ddr_result,
+        x_axis_key=("awg_0", "set_x"),
+        y_axis_key=("awg_1", "set_y"),
+        full_scale_mv=100.0,
+    )
+    widget = awg_map.AwgSweepMapPlotWidget()
+    widget.set_result(result)
+    app.processEvents()
+
+    if not hasattr(widget, "axis_x"):
+        widget.close()
+        pytest.skip("pyqtgraph is unavailable")
+    assert widget.axis_x.count() == 4
+    assert widget.axis_y.count() == 4
+    assert set(widget.slice_controls) == {
+        ("awg_2", "set_z"),
+        ("awg_3", "set_w"),
+    }
+    assert all(
+        combo.currentText() == "Average all"
+        for combo in widget.slice_controls.values()
+    )
+
+    z_combo = widget.slice_controls[("awg_2", "set_z")]
+    z_combo.setCurrentIndex(2)
+    app.processEvents()
+    assert widget._result.fixed_axis_values == (
+        (("awg_2", "set_z"), 0.25),
+    )
+    assert widget._result.averaged_axis_labels == ("awg_3 / set_w",)
+    assert widget._result.source_points_per_cell == 2
+
+    widget.axis_x.setCurrentIndex(
+        widget._axis_index(widget.axis_x, ("awg_2", "set_z"))
+    )
+    app.processEvents()
+    assert widget._result.x_axis_key == ("awg_2", "set_z")
+    assert widget._result.y_axis_key == ("awg_1", "set_y")
+    assert ("awg_0", "set_x") in widget.slice_controls
+    assert ("awg_3", "set_w") in widget.slice_controls
+    assert widget._result.i_mean.shape == (2, 2)
+    widget.close()
+
+
+def test_plot_axis_and_slice_settings_restore_before_data_arrives():
+    app = _application()
+    source_result = awg_map.reduce_awg_sweep_map(
+        _four_axis_result(),
+        x_axis_key=("awg_0", "set_x"),
+        y_axis_key=("awg_1", "set_y"),
+        full_scale_mv=100.0,
+    )
+    settings = {
+        "x_axis": {
+            "output_name": "awg_2",
+            "segment_name": "set_z",
+        },
+        "y_axis": {
+            "output_name": "awg_0",
+            "segment_name": "set_x",
+        },
+        "slice_axes": [
+            {
+                "output_name": "awg_1",
+                "segment_name": "set_y",
+                "mode": "value",
+                "value": 0.5,
+            },
+            {
+                "output_name": "awg_3",
+                "segment_name": "set_w",
+                "mode": "average",
+            },
+        ],
+    }
+    widget = awg_map.AwgSweepMapPlotWidget()
+    if not hasattr(widget, "axis_x"):
+        widget.close()
+        pytest.skip("pyqtgraph is unavailable")
+    widget.load_axis_selection_settings(settings)
+    widget.set_result(source_result)
+    app.processEvents()
+
+    assert widget._result.x_axis_key == ("awg_2", "set_z")
+    assert widget._result.y_axis_key == ("awg_0", "set_x")
+    assert widget._result.fixed_axis_values == (
+        (("awg_1", "set_y"), 0.5),
+    )
+    assert widget._result.averaged_axis_labels == ("awg_3 / set_w",)
+    assert widget.axis_selection_settings() == settings
+    widget.close()
+
+
 def test_experiment_panel_lists_ramp_rate_axis_for_2d_map():
     app = _application()
     window = gui.MainWindow()
@@ -755,12 +943,32 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
     app = _application()
     window = gui.MainWindow()
     window._add_port()
+    window._add_port()
     window._sweep_specs = [
         QickSweepSpec("set_0", "awg_0", -0.5, 0.5, 2),
         QickSweepSpec("set_0", "awg_1", -0.25, 0.25, 3),
+        QickSweepSpec("set_0", "awg_2", -0.1, 0.1, 2),
     ]
     window._refresh_sweep_overlay()
-    window._experiment_panel.sweep_map_x.setCurrentIndex(1)
+    axis_settings = {
+        "x_axis": {
+            "output_name": "awg_1",
+            "segment_name": "set_0",
+        },
+        "y_axis": {
+            "output_name": "awg_0",
+            "segment_name": "set_0",
+        },
+        "slice_axes": [
+            {
+                "output_name": "awg_2",
+                "segment_name": "set_0",
+                "mode": "value",
+                "value": 0.1,
+            },
+        ],
+    }
+    window._awg_sweep_plot.load_axis_selection_settings(axis_settings)
     window._awg_sweep_plot.load_color_range_settings({
         "i": {"auto": False, "minimum": -4.0, "maximum": 5.0},
         "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},
@@ -769,10 +977,7 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
     })
     window._awg_sweep_plot.load_visible_data(["i", "angle"])
     app.processEvents()
-    assert window._experiment_panel.selected_sweep_axis_keys() == (
-        ("awg_1", "set_0"),
-        ("awg_0", "set_0"),
-    )
+    assert window._awg_sweep_plot.axis_selection_settings() == axis_settings
 
     path = window._save_settings_json(tmp_path / "awg_map_axes.json")
     restored = gui.MainWindow()
@@ -782,6 +987,7 @@ def test_awg_map_axis_selection_round_trips_in_settings(tmp_path):
         ("awg_1", "set_0"),
         ("awg_0", "set_0"),
     )
+    assert restored._awg_sweep_plot.axis_selection_settings() == axis_settings
     assert restored._awg_sweep_plot.color_range_settings() == {
         "i": {"auto": False, "minimum": -4.0, "maximum": 5.0},
         "q": {"auto": True, "minimum": -1.0, "maximum": 1.0},

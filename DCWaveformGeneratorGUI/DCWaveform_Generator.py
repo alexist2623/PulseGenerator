@@ -4798,7 +4798,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow(self.sweep_parameter_group)
-        form.addRow(self.sweep_map_group)
+        self.sweep_map_group.setVisible(False)
         form.addRow(self.bias_t_group)
         form.addRow("Notes:", self.notes)
 
@@ -9059,6 +9059,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 source_label=f"QCoDeS Run {int(result.run_id)}",
                 database_path=str(result.database_path),
                 run_id=int(result.run_id),
+                source=(
+                    None
+                    if map_result.source is None
+                    else replace(
+                        map_result.source,
+                        source_label=f"QCoDeS Run {int(result.run_id)}",
+                        database_path=str(result.database_path),
+                        run_id=int(result.run_id),
+                    )
+                ),
             )
         except Exception as exc:
             self.statusBar().showMessage(
@@ -9463,7 +9473,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._bias_t_filter_tau_us = experiment_values["bias_t_filter_tau_us"]
         stability_settings = self._stability_panel.settings_dict()
-        sweep_map_settings = self._experiment_panel.sweep_map_settings()
+        sweep_map_settings = (
+            self._awg_sweep_plot.axis_selection_settings()
+            or self._experiment_panel.sweep_map_settings()
+        )
+        sweep_map_settings.setdefault("slice_axes", [])
         sweep_map_settings["color_ranges"] = (
             self._awg_sweep_plot.color_range_settings()
         )
@@ -10098,6 +10112,50 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             sweep_map_axes = (sweep_map_x, sweep_map_y)
         else:
             sweep_map_axes = None
+        raw_slice_axes = raw_sweep_map.get("slice_axes", [])
+        if not isinstance(raw_slice_axes, list):
+            raise TypeError("experiment sweep_map slice_axes must be an array")
+        sweep_map_slices = []
+        seen_slice_axes = set()
+        for entry in raw_slice_axes:
+            if not isinstance(entry, dict):
+                raise TypeError(
+                    "each experiment sweep_map slice axis must be an object"
+                )
+            key = (
+                str(entry.get("output_name", "")),
+                str(entry.get("segment_name", "")),
+            )
+            if key not in available_sweep_axes:
+                raise ValueError(
+                    f"experiment sweep_map slice axis {key!r} is not an "
+                    "AWG sweep"
+                )
+            if key in seen_slice_axes:
+                raise ValueError(
+                    f"experiment sweep_map slice axis {key!r} is duplicated"
+                )
+            if sweep_map_axes is not None and key in sweep_map_axes:
+                continue
+            seen_slice_axes.add(key)
+            mode = str(entry.get("mode", "average")).strip().lower()
+            decoded_slice = {
+                "output_name": key[0],
+                "segment_name": key[1],
+                "mode": mode,
+            }
+            if mode == "value":
+                value = float(entry["value"])
+                if not np.isfinite(value):
+                    raise ValueError(
+                        "experiment sweep_map slice value must be finite"
+                    )
+                decoded_slice["value"] = value
+            elif mode != "average":
+                raise ValueError(
+                    "experiment sweep_map slice mode must be average or value"
+                )
+            sweep_map_slices.append(decoded_slice)
         connection_config = QickConnectionConfig(
             host=str(experiment.get("qick_host", DEFAULT_QICK_HOST)),
             ns_port=self._json_int(
@@ -10601,6 +10659,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "connection_config": connection_config,
             "run_config": run_config,
             "sweep_map_axes": sweep_map_axes,
+            "sweep_map_slices": sweep_map_slices,
             "sweep_map_color_ranges": sweep_map_color_ranges,
             "sweep_map_visible_data": sweep_map_visible_data,
             "rf_outputs": tuple(rf_outputs),
@@ -10682,6 +10741,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.set_sweep_specs(
             self._active_map_sweep_specs(),
             selected_keys=settings["sweep_map_axes"],
+        )
+        sweep_map_axis_settings = {
+            "slice_axes": settings["sweep_map_slices"],
+        }
+        if settings["sweep_map_axes"] is not None:
+            x_axis, y_axis = settings["sweep_map_axes"]
+            sweep_map_axis_settings.update({
+                "x_axis": {
+                    "output_name": x_axis[0],
+                    "segment_name": x_axis[1],
+                },
+                "y_axis": {
+                    "output_name": y_axis[0],
+                    "segment_name": y_axis[1],
+                },
+            })
+        self._awg_sweep_plot.load_axis_selection_settings(
+            sweep_map_axis_settings
         )
         self._awg_sweep_plot.load_color_range_settings(
             settings["sweep_map_color_ranges"]
