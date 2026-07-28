@@ -299,6 +299,7 @@ class InputPowerCalibrationConfig:
     nqz: int = 1
     readout_nqz: int = 1
     margin_input_samples: int = 1024
+    fpga_trigger_delay_us: Optional[float] = None
     settle_seconds: float = 0.05
     force_overwrite: bool = True
     experiment_name: str = "QICK ADC input power calibration"
@@ -346,6 +347,15 @@ class InputPowerCalibrationConfig:
         if _integer(self.readout_nqz, "readout_nqz", 1) not in (1, 2):
             raise ValueError("readout_nqz must be 1 or 2")
         _integer(self.margin_input_samples, "margin_input_samples")
+        if self.fpga_trigger_delay_us is not None:
+            delay_us = _finite(
+                self.fpga_trigger_delay_us,
+                "fpga_trigger_delay_us",
+            )
+            if delay_us < 0.0:
+                raise ValueError(
+                    "fpga_trigger_delay_us must be nonnegative"
+                )
         if _finite(self.settle_seconds, "settle_seconds") < 0.0:
             raise ValueError("settle_seconds must be nonnegative")
         if not isinstance(self.force_overwrite, bool):
@@ -394,6 +404,7 @@ class InputPowerCalibrationConfig:
             nqz=self.nqz,
             readout_nqz=self.readout_nqz,
             margin_input_samples=self.margin_input_samples,
+            fpga_trigger_delay_us=self.fpga_trigger_delay_us,
             force_overwrite=self.force_overwrite,
             settle_seconds=self.settle_seconds,
         )

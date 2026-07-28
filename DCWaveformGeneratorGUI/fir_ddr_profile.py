@@ -65,6 +65,37 @@ class FirDdrProfile:
             f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
         )
 
+    def trigger_delay_value_for_us(self, delay_us: Any) -> int:
+        """Convert a user-facing microsecond delay to the HWH register unit."""
+
+        delay = float(delay_us)
+        if not isfinite(delay) or delay < 0.0:
+            raise ValueError("trigger delay in microseconds must be nonnegative")
+        if not self.uses_fpga_trigger_delay:
+            if delay == 0.0:
+                return 0
+            raise RuntimeError(
+                f"{self.rate_label} HWH does not expose an FPGA trigger-delay register"
+            )
+        if self.trigger_delay_units == "s_axis_aclk_cycles":
+            value = int(round(delay * self.input_rate_mhz))
+        elif self.trigger_delay_units == "valid_input_samples":
+            value = int(round(delay / self.sample_period_us))
+        else:
+            raise RuntimeError(
+                f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
+            )
+        if value > 0xFFFF_FFFF:
+            raise ValueError("trigger delay exceeds the 32-bit FPGA register")
+        return value
+
+    def selected_trigger_delay_value(self, delay_us: Any = None) -> int:
+        """Return the HWH default or a converted user override."""
+
+        if delay_us is None:
+            return self.trigger_delay_samples
+        return self.trigger_delay_value_for_us(delay_us)
+
     def trigger_delay_arm_kwargs(self, value: Any = None) -> dict[str, int]:
         """Build the unit-correct QICK arm keyword for this HWH generation."""
 
@@ -79,6 +110,13 @@ class FirDdrProfile:
             return {"trigger_delay_samples": delay}
         raise RuntimeError(
             f"unsupported FIR DDR trigger-delay units {self.trigger_delay_units!r}"
+        )
+
+    def trigger_delay_arm_kwargs_for_us(self, delay_us: Any = None) -> dict[str, int]:
+        """Build arm keywords from the HWH default or a microsecond override."""
+
+        return self.trigger_delay_arm_kwargs(
+            self.selected_trigger_delay_value(delay_us)
         )
 
     @property

@@ -70,6 +70,7 @@ class NoiseAcquisitionConfig:
     filter_cutoff_ghz: float = 2.5
     filter_bandwidth_ghz: float = 1.0
     margin_input_samples: int = 1024
+    fpga_trigger_delay_us: Optional[float] = None
     address: int = 0
     force_overwrite: bool = True
     post_run_read_delay_seconds: float = 0.1
@@ -102,6 +103,13 @@ class NoiseAcquisitionConfig:
             0,
             1 << 30,
         )
+        if self.fpga_trigger_delay_us is not None:
+            fpga_delay = _finite(
+                self.fpga_trigger_delay_us,
+                "FPGA trigger delay",
+            )
+            if fpga_delay < 0.0:
+                raise ValueError("FPGA trigger delay must be nonnegative")
         _bounded_int(self.address, "DDR address", 0, (1 << 63) - 1)
         if not isinstance(self.force_overwrite, bool):
             raise TypeError("force_overwrite must be boolean")
@@ -129,6 +137,7 @@ class NoiseAcquisitionConfig:
             samples_per_trigger=self.fir_samples,
             readout_frequency_mhz=self.readout_frequency_mhz,
             margin_input_samples=self.margin_input_samples,
+            fpga_trigger_delay_us=self.fpga_trigger_delay_us,
             address=self.address,
             force_overwrite=self.force_overwrite,
             post_run_read_delay_seconds=self.post_run_read_delay_seconds,
@@ -181,6 +190,9 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
             ) from exc
 
     profile = _validate_fir_ddr(soccfg, config)
+    trigger_delay_value = profile.selected_trigger_delay_value(
+        config.fpga_trigger_delay_us
+    )
     readout_cfg = soccfg["readouts"][config.ro_ch]
     tproc_mhz = float(soccfg["tprocs"][0]["f_time"])
     group_delay = int(ceil(profile.group_delay_input_samples))
@@ -236,8 +248,11 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
     program = DirectNoiseFirProgram(soccfg, {"reps": 1})
     program.noise_fir_warmup_tproc_cycles = warmup_cycles
     program.noise_fir_rate_profile = profile.name
-    program.noise_fir_fpga_trigger_delay_samples = profile.trigger_delay_samples
+    program.noise_fir_fpga_trigger_delay_samples = trigger_delay_value
     program.noise_fir_fpga_trigger_delay_units = profile.trigger_delay_units
+    program.noise_fir_fpga_trigger_delay_us = profile.trigger_delay_us_for(
+        trigger_delay_value
+    )
     return program
 
 
@@ -258,6 +273,10 @@ def acquire_noise_fir_trace(
     progress(2, "Connecting to QICK")
     soc, soccfg = connect_qick(config.connection_config, connector=connector)
     profile = _validate_fir_ddr(soccfg, config)
+    trigger_delay_value = profile.selected_trigger_delay_value(
+        config.fpga_trigger_delay_us
+    )
+    trigger_delay_us = profile.trigger_delay_us_for(trigger_delay_value)
     progress(8, "Configuring the selected ADC input")
     configure_rf_board(soc, (), config.readout_spec())
     progress(12, "Compiling the independent FIR-DDR capture program")
@@ -269,7 +288,7 @@ def acquire_noise_fir_trace(
     group_delay_input_samples = profile.group_delay_input_samples
     capture_seconds = (
         config.fir_samples / output_rate_hz
-        + profile.trigger_delay_us / 1.0e6
+        + trigger_delay_us / 1.0e6
         + (group_delay_input_samples + config.margin_input_samples)
         / input_rate_hz
     )
@@ -284,7 +303,9 @@ def acquire_noise_fir_trace(
         force_overwrite=config.force_overwrite,
     )
     if profile.uses_fpga_trigger_delay:
-        arm_kwargs.update(profile.trigger_delay_arm_kwargs())
+        arm_kwargs.update(
+            profile.trigger_delay_arm_kwargs(trigger_delay_value)
+        )
     reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
     progress(18, "Starting readout and DDR trigger")
     program.run_rounds(soc, progress=False)

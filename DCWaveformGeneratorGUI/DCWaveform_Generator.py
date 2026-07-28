@@ -357,6 +357,7 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "samples_per_trigger": 64,
     "readout_frequency_mhz": 50.0,
     "margin_input_samples": 1024,
+    "fpga_trigger_delay_us": None,
     "force_overwrite": False,
     "post_run_read_delay_seconds": 0.1,
     "input_board_type": "RF_In",
@@ -3779,6 +3780,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._front_panel_configuration = None
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
+        self._fir_uses_fpga_trigger_delay: Optional[bool] = None
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
@@ -3866,6 +3868,21 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.margin_samples = QtWidgets.QSpinBox()
         self.margin_samples.setRange(0, 10_000_000)
         self.margin_samples.setValue(1024)
+        self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default"
+        )
+        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox()
+        self.fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
+        self.fpga_trigger_delay_us.setDecimals(6)
+        self.fpga_trigger_delay_us.setSuffix(" us")
+        self.fpga_trigger_delay_us.setToolTip(
+            "FPGA delay from trigger arrival to FIR-DDR storage. The value is "
+            "converted to the register unit reported by the loaded HWH."
+        )
+        fpga_delay_row = QtWidgets.QHBoxLayout()
+        fpga_delay_row.setContentsMargins(0, 0, 0, 0)
+        fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
+        fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
         self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
         self.post_run_read_delay = QtWidgets.QDoubleSpinBox()
         self.post_run_read_delay.setRange(0.0, 60.0)
@@ -3927,6 +3944,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
         form.addRow("FIR input margin:", self.margin_samples)
+        form.addRow("FPGA trigger-to-store delay:", fpga_delay_row)
         form.addRow("DDR read delay after run:", self.post_run_read_delay)
         form.addRow(self.force_overwrite)
         self.fir_profile_note = QtWidgets.QLabel(
@@ -3960,6 +3978,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.filter_bandwidth,
             self.nqz,
             self.margin_samples,
+            self.override_fpga_trigger_delay,
+            self.fpga_trigger_delay_us,
             self.post_run_read_delay,
             self.force_overwrite,
         ):
@@ -3972,6 +3992,12 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 signal = getattr(widget, "textChanged", None)
             signal.connect(self._emit_spec)
         self.samples.valueChanged.connect(self._update_fir_profile_note)
+        self.override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.fpga_trigger_delay_us.valueChanged.connect(
+            self._update_fir_profile_note
+        )
         self.toggled.connect(self._emit_spec)
         self.input_board_type.currentTextChanged.connect(
             self._update_board_controls
@@ -3990,6 +4016,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         )
         self.ro_ch.valueChanged.connect(self._sync_front_panel_selection)
         self._update_board_controls()
+        self._update_fpga_trigger_delay_controls()
 
     def _update_board_controls(self, *_args) -> None:
         rf_input = self.input_board_type.currentText() == "RF_In"
@@ -4087,8 +4114,32 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._fir_trigger_delay_us = float(
             getattr(configuration, "fir_trigger_delay_us", 0.0)
         )
+        self._fir_uses_fpga_trigger_delay = (
+            str(
+                getattr(
+                    configuration,
+                    "fir_trigger_delay_units",
+                    "none",
+                )
+            )
+            != "none"
+        )
+        if not self.override_fpga_trigger_delay.isChecked():
+            with QtCore.QSignalBlocker(self.fpga_trigger_delay_us):
+                self.fpga_trigger_delay_us.setValue(
+                    self._fir_trigger_delay_us
+                )
+        self._update_fpga_trigger_delay_controls()
         self._update_fir_profile_note()
         self._sync_front_panel_selection()
+
+    def _update_fpga_trigger_delay_controls(self, *_args) -> None:
+        supported = self._fir_uses_fpga_trigger_delay is not False
+        self.override_fpga_trigger_delay.setEnabled(supported)
+        self.fpga_trigger_delay_us.setEnabled(
+            supported and self.override_fpga_trigger_delay.isChecked()
+        )
+        self._update_fir_profile_note()
 
     def _update_fir_profile_note(self, *_args) -> None:
         if self._fir_sample_rate_hz is None:
@@ -4098,11 +4149,16 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             return
         sample_period_us = 1_000_000.0 / float(self._fir_sample_rate_hz)
         trace_us = self.samples.value() * sample_period_us
-        delay = (
-            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
-            if self._fir_trigger_delay_us
-            else ""
-        )
+        if self._fir_uses_fpga_trigger_delay:
+            if self.override_fpga_trigger_delay.isChecked():
+                delay = (
+                    f"; FPGA delay override "
+                    f"{self.fpga_trigger_delay_us.value():g} us"
+                )
+            else:
+                delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
+        else:
+            delay = "; no FPGA trigger-delay register"
         self.fir_profile_note.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{sample_period_us:g} us/sample; "
@@ -4169,6 +4225,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             samples_per_trigger=self.samples.value(),
             readout_frequency_mhz=self.frequency_mhz.value(),
             margin_input_samples=self.margin_samples.value(),
+            fpga_trigger_delay_us=(
+                self.fpga_trigger_delay_us.value()
+                if (
+                    self.override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             force_overwrite=self.force_overwrite.isChecked(),
             post_run_read_delay_seconds=self.post_run_read_delay.value(),
             attenuation_db=self.attenuation_db.value(),
@@ -4262,6 +4326,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "samples_per_trigger": spec.samples_per_trigger,
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
+            "fpga_trigger_delay_us": spec.fpga_trigger_delay_us,
             "force_overwrite": spec.force_overwrite,
             "post_run_read_delay_seconds": spec.post_run_read_delay_seconds,
             "input_board_type": spec.input_board_type,
@@ -4322,6 +4387,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             samples_per_trigger=int(data["samples_per_trigger"]),
             readout_frequency_mhz=float(data.get("readout_frequency_mhz", 0.0)),
             margin_input_samples=int(data.get("margin_input_samples", 1024)),
+            fpga_trigger_delay_us=(
+                None
+                if data.get("fpga_trigger_delay_us") is None
+                else float(data["fpga_trigger_delay_us"])
+            ),
             force_overwrite=force_overwrite,
             post_run_read_delay_seconds=float(
                 data.get("post_run_read_delay_seconds", 0.1)
@@ -4367,6 +4437,17 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.frequency_mhz.setValue(spec.readout_frequency_mhz)
             self.input_board_type.setCurrentText(spec.input_board_type)
             self.margin_samples.setValue(spec.margin_input_samples)
+            self.override_fpga_trigger_delay.setChecked(
+                spec.fpga_trigger_delay_us is not None
+            )
+            if spec.fpga_trigger_delay_us is not None:
+                self.fpga_trigger_delay_us.setValue(
+                    spec.fpga_trigger_delay_us
+                )
+            elif self._fir_sample_rate_hz is not None:
+                self.fpga_trigger_delay_us.setValue(
+                    self._fir_trigger_delay_us
+                )
             self.force_overwrite.setChecked(spec.force_overwrite)
             self.post_run_read_delay.setValue(
                 spec.post_run_read_delay_seconds
@@ -4397,6 +4478,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.nqz.setValue(spec.nqz)
             self.setChecked(enabled)
         self._update_board_controls()
+        self._update_fpga_trigger_delay_controls()
         self._emit_spec()
 
     def apply_path_settings(self, values: Mapping[str, object]) -> None:
@@ -7808,7 +7890,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._stability_panel.dc_calibration_run_id.value()
             ),
             nqz=int(path["readout_nqz"]),
-            fpga_trigger_delay_samples=0,
+            fpga_trigger_delay_us=(
+                stability_config.fpga_trigger_delay_us
+            ),
         )
         overlap = {spec.gen_ch for spec in rf_specs}.intersection(
             self._qick_awg_channels
@@ -9626,6 +9710,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["margin_input_samples"],
                 f"{label} margin_input_samples",
             ),
+            fpga_trigger_delay_us=(
+                None
+                if entry.get("fpga_trigger_delay_us") is None
+                else self._json_finite_float(
+                    entry["fpga_trigger_delay_us"],
+                    f"{label} fpga_trigger_delay_us",
+                )
+            ),
             force_overwrite=self._json_bool(
                 entry["force_overwrite"],
                 f"{label} force_overwrite",
@@ -9675,6 +9767,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "samples_per_trigger": spec.samples_per_trigger,
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
+            "fpga_trigger_delay_us": spec.fpga_trigger_delay_us,
             "force_overwrite": spec.force_overwrite,
             "post_run_read_delay_seconds": spec.post_run_read_delay_seconds,
             "input_board_type": spec.input_board_type,
@@ -10314,6 +10407,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 raw_readout["margin_input_samples"],
                 "RF readout margin_input_samples",
             ),
+            fpga_trigger_delay_us=(
+                None
+                if raw_readout.get("fpga_trigger_delay_us") is None
+                else self._json_finite_float(
+                    raw_readout["fpga_trigger_delay_us"],
+                    "RF readout fpga_trigger_delay_us",
+                )
+            ),
             force_overwrite=force_overwrite,
             post_run_read_delay_seconds=self._json_finite_float(
                 raw_readout.get("post_run_read_delay_seconds", 0.1),
@@ -10362,6 +10463,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "samples_per_trigger": readout_spec.samples_per_trigger,
             "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
             "margin_input_samples": readout_spec.margin_input_samples,
+            "fpga_trigger_delay_us": readout_spec.fpga_trigger_delay_us,
             "force_overwrite": readout_spec.force_overwrite,
             "post_run_read_delay_seconds": (
                 readout_spec.post_run_read_delay_seconds

@@ -605,6 +605,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._fir_sample_rate_hz = None
         self._fir_trigger_delay_us = 0.0
+        self._fir_uses_fpga_trigger_delay = None
         layout = QtWidgets.QVBoxLayout(self)
         self._path_diagrams: dict[str, RfPathCorrectionWidget] = {}
         self._front_panel_mode = "output"
@@ -651,6 +652,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             self.path_diagram_for(mode).apply_external_settings(values)
         self.tabs.currentChanged.connect(self._select_front_panel_mode)
         layout.addWidget(self.tabs, 1)
+        self._update_fpga_trigger_delay_controls()
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
@@ -887,6 +889,22 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_scan_time.setDecimals(6)
         self.input_scan_time.setValue(100.0)
         self.input_scan_time.setSuffix(" us")
+        self.input_override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default"
+        )
+        self.input_fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox()
+        self.input_fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
+        self.input_fpga_trigger_delay_us.setDecimals(6)
+        self.input_fpga_trigger_delay_us.setSuffix(" us")
+        input_fpga_delay_row = QtWidgets.QHBoxLayout()
+        input_fpga_delay_row.setContentsMargins(0, 0, 0, 0)
+        input_fpga_delay_row.addWidget(
+            self.input_override_fpga_trigger_delay
+        )
+        input_fpga_delay_row.addWidget(
+            self.input_fpga_trigger_delay_us,
+            1,
+        )
         self.input_output_att1 = self._attenuation(0.0)
         self.input_output_att2 = self._attenuation(0.0)
         self.input_attenuation = self._attenuation(0.0)
@@ -937,6 +955,17 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Sample name:", self.input_sample_name),
         ):
             form.addRow(label, widget)
+        form.insertRow(
+            9,
+            "FPGA trigger-to-store delay:",
+            input_fpga_delay_row,
+        )
+        self.input_override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.input_fpga_trigger_delay_us.valueChanged.connect(
+            self._update_fir_profile_status
+        )
         self.run_input_button = QtWidgets.QPushButton("Run FIR-DDR Input Calibration")
         self.run_input_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
@@ -1041,6 +1070,25 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_margin_samples = QtWidgets.QSpinBox()
         self.dc_voltage_margin_samples.setRange(0, 10000000)
         self.dc_voltage_margin_samples.setValue(1024)
+        self.dc_voltage_override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default"
+        )
+        self.dc_voltage_fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox()
+        self.dc_voltage_fpga_trigger_delay_us.setRange(
+            0.0,
+            10_000_000.0,
+        )
+        self.dc_voltage_fpga_trigger_delay_us.setDecimals(6)
+        self.dc_voltage_fpga_trigger_delay_us.setSuffix(" us")
+        dc_fpga_delay_row = QtWidgets.QHBoxLayout()
+        dc_fpga_delay_row.setContentsMargins(0, 0, 0, 0)
+        dc_fpga_delay_row.addWidget(
+            self.dc_voltage_override_fpga_trigger_delay
+        )
+        dc_fpga_delay_row.addWidget(
+            self.dc_voltage_fpga_trigger_delay_us,
+            1,
+        )
         self.dc_voltage_force_overwrite = QtWidgets.QCheckBox(
             "Allow overwrite of reserved DDR range"
         )
@@ -1074,6 +1122,16 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Sample name:", self.dc_voltage_sample_name),
         ):
             form.addRow(label, widget)
+        form.addRow(
+            "FPGA trigger-to-store delay:",
+            dc_fpga_delay_row,
+        )
+        self.dc_voltage_override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.dc_voltage_fpga_trigger_delay_us.valueChanged.connect(
+            self._update_fir_profile_status
+        )
         form.addRow(self.dc_voltage_force_overwrite)
         self.run_dc_voltage_button = QtWidgets.QPushButton(
             "Run 0 MHz DC Voltage Calibration"
@@ -1270,6 +1328,14 @@ class CalibrationPanel(QtWidgets.QWidget):
             readout_filter_bandwidth_ghz=self.input_readout_bandwidth.value(),
             nqz=self.input_path_diagram.applied_values()["output_nqz"],
             readout_nqz=self.input_path_diagram.applied_values()["readout_nqz"],
+            fpga_trigger_delay_us=(
+                self.input_fpga_trigger_delay_us.value()
+                if (
+                    self.input_override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             fit_trim_low=self.input_trim_low.value(),
             fit_trim_high=self.input_trim_high.value(),
             experiment_name=self.input_experiment_name.text().strip(),
@@ -1298,6 +1364,14 @@ class CalibrationPanel(QtWidgets.QWidget):
             input_dc_gain_db=input_gain_db,
             settle_us=self.dc_voltage_settle_us.value(),
             margin_input_samples=self.dc_voltage_margin_samples.value(),
+            fpga_trigger_delay_us=(
+                self.dc_voltage_fpga_trigger_delay_us.value()
+                if (
+                    self.dc_voltage_override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             force_overwrite=self.dc_voltage_force_overwrite.isChecked(),
             experiment_name=self.dc_voltage_experiment_name.text().strip(),
             sample_name=self.dc_voltage_sample_name.text().strip(),
@@ -1443,6 +1517,46 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._fir_trigger_delay_us = float(
             getattr(configuration, "fir_trigger_delay_us", 0.0)
         )
+        self._fir_uses_fpga_trigger_delay = (
+            str(
+                getattr(
+                    configuration,
+                    "fir_trigger_delay_units",
+                    "none",
+                )
+            )
+            != "none"
+        )
+        for override, editor in (
+            (
+                self.input_override_fpga_trigger_delay,
+                self.input_fpga_trigger_delay_us,
+            ),
+            (
+                self.dc_voltage_override_fpga_trigger_delay,
+                self.dc_voltage_fpga_trigger_delay_us,
+            ),
+        ):
+            if not override.isChecked():
+                with QtCore.QSignalBlocker(editor):
+                    editor.setValue(self._fir_trigger_delay_us)
+        self._update_fpga_trigger_delay_controls()
+        self._update_fir_profile_status()
+
+    def _update_fpga_trigger_delay_controls(self, *_args) -> None:
+        supported = self._fir_uses_fpga_trigger_delay is not False
+        for override, editor in (
+            (
+                self.input_override_fpga_trigger_delay,
+                self.input_fpga_trigger_delay_us,
+            ),
+            (
+                self.dc_voltage_override_fpga_trigger_delay,
+                self.dc_voltage_fpga_trigger_delay_us,
+            ),
+        ):
+            override.setEnabled(supported)
+            editor.setEnabled(supported and override.isChecked())
         self._update_fir_profile_status()
 
     def _update_fir_profile_status(self, *_args) -> None:
@@ -1452,11 +1566,22 @@ class CalibrationPanel(QtWidgets.QWidget):
             )
             return
         sample_period_us = 1_000_000.0 / float(self._fir_sample_rate_hz)
-        delay = (
-            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
-            if self._fir_trigger_delay_us
-            else ""
-        )
+        if self._fir_uses_fpga_trigger_delay:
+            delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
+            overrides = []
+            if self.input_override_fpga_trigger_delay.isChecked():
+                overrides.append(
+                    f"Input {self.input_fpga_trigger_delay_us.value():g} us"
+                )
+            if self.dc_voltage_override_fpga_trigger_delay.isChecked():
+                overrides.append(
+                    "DC Voltage "
+                    f"{self.dc_voltage_fpga_trigger_delay_us.value():g} us"
+                )
+            if overrides:
+                delay += "; overrides: " + ", ".join(overrides)
+        else:
+            delay = "; no FPGA trigger-delay register"
         dc_trace = ""
         if hasattr(self, "dc_voltage_samples"):
             dc_trace_us = self.dc_voltage_samples.value() * sample_period_us
@@ -1573,6 +1698,20 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         for widget, value in assignments:
             widget.setValue(value)
+        self.input_override_fpga_trigger_delay.setChecked(
+            input_config.fpga_trigger_delay_us is not None
+        )
+        if input_config.fpga_trigger_delay_us is not None:
+            self.input_fpga_trigger_delay_us.setValue(
+                input_config.fpga_trigger_delay_us
+            )
+        self.dc_voltage_override_fpga_trigger_delay.setChecked(
+            dc_voltage.fpga_trigger_delay_us is not None
+        )
+        if dc_voltage.fpga_trigger_delay_us is not None:
+            self.dc_voltage_fpga_trigger_delay_us.setValue(
+                dc_voltage.fpga_trigger_delay_us
+            )
         self.output_board.setCurrentText(output.output_board_type)
         self.output_gain_scale.setCurrentIndex(
             self.output_gain_scale.findData(output.gain_scale)
@@ -1607,6 +1746,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             self.apply_path_settings(values, mode=mode)
         self._update_board_controls()
         self.tabs.setCurrentIndex(max(0, min(2, int(settings.get("selected_tab", 0)))))
+        self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_output_button.setEnabled(not running)
@@ -1615,6 +1755,15 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_application_group.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
+        for widget in (
+            self.input_override_fpga_trigger_delay,
+            self.input_fpga_trigger_delay_us,
+            self.dc_voltage_override_fpga_trigger_delay,
+            self.dc_voltage_fpga_trigger_delay_us,
+        ):
+            widget.setEnabled(not running)
+        if not running:
+            self._update_fpga_trigger_delay_controls()
         for diagram in self._path_diagrams.values():
             diagram.setEnabled(not running)
         self.progress.setVisible(running)

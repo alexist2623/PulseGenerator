@@ -535,6 +535,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._fir_sample_rate_hz = None
         self._fir_trigger_delay_us = 0.0
+        self._fir_uses_fpga_trigger_delay = None
         outer = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -715,6 +716,20 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.margin_input_samples = QtWidgets.QSpinBox()
         self.margin_input_samples.setRange(0, 10_000_000)
         self.margin_input_samples.setValue(1024)
+        self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default"
+        )
+        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox()
+        self.fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
+        self.fpga_trigger_delay_us.setDecimals(6)
+        self.fpga_trigger_delay_us.setSuffix(" us")
+        self.fpga_trigger_delay_us.setToolTip(
+            "FPGA delay from trigger arrival to FIR-DDR storage"
+        )
+        fpga_delay_row = QtWidgets.QHBoxLayout()
+        fpga_delay_row.setContentsMargins(0, 0, 0, 0)
+        fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
+        fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
         self.address = QtWidgets.QSpinBox()
         self.address.setRange(0, 2_147_483_647)
         self.stride_bytes = QtWidgets.QSpinBox()
@@ -729,11 +744,21 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             QtCore.Qt.TextSelectableByMouse
         )
         capture_form.addRow("FIR input margin:", self.margin_input_samples)
+        capture_form.addRow(
+            "FPGA trigger-to-store delay:",
+            fpga_delay_row,
+        )
         capture_form.addRow("DDR start address:", self.address)
         capture_form.addRow("Trigger stride (bytes):", self.stride_bytes)
         capture_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         capture_form.addRow(self.force_overwrite)
         content_layout.addWidget(capture_group)
+        self.override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.fpga_trigger_delay_us.valueChanged.connect(
+            self._update_fir_profile_status
+        )
 
         storage_group = QtWidgets.QGroupBox("S-Parameter Database")
         storage_form = QtWidgets.QFormLayout(storage_group)
@@ -983,6 +1008,30 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._fir_trigger_delay_us = float(
             getattr(configuration, "fir_trigger_delay_us", 0.0)
         )
+        self._fir_uses_fpga_trigger_delay = (
+            str(
+                getattr(
+                    configuration,
+                    "fir_trigger_delay_units",
+                    "none",
+                )
+            )
+            != "none"
+        )
+        if not self.override_fpga_trigger_delay.isChecked():
+            with QtCore.QSignalBlocker(self.fpga_trigger_delay_us):
+                self.fpga_trigger_delay_us.setValue(
+                    self._fir_trigger_delay_us
+                )
+        self._update_fpga_trigger_delay_controls()
+        self._update_fir_profile_status()
+
+    def _update_fpga_trigger_delay_controls(self, *_args) -> None:
+        supported = self._fir_uses_fpga_trigger_delay is not False
+        self.override_fpga_trigger_delay.setEnabled(supported)
+        self.fpga_trigger_delay_us.setEnabled(
+            supported and self.override_fpga_trigger_delay.isChecked()
+        )
         self._update_fir_profile_status()
 
     def _update_fir_profile_status(self, *_args) -> None:
@@ -1004,11 +1053,16 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         actual_time_us = (
             sample_count * 1_000_000.0 / float(self._fir_sample_rate_hz)
         )
-        delay = (
-            f"; FPGA delay {self._fir_trigger_delay_us:g} us"
-            if self._fir_trigger_delay_us
-            else ""
-        )
+        if self._fir_uses_fpga_trigger_delay:
+            if self.override_fpga_trigger_delay.isChecked():
+                delay = (
+                    f"; FPGA delay override "
+                    f"{self.fpga_trigger_delay_us.value():g} us"
+                )
+            else:
+                delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
+        else:
+            delay = "; no FPGA trigger-delay register"
         self.fir_profile_status.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{sample_count:,} samples = {actual_time_us:g} us actual"
@@ -1059,6 +1113,14 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             nqz=path["output_nqz"],
             readout_nqz=path["readout_nqz"],
             margin_input_samples=self.margin_input_samples.value(),
+            fpga_trigger_delay_us=(
+                self.fpga_trigger_delay_us.value()
+                if (
+                    self.override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             address=self.address.value(),
             stride_bytes=(
                 None if self.stride_bytes.value() == 0 else self.stride_bytes.value()
@@ -1124,6 +1186,17 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         for widget, value in widgets:
             widget.setValue(value)
+        self.override_fpga_trigger_delay.setChecked(
+            config.fpga_trigger_delay_us is not None
+        )
+        if config.fpga_trigger_delay_us is not None:
+            self.fpga_trigger_delay_us.setValue(
+                config.fpga_trigger_delay_us
+            )
+        elif self._fir_sample_rate_hz is not None:
+            self.fpga_trigger_delay_us.setValue(
+                self._fir_trigger_delay_us
+            )
         self.output_filter_type.setCurrentText(config.output_filter_type)
         self.readout_filter_type.setCurrentText(config.readout_filter_type)
         self.calibration_database_path.setText(config.calibration_database_path)
@@ -1154,6 +1227,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             "trigger_width_tproc_cycles": config.trigger_width_tproc_cycles,
             "recovery_tproc_cycles": config.recovery_tproc_cycles,
         }
+        self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
@@ -1162,6 +1236,14 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.browse_database.setEnabled(not running)
         self.power_calibration_enabled.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
+        self.override_fpga_trigger_delay.setEnabled(
+            not running and self._fir_uses_fpga_trigger_delay is not False
+        )
+        self.fpga_trigger_delay_us.setEnabled(
+            not running
+            and self._fir_uses_fpga_trigger_delay is not False
+            and self.override_fpga_trigger_delay.isChecked()
+        )
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)

@@ -271,6 +271,7 @@ class StabilityDiagramConfig:
     repetitions_per_point: int = DEFAULT_STABILITY_REPETITIONS
     trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
     settle_time_us: float = DEFAULT_STABILITY_SETTLE_US
+    fpga_trigger_delay_us: Optional[float] = None
     modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
     modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
     bias_t_compensation_enabled: bool = False
@@ -290,6 +291,17 @@ class StabilityDiagramConfig:
         )
         if _finite_float(self.settle_time_us, "stability settle time") < 0.0:
             raise ValueError("stability settle time must not be negative")
+        if (
+            self.fpga_trigger_delay_us is not None
+            and _finite_float(
+                self.fpga_trigger_delay_us,
+                "stability FPGA trigger delay",
+            )
+            < 0.0
+        ):
+            raise ValueError(
+                "stability FPGA trigger delay must not be negative"
+            )
         _integer(
             self.trace_samples_per_point,
             "stability FIR trace samples per point",
@@ -951,6 +963,7 @@ def default_stability_settings(
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
         "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
+        "fpga_trigger_delay_us": None,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
         "bias_t_compensation": {
@@ -1046,6 +1059,25 @@ def normalize_stability_settings(
     )
     if normalized["settle_time_us"] < 0.0:
         raise ValueError("stability settle time must not be negative")
+    raw_fpga_delay = settings.get(
+        "fpga_trigger_delay_us",
+        defaults["fpga_trigger_delay_us"],
+    )
+    normalized["fpga_trigger_delay_us"] = (
+        None
+        if raw_fpga_delay is None
+        else _finite_float(
+            raw_fpga_delay,
+            "stability FPGA trigger delay",
+        )
+    )
+    if (
+        normalized["fpga_trigger_delay_us"] is not None
+        and normalized["fpga_trigger_delay_us"] < 0.0
+    ):
+        raise ValueError(
+            "stability FPGA trigger delay must not be negative"
+        )
     normalized["modulation_frequency_mhz"] = _finite_float(
         settings.get(
             "modulation_frequency_mhz",
@@ -1603,10 +1635,19 @@ class StabilityDiagramWorker(QtCore.QObject):
             )
             for spec in kwargs.get("rf_specs", ())
         )
+        selected_delay_value = fir_profile.selected_trigger_delay_value(
+            stability_config.fpga_trigger_delay_us
+        )
+        selected_delay_us = fir_profile.trigger_delay_us_for(
+            selected_delay_value
+        )
         if hasattr(kwargs["readout_spec"], "__dataclass_fields__"):
             kwargs["readout_spec"] = replace(
                 kwargs["readout_spec"],
-                fpga_trigger_delay_samples=0,
+                fpga_trigger_delay_samples=None,
+                fpga_trigger_delay_us=(
+                    stability_config.fpga_trigger_delay_us
+                ),
             )
         self.progress_changed.emit(
             2,
@@ -1615,7 +1656,8 @@ class StabilityDiagramWorker(QtCore.QObject):
                 f"{getattr(fir_profile, 'rate_label', format_sample_rate_hz(fir_profile.sample_rate_hz))} "
                 f"({fir_profile.sample_period_us:g} us/sample); "
                 f"{stability_config.trace_samples_per_point:,} samples = "
-                f"{capture_window_us:g} us; Stability capture delay 0 samples"
+                f"{capture_window_us:g} us; FPGA trigger-to-store delay "
+                f"{selected_delay_us:g} us"
             ),
         )
         if self._stop_event.is_set():
@@ -1667,11 +1709,15 @@ class StabilityDiagramWorker(QtCore.QObject):
                 "fir_rate_profile": fir_profile.name,
                 "fir_sample_rate_hz": fir_profile.sample_rate_hz,
                 "fir_sample_period_us": fir_profile.sample_period_us,
-                "fir_fpga_trigger_delay_samples": 0,
+                "fir_fpga_trigger_delay_samples": selected_delay_value,
+                "fir_fpga_trigger_delay_units": (
+                    fir_profile.trigger_delay_units
+                ),
+                "fir_fpga_trigger_delay_us": selected_delay_us,
                 "fir_profile_default_trigger_delay_samples": (
                     fir_profile.trigger_delay_samples
                 ),
-                "fir_stability_capture_mode": "immediate_continuous_fir_output",
+                "fir_stability_capture_mode": "programmable_fpga_delay",
                 "fir_software_warmup_compensation": (
                     fir_profile.software_warmup_compensation
                 ),
@@ -2467,6 +2513,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
+        self._fir_uses_fpga_trigger_delay: Optional[bool] = None
         self.fir_profile_status = QtWidgets.QLabel(
             "Identify QICK to show the FIR DDR timing",
             acquisition,
@@ -2484,6 +2531,21 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "Time to hold each new X/Y voltage before RF modulation and "
             "FIR-DDR capture begin"
         )
+        self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default",
+            acquisition,
+        )
+        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox(acquisition)
+        self.fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
+        self.fpga_trigger_delay_us.setDecimals(6)
+        self.fpga_trigger_delay_us.setSuffix(" us")
+        self.fpga_trigger_delay_us.setToolTip(
+            "FPGA delay from trigger arrival to FIR-DDR storage"
+        )
+        fpga_delay_row = QtWidgets.QHBoxLayout()
+        fpga_delay_row.setContentsMargins(0, 0, 0, 0)
+        fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
+        fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
         self.modulation_frequency_mhz = QtWidgets.QDoubleSpinBox(acquisition)
         self.modulation_frequency_mhz.setRange(-10_000.0, 10_000.0)
         self.modulation_frequency_mhz.setDecimals(9)
@@ -2524,6 +2586,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         acquisition_form.addRow("Repetitions / point:", self.repetitions)
         acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
         acquisition_form.addRow("Settle before readout:", self.settle_time_us)
+        acquisition_form.addRow(
+            "FPGA trigger-to-store delay:",
+            fpga_delay_row,
+        )
         acquisition_form.addRow(
             "Modulation frequency:",
             self.modulation_frequency_mhz,
@@ -2774,6 +2840,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
         self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
+        self.override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.fpga_trigger_delay_us.valueChanged.connect(
+            self._update_fir_trace_duration
+        )
         self.measurement_unit.currentIndexChanged.connect(
             self._measurement_representation_changed
         )
@@ -3086,6 +3158,33 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "fir_sample_rate_hz",
             None,
         )
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._fir_uses_fpga_trigger_delay = (
+            str(
+                getattr(
+                    configuration,
+                    "fir_trigger_delay_units",
+                    "none",
+                )
+            )
+            != "none"
+        )
+        if not self.override_fpga_trigger_delay.isChecked():
+            with QtCore.QSignalBlocker(self.fpga_trigger_delay_us):
+                self.fpga_trigger_delay_us.setValue(
+                    self._fir_trigger_delay_us
+                )
+        self._update_fpga_trigger_delay_controls()
+        self._update_fir_trace_duration()
+
+    def _update_fpga_trigger_delay_controls(self, *_args) -> None:
+        supported = self._fir_uses_fpga_trigger_delay is not False
+        self.override_fpga_trigger_delay.setEnabled(supported)
+        self.fpga_trigger_delay_us.setEnabled(
+            supported and self.override_fpga_trigger_delay.isChecked()
+        )
         self._update_fir_trace_duration()
 
     def _update_fir_trace_duration(self, *_args) -> None:
@@ -3096,10 +3195,20 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             return
         sample_period_us = 1_000_000.0 / self._fir_sample_rate_hz
         trace_us = self.trace_samples.value() * sample_period_us
+        if self._fir_uses_fpga_trigger_delay:
+            if self.override_fpga_trigger_delay.isChecked():
+                delay = (
+                    f"; FPGA delay override "
+                    f"{self.fpga_trigger_delay_us.value():g} us"
+                )
+            else:
+                delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
+        else:
+            delay = "; no FPGA trigger-delay register"
         self.fir_profile_status.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{self.trace_samples.value():,} samples = {trace_us:g} us"
-            "; Stability capture delay 0 samples"
+            f"{delay}"
         )
 
     def front_panel_values(self) -> Mapping[str, Any]:
@@ -3144,6 +3253,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             repetitions_per_point=self.repetitions.value(),
             trace_samples_per_point=self.trace_samples.value(),
             settle_time_us=self.settle_time_us.value(),
+            fpga_trigger_delay_us=(
+                self.fpga_trigger_delay_us.value()
+                if (
+                    self.override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
             modulation_gain=self.modulation_gain.value(),
             bias_t_compensation_enabled=self.bias_t_group.isChecked(),
@@ -3163,6 +3280,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
             "settle_time_us": self.settle_time_us.value(),
+            "fpga_trigger_delay_us": (
+                self.fpga_trigger_delay_us.value()
+                if self.override_fpga_trigger_delay.isChecked()
+                else None
+            ),
             "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
             "modulation_gain": self.modulation_gain.value(),
             "bias_t_compensation": {
@@ -3217,6 +3339,16 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.settle_time_us.setValue(
             float(settings.get("settle_time_us", DEFAULT_STABILITY_SETTLE_US))
         )
+        saved_fpga_delay = settings.get("fpga_trigger_delay_us")
+        self.override_fpga_trigger_delay.setChecked(
+            saved_fpga_delay is not None
+        )
+        if saved_fpga_delay is not None:
+            self.fpga_trigger_delay_us.setValue(float(saved_fpga_delay))
+        elif self._fir_sample_rate_hz is not None:
+            self.fpga_trigger_delay_us.setValue(
+                self._fir_trigger_delay_us
+            )
         self.modulation_frequency_mhz.setValue(
             float(
                 settings.get(
@@ -3341,6 +3473,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
+        self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
@@ -3357,6 +3490,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
         self.settle_time_us.setEnabled(not running)
+        self.override_fpga_trigger_delay.setEnabled(
+            not running and self._fir_uses_fpga_trigger_delay is not False
+        )
+        self.fpga_trigger_delay_us.setEnabled(
+            not running
+            and self._fir_uses_fpga_trigger_delay is not False
+            and self.override_fpga_trigger_delay.isChecked()
+        )
         self.modulation_frequency_mhz.setEnabled(not running)
         self.modulation_gain.setEnabled(not running)
         self.bias_t_group.setEnabled(not running)

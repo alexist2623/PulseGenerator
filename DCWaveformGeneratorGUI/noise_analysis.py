@@ -64,6 +64,7 @@ DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "acquisition_filter_cutoff_ghz": 2.5,
     "acquisition_filter_bandwidth_ghz": 1.0,
     "acquisition_margin_input_samples": 1024,
+    "acquisition_fpga_trigger_delay_us": None,
     "acquisition_force_overwrite": True,
     "acquisition_post_run_read_delay_seconds": 0.1,
     "database_path": str(Path.home() / "qick_experiments.db"),
@@ -174,6 +175,19 @@ def normalize_noise_analysis_settings(
         "acquisition_post_run_read_delay_seconds",
     ):
         settings[name] = _finite(settings[name], name)
+    raw_fpga_delay = settings["acquisition_fpga_trigger_delay_us"]
+    settings["acquisition_fpga_trigger_delay_us"] = (
+        None
+        if raw_fpga_delay is None
+        else _finite(raw_fpga_delay, "acquisition_fpga_trigger_delay_us")
+    )
+    if (
+        settings["acquisition_fpga_trigger_delay_us"] is not None
+        and settings["acquisition_fpga_trigger_delay_us"] < 0.0
+    ):
+        raise ValueError(
+            "acquisition_fpga_trigger_delay_us must be nonnegative"
+        )
     if not 0.0 <= settings["acquisition_input_attenuation_db"] <= 31.75:
         raise ValueError("acquisition_input_attenuation_db must be in [0, 31.75]")
     if not -6.0 <= settings["acquisition_dc_gain_db"] <= 26.0:
@@ -735,6 +749,24 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.input_margin.setRange(0, 1 << 30)
         self.input_margin.setValue(1024)
         self.input_margin.setGroupSeparatorShown(True)
+        self._fir_trigger_delay_us = 0.0
+        self._fir_uses_fpga_trigger_delay: Optional[bool] = None
+        self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
+            "Override HWH default",
+            acquisition_group,
+        )
+        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox(
+            acquisition_group
+        )
+        self.fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
+        self.fpga_trigger_delay_us.setDecimals(6)
+        self.fpga_trigger_delay_us.setSuffix(" us")
+        self.fpga_trigger_delay_us.setToolTip(
+            "FPGA delay from trigger arrival to FIR-DDR storage"
+        )
+        fpga_delay_row = QtWidgets.QHBoxLayout()
+        fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
+        fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
         self.post_read_delay = QtWidgets.QDoubleSpinBox(acquisition_group)
         self.post_read_delay.setRange(0.0, 60.0)
         self.post_read_delay.setDecimals(6)
@@ -751,6 +783,11 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         )
         self.force_overwrite.setChecked(True)
         advanced_row.addWidget(self.force_overwrite)
+        self.fir_profile_status = QtWidgets.QLabel(
+            "Identify QICK to show the FIR DDR timing",
+            acquisition_group,
+        )
+        self.fir_profile_status.setWordWrap(True)
 
         self.acquire_button = QtWidgets.QPushButton(
             "Acquire FIR Trace and Analyze",
@@ -771,6 +808,11 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         acquisition_form.addRow("Input board setting:", board_setting_row)
         acquisition_form.addRow("Input filter:", filter_row)
         acquisition_form.addRow("Advanced:", advanced_row)
+        acquisition_form.addRow(
+            "FPGA trigger-to-store delay:",
+            fpga_delay_row,
+        )
+        acquisition_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         acquisition_form.addRow(self.acquire_button)
         acquisition_form.addRow("Status:", self.acquisition_status)
         outer.addWidget(acquisition_group)
@@ -937,6 +979,12 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         )
         self.acquire_button.clicked.connect(self._request_acquisition)
         self.fir_samples.valueChanged.connect(self._update_capture_duration)
+        self.override_fpga_trigger_delay.toggled.connect(
+            self._update_fpga_trigger_delay_controls
+        )
+        self.fpga_trigger_delay_us.valueChanged.connect(
+            self._update_capture_duration
+        )
         self.sample_rate.valueChanged.connect(self._update_capture_duration)
         self.input_board.currentTextChanged.connect(
             self._update_input_board_controls
@@ -971,6 +1019,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self._update_capture_duration()
         self._update_input_board_controls()
         self._update_mode_controls()
+        self._update_fpga_trigger_delay_controls()
 
     def connection_config(self):
         """Return the QICK connection mirrored from the shared Setup menu."""
@@ -998,6 +1047,14 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             filter_cutoff_ghz=self.filter_cutoff.value(),
             filter_bandwidth_ghz=self.filter_bandwidth.value(),
             margin_input_samples=self.input_margin.value(),
+            fpga_trigger_delay_us=(
+                self.fpga_trigger_delay_us.value()
+                if (
+                    self.override_fpga_trigger_delay.isChecked()
+                    and self._fir_uses_fpga_trigger_delay is not False
+                )
+                else None
+            ),
             force_overwrite=self.force_overwrite.isChecked(),
             post_run_read_delay_seconds=self.post_read_delay.value(),
         )
@@ -1041,15 +1098,40 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.front_panel_preview.set_configuration(configuration)
         self.front_panel_preview.set_channels(input_ch=self.readout_channel.value())
         sample_rate_hz = getattr(configuration, "fir_sample_rate_hz", None)
+        self._fir_trigger_delay_us = float(
+            getattr(configuration, "fir_trigger_delay_us", 0.0)
+        )
+        self._fir_uses_fpga_trigger_delay = (
+            str(
+                getattr(
+                    configuration,
+                    "fir_trigger_delay_units",
+                    "none",
+                )
+            )
+            != "none"
+        )
+        if not self.override_fpga_trigger_delay.isChecked():
+            with QtCore.QSignalBlocker(self.fpga_trigger_delay_us):
+                self.fpga_trigger_delay_us.setValue(
+                    self._fir_trigger_delay_us
+                )
         if sample_rate_hz is not None:
             self.sample_rate.setValue(float(sample_rate_hz))
-            self.acquisition_status.setText(
-                f"HWH FIR DDR: {configuration.fir_rate_label}"
-            )
+            self.fir_profile_status.setText(str(configuration.fir_rate_label))
         else:
-            self.acquisition_status.setText(
+            self.fir_profile_status.setText(
                 "HWH FIR DDR sample rate is unavailable"
             )
+        self._update_fpga_trigger_delay_controls()
+        self._update_capture_duration()
+
+    def _update_fpga_trigger_delay_controls(self, *_args) -> None:
+        supported = self._fir_uses_fpga_trigger_delay is not False
+        self.override_fpga_trigger_delay.setEnabled(supported)
+        self.fpga_trigger_delay_us.setEnabled(
+            supported and self.override_fpga_trigger_delay.isChecked()
+        )
         self._update_capture_duration()
 
     def _update_capture_duration(self, _value: float = 0.0) -> None:
@@ -1061,7 +1143,19 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             rate_label = "50 kSPS"
         else:
             rate_label = f"{sample_rate_hz:g} S/s"
-        self.capture_duration.setText(f"{seconds:g} s at {rate_label}")
+        if self._fir_uses_fpga_trigger_delay:
+            if self.override_fpga_trigger_delay.isChecked():
+                delay = (
+                    f", FPGA delay override "
+                    f"{self.fpga_trigger_delay_us.value():g} us"
+                )
+            else:
+                delay = f", HWH FPGA delay {self._fir_trigger_delay_us:g} us"
+        else:
+            delay = ""
+        self.capture_duration.setText(
+            f"{seconds:g} s at {rate_label}{delay}"
+        )
 
     def _update_input_board_controls(self, _board: str = "") -> None:
         is_rf = self.input_board.currentText() == "RF_In"
@@ -1339,6 +1433,11 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             "acquisition_filter_cutoff_ghz": self.filter_cutoff.value(),
             "acquisition_filter_bandwidth_ghz": self.filter_bandwidth.value(),
             "acquisition_margin_input_samples": self.input_margin.value(),
+            "acquisition_fpga_trigger_delay_us": (
+                self.fpga_trigger_delay_us.value()
+                if self.override_fpga_trigger_delay.isChecked()
+                else None
+            ),
             "acquisition_force_overwrite": self.force_overwrite.isChecked(),
             "acquisition_post_run_read_delay_seconds": self.post_read_delay.value(),
             "database_path": self.database_path.text().strip(),
@@ -1397,6 +1496,16 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.input_margin.setValue(
             settings["acquisition_margin_input_samples"]
         )
+        saved_fpga_delay = settings["acquisition_fpga_trigger_delay_us"]
+        self.override_fpga_trigger_delay.setChecked(
+            saved_fpga_delay is not None
+        )
+        if saved_fpga_delay is not None:
+            self.fpga_trigger_delay_us.setValue(saved_fpga_delay)
+        elif self.sample_rate.value() > 0.0:
+            self.fpga_trigger_delay_us.setValue(
+                self._fir_trigger_delay_us
+            )
         self.force_overwrite.setChecked(
             settings["acquisition_force_overwrite"]
         )
@@ -1441,6 +1550,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self._update_capture_duration()
         self._update_input_board_controls()
         self._update_mode_controls()
+        self._update_fpga_trigger_delay_controls()
 
 
 __all__ = [

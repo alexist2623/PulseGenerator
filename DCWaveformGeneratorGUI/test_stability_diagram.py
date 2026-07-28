@@ -25,6 +25,7 @@ from qick_qcodes_experiment import (
     store_qick_result,
 )
 import stability_diagram as stability
+from fir_ddr_profile import FirDdrProfile
 
 
 def _application():
@@ -35,17 +36,20 @@ def _fir_profile(*, is_50_ksps: bool = False):
     sample_rate_hz = 50_000.0 if is_50_ksps else 1_000_000.0
     trigger_delay_samples = 50 if is_50_ksps else 0
     sample_period_us = 1_000_000.0 / sample_rate_hz
-    return SimpleNamespace(
+    return FirDdrProfile(
         name="50_ksps" if is_50_ksps else "1_msps",
         sample_rate_hz=sample_rate_hz,
+        sample_rate_msps=sample_rate_hz / 1_000_000.0,
         sample_period_us=sample_period_us,
+        decimation=6000 if is_50_ksps else 300,
+        input_rate_mhz=300.0,
+        group_delay_input_samples=296_677.0 if is_50_ksps else 8_677.0,
+        uses_fpga_trigger_delay=is_50_ksps,
         trigger_delay_samples=trigger_delay_samples,
-        trigger_delay_us=trigger_delay_samples * sample_period_us,
         software_warmup_compensation=not is_50_ksps,
-        timing_label=(
-            "50 kSPS (20 us/sample, FPGA delay 50 samples (1000 us))"
-            if is_50_ksps
-            else "1 MSPS (1 us/sample, tProcessor FIR warm-up compensation)"
+        config={},
+        trigger_delay_units=(
+            "valid_input_samples" if is_50_ksps else "none"
         ),
     )
 
@@ -109,6 +113,7 @@ def _ddr_result():
 @dataclass(frozen=True)
 class _FakeReadoutSpec:
     fpga_trigger_delay_samples: int = 50
+    fpga_trigger_delay_us: float | None = None
 
 
 def _worker_kwargs(tmp_path=None):
@@ -617,7 +622,8 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
     assert captured["rf_specs"][0].duration_us == (
         _config().trace_samples_per_point * profile.sample_period_us
     )
-    assert captured["readout_spec"].fpga_trigger_delay_samples == 0
+    assert captured["readout_spec"].fpga_trigger_delay_samples is None
+    assert captured["readout_spec"].fpga_trigger_delay_us is None
 
 
 def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):

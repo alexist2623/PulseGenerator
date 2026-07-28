@@ -94,6 +94,36 @@ def test_50_ksps_profile_supports_shift_line_clock_cycle_delay():
     assert "source-clock cycles" in profile.timing_label
 
 
+def test_user_delay_microseconds_convert_to_hwh_reported_units():
+    sample_profile = resolve_fir_ddr_profile(_soccfg("50_ksps"))
+    cycle_profile = resolve_fir_ddr_profile(
+        _soccfg(
+            "50_ksps",
+            trigger_delay_units="s_axis_aclk_cycles",
+        )
+    )
+
+    assert sample_profile.trigger_delay_value_for_us(700.0) == 35
+    assert sample_profile.trigger_delay_arm_kwargs_for_us(700.0) == {
+        "trigger_delay_samples": 35
+    }
+    assert cycle_profile.trigger_delay_value_for_us(700.0) == 210_000
+    assert cycle_profile.trigger_delay_arm_kwargs_for_us(700.0) == {
+        "trigger_delay_cycles": 210_000
+    }
+    assert cycle_profile.trigger_delay_arm_kwargs_for_us() == {
+        "trigger_delay_cycles": 50
+    }
+
+
+def test_1_msps_profile_rejects_nonzero_fpga_delay_override():
+    profile = resolve_fir_ddr_profile(_soccfg("1_msps"))
+
+    assert profile.trigger_delay_value_for_us(0.0) == 0
+    with pytest.raises(RuntimeError, match="does not expose"):
+        profile.trigger_delay_value_for_us(1.0)
+
+
 def test_50_ksps_profile_rejects_hwh_without_v2_trigger_delay():
     soccfg = _soccfg("50_ksps")
     del soccfg["ddr4_buf"]["supports_trigger_delay"]

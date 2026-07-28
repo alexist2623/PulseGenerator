@@ -394,11 +394,20 @@ def build_runtime_ddr_readout(
         if spec.delay_us <= 0.0
         else cycles_from_us(spec.delay_us, tproc_mhz)
     )
+    fpga_trigger_delay = spec.fpga_trigger_delay_samples
+    if spec.fpga_trigger_delay_us is not None:
+        fir_profile = resolve_fir_ddr_profile(
+            soccfg,
+            context="QICK experiment FIR DDR",
+        )
+        fpga_trigger_delay = fir_profile.trigger_delay_value_for_us(
+            spec.fpga_trigger_delay_us
+        )
     return ddr_type(
         ro_ch=spec.ro_ch,
         samples_per_trigger=spec.samples_per_trigger,
         at_segment=spec.segment_name,
-        fpga_trigger_delay_samples=spec.fpga_trigger_delay_samples,
+        fpga_trigger_delay_samples=fpga_trigger_delay,
         readout_freq_mhz=spec.readout_frequency_mhz,
         trigger_delay_tproc_cycles=delay_cycles,
         margin_input_samples=spec.margin_input_samples,
@@ -1525,6 +1534,12 @@ def run_qick_qcodes_experiment(
         soccfg,
         context="QCoDeS experiment",
     )
+    if readout_spec.fpga_trigger_delay_samples is not None:
+        selected_trigger_delay = readout_spec.fpga_trigger_delay_samples
+    else:
+        selected_trigger_delay = fir_profile.selected_trigger_delay_value(
+            readout_spec.fpga_trigger_delay_us
+        )
     effective_run_config = replace(
         run_config,
         sample_rate_hz=fir_profile.sample_rate_hz,
@@ -1538,8 +1553,11 @@ def run_qick_qcodes_experiment(
         "fir_rate_profile": fir_profile.name,
         "fir_sample_rate_hz": fir_profile.sample_rate_hz,
         "fir_sample_period_us": fir_profile.sample_period_us,
-        "fir_fpga_trigger_delay_samples": fir_profile.trigger_delay_samples,
+        "fir_fpga_trigger_delay_samples": selected_trigger_delay,
         "fir_fpga_trigger_delay_units": fir_profile.trigger_delay_units,
+        "fir_fpga_trigger_delay_us": fir_profile.trigger_delay_us_for(
+            selected_trigger_delay
+        ),
         "fir_software_warmup_compensation": (
             fir_profile.software_warmup_compensation
         ),

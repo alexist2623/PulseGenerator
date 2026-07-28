@@ -413,6 +413,7 @@ class QickDdrReadoutSpec:
     measurement_representation: str = "auto"
     nqz: int = 1
     fpga_trigger_delay_samples: Optional[int] = None
+    fpga_trigger_delay_us: Optional[float] = None
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
@@ -426,6 +427,19 @@ class QickDdrReadoutSpec:
                 "DDR fpga_trigger_delay_samples",
                 0,
                 (1 << 32) - 1,
+            )
+        if self.fpga_trigger_delay_us is not None:
+            _nonnegative_real(
+                self.fpga_trigger_delay_us,
+                "DDR fpga_trigger_delay_us",
+            )
+        if (
+            self.fpga_trigger_delay_samples is not None
+            and self.fpga_trigger_delay_us is not None
+        ):
+            raise ValueError(
+                "set only one of fpga_trigger_delay_samples and "
+                "fpga_trigger_delay_us"
             )
         _finite_real(self.readout_frequency_mhz, "DDR readout_frequency_mhz")
         _bounded_int(self.nqz, "DDR readout nqz", 1, 2)

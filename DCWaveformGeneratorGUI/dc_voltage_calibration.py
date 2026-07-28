@@ -95,6 +95,7 @@ class DcVoltageCalibrationConfig:
     input_dc_gain_db: float = 0.0
     settle_us: float = 5.0
     margin_input_samples: int = 1024
+    fpga_trigger_delay_us: Optional[float] = None
     force_overwrite: bool = True
     experiment_name: str = "QICK DC input voltage calibration"
     sample_name: str = ""
@@ -133,6 +134,15 @@ class DcVoltageCalibrationConfig:
         if _finite(self.settle_us, "settle_us") < 0.0:
             raise ValueError("settle_us must be nonnegative")
         _integer(self.margin_input_samples, "margin_input_samples")
+        if self.fpga_trigger_delay_us is not None:
+            delay_us = _finite(
+                self.fpga_trigger_delay_us,
+                "fpga_trigger_delay_us",
+            )
+            if delay_us < 0.0:
+                raise ValueError(
+                    "fpga_trigger_delay_us must be nonnegative"
+                )
         if not isinstance(self.force_overwrite, bool):
             raise TypeError("force_overwrite must be boolean")
         if not str(self.experiment_name).strip():
@@ -291,13 +301,19 @@ def build_dc_voltage_calibration_program(
         soccfg,
         context="DC voltage calibration",
     )
+    fpga_trigger_delay_value = fir_profile.selected_trigger_delay_value(
+        config.fpga_trigger_delay_us
+    )
+    fpga_trigger_delay_us = fir_profile.trigger_delay_us_for(
+        fpga_trigger_delay_value
+    )
     # Keep the swept SET active through FIR readiness and the complete FIR-DDR
     # capture. The 50 kSPS HWH additionally delays capture in FPGA valid-sample
     # units, so the SET must cover that interval without moving the tProcessor
     # trigger. The following SET returns the DC output to zero every point.
     capture_hold_us = (
         float(config.settle_us)
-        + fir_profile.trigger_delay_us
+        + fpga_trigger_delay_us
         + float(config.samples_per_point) * fir_profile.sample_period_us
         + float(config.margin_input_samples) / fir_profile.input_rate_mhz
         + 2.0
@@ -329,6 +345,11 @@ def build_dc_voltage_calibration_program(
         trigger_delay_tproc_cycles=trigger_delay,
         readout_period_cycles=65535,
         margin_input_samples=int(config.margin_input_samples),
+        fpga_trigger_delay_samples=(
+            fpga_trigger_delay_value
+            if config.fpga_trigger_delay_us is not None
+            else None
+        ),
         force_overwrite=bool(config.force_overwrite),
     )
     return sequence.make_program(

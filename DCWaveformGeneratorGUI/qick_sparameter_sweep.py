@@ -180,6 +180,7 @@ class SParameterSweepConfig:
     nqz: int = 1
     readout_nqz: int = 1
     margin_input_samples: int = 1024
+    fpga_trigger_delay_us: Optional[float] = None
     address: int = 0
     stride_bytes: Optional[int] = None
     force_overwrite: bool = False
@@ -318,6 +319,15 @@ class SParameterSweepConfig:
             if zone not in (1, 2):
                 raise ValueError(f"{name} must be 1 or 2")
         _require_int(self.margin_input_samples, "margin_input_samples")
+        if self.fpga_trigger_delay_us is not None:
+            delay_us = _require_finite(
+                self.fpga_trigger_delay_us,
+                "fpga_trigger_delay_us",
+            )
+            if delay_us < 0.0:
+                raise ValueError(
+                    "fpga_trigger_delay_us must be nonnegative"
+                )
         _require_int(self.address, "address")
         if self.stride_bytes is not None:
             _require_int(self.stride_bytes, "stride_bytes", 1)
@@ -1059,6 +1069,19 @@ class SParameterSweepProgram(RAveragerProgram):
         )
         self._ddr_cfg = self._fir_profile.config
         self.fir_output_rate_msps = self._fir_profile.sample_rate_msps
+        self._fir_trigger_delay_value = (
+            self._fir_profile.selected_trigger_delay_value(
+                self.sweep.fpga_trigger_delay_us
+            )
+        )
+        self._fir_trigger_delay_input_cycles = (
+            self._fir_profile.trigger_delay_input_cycles_for(
+                self._fir_trigger_delay_value
+            )
+        )
+        self._fir_trigger_delay_us = self._fir_profile.trigger_delay_us_for(
+            self._fir_trigger_delay_value
+        )
         return gen_cfg, ro_cfg
 
     def _frequency_grid(self, gen_cfg, ro_cfg) -> None:
@@ -1191,13 +1214,13 @@ class SParameterSweepProgram(RAveragerProgram):
             )
         else:
             # The 50 kSPS HWH continuously filters and decimates. The V2 DDR
-            # buffer delays capture in valid post-filter samples, so the
+            # buffer delays capture in the unit reported by HWH, so the
             # tProcessor trigger remains aligned with RF output start.
             self.fir_warmup_tproc_cycles = 0
             self.ddr_trigger_time = self.output_command_time
             post_trigger_input_samples = (
                 self.scan_samples * decimation
-                + self._fir_profile.trigger_delay_input_cycles
+                + self._fir_trigger_delay_input_cycles
                 + self.sweep.margin_input_samples
             )
             self.fir_feed_input_samples = group_delay + post_trigger_input_samples
@@ -1468,7 +1491,11 @@ class SParameterSweepProgram(RAveragerProgram):
             force_overwrite=self.sweep.force_overwrite,
         )
         if self._fir_profile.uses_fpga_trigger_delay:
-            arm_kwargs.update(self._fir_profile.trigger_delay_arm_kwargs())
+            arm_kwargs.update(
+                self._fir_profile.trigger_delay_arm_kwargs(
+                    self._fir_trigger_delay_value
+                )
+            )
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
         if counter_progress is None and not self._uses_gain_table:
             self.run_rounds(soc, progress=progress)
@@ -1594,11 +1621,12 @@ class SParameterSweepProgram(RAveragerProgram):
                 self._fir_profile.software_warmup_compensation
             ),
             "fir_fpga_trigger_delay_samples": (
-                self._fir_profile.trigger_delay_samples
+                self._fir_trigger_delay_value
             ),
             "fir_fpga_trigger_delay_units": (
                 self._fir_profile.trigger_delay_units
             ),
+            "fir_fpga_trigger_delay_us": self._fir_trigger_delay_us,
             "rf_output_mode": "periodic_start_timed_zero_stop",
             "rf_periodic_word_fabric_cycles": self.PERIODIC_WORD_CYCLES,
             "rf_stop_word_fabric_cycles": self.STOP_WORD_CYCLES,

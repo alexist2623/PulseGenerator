@@ -35,10 +35,11 @@ def _configuration(*, is_50_ksps: bool) -> QickFrontPanelConfiguration:
             fir_rate_profile="50_ksps",
             fir_sample_rate_hz=50_000.0,
             fir_sample_period_us=20.0,
-            fir_trigger_delay_samples=50,
+            fir_trigger_delay_samples=300_000,
+            fir_trigger_delay_units="s_axis_aclk_cycles",
             fir_trigger_delay_us=1000.0,
             fir_rate_label=(
-                "50 kSPS (20 us/sample, FPGA delay 50 samples (1000 us))"
+                "50 kSPS (20 us/sample, FPGA delay 300000 cycles (1000 us))"
             ),
         )
     return QickFrontPanelConfiguration(
@@ -78,20 +79,44 @@ def test_all_fir_gui_tabs_display_hwh_selected_rate(
     readout.set_front_panel_configuration(configuration)
     assert rate_text in readout.fir_profile_note.text()
     assert f"100 samples = {trace_time_us:g} us" in readout.fir_profile_note.text()
+    assert readout.override_fpga_trigger_delay.isEnabled() is is_50_ksps
+    readout.override_fpga_trigger_delay.setChecked(True)
+    readout.fpga_trigger_delay_us.setValue(700.0)
+    assert readout.configured_spec().fpga_trigger_delay_us == (
+        700.0 if is_50_ksps else None
+    )
 
     stability = StabilityDiagramPanel()
+    stability.refresh_targets(("awg_0", "awg_1"), (0, 1))
     stability.trace_samples.setValue(100)
     stability.set_front_panel_configuration(configuration)
     assert rate_text in stability.fir_profile_status.text()
     assert f"100 samples = {trace_time_us:g} us" in stability.fir_profile_status.text()
-    assert "Stability capture delay 0 samples" in stability.fir_profile_status.text()
-    assert "FPGA delay 1000 us" not in stability.fir_profile_status.text()
+    if is_50_ksps:
+        assert "HWH FPGA delay 1000 us" in stability.fir_profile_status.text()
+    else:
+        assert (
+            "no FPGA trigger-delay register"
+            in stability.fir_profile_status.text()
+        )
+    assert stability.override_fpga_trigger_delay.isEnabled() is is_50_ksps
+    stability.override_fpga_trigger_delay.setChecked(True)
+    stability.fpga_trigger_delay_us.setValue(700.0)
+    assert stability.config(full_scale_mv=800.0).fpga_trigger_delay_us == (
+        700.0 if is_50_ksps else None
+    )
 
     sparameter = SParameterSweepPanel()
     sparameter.scan_time_us.setValue(101.0)
     sparameter.set_front_panel_configuration(configuration)
     assert rate_text in sparameter.fir_profile_status.text()
     assert sparameter_text in sparameter.fir_profile_status.text()
+    assert sparameter.override_fpga_trigger_delay.isEnabled() is is_50_ksps
+    sparameter.override_fpga_trigger_delay.setChecked(True)
+    sparameter.fpga_trigger_delay_us.setValue(700.0)
+    assert sparameter.config().fpga_trigger_delay_us == (
+        700.0 if is_50_ksps else None
+    )
 
     calibration = CalibrationPanel()
     calibration.dc_voltage_samples.setValue(100)
@@ -101,13 +126,27 @@ def test_all_fir_gui_tabs_display_hwh_selected_rate(
         f"DC calibration 100 samples = {trace_time_us:g} us"
         in calibration.fir_profile_status.text()
     )
+    assert (
+        calibration.input_override_fpga_trigger_delay.isEnabled()
+        is is_50_ksps
+    )
+    assert (
+        calibration.dc_voltage_override_fpga_trigger_delay.isEnabled()
+        is is_50_ksps
+    )
 
     noise = NoiseAnalysisPanel(default_database_path="noise.db")
     noise.fir_samples.setValue(100)
     noise.set_front_panel_configuration(configuration)
     assert noise.sample_rate.value() == configuration.fir_sample_rate_hz
     assert rate_text in noise.capture_duration.text()
-    assert configuration.fir_rate_label in noise.acquisition_status.text()
+    assert configuration.fir_rate_label in noise.fir_profile_status.text()
+    assert noise.override_fpga_trigger_delay.isEnabled() is is_50_ksps
+    noise.override_fpga_trigger_delay.setChecked(True)
+    noise.fpga_trigger_delay_us.setValue(700.0)
+    assert noise.acquisition_config().fpga_trigger_delay_us == (
+        700.0 if is_50_ksps else None
+    )
 
     app.processEvents()
     for widget in (readout, stability, sparameter, calibration, noise):

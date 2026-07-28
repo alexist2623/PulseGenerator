@@ -1318,7 +1318,8 @@ def test_stability_run_arguments_use_identified_50ksps_timing():
         np.ceil(expected_hold_us * 300.0)
     )
     assert arguments["rf_specs"][0].duration_us == 2000.0
-    assert arguments["readout_spec"].fpga_trigger_delay_samples == 0
+    assert arguments["readout_spec"].fpga_trigger_delay_samples is None
+    assert arguments["readout_spec"].fpga_trigger_delay_us is None
     assert arguments["stability_fabric_mhz"] == 300.0
     app.processEvents()
     window.close()
