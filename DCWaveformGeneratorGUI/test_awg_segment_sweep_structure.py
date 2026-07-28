@@ -287,6 +287,36 @@ def test_deleting_one_target_keeps_other_sweeps_on_same_port():
     window.close()
 
 
+def test_deleting_preceding_segment_keeps_sweep_visible_and_in_experiment():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._sweep_specs = [
+        QickSweepSpec("set_3", "awg_0", -0.2, 0.2, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    control.table.selectRow(2)
+    assert control.table.currentRow() == 2
+    assert control._edit_segment_structure("delete", 2)
+    app.processEvents()
+
+    assert _sweep_targets(window) == (("awg_0", "set_2"),)
+    assert control._sweep_rows == {2}
+    assert control.table.selectedItems() == []
+    marker_item = control.table.item(2, 0)
+    assert not marker_item.icon().isNull()
+    assert marker_item.toolTip() == "Voltage sweep target"
+
+    experiment = window._experiment_panel
+    assert experiment.sweep_parameter_table.rowCount() == 1
+    experiment.sweep_parameter_table.selectRow(0)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_2"
+    window.close()
+
+
 def test_insert_keeps_voltage_sweep_on_original_physical_segment():
     app = _application()
     window = gui.MainWindow()

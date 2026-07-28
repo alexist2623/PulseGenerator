@@ -1471,7 +1471,40 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             segment_index,
         )
         self.update_plot.emit()
+        # A deleted row's selection otherwise moves onto the row below it.
+        # Qt's selection brush then hides the sweep-target background, making
+        # a correctly remapped sweep look as though it disappeared.
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
         return True
+
+    def _sweep_indicator_icon(
+        self,
+        *,
+        voltage_sweep: bool,
+        ramp_sweep: bool,
+    ) -> QtGui.QIcon:
+        """Return a compact marker that remains visible on selected rows."""
+        pixmap = QtGui.QPixmap(16, 16)
+        pixmap.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtCore.Qt.NoPen)
+        voltage_color = QtGui.QColor(
+            self._sweep_color or QtGui.QColor("#f2c14e")
+        )
+        voltage_color.setAlpha(255)
+        ramp_color = QtGui.QColor("#3978c5")
+        if voltage_sweep and ramp_sweep:
+            painter.setBrush(voltage_color)
+            painter.drawRoundedRect(QtCore.QRectF(1.0, 2.0, 6.0, 12.0), 2.0, 2.0)
+            painter.setBrush(ramp_color)
+            painter.drawRoundedRect(QtCore.QRectF(9.0, 2.0, 6.0, 12.0), 2.0, 2.0)
+        else:
+            painter.setBrush(voltage_color if voltage_sweep else ramp_color)
+            painter.drawEllipse(QtCore.QRectF(3.0, 3.0, 10.0, 10.0))
+        painter.end()
+        return QtGui.QIcon(pixmap)
 
     def set_sweep_row(
         self,
@@ -1603,6 +1636,16 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                         if row in self._sweep_rows:
                             tooltip += "; voltage sweep target"
                         item.setToolTip(tooltip)
+                    if col == 0 and (
+                        row in self._sweep_rows
+                        or row in self._ramp_sweep_rows
+                    ):
+                        item.setIcon(
+                            self._sweep_indicator_icon(
+                                voltage_sweep=row in self._sweep_rows,
+                                ramp_sweep=row in self._ramp_sweep_rows,
+                            )
+                        )
                     if col == 0 or (col == 1 and row == 0):
                         item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                     self.table.setItem(row, col, item)
