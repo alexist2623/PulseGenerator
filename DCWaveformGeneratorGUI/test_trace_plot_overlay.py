@@ -11,7 +11,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 import DCWaveform_Generator as gui
 from dc_waveform_core import PulseSequence
@@ -149,6 +149,74 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
     )
     app.processEvents()
     widget.close()
+
+
+def test_trace_hold_and_ramp_labels_emit_edit_requests():
+    _application()
+    widget = _trace_widget()
+    hold_requests = []
+    ramp_requests = []
+    widget.hold_edit_requested.connect(hold_requests.append)
+    widget.ramp_edit_requested.connect(ramp_requests.append)
+
+    class _ClickEvent:
+        accepted = False
+
+        @staticmethod
+        def button():
+            return QtCore.Qt.LeftButton
+
+        def accept(self):
+            self.accepted = True
+
+        @staticmethod
+        def ignore():
+            return
+
+    hold_event = _ClickEvent()
+    widget._point_labels[1].mouseClickEvent(hold_event)
+    ramp_event = _ClickEvent()
+    widget._ramp_labels[0].mouseClickEvent(ramp_event)
+
+    assert hold_event.accepted is True
+    assert ramp_event.accepted is True
+    assert hold_requests == [1]
+    assert ramp_requests == [1]
+    assert "Click to edit X, Y" in widget._point_labels[1].toolTip()
+    assert "Click to edit ramp" in widget._ramp_labels[0].toolTip()
+    widget.close()
+
+
+def test_trace_edits_update_xy_values_and_share_segment_timing():
+    _application()
+    window = gui.MainWindow()
+    window._add_segment(500.0, 2_000.0, 100.0)
+    window._add_port()
+    window._add_port()
+    third_output_voltage = window._pulse[2].v.copy()
+    window._set_x(0)
+    window._set_y(1)
+
+    window._apply_trace_hold_edit(
+        segment_index=1,
+        x_mv=225.0,
+        y_mv=-175.0,
+        hold_ns=3_250.0,
+    )
+
+    assert window._pulse[0].v[2] == 225.0
+    assert window._pulse[1].v[2] == -175.0
+    np.testing.assert_array_equal(window._pulse[2].v, third_output_voltage)
+    for pulse in window._pulse:
+        assert pulse.t[3] - pulse.t[2] == 3_250.0
+
+    window._apply_trace_ramp_edit(
+        segment_index=1,
+        ramp_ns=875.0,
+    )
+    for pulse in window._pulse:
+        assert pulse.t[2] - pulse.t[1] == 875.0
+    window.close()
 
 
 def test_last_stability_magnitude_is_drawn_below_matching_trace():

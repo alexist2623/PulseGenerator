@@ -78,8 +78,30 @@ def _duration_pair_text(
     return f"X {x_value:.6g} / Y {y_value:.6g} {unit}"
 
 
+class _ClickableTraceLabel(pg.TextItem):
+    """Trace annotation that reports its logical segment when clicked."""
+
+    clicked = QtCore.pyqtSignal(int)
+
+    def __init__(self, segment_index: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.segment_index = int(segment_index)
+        self.setAcceptedMouseButtons(QtCore.Qt.LeftButton)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
+    def mouseClickEvent(self, event) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit(self.segment_index)
+            event.accept()
+            return
+        event.ignore()
+
+
 class TracePlotWidget(pg.PlotWidget):
     """Voltage trace with point timing and a last-stability-map underlay."""
+
+    hold_edit_requested = QtCore.pyqtSignal(int)
+    ramp_edit_requested = QtCore.pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -121,6 +143,7 @@ class TracePlotWidget(pg.PlotWidget):
         self._point_scatter.setZValue(12)
         self.addItem(self._point_scatter)
         self._point_scatter.sigHovered.connect(self._points_hovered)
+        self._point_scatter.sigClicked.connect(self._points_clicked)
         self.x_idx: Optional[int] = None
         self.y_idx: Optional[int] = None
         self._pulses: Sequence[PulseSequence] = ()
@@ -217,6 +240,16 @@ class TracePlotWidget(pg.PlotWidget):
             self._hover_label.hide()
             self.setTitle(self._default_title)
 
+    def _points_clicked(self, _item, points, event) -> None:
+        if not points:
+            return
+        record = points[0].data()
+        if not isinstance(record, dict):
+            return
+        self.hold_edit_requested.emit(int(record["point_index"]))
+        if event is not None:
+            event.accept()
+
     def _clear_point_labels(self) -> None:
         for label in self._point_labels:
             self.removeItem(label)
@@ -239,7 +272,8 @@ class TracePlotWidget(pg.PlotWidget):
                 "pos": (record["x_mv"], record["y_mv"]),
                 "data": record,
             })
-            label = pg.TextItem(
+            label = _ClickableTraceLabel(
+                record["point_index"],
                 text=(
                     f"P{record['point_index']}\n"
                     + self._point_timing_text(record)
@@ -249,19 +283,26 @@ class TracePlotWidget(pg.PlotWidget):
                 border=pg.mkPen((45, 45, 45, 150)),
                 fill=pg.mkBrush(255, 255, 255, 185),
             )
+            label.setToolTip(
+                "Click to edit X, Y, and hold duration"
+            )
+            label.clicked.connect(self.hold_edit_requested.emit)
             label.setZValue(14)
             label.setPos(record["x_mv"], record["y_mv"])
             self.addItem(label, ignoreBounds=True)
             self._point_labels.append(label)
             if record["point_index"]:
                 previous = self._point_records[record["point_index"] - 1]
-                ramp_label = pg.TextItem(
+                ramp_label = _ClickableTraceLabel(
+                    record["point_index"],
                     text=self._ramp_timing_text(record),
                     color=(18, 18, 18),
                     anchor=(0.5, 1.0),
                     border=pg.mkPen((125, 90, 0, 150)),
                     fill=pg.mkBrush(255, 248, 205, 205),
                 )
+                ramp_label.setToolTip("Click to edit ramp duration")
+                ramp_label.clicked.connect(self.ramp_edit_requested.emit)
                 ramp_label.setZValue(15)
                 ramp_label.setPos(
                     0.5 * (previous["x_mv"] + record["x_mv"]),
@@ -324,7 +365,9 @@ class TracePlotWidget(pg.PlotWidget):
         self._stability_image.hide()
         result = self._stability_result
         if result is None:
-            self._default_title = "Hover a P# marker for X/Y values and hold time"
+            self._default_title = (
+                "Click a P#/Hold or Ramp label to edit segment values"
+            )
             self.setTitle(self._default_title)
             return
         if not self.has_selection:
@@ -1030,12 +1073,16 @@ class WaveformPlotWidget(pg.PlotWidget):
             if key not in active_keys:
                 graphics["lower_curve"].setData([], [])
                 graphics["upper_curve"].setData([], [])
+                graphics["lower_curve"].setVisible(False)
+                graphics["upper_curve"].setVisible(False)
+                graphics["fill"].setVisible(False)
 
         if first is None:
             self._sweep_port_index = None
             self._sweep_time_ns = np.asarray([], dtype=float)
             self._sweep_lower_mv = np.asarray([], dtype=float)
             self._sweep_upper_mv = np.asarray([], dtype=float)
+            self.update()
             return
 
         # Preserve the original single-sweep inspection attributes.
@@ -1046,6 +1093,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._sweep_time_ns = np.concatenate(bounds_time)
         self._sweep_lower_mv = np.concatenate(bounds_lower)
         self._sweep_upper_mv = np.concatenate(bounds_upper)
+        self.update()
 
     def clear_sweep_envelope(self) -> None:
         self.set_sweep_envelopes(())

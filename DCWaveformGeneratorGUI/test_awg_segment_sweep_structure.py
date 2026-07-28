@@ -9,6 +9,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 from PyQt5 import QtWidgets
 
 import DCWaveform_Generator as gui
@@ -43,6 +44,63 @@ def _sweep_parameter_row(panel, axis_kind):
         if key[0] == axis_kind:
             return row
     raise AssertionError(f"missing {axis_kind!r} sweep parameter row")
+
+
+def _segment_timing_ns(pulse, row):
+    start, end = pulse.flat_segments()[row]
+    ramp = pulse.t[start] - pulse.t[start - 1] if start else 0.0
+    flat = pulse.t[end] - pulse.t[start]
+    return float(ramp), float(flat)
+
+
+def test_matching_awg_segments_share_ramp_and_hold_table_edits():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 2)
+    window._add_port()
+    control_0, control_1 = window._multi_ctrl._ctrl_pannels
+    voltage_0 = window._pulse[0].v.copy()
+    window._pulse[1].v[:] = (
+        -300.0,
+        -300.0,
+        450.0,
+        450.0,
+        -125.0,
+        -125.0,
+    )
+    voltage_1 = window._pulse[1].v.copy()
+    control_1.refresh_table()
+
+    control_0.table.item(1, 1).setText("0.75")
+    app.processEvents()
+    assert _segment_timing_ns(window._pulse[0], 1)[0] == 750.0
+    assert _segment_timing_ns(window._pulse[1], 1)[0] == 750.0
+
+    control_1.table.item(2, 2).setText("1.25")
+    app.processEvents()
+    assert _segment_timing_ns(window._pulse[0], 2)[1] == 1250.0
+    assert _segment_timing_ns(window._pulse[1], 2)[1] == 1250.0
+    assert np.array_equal(window._pulse[0].v, voltage_0)
+    assert np.array_equal(window._pulse[1].v, voltage_1)
+    window.close()
+
+
+def test_waveform_time_drag_shares_matching_segment_timing():
+    _application()
+    window = gui.MainWindow()
+    _add_segments(window, 2)
+    window._add_port()
+    window._port_select(1)
+
+    pulse = window._pulse[1]
+    pulse.update_point((2, 3), float(pulse.t[2]) + 375.0)
+    window._point_update(2, 3, float(pulse.t[2]))
+    window._flush_deferred_refresh()
+
+    assert _segment_timing_ns(window._pulse[0], 1) == (
+        _segment_timing_ns(window._pulse[1], 1)
+    )
+    window.close()
 
 
 def test_awg_sweep_parameter_table_edits_all_supported_sweep_types():
@@ -166,6 +224,38 @@ def test_awg_sweep_parameter_table_edits_all_supported_sweep_types():
     assert experiment.sweep_parameter_table.rowCount() == 0
     assert experiment.sweep_parameter_table.isHidden()
     assert not experiment.sweep_parameter_editor.isEnabled()
+    window.close()
+
+
+def test_ramp_rate_sweep_is_not_drawn_on_waveform_plot():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 1)
+    window._sweep_specs = [
+        QickRampRateSweepSpec("ramp_0_to_1", 0.1, 0.3, 4),
+    ]
+
+    window._refresh_sweep_overlay(sync_rows=True)
+    app.processEvents()
+
+    assert window._sweep_specs == [
+        QickRampRateSweepSpec("ramp_0_to_1", 0.1, 0.3, 4),
+    ]
+    assert window._multi_ctrl._ctrl_pannels[0]._ramp_sweep_rows == {1}
+    assert window._plot._sweep_time_ns.size == 0
+    assert all(
+        graphics["lower_curve"].getData()[0].size == 0
+        for graphics in window._plot._sweep_graphics.values()
+    )
+
+    window._sweep_specs.append(
+        QickSweepSpec("set_1", "awg_0", -0.25, 0.5, 5)
+    )
+    window._refresh_sweep_overlay(sync_rows=True)
+    app.processEvents()
+
+    assert len(window._plot._sweep_graphics) == 1
+    assert window._plot._sweep_time_ns.size > 0
     window.close()
 
 
@@ -382,3 +472,110 @@ def test_insert_remaps_rf_duration_sweep_anchor_and_selected_map_axis():
         ("rf_gen_0", "set_3"),
     )
     window.close()
+
+
+def test_experiment_sweep_edit_atomically_refreshes_waveform_and_markers():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 2)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.25, 0.5, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+    sweep_events = []
+    window.sweep_state_changed.connect(sweep_events.append)
+
+    experiment = window._experiment_panel
+    experiment.sweep_parameter_table.selectRow(0)
+    app.processEvents()
+    experiment.sweep_parameter_start.setValue(-160.0)
+    experiment.sweep_parameter_stop.setValue(320.0)
+    experiment.sweep_parameter_count.setValue(9)
+    experiment.sweep_parameter_apply.click()
+    app.processEvents()
+
+    full_scale_mv = experiment.full_scale_mv.value()
+    assert len(sweep_events) == 1
+    assert window._sweep_specs == [
+        QickSweepSpec(
+            "set_2",
+            "awg_0",
+            -160.0 / full_scale_mv,
+            320.0 / full_scale_mv,
+            9,
+        ),
+    ]
+    graphics = window._plot._sweep_graphics[("awg_0", "set_2")]
+    assert np.allclose(graphics["lower_mv"][4:6], -160.0)
+    assert np.allclose(graphics["upper_mv"][4:6], 320.0)
+    assert graphics["fill"].isVisible()
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._sweep_rows == {2}
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_2"
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_repeated_insert_delete_hides_stale_envelopes_and_relinks_target():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.2, 0.4, 7),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+    control = window._multi_ctrl._ctrl_pannels[0]
+    original = window._plot._sweep_graphics[("awg_0", "set_2")]
+
+    assert control._edit_segment_structure("insert_above", 2)
+    app.processEvents()
+
+    assert _sweep_targets(window) == (("awg_0", "set_3"),)
+    inserted = window._plot._sweep_graphics[("awg_0", "set_3")]
+    assert inserted["fill"].isVisible()
+    assert not original["fill"].isVisible()
+    original_x = original["lower_curve"].getData()[0]
+    assert original_x is None or original_x.size == 0
+    assert control._sweep_rows == {3}
+
+    assert control._edit_segment_structure("delete", 2)
+    app.processEvents()
+
+    assert _sweep_targets(window) == (("awg_0", "set_2"),)
+    assert original["fill"].isVisible()
+    assert not inserted["fill"].isVisible()
+    inserted_x = inserted["lower_curve"].getData()[0]
+    assert inserted_x is None or inserted_x.size == 0
+    assert control._sweep_rows == {2}
+    assert (
+        window._experiment_panel.sweep_parameter_target.text()
+        == "awg_0 / set_2"
+    )
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_sweep_state_event_prunes_orphaned_segment_references():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 1)
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_99", "awg_0", -0.2, 0.2, 5),
+        QickRampRateSweepSpec("ramp_8_to_9", 0.1, 0.3, 4),
+    ]
+
+    window._notify_sweep_state_changed()
+    app.processEvents()
+
+    assert window._sweep_specs == [
+        QickSweepSpec("set_0", "awg_0", -0.1, 0.1, 3),
+    ]
+    assert window._multi_ctrl._ctrl_pannels[0]._sweep_rows == {0}
+    assert window._experiment_panel.sweep_parameter_table.rowCount() == 1
+    assert set(window._plot._sweep_graphics) == {("awg_0", "set_0")}
+    window.close()
+    window.deleteLater()
+    app.processEvents()

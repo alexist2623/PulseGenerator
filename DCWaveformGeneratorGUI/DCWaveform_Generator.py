@@ -437,6 +437,10 @@ def rf_pulse_absolute_times_us(
 
 class _MatplotlibTracePlotWidget(Canvas):
     """Scatter/line plot that traces Pulse-X vs Pulse-Y (voltage-voltage)."""
+
+    hold_edit_requested = QtCore.pyqtSignal(int)
+    ramp_edit_requested = QtCore.pyqtSignal(int)
+
     def __init__(self, parent=None):
         fig = Figure(tight_layout=False)
         super().__init__(fig)
@@ -455,11 +459,13 @@ class _MatplotlibTracePlotWidget(Canvas):
         self._stability_bounds: Optional[
             Tuple[float, float, float, float]
         ] = None
+        self._trace_edit_targets = {}
 
         self.mpl_connect("motion_notify_event",  self._on_move)
         self.mpl_connect("button_press_event",   self._on_press)
         self.mpl_connect("button_release_event", self._on_release)
         self.mpl_connect("scroll_event",         self._on_scroll)
+        self.mpl_connect("pick_event", self._on_trace_label_pick)
 
     @property
     def has_selection(self) -> bool:
@@ -582,7 +588,7 @@ class _MatplotlibTracePlotWidget(Canvas):
                 pulse_y.t[flat_index + 1] - pulse_y.t[flat_index],
             )
             lines = [f"P{point_index}", f"Hold {hold_text}"]
-            self.ax.annotate(
+            hold_annotation = self.ax.annotate(
                 "\n".join(lines),
                 (
                     float(pulse_x.v[flat_index]),
@@ -598,6 +604,11 @@ class _MatplotlibTracePlotWidget(Canvas):
                     "edgecolor": "0.3",
                     "alpha": 0.78,
                 },
+                picker=True,
+            )
+            self._trace_edit_targets[hold_annotation] = (
+                "hold",
+                point_index,
             )
             if point_index:
                 ramp_text = self._duration_pair_text(
@@ -605,7 +616,7 @@ class _MatplotlibTracePlotWidget(Canvas):
                     pulse_y.t[flat_index] - pulse_y.t[flat_index - 1],
                 )
                 previous_flat_index = flat_index - 2
-                self.ax.annotate(
+                ramp_annotation = self.ax.annotate(
                     f"Ramp {ramp_text}",
                     (
                         0.5 * (
@@ -629,6 +640,11 @@ class _MatplotlibTracePlotWidget(Canvas):
                         "edgecolor": "#7d5a00",
                         "alpha": 0.82,
                     },
+                    picker=True,
+                )
+                self._trace_edit_targets[ramp_annotation] = (
+                    "ramp",
+                    point_index,
                 )
 
     def refresh_trace(self, pulses: list[PulseSequence]):
@@ -653,6 +669,7 @@ class _MatplotlibTracePlotWidget(Canvas):
         prev_x_lim = self.ax.get_xlim()
         prev_y_lim = self.ax.get_ylim()
         self.ax.cla()
+        self._trace_edit_targets.clear()
         self.ax.set_xlabel(f"Pulse {self.x_idx+1} [mV]")
         self.ax.set_ylabel(f"Pulse {self.y_idx+1} [mV]")
         self.ax.grid(True)
@@ -727,6 +744,16 @@ class _MatplotlibTracePlotWidget(Canvas):
         if (event.button != 1 or not event.inaxes):
             return
         self._pan_origin = (event.xdata, event.ydata)
+
+    def _on_trace_label_pick(self, event) -> None:
+        target = self._trace_edit_targets.get(event.artist)
+        if target is None:
+            return
+        kind, segment_index = target
+        if kind == "hold":
+            self.hold_edit_requested.emit(int(segment_index))
+        else:
+            self.ramp_edit_requested.emit(int(segment_index))
 
     def _on_move(self, event):
         if self._pan_origin and event.xdata is not None and event.ydata is not None:
@@ -1305,6 +1332,118 @@ else:
     RfPulseTimelineWidget = None
 
 
+def _trace_duration_spin(value_ns: float, unit: str) -> QtWidgets.QDoubleSpinBox:
+    editor = QtWidgets.QDoubleSpinBox()
+    editor.setDecimals(9)
+    editor.setRange(1.0e-9, 1.0e12)
+    editor.setSuffix(f" {unit}")
+    value = _time_from_ns(float(value_ns), unit)
+    editor.setValue(value)
+    editor.setSingleStep(max(1.0e-6, abs(value) * 0.1))
+    return editor
+
+
+class TraceHoldEditDialog(QtWidgets.QDialog):
+    """Edit one X/Y trace point and its shared hold duration."""
+
+    def __init__(
+        self,
+        *,
+        segment_index: int,
+        x_output: int,
+        y_output: int,
+        x_mv: float,
+        y_mv: float,
+        x_bounds: Tuple[float, float],
+        y_bounds: Tuple[float, float],
+        hold_ns: float,
+        time_unit: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._time_unit = time_unit
+        self._same_output = int(x_output) == int(y_output)
+        self.setWindowTitle(f"Edit Hold P{int(segment_index)}")
+        form = QtWidgets.QFormLayout(self)
+
+        self.x_voltage = QtWidgets.QDoubleSpinBox()
+        self.x_voltage.setDecimals(9)
+        self.x_voltage.setRange(float(x_bounds[0]), float(x_bounds[1]))
+        self.x_voltage.setSuffix(" mV")
+        self.x_voltage.setValue(float(x_mv))
+        form.addRow(f"X virtual voltage (AWG {int(x_output)}):", self.x_voltage)
+
+        self.y_voltage = QtWidgets.QDoubleSpinBox()
+        self.y_voltage.setDecimals(9)
+        self.y_voltage.setRange(float(y_bounds[0]), float(y_bounds[1]))
+        self.y_voltage.setSuffix(" mV")
+        self.y_voltage.setValue(float(y_mv))
+        self.y_voltage.setEnabled(not self._same_output)
+        form.addRow(f"Y virtual voltage (AWG {int(y_output)}):", self.y_voltage)
+
+        self.hold_duration = _trace_duration_spin(hold_ns, time_unit)
+        form.addRow("Hold duration:", self.hold_duration)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save
+            | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.setMinimumWidth(390)
+
+    def values(self) -> Tuple[float, float, float]:
+        y_mv = (
+            self.x_voltage.value()
+            if self._same_output
+            else self.y_voltage.value()
+        )
+        return (
+            float(self.x_voltage.value()),
+            float(y_mv),
+            _time_to_ns(
+                float(self.hold_duration.value()),
+                self._time_unit,
+            ),
+        )
+
+
+class TraceRampEditDialog(QtWidgets.QDialog):
+    """Edit the shared duration of one trace transition."""
+
+    def __init__(
+        self,
+        *,
+        segment_index: int,
+        ramp_ns: float,
+        time_unit: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._time_unit = time_unit
+        self.setWindowTitle(
+            f"Edit Ramp P{int(segment_index) - 1} to P{int(segment_index)}"
+        )
+        form = QtWidgets.QFormLayout(self)
+        self.ramp_duration = _trace_duration_spin(ramp_ns, time_unit)
+        form.addRow("Ramp duration:", self.ramp_duration)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save
+            | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.setMinimumWidth(340)
+
+    def value_ns(self) -> float:
+        return _time_to_ns(
+            float(self.ramp_duration.value()),
+            self._time_unit,
+        )
+
+
 class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     """Input boxes plus a live table of all segments."""
 
@@ -1315,6 +1454,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     sweep_remove_requested = QtCore.pyqtSignal(int, int)
     ramp_sweep_requested = QtCore.pyqtSignal(int, int)
     ramp_sweep_remove_requested = QtCore.pyqtSignal(int, int)
+    segment_timing_changed = QtCore.pyqtSignal(int, int)
     segment_structure_changed = QtCore.pyqtSignal(int, str, int)
     port_idx: int       = 0
 
@@ -1470,7 +1610,6 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             operation,
             segment_index,
         )
-        self.update_plot.emit()
         # A deleted row's selection otherwise moves onto the row below it.
         # Qt's selection brush then hides the sweep-target background, making
         # a correctly remapped sweep look as though it disappeared.
@@ -1518,13 +1657,30 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         rows,
         color: Optional[QtGui.QColor] = None,
     ) -> None:
-        self._sweep_rows = {int(row) for row in rows}
-        self._sweep_row = min(self._sweep_rows) if self._sweep_rows else None
-        self._sweep_color = QtGui.QColor(color) if color is not None else None
-        self.refresh_table()
+        self.set_sweep_state(
+            rows,
+            self._ramp_sweep_rows,
+            color,
+        )
 
     def set_ramp_sweep_rows(self, rows) -> None:
-        self._ramp_sweep_rows = {int(row) for row in rows}
+        self.set_sweep_state(
+            self._sweep_rows,
+            rows,
+            self._sweep_color,
+        )
+
+    def set_sweep_state(
+        self,
+        voltage_rows,
+        ramp_rows,
+        color: Optional[QtGui.QColor] = None,
+    ) -> None:
+        """Apply both sweep marker sets with one atomic table refresh."""
+        self._sweep_rows = {int(row) for row in voltage_rows}
+        self._sweep_row = min(self._sweep_rows) if self._sweep_rows else None
+        self._sweep_color = QtGui.QColor(color) if color is not None else None
+        self._ramp_sweep_rows = {int(row) for row in ramp_rows}
         self.refresh_table()
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
@@ -1554,7 +1710,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             self.refresh_table()
             return
         self.refresh_table()
-        self.update_plot.emit()
+        if col in (1, 2):
+            self.segment_timing_changed.emit(self.idx, row)
+        else:
+            self.update_plot.emit()
 
     def _on_add(self):
         self.port_is_selected.emit(self.idx)
@@ -2519,6 +2678,34 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.power_calibration_run_id.setSpecialValueText(
             "Latest compatible"
         )
+        self.power_calibration_run = QtWidgets.QComboBox()
+        self.power_calibration_run.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.power_calibration_run.setMinimumContentsLength(38)
+        self.power_calibration_run.addItem(
+            "Auto: best exact PCB / filter / Nyquist match",
+            0,
+        )
+        self.refresh_power_calibration_runs = QtWidgets.QPushButton(
+            "Refresh Runs"
+        )
+        self.refresh_power_calibration_runs.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        )
+        self.refresh_power_calibration_runs.setToolTip(
+            "Inspect calibration runs and rank them against the current "
+            "PCB, frequency, filter, and Nyquist settings"
+        )
+        power_calibration_run_row = QtWidgets.QHBoxLayout()
+        power_calibration_run_row.addWidget(
+            self.power_calibration_run,
+            1,
+        )
+        power_calibration_run_row.addWidget(
+            self.refresh_power_calibration_runs
+        )
+        self._power_calibration_candidates = ()
         self.target_output_power_dbm = QtWidgets.QDoubleSpinBox()
         self.target_output_power_dbm.setRange(-200.0, 100.0)
         self.target_output_power_dbm.setDecimals(6)
@@ -2539,8 +2726,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             power_calibration_database_row,
         )
         power_calibration_form.addRow(
-            "Calibration Run ID:",
-            self.power_calibration_run_id,
+            "Calibration run:",
+            power_calibration_run_row,
         )
         power_calibration_form.addRow(
             "Target output power:",
@@ -2664,6 +2851,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.apply_power_calibration.clicked.connect(
             self._apply_calibrated_output_power
         )
+        self.refresh_power_calibration_runs.clicked.connect(
+            self._refresh_power_calibration_runs
+        )
+        self.power_calibration_run.currentIndexChanged.connect(
+            self._power_calibration_run_changed
+        )
         self.power_calibration_group.toggled.connect(
             self._update_power_calibration_controls
         )
@@ -2730,6 +2923,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             and self.power_calibration_group.isChecked()
             and bool(self.power_calibration_database_path.text().strip())
         )
+        calibration_enabled = (
+            rf_output and self.power_calibration_group.isChecked()
+        )
+        self.power_calibration_run.setEnabled(calibration_enabled)
+        self.refresh_power_calibration_runs.setEnabled(
+            calibration_enabled
+            and bool(self.power_calibration_database_path.text().strip())
+        )
         if not rf_output:
             self._set_power_calibration_status(
                 "Calibrated power selection requires an RF_Out board.",
@@ -2762,6 +2963,139 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         if path:
             self.power_calibration_database_path.setText(path)
+            self._refresh_power_calibration_runs()
+
+    def _power_calibration_run_changed(self, *_args) -> None:
+        run_id = int(self.power_calibration_run.currentData() or 0)
+        with QtCore.QSignalBlocker(self.power_calibration_run_id):
+            self.power_calibration_run_id.setValue(run_id)
+        self._mark_power_calibration_stale()
+
+    def _set_power_calibration_run_id(self, run_id: int) -> None:
+        run_id = int(run_id)
+        with QtCore.QSignalBlocker(self.power_calibration_run_id):
+            self.power_calibration_run_id.setValue(run_id)
+        index = self.power_calibration_run.findData(run_id)
+        with QtCore.QSignalBlocker(self.power_calibration_run):
+            if index < 0 and run_id > 0:
+                self.power_calibration_run.addItem(
+                    f"Run {run_id} | refresh to inspect metadata",
+                    run_id,
+                )
+                index = self.power_calibration_run.findData(run_id)
+            self.power_calibration_run.setCurrentIndex(max(0, index))
+
+    def _refresh_power_calibration_runs(
+        self,
+        *,
+        update_status: bool = True,
+        catalog=None,
+    ):
+        database_path = self.power_calibration_database_path.text().strip()
+        if not database_path:
+            if update_status:
+                self._set_power_calibration_status(
+                    "Select a calibration database first.",
+                    state="error",
+                )
+            return ()
+        previous_run_id = int(self.power_calibration_run_id.value())
+        try:
+            if catalog is None:
+                catalog = CalibrationDatabase(database_path)
+            list_candidates = getattr(
+                catalog,
+                "output_calibration_candidates",
+                None,
+            )
+            if not callable(list_candidates):
+                return ()
+            candidates = tuple(
+                list_candidates(
+                    self.output_board_type.currentText(),
+                    [self.frequency_mhz.value()],
+                    nqz=self.nqz.value(),
+                    output_filter_type=self.filter_type.currentText(),
+                    output_filter_cutoff_ghz=self.filter_cutoff.value(),
+                    output_filter_bandwidth_ghz=(
+                        self.filter_bandwidth.value()
+                    ),
+                )
+            )
+        except (
+            LookupError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            self._power_calibration_candidates = ()
+            if update_status:
+                self._set_power_calibration_status(str(exc), state="error")
+            return ()
+
+        self._power_calibration_candidates = candidates
+        exact = next(
+            (candidate for candidate in candidates if candidate.exact_match),
+            None,
+        )
+        auto_label = (
+            f"Auto: Run {exact.summary.run_id} (best exact match)"
+            if exact is not None
+            else "Auto: no exact match - select a run below"
+        )
+        with QtCore.QSignalBlocker(self.power_calibration_run):
+            self.power_calibration_run.clear()
+            self.power_calibration_run.addItem(auto_label, 0)
+            for candidate in candidates:
+                self.power_calibration_run.addItem(
+                    candidate.display_label,
+                    candidate.summary.run_id,
+                )
+                index = self.power_calibration_run.count() - 1
+                self.power_calibration_run.setItemData(
+                    index,
+                    candidate.detail_text,
+                    QtCore.Qt.ToolTipRole,
+                )
+            selected_index = self.power_calibration_run.findData(
+                previous_run_id
+            )
+            if previous_run_id > 0 and selected_index < 0:
+                self.power_calibration_run.addItem(
+                    f"Run {previous_run_id} | not found in current DB",
+                    previous_run_id,
+                )
+                selected_index = self.power_calibration_run.count() - 1
+            self.power_calibration_run.setCurrentIndex(
+                max(0, selected_index)
+            )
+        with QtCore.QSignalBlocker(self.power_calibration_run_id):
+            self.power_calibration_run_id.setValue(
+                int(self.power_calibration_run.currentData() or 0)
+            )
+        if update_status:
+            if exact is not None:
+                self._set_power_calibration_status(
+                    f"Best match is Run {exact.summary.run_id}. "
+                    "The run list shows PCB, filter, Nyquist zone, and "
+                    "frequency coverage.",
+                    state="success",
+                )
+            elif candidates:
+                self._set_power_calibration_status(
+                    "No exact PCB/filter/Nyquist/frequency match. "
+                    "Review the candidate details and select a Run "
+                    "explicitly to override.",
+                    state="stale",
+                )
+            else:
+                self._set_power_calibration_status(
+                    "No output calibration runs were found in this database.",
+                    state="error",
+                )
+        return candidates
 
     def _apply_calibrated_output_power(self) -> Optional[int]:
         try:
@@ -2775,18 +3109,59 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if not database_path:
                 raise ValueError("select a calibration database")
             frequency_mhz = self.frequency_mhz.value()
-            selected_run_id = self.power_calibration_run_id.value()
-            calibration = CalibrationDatabase(
-                database_path
-            ).output_calibration(
-                "RF_Out",
-                [frequency_mhz],
-                run_id=selected_run_id or None,
-                nqz=self.nqz.value(),
-                output_filter_type=self.filter_type.currentText(),
-                output_filter_cutoff_ghz=self.filter_cutoff.value(),
-                output_filter_bandwidth_ghz=self.filter_bandwidth.value(),
+            catalog = CalibrationDatabase(database_path)
+            candidates = self._refresh_power_calibration_runs(
+                update_status=False,
+                catalog=catalog,
             )
+            selected_run_id = int(self.power_calibration_run_id.value())
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.summary.run_id == selected_run_id
+                ),
+                None,
+            )
+            manual_override = (
+                selected_run_id > 0
+                and selected_candidate is not None
+                and not selected_candidate.exact_match
+            )
+            if selected_run_id == 0 and candidates:
+                selected_candidate = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.exact_match
+                    ),
+                    None,
+                )
+                if selected_candidate is None:
+                    raise LookupError(
+                        "no exact PCB/filter/Nyquist/frequency calibration "
+                        "match; select one of the listed runs explicitly "
+                        "to use a manual override"
+                    )
+                selected_run_id = selected_candidate.summary.run_id
+            if manual_override:
+                calibration = catalog.output_calibration(
+                    selected_candidate.summary.board_type,
+                    [frequency_mhz],
+                    run_id=selected_run_id,
+                )
+            else:
+                calibration = catalog.output_calibration(
+                    "RF_Out",
+                    [frequency_mhz],
+                    run_id=selected_run_id or None,
+                    nqz=self.nqz.value(),
+                    output_filter_type=self.filter_type.currentText(),
+                    output_filter_cutoff_ghz=self.filter_cutoff.value(),
+                    output_filter_bandwidth_ghz=(
+                        self.filter_bandwidth.value()
+                    ),
+                )
             response_dbm = float(
                 calibration.frequency_response_dbm([frequency_mhz])[0]
             )
@@ -2842,8 +3217,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             f"{predicted_power_dbm:.6g} dBm at {frequency_mhz:.6g} MHz. "
             f"Current ATT1/ATT2 {self.att1_db.value():.2f}/"
             f"{self.att2_db.value():.2f} dB; Nyquist zone and "
-            f"{self.filter_type.currentText()} filter matched.",
-            state="success",
+            f"{self.filter_type.currentText()} filter "
+            + (
+                "manually overridden ("
+                + selected_candidate.detail_text
+                + ")."
+                if manual_override
+                else "matched."
+            ),
+            state="stale" if manual_override else "success",
         )
         self.changed.emit()
         return int(gain)
@@ -3155,7 +3537,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 )
             )
         )
-        self.power_calibration_run_id.setValue(
+        self._set_power_calibration_run_id(
             int(data.get("power_calibration_run_id", 0))
         )
         self.target_output_power_dbm.setValue(
@@ -5623,6 +6005,8 @@ class QickExportDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-methods
     """Main window for the DCWaveform generator application."""
 
+    sweep_state_changed = QtCore.pyqtSignal(object)
+
     @property
     def _sweep_spec(self) -> Optional[QickSweepSpec]:
         """Legacy single-sweep view used by older tests and callers."""
@@ -5762,6 +6146,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
+        self.sweep_state_changed.connect(self._synchronize_sweep_views)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
@@ -6026,6 +6411,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._pending_trace_refresh = False
         self._pending_rf_refresh = False
         self._pending_sweep_refresh = False
+        self._pending_shared_timing_refresh = False
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(33)
@@ -6051,6 +6437,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         control.ramp_sweep_requested.connect(self._configure_ramp_rate_sweep)
         control.ramp_sweep_remove_requested.connect(
             self._remove_ramp_rate_sweep
+        )
+        control.segment_timing_changed.connect(
+            self._on_segment_timing_changed
         )
         control.segment_structure_changed.connect(self._on_segment_structure_changed)
 
@@ -6128,7 +6517,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
             updated_sweeps.append(spec)
         self._sweep_specs = updated_sweeps
-        self._refresh_sweep_overlay(sync_rows=True)
+        self._notify_sweep_state_changed(waveform_changed=True)
         self._refresh_rf_editor()
         if self._trace is not None:
             for attr in ("x_idx", "y_idx"):
@@ -6477,7 +6866,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return None
         if port_index >= len(self._pulse):
             return None
-        if segment_index >= len(self._pulse[port_index].flat_segments()):
+        if (
+            segment_index < 0
+            or segment_index >= len(self._pulse[port_index].flat_segments())
+        ):
             return None
         return port_index, segment_index
 
@@ -6520,8 +6912,72 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     if hasattr(self._plot, "line_color")
                     else QtGui.QColor(self._multi_ctrl._color_map[port_index])
                 )
-            control.set_sweep_rows(rows, color)
-            control.set_ramp_sweep_rows(ramp_rows)
+            control.set_sweep_state(rows, ramp_rows, color)
+
+    def _reconcile_sweep_specs(self) -> int:
+        """Drop sweep references that no longer resolve to live segments."""
+        valid_specs = []
+        removed = 0
+        for spec in self._sweep_specs:
+            if isinstance(spec, QickSweepSpec):
+                valid = self._sweep_target_indices(spec) is not None
+            elif isinstance(spec, QickRampRateSweepSpec):
+                row = self._ramp_sweep_row(spec)
+                valid = (
+                    row is not None
+                    and all(
+                        row < len(pulse.flat_segments())
+                        for pulse in self._pulse
+                    )
+                )
+            else:
+                valid = False
+            if valid:
+                valid_specs.append(spec)
+            else:
+                removed += 1
+        if removed:
+            self._sweep_specs = valid_specs
+        return removed
+
+    def _notify_sweep_state_changed(
+        self,
+        *,
+        fit_view: bool = False,
+        selected_map_keys: Optional[
+            Tuple[Tuple[str, str], Tuple[str, str]]
+        ] = None,
+        waveform_changed: bool = False,
+        trace_changed: bool = False,
+        rf_changed: bool = False,
+    ) -> None:
+        """Emit one event after a sweep or its segment model changes."""
+        self.sweep_state_changed.emit(
+            {
+                "fit_view": bool(fit_view),
+                "selected_map_keys": selected_map_keys,
+                "waveform_changed": bool(waveform_changed),
+                "trace_changed": bool(trace_changed),
+                "rf_changed": bool(rf_changed),
+            }
+        )
+
+    @QtCore.pyqtSlot(object)
+    def _synchronize_sweep_views(self, request) -> None:
+        """Synchronize the sweep model with every dependent AWG view."""
+        options = request if isinstance(request, Mapping) else {}
+        self._reconcile_sweep_specs()
+        if options.get("waveform_changed", False):
+            self._refresh_waveform_plot()
+        self._refresh_sweep_overlay(
+            fit_view=bool(options.get("fit_view", False)),
+            sync_rows=True,
+            selected_map_keys=options.get("selected_map_keys"),
+        )
+        if options.get("trace_changed", False):
+            self._refresh_trace_if_needed(force=True)
+        if options.get("rf_changed", False):
+            self._refresh_rf_editor()
 
     def _refresh_sweep_overlay(
         self,
@@ -6600,64 +7056,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     )
                 )
 
-        ramp_sweeps = [
-            spec
-            for spec in self._sweep_specs
-            if isinstance(spec, QickRampRateSweepSpec)
-        ]
-        for ramp_sweep in ramp_sweeps:
-            ramp_row = self._ramp_sweep_row(ramp_sweep)
-            if ramp_row is not None and all(
-                ramp_row < len(pulse.flat_segments()) for pulse in self._pulse
-            ):
-                point_index = ramp_row * 2
-                endpoint_waveforms = []
-                for duration_us in (ramp_sweep.start, ramp_sweep.stop):
-                    endpoint_pulses = [pulse.copy() for pulse in self._pulse]
-                    desired_duration_ns = float(duration_us) * 1000.0
-                    for pulse in endpoint_pulses:
-                        current_duration_ns = (
-                            pulse.t[point_index] - pulse.t[point_index - 1]
-                        )
-                        pulse.t[point_index:] += (
-                            desired_duration_ns - current_duration_ns
-                        )
-                    endpoint_waveforms.append(
-                        transform_virtual_waveforms(
-                            endpoint_pulses,
-                            self._cross_capacitance,
-                        )
-                    )
-                time_a, _virtual_a, physical_a = endpoint_waveforms[0]
-                time_b, _virtual_b, physical_b = endpoint_waveforms[1]
-                common_time = np.unique(
-                    np.concatenate((
-                        np.asarray(time_a, dtype=float),
-                        np.asarray(time_b, dtype=float),
-                    ))
-                )
-                for destination_port in range(len(self._pulse)):
-                    endpoint_a = np.interp(
-                        common_time,
-                        time_a,
-                        physical_a[destination_port],
-                    )
-                    endpoint_b = np.interp(
-                        common_time,
-                        time_b,
-                        physical_b[destination_port],
-                    )
-                    envelopes.append((
-                        (
-                            f"awg_{destination_port}",
-                            ramp_sweep.segment_name,
-                            "ramp_rate",
-                        ),
-                        destination_port,
-                        common_time,
-                        endpoint_a,
-                        endpoint_b,
-                    ))
         self._plot.set_sweep_envelopes(envelopes)
         if sync_rows:
             self._sync_sweep_rows()
@@ -6666,8 +7064,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _clear_sweep(self, message: Optional[str] = None) -> None:
         self._sweep_specs = []
-        self._plot.clear_sweep_envelope()
-        self._sync_sweep_rows()
+        self._notify_sweep_state_changed()
         if message:
             self.statusBar().showMessage(message)
 
@@ -6717,7 +7114,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         else:
             self._sweep_specs.append(new_spec)
         self._port_select(port_index)
-        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._notify_sweep_state_changed(fit_view=True)
         self.statusBar().showMessage(
             f"Sweep applied to {output_name}/{segment_name}: "
             f"{new_spec.start * self._qick_full_scale_mv:.6g} mV to "
@@ -6734,7 +7131,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         if len(remaining) != len(self._sweep_specs):
             self._sweep_specs = remaining
-            self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+            self._notify_sweep_state_changed(fit_view=True)
             self.statusBar().showMessage(
                 f"Voltage sweep removed; {self._sweep_cartesian_count()} "
                 "Cartesian combinations remain"
@@ -6809,7 +7206,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if not isinstance(spec, QickRampRateSweepSpec)
         ]
         self._port_select(int(port_index))
-        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._notify_sweep_state_changed(fit_view=True)
         self.statusBar().showMessage(
             f"RAMP-rate sweep applied to {segment_name}: "
             f"{new_spec.start:.9g} to {new_spec.stop:.9g} us, "
@@ -6834,7 +7231,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if len(remaining) == len(self._sweep_specs):
             return
         self._sweep_specs = remaining
-        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._notify_sweep_state_changed(fit_view=True)
         self.statusBar().showMessage(
             f"RAMP-rate sweep removed; {self._sweep_cartesian_count()} "
             "Cartesian combinations remain"
@@ -6846,6 +7243,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         operation: str,
         segment_index: int,
     ) -> None:
+        self._share_matching_port_timings(int(port_index))
         output_name = f"awg_{int(port_index)}"
         previous_map_keys = (
             self._experiment_panel.selected_sweep_axis_keys()
@@ -6939,10 +7337,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ):
                 selected_map_keys = tuple(remapped_keys)
 
-        self._refresh_sweep_overlay(
+        self._notify_sweep_state_changed(
             fit_view=True,
-            sync_rows=True,
             selected_map_keys=selected_map_keys,
+            waveform_changed=True,
+            trace_changed=True,
+            rf_changed=True,
         )
         action = "inserted" if operation == "insert" else "deleted"
         self.statusBar().showMessage(
@@ -7024,9 +7424,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_rf_specs_changed(self, specs) -> None:
         self._rf_pulse_specs = list(specs)
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
-        self._experiment_panel.set_sweep_specs(
-            self._active_map_sweep_specs()
-        )
+        self._notify_sweep_state_changed()
         self._refresh_rf_timeline()
 
     def _active_map_sweep_specs(self) -> tuple:
@@ -7113,7 +7511,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "the selected sweep no longer exists in the AWG settings"
                 )
             self._sweep_specs[replacement_index] = replacement
-            self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+            self._notify_sweep_state_changed(fit_view=True)
             _kind, target, display_start, display_stop, unit = (
                 self._experiment_panel._sweep_parameter_values(replacement)
             )
@@ -7171,7 +7569,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             return
         self._sweep_specs = remaining
-        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._notify_sweep_state_changed(fit_view=True)
         self.statusBar().showMessage(
             f"Sweep removed; {self._sweep_cartesian_count()} Cartesian "
             "combinations remain"
@@ -8680,6 +9078,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 flat,
                 v
             )
+            segment_index = (
+                len(self._pulse[self._selected_port_idx].flat_segments()) - 1
+            )
+            self._share_segment_timing(
+                self._selected_port_idx,
+                segment_index,
+            )
             self._plot.set_selected_port_idx(self._selected_port_idx)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Invalid input", str(exc))
@@ -8690,23 +9095,41 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_stability_targets()
         self._refresh_trace_if_needed(force=True)
         self._refresh_sweep_overlay()
-        if self._selected_port_idx == 0:
-            self._refresh_rf_editor()
+        self._refresh_rf_editor()
 
     def _flat_update(self, i0: int, i1: int, new_v: float) -> None:
         self.statusBar().showMessage(f"Flat {i0}-{i1} moved to {new_v:.6g} mV")
         self._schedule_deferred_refresh()
 
     def _point_update(self, i0, i1, new_t):
+        self._share_segment_timing(
+            self._selected_port_idx,
+            int(i0) // 2,
+        )
         self.statusBar().showMessage(
             f"Point {i0}-{i1} moved to "
             f"{_time_from_ns(new_t, self._time_unit):.6g} {self._time_unit}"
         )
-        self._schedule_deferred_refresh(timing_changed=True)
+        self._schedule_deferred_refresh(
+            timing_changed=True,
+            shared_timing_changed=True,
+        )
 
-    def _schedule_deferred_refresh(self, *, timing_changed: bool = False) -> None:
+    def _schedule_deferred_refresh(
+        self,
+        *,
+        timing_changed: bool = False,
+        shared_timing_changed: bool = False,
+    ) -> None:
         self._pending_table_refresh = True
-        if self._trace is not None and self._trace.uses_port(self._selected_port_idx):
+        self._pending_shared_timing_refresh |= shared_timing_changed
+        if (
+            self._trace is not None
+            and (
+                shared_timing_changed
+                or self._trace.uses_port(self._selected_port_idx)
+            )
+        ):
             self._pending_trace_refresh = True
         self._pending_rf_refresh |= timing_changed
         sweep_targets = {
@@ -8717,7 +9140,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if target is not None
         }
         self._pending_sweep_refresh |= (
-            bool(self._sweep_specs)
+            shared_timing_changed
+            or bool(self._sweep_specs)
             or any(target[0] == self._selected_port_idx for target in sweep_targets)
         )
         if not self._refresh_timer.isActive():
@@ -8725,7 +9149,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _flush_deferred_refresh(self) -> None:
         if self._pending_table_refresh:
-            self._multi_ctrl._ctrl_pannels[self._selected_port_idx].refresh_table()
+            if self._pending_shared_timing_refresh:
+                self._multi_ctrl.refresh_table()
+                self._refresh_waveform_plot()
+            else:
+                self._multi_ctrl._ctrl_pannels[
+                    self._selected_port_idx
+                ].refresh_table()
         if self._pending_trace_refresh and self._trace is not None:
             self._trace.refresh_trace(self._pulse)
         if self._pending_rf_refresh:
@@ -8738,10 +9168,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._pending_trace_refresh = False
         self._pending_rf_refresh = False
         self._pending_sweep_refresh = False
+        self._pending_shared_timing_refresh = False
 
     def _ensure_trace_widget(self) -> TracePlotWidget:
         if self._trace is None:
             self._trace = TracePlotWidget(self)
+            self._trace.hold_edit_requested.connect(
+                self._edit_trace_hold
+            )
+            self._trace.ramp_edit_requested.connect(
+                self._edit_trace_ramp
+            )
             if hasattr(self._trace, "set_time_unit"):
                 self._trace.set_time_unit(self._time_unit)
             if hasattr(self._trace, "set_stability_overlay"):
@@ -8756,6 +9193,151 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._trace_placeholder.hide()
             self._trace_placeholder.deleteLater()
         return self._trace
+
+    def _trace_selection(self) -> Tuple[int, int]:
+        if self._trace is None or not self._trace.has_selection:
+            raise ValueError("select both X and Y AWG outputs first")
+        return int(self._trace.x_idx), int(self._trace.y_idx)
+
+    def _refresh_after_trace_segment_edit(self) -> None:
+        self._multi_ctrl.refresh_table()
+        self._refresh_waveform_plot()
+        self._refresh_trace_if_needed(force=True)
+        self._refresh_rf_editor()
+        self._refresh_sweep_overlay()
+
+    def _apply_trace_hold_edit(
+        self,
+        segment_index: int,
+        x_mv: float,
+        y_mv: float,
+        hold_ns: float,
+    ) -> None:
+        x_output, y_output = self._trace_selection()
+        segment_index = int(segment_index)
+        flat_index = 2 * segment_index
+        pulse_x = self._pulse[x_output]
+        pulse_y = self._pulse[y_output]
+        if (
+            segment_index >= len(pulse_x.flat_segments())
+            or segment_index >= len(pulse_y.flat_segments())
+        ):
+            raise ValueError("the selected trace point no longer exists")
+        if x_output == y_output and not np.isclose(
+            float(x_mv),
+            float(y_mv),
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "X and Y use the same AWG output and must have one voltage"
+            )
+        if not pulse_x.edit_voltage(flat_index, float(x_mv)):
+            raise ValueError("invalid X hold point")
+        if x_output != y_output and not pulse_y.edit_voltage(
+            flat_index,
+            float(y_mv),
+        ):
+            raise ValueError("invalid Y hold point")
+        if not pulse_x.edit_flat(flat_index, float(hold_ns)):
+            raise ValueError("hold duration must be positive")
+        self._share_segment_timing(x_output, segment_index)
+        self._refresh_after_trace_segment_edit()
+        self.statusBar().showMessage(
+            f"P{segment_index} updated: X {float(x_mv):.6g} mV, "
+            f"Y {float(y_mv):.6g} mV, hold "
+            f"{_time_from_ns(float(hold_ns), self._time_unit):.6g} "
+            f"{self._time_unit}"
+        )
+
+    def _apply_trace_ramp_edit(
+        self,
+        segment_index: int,
+        ramp_ns: float,
+    ) -> None:
+        x_output, _y_output = self._trace_selection()
+        segment_index = int(segment_index)
+        if segment_index <= 0:
+            raise ValueError("the initial hold has no incoming ramp")
+        pulse = self._pulse[x_output]
+        if segment_index >= len(pulse.flat_segments()):
+            raise ValueError("the selected ramp no longer exists")
+        if not pulse.edit_ramp(2 * segment_index, float(ramp_ns)):
+            raise ValueError("ramp duration must be positive")
+        self._share_segment_timing(x_output, segment_index)
+        self._refresh_after_trace_segment_edit()
+        self.statusBar().showMessage(
+            f"Ramp P{segment_index - 1} to P{segment_index} updated to "
+            f"{_time_from_ns(float(ramp_ns), self._time_unit):.6g} "
+            f"{self._time_unit}"
+        )
+
+    def _edit_trace_hold(self, segment_index: int) -> None:
+        try:
+            x_output, y_output = self._trace_selection()
+            segment_index = int(segment_index)
+            flat_index = 2 * segment_index
+            pulse_x = self._pulse[x_output]
+            pulse_y = self._pulse[y_output]
+            timing = self._segment_timing_ns(pulse_x, segment_index)
+            if (
+                timing is None
+                or segment_index >= len(pulse_y.flat_segments())
+            ):
+                raise ValueError("the selected trace point no longer exists")
+            dialog = TraceHoldEditDialog(
+                segment_index=segment_index,
+                x_output=x_output,
+                y_output=y_output,
+                x_mv=float(pulse_x.v[flat_index]),
+                y_mv=float(pulse_y.v[flat_index]),
+                x_bounds=tuple(pulse_x.v_bounds),
+                y_bounds=tuple(pulse_y.v_bounds),
+                hold_ns=timing[1],
+                time_unit=self._time_unit,
+                parent=self,
+            )
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            self._apply_trace_hold_edit(
+                segment_index,
+                *dialog.values(),
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Trace hold edit failed",
+                str(exc),
+            )
+
+    def _edit_trace_ramp(self, segment_index: int) -> None:
+        try:
+            x_output, _y_output = self._trace_selection()
+            segment_index = int(segment_index)
+            timing = self._segment_timing_ns(
+                self._pulse[x_output],
+                segment_index,
+            )
+            if timing is None or segment_index <= 0:
+                raise ValueError("the selected ramp no longer exists")
+            dialog = TraceRampEditDialog(
+                segment_index=segment_index,
+                ramp_ns=timing[0],
+                time_unit=self._time_unit,
+                parent=self,
+            )
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            self._apply_trace_ramp_edit(
+                segment_index,
+                dialog.value_ns(),
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Trace ramp edit failed",
+                str(exc),
+            )
 
     def _refresh_trace_if_needed(self, *, force: bool = False) -> None:
         if self._trace is None:
@@ -9939,6 +10521,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             target.t = source.t.copy()
             target.v = source.v.copy()
             target.v_bounds = tuple(source.v_bounds)
+        self._share_matching_port_timings(0)
 
         self._cross_capacitance = settings["cross_capacitance"].copy()
         self._sweep_specs = list(settings["sweeps"])
@@ -10334,6 +10917,98 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         dlg.setDetailedText(code_str)
         dlg.exec_()
 
+    @staticmethod
+    def _segment_timing_ns(
+        pulse: PulseSequence,
+        segment_index: int,
+    ) -> Optional[Tuple[float, float]]:
+        segments = pulse.flat_segments()
+        if not 0 <= int(segment_index) < len(segments):
+            return None
+        flat_start, flat_end = segments[int(segment_index)]
+        ramp_ns = (
+            float(pulse.t[flat_start] - pulse.t[flat_start - 1])
+            if flat_start > 0
+            else 0.0
+        )
+        flat_ns = float(pulse.t[flat_end] - pulse.t[flat_start])
+        return ramp_ns, flat_ns
+
+    def _share_segment_timing(
+        self,
+        source_port: int,
+        segment_index: int,
+    ) -> bool:
+        """Copy one segment's RAMP/hold durations to matching AWG rows."""
+        if not 0 <= int(source_port) < len(self._pulse):
+            return False
+        timing = self._segment_timing_ns(
+            self._pulse[int(source_port)],
+            int(segment_index),
+        )
+        if timing is None:
+            return False
+        ramp_ns, flat_ns = timing
+        changed = False
+        for port_index, pulse in enumerate(self._pulse):
+            if port_index == int(source_port):
+                continue
+            segments = pulse.flat_segments()
+            if not 0 <= int(segment_index) < len(segments):
+                continue
+            flat_start, _flat_end = segments[int(segment_index)]
+            target_timing = self._segment_timing_ns(pulse, int(segment_index))
+            if target_timing is None:
+                continue
+            target_ramp_ns, target_flat_ns = target_timing
+            if flat_start > 0 and not np.isclose(
+                target_ramp_ns,
+                ramp_ns,
+                rtol=0.0,
+                atol=1.0e-9,
+            ):
+                pulse.edit_ramp(flat_start, ramp_ns)
+                changed = True
+            if not np.isclose(
+                target_flat_ns,
+                flat_ns,
+                rtol=0.0,
+                atol=1.0e-9,
+            ):
+                pulse.edit_flat(flat_start, flat_ns)
+                changed = True
+        return changed
+
+    def _share_matching_port_timings(self, source_port: int) -> bool:
+        """Share every row that exists on the source and destination ports."""
+        if not 0 <= int(source_port) < len(self._pulse):
+            return False
+        changed = False
+        for segment_index in range(
+            len(self._pulse[int(source_port)].flat_segments())
+        ):
+            changed |= self._share_segment_timing(
+                int(source_port),
+                segment_index,
+            )
+        return changed
+
+    def _on_segment_timing_changed(
+        self,
+        source_port: int,
+        segment_index: int,
+    ) -> None:
+        self._share_segment_timing(source_port, segment_index)
+        self._multi_ctrl.refresh_table()
+        self._refresh_waveform_plot()
+        self._refresh_trace_if_needed(force=True)
+        self._refresh_rf_editor()
+        self._refresh_sweep_overlay()
+        self.statusBar().showMessage(
+            f"Segment {int(segment_index) + 1} RAMP/hold timing shared "
+            "across AWG outputs"
+        )
+
     def _synchronize_port_timing(self) -> None:
         """Copy the selected SET/RAMP timing grid to every other port."""
         source = self._pulse[self._selected_port_idx]
@@ -10393,7 +11068,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl.refresh_table()
         self.refresh_panel_table()
         self._port_select(len(self._pulse) - 1)
-        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._notify_sweep_state_changed(fit_view=True)
 
     def _port_select(self, idx: int) -> None:
         """Activate the selected control panel."""

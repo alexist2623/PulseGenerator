@@ -209,6 +209,40 @@ def test_output_calibration_requires_matching_nyquist_and_filter_settings(
     assert calibration.summary.run_id == 2
     assert calibration.summary.output_nqz == 1
     assert calibration.summary.output_filter_type == "lowpass"
+    candidates = catalog.output_calibration_candidates(
+        "RF_Out",
+        [450.0],
+        nqz=1,
+        output_filter_type="lowpass",
+        output_filter_cutoff_ghz=2.5,
+        output_filter_bandwidth_ghz=1.0,
+    )
+    assert candidates[0].summary.run_id == 2
+    assert candidates[0].exact_match is True
+    assert "PCB RF_Out" in candidates[0].display_label
+    assert "NQZ 1" in candidates[0].display_label
+    assert "lowpass" in candidates[0].display_label
+
+    no_exact_candidates = catalog.output_calibration_candidates(
+        "RF_Out",
+        [450.0],
+        nqz=2,
+        output_filter_type="highpass",
+        output_filter_cutoff_ghz=1.5,
+        output_filter_bandwidth_ghz=0.5,
+    )
+    assert no_exact_candidates
+    assert not any(
+        candidate.exact_match for candidate in no_exact_candidates
+    )
+    assert any(
+        "PCB DC_Out" in candidate.display_label
+        for candidate in no_exact_candidates
+    )
+    assert any(
+        "Nyquist zone 1 != 2" in candidate.detail_text
+        for candidate in no_exact_candidates
+    )
 
     response = float(calibration.frequency_response_dbm([450.0])[0])
     attenuated_power = float(

@@ -123,6 +123,51 @@ class CalibrationRunSummary:
 
 
 @dataclass(frozen=True)
+class OutputCalibrationCandidate:
+    """An output calibration run ranked against the requested RF path."""
+
+    summary: CalibrationRunSummary
+    full_frequency_coverage: bool
+    frequency_overlap_mhz: float
+    mismatches: Tuple[str, ...] = ()
+
+    @property
+    def exact_match(self) -> bool:
+        return self.full_frequency_coverage and not self.mismatches
+
+    @property
+    def display_label(self) -> str:
+        summary = self.summary
+        nqz = "?" if summary.output_nqz is None else str(summary.output_nqz)
+        filter_name = summary.output_filter_type or "unknown"
+        cutoff = (
+            "?"
+            if summary.output_filter_cutoff_ghz is None
+            else f"{summary.output_filter_cutoff_ghz:.6g}"
+        )
+        bandwidth = (
+            "?"
+            if summary.output_filter_bandwidth_ghz is None
+            else f"{summary.output_filter_bandwidth_ghz:.6g}"
+        )
+        match = "exact match" if self.exact_match else "candidate"
+        return (
+            f"Run {summary.run_id} | PCB {summary.board_type} "
+            f"[{summary.sample_name}] | "
+            f"NQZ {nqz} | {filter_name} "
+            f"(fc {cutoff} GHz, BW {bandwidth} GHz) | "
+            f"{summary.frequency_min_mhz:.6g}.."
+            f"{summary.frequency_max_mhz:.6g} MHz | {match}"
+        )
+
+    @property
+    def detail_text(self) -> str:
+        if self.exact_match:
+            return "Exact PCB, frequency coverage, Nyquist zone, and filter match."
+        return "; ".join(self.mismatches)
+
+
+@dataclass(frozen=True)
 class GainSchedule:
     """Frequency-compensated gain words stored in tProcessor DMEM."""
 
@@ -711,6 +756,126 @@ class CalibrationDatabase:
                 )
         return tuple(mismatches)
 
+    def output_calibration_candidates(
+        self,
+        board_type: str,
+        requested_frequencies_mhz: Any,
+        *,
+        nqz: Optional[int] = None,
+        output_filter_type: Optional[str] = None,
+        output_filter_cutoff_ghz: Optional[float] = None,
+        output_filter_bandwidth_ghz: Optional[float] = None,
+    ) -> Tuple[OutputCalibrationCandidate, ...]:
+        """List output-power runs, with the closest compatible run first."""
+        board_type = _validate_board_type(board_type, output=True)
+        requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
+        if requested.size < 1 or not np.all(np.isfinite(requested)):
+            raise ValueError("requested frequencies must be a nonempty finite array")
+        requested_min = float(np.min(requested))
+        requested_max = float(np.max(requested))
+        frequency_tolerance_mhz = 1.0e-5
+        candidates = []
+        with self._connect() as connection:
+            for candidate_board in OUTPUT_BOARD_TYPES:
+                for row in self._candidate_rows(connection, candidate_board):
+                    table_name = str(row["result_table_name"])
+                    columns = self._table_columns(connection, table_name)
+                    if not {"gain", "freq", "pwr"}.issubset(columns):
+                        continue
+                    records = connection.execute(
+                        f"SELECT gain, freq, pwr FROM "
+                        f"{_quote_identifier(table_name)} "
+                        "WHERE gain IS NOT NULL AND freq IS NOT NULL "
+                        "AND pwr IS NOT NULL"
+                    ).fetchall()
+                    if not records:
+                        continue
+                    raw = np.asarray(
+                        [tuple(record) for record in records],
+                        dtype=float,
+                    )
+                    frequencies = _frequency_values_to_mhz(
+                        raw[:, 1],
+                        self._frequency_unit(connection, int(row["run_id"])),
+                    )
+                    frequency_min = float(np.min(frequencies))
+                    frequency_max = float(np.max(frequencies))
+                    overlap = max(
+                        0.0,
+                        min(requested_max, frequency_max)
+                        - max(requested_min, frequency_min),
+                    )
+                    full_coverage = (
+                        requested_min >= frequency_min - frequency_tolerance_mhz
+                        and requested_max
+                        <= frequency_max + frequency_tolerance_mhz
+                    )
+                    output_settings = self._output_path_settings(row)
+                    mismatches = []
+                    if candidate_board != board_type:
+                        mismatches.append(
+                            f"PCB {candidate_board} != {board_type}"
+                        )
+                    mismatches.extend(
+                        self._output_setting_mismatches(
+                            output_settings,
+                            nqz=nqz,
+                            output_filter_type=output_filter_type,
+                            output_filter_cutoff_ghz=(
+                                output_filter_cutoff_ghz
+                            ),
+                            output_filter_bandwidth_ghz=(
+                                output_filter_bandwidth_ghz
+                            ),
+                        )
+                    )
+                    if not full_coverage:
+                        mismatches.append(
+                            f"frequency range {frequency_min:.6g}.."
+                            f"{frequency_max:.6g} MHz does not cover "
+                            f"{requested_min:.6g}..{requested_max:.6g} MHz"
+                        )
+                    att1, att2 = self._attenuation(row)
+                    summary = CalibrationRunSummary(
+                        database_path=self.database_path,
+                        run_id=int(row["run_id"]),
+                        experiment_id=int(row["exp_id"]),
+                        board_type=candidate_board,
+                        sample_name=str(row["sample_name"]),
+                        result_table_name=table_name,
+                        frequency_min_mhz=frequency_min,
+                        frequency_max_mhz=frequency_max,
+                        frequency_count=int(np.unique(frequencies).size),
+                        row_count=int(raw.shape[0]),
+                        calibration_att1_db=float(att1),
+                        calibration_att2_db=float(att2),
+                        purpose="output_power",
+                        output_nqz=output_settings[0],
+                        output_filter_type=output_settings[1],
+                        output_filter_cutoff_ghz=output_settings[2],
+                        output_filter_bandwidth_ghz=output_settings[3],
+                    )
+                    candidates.append(
+                        OutputCalibrationCandidate(
+                            summary=summary,
+                            full_frequency_coverage=full_coverage,
+                            frequency_overlap_mhz=overlap,
+                            mismatches=tuple(mismatches),
+                        )
+                    )
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.exact_match,
+                candidate.summary.board_type == board_type,
+                candidate.full_frequency_coverage,
+                -len(candidate.mismatches),
+                candidate.frequency_overlap_mhz,
+                candidate.summary.run_id,
+            ),
+            reverse=True,
+        )
+        return tuple(candidates)
+
     def output_calibration(
         self,
         board_type: str,
@@ -1151,5 +1316,6 @@ __all__ = [
     "INPUT_BOARD_TYPES",
     "MAX_DMEM_GAIN_ENTRIES",
     "MAX_QICK_GAIN",
+    "OutputCalibrationCandidate",
     "OUTPUT_BOARD_TYPES",
 ]

@@ -465,7 +465,7 @@ def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
     panel.filter_cutoff.setValue(1.5)
     panel.filter_bandwidth.setValue(0.4)
     panel.power_calibration_database_path.setText("calibration.db")
-    panel.power_calibration_run_id.setValue(42)
+    panel.power_calibration_run_id.setValue(0)
     panel.target_output_power_dbm.setValue(-25.0)
     panel.power_calibration_group.setChecked(True)
     app.processEvents()
@@ -491,6 +491,37 @@ def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
         def __init__(self, path):
             calls["database_path"] = path
 
+        def output_calibration_candidates(self, *_args, **_kwargs):
+            return (
+                SimpleNamespace(
+                    exact_match=True,
+                    display_label=(
+                        "Run 42 | PCB RF_Out | NQZ 2 | highpass "
+                        "(fc 1.5 GHz, BW 0.4 GHz) | exact match"
+                    ),
+                    detail_text=(
+                        "Exact PCB, frequency coverage, Nyquist zone, "
+                        "and filter match."
+                    ),
+                    summary=SimpleNamespace(
+                        run_id=42,
+                        board_type="RF_Out",
+                    ),
+                ),
+                SimpleNamespace(
+                    exact_match=False,
+                    display_label=(
+                        "Run 41 | PCB DC_Out | NQZ 1 | lowpass "
+                        "(fc 2.5 GHz, BW 1 GHz) | candidate"
+                    ),
+                    detail_text="PCB DC_Out != RF_Out",
+                    summary=SimpleNamespace(
+                        run_id=41,
+                        board_type="DC_Out",
+                    ),
+                ),
+            )
+
         def output_calibration(self, board_type, frequencies, **kwargs):
             calls["lookup"] = (board_type, list(frequencies), kwargs)
             return FakeCalibration()
@@ -499,6 +530,8 @@ def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
 
     assert panel._apply_calibrated_output_power() == 1234
     assert panel.gain.value() == 1234
+    assert panel.power_calibration_run.currentData() == 0
+    assert "Run 42" in panel.power_calibration_run.currentText()
     assert calls["database_path"] == "calibration.db"
     board_type, frequencies, lookup = calls["lookup"]
     assert board_type == "RF_Out"
@@ -537,7 +570,7 @@ def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
     restored.load_settings(settings)
     assert restored.power_calibration_group.isChecked() is True
     assert restored.power_calibration_database_path.text() == "calibration.db"
-    assert restored.power_calibration_run_id.value() == 42
+    assert restored.power_calibration_run_id.value() == 0
     assert restored.target_output_power_dbm.value() == -25.0
 
     panel.validate_power_calibration()
@@ -545,6 +578,77 @@ def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
     with pytest.raises(ValueError, match="click Apply calibrated gain"):
         panel.validate_power_calibration()
     restored.close()
+    window.close()
+
+
+def test_rf_output_power_calibration_allows_explicit_mismatch_override(
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.setChecked(True)
+    panel.output_board_type.setCurrentText("RF_Out")
+    panel.frequency_mhz.setValue(450.0)
+    panel.nqz.setValue(2)
+    panel.filter_type.setCurrentText("highpass")
+    panel.filter_cutoff.setValue(1.5)
+    panel.filter_bandwidth.setValue(0.4)
+    panel.power_calibration_database_path.setText("calibration.db")
+    panel.power_calibration_group.setChecked(True)
+    app.processEvents()
+
+    candidate = SimpleNamespace(
+        exact_match=False,
+        display_label=(
+            "Run 73 | PCB DC_Out | NQZ 1 | lowpass "
+            "(fc 2.5 GHz, BW 1 GHz) | candidate"
+        ),
+        detail_text=(
+            "PCB DC_Out != RF_Out; Nyquist zone 1 != 2; "
+            "filter lowpass != highpass"
+        ),
+        summary=SimpleNamespace(run_id=73, board_type="DC_Out"),
+    )
+    calls = {}
+
+    class FakeCalibration:
+        summary = SimpleNamespace(run_id=73)
+
+        def frequency_response_dbm(self, _frequencies):
+            return np.asarray([-10.0])
+
+        def nominal_gain_for_power(self, _target, **_kwargs):
+            return 4321
+
+        def output_power_dbm(self, _frequencies, _gains, **_kwargs):
+            return np.asarray([-20.0])
+
+    class FakeCalibrationDatabase:
+        def __init__(self, _path):
+            pass
+
+        def output_calibration_candidates(self, *_args, **_kwargs):
+            return (candidate,)
+
+        def output_calibration(self, board_type, frequencies, **kwargs):
+            calls["lookup"] = (board_type, list(frequencies), kwargs)
+            return FakeCalibration()
+
+    monkeypatch.setattr(gui, "CalibrationDatabase", FakeCalibrationDatabase)
+    panel._refresh_power_calibration_runs()
+    run_index = panel.power_calibration_run.findData(73)
+    assert run_index > 0
+    panel.power_calibration_run.setCurrentIndex(run_index)
+
+    assert panel._apply_calibrated_output_power() == 4321
+    assert calls["lookup"] == (
+        "DC_Out",
+        [450.0],
+        {"run_id": 73},
+    )
+    assert "manually overridden" in panel.power_calibration_status.text()
+    assert "PCB DC_Out != RF_Out" in panel.power_calibration_status.text()
     window.close()
 
 
