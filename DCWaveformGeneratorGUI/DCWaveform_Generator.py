@@ -168,23 +168,39 @@ except ImportError:
 
 try:
     from .qick_qcodes_experiment import (
+        AWG_METADATA_MODE_EXPANDED,
+        AWG_METADATA_MODE_PARAMETRIC,
+        DEFAULT_AWG_METADATA_MODE,
         QcodesRunConfig,
         QickConnectionConfig,
+        build_awg_vertex_record,
+        build_awg_vertex_metadata,
+        build_awg_waveform_recipe,
         build_qick_program,
         configure_rf_output,
         connect_qick,
         measurement_iq_values,
+        normalize_awg_metadata_mode,
         run_qick_qcodes_experiment,
+        write_awg_vertex_metadata_jsonl,
     )
 except ImportError:
     from qick_qcodes_experiment import (
+        AWG_METADATA_MODE_EXPANDED,
+        AWG_METADATA_MODE_PARAMETRIC,
+        DEFAULT_AWG_METADATA_MODE,
         QcodesRunConfig,
         QickConnectionConfig,
+        build_awg_vertex_record,
+        build_awg_vertex_metadata,
+        build_awg_waveform_recipe,
         build_qick_program,
         configure_rf_output,
         connect_qick,
         measurement_iq_values,
+        normalize_awg_metadata_mode,
         run_qick_qcodes_experiment,
+        write_awg_vertex_metadata_jsonl,
     )
 
 try:
@@ -312,7 +328,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 31
+SETTINGS_VERSION = 32
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -5103,6 +5119,7 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     run_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
+    awg_metadata_requested = QtCore.pyqtSignal()
     sweep_axes_changed = QtCore.pyqtSignal()
     sweep_update_requested = QtCore.pyqtSignal(object, float, float, int)
     sweep_remove_requested = QtCore.pyqtSignal(object)
@@ -5171,6 +5188,36 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
+        self.awg_metadata_mode = QtWidgets.QComboBox()
+        self.awg_metadata_mode.addItem(
+            "Parametric recipe only (recommended)",
+            AWG_METADATA_MODE_PARAMETRIC,
+        )
+        self.awg_metadata_mode.addItem(
+            "Expanded vertices for every sweep point",
+            AWG_METADATA_MODE_EXPANDED,
+        )
+        self.awg_metadata_mode.setCurrentIndex(
+            self.awg_metadata_mode.findData(DEFAULT_AWG_METADATA_MODE)
+        )
+        self.awg_metadata_mode.setToolTip(
+            "Parametric mode stores the base waveform and sweep rules without "
+            "allocating per-point vertex arrays."
+        )
+        self.awg_metadata_button = QtWidgets.QPushButton(
+            "Preview / Export AWG Metadata..."
+        )
+        self.awg_metadata_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        self.awg_metadata_button.clicked.connect(
+            self.awg_metadata_requested.emit
+        )
+        metadata_hint = QtWidgets.QLabel(
+            "The default recipe is compact. Expanded per-point vertices are "
+            "generated only when explicitly selected or exported."
+        )
+        metadata_hint.setWordWrap(True)
         self._map_sweep_specs: Tuple[QickSweepAxisSpec, ...] = ()
         self.sweep_parameter_group = QtWidgets.QGroupBox("Sweep parameters")
         sweep_parameter_layout = QtWidgets.QVBoxLayout(
@@ -5336,6 +5383,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("Sample name:", self.sample_name)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
+        form.addRow("AWG waveform metadata:", self.awg_metadata_mode)
+        form.addRow(metadata_hint)
+        form.addRow(self.awg_metadata_button)
         form.addRow(self.sweep_parameter_group)
         self.sweep_map_group.setVisible(False)
         form.addRow(self.bias_t_group)
@@ -5814,6 +5864,9 @@ class ExperimentPanel(QtWidgets.QWidget):
             "full_scale_mv": self.full_scale_mv.value(),
             "awg_channels": self._parse_awg_channels(output_count),
             "repetitions_per_sweep": self.repetitions.value(),
+            "awg_metadata_mode": normalize_awg_metadata_mode(
+                self.awg_metadata_mode.currentData()
+            ),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
             "bias_t_compensation_type": str(self.bias_t_type.currentData()),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
@@ -5879,6 +5932,13 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels.setText(", ".join(str(value) for value in awg_channels))
         self.repetitions.setValue(int(repetitions))
 
+    def set_awg_metadata_mode(self, mode: str) -> None:
+        mode = normalize_awg_metadata_mode(mode)
+        index = self.awg_metadata_mode.findData(mode)
+        if index < 0:
+            raise ValueError(f"unsupported AWG metadata mode {mode!r}")
+        self.awg_metadata_mode.setCurrentIndex(index)
+
     def set_connection_values(self, connection: QickConnectionConfig) -> None:
         """Mirror the shared Setup connection into legacy execution fields."""
         self.qick_host.setText(connection.host)
@@ -5938,6 +5998,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         bias_t_mode: str = "fixed_voltage",
         bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
+        awg_metadata_mode: str = DEFAULT_AWG_METADATA_MODE,
     ) -> None:
         self.qick_host.setText(connection.host)
         self.ns_port.setValue(connection.ns_port)
@@ -5953,6 +6014,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             awg_channels=awg_channels,
             repetitions=repetitions,
         )
+        self.set_awg_metadata_mode(awg_metadata_mode)
         self.set_bias_t_values(
             enabled=bias_t_enabled,
             compensation_type=bias_t_compensation_type,
@@ -6194,6 +6256,302 @@ class QickAssemblyDialog(QtWidgets.QDialog):
             output_path = output_path.with_suffix(".asm")
         output_path.write_text(self._assembly, encoding="utf-8")
         self.status_label.setText(f"Saved to {output_path}")
+
+
+class AwgMetadataDialog(QtWidgets.QDialog):
+    """Preview and export parametric or expanded AWG waveform metadata."""
+
+    def __init__(
+        self,
+        sequence,
+        *,
+        fabric_mhz: float,
+        full_scale_mv: float,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._sequence = sequence
+        self._fabric_mhz = float(fabric_mhz)
+        self._full_scale_mv = float(full_scale_mv)
+        self._recipe = dict(build_awg_waveform_recipe(
+            sequence,
+            fabric_mhz=self._fabric_mhz,
+            full_scale_mv=self._full_scale_mv,
+        ))
+        self._point_record = None
+        self.setWindowTitle("AWG Waveform Metadata")
+        self.resize(1100, 760)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        point_count = int(self._recipe["point_count"])
+        sweep_shape = tuple(int(value) for value in self._recipe["sweep_shape"])
+        output_count = len(self._recipe["output_names"])
+        self.summary_label = QtWidgets.QLabel(
+            f"Compact recipe: {output_count} output(s), "
+            f"{point_count:,} sweep point(s), shape {sweep_shape or (1,)}. "
+            "Point previews are expanded on demand."
+        )
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        selector_layout = QtWidgets.QHBoxLayout()
+        selector_layout.addWidget(QtWidgets.QLabel("Sweep point index:"))
+        self.point_index = QtWidgets.QSpinBox(self)
+        self.point_index.setRange(0, min(point_count - 1, 2_147_483_647))
+        self.point_index.valueChanged.connect(self._refresh_point)
+        selector_layout.addWidget(self.point_index)
+        self.coordinate_label = QtWidgets.QLabel()
+        self.coordinate_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        selector_layout.addWidget(self.coordinate_label, 1)
+        layout.addLayout(selector_layout)
+
+        tabs = QtWidgets.QTabWidget(self)
+        self.vertex_table = QtWidgets.QTableWidget(self)
+        self.vertex_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.vertex_table.setAlternatingRowColors(True)
+        tabs.addTab(self.vertex_table, "Expanded Point Preview")
+
+        self.recipe_text = QtWidgets.QPlainTextEdit(self)
+        self.recipe_text.setReadOnly(True)
+        self.recipe_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.recipe_text.setFont(
+            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        )
+        self.recipe_text.setPlainText(
+            json.dumps(
+                self._recipe,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        tabs.addTab(self.recipe_text, "Parametric Recipe")
+        layout.addWidget(tabs, 1)
+
+        self.status_label = QtWidgets.QLabel(
+            "The QCoDeS default stores only this compact recipe."
+        )
+        self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.status_label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        self.save_recipe_button = buttons.addButton(
+            "Save Recipe JSON...",
+            QtWidgets.QDialogButtonBox.ActionRole,
+        )
+        self.save_point_button = buttons.addButton(
+            "Save Selected Point JSON...",
+            QtWidgets.QDialogButtonBox.ActionRole,
+        )
+        self.save_all_button = buttons.addButton(
+            "Save All Points JSONL...",
+            QtWidgets.QDialogButtonBox.ActionRole,
+        )
+        self.save_recipe_button.clicked.connect(self._save_recipe)
+        self.save_point_button.clicked.connect(self._save_selected_point)
+        self.save_all_button.clicked.connect(self._save_all_points)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._refresh_point()
+
+    @property
+    def recipe(self) -> Mapping:
+        return self._recipe
+
+    @property
+    def point_record(self) -> Mapping:
+        return self._point_record
+
+    def _refresh_point(self) -> None:
+        record = dict(build_awg_vertex_record(
+            self._sequence,
+            self.point_index.value(),
+            fabric_mhz=self._fabric_mhz,
+            full_scale_mv=self._full_scale_mv,
+        ))
+        self._point_record = record
+        coordinates = record["sweep_coordinate"]
+        coordinate_parts = []
+        for axis, value in zip(self._recipe["sweep_axes"], coordinates):
+            target = " / ".join(
+                part
+                for part in (
+                    str(axis.get("output_name", "")).strip(),
+                    str(axis.get("segment_name", "")).strip(),
+                )
+                if part
+            )
+            unit = str(axis.get("coordinate_unit", "")).strip()
+            coordinate_parts.append(
+                f"{target or axis.get('axis_kind', 'sweep')} = "
+                f"{float(value):.9g}{(' ' + unit) if unit else ''}"
+            )
+        self.coordinate_label.setText(
+            " | ".join(coordinate_parts)
+            if coordinate_parts
+            else "Base waveform (no sweep axes)"
+        )
+
+        output_names = tuple(record["output_names"])
+        headers = ["Time [cycles]", "Time [us]"]
+        for name in output_names:
+            headers.extend([
+                f"{name} virtual [mV]",
+                f"{name} physical [mV]",
+            ])
+        self.vertex_table.setColumnCount(len(headers))
+        self.vertex_table.setHorizontalHeaderLabels(headers)
+        times_cycles = record["time_cycles"]
+        times_us = record["time_us"]
+        self.vertex_table.setRowCount(len(times_cycles))
+        for row, (time_cycles, time_us) in enumerate(
+            zip(times_cycles, times_us)
+        ):
+            values = [f"{float(time_cycles):.9g}", f"{float(time_us):.9g}"]
+            for name in output_names:
+                values.extend([
+                    f"{float(record['virtual_values_mv'][name][row]):.9g}",
+                    f"{float(record['physical_values_mv'][name][row]):.9g}",
+                ])
+            for column, value in enumerate(values):
+                self.vertex_table.setItem(
+                    row,
+                    column,
+                    QtWidgets.QTableWidgetItem(value),
+                )
+        self.vertex_table.resizeColumnsToContents()
+
+    @staticmethod
+    def _write_json(path: str, payload: Mapping) -> Path:
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".json":
+            output_path = output_path.with_suffix(".json")
+        output_path.write_text(
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return output_path
+
+    def _save_recipe(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save compact AWG waveform recipe",
+            "awg_waveform_recipe.json",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        output_path = self._write_json(path, self._recipe)
+        self.status_label.setText(f"Compact recipe saved to {output_path}")
+
+    def _save_selected_point(self) -> None:
+        point_index = self.point_index.value()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save expanded AWG waveform point",
+            f"awg_waveform_point_{point_index}.json",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        payload = {
+            "schema": "qick-awg-waveform-selected-point-v1",
+            "recipe": self._recipe,
+            "waveform_point": self._point_record,
+        }
+        output_path = self._write_json(path, payload)
+        self.status_label.setText(
+            f"Expanded point {point_index:,} saved to {output_path}"
+        )
+
+    def _save_all_points(self) -> None:
+        point_count = int(self._recipe["point_count"])
+        if point_count > 100_000:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Export all expanded AWG vertices?",
+                (
+                    f"This will explicitly expand {point_count:,} sweep points. "
+                    "The JSONL writer streams points to disk, but the file can "
+                    "be very large and take a long time. Continue?"
+                ),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save all expanded AWG waveform points",
+            "awg_waveform_vertices.jsonl",
+            "JSON Lines (*.jsonl);;All files (*)",
+        )
+        if not path:
+            return
+
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".jsonl":
+            output_path = output_path.with_suffix(".jsonl")
+        progress = QtWidgets.QProgressDialog(
+            "Expanding AWG waveform points...",
+            "Cancel",
+            0,
+            point_count,
+            self,
+        )
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def update_progress(completed: int, total: int) -> bool:
+            progress.setMaximum(int(total))
+            progress.setValue(int(completed))
+            progress.setLabelText(
+                f"Expanded {completed:,} of {total:,} AWG waveform points"
+            )
+            QtWidgets.QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            output_path = write_awg_vertex_metadata_jsonl(
+                self._sequence,
+                output_path,
+                fabric_mhz=self._fabric_mhz,
+                full_scale_mv=self._full_scale_mv,
+                progress_callback=update_progress,
+            )
+        except RuntimeError as exc:
+            output_path.unlink(missing_ok=True)
+            if progress.wasCanceled():
+                self.status_label.setText("Expanded AWG metadata export canceled.")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "AWG metadata export failed",
+                    str(exc),
+                )
+            return
+        except Exception as exc:
+            output_path.unlink(missing_ok=True)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "AWG metadata export failed",
+                str(exc),
+            )
+            return
+        finally:
+            progress.close()
+        self.status_label.setText(
+            f"Expanded {point_count:,} point(s) to {output_path}"
+        )
 
 
 class QickExportDialog(QtWidgets.QDialog):
@@ -6830,6 +7188,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
+        )
+        self._experiment_panel.awg_metadata_requested.connect(
+            self._show_awg_metadata
         )
         self._experiment_panel.sweep_axes_changed.connect(
             self._refresh_awg_sweep_map_from_last_result
@@ -9740,6 +10101,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_worker = worker
         thread.start()
 
+    def _show_awg_metadata(self) -> None:
+        try:
+            arguments = self._experiment_run_arguments(
+                require_readout=False,
+                require_run_config=False,
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Cannot build AWG metadata",
+                str(exc),
+            )
+            return
+        dialog = AwgMetadataDialog(
+            arguments["sequence"],
+            fabric_mhz=self._qick_fabric_mhz,
+            full_scale_mv=self._qick_full_scale_mv,
+            parent=self,
+        )
+        dialog.exec_()
+
     def _show_qick_program(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -10398,6 +10780,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "full_scale_mv": self._qick_full_scale_mv,
                 "awg_channels": list(self._qick_awg_channels),
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+                "awg_metadata_mode": experiment_values["awg_metadata_mode"],
                 "bias_t_compensation": {
                     "enabled": self._bias_t_compensation_enabled,
                     "type": self._bias_t_compensation_type,
@@ -10955,6 +11338,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "QICK full_scale_mv",
             positive=True,
         )
+        awg_metadata_mode = normalize_awg_metadata_mode(
+            qick.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
+        )
         raw_stability_settings = data.get("stability_diagram")
         stability_settings = normalize_stability_settings(
             raw_stability_settings,
@@ -11046,82 +11432,83 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         sweep_map_visible_data = normalize_awg_sweep_visible_data(
             raw_sweep_map.get("visible_data")
         )
-        available_sweep_axes = tuple(
-            (spec.output_name, spec.segment_name) for spec in sweeps
-        )
+        def decode_sweep_map_settings(available_sweep_axes):
+            """Restore display axes after every AWG and RF sweep is decoded."""
+            available_sweep_axes = tuple(dict.fromkeys(available_sweep_axes))
 
-        def decode_sweep_map_axis(name: str):
-            raw_axis = raw_sweep_map.get(name)
-            if raw_axis is None:
-                return None
-            if not isinstance(raw_axis, dict):
-                raise TypeError(f"experiment sweep_map {name} must be an object")
-            key = (
-                str(raw_axis.get("output_name", "")),
-                str(raw_axis.get("segment_name", "")),
-            )
-            if key not in available_sweep_axes:
-                raise ValueError(
-                    f"experiment sweep_map {name} {key!r} is not an AWG sweep"
-                )
-            return key
-
-        sweep_map_x = decode_sweep_map_axis("x_axis")
-        sweep_map_y = decode_sweep_map_axis("y_axis")
-        if len(available_sweep_axes) >= 2:
-            if sweep_map_x is None:
-                sweep_map_x = available_sweep_axes[0]
-            if sweep_map_y is None or sweep_map_y == sweep_map_x:
-                sweep_map_y = next(
-                    key for key in available_sweep_axes if key != sweep_map_x
-                )
-            sweep_map_axes = (sweep_map_x, sweep_map_y)
-        else:
-            sweep_map_axes = None
-        raw_slice_axes = raw_sweep_map.get("slice_axes", [])
-        if not isinstance(raw_slice_axes, list):
-            raise TypeError("experiment sweep_map slice_axes must be an array")
-        sweep_map_slices = []
-        seen_slice_axes = set()
-        for entry in raw_slice_axes:
-            if not isinstance(entry, dict):
-                raise TypeError(
-                    "each experiment sweep_map slice axis must be an object"
-                )
-            key = (
-                str(entry.get("output_name", "")),
-                str(entry.get("segment_name", "")),
-            )
-            if key not in available_sweep_axes:
-                raise ValueError(
-                    f"experiment sweep_map slice axis {key!r} is not an "
-                    "AWG sweep"
-                )
-            if key in seen_slice_axes:
-                raise ValueError(
-                    f"experiment sweep_map slice axis {key!r} is duplicated"
-                )
-            if sweep_map_axes is not None and key in sweep_map_axes:
-                continue
-            seen_slice_axes.add(key)
-            mode = str(entry.get("mode", "average")).strip().lower()
-            decoded_slice = {
-                "output_name": key[0],
-                "segment_name": key[1],
-                "mode": mode,
-            }
-            if mode == "value":
-                value = float(entry["value"])
-                if not np.isfinite(value):
-                    raise ValueError(
-                        "experiment sweep_map slice value must be finite"
+            def decode_axis(name: str):
+                raw_axis = raw_sweep_map.get(name)
+                if raw_axis is None:
+                    return None
+                if not isinstance(raw_axis, dict):
+                    raise TypeError(
+                        f"experiment sweep_map {name} must be an object"
                     )
-                decoded_slice["value"] = value
-            elif mode != "average":
-                raise ValueError(
-                    "experiment sweep_map slice mode must be average or value"
+                key = (
+                    str(raw_axis.get("output_name", "")),
+                    str(raw_axis.get("segment_name", "")),
                 )
-            sweep_map_slices.append(decoded_slice)
+                # Axis selection is a display preference. A removed sweep must
+                # not make the complete experiment settings document unloadable.
+                return key if key in available_sweep_axes else None
+
+            sweep_map_x = decode_axis("x_axis")
+            sweep_map_y = decode_axis("y_axis")
+            if len(available_sweep_axes) >= 2:
+                if sweep_map_x is None:
+                    sweep_map_x = available_sweep_axes[0]
+                if sweep_map_y is None or sweep_map_y == sweep_map_x:
+                    sweep_map_y = next(
+                        key for key in available_sweep_axes if key != sweep_map_x
+                    )
+                sweep_map_axes = (sweep_map_x, sweep_map_y)
+            else:
+                sweep_map_axes = None
+
+            raw_slice_axes = raw_sweep_map.get("slice_axes", [])
+            if not isinstance(raw_slice_axes, list):
+                raise TypeError("experiment sweep_map slice_axes must be an array")
+            sweep_map_slices = []
+            seen_slice_axes = set()
+            for entry in raw_slice_axes:
+                if not isinstance(entry, dict):
+                    raise TypeError(
+                        "each experiment sweep_map slice axis must be an object"
+                    )
+                key = (
+                    str(entry.get("output_name", "")),
+                    str(entry.get("segment_name", "")),
+                )
+                # Ignore stale visualization entries left by a removed AWG/RF
+                # sweep. Active RF axes are included in available_sweep_axes.
+                if key not in available_sweep_axes:
+                    continue
+                if key in seen_slice_axes:
+                    raise ValueError(
+                        f"experiment sweep_map slice axis {key!r} is duplicated"
+                    )
+                if sweep_map_axes is not None and key in sweep_map_axes:
+                    continue
+                seen_slice_axes.add(key)
+                mode = str(entry.get("mode", "average")).strip().lower()
+                decoded_slice = {
+                    "output_name": key[0],
+                    "segment_name": key[1],
+                    "mode": mode,
+                }
+                if mode == "value":
+                    value = float(entry["value"])
+                    if not np.isfinite(value):
+                        raise ValueError(
+                            "experiment sweep_map slice value must be finite"
+                        )
+                    decoded_slice["value"] = value
+                elif mode != "average":
+                    raise ValueError(
+                        "experiment sweep_map slice mode must be average or value"
+                    )
+                sweep_map_slices.append(decoded_slice)
+            return sweep_map_axes, sweep_map_slices
         connection_config = QickConnectionConfig(
             host=str(experiment.get("qick_host", DEFAULT_QICK_HOST)),
             ns_port=self._json_int(
@@ -11296,6 +11683,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if not isinstance(raw_rf_outputs, list) or len(raw_rf_outputs) > 8:
             raise ValueError("rf_outputs must contain at most eight entries")
         rf_outputs = []
+        active_rf_output_specs = []
         for index, entry in enumerate(raw_rf_outputs):
             if not isinstance(entry, dict):
                 raise TypeError("each RF output setting must be a JSON object")
@@ -11389,6 +11777,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             if spec.segment_name not in set_names:
                 raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
+            if enabled:
+                active_rf_output_specs.append(spec)
             rf_outputs.append({"enabled": enabled, **{
                 "gen_ch": spec.gen_ch,
                 "segment_name": spec.segment_name,
@@ -11435,6 +11825,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     spec.target_output_power_dbm
                 ),
             }})
+
+        available_sweep_axes = tuple(
+            (spec.output_name, spec.segment_name) for spec in sweeps
+        ) + tuple(
+            (axis.output_name, axis.segment_name)
+            for spec in active_rf_output_specs
+            for axis in spec.sweep_axes
+        )
+        sweep_map_axes, sweep_map_slices = decode_sweep_map_settings(
+            available_sweep_axes
+        )
 
         raw_readout = data.get("rf_readout", {})
         if raw_readout is None:
@@ -11666,6 +12067,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "full_scale_mv": full_scale_mv,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
+            "awg_metadata_mode": awg_metadata_mode,
             "bias_t_enabled": bias_t_enabled,
             "bias_t_type": bias_t_type,
             "bias_t_mode": bias_t_mode,
@@ -11728,6 +12130,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=self._qick_full_scale_mv,
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
+            awg_metadata_mode=settings["awg_metadata_mode"],
             bias_t_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,

@@ -44,7 +44,11 @@ try:
     from .measurement_display import attach_color_bar, scale_iq_for_display
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
+        AWG_METADATA_MODE_EXPANDED,
+        DEFAULT_AWG_METADATA_MODE,
         build_awg_vertex_metadata,
+        build_awg_waveform_recipe,
+        normalize_awg_metadata_mode,
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
@@ -70,7 +74,11 @@ except ImportError:
     from measurement_display import attach_color_bar, scale_iq_for_display
     from qick_qcodes_experiment import (
         StoredQickExperiment,
+        AWG_METADATA_MODE_EXPANDED,
+        DEFAULT_AWG_METADATA_MODE,
         build_awg_vertex_metadata,
+        build_awg_waveform_recipe,
+        normalize_awg_metadata_mode,
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
@@ -1537,16 +1545,27 @@ def _stored_gui_settings_with_vertices(
     qick_settings = stored.get("qick", {})
     if not isinstance(qick_settings, Mapping):
         return stored
-    stored["awg_waveform_vertices"] = build_awg_vertex_metadata(
-        sequence,
-        fabric_mhz=float(qick_settings.get("fabric_mhz", 300.0)),
-        full_scale_mv=float(
-            qick_settings.get(
-                "full_scale_mv",
-                DEFAULT_QICK_FULL_SCALE_MV,
-            )
-        ),
+    fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
+    full_scale_mv = float(
+        qick_settings.get(
+            "full_scale_mv",
+            DEFAULT_QICK_FULL_SCALE_MV,
+        )
     )
+    stored["awg_waveform_recipe"] = build_awg_waveform_recipe(
+        sequence,
+        fabric_mhz=fabric_mhz,
+        full_scale_mv=full_scale_mv,
+    )
+    metadata_mode = normalize_awg_metadata_mode(
+        qick_settings.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
+    )
+    if metadata_mode == AWG_METADATA_MODE_EXPANDED:
+        stored["awg_waveform_vertices"] = build_awg_vertex_metadata(
+            sequence,
+            fabric_mhz=fabric_mhz,
+            full_scale_mv=full_scale_mv,
+        )
     return stored
 
 

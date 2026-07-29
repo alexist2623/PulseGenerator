@@ -30,6 +30,13 @@ IQ_TRACE_PARAMETER = "iq_trace"
 I_TRACE_PARAMETER = "i_trace"
 Q_TRACE_PARAMETER = "q_trace"
 SAMPLE_INDEX_PARAMETER = "sample_index"
+AWG_METADATA_MODE_PARAMETRIC = "parametric"
+AWG_METADATA_MODE_EXPANDED = "expanded"
+AWG_METADATA_MODES = (
+    AWG_METADATA_MODE_PARAMETRIC,
+    AWG_METADATA_MODE_EXPANDED,
+)
+DEFAULT_AWG_METADATA_MODE = AWG_METADATA_MODE_PARAMETRIC
 
 try:
     from .dc_waveform_core import (
@@ -186,11 +193,148 @@ def _emit_progress(
         callback(max(0, min(100, int(percent))), str(message))
 
 
+def normalize_awg_metadata_mode(value: Any) -> str:
+    """Return a supported AWG waveform metadata storage mode."""
+    mode = str(value or DEFAULT_AWG_METADATA_MODE).strip().lower()
+    if mode not in AWG_METADATA_MODES:
+        raise ValueError(
+            f"AWG waveform metadata mode must be one of {AWG_METADATA_MODES}"
+        )
+    return mode
+
+
+def build_awg_waveform_recipe(
+    sequence: Any,
+    *,
+    fabric_mhz: float,
+    full_scale_mv: float,
+) -> Mapping[str, Any]:
+    """Serialize the base waveform and sweep rules without expanding points."""
+    fabric_mhz = float(fabric_mhz)
+    full_scale_mv = float(full_scale_mv)
+    if not np.isfinite(fabric_mhz) or fabric_mhz <= 0.0:
+        raise ValueError("fabric_mhz must be positive and finite")
+    if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
+        raise ValueError("full_scale_mv must be positive and finite")
+
+    output_names = tuple(str(name) for name in sequence.output_names)
+    sweep_axes = []
+    for axis in sequence.sweep_axes:
+        axis_data = dict(_json_ready(axis))
+        axis_data.update({
+            "axis_kind": str(getattr(axis, "axis_kind", "amplitude")),
+            "output_name": str(getattr(axis, "output_name", "")),
+            "coordinate_unit": str(getattr(axis, "coordinate_unit", "")),
+        })
+        sweep_axes.append(axis_data)
+
+    compensation = getattr(sequence, "bias_t_compensation", None)
+    compensation_data = None
+    if compensation is not None:
+        compensation_data = dict(_json_ready(compensation))
+        compensation_data["kind"] = (
+            "filter" if hasattr(compensation, "tau_cycles") else "dc"
+        )
+
+    sweep_shape = [int(axis.count) for axis in sequence.sweep_axes]
+    point_count = int(np.prod(sweep_shape or [1], dtype=np.int64))
+    return {
+        "schema": "qick-awg-waveform-recipe-v1",
+        "metadata_mode": AWG_METADATA_MODE_PARAMETRIC,
+        "output_names": list(output_names),
+        "segments": _json_ready(sequence.segments),
+        "cross_capacitance": np.asarray(
+            sequence.cross_capacitance,
+            dtype=float,
+        ).tolist(),
+        "bias_t_compensation": compensation_data,
+        "sweep_axes": sweep_axes,
+        "sweep_shape": sweep_shape,
+        "point_count": point_count,
+        "fabric_mhz": fabric_mhz,
+        "full_scale_mv": full_scale_mv,
+        "time_reference": "start of each pulse sequence repetition",
+        "vertex_rule": (
+            "Connect adjacent vertices in order; equal adjacent times encode "
+            "an instantaneous SET transition."
+        ),
+        "reconstruction": (
+            "Apply each Cartesian sweep coordinate to the named base segment, "
+            "then apply the cross-capacitance matrix and segment timing rules."
+        ),
+    }
+
+
+def _awg_point_indices(
+    sequence: Any,
+    point_indices: Optional[Sequence[int]],
+) -> Sequence[int]:
+    point_count = int(sequence.sweep_point_count)
+    if point_indices is None:
+        return range(point_count)
+    normalized = tuple(int(index) for index in point_indices)
+    if not normalized:
+        raise ValueError("point_indices must not be empty")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("point_indices must not contain duplicates")
+    if any(index < 0 or index >= point_count for index in normalized):
+        raise IndexError("AWG metadata point index is out of range")
+    return normalized
+
+
+def build_awg_vertex_record(
+    sequence: Any,
+    point_index: int,
+    *,
+    fabric_mhz: float,
+    full_scale_mv: float,
+) -> Mapping[str, Any]:
+    """Expand one Cartesian sweep point into virtual and physical vertices."""
+    point_index = int(point_index)
+    if not 0 <= point_index < int(sequence.sweep_point_count):
+        raise IndexError("AWG metadata point index is out of range")
+    virtual_times, virtual_values, boundaries = sequence.waveform_vertices(
+        point_index,
+        space="virtual",
+    )
+    physical_times, physical_values, _ = sequence.waveform_vertices(
+        point_index,
+        space="physical",
+    )
+    if not np.array_equal(virtual_times, physical_times):
+        raise RuntimeError("virtual and physical AWG vertex times differ")
+    output_names = tuple(str(name) for name in sequence.output_names)
+    times = np.asarray(virtual_times, dtype=float)
+    return {
+        "schema": "qick-awg-waveform-vertex-record-v1",
+        "point_index": point_index,
+        "sweep_coordinate": list(sequence.sweep_coordinate(point_index)),
+        "time_cycles": times.tolist(),
+        "time_us": (times / float(fabric_mhz)).tolist(),
+        "segment_boundaries": _json_ready(boundaries),
+        "output_names": list(output_names),
+        "virtual_values_mv": {
+            name: (
+                np.asarray(virtual_values[name], dtype=float) * float(full_scale_mv)
+            ).tolist()
+            for name in output_names
+        },
+        "physical_values_mv": {
+            name: (
+                np.asarray(physical_values[name], dtype=float) * float(full_scale_mv)
+            ).tolist()
+            for name in output_names
+        },
+        "amplitude_unit": "mV",
+    }
+
+
 def build_awg_vertex_metadata(
     sequence: Any,
     *,
     fabric_mhz: float,
     full_scale_mv: float,
+    point_indices: Optional[Sequence[int]] = None,
 ) -> Mapping[str, Any]:
     """Build compact virtual/physical AWG vertices for every sweep point."""
     fabric_mhz = float(fabric_mhz)
@@ -201,11 +345,13 @@ def build_awg_vertex_metadata(
         raise ValueError("full_scale_mv must be positive and finite")
 
     output_names = tuple(sequence.output_names)
-    point_count = int(sequence.sweep_point_count)
+    selected_indices = _awg_point_indices(sequence, point_indices)
+    point_count = len(selected_indices)
     point_times = []
     virtual_points = []
     physical_points = []
-    for point_index in range(point_count):
+    coordinates = []
+    for point_index in selected_indices:
         virtual_times, virtual_values, _ = sequence.waveform_vertices(
             point_index, space="virtual"
         )
@@ -223,6 +369,7 @@ def build_awg_vertex_metadata(
             np.vstack([physical_values[name] for name in output_names])
             * full_scale_mv
         )
+        coordinates.append(sequence.sweep_coordinate(point_index))
 
     if not point_times:
         raise ValueError("the AWG sequence has no waveform vertices")
@@ -232,7 +379,10 @@ def build_awg_vertex_metadata(
     point_times = np.asarray(point_times, dtype=float)
     shared_times = bool(np.all(point_times == point_times[0]))
     stored_times = point_times[0] if shared_times else point_times
-    coordinates = np.asarray(sequence.sweep_coordinates, dtype=float)
+    coordinates = np.asarray(coordinates, dtype=float).reshape(
+        point_count,
+        len(sequence.sweep_axes),
+    )
     shared = {
         "schema": (
             "qick-awg-waveform-vertices-v1"
@@ -240,7 +390,7 @@ def build_awg_vertex_metadata(
             else "qick-awg-waveform-vertices-v2"
         ),
         "output_names": list(output_names),
-        "point_index": list(range(point_count)),
+        "point_index": list(selected_indices),
         "sweep_coordinates": coordinates.tolist(),
         "sweep_axes": _json_ready(sequence.sweep_axes),
         "time_cycles": stored_times.tolist(),
@@ -266,6 +416,58 @@ def build_awg_vertex_metadata(
             "values_mv": np.asarray(physical_points).tolist(),
         },
     }
+
+
+def write_awg_vertex_metadata_jsonl(
+    sequence: Any,
+    path: Any,
+    *,
+    fabric_mhz: float,
+    full_scale_mv: float,
+    point_indices: Optional[Sequence[int]] = None,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+) -> Path:
+    """Stream expanded AWG vertices to JSONL without retaining every point."""
+    output_path = Path(path)
+    if output_path.suffix.lower() != ".jsonl":
+        output_path = output_path.with_suffix(".jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_indices = _awg_point_indices(sequence, point_indices)
+    recipe = build_awg_waveform_recipe(
+        sequence,
+        fabric_mhz=fabric_mhz,
+        full_scale_mv=full_scale_mv,
+    )
+    header = {
+        "schema": "qick-awg-waveform-vertices-jsonl-v1",
+        "record_type": "header",
+        "selected_point_count": len(selected_indices),
+        "recipe": recipe,
+    }
+    with output_path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(_json_text(header) + "\n")
+        for completed, point_index in enumerate(selected_indices, start=1):
+            record = build_awg_vertex_record(
+                sequence,
+                point_index,
+                fabric_mhz=fabric_mhz,
+                full_scale_mv=full_scale_mv,
+            )
+            stream.write(
+                _json_text({
+                    "record_type": "waveform_point",
+                    **record,
+                })
+                + "\n"
+            )
+            if progress_callback is not None and (
+                completed == len(selected_indices)
+                or completed == 1
+                or completed % max(1, len(selected_indices) // 100) == 0
+            ):
+                if progress_callback(completed, len(selected_indices)) is False:
+                    raise RuntimeError("AWG metadata export canceled")
+    return output_path
 
 
 def _coerce_awg_vertex_data(
@@ -1222,6 +1424,7 @@ def store_qick_result(
 
     stored_gui_settings = dict(gui_settings)
     awg_vertices = stored_gui_settings.pop("awg_waveform_vertices", {})
+    awg_recipe = stored_gui_settings.get("awg_waveform_recipe", {})
     vertex_data = _coerce_awg_vertex_data(
         awg_vertices,
         point_count=point_count,
@@ -1429,6 +1632,20 @@ def store_qick_result(
             "write_mode": "local_staging_then_sqlite_backup",
         },
         "gui_settings": stored_gui_settings,
+        "awg_waveform_metadata": {
+            "mode": normalize_awg_metadata_mode(
+                stored_gui_settings.get("qick", {}).get(
+                    "awg_metadata_mode",
+                    DEFAULT_AWG_METADATA_MODE,
+                )
+            ),
+            "recipe_schema": (
+                awg_recipe.get("schema")
+                if isinstance(awg_recipe, Mapping)
+                else None
+            ),
+            "expanded_vertices_stored": vertex_data is not None,
+        },
         "program_summary": program_summary,
         "rf_settings_actual": rf_settings,
         "measurement_layout": {
@@ -1530,6 +1747,11 @@ def store_qick_result(
                 stored_gui_settings.get("awg", {}).get("cross_capacitance", [])
             ),
         )
+        if awg_recipe:
+            dataset.add_metadata(
+                "awg_waveform_recipe_json",
+                _json_text(awg_recipe),
+            )
         dataset.add_metadata(
             "rf_configuration_json",
             _json_text({
@@ -1717,18 +1939,31 @@ def run_qick_qcodes_experiment(
     tproc_mhz = float(
         qick_settings.get("tproc_mhz", DEFAULT_QICK_TPROC_MHZ)
     )
+    metadata_mode = normalize_awg_metadata_mode(
+        qick_settings.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
+    )
+    stored_qick_settings["awg_metadata_mode"] = metadata_mode
     if hasattr(sequence, "waveform_vertices"):
-        _emit_progress(progress_callback, 4, "Building compact AWG vertices")
-        stored_gui_settings["awg_waveform_vertices"] = build_awg_vertex_metadata(
-            sequence,
-            fabric_mhz=float(qick_settings.get("fabric_mhz", 300.0)),
-            full_scale_mv=float(
-                qick_settings.get(
-                    "full_scale_mv",
-                    DEFAULT_QICK_FULL_SCALE_MV,
-                )
-            ),
+        fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
+        full_scale_mv = float(
+            qick_settings.get(
+                "full_scale_mv",
+                DEFAULT_QICK_FULL_SCALE_MV,
+            )
         )
+        _emit_progress(progress_callback, 4, "Preparing parametric AWG waveform recipe")
+        stored_gui_settings["awg_waveform_recipe"] = build_awg_waveform_recipe(
+            sequence,
+            fabric_mhz=fabric_mhz,
+            full_scale_mv=full_scale_mv,
+        )
+        if metadata_mode == AWG_METADATA_MODE_EXPANDED:
+            _emit_progress(progress_callback, 4, "Building expanded AWG vertices")
+            stored_gui_settings["awg_waveform_vertices"] = build_awg_vertex_metadata(
+                sequence,
+                fabric_mhz=fabric_mhz,
+                full_scale_mv=full_scale_mv,
+            )
     program, ddr_result, rf_settings = execute_qick_sequence(
         soc,
         soccfg,
@@ -1764,6 +1999,10 @@ def run_qick_qcodes_experiment(
 
 
 __all__ = [
+    "AWG_METADATA_MODE_EXPANDED",
+    "AWG_METADATA_MODE_PARAMETRIC",
+    "AWG_METADATA_MODES",
+    "DEFAULT_AWG_METADATA_MODE",
     "DEFAULT_QCODES_BATCH_ROWS",
     "I_TRACE_PARAMETER",
     "IQ_TRACE_PARAMETER",
@@ -1773,7 +2012,9 @@ __all__ = [
     "QcodesRunConfig",
     "QickConnectionConfig",
     "StoredQickExperiment",
+    "build_awg_vertex_record",
     "build_awg_vertex_metadata",
+    "build_awg_waveform_recipe",
     "build_qick_program",
     "build_runtime_ddr_readout",
     "build_runtime_rf_pulses",
@@ -1785,6 +2026,8 @@ __all__ = [
     "execute_qick_sequence",
     "load_qick_iq_arrays",
     "measurement_iq_values",
+    "normalize_awg_metadata_mode",
     "run_qick_qcodes_experiment",
     "store_qick_result",
+    "write_awg_vertex_metadata_jsonl",
 ]

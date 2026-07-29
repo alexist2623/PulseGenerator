@@ -68,6 +68,7 @@ DEFAULT_BIAS_T_DURATION_FRAC_BITS = 8
 BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
+DEFAULT_DDR_READBACK_TRIGGER_CHUNK = 100_000
 
 
 def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -1451,13 +1452,23 @@ class FineTuneSequence:
 
     @property
     def sweep_point_count(self) -> int:
-        return int(self.sweep_coordinates.shape[0])
+        return int(np.prod(self.sweep_shape, dtype=np.int64))
 
     def sweep_coordinate(self, point_index: int) -> Tuple[float, ...]:
         point_index = _require_int(point_index, "point_index", 0)
         if point_index >= self.sweep_point_count:
             raise IndexError("point_index is out of range")
-        return tuple(float(value) for value in self.sweep_coordinates[point_index])
+        if not self.sweeps:
+            return ()
+        indices = np.unravel_index(
+            point_index,
+            self.sweep_shape,
+            order="C",
+        )
+        return tuple(
+            float(axis.points[axis_index])
+            for axis, axis_index in zip(self.sweeps, indices)
+        )
 
     @property
     def sweep_points(self) -> np.ndarray:
@@ -6156,6 +6167,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         *,
         progress: bool = True,
         counter_progress=None,
+        readback_chunk_triggers: int = DEFAULT_DDR_READBACK_TRIGGER_CHUNK,
         **run_kwargs,
     ):
         """Arm DDR and return IQ grouped at the HWH-selected FIR sample rate.
@@ -6173,6 +6185,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         n_points = self.sequence.sweep_point_count
         repetitions = int(self.cfg["reps"])
         n_triggers = n_points * repetitions
+        readback_chunk_triggers = _require_int(
+            readback_chunk_triggers,
+            "readback_chunk_triggers",
+            1,
+        )
         arm_kwargs = dict(
             ch=ddr.ro_ch,
             n_samples=ddr.samples_per_trigger,
@@ -6196,17 +6213,61 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             self._run_rounds_with_counter_progress(soc, counter_progress)
         if ddr.settle_seconds:
             time.sleep(float(ddr.settle_seconds))
-        raw = np.asarray(soc.get_ddr4_fir_samples(
-            n_samples=ddr.samples_per_trigger,
-            n_triggers=n_triggers,
-            start=ddr.address,
-            stride_bytes=ddr.stride_bytes,
-        ))
-        expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
-        if raw.shape != expected_shape:
+
+        if reserved % n_triggers:
             raise RuntimeError(
-                f"unexpected DDR IQ shape {raw.shape}; expected {expected_shape}"
+                "reserved DDR words are not divisible by the trigger count"
             )
+        physical_words_per_trigger = reserved // n_triggers
+        if ddr.address % 4:
+            raise ValueError("DDR byte address must be aligned to a 32-bit word")
+        base_word = ddr.address // 4
+        if ddr.stride_bytes is None:
+            stride_words = physical_words_per_trigger
+        else:
+            if ddr.stride_bytes % 4:
+                raise ValueError("DDR stride_bytes must be a multiple of 4")
+            stride_words = ddr.stride_bytes // 4
+
+        expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
+        raw = None
+        for first_trigger in range(
+            0,
+            n_triggers,
+            readback_chunk_triggers,
+        ):
+            chunk_trigger_count = min(
+                readback_chunk_triggers,
+                n_triggers - first_trigger,
+            )
+            chunk_start_word = base_word + first_trigger * stride_words
+            chunk = np.asarray(soc.get_ddr4_fir_samples(
+                n_samples=ddr.samples_per_trigger,
+                n_triggers=chunk_trigger_count,
+                start=chunk_start_word,
+                stride_bytes=ddr.stride_bytes,
+            ))
+            expected_chunk_shape = (
+                chunk_trigger_count * ddr.samples_per_trigger,
+                2,
+            )
+            if chunk.shape != expected_chunk_shape:
+                raise RuntimeError(
+                    f"unexpected DDR IQ chunk shape {chunk.shape}; expected "
+                    f"{expected_chunk_shape} for triggers "
+                    f"{first_trigger}.."
+                    f"{first_trigger + chunk_trigger_count - 1}"
+                )
+            if raw is None:
+                raw = np.empty(expected_shape, dtype=chunk.dtype)
+            first_sample = first_trigger * ddr.samples_per_trigger
+            last_sample = (
+                first_trigger + chunk_trigger_count
+            ) * ddr.samples_per_trigger
+            raw[first_sample:last_sample] = chunk
+
+        if raw is None:
+            raise RuntimeError("DDR readback produced no chunks")
         iq = raw.reshape(
             n_points,
             repetitions,

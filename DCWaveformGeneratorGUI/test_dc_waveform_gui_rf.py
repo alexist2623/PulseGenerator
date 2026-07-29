@@ -30,6 +30,7 @@ from dc_waveform_core import (
     generate_qick_program_code,
 )
 from stability_diagram import DEFAULT_STABILITY_POINT_GUARD_US
+from qick_fine_tune_sweep import FineTuneSequence
 
 
 def _application():
@@ -522,6 +523,77 @@ def test_rf_frequency_and_power_sweep_controls_round_trip():
     assert restored_spec.power_calibration_database_path == "calibration.db"
     restored.close()
     window.close()
+
+
+def test_settings_restore_rf_frequency_slice_and_ignore_removed_slice(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_0", "awg_1", -0.2, 0.2, 5),
+    ]
+
+    rf_panel = window._rf_ports_panel._panels[0]
+    rf_panel.setChecked(True)
+    rf_panel.gen_ch.setValue(0)
+    rf_panel.segment.setCurrentIndex(rf_panel.segment.findData("set_0"))
+    rf_panel.frequency_sweep_enabled.setChecked(True)
+    rf_panel.frequency_sweep_start_mhz.setValue(100.0)
+    rf_panel.frequency_sweep_stop_mhz.setValue(200.0)
+    rf_panel.frequency_sweep_count.setValue(11)
+    app.processEvents()
+    window._refresh_sweep_overlay()
+
+    axis_settings = {
+        "x_axis": {
+            "output_name": "awg_0",
+            "segment_name": "set_0",
+        },
+        "y_axis": {
+            "output_name": "awg_1",
+            "segment_name": "set_0",
+        },
+        "slice_axes": [
+            {
+                "output_name": "rf_gen_0_frequency",
+                "segment_name": "set_0",
+                "mode": "value",
+                "value": 150.0,
+            },
+        ],
+    }
+    window._awg_sweep_plot.load_axis_selection_settings(axis_settings)
+    saved_path = window._save_settings_json(tmp_path / "rf_frequency_slice")
+
+    restored = gui.MainWindow()
+    restored._load_settings_json(saved_path)
+    app.processEvents()
+    assert restored._awg_sweep_plot.axis_selection_settings() == axis_settings
+
+    document = json.loads(saved_path.read_text(encoding="utf-8"))
+    document["rf_outputs"][0]["frequency_sweep_enabled"] = False
+    stale_path = tmp_path / "removed_rf_frequency_slice.json"
+    stale_path.write_text(json.dumps(document), encoding="utf-8")
+    restored._load_settings_json(stale_path)
+    app.processEvents()
+    assert restored._awg_sweep_plot.axis_selection_settings() == {
+        "x_axis": {
+            "output_name": "awg_0",
+            "segment_name": "set_0",
+        },
+        "y_axis": {
+            "output_name": "awg_1",
+            "segment_name": "set_0",
+        },
+        "slice_axes": [],
+    }
+
+    restored.close()
+    window.close()
+    restored.deleteLater()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
@@ -1452,6 +1524,52 @@ def test_experiment_panel_exposes_show_program_action():
     panel.close()
 
 
+def test_experiment_panel_defaults_to_parametric_awg_metadata():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+    emitted = []
+    panel.awg_metadata_requested.connect(lambda: emitted.append(True))
+
+    assert panel.awg_metadata_mode.currentData() == "parametric"
+    assert panel.values(1)["awg_metadata_mode"] == "parametric"
+    panel.awg_metadata_button.click()
+    app.processEvents()
+    assert emitted == [True]
+
+    panel.set_awg_metadata_mode("expanded")
+    assert panel.values(1)["awg_metadata_mode"] == "expanded"
+    panel.close()
+
+
+def test_awg_metadata_dialog_expands_only_the_selected_point():
+    app = _application()
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 30)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 3)
+    dialog = gui.AwgMetadataDialog(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+    )
+
+    assert dialog.recipe["point_count"] == 3
+    assert dialog.recipe["schema"] == "qick-awg-waveform-recipe-v1"
+    assert dialog.point_record["point_index"] == 0
+    dialog.point_index.setValue(2)
+    app.processEvents()
+    assert dialog.point_record["point_index"] == 2
+    assert dialog.point_record["sweep_coordinate"] == [0.5]
+    assert dialog.point_record["virtual_values_mv"]["awg_0"] == [400.0, 400.0]
+    assert dialog.vertex_table.rowCount() == 2
+    dialog.close()
+
+
 def test_show_program_snapshot_allows_disabled_readout():
     app = _application()
     window = gui.MainWindow()
@@ -1690,7 +1808,8 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 31
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 32
+    assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

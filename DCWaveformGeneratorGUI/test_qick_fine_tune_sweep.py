@@ -901,6 +901,69 @@ def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch)
     assert result.fir_rate_profile == "50_ksps"
 
 
+def test_fir_ddr_readback_is_chunked_by_trigger_on_the_client(monkeypatch):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("capture", (0.0,), 300)
+    sequence.set_amplitude_sweep("capture", "awg_0", -0.2, 0.2, 3)
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=10,
+        at_segment="capture",
+        margin_input_samples=0,
+        address=128,
+        settle_seconds=0.0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=2,
+        ddr_readout=ddr,
+    )
+
+    class FakeSoc:
+        def __init__(self):
+            self.read_calls = []
+
+        def arm_ddr4_fir_samples(self, **kwargs):
+            self.arm_kwargs = kwargs
+            return kwargs["n_triggers"] * 16
+
+        def get_ddr4_fir_samples(self, **kwargs):
+            self.read_calls.append(kwargs)
+            first_trigger = (kwargs["start"] - 32) // 16
+            count = kwargs["n_triggers"]
+            values = np.empty((count * 10, 2), dtype=np.int16)
+            for local_trigger in range(count):
+                trigger = first_trigger + local_trigger
+                first_sample = local_trigger * 10
+                values[first_sample:first_sample + 10, 0] = trigger
+                values[first_sample:first_sample + 10, 1] = -trigger
+            return values
+
+    soc = FakeSoc()
+    monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
+    result = program.acquire_fir_ddr(
+        soc,
+        progress=False,
+        readback_chunk_triggers=4,
+    )
+
+    assert soc.arm_kwargs["n_triggers"] == 6
+    assert [
+        (call["start"], call["n_triggers"])
+        for call in soc.read_calls
+    ] == [(32, 4), (96, 2)]
+    assert result.iq.shape == (3, 2, 10, 2)
+    np.testing.assert_array_equal(
+        result.iq[:, :, 0, 0].reshape(-1),
+        np.arange(6),
+    )
+    np.testing.assert_array_equal(
+        result.iq[:, :, 0, 1].reshape(-1),
+        -np.arange(6),
+    )
+
+
 def test_50_ksps_ddr_does_not_repeat_fir_group_delay_between_points():
     sequence = FineTuneSequence(("awg_0",))
     # Stability-style point: ten 50 kSPS samples plus one microsecond guard.

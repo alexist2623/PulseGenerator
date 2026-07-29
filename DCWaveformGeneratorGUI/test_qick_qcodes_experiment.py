@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tracemalloc
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +24,9 @@ from qick_fine_tune_sweep import (
     RfDurationSweep,
 )
 from qick_qcodes_experiment import (
+    AWG_METADATA_MODE_EXPANDED,
+    AWG_METADATA_MODE_PARAMETRIC,
+    DEFAULT_AWG_METADATA_MODE,
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
     Q_TRACE_PARAMETER,
@@ -31,7 +35,9 @@ from qick_qcodes_experiment import (
     QcodesRunConfig,
     QickConnectionConfig,
     _sweep_parameter_names,
+    build_awg_vertex_record,
     build_awg_vertex_metadata,
+    build_awg_waveform_recipe,
     build_qick_program,
     build_runtime_ddr_readout,
     build_runtime_rf_pulses,
@@ -41,6 +47,7 @@ from qick_qcodes_experiment import (
     load_qick_iq_arrays,
     run_qick_qcodes_experiment,
     store_qick_result,
+    write_awg_vertex_metadata_jsonl,
 )
 
 
@@ -708,6 +715,245 @@ def test_awg_vertex_metadata_tracks_ramp_duration_rate_sweep():
         virtual["time_us"],
         np.asarray(virtual["time_cycles"]) / 300.0,
     )
+
+
+def test_awg_waveform_recipe_keeps_base_waveform_and_sweeps_parametric():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.set_cross_capacitance(((1.0, 0.25), (0.0, 1.0)))
+    sequence.add_set("start", (0.0, 0.1), 10)
+    sequence.add_ramp("to_gate", 5)
+    sequence.add_set("gate", (0.2, -0.1), 15)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.2, 0.2, 101)
+    sequence.add_hold_duration_sweep(
+        "gate",
+        0.04,
+        0.08,
+        11,
+        sequence_fabric_mhz=300.0,
+    )
+
+    recipe = build_awg_waveform_recipe(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+    )
+
+    assert recipe["schema"] == "qick-awg-waveform-recipe-v1"
+    assert recipe["metadata_mode"] == AWG_METADATA_MODE_PARAMETRIC
+    assert recipe["output_names"] == ["awg_0", "awg_1"]
+    assert recipe["sweep_shape"] == list(sequence.sweep_shape)
+    assert recipe["point_count"] == 1111
+    assert len(recipe["segments"]) == 3
+    assert recipe["cross_capacitance"] == [[1.0, 0.25], [0.0, 1.0]]
+    assert "values_mv" not in recipe
+    assert len(json.dumps(recipe)) < 20_000
+
+
+def test_awg_vertex_expansion_can_select_one_point_without_expanding_all():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 10)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 1001)
+
+    metadata = build_awg_vertex_metadata(
+        sequence,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+        point_indices=(500,),
+    )
+    record = build_awg_vertex_record(
+        sequence,
+        500,
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+    )
+
+    assert metadata["virtual"]["point_index"] == [500]
+    assert metadata["virtual"]["value_shape"] == [1, 1, 2]
+    assert metadata["virtual"]["sweep_coordinates"] == [[0.0]]
+    assert record["point_index"] == 500
+    assert record["sweep_coordinate"] == [0.0]
+    assert record["virtual_values_mv"]["awg_0"] == [0.0, 0.0]
+
+
+def test_awg_vertex_jsonl_export_streams_header_and_point_records(tmp_path):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 10)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 3)
+    progress = []
+
+    output_path = write_awg_vertex_metadata_jsonl(
+        sequence,
+        tmp_path / "expanded_vertices",
+        fabric_mhz=300.0,
+        full_scale_mv=800.0,
+        progress_callback=lambda completed, total: (
+            progress.append((completed, total)) or True
+        ),
+    )
+    records = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert output_path.suffix == ".jsonl"
+    assert records[0]["record_type"] == "header"
+    assert records[0]["recipe"]["point_count"] == 3
+    assert [record["point_index"] for record in records[1:]] == [0, 1, 2]
+    assert progress[-1] == (3, 3)
+
+
+def test_parametric_preview_does_not_materialize_multi_million_point_grid():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("gate", (0.0, 0.0), 100)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 101)
+    sequence.add_amplitude_sweep("gate", "awg_1", -0.5, 0.5, 101)
+    sequence.add_rf_frequency_sweep("gate", 0, 800.0, 1200.0, 401)
+
+    tracemalloc.start()
+    try:
+        recipe = build_awg_waveform_recipe(
+            sequence,
+            fabric_mhz=300.0,
+            full_scale_mv=800.0,
+        )
+        record = build_awg_vertex_record(
+            sequence,
+            recipe["point_count"] - 1,
+            fabric_mhz=300.0,
+            full_scale_mv=800.0,
+        )
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert recipe["point_count"] == 4_090_601
+    assert record["sweep_coordinate"] == [0.5, 0.5, 1200.0]
+    assert peak_bytes < 5_000_000
+
+
+def test_run_defaults_to_parametric_awg_metadata(tmp_path, monkeypatch):
+    captured = {}
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 10)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 2)
+    soccfg = {
+        "tprocs": [{"f_time": 300.0}],
+        "gens": [{"f_fabric": 300.0}],
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_rate_profile": "1_msps",
+            "stored_sample_rate_hz": 1_000_000.0,
+            "fir_decimation": 300,
+            "fir_input_fs_mhz": 300.0,
+            "fir_group_delay_input_samples": 8677.0,
+        },
+    }
+
+    class FakeProgram:
+        def summary(self):
+            return {}
+
+    monkeypatch.setattr(
+        experiment_module,
+        "connect_qick",
+        lambda *_args, **_kwargs: (object(), soccfg),
+    )
+    monkeypatch.setattr(
+        experiment_module,
+        "execute_qick_sequence",
+        lambda *_args, **_kwargs: (FakeProgram(), _ddr_result(), {}),
+    )
+    monkeypatch.setattr(
+        experiment_module,
+        "build_awg_vertex_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default metadata mode expanded all vertices")
+        ),
+    )
+
+    def fake_store(_ddr_result, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(run_id=92, guid="recipe-guid"), 1
+
+    monkeypatch.setattr(experiment_module, "store_qick_result", fake_store)
+    result = run_qick_qcodes_experiment(
+        connection_config=QickConnectionConfig("host", 8888, "proxy"),
+        run_config=QcodesRunConfig(str(tmp_path / "recipe.db")),
+        sequence=sequence,
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        rf_specs=(),
+        readout_spec=QickDdrReadoutSpec(0, "gate", 0.0, 3),
+        gui_settings={"qick": {"fabric_mhz": 300.0, "full_scale_mv": 800.0}},
+    )
+
+    stored = captured["gui_settings"]
+    assert result.guid == "recipe-guid"
+    assert stored["qick"]["awg_metadata_mode"] == DEFAULT_AWG_METADATA_MODE
+    assert stored["awg_waveform_recipe"]["point_count"] == 2
+    assert "awg_waveform_vertices" not in stored
+
+
+def test_run_expanded_mode_builds_awg_vertex_metadata(tmp_path, monkeypatch):
+    captured = {}
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 10)
+    sequence.set_amplitude_sweep("gate", "awg_0", -0.5, 0.5, 2)
+    soccfg = {
+        "tprocs": [{"f_time": 300.0}],
+        "gens": [{"f_fabric": 300.0}],
+        "ddr4_buf": {
+            "sample_capture": True,
+            "fir_enabled": True,
+            "fir_rate_profile": "1_msps",
+            "stored_sample_rate_hz": 1_000_000.0,
+            "fir_decimation": 300,
+            "fir_input_fs_mhz": 300.0,
+            "fir_group_delay_input_samples": 8677.0,
+        },
+    }
+
+    class FakeProgram:
+        def summary(self):
+            return {}
+
+    monkeypatch.setattr(
+        experiment_module,
+        "connect_qick",
+        lambda *_args, **_kwargs: (object(), soccfg),
+    )
+    monkeypatch.setattr(
+        experiment_module,
+        "execute_qick_sequence",
+        lambda *_args, **_kwargs: (FakeProgram(), _ddr_result(), {}),
+    )
+
+    def fake_store(_ddr_result, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(run_id=93, guid="expanded-guid"), 1
+
+    monkeypatch.setattr(experiment_module, "store_qick_result", fake_store)
+    run_qick_qcodes_experiment(
+        connection_config=QickConnectionConfig("host", 8888, "proxy"),
+        run_config=QcodesRunConfig(str(tmp_path / "expanded.db")),
+        sequence=sequence,
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        rf_specs=(),
+        readout_spec=QickDdrReadoutSpec(0, "gate", 0.0, 3),
+        gui_settings={
+            "qick": {
+                "fabric_mhz": 300.0,
+                "full_scale_mv": 800.0,
+                "awg_metadata_mode": AWG_METADATA_MODE_EXPANDED,
+            }
+        },
+    )
+
+    stored = captured["gui_settings"]
+    assert stored["qick"]["awg_metadata_mode"] == AWG_METADATA_MODE_EXPANDED
+    assert stored["awg_waveform_vertices"]["virtual"]["value_shape"] == [2, 1, 2]
 
 
 def test_runtime_configs_accept_manual_tproc_clock_override():
