@@ -605,3 +605,63 @@ def test_saved_stability_run_refreshes_trace_overlay_selector(tmp_path):
     assert window._trace_overlay_selector.database_path.value == str(database_path)
     assert window._trace_overlay_selector.refresh_count == 1
     assert window._trace_overlay_selector.latest is stored.diagram
+
+
+def test_settings_json_restores_pinned_trace_overlay(tmp_path):
+    app = _application()
+    database_path = tmp_path / "saved_stability.db"
+    source = gui.MainWindow()
+    source._trace_overlay_result = replace(
+        _result(),
+        source_label="QCoDeS Run 42",
+        database_path=str(database_path),
+        run_id=42,
+    )
+    source._trace_overlay_pinned = True
+    source._trace_overlay_quantity = "q"
+
+    saved_path = source._save_settings_json(tmp_path / "trace_overlay")
+    saved_settings = source._settings_to_dict()
+    assert saved_settings["display"]["trace_stability_overlay"] == {
+        "mode": "saved",
+        "database_path": str(database_path),
+        "run_id": 42,
+        "quantity": "q",
+    }
+
+    restored = gui.MainWindow()
+    load_requests = []
+    restored._load_trace_stability_overlay = (
+        lambda path, run_id, quantity: load_requests.append(
+            (path, run_id, quantity)
+        )
+    )
+    restored._load_settings_json(saved_path)
+
+    assert load_requests == [(str(database_path), 42, "q")]
+    assert restored._trace_overlay_selector.database_path.text() == str(
+        database_path
+    )
+    assert restored._trace_overlay_selector.run_combo.currentData() == 42
+    assert restored._trace_overlay_selector.quantity == "q"
+    source.close()
+    restored.close()
+    app.processEvents()
+
+
+def test_old_settings_without_trace_overlay_follow_latest_scan():
+    app = _application()
+    source = gui.MainWindow()
+    document = source._settings_to_dict()
+    document["version"] = 32
+    document["display"].pop("trace_stability_overlay")
+
+    restored = gui.MainWindow()
+    decoded = restored._decode_settings(document)
+
+    assert decoded["trace_stability_overlay"]["mode"] == "latest"
+    assert decoded["trace_stability_overlay"]["run_id"] == 0
+    assert decoded["trace_stability_overlay"]["quantity"] == "magnitude"
+    source.close()
+    restored.close()
+    app.processEvents()

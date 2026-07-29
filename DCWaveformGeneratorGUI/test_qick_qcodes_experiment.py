@@ -1156,6 +1156,7 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
             soc,
             progress=False,
             counter_progress=None,
+            readback_progress=None,
             phase_callback=None,
         ):
             calls.append(("acquire", soc, progress))
@@ -1170,6 +1171,11 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
             if phase_callback is not None:
                 phase_callback("acquisition", "completed", "Acquired")
                 phase_callback("ddr_readback", "started", "Reading")
+            if readback_progress is not None:
+                readback_progress(0, 4)
+                readback_progress(1, 4)
+                readback_progress(4, 4)
+            if phase_callback is not None:
                 phase_callback("ddr_readback", "completed", "Read")
             return ddr_result
 
@@ -1249,7 +1255,13 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert progress_updates[-1] == (100, "Experiment saved")
     assert any(percent == 32 for percent, _ in progress_updates)
     assert any(percent == 55 for percent, _ in progress_updates)
-    assert any(percent == 60 for percent, _ in progress_updates)
+    assert any(percent == 57 for percent, _ in progress_updates)
+    assert any(percent == 64 for percent, _ in progress_updates)
+    assert any(
+        "Reading FIR DDR traces 1/4" in message
+        and "3/12 I/Q sample pairs" in message
+        for _, message in progress_updates
+    )
     assert ("connection", "started") in [
         event[:2] for event in event_updates
     ]

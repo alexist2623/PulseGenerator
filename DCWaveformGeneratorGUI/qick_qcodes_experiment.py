@@ -1028,6 +1028,23 @@ def execute_qick_sequence(
             ),
         )
 
+    def readback_progress(completed: int, total: int) -> None:
+        fraction = 1.0 if total <= 0 else completed / total
+        fraction = max(0.0, min(1.0, fraction))
+        percent = 55 + round(fraction * 9)
+        samples_per_trigger = int(readout_spec.samples_per_trigger)
+        completed_samples = int(completed) * samples_per_trigger
+        total_samples = int(total) * samples_per_trigger
+        _emit_progress(
+            progress_callback,
+            percent,
+            (
+                f"Reading FIR DDR traces {completed:,}/{total:,} "
+                f"({100.0 * fraction:.1f}% readback; "
+                f"{completed_samples:,}/{total_samples:,} I/Q sample pairs)"
+            ),
+        )
+
     acquire_kwargs = {
         "progress": progress,
         "counter_progress": (
@@ -1035,11 +1052,18 @@ def execute_qick_sequence(
             if progress_callback is not None or event_callback is not None
             else None
         ),
+        "readback_progress": (
+            readback_progress if progress_callback is not None else None
+        ),
     }
     if event_callback is not None:
         acquire_kwargs["phase_callback"] = event_callback
     ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
-    _emit_progress(progress_callback, 60, "FIR DDR acquisition completed")
+    _emit_progress(
+        progress_callback,
+        64,
+        "FIR DDR acquisition and readback completed",
+    )
     return program, ddr_result, rf_settings
 
 

@@ -6167,6 +6167,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         *,
         progress: bool = True,
         counter_progress=None,
+        readback_progress=None,
         phase_callback=None,
         readback_chunk_triggers: int = DEFAULT_DDR_READBACK_TRIGGER_CHUNK,
         **run_kwargs,
@@ -6284,6 +6285,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 f"{readback_chunks:,} chunk(s)"
             ),
         )
+        if readback_progress is not None:
+            readback_progress(0, n_triggers)
         for first_trigger in range(
             0,
             n_triggers,
@@ -6318,6 +6321,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 first_trigger + chunk_trigger_count
             ) * ddr.samples_per_trigger
             raw[first_sample:last_sample] = chunk
+            if readback_progress is not None:
+                readback_progress(
+                    first_trigger + chunk_trigger_count,
+                    n_triggers,
+                )
 
         if raw is None:
             raise RuntimeError("DDR readback produced no chunks")

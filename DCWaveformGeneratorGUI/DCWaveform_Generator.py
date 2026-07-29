@@ -243,6 +243,7 @@ except ImportError:
 
 try:
     from .stability_diagram import (
+        DEFAULT_STABILITY_DB_PATH,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -252,6 +253,7 @@ try:
     )
 except ImportError:
     from stability_diagram import (
+        DEFAULT_STABILITY_DB_PATH,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -336,7 +338,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 32
+SETTINGS_VERSION = 33
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
@@ -10375,6 +10377,38 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Trace Plot now follows the latest Stability Diagram scan"
         )
 
+    def _restore_trace_stability_overlay_settings(self, settings: dict) -> None:
+        """Restore the Trace Plot overlay selector and reload a saved run."""
+        selector = self._trace_overlay_selector
+        database_path = str(settings["database_path"])
+        run_id = int(settings["run_id"])
+        quantity = str(settings["quantity"])
+
+        selector.database_path.setText(database_path)
+        quantity_index = selector.quantity_combo.findData(quantity)
+        with QtCore.QSignalBlocker(selector.quantity_combo):
+            selector.quantity_combo.setCurrentIndex(quantity_index)
+        self._trace_overlay_quantity = quantity
+
+        selector.run_combo.clear()
+        if run_id > 0:
+            selector.run_combo.addItem(
+                f"Run {run_id} (from loaded settings)",
+                run_id,
+            )
+
+        if settings["mode"] == "saved":
+            self._trace_overlay_pinned = False
+            self._trace_overlay_result = None
+            self._apply_trace_stability_overlay()
+            self._load_trace_stability_overlay(
+                database_path,
+                run_id,
+                quantity,
+            )
+        else:
+            self._use_latest_trace_stability_overlay()
+
     def _load_trace_stability_overlay(
         self,
         database_path: str,
@@ -11169,6 +11203,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if force or self._trace.uses_port(self._selected_port_idx):
             self._trace.refresh_trace(self._pulse)
 
+    def _trace_stability_overlay_settings(self) -> dict:
+        """Return the reloadable Trace Plot overlay selection."""
+        selector = self._trace_overlay_selector
+        quantity = str(
+            getattr(self, "_trace_overlay_quantity", selector.quantity)
+        )
+        database_path = selector.database_path.text().strip()
+        selected_run_id = selector.run_combo.currentData()
+        run_id = int(selected_run_id) if selected_run_id is not None else 0
+        mode = "latest"
+
+        result = getattr(self, "_trace_overlay_result", None)
+        if getattr(self, "_trace_overlay_pinned", False) and result is not None:
+            result_database = str(
+                getattr(result, "database_path", "")
+            ).strip()
+            result_run_id = int(getattr(result, "run_id", 0) or 0)
+            if result_database and result_run_id > 0:
+                mode = "saved"
+                database_path = result_database
+                run_id = result_run_id
+
+        return {
+            "mode": mode,
+            "database_path": database_path or DEFAULT_STABILITY_DB_PATH,
+            "run_id": run_id,
+            "quantity": quantity,
+        }
+
     def _settings_to_dict(self) -> dict:
         """Return every user-editable experiment setting in canonical units."""
         experiment_values = self._experiment_panel.values(len(self._pulse))
@@ -11220,6 +11283,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "selected_awg_output": self._selected_port_idx,
                 "selected_control_tab": self._control_tabs.currentIndex(),
                 "selected_awg_tuning_tab": self._awg_tuning_tabs.currentIndex(),
+                "trace_stability_overlay": (
+                    self._trace_stability_overlay_settings()
+                ),
             },
             "grid": {
                 "time_step_ns": self._grid_time_ns,
@@ -11620,6 +11686,46 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         voltage_view = str(display.get("voltage_view", "both"))
         if voltage_view not in {"both", "virtual", "physical"}:
             raise ValueError(f"unsupported voltage view {voltage_view!r}")
+        raw_trace_overlay = display.get("trace_stability_overlay", {})
+        if raw_trace_overlay is None:
+            raw_trace_overlay = {}
+        if not isinstance(raw_trace_overlay, dict):
+            raise TypeError(
+                "display trace_stability_overlay must be a JSON object"
+            )
+        trace_overlay_mode = str(
+            raw_trace_overlay.get("mode", "latest")
+        ).strip().lower()
+        if trace_overlay_mode not in {"latest", "saved"}:
+            raise ValueError(
+                "Trace Plot Stability overlay mode must be latest or saved"
+            )
+        trace_overlay_database_path = str(
+            raw_trace_overlay.get(
+                "database_path",
+                DEFAULT_STABILITY_DB_PATH,
+            )
+        ).strip()
+        if not trace_overlay_database_path:
+            raise ValueError(
+                "Trace Plot Stability overlay database path must not be empty"
+            )
+        trace_overlay_run_id = self._json_int(
+            raw_trace_overlay.get("run_id", 0),
+            "Trace Plot Stability overlay run_id",
+        )
+        trace_overlay_quantity = str(
+            raw_trace_overlay.get("quantity", "magnitude")
+        ).strip().lower()
+        if trace_overlay_quantity not in {"i", "q", "magnitude", "phase"}:
+            raise ValueError(
+                "Trace Plot Stability overlay quantity must be "
+                "i, q, magnitude, or phase"
+            )
+        if trace_overlay_mode == "saved" and trace_overlay_run_id < 1:
+            raise ValueError(
+                "a saved Trace Plot Stability overlay requires run_id >= 1"
+            )
 
         raw_outputs = awg.get("outputs")
         if not isinstance(raw_outputs, list) or not 1 <= len(raw_outputs) <= 8:
@@ -12528,6 +12634,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "selected_output": selected_output,
             "selected_tab": selected_tab,
             "selected_awg_tuning_tab": selected_awg_tuning_tab,
+            "trace_stability_overlay": {
+                "mode": trace_overlay_mode,
+                "database_path": trace_overlay_database_path,
+                "run_id": trace_overlay_run_id,
+                "quantity": trace_overlay_quantity,
+            },
             "grid_time_ns": self._json_finite_float(
                 grid.get("time_step_ns", 1000.0),
                 "grid time_step_ns",
@@ -12698,6 +12810,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_trace_if_needed(force=True)
         self._refresh_rf_timeline(fit_view=True)
         self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        self._restore_trace_stability_overlay_settings(
+            settings["trace_stability_overlay"]
+        )
 
     def _apply_legacy_settings(self, data: dict) -> None:
         """Read the original single-waveform JSON format."""
