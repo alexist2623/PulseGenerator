@@ -74,6 +74,33 @@ ProgressCallback = Callable[[int, str], None]
 ToneRunner = Callable[[Any, Any, int, int, float, int, int], float]
 MAX_RF_PERIODIC_WORD_CYCLES = 65535
 RF_STOP_WORD_CYCLES = 3
+MIN_VALID_OSCILLOSCOPE_POWER_DBM = -200.0
+MAX_VALID_OSCILLOSCOPE_POWER_DBM = 100.0
+
+
+class InvalidOscilloscopePowerError(RuntimeError):
+    """Raised when an oscilloscope marker cannot be used as calibration data."""
+
+
+def _valid_oscilloscope_power_dbm(value: Any) -> bool:
+    try:
+        power_dbm = float(value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        np.isfinite(power_dbm)
+        and MIN_VALID_OSCILLOSCOPE_POWER_DBM
+        <= power_dbm
+        <= MAX_VALID_OSCILLOSCOPE_POWER_DBM
+    )
+
+
+def _invalid_power_message(value: Any) -> str:
+    return (
+        f"oscilloscope power {value!r} dBm is outside the valid calibration "
+        f"range {MIN_VALID_OSCILLOSCOPE_POWER_DBM:g}.."
+        f"{MAX_VALID_OSCILLOSCOPE_POWER_DBM:g} dBm"
+    )
 
 
 def _emit_progress(
@@ -490,9 +517,21 @@ class KeysightFftPowerMeter:
             if self.config.sample_interval_seconds:
                 time.sleep(self.config.sample_interval_seconds)
         values = np.asarray(readings, dtype=float)
-        if not np.all(np.isfinite(values)):
-            raise RuntimeError("oscilloscope returned a non-finite FFT power")
-        return float(np.mean(values))
+        valid = np.asarray(
+            [_valid_oscilloscope_power_dbm(value) for value in values],
+            dtype=bool,
+        )
+        if not np.all(valid):
+            invalid_value = values[np.flatnonzero(~valid)[0]]
+            raise InvalidOscilloscopePowerError(
+                _invalid_power_message(float(invalid_value))
+            )
+        measured_power = float(np.mean(values))
+        if not _valid_oscilloscope_power_dbm(measured_power):
+            raise InvalidOscilloscopePowerError(
+                _invalid_power_message(measured_power)
+            )
+        return measured_power
 
 
 def _run_tone_program(
@@ -583,7 +622,21 @@ def _store_output_calibration(
     *,
     rf_settings: Mapping[str, Any],
     scope_identity: str,
+    excluded_points: Tuple[Mapping[str, Any], ...] = (),
 ) -> StoredCalibrationRun:
+    valid_power = (
+        np.isfinite(powers_dbm)
+        & (powers_dbm >= MIN_VALID_OSCILLOSCOPE_POWER_DBM)
+        & (powers_dbm <= MAX_VALID_OSCILLOSCOPE_POWER_DBM)
+    )
+    valid_count = int(np.count_nonzero(valid_power))
+    excluded_count = int(valid_power.size - valid_count)
+    if valid_count < 1:
+        raise RuntimeError(
+            "oscilloscope calibration produced no valid power points; "
+            f"accepted range is {MIN_VALID_OSCILLOSCOPE_POWER_DBM:g}.."
+            f"{MAX_VALID_OSCILLOSCOPE_POWER_DBM:g} dBm"
+        )
     try:
         from qcodes import (
             Measurement,
@@ -629,6 +682,13 @@ def _store_output_calibration(
             "rf_settings_actual": dict(rf_settings),
             "oscilloscope_identity": scope_identity,
             "formula": "P(f,g)=response(f)+20*log10(g/32766)-attenuation_delta",
+            "measurement_validation": {
+                "minimum_power_dbm": MIN_VALID_OSCILLOSCOPE_POWER_DBM,
+                "maximum_power_dbm": MAX_VALID_OSCILLOSCOPE_POWER_DBM,
+                "valid_point_count": valid_count,
+                "excluded_point_count": excluded_count,
+                "excluded_points": [dict(point) for point in excluded_points],
+            },
         }
         with measurement.run(
             write_in_background=False,
@@ -649,6 +709,8 @@ def _store_output_calibration(
                 dataset.add_metadata("calibration_notes", config.notes)
             for gain_index, gain in enumerate(gains):
                 for frequency_index, frequency in enumerate(frequencies_mhz):
+                    if not valid_power[gain_index, frequency_index]:
+                        continue
                     datasaver.add_result(
                         (gain_parameter, int(gain)),
                         (frequency_parameter, float(frequency)),
@@ -669,13 +731,22 @@ def _store_output_calibration(
             run_id=run_id,
             guid=guid,
             database_path=database_path,
-            row_count=int(gains.size * frequencies_mhz.size),
+            row_count=valid_count,
             board_type=config.output_board_type,
             dataset=final_dataset,
             result={
                 "frequencies_mhz": frequencies_mhz.tolist(),
                 "gains": gains.tolist(),
-                "powers_dbm": powers_dbm.tolist(),
+                "powers_dbm": [
+                    [
+                        float(value) if valid_power[gain_index, frequency_index] else None
+                        for frequency_index, value in enumerate(row)
+                    ]
+                    for gain_index, row in enumerate(powers_dbm)
+                ],
+                "valid_point_count": valid_count,
+                "excluded_point_count": excluded_count,
+                "excluded_points": [dict(point) for point in excluded_points],
             },
         )
     finally:
@@ -706,10 +777,11 @@ def run_output_power_calibration(
     soc, soccfg = connect_qick(connection_config, connector=connector)
     _emit_progress(progress_callback, 3, "Configuring calibrated RF output chain")
     rf_settings = _configure_output_chain(soc, calibration_config)
-    measured = np.empty((gains.size, frequencies.size), dtype=float)
+    measured = np.full((gains.size, frequencies.size), np.nan, dtype=float)
     actual_frequencies = np.empty(frequencies.size, dtype=float)
     completed = 0
     scope_identity = ""
+    excluded_points = []
     try:
         with power_meter_factory(calibration_config.oscilloscope) as meter:
             scope_identity = str(getattr(meter, "idn", ""))
@@ -726,16 +798,39 @@ def run_output_power_calibration(
                     )
                     if gain_index == 0:
                         actual_frequencies[frequency_index] = actual_frequency
-                    measured[gain_index, frequency_index] = meter.measure_power_dbm(
-                        actual_frequency
-                    )
+                    try:
+                        measured_power = meter.measure_power_dbm(actual_frequency)
+                    except InvalidOscilloscopePowerError as exc:
+                        measured_power = np.nan
+                        invalid_reason = str(exc)
+                    else:
+                        if _valid_oscilloscope_power_dbm(measured_power):
+                            measured_power = float(measured_power)
+                            invalid_reason = ""
+                        else:
+                            invalid_reason = _invalid_power_message(measured_power)
+                            measured_power = np.nan
+                    measured[gain_index, frequency_index] = measured_power
+                    if invalid_reason:
+                        excluded_points.append(
+                            {
+                                "frequency_mhz": float(actual_frequency),
+                                "gain": int(gain),
+                                "reason": invalid_reason,
+                            }
+                        )
                     completed += 1
                     _emit_progress(
                         progress_callback,
                         5 + round(83 * completed / total),
                         (
-                            f"Scope calibration {completed}/{total}: "
+                            f"Excluded invalid scope point {completed}/{total}: "
                             f"{actual_frequency:.9g} MHz, gain {int(gain)}"
+                            if invalid_reason
+                            else (
+                                f"Scope calibration {completed}/{total}: "
+                                f"{actual_frequency:.9g} MHz, gain {int(gain)}"
+                            )
                         ),
                     )
     finally:
@@ -759,9 +854,20 @@ def run_output_power_calibration(
         measured,
         rf_settings=rf_settings,
         scope_identity=scope_identity,
+        excluded_points=tuple(excluded_points),
     )
     _emit_progress(
-        progress_callback, 100, f"Output calibration Run {stored.run_id} saved"
+        progress_callback,
+        100,
+        (
+            f"Output calibration Run {stored.run_id} saved "
+            f"({stored.row_count}/{total} valid points"
+            + (
+                f", {len(excluded_points)} excluded)"
+                if excluded_points
+                else ")"
+            )
+        ),
     )
     return stored
 
@@ -1070,8 +1176,11 @@ def run_input_power_calibration(
 
 
 __all__ = [
+    "InvalidOscilloscopePowerError",
     "InputPowerCalibrationConfig",
     "KeysightFftPowerMeter",
+    "MAX_VALID_OSCILLOSCOPE_POWER_DBM",
+    "MIN_VALID_OSCILLOSCOPE_POWER_DBM",
     "OscilloscopeConfig",
     "OutputPowerCalibrationConfig",
     "StoredCalibrationRun",

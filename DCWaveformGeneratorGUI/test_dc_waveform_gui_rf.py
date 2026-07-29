@@ -596,6 +596,46 @@ def test_settings_restore_rf_frequency_slice_and_ignore_removed_slice(tmp_path):
     app.processEvents()
 
 
+def test_settings_clamp_stale_indexed_rf_anchors(tmp_path):
+    app = _application()
+    source = gui.MainWindow()
+    pulse = PulseSequence(0.0, initial_duration_ns=1000.0)
+    pulse.add_flat_ramp(100.0, 100.0, 1000.0)
+    pulse.add_flat_ramp(200.0, 100.0, 1000.0)
+    document = source._settings_to_dict()
+    document["awg"]["outputs"] = [pulse.to_dict()]
+    document["rf_outputs"][0]["enabled"] = True
+    document["rf_outputs"][0]["segment_name"] = "set_4"
+    document["rf_readout"]["enabled"] = True
+    document["rf_readout"]["segment_name"] = "set_3"
+    path = tmp_path / "stale_rf_anchors.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    restored = gui.MainWindow()
+    restored._load_settings_json(path)
+    app.processEvents()
+
+    assert restored._rf_ports_panel._panels[0].segment.currentData() == "set_2"
+    assert restored._rf_readout_panel.segment.currentData() == "set_2"
+    upgraded = restored._settings_to_dict()
+    assert upgraded["rf_outputs"][0]["segment_name"] == "set_2"
+    assert upgraded["rf_readout"]["segment_name"] == "set_2"
+
+    malformed = json.loads(json.dumps(document))
+    malformed["rf_readout"]["segment_name"] = "measurement"
+    with pytest.raises(
+        ValueError,
+        match="unknown RF readout anchor 'measurement'",
+    ):
+        source._decode_settings(malformed)
+
+    restored.close()
+    source.close()
+    restored.deleteLater()
+    source.deleteLater()
+    app.processEvents()
+
+
 def test_rf_output_power_calibration_applies_matching_gain_and_round_trips(
     monkeypatch,
 ):

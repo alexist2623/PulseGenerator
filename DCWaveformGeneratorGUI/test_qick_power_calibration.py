@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt5 import QtWidgets
+import pytest
 import qick.asm_v1 as qick_asm_v1
 
 import qick_power_calibration as calibration_module
@@ -24,6 +25,7 @@ from calibration_gui import (
 from power_calibration import CalibrationDatabase, MAX_QICK_GAIN
 from qick_power_calibration import (
     InputPowerCalibrationConfig,
+    InvalidOscilloscopePowerError,
     KeysightFftPowerMeter,
     OscilloscopeConfig,
     OutputPowerCalibrationConfig,
@@ -101,6 +103,50 @@ def test_keysight_fft_adapter_uses_original_notebook_scpi(monkeypatch):
     assert ":FUNCtion1:SOURce CHANnel2" in instrument.commands
     assert ":MARKer:X1Position 450000000" in instrument.commands
     assert instrument.commands.count(":MARKer:Y1Position?") == 2
+
+
+def test_keysight_fft_adapter_rejects_absurd_power(monkeypatch):
+    class Instrument:
+        def __init__(self):
+            self.timeout = None
+            self.write_termination = None
+            self.read_termination = None
+
+        def write(self, _command):
+            pass
+
+        def query(self, command):
+            if command == "*IDN?":
+                return "AGILENT TECHNOLOGIES,DSO-X 6004A,TEST,1.0"
+            return "1e30"
+
+        def close(self):
+            pass
+
+    class ResourceManager:
+        def open_resource(self, _resource):
+            return Instrument()
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pyvisa",
+        SimpleNamespace(ResourceManager=ResourceManager),
+    )
+    config = OscilloscopeConfig(
+        visa_resource="USB::TEST",
+        average_count=1,
+        settle_seconds=0.0,
+        sample_interval_seconds=0.0,
+    )
+    with KeysightFftPowerMeter(config) as meter:
+        with pytest.raises(
+            InvalidOscilloscopePowerError,
+            match="outside the valid calibration range",
+        ):
+            meter.measure_power_dbm(450.0)
 
 
 def test_output_calibration_clamps_periodic_word_not_total_tone_time(monkeypatch):
@@ -430,6 +476,80 @@ def _create_output_calibration(tmp_path, monkeypatch):
     assert stored.row_count == 9
     assert tone_calls[-1][3] == 0
     return database_path, stored
+
+
+def test_output_calibration_excludes_absurd_scope_point(tmp_path, monkeypatch):
+    database_path = tmp_path / "filtered_gain_pwr_calb.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    state = {"gain": 0, "frequency_mhz": 0.0}
+
+    def tone_runner(
+        _soc,
+        _soccfg,
+        _output_ch,
+        _nqz,
+        frequency_mhz,
+        gain,
+        _length_cycles,
+    ):
+        state["gain"] = int(gain)
+        state["frequency_mhz"] = float(frequency_mhz)
+        return float(frequency_mhz)
+
+    class Meter:
+        idn = "AGILENT TECHNOLOGIES,DSO-X 6004A,TEST,1.0"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def measure_power_dbm(self, _frequency_mhz):
+            if state["gain"] == 10_000 and state["frequency_mhz"] == 420.0:
+                return 1.0e30
+            return -10.0 + 20.0 * np.log10(state["gain"] / MAX_QICK_GAIN)
+
+    config = OutputPowerCalibrationConfig(
+        database_path=str(database_path),
+        output_board_type="RF_Out",
+        frequency_start_mhz=400.0,
+        frequency_end_mhz=420.0,
+        frequency_points=2,
+        gain_start=1000,
+        gain_end=10_000,
+        gain_points=2,
+        oscilloscope=OscilloscopeConfig(visa_resource="MOCK"),
+    )
+    stored = run_output_power_calibration(
+        connection_config=QickConnectionConfig(host="127.0.0.1"),
+        calibration_config=config,
+        connector=lambda **_kwargs: (_FakeSoc(), object()),
+        power_meter_factory=lambda _config: Meter(),
+        tone_runner=tone_runner,
+    )
+
+    assert stored.row_count == 3
+    assert stored.result["valid_point_count"] == 3
+    assert stored.result["excluded_point_count"] == 1
+    assert stored.result["powers_dbm"][1][1] is None
+    assert "1e+30" in stored.result["excluded_points"][0]["reason"]
+
+    loaded = CalibrationDatabase(database_path).output_calibration(
+        "RF_Out",
+        [400.0, 420.0],
+    )
+    assert loaded.summary.row_count == 3
+    assert np.all(
+        np.isfinite(loaded.output_power_dbm([400.0, 420.0], [1000, 1000]))
+    )
+
+    app = _application()
+    panel = CalibrationPanel()
+    panel.show_result(stored)
+    app.processEvents()
+    assert "Excluded 1 invalid oscilloscope power point" in panel.status.text()
+    panel.close()
 
 
 def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):

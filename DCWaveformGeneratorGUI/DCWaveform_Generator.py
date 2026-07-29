@@ -440,6 +440,33 @@ def _remap_set_segment_name(
     return f"set_{current_index}"
 
 
+def _resolve_stored_set_segment_name(
+    segment_name: str,
+    valid_names: Sequence[str],
+    *,
+    label: str,
+) -> str:
+    """Clamp a stale indexed SET reference while rejecting malformed anchors."""
+    segment_name = str(segment_name)
+    valid_names = tuple(str(name) for name in valid_names)
+    if segment_name in valid_names:
+        return segment_name
+
+    match = re.fullmatch(r"set_(\d+)", segment_name)
+    indexed_names = []
+    for name in valid_names:
+        valid_match = re.fullmatch(r"set_(\d+)", name)
+        if valid_match is not None:
+            indexed_names.append((int(valid_match.group(1)), name))
+    if match is not None and indexed_names:
+        stored_index = int(match.group(1))
+        return min(
+            indexed_names,
+            key=lambda item: (abs(item[0] - stored_index), item[0]),
+        )[1]
+    raise ValueError(f"unknown {label} anchor {segment_name!r}")
+
+
 def _remap_ramp_segment_name(
     segment_name: str,
     operation: str,
@@ -3936,7 +3963,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             raise TypeError("RF power_calibration_enabled must be boolean")
         spec = QickRfPulseSpec(
             gen_ch=int(data["gen_ch"]),
-            segment_name=str(data["segment_name"]),
+            segment_name=_resolve_stored_set_segment_name(
+                data["segment_name"],
+                tuple(
+                    self.segment.itemData(index)
+                    for index in range(self.segment.count())
+                ),
+                label="RF output",
+            ),
             delay_us=float(data["delay_us"]),
             duration_us=float(data["duration_us"]),
             frequency_mhz=float(data["frequency_mhz"]),
@@ -4937,7 +4971,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             )
         spec = QickDdrReadoutSpec(
             ro_ch=int(data["ro_ch"]),
-            segment_name=str(data["segment_name"]),
+            segment_name=_resolve_stored_set_segment_name(
+                data["segment_name"],
+                tuple(
+                    self.segment.itemData(index)
+                    for index in range(self.segment.count())
+                ),
+                label="RF readout",
+            ),
             delay_us=float(data["delay_us"]),
             samples_per_trigger=int(data["samples_per_trigger"]),
             readout_frequency_mhz=float(data.get("readout_frequency_mhz", 0.0)),
@@ -10886,7 +10927,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], f"{label} generator channel"),
-                segment_name=str(entry["segment_name"]),
+                segment_name=_resolve_stored_set_segment_name(
+                    entry["segment_name"],
+                    set_names,
+                    label=label,
+                ),
                 delay_us=float(entry["delay_us"]),
                 duration_us=float(entry["duration_us"]),
                 frequency_mhz=float(entry["frequency_mhz"]),
@@ -11023,7 +11068,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         enabled = self._json_bool(entry["enabled"], f"{label} enabled")
         spec = QickDdrReadoutSpec(
             ro_ch=self._json_int(entry["ro_ch"], f"{label} channel"),
-            segment_name=str(entry["segment_name"]),
+            segment_name=_resolve_stored_set_segment_name(
+                entry["segment_name"],
+                set_names,
+                label=label,
+            ),
             delay_us=float(entry["delay_us"]),
             samples_per_trigger=self._json_int(
                 entry["samples_per_trigger"],
@@ -11725,7 +11774,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], "RF generator channel"),
-                segment_name=str(entry["segment_name"]),
+                segment_name=_resolve_stored_set_segment_name(
+                    entry["segment_name"],
+                    set_names,
+                    label="RF output",
+                ),
                 delay_us=float(entry["delay_us"]),
                 duration_us=float(entry["duration_us"]),
                 frequency_mhz=float(entry["frequency_mhz"]),
@@ -11870,7 +11923,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         readout_spec = QickDdrReadoutSpec(
             ro_ch=self._json_int(raw_readout["ro_ch"], "RF readout channel"),
-            segment_name=str(raw_readout["segment_name"]),
+            segment_name=_resolve_stored_set_segment_name(
+                raw_readout["segment_name"],
+                set_names,
+                label="RF readout",
+            ),
             delay_us=float(raw_readout["delay_us"]),
             samples_per_trigger=self._json_int(
                 raw_readout["samples_per_trigger"],

@@ -1779,6 +1779,13 @@ class CalibrationPanel(QtWidgets.QWidget):
     def show_result(self, stored) -> None:
         plot_message = ""
         result = getattr(stored, "result", None)
+        if isinstance(result, Mapping):
+            excluded_count = int(result.get("excluded_point_count", 0) or 0)
+            if excluded_count:
+                plot_message = (
+                    f"\nExcluded {excluded_count:,} invalid oscilloscope "
+                    "power point(s)."
+                )
         if isinstance(result, Mapping) and {
             "frequencies_mhz",
             "gains",
@@ -1788,7 +1795,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             try:
                 self.input_response_plot.set_result(result)
             except (TypeError, ValueError) as exc:
-                plot_message = f"\nPlot unavailable: {exc}"
+                plot_message += f"\nPlot unavailable: {exc}"
             else:
                 self.tabs.setCurrentIndex(1)
         elif isinstance(result, Mapping) and "calibration" in result:
@@ -1796,7 +1803,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             try:
                 self.dc_voltage_response_plot.set_result(result)
             except (TypeError, ValueError) as exc:
-                plot_message = f"\nPlot unavailable: {exc}"
+                plot_message += f"\nPlot unavailable: {exc}"
             if isinstance(calibration, Mapping):
                 fit_message = (
                     "\n0 MHz DC voltage fit: "
