@@ -107,6 +107,88 @@ def test_matching_awg_segments_share_user_facing_name_edits():
     window.close()
 
 
+def test_appending_segment_adds_matching_row_to_every_awg_output():
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    port_0_initial = float(window._pulse[0].v[-1])
+    assert window._pulse[1].edit_voltage(0, -300.0)
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_0", "awg_1", -0.2, 0.2, 4),
+        QickHoldDurationSweepSpec("set_0", 1.0, 2.0, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+    original_specs = list(window._sweep_specs)
+
+    window._port_select(1)
+    window._add_segment(750.0, 1250.0, 225.0)
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (2, 2)
+    assert _segment_timing_ns(window._pulse[0], 1) == (750.0, 1250.0)
+    assert _segment_timing_ns(window._pulse[1], 1) == (750.0, 1250.0)
+    assert window._pulse[0].v[2:4].tolist() == [
+        port_0_initial,
+        port_0_initial,
+    ]
+    assert window._pulse[1].v[2:4].tolist() == [225.0, 225.0]
+    assert window._pulse[0].segment_names == window._pulse[1].segment_names
+    assert window._sweep_specs == original_specs
+    assert window._multi_ctrl._ctrl_pannels[0]._sweep_rows == {0}
+    assert window._multi_ctrl._ctrl_pannels[1]._sweep_rows == {0}
+    assert all(
+        control._hold_sweep_rows == {0}
+        for control in window._multi_ctrl._ctrl_pannels
+    )
+    assert tuple(
+        control.table.rowCount()
+        for control in window._multi_ctrl._ctrl_pannels
+    ) == (2, 2)
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_insert_and_delete_segment_rows_are_shared_across_awg_outputs():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._add_port()
+    for row, voltage in enumerate((-300.0, -200.0, -100.0, 50.0)):
+        assert window._pulse[1].edit_voltage(2 * row, voltage)
+    original_times = [pulse.t.copy() for pulse in window._pulse]
+    original_voltages = [pulse.v.copy() for pulse in window._pulse]
+    original_names = [list(pulse.segment_names) for pulse in window._pulse]
+
+    control_0, control_1 = window._multi_ctrl._ctrl_pannels
+    assert control_0._edit_segment_structure("insert_below", 1)
+    app.processEvents()
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (5, 5)
+    assert tuple(control.table.rowCount() for control in (control_0, control_1)) == (
+        5,
+        5,
+    )
+    assert window._pulse[0].v[4:6].tolist() == [
+        original_voltages[0][3],
+        original_voltages[0][3],
+    ]
+    assert window._pulse[1].v[4:6].tolist() == [-200.0, -200.0]
+    assert window._pulse[0].segment_names == window._pulse[1].segment_names
+
+    assert control_1._edit_segment_structure("delete", 2)
+    app.processEvents()
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (4, 4)
+    for index, pulse in enumerate(window._pulse):
+        assert np.array_equal(pulse.t, original_times[index])
+        assert np.array_equal(pulse.v, original_voltages[index])
+        assert pulse.segment_names == original_names[index]
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_waveform_time_drag_shares_matching_segment_timing():
     _application()
     window = gui.MainWindow()
@@ -325,7 +407,7 @@ def test_insert_and_delete_remap_shared_hold_duration_sweep():
     window.close()
 
 
-def test_insert_delete_sequence_remaps_only_affected_voltage_sweeps():
+def test_insert_delete_sequence_updates_all_ports_and_remaps_all_sweeps():
     app = _application()
     window = gui.MainWindow()
     _add_segments(window, 3)
@@ -353,15 +435,17 @@ def test_insert_delete_sequence_remaps_only_affected_voltage_sweeps():
         ("awg_0", "set_0"),
         ("awg_0", "set_1"),
         ("awg_0", "set_4"),
-        ("awg_1", "set_2"),
+        ("awg_1", "set_3"),
         ("all_awg_outputs", "ramp_0_to_1"),
+        ("all_awg_outputs", "ramp_3_to_4"),
     )
     assert panel.selected_sweep_axis_keys() == (
         ("awg_0", "set_4"),
-        ("awg_1", "set_2"),
+        ("awg_1", "set_3"),
     )
     assert control_0._sweep_rows == {0, 1, 4}
-    assert window._multi_ctrl._ctrl_pannels[1]._sweep_rows == {2}
+    assert window._multi_ctrl._ctrl_pannels[1]._sweep_rows == {3}
+    assert tuple(pulse.set_count for pulse in window._pulse) == (5, 5)
 
     assert control_0._edit_segment_structure("delete", 1)
     app.processEvents()
@@ -369,6 +453,7 @@ def test_insert_delete_sequence_remaps_only_affected_voltage_sweeps():
         ("awg_0", "set_0"),
         ("awg_0", "set_3"),
         ("awg_1", "set_2"),
+        ("all_awg_outputs", "ramp_2_to_3"),
     )
     assert panel.selected_sweep_axis_keys() == (
         ("awg_0", "set_3"),
@@ -376,29 +461,138 @@ def test_insert_delete_sequence_remaps_only_affected_voltage_sweeps():
     )
     assert control_0._sweep_rows == {0, 3}
     assert window._multi_ctrl._ctrl_pannels[1]._sweep_rows == {2}
+    assert tuple(pulse.set_count for pulse in window._pulse) == (4, 4)
 
     control_1 = window._multi_ctrl._ctrl_pannels[1]
     assert control_1._edit_segment_structure("insert_below", 0)
     app.processEvents()
     assert _sweep_targets(window) == (
         ("awg_0", "set_0"),
-        ("awg_0", "set_3"),
+        ("awg_0", "set_4"),
         ("awg_1", "set_3"),
+        ("all_awg_outputs", "ramp_3_to_4"),
     )
     assert panel.selected_sweep_axis_keys() == (
-        ("awg_0", "set_3"),
+        ("awg_0", "set_4"),
         ("awg_1", "set_3"),
     )
+    assert tuple(pulse.set_count for pulse in window._pulse) == (5, 5)
 
     assert control_1._edit_segment_structure("delete", 3)
     app.processEvents()
     assert _sweep_targets(window) == (
         ("awg_0", "set_0"),
         ("awg_0", "set_3"),
+        ("all_awg_outputs", "ramp_2_to_3"),
     )
     assert control_0._sweep_rows == {0, 3}
     assert control_1._sweep_rows == set()
+    assert tuple(pulse.set_count for pulse in window._pulse) == (4, 4)
     window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_three_port_insert_delete_round_trip_preserves_sweep_identity():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 4)
+    window._add_port()
+    window._add_port()
+    original_specs = [
+        QickSweepSpec("set_1", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_2", "awg_1", -0.2, 0.2, 4),
+        QickSweepSpec("set_4", "awg_2", -0.3, 0.3, 5),
+        QickHoldDurationSweepSpec("set_3", 1.0, 2.0, 6),
+        QickRampRateSweepSpec("ramp_0_to_1", 0.1, 0.2, 7),
+        QickRampRateSweepSpec("ramp_3_to_4", 0.2, 0.4, 8),
+    ]
+    window._sweep_specs = list(original_specs)
+    window._refresh_sweep_overlay(sync_rows=True)
+    panel = window._experiment_panel
+    panel.set_sweep_specs(
+        window._active_map_sweep_specs(),
+        selected_keys=(("awg_1", "set_2"), ("awg_2", "set_4")),
+    )
+
+    controls = window._multi_ctrl._ctrl_pannels
+    assert controls[2]._edit_segment_structure("insert_above", 2)
+    app.processEvents()
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (6, 6, 6)
+    assert _sweep_targets(window) == (
+        ("awg_0", "set_1"),
+        ("awg_1", "set_3"),
+        ("awg_2", "set_5"),
+        ("all_awg_outputs", "set_4"),
+        ("all_awg_outputs", "ramp_0_to_1"),
+        ("all_awg_outputs", "ramp_4_to_5"),
+    )
+    assert panel.selected_sweep_axis_keys() == (
+        ("awg_1", "set_3"),
+        ("awg_2", "set_5"),
+    )
+
+    assert controls[0]._edit_segment_structure("delete", 2)
+    app.processEvents()
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (5, 5, 5)
+    assert window._sweep_specs == original_specs
+    assert panel.selected_sweep_axis_keys() == (
+        ("awg_1", "set_2"),
+        ("awg_2", "set_4"),
+    )
+    assert controls[0]._sweep_rows == {1}
+    assert controls[1]._sweep_rows == {2}
+    assert controls[2]._sweep_rows == {4}
+    assert all(control._hold_sweep_rows == {3} for control in controls)
+    assert all(control._ramp_sweep_rows == {1, 4} for control in controls)
+    build_qick_sequence(
+        tuple(window._pulse),
+        sweeps=tuple(window._sweep_specs),
+    )
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_deleting_shared_segment_removes_only_its_sweeps_on_all_ports():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._add_port()
+    window._add_port()
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_2", "awg_1", -0.2, 0.2, 4),
+        QickSweepSpec("set_3", "awg_2", -0.3, 0.3, 5),
+        QickHoldDurationSweepSpec("set_2", 1.0, 2.0, 6),
+        QickRampRateSweepSpec("ramp_1_to_2", 0.1, 0.2, 7),
+        QickRampRateSweepSpec("ramp_2_to_3", 0.2, 0.4, 8),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+
+    controls = window._multi_ctrl._ctrl_pannels
+    assert controls[1]._edit_segment_structure("delete", 2)
+    app.processEvents()
+
+    assert tuple(pulse.set_count for pulse in window._pulse) == (3, 3, 3)
+    assert _sweep_targets(window) == (
+        ("awg_2", "set_2"),
+        ("all_awg_outputs", "ramp_1_to_2"),
+    )
+    assert controls[0]._sweep_rows == set()
+    assert controls[1]._sweep_rows == set()
+    assert controls[2]._sweep_rows == {2}
+    assert all(control._hold_sweep_rows == set() for control in controls)
+    assert all(control._ramp_sweep_rows == {2} for control in controls)
+    build_qick_sequence(
+        tuple(window._pulse),
+        sweeps=tuple(window._sweep_specs),
+    )
+    window.close()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_deleting_one_target_keeps_other_sweeps_on_same_port():

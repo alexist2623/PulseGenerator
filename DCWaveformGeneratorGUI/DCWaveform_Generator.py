@@ -424,6 +424,31 @@ def _remap_set_segment_name(
     return f"set_{current_index}"
 
 
+def _remap_ramp_segment_name(
+    segment_name: str,
+    operation: str,
+    segment_index: int,
+) -> Optional[str]:
+    """Keep an incoming RAMP reference attached to its destination SET."""
+    match = re.fullmatch(r"ramp_(\d+)_to_(\d+)", str(segment_name))
+    if match is None:
+        return str(segment_name)
+    source_index, destination_index = map(int, match.groups())
+    if destination_index != source_index + 1:
+        return str(segment_name)
+    remapped_destination = _remap_set_segment_name(
+        f"set_{destination_index}",
+        operation,
+        segment_index,
+    )
+    if remapped_destination is None:
+        return None
+    destination_index = int(remapped_destination.rsplit("_", 1)[1])
+    if destination_index <= 0:
+        return None
+    return f"ramp_{destination_index - 1}_to_{destination_index}"
+
+
 def _remap_segment_rows(
     rows,
     operation: str,
@@ -1667,22 +1692,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         # Move the local marker state before the first repaint. The main-window
         # model remaps the sweep specifications below, but repainting first
         # would briefly mark the newly inserted row as the sweep target.
-        self._sweep_rows = _remap_segment_rows(
-            self._sweep_rows,
-            operation,
-            segment_index,
-        )
-        self._hold_sweep_rows = _remap_segment_rows(
-            self._hold_sweep_rows,
-            operation,
-            segment_index,
-        )
-        self._ramp_sweep_rows = {
-            row
-            for row in self._ramp_sweep_rows
-            if row < segment_index
-        }
-        self._sweep_row = min(self._sweep_rows) if self._sweep_rows else None
+        self._remap_structure_markers(operation, segment_index)
         self.refresh_table()
         self.segment_structure_changed.emit(
             self.idx,
@@ -1695,6 +1705,29 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self.table.clearSelection()
         self.table.setCurrentCell(-1, -1)
         return True
+
+    def _remap_structure_markers(
+        self,
+        operation: str,
+        segment_index: int,
+    ) -> None:
+        """Move local sweep markers with a shared segment structure edit."""
+        self._sweep_rows = _remap_segment_rows(
+            self._sweep_rows,
+            operation,
+            segment_index,
+        )
+        self._hold_sweep_rows = _remap_segment_rows(
+            self._hold_sweep_rows,
+            operation,
+            segment_index,
+        )
+        self._ramp_sweep_rows = _remap_segment_rows(
+            self._ramp_sweep_rows,
+            operation,
+            segment_index,
+        )
+        self._sweep_row = min(self._sweep_rows) if self._sweep_rows else None
 
     def _sweep_indicator_icon(
         self,
@@ -8019,15 +8052,65 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Cartesian combinations remain"
         )
 
+    def _mirror_segment_structure_edit(
+        self,
+        source_port: int,
+        operation: str,
+        segment_index: int,
+    ) -> None:
+        """Apply one insert/delete to every AWG output except the source."""
+        source_port = int(source_port)
+        segment_index = int(segment_index)
+        source = self._pulse[source_port]
+        if operation == "insert":
+            timing = self._segment_timing_ns(source, segment_index)
+            if timing is None:
+                raise RuntimeError("inserted segment timing is unavailable")
+            ramp_ns, flat_ns = timing
+            segment_name = source.segment_name(segment_index)
+        elif operation == "delete":
+            ramp_ns = flat_ns = None
+            segment_name = None
+        else:
+            raise ValueError(
+                f"unsupported segment structure operation {operation!r}"
+            )
+
+        for port_index, pulse in enumerate(self._pulse):
+            if port_index == source_port:
+                continue
+            if operation == "insert":
+                ok = pulse.insert_flat_ramp(
+                    segment_index * 2,
+                    ramp_ns=ramp_ns,
+                    flat_ns=flat_ns,
+                )
+                if ok:
+                    pulse.rename_segment(segment_index, segment_name)
+            else:
+                ok = pulse.delete_flat_ramp(segment_index * 2)
+            if not ok:
+                raise RuntimeError(
+                    f"could not {operation} segment {segment_index + 1} "
+                    f"on AWG output {port_index + 1}"
+                )
+            self._multi_ctrl._ctrl_pannels[
+                port_index
+            ]._remap_structure_markers(operation, segment_index)
+
     def _on_segment_structure_changed(
         self,
         port_index: int,
         operation: str,
         segment_index: int,
     ) -> None:
+        self._mirror_segment_structure_edit(
+            int(port_index),
+            operation,
+            int(segment_index),
+        )
         self._share_matching_port_timings(int(port_index))
         self._share_matching_segment_names(int(port_index))
-        output_name = f"awg_{int(port_index)}"
         previous_map_keys = (
             self._experiment_panel.selected_sweep_axis_keys()
             if hasattr(self, "_experiment_panel")
@@ -8043,10 +8126,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     str(spec.output_name),
                     str(spec.segment_name),
                 )
-                if spec.output_name != output_name:
-                    updated_sweeps.append(spec)
-                    sweep_key_remap[old_key] = old_key
-                    continue
                 remapped_name = _remap_set_segment_name(
                     spec.segment_name,
                     operation,
@@ -8090,25 +8169,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
                 continue
 
-            old_key = (
-                str(spec.output_name),
-                str(spec.segment_name),
-            )
-            ramp_row = self._ramp_sweep_row(spec)
-            if ramp_row is not None and ramp_row >= int(segment_index):
-                # RAMP-rate sweeps are shared by every AWG output. A structural
-                # edit to only one output makes the affected transition
-                # ambiguous, so retain earlier transitions and remove only the
-                # affected and following ones.
-                removed_count += 1
-                sweep_key_remap[old_key] = None
+            if isinstance(spec, QickRampRateSweepSpec):
+                old_key = (
+                    str(spec.output_name),
+                    str(spec.segment_name),
+                )
+                remapped_name = _remap_ramp_segment_name(
+                    spec.segment_name,
+                    operation,
+                    segment_index,
+                )
+                if remapped_name is None:
+                    removed_count += 1
+                    sweep_key_remap[old_key] = None
+                    continue
+                if remapped_name != spec.segment_name:
+                    spec = replace(spec, segment_name=remapped_name)
+                    remapped_count += 1
+                updated_sweeps.append(spec)
+                sweep_key_remap[old_key] = (
+                    str(spec.output_name),
+                    str(spec.segment_name),
+                )
                 continue
+
             updated_sweeps.append(spec)
-            sweep_key_remap[old_key] = old_key
 
         self._sweep_specs = updated_sweeps
 
-        if int(port_index) == 0 and hasattr(self, "_rf_ports_panel"):
+        if hasattr(self, "_rf_ports_panel"):
             rf_key_remap = self._rf_ports_panel.remap_segment_references(
                 self._pulse[0],
                 operation,
@@ -8153,8 +8242,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         action = "inserted" if operation == "insert" else "deleted"
         self.statusBar().showMessage(
-            f"Segment {segment_index} {action}: remapped {remapped_count} "
-            f"sweep target(s), removed {removed_count} invalid sweep(s)"
+            f"Segment {segment_index + 1} {action} on all AWG outputs: "
+            f"remapped {remapped_count} sweep target(s), removed "
+            f"{removed_count} invalid sweep(s)"
         )
         self._refresh_stability_targets()
 
@@ -9936,23 +10026,33 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _add_segment(self, ramp: float, flat: float, v: float) -> None:
         try:
-            self._pulse[self._selected_port_idx].add_flat_ramp(
+            source_port = int(self._selected_port_idx)
+            source = self._pulse[source_port]
+            source.add_flat_ramp(
                 ramp,
                 flat,
                 v
             )
-            segment_index = (
-                len(self._pulse[self._selected_port_idx].flat_segments()) - 1
-            )
+            segment_index = len(source.flat_segments()) - 1
+            segment_name = source.segment_name(segment_index)
+            for port_index, pulse in enumerate(self._pulse):
+                if port_index == source_port:
+                    continue
+                pulse.add_flat_ramp(
+                    ramp,
+                    flat,
+                    float(pulse.v[-1]),
+                )
+                pulse.rename_segment(segment_index, segment_name)
             self._share_segment_timing(
-                self._selected_port_idx,
+                source_port,
                 segment_index,
             )
             self._share_segment_name(
-                self._selected_port_idx,
+                source_port,
                 segment_index,
             )
-            self._plot.set_selected_port_idx(self._selected_port_idx)
+            self._plot.set_selected_port_idx(source_port)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Invalid input", str(exc))
             return
