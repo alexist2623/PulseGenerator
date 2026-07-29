@@ -1133,6 +1133,7 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     ddr_result = _ddr_result()
     calls = []
     progress_updates = []
+    event_updates = []
 
     class FakeSoc:
         def rfb_set_gen_rf(self, gen_ch, att1, att2):
@@ -1150,12 +1151,26 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
             calls.append(("filter", ro_ch, kwargs))
 
     class FakeProgram:
-        def acquire_fir_ddr(self, soc, progress=False, counter_progress=None):
+        def acquire_fir_ddr(
+            self,
+            soc,
+            progress=False,
+            counter_progress=None,
+            phase_callback=None,
+        ):
             calls.append(("acquire", soc, progress))
+            if phase_callback is not None:
+                phase_callback("ddr_arm", "started", "Arming")
+                phase_callback("ddr_arm", "completed", "Armed")
+                phase_callback("acquisition", "started", "Acquiring")
             if counter_progress is not None:
                 counter_progress(0, 4)
                 counter_progress(2, 4)
                 counter_progress(4, 4)
+            if phase_callback is not None:
+                phase_callback("acquisition", "completed", "Acquired")
+                phase_callback("ddr_readback", "started", "Reading")
+                phase_callback("ddr_readback", "completed", "Read")
             return ddr_result
 
         def summary(self):
@@ -1206,6 +1221,9 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
         progress_callback=lambda percent, message: progress_updates.append(
             (percent, message)
         ),
+        event_callback=lambda key, state, message: event_updates.append(
+            (key, state, message)
+        ),
     )
 
     assert result.row_count == 12
@@ -1232,6 +1250,21 @@ def test_connect_and_run_support_injected_qick_server(tmp_path, monkeypatch):
     assert any(percent == 32 for percent, _ in progress_updates)
     assert any(percent == 55 for percent, _ in progress_updates)
     assert any(percent == 60 for percent, _ in progress_updates)
+    assert ("connection", "started") in [
+        event[:2] for event in event_updates
+    ]
+    assert ("connection", "completed") in [
+        event[:2] for event in event_updates
+    ]
+    assert ("compile", "started") in [event[:2] for event in event_updates]
+    assert ("compile", "completed") in [event[:2] for event in event_updates]
+    assert ("acquisition", "completed") in [
+        event[:2] for event in event_updates
+    ]
+    assert ("ddr_readback", "completed") in [
+        event[:2] for event in event_updates
+    ]
+    assert event_updates[-1][:2] == ("qcodes_save", "completed")
 
 
 def test_configure_rf_output_applies_attenuators_and_filter_explicitly():

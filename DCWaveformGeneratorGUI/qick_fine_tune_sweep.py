@@ -6167,6 +6167,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         *,
         progress: bool = True,
         counter_progress=None,
+        phase_callback=None,
         readback_chunk_triggers: int = DEFAULT_DDR_READBACK_TRIGGER_CHUNK,
         **run_kwargs,
     ):
@@ -6185,6 +6186,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         n_points = self.sequence.sweep_point_count
         repetitions = int(self.cfg["reps"])
         n_triggers = n_points * repetitions
+
+        def emit_phase(key, state, message):
+            if phase_callback is not None:
+                phase_callback(str(key), str(state), str(message))
+
         readback_chunk_triggers = _require_int(
             readback_chunk_triggers,
             "readback_chunk_triggers",
@@ -6200,7 +6206,25 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         )
         if self._fir_cfg["uses_fpga_trigger_delay"]:
             arm_kwargs.update(self._fir_cfg["trigger_delay_arm_kwargs"])
+        emit_phase(
+            "ddr_arm",
+            "started",
+            f"Arming FIR DDR for {n_triggers:,} trigger(s)",
+        )
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
+        emit_phase(
+            "ddr_arm",
+            "completed",
+            f"FIR DDR armed; reserved {reserved:,} physical 32-bit word(s)",
+        )
+        emit_phase(
+            "acquisition",
+            "started",
+            (
+                f"Starting {n_points:,} sweep point(s) x "
+                f"{repetitions:,} repetition(s)"
+            ),
+        )
         if counter_progress is None:
             self.run_rounds(soc, progress=progress, **run_kwargs)
         else:
@@ -6211,8 +6235,26 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     f"arguments: {unexpected}"
                 )
             self._run_rounds_with_counter_progress(soc, counter_progress)
+        emit_phase(
+            "acquisition",
+            "completed",
+            f"All {n_triggers:,} acquisition trigger(s) completed",
+        )
         if ddr.settle_seconds:
+            emit_phase(
+                "ddr_wait",
+                "started",
+                (
+                    "Waiting before DDR readback "
+                    f"({float(ddr.settle_seconds):g} s)"
+                ),
+            )
             time.sleep(float(ddr.settle_seconds))
+            emit_phase(
+                "ddr_wait",
+                "completed",
+                "Post-acquisition DDR read delay completed",
+            )
 
         if reserved % n_triggers:
             raise RuntimeError(
@@ -6231,6 +6273,17 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
         raw = None
+        readback_chunks = (
+            n_triggers + readback_chunk_triggers - 1
+        ) // readback_chunk_triggers
+        emit_phase(
+            "ddr_readback",
+            "started",
+            (
+                f"Reading {n_triggers:,} DDR trace(s) in "
+                f"{readback_chunks:,} chunk(s)"
+            ),
+        )
         for first_trigger in range(
             0,
             n_triggers,
@@ -6268,6 +6321,14 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         if raw is None:
             raise RuntimeError("DDR readback produced no chunks")
+        emit_phase(
+            "ddr_readback",
+            "completed",
+            (
+                f"FIR DDR readback completed: "
+                f"{expected_shape[0]:,} I/Q sample pair(s)"
+            ),
+        )
         iq = raw.reshape(
             n_points,
             repetitions,

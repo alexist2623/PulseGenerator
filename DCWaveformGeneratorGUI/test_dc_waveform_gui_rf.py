@@ -1564,6 +1564,36 @@ def test_experiment_panel_exposes_show_program_action():
     panel.close()
 
 
+def test_experiment_panel_records_run_elapsed_time_and_stage_events():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+
+    panel.start_run_timeline("Run requested")
+    panel.record_run_event("validation", "started", "Checking settings")
+    panel.record_run_event("validation", "completed", "Settings validated")
+    panel.record_run_event("compile", "started", "Compiling")
+    panel.record_run_event("compile", "completed", "Compiled")
+    panel.finish_run_timeline("Run completed", success=True)
+    app.processEvents()
+
+    log = panel.run_event_log.toPlainText()
+    assert "Experiment STARTED" in log
+    assert "Run validation COMPLETED" in log
+    assert "tProcessor compile STARTED" in log
+    assert "tProcessor compile COMPLETED" in log
+    assert "stage 00:00:" in log
+    assert "Experiment COMPLETED" in log
+    assert "Finished | Started " in panel.run_elapsed_label.text()
+    assert panel.clear_run_log_button.isEnabled() is True
+    panel.close()
+
+
 def test_experiment_panel_defaults_to_parametric_awg_metadata():
     app = _application()
     panel = gui.ExperimentPanel(
@@ -1584,6 +1614,66 @@ def test_experiment_panel_defaults_to_parametric_awg_metadata():
 
     panel.set_awg_metadata_mode("expanded")
     assert panel.values(1)["awg_metadata_mode"] == "expanded"
+    panel.close()
+
+
+def test_experiment_panel_visualizes_sweep_repetition_ddr_usage():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=3,
+    )
+    panel.set_sweep_specs(
+        (
+            SimpleNamespace(
+                axis_kind="amplitude",
+                output_name="awg_0",
+                segment_name="set_0",
+                start=-0.1,
+                stop=0.1,
+                count=5,
+            ),
+            SimpleNamespace(
+                axis_kind="rf_frequency",
+                output_name="rf_gen_0_frequency",
+                segment_name="set_0",
+                gen_ch=0,
+                start=100.0,
+                stop=200.0,
+                count=7,
+            ),
+        )
+    )
+    panel.set_ddr_readout_spec(
+        QickDdrReadoutSpec(
+            ro_ch=0,
+            segment_name="set_0",
+            delay_us=0.0,
+            samples_per_trigger=10,
+        )
+    )
+    panel.set_ddr_memory_configuration(
+        SimpleNamespace(
+            ddr_capacity_words_32b=4096,
+            ddr_samples_per_axi_word=8,
+        )
+    )
+    app.processEvents()
+
+    assert "35 Cartesian point(s)" in panel.ddr_usage_summary.text()
+    assert "105 DDR trigger(s)" in panel.ddr_usage_summary.text()
+    assert "16 padded 32-bit word(s)/trigger" in panel.ddr_usage_detail.text()
+    assert "6.562 KiB" in panel.ddr_usage_detail.text()
+    assert panel.ddr_usage_progress.value() == 4102
+    assert "41.016%" in panel.ddr_usage_progress.format()
+
+    panel.repetitions.setValue(4)
+    app.processEvents()
+    assert "140 DDR trigger(s)" in panel.ddr_usage_summary.text()
+    assert "54.688%" in panel.ddr_usage_progress.format()
     panel.close()
 
 

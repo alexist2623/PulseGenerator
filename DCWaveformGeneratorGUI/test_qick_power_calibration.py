@@ -149,6 +149,49 @@ def test_keysight_fft_adapter_rejects_absurd_power(monkeypatch):
             meter.measure_power_dbm(450.0)
 
 
+def test_keysight_fft_adapter_averages_remaining_valid_readings(monkeypatch):
+    class Instrument:
+        def __init__(self):
+            self.responses = iter(("-20", "1e30", "-22"))
+            self.timeout = None
+            self.write_termination = None
+            self.read_termination = None
+
+        def write(self, _command):
+            pass
+
+        def query(self, command):
+            if command == "*IDN?":
+                return "AGILENT TECHNOLOGIES,DSO-X 6004A,TEST,1.0"
+            return next(self.responses)
+
+        def close(self):
+            pass
+
+    class ResourceManager:
+        def open_resource(self, _resource):
+            return Instrument()
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pyvisa",
+        SimpleNamespace(ResourceManager=ResourceManager),
+    )
+    config = OscilloscopeConfig(
+        visa_resource="USB::TEST",
+        average_count=3,
+        settle_seconds=0.0,
+        sample_interval_seconds=0.0,
+    )
+    with KeysightFftPowerMeter(config) as meter:
+        assert meter.measure_power_dbm(450.0) == -21.0
+        assert meter.last_reading_count == 3
+        assert meter.last_rejected_reading_count == 1
+
+
 def test_output_calibration_clamps_periodic_word_not_total_tone_time(monkeypatch):
     pulse_registers = []
 

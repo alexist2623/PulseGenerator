@@ -100,6 +100,8 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
     assert len(widget._point_records) == 3
     assert len(widget._point_labels) == 3
     assert len(widget._ramp_labels) == 2
+    assert len(widget._point_connectors) == 3
+    assert len(widget._ramp_connectors) == 2
     assert len(widget._point_scatter.points()) == 3
     point_one = widget._point_records[1]
     assert point_one["point_index"] == 1
@@ -117,8 +119,18 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
         == "Ramp X 0.5 / Y 0.75 us"
     )
     np.testing.assert_allclose(
-        [ramp_label.pos().x(), ramp_label.pos().y()],
+        [ramp_label.trace_target.x(), ramp_label.trace_target.y()],
         [50.0, -20.0],
+    )
+    assert ramp_label.pos() != ramp_label.trace_target
+    connector_x, connector_y = ramp_label.trace_connector.getData()
+    np.testing.assert_allclose(
+        [connector_x[0], connector_y[0]],
+        [50.0, -20.0],
+    )
+    np.testing.assert_allclose(
+        [connector_x[-1], connector_y[-1]],
+        [ramp_label.pos().x(), ramp_label.pos().y()],
     )
     tooltip = widget._point_tooltip(0.0, 0.0, point_one)
     assert "set_1" in tooltip
@@ -232,8 +244,92 @@ def test_trace_hold_and_ramp_labels_emit_edit_requests():
     assert ramp_event.accepted is True
     assert hold_requests == [1]
     assert ramp_requests == [1]
-    assert "Click to edit X, Y" in widget._point_labels[1].toolTip()
-    assert "Click to edit ramp" in widget._ramp_labels[0].toolTip()
+    assert "Drag to reposition" in widget._point_labels[1].toolTip()
+    assert "click to edit X, Y" in widget._point_labels[1].toolTip()
+    assert "Drag to reposition" in widget._ramp_labels[0].toolTip()
+    assert "click to edit ramp" in widget._ramp_labels[0].toolTip()
+    widget.close()
+
+
+def test_trace_label_drag_moves_box_connector_and_persists_after_refresh():
+    _application()
+    widget = _trace_widget()
+    label = widget._point_labels[1]
+    original_position = QtCore.QPointF(label.pos())
+
+    class _DragEvent:
+        def __init__(self, *, start, finish, scene_pos, button_down_pos):
+            self._start = bool(start)
+            self._finish = bool(finish)
+            self._scene_pos = QtCore.QPointF(scene_pos)
+            self._button_down_pos = QtCore.QPointF(button_down_pos)
+            self.accepted = False
+
+        @staticmethod
+        def button():
+            return QtCore.Qt.LeftButton
+
+        def isStart(self):
+            return self._start
+
+        def isFinish(self):
+            return self._finish
+
+        def scenePos(self):
+            return self._scene_pos
+
+        def buttonDownScenePos(self):
+            return self._button_down_pos
+
+        def accept(self):
+            self.accepted = True
+
+        @staticmethod
+        def ignore():
+            return
+
+    mouse_start = label.mapToScene(label.boundingRect().center())
+    mouse_end = mouse_start + QtCore.QPointF(80.0, -45.0)
+    start_event = _DragEvent(
+        start=True,
+        finish=False,
+        scene_pos=mouse_end,
+        button_down_pos=mouse_start,
+    )
+    label.mouseDragEvent(start_event)
+    finish_event = _DragEvent(
+        start=False,
+        finish=True,
+        scene_pos=mouse_end,
+        button_down_pos=mouse_start,
+    )
+    label.mouseDragEvent(finish_event)
+
+    assert start_event.accepted is True
+    assert finish_event.accepted is True
+    assert label.pos() != original_position
+    moved_position = QtCore.QPointF(label.pos())
+    connector_x, connector_y = label.trace_connector.getData()
+    np.testing.assert_allclose(
+        [connector_x[0], connector_y[0]],
+        [label.trace_target.x(), label.trace_target.y()],
+    )
+    np.testing.assert_allclose(
+        [connector_x[-1], connector_y[-1]],
+        [moved_position.x(), moved_position.y()],
+    )
+
+    widget.refresh_trace(widget._pulses)
+    refreshed_label = widget._point_labels[1]
+    np.testing.assert_allclose(
+        [refreshed_label.pos().x(), refreshed_label.pos().y()],
+        [moved_position.x(), moved_position.y()],
+    )
+    refreshed_x, refreshed_y = refreshed_label.trace_connector.getData()
+    np.testing.assert_allclose(
+        [refreshed_x[-1], refreshed_y[-1]],
+        [moved_position.x(), moved_position.y()],
+    )
     widget.close()
 
 

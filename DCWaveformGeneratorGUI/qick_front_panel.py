@@ -66,6 +66,8 @@ class QickFrontPanelConfiguration:
     fir_trigger_delay_units: str = "none"
     fir_trigger_delay_us: float = 0.0
     fir_rate_label: str = "FIR DDR rate unavailable"
+    ddr_capacity_words_32b: Optional[int] = None
+    ddr_samples_per_axi_word: int = 8
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -230,12 +232,30 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             "fir_trigger_delay_us": fir_profile.trigger_delay_us,
             "fir_rate_label": fir_profile.timing_label,
         }
+    ddr_values = {}
+    ddr_config = config.get("ddr4_buf")
+    if isinstance(ddr_config, Mapping):
+        try:
+            capacity_words = int(ddr_config.get("maxlen", 0))
+        except (TypeError, ValueError):
+            capacity_words = 0
+        try:
+            samples_per_axi_word = int(
+                ddr_config.get("samples_per_axi_word", 8)
+            )
+        except (TypeError, ValueError):
+            samples_per_axi_word = 8
+        if capacity_words > 0:
+            ddr_values["ddr_capacity_words_32b"] = capacity_words
+        if samples_per_axi_word > 0:
+            ddr_values["ddr_samples_per_axi_word"] = samples_per_axi_word
     return QickFrontPanelConfiguration(
         board=board,
         firmware_timestamp=str(config.get("fw_timestamp", "unknown")),
         outputs=outputs,
         inputs=inputs,
         **fir_values,
+        **ddr_values,
     )
 
 

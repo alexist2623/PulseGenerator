@@ -941,10 +941,14 @@ def test_fir_ddr_readback_is_chunked_by_trigger_on_the_client(monkeypatch):
             return values
 
     soc = FakeSoc()
+    phase_events = []
     monkeypatch.setattr(program, "run_rounds", lambda *_args, **_kwargs: None)
     result = program.acquire_fir_ddr(
         soc,
         progress=False,
+        phase_callback=lambda key, state, message: phase_events.append(
+            (key, state, message)
+        ),
         readback_chunk_triggers=4,
     )
 
@@ -962,6 +966,14 @@ def test_fir_ddr_readback_is_chunked_by_trigger_on_the_client(monkeypatch):
         result.iq[:, :, 0, 1].reshape(-1),
         -np.arange(6),
     )
+    assert [event[:2] for event in phase_events] == [
+        ("ddr_arm", "started"),
+        ("ddr_arm", "completed"),
+        ("acquisition", "started"),
+        ("acquisition", "completed"),
+        ("ddr_readback", "started"),
+        ("ddr_readback", "completed"),
+    ]
 
 
 def test_50_ksps_ddr_does_not_repeat_fir_group_delay_between_points():

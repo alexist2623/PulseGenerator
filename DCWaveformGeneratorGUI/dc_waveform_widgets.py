@@ -88,15 +88,63 @@ def _duration_pair_text(
 
 
 class _ClickableTraceLabel(pg.TextItem):
-    """Trace annotation that reports its logical segment when clicked."""
+    """Trace annotation that can be dragged and edited with a click."""
 
     clicked = QtCore.pyqtSignal(int)
+    moved = QtCore.pyqtSignal(float, float)
 
     def __init__(self, segment_index: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.segment_index = int(segment_index)
+        self._drag_start_position: Optional[QtCore.QPointF] = None
+        self._drag_start_view_position: Optional[QtCore.QPointF] = None
+        self.textItem.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+        self.textItem.setAcceptHoverEvents(False)
         self.setAcceptedMouseButtons(QtCore.Qt.LeftButton)
-        self.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.setAcceptHoverEvents(True)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.SizeAllCursor))
+
+    def move_to(self, x_value: float, y_value: float) -> None:
+        """Move in plot coordinates and notify the connector owner."""
+        self.setPos(float(x_value), float(y_value))
+        self.moved.emit(float(x_value), float(y_value))
+
+    def hoverEvent(self, event) -> None:
+        event.acceptClicks(QtCore.Qt.LeftButton)
+        event.acceptDrags(QtCore.Qt.LeftButton)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.SizeAllCursor))
+
+    def mouseDragEvent(self, event) -> None:
+        if event.button() != QtCore.Qt.LeftButton:
+            event.ignore()
+            return
+        view_box = self.getViewBox()
+        if view_box is None:
+            event.ignore()
+            return
+        if event.isStart():
+            self._drag_start_position = QtCore.QPointF(self.pos())
+            self._drag_start_view_position = view_box.mapSceneToView(
+                event.buttonDownScenePos()
+            )
+            self.setCursor(QtGui.QCursor(QtCore.Qt.ClosedHandCursor))
+        if (
+            self._drag_start_position is None
+            or self._drag_start_view_position is None
+        ):
+            event.ignore()
+            return
+        current_view_position = view_box.mapSceneToView(event.scenePos())
+        delta = current_view_position - self._drag_start_view_position
+        self.move_to(
+            self._drag_start_position.x() + delta.x(),
+            self._drag_start_position.y() + delta.y(),
+        )
+        if event.isFinish():
+            self._drag_start_position = None
+            self._drag_start_view_position = None
+            self.setCursor(QtGui.QCursor(QtCore.Qt.SizeAllCursor))
+        event.accept()
 
     def mouseClickEvent(self, event) -> None:
         if event.button() == QtCore.Qt.LeftButton:
@@ -160,6 +208,9 @@ class TracePlotWidget(pg.PlotWidget):
         self._point_records: Tuple[dict, ...] = ()
         self._point_labels: List[pg.TextItem] = []
         self._ramp_labels: List[pg.TextItem] = []
+        self._point_connectors: List[pg.PlotCurveItem] = []
+        self._ramp_connectors: List[pg.PlotCurveItem] = []
+        self._trace_label_offsets = {}
         self._hover_label = pg.TextItem(
             text="",
             color=(18, 18, 18),
@@ -266,7 +317,142 @@ class TracePlotWidget(pg.PlotWidget):
         for label in self._ramp_labels:
             self.removeItem(label)
         self._ramp_labels.clear()
+        for connector in self._point_connectors:
+            self.removeItem(connector)
+        self._point_connectors.clear()
+        for connector in self._ramp_connectors:
+            self.removeItem(connector)
+        self._ramp_connectors.clear()
         self._hover_label.hide()
+
+    def _trace_label_key(
+        self,
+        kind: str,
+        record: dict,
+        previous: Optional[dict] = None,
+    ) -> tuple:
+        key = (
+            self.x_idx,
+            self.y_idx,
+            str(kind),
+            record["x_segment_name"],
+            record["y_segment_name"],
+        )
+        if previous is not None:
+            key += (
+                previous["x_segment_name"],
+                previous["y_segment_name"],
+            )
+        return key
+
+    @staticmethod
+    def _trace_label_spacing(
+        records: Sequence[dict],
+    ) -> Tuple[float, float]:
+        x_values = np.asarray([record["x_mv"] for record in records], dtype=float)
+        y_values = np.asarray([record["y_mv"] for record in records], dtype=float)
+        x_span = float(np.ptp(x_values)) if x_values.size else 0.0
+        y_span = float(np.ptp(y_values)) if y_values.size else 0.0
+        x_reference = float(np.max(np.abs(x_values))) if x_values.size else 0.0
+        y_reference = float(np.max(np.abs(y_values))) if y_values.size else 0.0
+        return (
+            max(4.0, 0.05 * x_span, 0.01 * x_reference),
+            max(4.0, 0.07 * y_span, 0.01 * y_reference),
+        )
+
+    @staticmethod
+    def _inward_label_offset(
+        target: Tuple[float, float],
+        center: Tuple[float, float],
+        x_distance: float,
+        y_distance: float,
+        index: int,
+    ) -> Tuple[float, float]:
+        fallback_x = 1.0 if index % 2 == 0 else -1.0
+        fallback_y = -fallback_x
+        if target[0] < center[0]:
+            x_direction = 1.0
+        elif target[0] > center[0]:
+            x_direction = -1.0
+        else:
+            x_direction = fallback_x
+        if target[1] < center[1]:
+            y_direction = 1.0
+        elif target[1] > center[1]:
+            y_direction = -1.0
+        else:
+            y_direction = fallback_y
+        return (
+            x_direction * float(x_distance),
+            y_direction * float(y_distance),
+        )
+
+    def _trace_label_moved(
+        self,
+        key: tuple,
+        target: Tuple[float, float],
+        label: _ClickableTraceLabel,
+        connector: pg.PlotCurveItem,
+        x_value: float,
+        y_value: float,
+    ) -> None:
+        self._trace_label_offsets[key] = (
+            float(x_value) - target[0],
+            float(y_value) - target[1],
+        )
+        self._set_trace_label_anchor(
+            label,
+            target,
+            (float(x_value), float(y_value)),
+        )
+        connector.setData(
+            [target[0], float(x_value)],
+            [target[1], float(y_value)],
+        )
+
+    @staticmethod
+    def _set_trace_label_anchor(
+        label: _ClickableTraceLabel,
+        target: Tuple[float, float],
+        label_position: Tuple[float, float],
+    ) -> None:
+        label.setAnchor((
+            0.0 if label_position[0] >= target[0] else 1.0,
+            1.0 if label_position[1] >= target[1] else 0.0,
+        ))
+
+    def _add_trace_connector(
+        self,
+        *,
+        target: Tuple[float, float],
+        label: _ClickableTraceLabel,
+        label_position: Tuple[float, float],
+        key: tuple,
+        pen,
+        connectors: List[pg.PlotCurveItem],
+    ) -> None:
+        connector = pg.PlotCurveItem(
+            [target[0], label_position[0]],
+            [target[1], label_position[1]],
+            pen=pen,
+        )
+        connector.setZValue(13)
+        self.addItem(connector, ignoreBounds=True)
+        connectors.append(connector)
+        self._set_trace_label_anchor(label, target, label_position)
+        label.trace_target = QtCore.QPointF(*target)
+        label.trace_connector = connector
+        label.moved.connect(
+            lambda x_value, y_value, *, _key=key, _target=target,
+            _connector=connector, _label=label: self._trace_label_moved(
+                _key,
+                _target,
+                _label,
+                _connector,
+                x_value,
+                y_value,
+            )
+        )
 
     def _refresh_point_items(
         self,
@@ -275,6 +461,13 @@ class TracePlotWidget(pg.PlotWidget):
     ) -> None:
         self._point_records = _trace_point_records(pulse_x, pulse_y)
         self._clear_point_labels()
+        point_dx, point_dy = self._trace_label_spacing(self._point_records)
+        x_values = [record["x_mv"] for record in self._point_records]
+        y_values = [record["y_mv"] for record in self._point_records]
+        trace_center = (
+            0.5 * (min(x_values) + max(x_values)),
+            0.5 * (min(y_values) + max(y_values)),
+        )
         spots = []
         for record in self._point_records:
             spots.append({
@@ -293,11 +486,39 @@ class TracePlotWidget(pg.PlotWidget):
                 fill=pg.mkBrush(255, 255, 255, 185),
             )
             label.setToolTip(
-                "Click to edit X, Y, and hold duration"
+                "Drag to reposition; click to edit X, Y, and hold duration"
             )
             label.clicked.connect(self.hold_edit_requested.emit)
             label.setZValue(14)
-            label.setPos(record["x_mv"], record["y_mv"])
+            point_key = self._trace_label_key("hold", record)
+            point_offset = self._trace_label_offsets.get(
+                point_key,
+                self._inward_label_offset(
+                    (record["x_mv"], record["y_mv"]),
+                    trace_center,
+                    point_dx,
+                    point_dy,
+                    record["point_index"],
+                ),
+            )
+            point_target = (record["x_mv"], record["y_mv"])
+            point_label_position = (
+                point_target[0] + point_offset[0],
+                point_target[1] + point_offset[1],
+            )
+            label.setPos(*point_label_position)
+            self._add_trace_connector(
+                target=point_target,
+                label=label,
+                label_position=point_label_position,
+                key=point_key,
+                pen=pg.mkPen(
+                    (55, 55, 55, 185),
+                    width=1.1,
+                    style=QtCore.Qt.DashLine,
+                ),
+                connectors=self._point_connectors,
+            )
             self.addItem(label, ignoreBounds=True)
             self._point_labels.append(label)
             if record["point_index"]:
@@ -310,12 +531,46 @@ class TracePlotWidget(pg.PlotWidget):
                     border=pg.mkPen((125, 90, 0, 150)),
                     fill=pg.mkBrush(255, 248, 205, 205),
                 )
-                ramp_label.setToolTip("Click to edit ramp duration")
+                ramp_label.setToolTip(
+                    "Drag to reposition; click to edit ramp duration"
+                )
                 ramp_label.clicked.connect(self.ramp_edit_requested.emit)
                 ramp_label.setZValue(15)
-                ramp_label.setPos(
+                ramp_target = (
                     0.5 * (previous["x_mv"] + record["x_mv"]),
                     0.5 * (previous["y_mv"] + record["y_mv"]),
+                )
+                ramp_key = self._trace_label_key(
+                    "ramp",
+                    record,
+                    previous,
+                )
+                ramp_offset = self._trace_label_offsets.get(
+                    ramp_key,
+                    self._inward_label_offset(
+                        ramp_target,
+                        trace_center,
+                        2.0 * point_dx,
+                        3.2 * point_dy,
+                        record["point_index"],
+                    ),
+                )
+                ramp_label_position = (
+                    ramp_target[0] + ramp_offset[0],
+                    ramp_target[1] + ramp_offset[1],
+                )
+                ramp_label.setPos(*ramp_label_position)
+                self._add_trace_connector(
+                    target=ramp_target,
+                    label=ramp_label,
+                    label_position=ramp_label_position,
+                    key=ramp_key,
+                    pen=pg.mkPen(
+                        (125, 90, 0, 205),
+                        width=1.2,
+                        style=QtCore.Qt.DashLine,
+                    ),
+                    connectors=self._ramp_connectors,
                 )
                 self.addItem(ramp_label, ignoreBounds=True)
                 self._ramp_labels.append(ramp_label)

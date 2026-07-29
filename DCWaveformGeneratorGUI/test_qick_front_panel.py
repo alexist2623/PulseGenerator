@@ -76,6 +76,19 @@ def test_hwh_and_card_detection_build_zcu216_physical_port_map():
     assert configuration.port("input", 7).qick_channels == (2,)
 
 
+def test_hwh_identification_reports_runtime_pl_ddr_capacity():
+    config = _live_config()
+    config["ddr4_buf"] = {
+        "maxlen": 1 << 30,
+        "samples_per_axi_word": 8,
+    }
+
+    configuration = identify_qick_front_panel(config)
+
+    assert configuration.ddr_capacity_words_32b == 1 << 30
+    assert configuration.ddr_samples_per_axi_word == 8
+
+
 @pytest.mark.parametrize(
     (
         "rate_profile",

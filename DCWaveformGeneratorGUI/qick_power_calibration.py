@@ -456,6 +456,8 @@ class KeysightFftPowerMeter:
         self.resource_manager = None
         self.instrument = None
         self.idn = ""
+        self.last_reading_count = 0
+        self.last_rejected_reading_count = 0
 
     def __enter__(self) -> "KeysightFftPowerMeter":
         if not self.config.visa_resource.strip():
@@ -521,12 +523,16 @@ class KeysightFftPowerMeter:
             [_valid_oscilloscope_power_dbm(value) for value in values],
             dtype=bool,
         )
-        if not np.all(valid):
+        self.last_reading_count = int(values.size)
+        self.last_rejected_reading_count = int(np.count_nonzero(~valid))
+        valid_values = values[valid]
+        if valid_values.size < 1:
             invalid_value = values[np.flatnonzero(~valid)[0]]
             raise InvalidOscilloscopePowerError(
-                _invalid_power_message(float(invalid_value))
+                "all oscilloscope FFT readings were invalid; "
+                + _invalid_power_message(float(invalid_value))
             )
-        measured_power = float(np.mean(values))
+        measured_power = float(np.mean(valid_values))
         if not _valid_oscilloscope_power_dbm(measured_power):
             raise InvalidOscilloscopePowerError(
                 _invalid_power_message(measured_power)

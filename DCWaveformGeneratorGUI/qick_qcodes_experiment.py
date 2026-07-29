@@ -23,6 +23,7 @@ import numpy as np
 
 
 ProgressCallback = Callable[[int, str], None]
+ExperimentEventCallback = Callable[[str, str, str], None]
 DEFAULT_QCODES_BATCH_ROWS = 8192
 QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
 # Legacy packed-IQ parameter used by runs written before split trace storage.
@@ -191,6 +192,16 @@ def _emit_progress(
 ) -> None:
     if callback is not None:
         callback(max(0, min(100, int(percent))), str(message))
+
+
+def _emit_experiment_event(
+    callback: Optional[ExperimentEventCallback],
+    key: str,
+    state: str,
+    message: str,
+) -> None:
+    if callback is not None:
+        callback(str(key), str(state), str(message))
 
 
 def normalize_awg_metadata_mode(value: Any) -> str:
@@ -938,10 +949,23 @@ def execute_qick_sequence(
     readout_spec: QickDdrReadoutSpec,
     progress: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
+    event_callback: Optional[ExperimentEventCallback] = None,
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
     """Configure the readout, execute the tProcessor program, and read DDR."""
     _emit_progress(progress_callback, 5, "Configuring RF readout hardware")
+    _emit_experiment_event(
+        event_callback,
+        "rf_setup",
+        "started",
+        "Configuring RF readout hardware",
+    )
     readout_settings = configure_rf_readout(soc, readout_spec)
+    _emit_experiment_event(
+        event_callback,
+        "rf_setup",
+        "completed",
+        "RF readout hardware configured",
+    )
     output_details = tuple(describe_rf_output(spec) for spec in rf_specs)
     rf_settings = {
         "outputs": tuple(
@@ -955,6 +979,12 @@ def execute_qick_sequence(
         **readout_settings,
     }
     _emit_progress(progress_callback, 8, "Compiling the tProcessor program")
+    _emit_experiment_event(
+        event_callback,
+        "compile",
+        "started",
+        "Compiling the tProcessor program",
+    )
     program = build_qick_program(
         soccfg,
         sequence,
@@ -963,6 +993,12 @@ def execute_qick_sequence(
         repetitions_per_sweep=int(repetitions_per_sweep),
         rf_specs=rf_specs,
         readout_spec=readout_spec,
+    )
+    _emit_experiment_event(
+        event_callback,
+        "compile",
+        "completed",
+        "tProcessor program compiled",
     )
     sweep_point_count = int(getattr(
         sequence,
@@ -992,11 +1028,17 @@ def execute_qick_sequence(
             ),
         )
 
-    ddr_result = program.acquire_fir_ddr(
-        soc,
-        progress=progress,
-        counter_progress=counter_progress if progress_callback is not None else None,
-    )
+    acquire_kwargs = {
+        "progress": progress,
+        "counter_progress": (
+            counter_progress
+            if progress_callback is not None or event_callback is not None
+            else None
+        ),
+    }
+    if event_callback is not None:
+        acquire_kwargs["phase_callback"] = event_callback
+    ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
     _emit_progress(progress_callback, 60, "FIR DDR acquisition completed")
     return program, ddr_result, rf_settings
 
@@ -1898,11 +1940,24 @@ def run_qick_qcodes_experiment(
     progress: bool = False,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    event_callback: Optional[ExperimentEventCallback] = None,
 ) -> StoredQickExperiment:
     """Connect, execute, acquire FIR DDR IQ, and commit one QCoDeS run."""
     _emit_progress(progress_callback, 0, "Starting QICK experiment")
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
+    _emit_experiment_event(
+        event_callback,
+        "connection",
+        "started",
+        "Connecting to QICK Pyro server",
+    )
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _emit_experiment_event(
+        event_callback,
+        "connection",
+        "completed",
+        "QICK Pyro connection completed",
+    )
     fir_profile = resolve_fir_ddr_profile(
         soccfg,
         context="QCoDeS experiment",
@@ -1952,17 +2007,41 @@ def run_qick_qcodes_experiment(
             )
         )
         _emit_progress(progress_callback, 4, "Preparing parametric AWG waveform recipe")
+        _emit_experiment_event(
+            event_callback,
+            "awg_recipe",
+            "started",
+            "Preparing parametric AWG waveform recipe",
+        )
         stored_gui_settings["awg_waveform_recipe"] = build_awg_waveform_recipe(
             sequence,
             fabric_mhz=fabric_mhz,
             full_scale_mv=full_scale_mv,
         )
+        _emit_experiment_event(
+            event_callback,
+            "awg_recipe",
+            "completed",
+            "Parametric AWG waveform recipe prepared",
+        )
         if metadata_mode == AWG_METADATA_MODE_EXPANDED:
             _emit_progress(progress_callback, 4, "Building expanded AWG vertices")
+            _emit_experiment_event(
+                event_callback,
+                "awg_vertices",
+                "started",
+                "Building expanded AWG vertices",
+            )
             stored_gui_settings["awg_waveform_vertices"] = build_awg_vertex_metadata(
                 sequence,
                 fabric_mhz=fabric_mhz,
                 full_scale_mv=full_scale_mv,
+            )
+            _emit_experiment_event(
+                event_callback,
+                "awg_vertices",
+                "completed",
+                "Expanded AWG vertices built",
             )
     program, ddr_result, rf_settings = execute_qick_sequence(
         soc,
@@ -1975,6 +2054,13 @@ def run_qick_qcodes_experiment(
         readout_spec=readout_spec,
         progress=progress,
         progress_callback=progress_callback,
+        event_callback=event_callback,
+    )
+    _emit_experiment_event(
+        event_callback,
+        "qcodes_save",
+        "started",
+        "Saving acquisition data to QCoDeS",
     )
     dataset, row_count = store_qick_result(
         ddr_result,
@@ -1984,6 +2070,12 @@ def run_qick_qcodes_experiment(
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
         progress_callback=progress_callback,
+    )
+    _emit_experiment_event(
+        event_callback,
+        "qcodes_save",
+        "completed",
+        "QCoDeS database saved, checkpointed, and published",
     )
     _emit_progress(progress_callback, 100, "Experiment saved")
     return StoredQickExperiment(
@@ -2004,6 +2096,7 @@ __all__ = [
     "AWG_METADATA_MODES",
     "DEFAULT_AWG_METADATA_MODE",
     "DEFAULT_QCODES_BATCH_ROWS",
+    "ExperimentEventCallback",
     "I_TRACE_PARAMETER",
     "IQ_TRACE_PARAMETER",
     "Q_TRACE_PARAMETER",

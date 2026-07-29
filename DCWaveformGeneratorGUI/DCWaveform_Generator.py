@@ -310,12 +310,20 @@ try:
         QickFrontPanelPreview,
         identify_qick_front_panel,
     )
+    from .ddr_memory_usage import (
+        calculate_ddr_capture_memory_usage,
+        format_binary_bytes,
+    )
     from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from qick_front_panel import (
         QickFrontPanelControl,
         QickFrontPanelPreview,
         identify_qick_front_panel,
+    )
+    from ddr_memory_usage import (
+        calculate_ddr_capture_memory_usage,
+        format_binary_bytes,
     )
     from fir_ddr_profile import format_sample_rate_hz
 
@@ -5165,6 +5173,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     sweep_update_requested = QtCore.pyqtSignal(object, float, float, int)
     sweep_remove_requested = QtCore.pyqtSignal(object)
     bias_t_changed = QtCore.pyqtSignal(bool, str, float, str, float, float)
+    ddr_capacity_refresh_requested = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -5229,6 +5238,51 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
+        self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
+        self._ddr_capacity_words_32b: Optional[int] = None
+        self._ddr_samples_per_axi_word = 8
+
+        self.ddr_usage_group = QtWidgets.QGroupBox("PL DDR capture memory")
+        ddr_usage_layout = QtWidgets.QVBoxLayout(self.ddr_usage_group)
+        self.ddr_usage_progress = QtWidgets.QProgressBar()
+        self.ddr_usage_progress.setRange(0, 10_000)
+        self.ddr_usage_progress.setValue(0)
+        self.ddr_usage_progress.setTextVisible(True)
+        self.ddr_usage_progress.setFormat("Capacity unavailable")
+        self.ddr_usage_progress.setFixedHeight(
+            max(22, self.ddr_usage_progress.sizeHint().height())
+        )
+        self.ddr_usage_summary = QtWidgets.QLabel()
+        self.ddr_usage_summary.setWordWrap(True)
+        self.ddr_usage_summary.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.ddr_usage_detail = QtWidgets.QLabel()
+        self.ddr_usage_detail.setWordWrap(True)
+        self.ddr_usage_detail.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.ddr_capacity_refresh = QtWidgets.QPushButton(
+            "Identify QICK / Refresh Capacity"
+        )
+        self.ddr_capacity_refresh.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        )
+        self.ddr_capacity_refresh.setToolTip(
+            "Connect to QICK, read the HWH-backed DDR buffer size, and "
+            "recalculate the percentage."
+        )
+        self.ddr_capacity_refresh.clicked.connect(
+            self.ddr_capacity_refresh_requested.emit
+        )
+        ddr_usage_layout.addWidget(self.ddr_usage_progress)
+        ddr_usage_layout.addWidget(self.ddr_usage_summary)
+        ddr_usage_layout.addWidget(self.ddr_usage_detail)
+        ddr_usage_layout.addWidget(
+            self.ddr_capacity_refresh,
+            0,
+            QtCore.Qt.AlignRight,
+        )
         self.awg_metadata_mode = QtWidgets.QComboBox()
         self.awg_metadata_mode.addItem(
             "Parametric recipe only (recommended)",
@@ -5424,6 +5478,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("Sample name:", self.sample_name)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
+        form.addRow(self.ddr_usage_group)
         form.addRow("AWG waveform metadata:", self.awg_metadata_mode)
         form.addRow(metadata_hint)
         form.addRow(self.awg_metadata_button)
@@ -5436,6 +5491,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.valueChanged.connect(
             lambda _value: self.set_sweep_specs(self._map_sweep_specs)
         )
+        self.repetitions.valueChanged.connect(self._refresh_ddr_usage)
         self.bias_t_group.toggled.connect(self._emit_bias_t_changed)
         self.bias_t_compensation_mv.valueChanged.connect(self._emit_bias_t_changed)
         self.bias_t_duration_us.valueChanged.connect(self._emit_bias_t_changed)
@@ -5443,6 +5499,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_type.currentIndexChanged.connect(self._on_bias_t_mode_changed)
         self.bias_t_mode.currentIndexChanged.connect(self._on_bias_t_mode_changed)
         self._update_bias_t_mode_controls()
+        self._refresh_ddr_usage()
 
         self.run_button = QtWidgets.QPushButton("Run QICK Experiment")
         self.run_button.setIcon(
@@ -5467,9 +5524,193 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.progress.hide()
         self.run_status = QtWidgets.QLabel("Ready")
         self.run_status.setWordWrap(True)
+        self.run_timing_group = QtWidgets.QGroupBox("Run timing and events")
+        run_timing_layout = QtWidgets.QVBoxLayout(self.run_timing_group)
+        self.run_elapsed_label = QtWidgets.QLabel(
+            "Elapsed: 00:00:00.000 | Not running"
+        )
+        self.run_elapsed_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.run_event_log = QtWidgets.QPlainTextEdit()
+        self.run_event_log.setReadOnly(True)
+        self.run_event_log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.run_event_log.setPlaceholderText(
+            "Compile, acquisition, DDR readback, and database events "
+            "will appear here."
+        )
+        self.run_event_log.setMaximumBlockCount(1000)
+        self.run_event_log.setMinimumHeight(150)
+        self.run_event_log.setMaximumHeight(220)
+        run_log_actions = QtWidgets.QHBoxLayout()
+        run_log_actions.addStretch(1)
+        self.copy_run_log_button = QtWidgets.QToolButton()
+        self.copy_run_log_button.setText("Copy log")
+        self.copy_run_log_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonTextBesideIcon
+        )
+        self.copy_run_log_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        self.copy_run_log_button.clicked.connect(self._copy_run_event_log)
+        self.clear_run_log_button = QtWidgets.QToolButton()
+        self.clear_run_log_button.setText("Clear")
+        self.clear_run_log_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonTextBesideIcon
+        )
+        self.clear_run_log_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogResetButton)
+        )
+        self.clear_run_log_button.clicked.connect(self.run_event_log.clear)
+        run_log_actions.addWidget(self.copy_run_log_button)
+        run_log_actions.addWidget(self.clear_run_log_button)
+        run_timing_layout.addWidget(self.run_elapsed_label)
+        run_timing_layout.addWidget(self.run_event_log)
+        run_timing_layout.addLayout(run_log_actions)
+        self._run_elapsed_timer = QtCore.QElapsedTimer()
+        self._run_timeline_active = False
+        self._run_stage_starts = {}
+        self._run_last_event_ms = 0
+        self._run_final_elapsed_ms = 0
+        self._run_started_at = ""
+        self._run_elapsed_update_timer = QtCore.QTimer(self)
+        self._run_elapsed_update_timer.setInterval(250)
+        self._run_elapsed_update_timer.timeout.connect(
+            self._update_run_elapsed_label
+        )
         form.addRow(action_row)
         form.addRow(self.progress)
         form.addRow("Status:", self.run_status)
+        form.addRow(self.run_timing_group)
+
+    def set_ddr_readout_spec(
+        self,
+        spec: Optional[QickDdrReadoutSpec],
+    ) -> None:
+        """Update the capture estimate from the Experiment RF-readout editor."""
+        self._ddr_readout_spec = spec
+        self._refresh_ddr_usage()
+
+    def set_ddr_memory_configuration(self, configuration) -> None:
+        """Use the live HWH/runtime DDR capacity reported by QICK."""
+        self._ddr_capacity_words_32b = getattr(
+            configuration,
+            "ddr_capacity_words_32b",
+            None,
+        )
+        self._ddr_samples_per_axi_word = int(
+            getattr(configuration, "ddr_samples_per_axi_word", 8)
+        )
+        self._refresh_ddr_usage()
+
+    def _set_ddr_usage_style(self, state: str) -> None:
+        colors = {
+            "inactive": ("#eceff1", "#9aa4ad"),
+            "normal": ("#e7eef0", "#267b8a"),
+            "warning": ("#f6efe1", "#c58a1c"),
+            "error": ("#f5e5e5", "#b33a3a"),
+        }
+        background, chunk = colors[state]
+        self.ddr_usage_progress.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid #8b949c;"
+            " background: %s;"
+            " color: #202428;"
+            " text-align: center;"
+            " padding: 1px;"
+            "}"
+            "QProgressBar::chunk { background: %s; }"
+            % (background, chunk)
+        )
+
+    def _refresh_ddr_usage(self, *_args) -> None:
+        sweep_points = prod(spec.count for spec in self._map_sweep_specs)
+        repetitions = self.repetitions.value()
+        sweep_axes = len(self._map_sweep_specs)
+        spec = self._ddr_readout_spec
+
+        if spec is None:
+            self.ddr_usage_progress.setValue(0)
+            self.ddr_usage_progress.setFormat("RF readout disabled")
+            self.ddr_usage_summary.setText(
+                f"{sweep_axes} sweep axis/axes -> {sweep_points:,} Cartesian "
+                f"point(s) x {repetitions:,} repetition(s)."
+            )
+            self.ddr_usage_detail.setText(
+                "Enable RF Readout to calculate the PL DDR capture allocation."
+            )
+            self._set_ddr_usage_style("inactive")
+            return
+
+        usage = calculate_ddr_capture_memory_usage(
+            sweep_points=sweep_points,
+            repetitions=repetitions,
+            samples_per_trigger=int(spec.samples_per_trigger),
+            start_address_bytes=int(spec.address),
+            capacity_words_32b=self._ddr_capacity_words_32b,
+            samples_per_axi_word=self._ddr_samples_per_axi_word,
+            force_overwrite=bool(spec.force_overwrite),
+        )
+        self.ddr_usage_summary.setText(
+            f"{sweep_axes} sweep axis/axes -> {usage.sweep_points:,} "
+            f"Cartesian point(s) x {usage.repetitions:,} repetition(s) = "
+            f"{usage.trigger_count:,} DDR trigger(s)."
+        )
+        detail = (
+            f"{usage.samples_per_trigger:,} I/Q sample(s)/trigger -> "
+            f"{usage.physical_words_per_trigger:,} padded 32-bit "
+            f"word(s)/trigger. Valid data {format_binary_bytes(usage.valid_data_bytes)}; "
+            f"AXI padding {format_binary_bytes(usage.padding_bytes)}; "
+            f"reserved {format_binary_bytes(usage.reserved_bytes)}."
+        )
+
+        percent = usage.address_usage_percent
+        if percent is None:
+            self.ddr_usage_progress.setValue(0)
+            self.ddr_usage_progress.setFormat(
+                f"{format_binary_bytes(usage.reserved_bytes)} reserved | "
+                "capacity unknown"
+            )
+            self.ddr_usage_detail.setText(
+                detail
+                + " Identify QICK to read ddr4_buf.maxlen and calculate the "
+                "PL DDR percentage."
+            )
+            self._set_ddr_usage_style("inactive")
+            return
+
+        self.ddr_usage_progress.setValue(
+            min(10_000, max(0, int(round(percent * 100.0))))
+        )
+        self.ddr_usage_progress.setFormat(
+            f"{percent:.3f}% | "
+            f"{format_binary_bytes(usage.end_address_bytes)} / "
+            f"{format_binary_bytes(usage.capacity_bytes)}"
+        )
+        address_detail = (
+            f" Address range: 0x{usage.start_address_bytes:08X} to "
+            f"0x{usage.end_address_bytes:08X}; HWH/runtime capacity "
+            f"{format_binary_bytes(usage.capacity_bytes)}."
+        )
+        if usage.exceeds_capacity:
+            if usage.force_overwrite:
+                warning = (
+                    " The request exceeds PL DDR capacity; overwrite is "
+                    "enabled, so earlier trigger data will be overwritten."
+                )
+            else:
+                warning = (
+                    " The request exceeds PL DDR capacity and the QICK "
+                    "driver will reject the run."
+                )
+            self._set_ddr_usage_style("error")
+        elif percent >= 80.0:
+            warning = " High PL DDR utilization."
+            self._set_ddr_usage_style("warning")
+        else:
+            warning = ""
+            self._set_ddr_usage_style("normal")
+        self.ddr_usage_detail.setText(detail + address_detail + warning)
 
     def _update_bias_t_range(self, full_scale_mv: float) -> None:
         self.bias_t_compensation_mv.setMaximum(max(0.001, float(full_scale_mv)))
@@ -5827,6 +6068,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         current = self.selected_sweep_axis_keys()
         if current != previous:
             self.sweep_axes_changed.emit()
+        self._refresh_ddr_usage()
 
     def _on_sweep_axis_changed(self, _index: int) -> None:
         if self.sweep_map_x.count() >= 2:
@@ -6075,6 +6317,138 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.progress.setVisible(running and show_progress)
         self.run_status.setText(message)
 
+    @staticmethod
+    def _format_elapsed_ms(elapsed_ms: int) -> str:
+        elapsed_ms = max(0, int(elapsed_ms))
+        hours, remainder = divmod(elapsed_ms, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        seconds, milliseconds = divmod(remainder, 1_000)
+        return (
+            f"{hours:02d}:{minutes:02d}:{seconds:02d}."
+            f"{milliseconds:03d}"
+        )
+
+    @staticmethod
+    def _run_stage_label(key: str) -> str:
+        return {
+            "experiment": "Experiment",
+            "validation": "Run validation",
+            "connection": "QICK connection",
+            "awg_recipe": "AWG recipe",
+            "awg_vertices": "Expanded AWG vertices",
+            "rf_setup": "RF readout setup",
+            "compile": "tProcessor compile",
+            "ddr_arm": "FIR DDR arm",
+            "acquisition": "Acquisition",
+            "ddr_wait": "DDR read delay",
+            "ddr_readback": "FIR DDR readback",
+            "qcodes_save": "QCoDeS save",
+        }.get(str(key), str(key).replace("_", " ").title())
+
+    def _current_run_elapsed_ms(self) -> int:
+        if not self._run_elapsed_timer.isValid():
+            return 0
+        if not self._run_timeline_active:
+            return int(self._run_final_elapsed_ms)
+        return int(self._run_elapsed_timer.elapsed())
+
+    def _update_run_elapsed_label(self) -> None:
+        elapsed = self._format_elapsed_ms(self._current_run_elapsed_ms())
+        if self._run_timeline_active:
+            suffix = f"Running | Started {self._run_started_at}"
+        elif self._run_started_at:
+            suffix = f"Finished | Started {self._run_started_at}"
+        else:
+            suffix = "Not running"
+        self.run_elapsed_label.setText(f"Elapsed: {elapsed} | {suffix}")
+
+    def _copy_run_event_log(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(
+            self.run_event_log.toPlainText()
+        )
+
+    def start_run_timeline(self, message: str) -> None:
+        self.run_event_log.clear()
+        self._run_stage_starts.clear()
+        self._run_last_event_ms = 0
+        self._run_final_elapsed_ms = 0
+        self._run_started_at = QtCore.QDateTime.currentDateTime().toString(
+            "yyyy-MM-dd HH:mm:ss.zzz"
+        )
+        self._run_elapsed_timer.start()
+        self._run_timeline_active = True
+        self.clear_run_log_button.setEnabled(False)
+        self._run_elapsed_update_timer.start()
+        self.record_run_event("experiment", "started", message)
+        self._update_run_elapsed_label()
+
+    def record_run_event(self, key: str, state: str, message: str) -> None:
+        if not self._run_timeline_active:
+            return
+        elapsed_ms = self._current_run_elapsed_ms()
+        key = str(key)
+        state = str(state).lower()
+        label = self._run_stage_label(key)
+        duration_text = ""
+        if state == "started":
+            self._run_stage_starts[key] = elapsed_ms
+            state_text = "STARTED"
+        elif state == "completed":
+            started_ms = self._run_stage_starts.pop(
+                key, self._run_last_event_ms
+            )
+            duration_text = (
+                f" | stage {self._format_elapsed_ms(elapsed_ms - started_ms)}"
+            )
+            state_text = "COMPLETED"
+        elif state == "failed":
+            started_ms = self._run_stage_starts.pop(
+                key, self._run_last_event_ms
+            )
+            duration_text = (
+                f" | stage {self._format_elapsed_ms(elapsed_ms - started_ms)}"
+            )
+            state_text = "FAILED"
+        else:
+            state_text = "INFO"
+        completed_at = QtCore.QDateTime.currentDateTime().toString(
+            "HH:mm:ss.zzz"
+        )
+        self.run_event_log.appendPlainText(
+            f"[{completed_at}] +{self._format_elapsed_ms(elapsed_ms)}"
+            f"{duration_text} | {label} {state_text} | {message}"
+        )
+        self._run_last_event_ms = elapsed_ms
+        scrollbar = self.run_event_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self._update_run_elapsed_label()
+
+    def finish_run_timeline(self, message: str, *, success: bool) -> None:
+        if not self._run_timeline_active:
+            return
+        if not success:
+            pending_stages = [
+                key
+                for key in self._run_stage_starts
+                if key != "experiment"
+            ]
+            for key in pending_stages:
+                self.record_run_event(
+                    key,
+                    "failed",
+                    "Stage interrupted by experiment failure",
+                )
+        self.record_run_event(
+            "experiment",
+            "completed" if success else "failed",
+            message,
+        )
+        self._run_final_elapsed_ms = int(self._run_elapsed_timer.elapsed())
+        self._run_timeline_active = False
+        self._run_elapsed_update_timer.stop()
+        self.clear_run_log_button.setEnabled(True)
+        self._update_run_elapsed_label()
+
     def update_progress(self, percent: int, message: str) -> None:
         percent = max(0, min(100, int(percent)))
         self.progress.setValue(percent)
@@ -6123,6 +6497,7 @@ class QickExperimentWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
+    event_changed = QtCore.pyqtSignal(str, str, str)
 
     def __init__(self, kwargs: dict, parent=None):
         super().__init__(parent)
@@ -6133,6 +6508,7 @@ class QickExperimentWorker(QtCore.QObject):
         try:
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
+            kwargs["event_callback"] = self.event_changed.emit
             result = run_qick_qcodes_experiment(**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -7225,6 +7601,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
+        self._experiment_panel.set_ddr_readout_spec(
+            self._rf_readout_panel.spec()
+        )
         self.sweep_state_changed.connect(self._synchronize_sweep_views)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
         self._experiment_panel.show_program_requested.connect(
@@ -7232,6 +7611,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._experiment_panel.awg_metadata_requested.connect(
             self._show_awg_metadata
+        )
+        self._experiment_panel.ddr_capacity_refresh_requested.connect(
+            self._identify_experiment_qick_configuration
         )
         self._experiment_panel.sweep_axes_changed.connect(
             self._refresh_awg_sweep_map_from_last_result
@@ -8917,6 +9299,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_readout_spec_changed(self, spec) -> None:
         self._ddr_readout_spec = spec
+        self._experiment_panel.set_ddr_readout_spec(spec)
         if spec is None:
             self.statusBar().showMessage("RF readout disabled")
         elif spec.effective_measurement_representation == "current":
@@ -9305,8 +9688,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_worker = worker
         thread.start()
 
+    def _identify_experiment_qick_configuration(self) -> None:
+        """Refresh Experiment memory capacity using the shared QICK endpoint."""
+        self._qick_front_panel_target = None
+        self._identify_qick_configuration()
+
     def _on_qick_configuration_identified(self, configuration) -> None:
         self._qick_configuration = configuration
+        self._experiment_panel.set_ddr_memory_configuration(configuration)
         self._qick_front_panel.set_configuration(configuration)
         self._multi_ctrl.set_front_panel_configuration(configuration)
         self._sparameter_panel.set_front_panel_configuration(configuration)
@@ -10102,11 +10491,33 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "Wait for the current QICK experiment to finish.",
             )
             return
+        self._experiment_panel.start_run_timeline(
+            "Run button pressed; validating Experiment settings"
+        )
+        self._experiment_panel.record_run_event(
+            "validation",
+            "started",
+            "Validating waveform, sweep, RF readout, and DDR settings",
+        )
         try:
             arguments = self._experiment_run_arguments()
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            self._experiment_panel.record_run_event(
+                "validation",
+                "failed",
+                str(exc),
+            )
+            self._experiment_panel.finish_run_timeline(
+                f"Run validation failed: {exc}",
+                success=False,
+            )
             QtWidgets.QMessageBox.warning(self, "Cannot run experiment", str(exc))
             return
+        self._experiment_panel.record_run_event(
+            "validation",
+            "completed",
+            "Experiment settings validated",
+        )
 
         expected_rows = (
             arguments["sequence"].sweep_point_count
@@ -10132,6 +10543,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.finished.connect(self._on_experiment_finished)
         worker.failed.connect(self._on_experiment_failed)
         worker.progress_changed.connect(self._on_experiment_progress)
+        worker.event_changed.connect(self._on_experiment_event)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -10236,6 +10648,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_experiment_progress(self, percent: int, message: str) -> None:
         self._experiment_panel.update_progress(percent, message)
         self.statusBar().showMessage(f"QICK experiment {percent}%: {message}")
+
+    def _on_experiment_event(
+        self,
+        key: str,
+        state: str,
+        message: str,
+    ) -> None:
+        self._experiment_panel.record_run_event(key, state, message)
 
     def _load_awg_sweep_saved_run(
         self,
@@ -10371,12 +10791,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if map_error:
             message += f"; AWG 2D map unavailable: {map_error}"
+        self._experiment_panel.finish_run_timeline(
+            f"QCoDeS Run {result.run_id} completed",
+            success=True,
+        )
         self.statusBar().showMessage(message)
 
     def _on_experiment_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown QICK experiment error"
         self._experiment_panel.set_running(False, f"Failed: {summary}")
+        self._experiment_panel.finish_run_timeline(
+            f"Run failed: {summary}",
+            success=False,
+        )
         self.statusBar().showMessage("QICK experiment failed")
         dialog = DetailedErrorMessageBox(
             "QICK experiment failed", summary, details, self
@@ -12245,6 +12673,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             settings["sweep_map_visible_data"]
         )
         self._ddr_readout_spec = self._rf_readout_panel.spec()
+        self._experiment_panel.set_ddr_readout_spec(self._ddr_readout_spec)
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
         self._noise_panel.load_settings(settings["noise_analysis"])
@@ -12433,6 +12862,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._rf_pulse_specs[0] if self._rf_pulse_specs else None
             )
             self._ddr_readout_spec = self._rf_readout_panel.spec()
+            self._experiment_panel.set_ddr_readout_spec(
+                self._ddr_readout_spec
+            )
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "Invalid waveform", str(exc))
             return None
@@ -12468,6 +12900,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_pulse_specs = list(settings["rf_pulse_specs"])
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._ddr_readout_spec = settings["ddr_readout_spec"]
+        self._experiment_panel.set_ddr_readout_spec(self._ddr_readout_spec)
         if settings["sweeps"] is not None:
             self._sweep_specs = list(settings["sweeps"])
         elif settings["sweep"] is not None:
