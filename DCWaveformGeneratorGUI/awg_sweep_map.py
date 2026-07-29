@@ -122,8 +122,14 @@ def sweep_axis_label(axis: Any) -> str:
     axis_kind = getattr(axis, "axis_kind", "amplitude")
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
+    if axis_kind == "rf_frequency":
+        return f"{output_name} / {segment_name} RF frequency"
+    if axis_kind == "rf_power":
+        return f"{output_name} / {segment_name} RF power"
     if axis_kind == "ramp_duration":
         return f"{segment_name} RAMP duration (rate derived)"
+    if axis_kind == "hold_duration":
+        return f"{segment_name} SET hold duration"
     return f"{output_name} / {segment_name}"
 
 
@@ -132,11 +138,17 @@ def _axis_display_values(
     axis: Any,
     full_scale_mv: float,
 ) -> Tuple[np.ndarray, str]:
-    if getattr(axis, "axis_kind", "amplitude") in {
+    axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind in {
         "rf_duration",
         "ramp_duration",
+        "hold_duration",
     }:
         return np.asarray(coordinates, dtype=np.float64), "us"
+    if axis_kind == "rf_frequency":
+        return np.asarray(coordinates, dtype=np.float64), "MHz"
+    if axis_kind == "rf_power":
+        return np.asarray(coordinates, dtype=np.float64), "dBm"
     return np.asarray(coordinates, dtype=np.float64) * full_scale_mv, "mV"
 
 
@@ -256,8 +268,14 @@ def _stored_axis_label(axis: Mapping[str, Any]) -> str:
     axis_kind = str(axis.get("axis_kind", "amplitude"))
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
+    if axis_kind == "rf_frequency":
+        return f"{output_name} / {segment_name} RF frequency"
+    if axis_kind == "rf_power":
+        return f"{output_name} / {segment_name} RF power"
     if axis_kind == "ramp_duration":
         return f"{segment_name} RAMP duration (rate derived)"
+    if axis_kind == "hold_duration":
+        return f"{segment_name} SET hold duration"
     return f"{output_name} / {segment_name}"
 
 
@@ -406,11 +424,16 @@ def _stored_axis_native_values(
     coordinates = np.asarray(values, dtype=np.float64)
     unit = str(axis.get("unit", "")).strip().lower()
     axis_kind = str(axis.get("axis_kind", "amplitude"))
-    if axis_kind in {"rf_duration", "ramp_duration"}:
+    if axis_kind in {
+        "rf_duration",
+        "ramp_duration",
+        "hold_duration",
+    }:
         duration_scales = {
             "": 1.0,
             "us": 1.0,
             "µs": 1.0,
+            "μs": 1.0,
             "ns": 1.0e-3,
             "ms": 1.0e3,
             "s": 1.0e6,
@@ -421,6 +444,28 @@ def _stored_axis_native_values(
             raise ValueError(
                 f"unsupported stored AWG duration unit {axis.get('unit')!r}"
             ) from exc
+
+    if axis_kind == "rf_frequency":
+        frequency_scales_to_mhz = {
+            "": 1.0,
+            "mhz": 1.0,
+            "hz": 1.0e-6,
+            "khz": 1.0e-3,
+            "ghz": 1.0e3,
+        }
+        try:
+            return coordinates * frequency_scales_to_mhz[unit]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported stored RF frequency unit {axis.get('unit')!r}"
+            ) from exc
+
+    if axis_kind == "rf_power":
+        if unit in {"", "dbm"}:
+            return coordinates
+        raise ValueError(
+            f"unsupported stored RF power unit {axis.get('unit')!r}"
+        )
 
     if unit == "mv":
         return coordinates / full_scale_mv

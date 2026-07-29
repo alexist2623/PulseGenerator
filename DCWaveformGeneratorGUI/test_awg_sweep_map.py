@@ -612,6 +612,105 @@ def test_saved_awg_arrays_restore_selected_axes_and_average_other_axis(
     assert sliced.run_id == 37
 
 
+def test_saved_awg_arrays_restore_rf_frequency_power_and_hold_units(
+    tmp_path,
+):
+    metadata = _stored_awg_metadata()
+    metadata["gui_settings"]["experiment"]["sweep_map"] = {
+        "x_axis": {
+            "output_name": "rf_gen_0",
+            "segment_name": "set_1",
+        },
+        "y_axis": {
+            "output_name": "rf_gen_0",
+            "segment_name": "set_1_power",
+        },
+    }
+    metadata["measurement_layout"]["sweep_axes"] = [
+        {
+            "parameter": "rf_gen_0_set_1_frequency_mhz",
+            "output_name": "rf_gen_0",
+            "segment_name": "set_1",
+            "axis_kind": "rf_frequency",
+            "unit": "MHz",
+            "count": 2,
+        },
+        {
+            "parameter": "rf_gen_0_set_1_output_power_dbm",
+            "output_name": "rf_gen_0",
+            "segment_name": "set_1_power",
+            "axis_kind": "rf_power",
+            "unit": "dBm",
+            "count": 2,
+        },
+        {
+            "parameter": "all_awg_outputs_set_2_hold_duration_us",
+            "output_name": "all_awg_outputs",
+            "segment_name": "set_2",
+            "axis_kind": "hold_duration",
+            "unit": "us",
+            "count": 2,
+        },
+    ]
+    frequencies_mhz = (100.0, 250.0)
+    powers_dbm = (-30.0, -20.0)
+    hold_durations_us = (1.0, 4.0)
+    coordinates = np.asarray(
+        tuple(product(frequencies_mhz, powers_dbm, hold_durations_us)),
+        dtype=np.float64,
+    )
+    iq = np.empty((coordinates.shape[0], 1, 2, 2), dtype=np.int32)
+    for point_index, (frequency, power, hold_us) in enumerate(coordinates):
+        iq[point_index, ..., 0] = int(frequency + hold_us)
+        iq[point_index, ..., 1] = int(10.0 * power)
+    arrays = {
+        "metadata": metadata,
+        "iq": iq,
+        "iq_unit": "ADC units",
+        "measurement_mode": "raw_iq",
+        "sweep_coordinates": {
+            axis["parameter"]: np.repeat(
+                coordinates[:, column, None],
+                iq.shape[1],
+                axis=1,
+            )
+            for column, axis in enumerate(
+                metadata["measurement_layout"]["sweep_axes"]
+            )
+        },
+    }
+
+    result = awg_map.awg_sweep_result_from_stored_arrays(
+        arrays,
+        database_path=tmp_path / "rf_awg_sweeps.db",
+        run_id=41,
+    )
+
+    np.testing.assert_allclose(result.x_values, frequencies_mhz)
+    np.testing.assert_allclose(result.y_values, powers_dbm)
+    assert result.x_unit == "MHz"
+    assert result.y_unit == "dBm"
+    assert result.x_axis_label == "rf_gen_0 / set_1 RF frequency"
+    assert result.y_axis_label == "rf_gen_0 / set_1_power RF power"
+    assert result.averaged_axis_labels == ("set_2 SET hold duration",)
+    assert result.source_points_per_cell == 2
+    assert result.source is not None
+
+    hold_map = awg_map.reduce_awg_sweep_source(
+        result.source,
+        x_axis_key=("all_awg_outputs", "set_2"),
+        y_axis_key=("rf_gen_0", "set_1"),
+        fixed_axis_values={("rf_gen_0", "set_1_power"): -30.0},
+    )
+    np.testing.assert_allclose(hold_map.x_values, hold_durations_us)
+    np.testing.assert_allclose(hold_map.y_values, frequencies_mhz)
+    assert hold_map.x_unit == "us"
+    assert hold_map.y_unit == "MHz"
+    assert hold_map.fixed_axis_labels == (
+        "rf_gen_0 / set_1_power RF power = -30 dBm",
+    )
+
+
 def test_awg_sweep_selector_lists_run_and_emits_selection(tmp_path):
     app = _application()
     database_path = tmp_path / "awg_sweeps.db"
