@@ -170,6 +170,8 @@ try:
     from .qick_qcodes_experiment import (
         AWG_METADATA_MODE_EXPANDED,
         AWG_METADATA_MODE_PARAMETRIC,
+        COMPILE_VALIDATION_BOUNDARY,
+        COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
         QcodesRunConfig,
         QickConnectionConfig,
@@ -181,6 +183,7 @@ try:
         connect_qick,
         measurement_iq_values,
         normalize_awg_metadata_mode,
+        normalize_compile_validation_mode,
         run_qick_qcodes_experiment,
         write_awg_vertex_metadata_jsonl,
     )
@@ -188,6 +191,8 @@ except ImportError:
     from qick_qcodes_experiment import (
         AWG_METADATA_MODE_EXPANDED,
         AWG_METADATA_MODE_PARAMETRIC,
+        COMPILE_VALIDATION_BOUNDARY,
+        COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
         QcodesRunConfig,
         QickConnectionConfig,
@@ -199,6 +204,7 @@ except ImportError:
         connect_qick,
         measurement_iq_values,
         normalize_awg_metadata_mode,
+        normalize_compile_validation_mode,
         run_qick_qcodes_experiment,
         write_awg_vertex_metadata_jsonl,
     )
@@ -338,8 +344,9 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 33
+SETTINGS_VERSION = 34
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
+DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
@@ -5191,6 +5198,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         bias_t_mode: str = "fixed_voltage",
         bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
+        compile_validation_mode: str = DEFAULT_GUI_COMPILE_VALIDATION_MODE,
         parent=None,
     ):
         super().__init__(parent)
@@ -5315,6 +5323,27 @@ class ExperimentPanel(QtWidgets.QWidget):
             "generated only when explicitly selected or exported."
         )
         metadata_hint.setWordWrap(True)
+        self.compile_validation_mode = QtWidgets.QComboBox()
+        self.compile_validation_mode.addItem(
+            "Boundary and corners (fast, recommended)",
+            COMPILE_VALIDATION_BOUNDARY,
+        )
+        self.compile_validation_mode.addItem(
+            "Every Cartesian point (slow, exhaustive)",
+            COMPILE_VALIDATION_FULL,
+        )
+        compile_mode = normalize_compile_validation_mode(
+            compile_validation_mode
+        )
+        self.compile_validation_mode.setCurrentIndex(
+            self.compile_validation_mode.findData(compile_mode)
+        )
+        self.compile_validation_mode.setToolTip(
+            "Boundary mode validates the sweep origin, endpoints, Cartesian "
+            "corners, and duration-table rows without expanding every sweep "
+            "combination. Full mode validates every Cartesian point and can "
+            "take a long time for large sweeps."
+        )
         self._map_sweep_specs: Tuple[QickSweepAxisSpec, ...] = ()
         self.sweep_parameter_group = QtWidgets.QGroupBox("Sweep parameters")
         sweep_parameter_layout = QtWidgets.QVBoxLayout(
@@ -5481,6 +5510,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow(self.ddr_usage_group)
+        form.addRow("Compile validation:", self.compile_validation_mode)
         form.addRow("AWG waveform metadata:", self.awg_metadata_mode)
         form.addRow(metadata_hint)
         form.addRow(self.awg_metadata_button)
@@ -6152,6 +6182,9 @@ class ExperimentPanel(QtWidgets.QWidget):
             "awg_metadata_mode": normalize_awg_metadata_mode(
                 self.awg_metadata_mode.currentData()
             ),
+            "compile_validation_mode": normalize_compile_validation_mode(
+                self.compile_validation_mode.currentData()
+            ),
             "bias_t_compensation_enabled": self.bias_t_group.isChecked(),
             "bias_t_compensation_type": str(self.bias_t_type.currentData()),
             "bias_t_compensation_voltage_mv": self.bias_t_compensation_mv.value(),
@@ -6224,6 +6257,13 @@ class ExperimentPanel(QtWidgets.QWidget):
             raise ValueError(f"unsupported AWG metadata mode {mode!r}")
         self.awg_metadata_mode.setCurrentIndex(index)
 
+    def set_compile_validation_mode(self, mode: str) -> None:
+        mode = normalize_compile_validation_mode(mode)
+        index = self.compile_validation_mode.findData(mode)
+        if index < 0:
+            raise ValueError(f"unsupported compile validation mode {mode!r}")
+        self.compile_validation_mode.setCurrentIndex(index)
+
     def set_connection_values(self, connection: QickConnectionConfig) -> None:
         """Mirror the shared Setup connection into legacy execution fields."""
         self.qick_host.setText(connection.host)
@@ -6284,6 +6324,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
         awg_metadata_mode: str = DEFAULT_AWG_METADATA_MODE,
+        compile_validation_mode: str = DEFAULT_GUI_COMPILE_VALIDATION_MODE,
     ) -> None:
         self.qick_host.setText(connection.host)
         self.ns_port.setValue(connection.ns_port)
@@ -6300,6 +6341,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             repetitions=repetitions,
         )
         self.set_awg_metadata_mode(awg_metadata_mode)
+        self.set_compile_validation_mode(compile_validation_mode)
         self.set_bias_t_values(
             enabled=bias_t_enabled,
             compensation_type=bias_t_compensation_type,
@@ -9438,6 +9480,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sequence": sequence,
             "awg_channels": self._qick_awg_channels,
             "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+            "compile_validation_mode": values["compile_validation_mode"],
             "rf_specs": rf_specs,
             "readout_spec": readout_spec,
             "gui_settings": gui_settings,
@@ -10632,6 +10675,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "tproc_mhz": self._qick_tproc_mhz,
             "rf_specs": arguments["rf_specs"],
             "readout_spec": arguments["readout_spec"],
+            "compile_validation_mode": arguments[
+                "compile_validation_mode"
+            ],
         }
         self._experiment_panel.set_running(
             True,
@@ -11316,6 +11362,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "awg_channels": list(self._qick_awg_channels),
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
                 "awg_metadata_mode": experiment_values["awg_metadata_mode"],
+                "compile_validation_mode": experiment_values[
+                    "compile_validation_mode"
+                ],
                 "bias_t_compensation": {
                     "enabled": self._bias_t_compensation_enabled,
                     "type": self._bias_t_compensation_type,
@@ -11923,6 +11972,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         awg_metadata_mode = normalize_awg_metadata_mode(
             qick.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
+        )
+        compile_validation_mode = normalize_compile_validation_mode(
+            qick.get(
+                "compile_validation_mode",
+                DEFAULT_GUI_COMPILE_VALIDATION_MODE,
+            )
         )
         raw_stability_settings = data.get("stability_diagram")
         stability_settings = normalize_stability_settings(
@@ -12665,6 +12720,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "awg_metadata_mode": awg_metadata_mode,
+            "compile_validation_mode": compile_validation_mode,
             "bias_t_enabled": bias_t_enabled,
             "bias_t_type": bias_t_type,
             "bias_t_mode": bias_t_mode,
@@ -12728,6 +12784,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
             awg_metadata_mode=settings["awg_metadata_mode"],
+            compile_validation_mode=settings["compile_validation_mode"],
             bias_t_enabled=self._bias_t_compensation_enabled,
             bias_t_compensation_type=self._bias_t_compensation_type,
             bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,

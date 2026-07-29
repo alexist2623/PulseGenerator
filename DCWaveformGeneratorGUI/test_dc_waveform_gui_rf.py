@@ -1288,6 +1288,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         experiment.bias_t_mode.findData("fixed_time")
     )
     experiment.bias_t_duration_us.setValue(2.5)
+    experiment.set_compile_validation_mode("full")
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -1297,6 +1298,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["schema"] == gui.SETTINGS_SCHEMA
     assert document["version"] == gui.SETTINGS_VERSION
     assert document["qick"]["tproc_mhz"] == 275.0
+    assert document["qick"]["compile_validation_mode"] == "full"
     assert document["qick"]["bias_t_compensation"] == {
         "enabled": True,
         "type": "dc",
@@ -1377,6 +1379,10 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored._experiment_panel.bias_t_mode.currentData() == "fixed_time"
     assert restored._experiment_panel.bias_t_compensation_mv.value() == 125.0
     assert restored._experiment_panel.bias_t_duration_us.value() == 2.5
+    assert (
+        restored._experiment_panel.compile_validation_mode.currentData()
+        == "full"
+    )
     assert restored._control_tabs.currentWidget() is restored._awg_tuning_page
     assert restored._awg_tuning_tabs.currentWidget() is restored._rf_readout_panel
     assert restored._experiment_panel.database_path.text().endswith("experiment.db")
@@ -1399,6 +1405,7 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     assert arguments["connection_config"].host == gui.DEFAULT_QICK_HOST
     assert arguments["run_config"].resolved_database_path == (tmp_path / "run.db")
     assert arguments["awg_channels"] == (1,)
+    assert arguments["compile_validation_mode"] == "boundary"
     assert arguments["readout_spec"].samples_per_trigger == 32
     assert arguments["gui_settings"]["qick"]["tproc_mhz"] == 300.0
     assert arguments["sequence"].bias_t_compensation.amplitude == 0.25
@@ -1608,12 +1615,16 @@ def test_experiment_panel_defaults_to_parametric_awg_metadata():
 
     assert panel.awg_metadata_mode.currentData() == "parametric"
     assert panel.values(1)["awg_metadata_mode"] == "parametric"
+    assert panel.compile_validation_mode.currentData() == "boundary"
+    assert panel.values(1)["compile_validation_mode"] == "boundary"
     panel.awg_metadata_button.click()
     app.processEvents()
     assert emitted == [True]
 
     panel.set_awg_metadata_mode("expanded")
     assert panel.values(1)["awg_metadata_mode"] == "expanded"
+    panel.set_compile_validation_mode("full")
+    assert panel.values(1)["compile_validation_mode"] == "full"
     panel.close()
 
 
@@ -1938,8 +1949,9 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 33
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 34
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
+    assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
     assert upgraded["display"]["voltage_view"] == "both"

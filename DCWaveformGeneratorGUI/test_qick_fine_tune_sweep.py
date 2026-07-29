@@ -14,6 +14,8 @@ from qick.awg_tuning import TProcV1BehaviorModel
 from qick.qick_asm import QickConfig
 
 from qick_fine_tune_sweep import (
+    COMPILE_VALIDATION_BOUNDARY,
+    COMPILE_VALIDATION_FULL,
     DdrFirReadoutConfig,
     FineTuneSequence,
     HoldDurationSweep,
@@ -218,6 +220,79 @@ def test_set_and_ramp_words_are_updated_by_nested_loop_and_add():
     assert swept_kinds == {"set", "ramp"}
 
 
+def test_boundary_validation_matches_full_cartesian_tproc_output():
+    sequence = _make_cartesian_sequence()
+    full = sequence.make_program(
+        _mock_soccfg(),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=2,
+        compile_validation_mode=COMPILE_VALIDATION_FULL,
+    )
+    boundary = sequence.make_program(
+        _mock_soccfg(),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=2,
+        compile_validation_mode=COMPILE_VALIDATION_BOUNDARY,
+    )
+    full.compile()
+    boundary.compile()
+
+    full_tproc = TProcV1BehaviorModel(strict=True)
+    boundary_tproc = TProcV1BehaviorModel(strict=True)
+    full.load_runtime_dmem_into_model(full_tproc)
+    boundary.load_runtime_dmem_into_model(boundary_tproc)
+    full_tproc.run(full.prog_list, max_steps=1_000_000)
+    boundary_tproc.run(boundary.prog_list, max_steps=1_000_000)
+
+    assert sequence.sweep_point_count == 12
+    assert len(full.compiled_points) == 12
+    assert boundary._compile_validation_point_indices == (0, 2, 9, 11)
+    assert len(boundary._compiled_point_by_index) == 4
+    assert len(boundary.compiled_points) == 1
+    assert [event.word for event in boundary_tproc.output_events] == [
+        event.word for event in full_tproc.output_events
+    ]
+    assert boundary._runtime_dmem_words == full._runtime_dmem_words
+    assert boundary.summary()["compile_validation_mode"] == "boundary"
+    assert boundary.summary()["compile_validation_point_count"] == 4
+
+
+def test_boundary_validation_does_not_expand_million_point_sweep():
+    sequence = FineTuneSequence(("awg_0", "awg_1", "awg_2"))
+    sequence.add_set("base", (0.0, 0.0, 0.0), 16)
+    for output_index in range(3):
+        sequence.add_amplitude_sweep(
+            "base",
+            f"awg_{output_index}",
+            -0.5,
+            0.5,
+            101,
+        )
+
+    program = sequence.make_program(
+        _independent_awg_soccfg(3),
+        awg_channels=(0, 1, 2),
+        repetitions_per_sweep=1,
+        compile_validation_mode=COMPILE_VALIDATION_BOUNDARY,
+    )
+
+    assert sequence.sweep_point_count == 1_030_301
+    assert program._compile_validation_point_indices == (
+        0,
+        100,
+        10_100,
+        10_200,
+        1_020_100,
+        1_020_200,
+        1_030_200,
+        1_030_300,
+    )
+    assert len(program.compiled_points) == 1
+    assert program._compiled_point_by_index is not None
+    assert len(program._compiled_point_by_index) == 8
+    assert len(program.prog_list) < 500
+
+
 def test_ramp_rate_sweep_recomputes_steps_for_adjacent_voltage_axes():
     sequence = FineTuneSequence(("awg_0", "awg_1"))
     sequence.set_cross_capacitance(((1.0, 0.2), (-0.15, 1.0)))
@@ -273,6 +348,53 @@ def test_ramp_rate_sweep_recomputes_steps_for_adjacent_voltage_axes():
         for command in point.segment_commands[1]
     }
     assert len(ramp_steps) > len(ramp_durations)
+
+
+def test_boundary_validation_matches_full_for_duration_table_and_bias_t():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (-0.2,), 18)
+    sequence.add_ramp("to_gate", 30)
+    sequence.add_set("gate", (0.35,), 24)
+    sequence.add_ramp_duration_sweep(
+        "to_gate",
+        start_us=0.08,
+        stop_us=0.12,
+        count=4,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_amplitude_sweep("gate", "awg_0", -0.4, 0.4, 5)
+    sequence.set_bias_t_compensation(0.1)
+
+    programs = {}
+    events = {}
+    for mode in (COMPILE_VALIDATION_FULL, COMPILE_VALIDATION_BOUNDARY):
+        program = sequence.make_program(
+            _independent_awg_soccfg(1),
+            awg_channels=(0,),
+            repetitions_per_sweep=1,
+            recovery_tproc_cycles=0,
+            compile_validation_mode=mode,
+        )
+        program.compile()
+        tproc = TProcV1BehaviorModel(strict=True)
+        program.load_runtime_dmem_into_model(tproc)
+        tproc.run(program.prog_list, max_steps=2_000_000)
+        assert tproc.timing_conflicts == []
+        programs[mode] = program
+        events[mode] = [event.word for event in tproc.output_events]
+
+    boundary = programs[COMPILE_VALIDATION_BOUNDARY]
+    full = programs[COMPILE_VALIDATION_FULL]
+    assert sequence.sweep_point_count == 20
+    assert len(boundary._compile_validation_point_indices) == 8
+    assert events[COMPILE_VALIDATION_BOUNDARY] == events[COMPILE_VALIDATION_FULL]
+    assert boundary._runtime_dmem_words == full._runtime_dmem_words
+    assert boundary._bias_t_max_duration_q_error == (
+        full._bias_t_max_duration_q_error
+    )
+    assert boundary._bias_t_max_target_code_error == (
+        full._bias_t_max_target_code_error
+    )
 
 
 def test_independent_ramp_rate_sweeps_use_nested_tables_without_point_table():

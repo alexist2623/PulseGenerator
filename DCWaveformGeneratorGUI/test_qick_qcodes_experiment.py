@@ -11,6 +11,7 @@ import tracemalloc
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from plottr.data.qcodes_dataset import ds_to_datadicts
 
 import qick_qcodes_experiment as experiment_module
@@ -26,6 +27,8 @@ from qick_fine_tune_sweep import (
 from qick_qcodes_experiment import (
     AWG_METADATA_MODE_EXPANDED,
     AWG_METADATA_MODE_PARAMETRIC,
+    COMPILE_VALIDATION_BOUNDARY,
+    DEFAULT_COMPILE_VALIDATION_MODE,
     DEFAULT_AWG_METADATA_MODE,
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
@@ -45,6 +48,7 @@ from qick_qcodes_experiment import (
     configure_rf_output,
     connect_qick,
     load_qick_iq_arrays,
+    normalize_compile_validation_mode,
     run_qick_qcodes_experiment,
     store_qick_result,
     write_awg_vertex_metadata_jsonl,
@@ -61,6 +65,15 @@ def test_sweep_parameter_names_identify_output_segment_and_voltage_unit():
         "awg_0_set_1_voltage_mv",
         "awg_3_gate_hold_voltage_mv",
     )
+
+
+def test_compile_validation_mode_normalization():
+    assert normalize_compile_validation_mode(None) == DEFAULT_COMPILE_VALIDATION_MODE
+    assert normalize_compile_validation_mode(" BOUNDARY ") == (
+        COMPILE_VALIDATION_BOUNDARY
+    )
+    with pytest.raises(ValueError, match="compile validation mode"):
+        normalize_compile_validation_mode("sampled")
 
 
 def test_sweep_parameter_names_preserve_rf_duration_units():
@@ -891,6 +904,10 @@ def test_run_defaults_to_parametric_awg_metadata(tmp_path, monkeypatch):
     stored = captured["gui_settings"]
     assert result.guid == "recipe-guid"
     assert stored["qick"]["awg_metadata_mode"] == DEFAULT_AWG_METADATA_MODE
+    assert (
+        stored["qick"]["compile_validation_mode"]
+        == DEFAULT_COMPILE_VALIDATION_MODE
+    )
     assert stored["awg_waveform_recipe"]["point_count"] == 2
     assert "awg_waveform_vertices" not in stored
 
@@ -1116,6 +1133,7 @@ def test_build_qick_program_reuses_runtime_conversion_without_hardware():
         tproc_mhz=300.0,
         rf_specs=(rf,),
         readout_spec=None,
+        compile_validation_mode="boundary",
     )
 
     assert program == "program"
@@ -1123,6 +1141,7 @@ def test_build_qick_program_reuses_runtime_conversion_without_hardware():
     assert kwargs["awg_channels"] == (3, 5)
     assert kwargs["repetitions_per_sweep"] == 7
     assert kwargs["tproc_mhz"] == 300.0
+    assert kwargs["compile_validation_mode"] == "boundary"
     assert kwargs["rf_pulses"][0].delay_tproc_cycles == 60
     assert kwargs["rf_pulses"][0].length_cycles == 100
     assert "ddr_readout" not in kwargs

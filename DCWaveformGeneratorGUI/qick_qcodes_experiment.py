@@ -38,6 +38,13 @@ AWG_METADATA_MODES = (
     AWG_METADATA_MODE_EXPANDED,
 )
 DEFAULT_AWG_METADATA_MODE = AWG_METADATA_MODE_PARAMETRIC
+COMPILE_VALIDATION_BOUNDARY = "boundary"
+COMPILE_VALIDATION_FULL = "full"
+COMPILE_VALIDATION_MODES = (
+    COMPILE_VALIDATION_BOUNDARY,
+    COMPILE_VALIDATION_FULL,
+)
+DEFAULT_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_FULL
 
 try:
     from .dc_waveform_core import (
@@ -210,6 +217,17 @@ def normalize_awg_metadata_mode(value: Any) -> str:
     if mode not in AWG_METADATA_MODES:
         raise ValueError(
             f"AWG waveform metadata mode must be one of {AWG_METADATA_MODES}"
+        )
+    return mode
+
+
+def normalize_compile_validation_mode(value: Any) -> str:
+    """Return a supported tProcessor compile validation mode."""
+    mode = str(value or DEFAULT_COMPILE_VALIDATION_MODE).strip().lower()
+    if mode not in COMPILE_VALIDATION_MODES:
+        raise ValueError(
+            "compile validation mode must be one of "
+            f"{COMPILE_VALIDATION_MODES}"
         )
     return mode
 
@@ -743,6 +761,7 @@ def build_qick_program(
     tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec] = (),
     readout_spec: Optional[QickDdrReadoutSpec] = None,
+    compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
 ):
     """Build the tProcessor program without configuring or running hardware."""
     effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
@@ -750,6 +769,9 @@ def build_qick_program(
         "awg_channels": tuple(int(channel) for channel in awg_channels),
         "tproc_mhz": effective_tproc_mhz,
         "repetitions_per_sweep": int(repetitions_per_sweep),
+        "compile_validation_mode": normalize_compile_validation_mode(
+            compile_validation_mode
+        ),
         "rf_pulses": build_runtime_rf_pulses(
             soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
         ),
@@ -947,6 +969,7 @@ def execute_qick_sequence(
     tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
+    compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[ExperimentEventCallback] = None,
@@ -993,6 +1016,7 @@ def execute_qick_sequence(
         repetitions_per_sweep=int(repetitions_per_sweep),
         rf_specs=rf_specs,
         readout_spec=readout_spec,
+        compile_validation_mode=compile_validation_mode,
     )
     _emit_experiment_event(
         event_callback,
@@ -1961,6 +1985,7 @@ def run_qick_qcodes_experiment(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     gui_settings: Mapping[str, Any],
+    compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
     progress_callback: Optional[ProgressCallback] = None,
@@ -2022,6 +2047,10 @@ def run_qick_qcodes_experiment(
         qick_settings.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
     )
     stored_qick_settings["awg_metadata_mode"] = metadata_mode
+    compile_validation_mode = normalize_compile_validation_mode(
+        compile_validation_mode
+    )
+    stored_qick_settings["compile_validation_mode"] = compile_validation_mode
     if hasattr(sequence, "waveform_vertices"):
         fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
         full_scale_mv = float(
@@ -2076,6 +2105,7 @@ def run_qick_qcodes_experiment(
         tproc_mhz=tproc_mhz,
         rf_specs=rf_specs,
         readout_spec=readout_spec,
+        compile_validation_mode=compile_validation_mode,
         progress=progress,
         progress_callback=progress_callback,
         event_callback=event_callback,
@@ -2118,6 +2148,10 @@ __all__ = [
     "AWG_METADATA_MODE_EXPANDED",
     "AWG_METADATA_MODE_PARAMETRIC",
     "AWG_METADATA_MODES",
+    "COMPILE_VALIDATION_BOUNDARY",
+    "COMPILE_VALIDATION_FULL",
+    "COMPILE_VALIDATION_MODES",
+    "DEFAULT_COMPILE_VALIDATION_MODE",
     "DEFAULT_AWG_METADATA_MODE",
     "DEFAULT_QCODES_BATCH_ROWS",
     "ExperimentEventCallback",
@@ -2144,6 +2178,7 @@ __all__ = [
     "load_qick_iq_arrays",
     "measurement_iq_values",
     "normalize_awg_metadata_mode",
+    "normalize_compile_validation_mode",
     "run_qick_qcodes_experiment",
     "store_qick_result",
     "write_awg_vertex_metadata_jsonl",

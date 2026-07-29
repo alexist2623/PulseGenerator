@@ -69,6 +69,24 @@ BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
 DEFAULT_DDR_READBACK_TRIGGER_CHUNK = 100_000
+COMPILE_VALIDATION_FULL = "full"
+COMPILE_VALIDATION_BOUNDARY = "boundary"
+COMPILE_VALIDATION_MODES = (
+    COMPILE_VALIDATION_BOUNDARY,
+    COMPILE_VALIDATION_FULL,
+)
+DEFAULT_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_FULL
+
+
+def normalize_compile_validation_mode(value) -> str:
+    """Return a supported sweep compiler validation mode."""
+    mode = str(value or DEFAULT_COMPILE_VALIDATION_MODE).strip().lower()
+    if mode not in COMPILE_VALIDATION_MODES:
+        raise ValueError(
+            "compile validation mode must be one of "
+            f"{COMPILE_VALIDATION_MODES}"
+        )
+    return mode
 
 
 def _require_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -1444,9 +1462,23 @@ class FineTuneSequence:
             if not self.sweeps:
                 coordinates = np.empty((1, 0), dtype=float)
             else:
-                axis_points = [item.points for item in self.sweeps]
-                coordinates = np.asarray(tuple(product(*axis_points)), dtype=float)
-                coordinates = coordinates.reshape(-1, len(self.sweeps))
+                shape = tuple(int(item.count) for item in self.sweeps)
+                point_count = int(np.prod(shape, dtype=np.int64))
+                coordinates = np.empty(
+                    (point_count, len(self.sweeps)),
+                    dtype=float,
+                )
+                for axis_index, item in enumerate(self.sweeps):
+                    repeats = int(
+                        np.prod(shape[axis_index + 1:] or (1,), dtype=np.int64)
+                    )
+                    tiles = int(
+                        np.prod(shape[:axis_index] or (1,), dtype=np.int64)
+                    )
+                    coordinates[:, axis_index] = np.tile(
+                        np.repeat(np.asarray(item.points, dtype=float), repeats),
+                        tiles,
+                    )
             self._sweep_coordinate_cache = coordinates
         return self._sweep_coordinate_cache
 
@@ -2146,6 +2178,7 @@ class FineTuneSequence:
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
+        compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     ):
         return FineTuneAmplitudeSweepProgram(
             soccfg,
@@ -2161,6 +2194,7 @@ class FineTuneSequence:
             command_lead_tproc_cycles=command_lead_tproc_cycles,
             command_spacing_tproc_cycles=command_spacing_tproc_cycles,
             recovery_tproc_cycles=recovery_tproc_cycles,
+            compile_validation_mode=compile_validation_mode,
         )
 
 
@@ -2338,8 +2372,10 @@ def compile_sequence(
     sequence: FineTuneSequence,
     soccfg,
     awg_channels: Union[Sequence[int], Mapping[str, int]],
+    *,
+    point_indices: Optional[Iterable[int]] = None,
 ) -> Tuple[Tuple[int, ...], Tuple[CompiledPoint, ...]]:
-    """Compile every sweep point into exact five-word AWG commands."""
+    """Compile selected sweep points into exact five-word AWG commands."""
     sequence._validate()
     channels = _resolve_awg_channels(sequence, awg_channels)
     gens = soccfg["gens"]
@@ -2351,8 +2387,13 @@ def compile_sequence(
         _validate_gen_config(gen_ch, gen_cfg)
         gen_cfgs.append(gen_cfg)
 
+    if point_indices is None:
+        point_indices = range(sequence.sweep_point_count)
     compiled_points = []
-    for point_index in range(sequence.sweep_point_count):
+    for point_index in point_indices:
+        point_index = _require_int(point_index, "point_index", 0)
+        if point_index >= sequence.sweep_point_count:
+            raise IndexError("point_index is out of range")
         sweep_coordinate = sequence.sweep_coordinate(point_index)
         if isinstance(
             sequence.bias_t_compensation,
@@ -2461,6 +2502,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
+        compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     ):
         sequence._validate()
         self.sequence = sequence
@@ -2492,6 +2534,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             self.rf_pulse_configs[0] if len(self.rf_pulse_configs) == 1 else None
         )
         self.ddr_readout_config = ddr_readout
+        self.compile_validation_mode = normalize_compile_validation_mode(
+            compile_validation_mode
+        )
         if readout is not None and ddr_readout is not None:
             raise ValueError("readout and ddr_readout cannot be enabled together")
         self.command_lead_tproc_cycles = _require_int(
@@ -2511,10 +2556,18 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if repetitions_per_sweep != 1 and repetitions_per_sweep != reps:
                 raise ValueError("reps and repetitions_per_sweep disagree")
             repetitions_per_sweep = reps
-        points = sequence.sweep_points
-        if points.ndim == 1:
-            cfg_start = float(points[0])
-            nominal_step = 0.0 if len(points) < 2 else float(points[1] - points[0])
+        if len(sequence.sweep_axes) <= 1:
+            axis_points = (
+                np.array([0.0], dtype=float)
+                if not sequence.sweep_axes
+                else sequence.sweep_axes[0].points
+            )
+            cfg_start = float(axis_points[0])
+            nominal_step = (
+                0.0
+                if len(axis_points) < 2
+                else float(axis_points[1] - axis_points[0])
+            )
         else:
             # RAveragerProgram requires scalar start/step metadata.  Cartesian
             # coordinates are returned by get_expt_pts() instead.
@@ -2531,15 +2584,77 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
     def get_expt_pts(self):
         return self.sequence.sweep_points.copy()
 
+    def _boundary_validation_indices(self) -> Tuple[int, ...]:
+        """Return corners plus rows required by duration-conditioned tables."""
+        axes = self.sequence.sweep_axes
+        if not axes:
+            return (0,)
+        shape = tuple(int(axis.count) for axis in axes)
+        selected = {
+            int(np.ravel_multi_index(indices, shape, order="C"))
+            for indices in product(
+                *((0,) if count <= 1 else (0, count - 1) for count in shape)
+            )
+        }
+        duration_axes = self._duration_axis_indices(axes)
+        if duration_axes:
+            duration_shape = tuple(shape[index] for index in duration_axes)
+            non_duration_axes = tuple(
+                index for index in range(len(axes))
+                if index not in duration_axes and shape[index] > 1
+            )
+            for duration_indices in np.ndindex(duration_shape):
+                base = [0] * len(axes)
+                for axis_index, value in zip(
+                    duration_axes,
+                    duration_indices,
+                ):
+                    base[axis_index] = int(value)
+                selected.add(
+                    int(np.ravel_multi_index(tuple(base), shape, order="C"))
+                )
+                for axis_index in non_duration_axes:
+                    endpoint = list(base)
+                    endpoint[axis_index] = shape[axis_index] - 1
+                    selected.add(
+                        int(
+                            np.ravel_multi_index(
+                                tuple(endpoint),
+                                shape,
+                                order="C",
+                            )
+                        )
+                    )
+        return tuple(sorted(selected))
+
+    def _compile_boundary_points(self) -> None:
+        indices = self._boundary_validation_indices()
+        self.awg_channels, points = compile_sequence(
+            self.sequence,
+            self.soccfg,
+            self.awg_channel_spec,
+            point_indices=indices,
+        )
+        self._compiled_point_by_index = dict(zip(indices, points))
+        self._compile_validation_point_indices = indices
+        self.compiled_points = points
+
     def initialize(self):
         # QICK's pulse/readout helpers use self.tproccfg for timestamp math.
         # Keep the hardware description intact and override only this program's
         # local timing view when the caller supplied a manual clock.
         self.tproccfg = dict(self.tproccfg)
         self.tproccfg["f_time"] = self.tproc_mhz
-        self.awg_channels, self.compiled_points = compile_sequence(
-            self.sequence, self.soccfg, self.awg_channel_spec
-        )
+        if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
+            self.awg_channels, self.compiled_points = compile_sequence(
+                self.sequence, self.soccfg, self.awg_channel_spec
+            )
+            self._compiled_point_by_index = None
+            self._compile_validation_point_indices = range(
+                len(self.compiled_points)
+            )
+        else:
+            self._compile_boundary_points()
         self._validate_bias_t_tproc_ports()
         self.bias_t_simultaneous_start_lead_cycles = (
             BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * len(self.awg_channels)
@@ -3064,6 +3179,332 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self._bias_t_max_duration_q_error = max_error
         return models
 
+    def _boundary_bias_models_from_values(
+        self,
+        sweep_axes,
+        sweep_shape,
+        *,
+        register_name,
+        metadata,
+        value_at,
+    ):
+        """Build and check Bias-T models without expanding Cartesian points."""
+        validation_indices = self._compile_validation_point_indices
+        duration_axes = self._duration_axis_indices(sweep_axes)
+        requested = np.asarray(
+            [
+                [
+                    int(value_at(point_index, output_index))
+                    for output_index in range(self.sequence.n_outputs)
+                ]
+                for point_index in validation_indices
+            ],
+            dtype=np.int64,
+        )
+        actual = np.empty_like(requested)
+        models = []
+        max_error = 0
+
+        for output_index in range(self.sequence.n_outputs):
+            quantum = int(metadata[output_index].get("quantum", 1))
+            if duration_axes:
+                duration_shape = tuple(
+                    int(sweep_axes[axis_index].count)
+                    for axis_index in duration_axes
+                )
+                bases = []
+                axis_rows = {
+                    axis_index: []
+                    for axis_index, axis in enumerate(sweep_axes)
+                    if axis_index not in duration_axes and axis.count > 1
+                }
+                for duration_indices in np.ndindex(duration_shape):
+                    base_indices = [0] * len(sweep_axes)
+                    for axis_index, duration_index in zip(
+                        duration_axes,
+                        duration_indices,
+                    ):
+                        base_indices[axis_index] = int(duration_index)
+                    base_point = int(
+                        np.ravel_multi_index(
+                            tuple(base_indices),
+                            sweep_shape,
+                            order="C",
+                        )
+                    )
+                    base = int(value_at(base_point, output_index))
+                    bases.append(base)
+                    for axis_index in axis_rows:
+                        endpoint_indices = list(base_indices)
+                        endpoint_indices[axis_index] = (
+                            sweep_axes[axis_index].count - 1
+                        )
+                        endpoint_point = int(
+                            np.ravel_multi_index(
+                                tuple(endpoint_indices),
+                                sweep_shape,
+                                order="C",
+                            )
+                        )
+                        units = _round_div_nearest(
+                            int(value_at(endpoint_point, output_index)) - base,
+                            (
+                                sweep_axes[axis_index].count - 1
+                            ) * quantum,
+                        )
+                        axis_rows[axis_index].append(units * quantum)
+                model = {
+                    "key": ("bias_t", output_index, register_name),
+                    "register_name": register_name,
+                    "base": int(bases[0]),
+                    "axis_deltas": tuple(0 for _axis in sweep_axes),
+                    "duration_table_bases": tuple(bases),
+                    "duration_table_axis_deltas": {
+                        int(axis_index): tuple(values)
+                        for axis_index, values in axis_rows.items()
+                    },
+                    "duration_axis_index": duration_axes[0],
+                    "duration_axis_indices": duration_axes,
+                    "duration_table_shape": duration_shape,
+                    "output_index": output_index,
+                    "gen_ch": self.awg_channels[output_index],
+                }
+            else:
+                base = int(value_at(0, output_index))
+                axis_deltas = []
+                for axis_index, axis in enumerate(sweep_axes):
+                    if axis.count <= 1:
+                        axis_deltas.append(0)
+                        continue
+                    endpoint_indices = [0] * len(sweep_axes)
+                    endpoint_indices[axis_index] = axis.count - 1
+                    endpoint_point = int(
+                        np.ravel_multi_index(
+                            tuple(endpoint_indices),
+                            sweep_shape,
+                            order="C",
+                        )
+                    )
+                    units = _round_div_nearest(
+                        int(value_at(endpoint_point, output_index)) - base,
+                        (axis.count - 1) * quantum,
+                    )
+                    axis_deltas.append(units * quantum)
+                model = {
+                    "key": ("bias_t", output_index, register_name),
+                    "register_name": register_name,
+                    "base": base,
+                    "axis_deltas": tuple(axis_deltas),
+                    "output_index": output_index,
+                    "gen_ch": self.awg_channels[output_index],
+                }
+            model.update(metadata[output_index])
+            models.append(model)
+
+            for row, point_index in enumerate(validation_indices):
+                indices = (
+                    np.unravel_index(point_index, sweep_shape, order="C")
+                    if sweep_axes
+                    else ()
+                )
+                if "duration_table_bases" in model:
+                    duration_indices = tuple(
+                        int(indices[axis_index])
+                        for axis_index in duration_axes
+                    )
+                    duration_row = int(
+                        np.ravel_multi_index(
+                            duration_indices,
+                            model["duration_table_shape"],
+                            order="C",
+                        )
+                    )
+                    value = int(
+                        model["duration_table_bases"][duration_row]
+                    )
+                    for axis_index, deltas in model[
+                        "duration_table_axis_deltas"
+                    ].items():
+                        value += (
+                            int(indices[axis_index])
+                            * int(deltas[duration_row])
+                        )
+                else:
+                    value = int(model["base"]) + sum(
+                        int(index) * int(delta)
+                        for index, delta in zip(
+                            indices,
+                            model["axis_deltas"],
+                        )
+                    )
+                actual[row, output_index] = value
+                max_error = max(
+                    max_error,
+                    abs(
+                        value
+                        - int(value_at(point_index, output_index))
+                    ),
+                )
+
+        return tuple(models), requested, actual, int(max_error)
+
+    def _build_bias_t_models_boundary(self, sweep_axes, sweep_shape):
+        """Build Bias-T state from boundary and duration-table points only."""
+        config = self.sequence.bias_t_compensation
+        self._bias_t_mode = (
+            None
+            if config is None
+            else (
+                "filter"
+                if isinstance(config, BiasTFilterCompensationConfig)
+                else config.mode
+            )
+        )
+        self._bias_t_comp_codes = ()
+        self._bias_t_duration_q_requested = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_duration_q_actual = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_target_code_requested = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_target_code_actual = np.empty((0, 0), dtype=np.int64)
+        self._bias_t_max_duration_q_error = 0
+        self._bias_t_max_target_code_error = 0
+        if config is None or isinstance(config, BiasTFilterCompensationConfig):
+            self._bias_t_fields = ()
+            return ()
+
+        area_cache = {
+            point_index: self._compiled_point_area2(
+                point_index,
+                self._compiled_point_by_index[point_index],
+            )
+            for point_index in self._compile_validation_point_indices
+        }
+
+        if config.mode == "fixed_time":
+            duration = int(config.fixed_duration_cycles)
+            metadata = []
+            limits = []
+            for gen_ch in self.awg_channels:
+                gen_cfg = self.soccfg["gens"][gen_ch]
+                minimum = int(gen_cfg.get("minv", -32768))
+                maximum = int(gen_cfg.get("maxv", 32764))
+                quantum = 1 << int(gen_cfg.get("dac_invalid_lsb", 2))
+                fabric_mhz = Fraction(str(gen_cfg["f_fabric"]))
+                duration_ratio = (
+                    Fraction(duration)
+                    * Fraction(str(self.tproc_mhz))
+                    / fabric_mhz
+                )
+                duration_tproc = max(
+                    1,
+                    (
+                        duration_ratio.numerator
+                        + duration_ratio.denominator
+                        - 1
+                    ) // duration_ratio.denominator,
+                )
+                limits.append((minimum, maximum, quantum))
+                metadata.append({
+                    "fixed_duration_fabric_cycles": duration,
+                    "fixed_duration_tproc_cycles": int(duration_tproc),
+                    "quantum": quantum,
+                })
+
+            def target_at(point_index, output_index):
+                minimum, maximum, quantum = limits[output_index]
+                units = _round_div_nearest(
+                    -int(area_cache[int(point_index)][output_index]),
+                    2 * duration * quantum,
+                )
+                target = units * quantum
+                if target < minimum or target > maximum:
+                    raise ValueError(
+                        "Bias-T fixed compensation time is too short for "
+                        f"{self.sequence.output_names[output_index]}; required "
+                        f"DAC code {target} is outside [{minimum}, {maximum}]"
+                    )
+                return target
+
+            models, requested, actual, max_error = (
+                self._boundary_bias_models_from_values(
+                    sweep_axes,
+                    sweep_shape,
+                    register_name="bias_t_target_code",
+                    metadata=metadata,
+                    value_at=target_at,
+                )
+            )
+            self._bias_t_target_code_requested = requested
+            self._bias_t_target_code_actual = actual
+            self._bias_t_max_target_code_error = max_error
+            return models
+
+        scale = 1 << int(config.duration_frac_bits)
+        rounding = scale >> 1
+        comp_codes = []
+        metadata = []
+        for gen_ch in self.awg_channels:
+            gen_cfg = self.soccfg["gens"][gen_ch]
+            kwargs = {
+                "min_code": int(gen_cfg.get("minv", -32768)),
+                "max_code": int(gen_cfg.get("maxv", 32764)),
+                "invalid_lsb": int(gen_cfg.get("dac_invalid_lsb", 2)),
+            }
+            positive = normalized_to_dac(config.amplitude, **kwargs)
+            negative = normalized_to_dac(-config.amplitude, **kwargs)
+            if positive <= 0 or negative >= 0:
+                raise ValueError(
+                    "Bias-T compensation voltage is below one legal DAC code"
+                )
+            comp_codes.append((positive, negative))
+            metadata.append({
+                "positive_code": int(positive),
+                "negative_code": int(negative),
+                "duration_frac_bits": int(config.duration_frac_bits),
+            })
+
+        def duration_at(point_index, output_index):
+            signed_area2 = int(area_cache[int(point_index)][output_index])
+            if signed_area2 == 0:
+                duration_q = 0
+            else:
+                positive, negative = comp_codes[output_index]
+                target_magnitude = (
+                    abs(negative) if signed_area2 > 0 else positive
+                )
+                gen_ch = self.awg_channels[output_index]
+                fabric_mhz = Fraction(
+                    str(self.soccfg["gens"][gen_ch]["f_fabric"])
+                )
+                ratio = Fraction(
+                    signed_area2 * scale,
+                    2 * int(target_magnitude),
+                ) * Fraction(str(self.tproc_mhz)) / fabric_mhz
+                duration_q = _round_div_nearest(
+                    ratio.numerator,
+                    ratio.denominator,
+                )
+            if abs(duration_q) + rounding > (1 << 31) - 1:
+                raise ValueError(
+                    "Bias-T compensation duration exceeds the signed 32-bit "
+                    "tProcessor fixed-point range; increase compensation voltage"
+                )
+            return duration_q
+
+        models, requested, actual, max_error = (
+            self._boundary_bias_models_from_values(
+                sweep_axes,
+                sweep_shape,
+                register_name="bias_t_duration_q",
+                metadata=metadata,
+                value_at=duration_at,
+            )
+        )
+        self._bias_t_comp_codes = tuple(comp_codes)
+        self._bias_t_duration_q_requested = requested
+        self._bias_t_duration_q_actual = actual
+        self._bias_t_max_duration_q_error = max_error
+        return models
+
     def _build_rf_point_table_models(self, sweep_axes):
         """Build compact DMEM tables for exact RF frequency and gain words."""
         tables = []
@@ -3162,9 +3603,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
     def _build_sweep_register_plan(self):
         """Map Cartesian sweep axes to tProcessor register increments."""
-        command_maps = []
+        validation_indices = tuple(self._compile_validation_point_indices)
+        command_maps = {}
         command_order = []
-        for point_index, point in enumerate(self.compiled_points):
+        for validation_position, (point_index, point) in enumerate(zip(
+            validation_indices,
+            self.compiled_points,
+        )):
             point_map = {}
             for commands in point.segment_commands:
                 for command in commands:
@@ -3172,12 +3617,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     if key in point_map:
                         raise RuntimeError(f"duplicate compiled command key {key}")
                     point_map[key] = command
-                    if point_index == 0:
+                    if validation_position == 0:
                         command_order.append(key)
-            command_maps.append(point_map)
+            command_maps[int(point_index)] = point_map
 
         expected_keys = set(command_order)
-        for point_index, point_map in enumerate(command_maps[1:], start=1):
+        for point_index in validation_indices[1:]:
+            point_map = command_maps[int(point_index)]
             if set(point_map) != expected_keys:
                 raise RuntimeError(
                     f"sweep point {point_index} changes the active AWG command set"
@@ -3212,35 +3658,88 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     base = int(first_command.duration_samples)
                     quantum = 1
 
-                requested_values = np.asarray(
-                    [
-                        (
-                            command_maps[point_index][key].target_code
-                            if register_name == "target"
-                            else (
-                                command_maps[point_index][key].step
-                                if register_name == "step"
-                                else command_maps[point_index][key].duration_samples
-                            )
-                        )
-                        for point_index in range(len(command_maps))
-                    ],
-                    dtype=np.int64,
-                )
+                def requested_value(point_index):
+                    command = command_maps[int(point_index)][key]
+                    if register_name == "target":
+                        return int(command.target_code)
+                    if register_name == "step":
+                        return int(command.step)
+                    return int(command.duration_samples)
 
                 if selected_ramp_axis_index is not None and register_name == "step":
-                    (
-                        table_bases,
-                        table_axis_deltas,
-                        _actual,
-                        _max_error,
-                    ) = self._duration_conditioned_values(
-                        requested_values,
-                        sweep_axes,
-                        sweep_shape,
-                        duration_axis_index=selected_ramp_axis_index,
-                        quantum=quantum,
-                    )
+                    if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
+                        requested_values = np.asarray(
+                            [
+                                requested_value(point_index)
+                                for point_index in validation_indices
+                            ],
+                            dtype=np.int64,
+                        )
+                        (
+                            table_bases,
+                            table_axis_deltas,
+                            _actual,
+                            _max_error,
+                        ) = self._duration_conditioned_values(
+                            requested_values,
+                            sweep_axes,
+                            sweep_shape,
+                            duration_axis_index=selected_ramp_axis_index,
+                            quantum=quantum,
+                        )
+                    else:
+                        table_bases = []
+                        table_axis_deltas = {
+                            axis_index: []
+                            for axis_index, axis in enumerate(sweep_axes)
+                            if (
+                                axis_index != selected_ramp_axis_index
+                                and axis.count > 1
+                            )
+                        }
+                        for duration_index in range(
+                            sweep_axes[selected_ramp_axis_index].count
+                        ):
+                            base_indices = [0] * len(sweep_axes)
+                            base_indices[
+                                selected_ramp_axis_index
+                            ] = duration_index
+                            base_point = int(
+                                np.ravel_multi_index(
+                                    tuple(base_indices),
+                                    sweep_shape,
+                                    order="C",
+                                )
+                            )
+                            row_base = requested_value(base_point)
+                            table_bases.append(row_base)
+                            for axis_index in table_axis_deltas:
+                                endpoint_indices = list(base_indices)
+                                endpoint_indices[axis_index] = (
+                                    sweep_axes[axis_index].count - 1
+                                )
+                                endpoint_point = int(
+                                    np.ravel_multi_index(
+                                        tuple(endpoint_indices),
+                                        sweep_shape,
+                                        order="C",
+                                    )
+                                )
+                                units = _round_div_nearest(
+                                    requested_value(endpoint_point) - row_base,
+                                    (
+                                        sweep_axes[axis_index].count - 1
+                                    ) * quantum,
+                                )
+                                table_axis_deltas[axis_index].append(
+                                    units * quantum
+                                )
+                        table_bases = tuple(table_bases)
+                        table_axis_deltas = {
+                            int(axis_index): tuple(values)
+                            for axis_index, values
+                            in table_axis_deltas.items()
+                        }
                     models[(*key, register_name)] = {
                         "key": (*key, register_name),
                         "command_key": key,
@@ -3268,7 +3767,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     endpoint_index = int(
                         np.ravel_multi_index(tuple(indices), sweep_shape, order="C")
                     )
-                    endpoint = int(requested_values[endpoint_index])
+                    endpoint = requested_value(endpoint_index)
                     units = _round_div_nearest(
                         endpoint - base,
                         (axis.count - 1) * quantum,
@@ -3285,6 +3784,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         requested_points = self.compiled_points
         actual_points = []
+        actual_point_indices = []
         max_target_error = 0
         max_step_error = 0
         max_duration_error = 0
@@ -3330,7 +3830,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 value += int(indices[axis_index]) * int(deltas[duration_row])
             return value
 
-        for point_index, requested_point in enumerate(requested_points):
+        for point_index, requested_point in zip(
+            validation_indices,
+            requested_points,
+        ):
             if sweep_axes:
                 indices = np.unravel_index(point_index, sweep_shape, order="C")
             else:
@@ -3380,11 +3883,31 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             actual_points.append(
                 replace(requested_point, segment_commands=tuple(actual_segments))
             )
+            actual_point_indices.append(int(point_index))
 
         self.requested_compiled_points = requested_points
-        self.compiled_points = tuple(actual_points)
+        if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
+            self.compiled_points = tuple(actual_points)
+        else:
+            self._compiled_point_by_index = {
+                point_index: point
+                for point_index, point in zip(
+                    actual_point_indices,
+                    actual_points,
+                )
+            }
+            self.compiled_points = (self._compiled_point_by_index[0],)
 
-        bias_t_models = self._build_bias_t_models(sweep_axes, sweep_shape)
+        if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
+            bias_t_models = self._build_bias_t_models(
+                sweep_axes,
+                sweep_shape,
+            )
+        else:
+            bias_t_models = self._build_bias_t_models_boundary(
+                sweep_axes,
+                sweep_shape,
+            )
         event_timing_models = self._build_event_timing_models()
 
         fields = []
@@ -4700,7 +5223,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 )
         events.sort(key=lambda event: event[:3])
         shape = tuple(axis.count for axis in self.sequence.sweep_axes)
-        for point_index in range(self.sequence.sweep_point_count):
+        point_indices = (
+            range(self.sequence.sweep_point_count)
+            if self.compile_validation_mode == COMPILE_VALIDATION_FULL
+            else self._compile_validation_point_indices
+        )
+        for point_index in point_indices:
             indices = (
                 np.unravel_index(point_index, shape, order="C")
                 if self.sequence.sweep_axes
@@ -6388,6 +6916,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "sweep_axes": self.sequence.sweep_axes,
             "sweep_shape": self.sequence.sweep_shape,
             "cartesian_point_count": self.sequence.sweep_point_count,
+            "compile_validation_mode": self.compile_validation_mode,
+            "compile_validation_point_count": len(
+                self._compile_validation_point_indices
+            ),
+            "compile_validation_point_indices": (
+                None
+                if self.compile_validation_mode == COMPILE_VALIDATION_FULL
+                else self._compile_validation_point_indices
+            ),
             "cross_capacitance": self.sequence.cross_capacitance.copy(),
             "segments": tuple(segment.name for segment in self.sequence.segments),
             "repetitions_per_sweep": self.cfg["reps"],
@@ -6552,8 +7089,12 @@ __all__ = [
     "BiasTCompensationConfig",
     "BiasTCompensationPreview",
     "BiasTFilterCompensationConfig",
+    "COMPILE_VALIDATION_BOUNDARY",
+    "COMPILE_VALIDATION_FULL",
+    "COMPILE_VALIDATION_MODES",
     "CompiledCommand",
     "CompiledPoint",
+    "DEFAULT_COMPILE_VALIDATION_MODE",
     "DdrFirReadoutConfig",
     "DEFAULT_BIAS_T_DURATION_FRAC_BITS",
     "FineTuneAmplitudeSweepProgram",
@@ -6570,6 +7111,7 @@ __all__ = [
     "RfPulseConfig",
     "compile_sequence",
     "cycles_from_ns",
+    "normalize_compile_validation_mode",
     "cycles_from_us",
     "dac_to_normalized",
     "normalized_to_dac",
