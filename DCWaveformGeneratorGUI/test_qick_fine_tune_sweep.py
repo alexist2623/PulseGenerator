@@ -16,6 +16,7 @@ from qick.qick_asm import QickConfig
 from qick_fine_tune_sweep import (
     DdrFirReadoutConfig,
     FineTuneSequence,
+    HoldDurationSweep,
     RampDurationSweep,
     ReadoutConfig,
     RfPulseConfig,
@@ -657,6 +658,123 @@ def test_ramp_rate_sweep_moves_50_ksps_ddr_trigger_with_segment():
     assert tproc.timing_conflicts == []
 
 
+def test_hold_duration_sweep_moves_later_commands_and_50_ksps_trigger():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 18)
+    sequence.add_ramp("to_capture", 30)
+    sequence.add_set("capture", (0.4,), 60)
+    sequence.add_hold_duration_sweep(
+        "start",
+        start_us=0.10,
+        stop_us=0.20,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+
+    assert isinstance(sequence.sweep_axes[0], HoldDurationSweep)
+    assert sequence.sweep_axes[0].duration_cycles_points == (30, 45, 60)
+    assert tuple(
+        sequence.segment_duration_cycles_at(point_index, 0)
+        for point_index in range(3)
+    ) == (30, 45, 60)
+    assert tuple(
+        sequence.waveform_vertices(point_index)[0][-1]
+        for point_index in range(3)
+    ) == (120.0, 135.0, 150.0)
+
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=8,
+        at_segment="capture",
+        trigger_delay_tproc_cycles=17,
+        margin_input_samples=0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(
+            fir_rate_profile="50_ksps",
+            ddr_trigger_port=7,
+        ),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=500_000)
+
+    awg_events = [
+        event for event in tproc.output_events if event.tproc_ch == 0
+    ]
+    trigger_high = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 7 and event.word == 1 << 1
+    ]
+    trigger_low = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 7 and event.word == 0
+    ]
+    assert [event.word for event in awg_events] == _expected_words(program)
+    assert len(trigger_high) == 3
+    assert len(trigger_low) == 3
+    for point_index, (trigger_event, low_event) in enumerate(
+        zip(trigger_high, trigger_low)
+    ):
+        capture_set_event = awg_events[point_index * 3 + 2]
+        assert trigger_event.cycle - capture_set_event.cycle == 17
+        assert low_event.cycle - trigger_event.cycle == (
+            ddr.trigger_width_tproc_cycles
+        )
+    assert len(program.summary()["hold_duration_sweeps"]) == 1
+    assert tproc.timing_conflicts == []
+
+
+def test_hold_duration_axis_drives_exact_bias_t_duration_table():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.4,), 18)
+    sequence.add_ramp("to_middle", 30)
+    sequence.add_set("middle", (0.2,), 18)
+    sequence.add_ramp("to_finish", 40)
+    sequence.add_set("finish", (-0.6,), 18)
+    sequence.add_hold_duration_sweep(
+        "middle",
+        start_us=0.06,
+        stop_us=0.10,
+        count=3,
+        sequence_fabric_mhz=300.0,
+    )
+    sequence.add_amplitude_sweep(
+        "finish",
+        "awg_0",
+        -0.6,
+        -0.4,
+        2,
+    )
+    sequence.set_bias_t_compensation(0.1)
+
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    bias_field = program._bias_t_fields[0]
+    assert tuple(bias_field["duration_axis_indices"]) == (0,)
+    assert tuple(bias_field["duration_table_shape"]) == (3,)
+    assert program._bias_t_max_duration_q_error <= 1
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=1_000_000)
+    assert len(tproc.output_events) > len(_expected_words(program))
+    assert tproc.timing_conflicts == []
+
+
 def test_two_ramp_rate_axes_move_50_ksps_ddr_trigger_additively():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("start", (0.0,), 18)
@@ -1141,6 +1259,72 @@ def test_rf_duration_is_a_cartesian_axis_with_amplitude_sweep():
             [0.25, 30 / 300],
         ],
     )
+
+
+def test_rf_frequency_and_power_sweeps_load_exact_dmem_words():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 100)
+    sequence.add_rf_frequency_sweep(
+        "gate",
+        0,
+        10.0,
+        30.0,
+        3,
+    )
+    sequence.add_rf_power_sweep(
+        "gate",
+        0,
+        -30.0,
+        -20.0,
+        2,
+    )
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="gate",
+        length_cycles=20,
+        gain=101,
+        freq_mhz=10.0,
+        sweep_gain_codes=(101, 102, 201, 202, 301, 302),
+        sweep_gain_shape=(3, 2),
+        power_calibration_run_id=77,
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulse=rf,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=200_000)
+    rf_events = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and ((event.word >> 152) & 0xFF) == 0
+    ]
+    assert len(rf_events) == 6
+    expected_frequencies = [
+        program._rf_frequency_word(rf, frequency)
+        for frequency in (10.0, 10.0, 20.0, 20.0, 30.0, 30.0)
+    ]
+    assert [event.word & 0xFFFFFFFF for event in rf_events] == (
+        expected_frequencies
+    )
+    assert [
+        (event.word >> 96) & 0xFFFFFFFF for event in rf_events
+    ] == [101, 102, 201, 202, 301, 302]
+    assert any(
+        instruction["name"] == "memr"
+        for instruction in program.prog_list
+    )
+    summary = program.summary()
+    assert summary["rf_frequency_sweeps"] == 1
+    assert summary["rf_power_sweeps"] == 1
+    assert summary["rf_point_table_count"] == 2
+    assert summary["rf_point_table_words"] == 9
 
 
 def test_rf_and_readout_phase_reset_are_fixed_off():

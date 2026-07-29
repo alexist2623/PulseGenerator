@@ -108,7 +108,7 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
     assert point_one["hold_x_ns"] == 2_000.0
     assert point_one["hold_y_ns"] == 2_500.0
     label = widget._point_labels[1].textItem.toPlainText()
-    assert "P1" in label
+    assert "set_1" in label
     assert "Hold X 2 / Y 2.5 us" in label
     assert "Ramp" not in label
     ramp_label = widget._ramp_labels[0]
@@ -121,7 +121,7 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
         [50.0, -20.0],
     )
     tooltip = widget._point_tooltip(0.0, 0.0, point_one)
-    assert "P1" in tooltip
+    assert "set_1" in tooltip
     assert "X 100 mV" in tooltip
     assert "Y -50 mV" in tooltip
     assert "Hold X 2 / Y 2.5 us" in tooltip
@@ -150,6 +150,45 @@ def test_trace_points_show_hold_and_ramps_above_their_segments():
     assert (
         widget._ramp_labels[0].textItem.toPlainText()
         == "Ramp X 500 / Y 750 ns"
+    )
+    app.processEvents()
+    widget.close()
+
+
+def test_trace_points_use_custom_segment_names():
+    app = _application()
+    pulse_x = _pulse(
+        [0.0, 100.0],
+        [1_000.0, 2_000.0],
+        [500.0],
+    )
+    pulse_y = _pulse(
+        [10.0, -50.0],
+        [1_000.0, 2_000.0],
+        [500.0],
+    )
+    for pulse in (pulse_x, pulse_y):
+        pulse.rename_segment(0, "Reset")
+        pulse.rename_segment(1, "Measure")
+    widget = TracePlotWidget()
+    widget.x_idx = 0
+    widget.y_idx = 1
+    widget.refresh_trace((pulse_x, pulse_y))
+
+    assert "Reset" in widget._point_labels[0].textItem.toPlainText()
+    assert "Measure" in widget._point_labels[1].textItem.toPlainText()
+    assert "P0" not in widget._point_labels[0].textItem.toPlainText()
+    assert "Measure" in widget._point_tooltip(
+        100.0,
+        -50.0,
+        widget._point_records[1],
+    )
+
+    pulse_y.rename_segment(1, "Sense")
+    widget.refresh_trace((pulse_x, pulse_y))
+    assert (
+        "X Measure / Y Sense"
+        in widget._point_labels[1].textItem.toPlainText()
     )
     app.processEvents()
     widget.close()
@@ -213,6 +252,7 @@ def test_trace_edits_update_xy_values_and_share_segment_timing():
         x_mv=225.0,
         y_mv=-175.0,
         hold_ns=3_250.0,
+        segment_name="Readout",
     )
 
     assert window._pulse[0].v[2] == 225.0
@@ -220,6 +260,8 @@ def test_trace_edits_update_xy_values_and_share_segment_timing():
     np.testing.assert_array_equal(window._pulse[2].v, third_output_voltage)
     for pulse in window._pulse:
         assert pulse.t[3] - pulse.t[2] == 3_250.0
+        assert pulse.segment_name(1) == "Readout"
+    assert "Readout" in window._trace._point_labels[1].textItem.toPlainText()
 
     window._apply_trace_ramp_edit(
         segment_index=1,

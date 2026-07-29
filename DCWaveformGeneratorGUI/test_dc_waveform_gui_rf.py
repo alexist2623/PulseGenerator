@@ -21,6 +21,7 @@ from dc_waveform_core import (
     DEFAULT_QICK_FULL_SCALE_MV,
     PulseSequence,
     QickDdrReadoutSpec,
+    QickHoldDurationSweepSpec,
     QickRampRateSweepSpec,
     QickRfPulseSpec,
     QickSweepSpec,
@@ -138,7 +139,8 @@ def test_gui_defaults_and_time_unit_round_trip():
     window._time_unit_combo.setCurrentText("ns")
     app.processEvents()
     assert control.edit_ramp.text() == "1000"
-    assert control.table.horizontalHeaderItem(2).text() == "Flat [ns]"
+    assert control.table.horizontalHeaderItem(1).text() == "Name"
+    assert control.table.horizontalHeaderItem(3).text() == "Flat [ns]"
 
     window._time_unit_combo.setCurrentText("ms")
     app.processEvents()
@@ -303,6 +305,25 @@ def test_ramp_rate_sweep_dialog_uses_duration_and_reports_derived_rate():
     dialog.close()
 
 
+def test_hold_duration_sweep_dialog_uses_shared_set_timing():
+    app = _application()
+    initial = QickHoldDurationSweepSpec("set_1", 1.0, 5.0, 5)
+    dialog = gui.HoldDurationSweepSettingsDialog(
+        segment_name="set_1",
+        current_duration_us=2.0,
+        initial=initial,
+        cartesian_base_count=7,
+    )
+
+    assert dialog.start.value() == 1.0
+    assert dialog.stop.value() == 5.0
+    assert dialog.count.value() == 5
+    assert dialog.cartesian_summary.text() == "7 x 5 = 35 points"
+    assert dialog.value() == initial
+    app.processEvents()
+    dialog.close()
+
+
 def test_export_sweep_editor_displays_mv_and_tracks_full_scale():
     app = _application()
     dialog = gui.QickExportDialog(
@@ -334,21 +355,22 @@ def test_export_dialog_preserves_multiple_ramp_rate_axes():
     app = _application()
     ramp_a = QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3)
     ramp_b = QickRampRateSweepSpec("ramp_1_to_2", 0.10, 0.16, 4)
+    hold = QickHoldDurationSweepSpec("set_1", 0.5, 1.0, 2)
     voltage = QickSweepSpec("set_2", "awg_0", -0.5, 0.5, 5)
     dialog = gui.QickExportDialog(
         pulse_count=1,
         set_names=("set_0", "set_1", "set_2"),
         initial_full_scale_mv=200.0,
-        initial_sweeps=(ramp_a, ramp_b, voltage),
+        initial_sweeps=(ramp_a, ramp_b, hold, voltage),
     )
     app.processEvents()
 
-    assert dialog._effective_sweeps() == (ramp_a, ramp_b, voltage)
-    assert dialog.sweep_total.text() == "3 x 4 x 5 = 60 combinations"
+    assert dialog._effective_sweeps() == (ramp_a, ramp_b, hold, voltage)
+    assert dialog.sweep_total.text() == "3 x 4 x 2 x 5 = 120 combinations"
     dialog.sweep_group.setChecked(False)
     app.processEvents()
-    assert dialog._effective_sweeps() == (ramp_a, ramp_b)
-    assert dialog.sweep_total.text() == "3 x 4 = 12 combinations"
+    assert dialog._effective_sweeps() == (ramp_a, ramp_b, hold)
+    assert dialog.sweep_total.text() == "3 x 4 x 2 = 24 combinations"
     dialog.close()
 
 
@@ -451,6 +473,54 @@ def test_rf_duration_sweep_controls_build_sequence_axis_and_round_trip():
     assert restored_spec.duration_sweep_stop_us == 1.25
     assert restored_spec.duration_sweep_count == 5
     assert restored_spec.segment_length_mode == "extend_by_rf_duration"
+    window.close()
+
+
+def test_rf_frequency_and_power_sweep_controls_round_trip():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.setChecked(True)
+    panel.gen_ch.setValue(0)
+    panel.segment.setCurrentIndex(panel.segment.findData("set_0"))
+    panel.frequency_sweep_enabled.setChecked(True)
+    panel.frequency_sweep_start_mhz.setValue(100.0)
+    panel.frequency_sweep_stop_mhz.setValue(200.0)
+    panel.frequency_sweep_count.setValue(11)
+    panel.power_calibration_group.setChecked(True)
+    panel.power_calibration_database_path.setText("calibration.db")
+    panel.power_sweep_enabled.setChecked(True)
+    panel.power_sweep_start_dbm.setValue(-40.0)
+    panel.power_sweep_stop_dbm.setValue(-20.0)
+    panel.power_sweep_count.setValue(5)
+    app.processEvents()
+
+    spec = panel.configured_spec()
+    assert [
+        (axis.axis_kind, axis.start, axis.stop, axis.count)
+        for axis in spec.sweep_axes
+    ] == [
+        ("rf_frequency", 100.0, 200.0, 11),
+        ("rf_power", -40.0, -20.0, 5),
+    ]
+    settings = panel.settings_dict()
+    restored = gui.RfPulsePortPanel(
+        window._pulse[0],
+        0,
+        time_unit="us",
+    )
+    restored.load_settings(settings)
+    restored_spec = restored.configured_spec()
+    assert restored_spec.frequency_sweep_enabled is True
+    assert restored_spec.frequency_sweep_start_mhz == 100.0
+    assert restored_spec.frequency_sweep_stop_mhz == 200.0
+    assert restored_spec.frequency_sweep_count == 11
+    assert restored_spec.power_sweep_enabled is True
+    assert restored_spec.power_sweep_start_dbm == -40.0
+    assert restored_spec.power_sweep_stop_dbm == -20.0
+    assert restored_spec.power_sweep_count == 5
+    assert restored_spec.power_calibration_database_path == "calibration.db"
+    restored.close()
     window.close()
 
 
@@ -770,6 +840,30 @@ def test_generated_qick_module_preserves_multiple_ramp_rate_sweeps():
     assert sequence.sweep_axes[1].points == (0.1, 0.12, 0.14, 0.16)
 
 
+def test_generated_qick_module_preserves_hold_duration_sweep():
+    pulse = PulseSequence(0.0, initial_duration_ns=1000.0)
+    pulse.add_flat_ramp(100.0, 2000.0, 200.0)
+    hold_sweep = QickHoldDurationSweepSpec("set_1", 1.0, 5.0, 5)
+    code = generate_qick_program_code(
+        (pulse,),
+        output_names=("awg_0",),
+        awg_channels=(1,),
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        sweeps=(hold_sweep,),
+    )
+    ast.parse(code)
+    namespace = {}
+    exec(compile(code, "<hold-duration-generated>", "exec"), namespace)
+
+    sequence = namespace["build_sequence"]()
+    assert len(sequence.sweep_axes) == 1
+    axis = sequence.sweep_axes[0]
+    assert axis.axis_kind == "hold_duration"
+    assert axis.segment_name == "set_1"
+    assert axis.points == (1.0, 2.0, 3.0, 4.0, 5.0)
+
+
 def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     app = _application()
     window = gui.MainWindow()
@@ -995,6 +1089,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     window._sweep_specs = [
         QickRampRateSweepSpec("ramp_0_to_1", 0.08, 0.12, 3),
         QickRampRateSweepSpec("ramp_1_to_2", 0.10, 0.16, 4),
+        QickHoldDurationSweepSpec("set_1", 1.0, 5.0, 5),
         QickSweepSpec("set_2", "awg_0", -0.4, 0.6, 7),
     ]
     window._qick_fabric_mhz = 300.0
@@ -1114,6 +1209,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         "start": 0.10,
         "stop": 0.16,
         "count": 4,
+    }
+    assert document["awg"]["sweeps"][2] == {
+        "axis_kind": "hold_duration",
+        "segment_name": "set_1",
+        "output_name": "all_awg_outputs",
+        "start": 1.0,
+        "stop": 5.0,
+        "count": 5,
     }
     assert len(document["rf_outputs"]) == 2
     assert document["rf_outputs"][0]["filter_type"] == "highpass"
@@ -1479,6 +1582,29 @@ def test_legacy_single_waveform_json_remains_loadable(tmp_path):
     app.processEvents()
     assert window._pulse[0].to_dict() == pulse.to_dict()
     window.close()
+
+
+def test_segment_names_survive_insert_delete_copy_and_json():
+    pulse = PulseSequence(-125.0, initial_duration_ns=750.0)
+    pulse.rename_segment(0, "Reset")
+    pulse.add_flat_ramp(125.0, 500.0, 225.0)
+    pulse.rename_segment(1, "Readout")
+
+    assert pulse.insert_flat_ramp(2, 50.0, 100.0)
+    inserted_name = pulse.segment_name(1)
+    assert inserted_name not in {"Reset", "Readout"}
+    assert pulse.segment_names == ["Reset", inserted_name, "Readout"]
+
+    assert pulse.delete_flat_ramp(2)
+    assert pulse.segment_names == ["Reset", "Readout"]
+    assert pulse.copy().segment_names == ["Reset", "Readout"]
+    restored = PulseSequence.from_dict(pulse.to_dict())
+    assert restored.segment_names == ["Reset", "Readout"]
+
+    legacy = pulse.to_dict()
+    legacy.pop("segment_names")
+    restored_legacy = PulseSequence.from_dict(legacy)
+    assert restored_legacy.segment_names == ["set_0", "set_1"]
 
 
 def test_settings_without_tproc_clock_use_300_mhz_default():

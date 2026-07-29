@@ -18,6 +18,7 @@ from qick_fine_tune_sweep import (
     AmplitudeSweep,
     FineTuneDdrResult,
     FineTuneSequence,
+    HoldDurationSweep,
     RampDurationSweep,
     RfDurationSweep,
 )
@@ -98,6 +99,24 @@ def test_sweep_parameter_names_preserve_ramp_duration_units():
     assert _sweep_parameter_names(axes) == (
         "all_awg_outputs_ramp_0_to_1_ramp_duration_us",
         "all_awg_outputs_ramp_1_to_2_ramp_duration_us",
+        "awg_0_gate_voltage_mv",
+    )
+
+
+def test_sweep_parameter_names_preserve_hold_duration_units():
+    axes = (
+        HoldDurationSweep(
+            segment_name="readout hold",
+            start=1.0,
+            stop=5.0,
+            count=5,
+            sequence_fabric_mhz=300.0,
+        ),
+        AmplitudeSweep("gate", "awg_0", -0.5, 0.5, 3),
+    )
+
+    assert _sweep_parameter_names(axes) == (
+        "all_awg_outputs_readout_hold_hold_duration_us",
         "awg_0_gate_voltage_mv",
     )
 
@@ -727,6 +746,104 @@ def test_runtime_configs_accept_manual_tproc_clock_override():
     assert build_runtime_ddr_readout(
         soccfg, ddr
     ).trigger_delay_tproc_cycles == 100
+
+
+def test_runtime_rf_frequency_power_sweep_builds_calibrated_gain_matrix(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeCalibration:
+        summary = SimpleNamespace(run_id=91)
+
+        def build_gain_schedule(
+            self,
+            frequencies,
+            target_power_dbm,
+            **kwargs,
+        ):
+            calls.append((
+                tuple(float(value) for value in frequencies),
+                float(target_power_dbm),
+                kwargs,
+            ))
+            offset = 100 if target_power_dbm == -30.0 else 200
+            return SimpleNamespace(
+                gain_codes=np.asarray(
+                    [offset + index for index in range(len(frequencies))],
+                    dtype=np.int32,
+                )
+            )
+
+    class FakeCalibrationDatabase:
+        def __init__(self, path):
+            assert path == "calibration.db"
+
+        def output_calibration(self, board_type, frequencies, **kwargs):
+            assert board_type == "RF_Out"
+            assert tuple(frequencies) == (100.0, 150.0, 200.0)
+            assert kwargs == {
+                "run_id": 91,
+                "nqz": 2,
+                "output_filter_type": "highpass",
+                "output_filter_cutoff_ghz": 1.5,
+                "output_filter_bandwidth_ghz": 0.4,
+            }
+            return FakeCalibration()
+
+    monkeypatch.setattr(
+        experiment_module,
+        "CalibrationDatabase",
+        FakeCalibrationDatabase,
+    )
+    spec = QickRfPulseSpec(
+        0,
+        "set_0",
+        0.0,
+        1.0,
+        100.0,
+        20_000,
+        10.0,
+        5.0,
+        nqz=2,
+        filter_type="highpass",
+        filter_cutoff=1.5,
+        filter_bandwidth=0.4,
+        frequency_sweep_enabled=True,
+        frequency_sweep_start_mhz=100.0,
+        frequency_sweep_stop_mhz=200.0,
+        frequency_sweep_count=3,
+        power_sweep_enabled=True,
+        power_sweep_start_dbm=-30.0,
+        power_sweep_stop_dbm=-20.0,
+        power_sweep_count=2,
+        power_calibration_enabled=True,
+        power_calibration_database_path="calibration.db",
+        power_calibration_run_id=91,
+    )
+    runtime = build_runtime_rf_pulses(
+        {
+            "tprocs": [{"f_time": 300.0}],
+            "gens": [{"f_fabric": 300.0}],
+        },
+        (spec,),
+    )[0]
+
+    assert runtime.freq_mhz == 100.0
+    assert runtime.gain == 100
+    assert runtime.sweep_gain_shape == (3, 2)
+    assert runtime.sweep_gain_codes == (100, 200, 101, 201, 102, 202)
+    assert runtime.power_calibration_run_id == 91
+    assert [call[1] for call in calls] == [-30.0, -20.0]
+    assert all(
+        call[2]
+        == {
+            "output_att1_db": 10.0,
+            "output_att2_db": 5.0,
+            "max_entries": 3,
+        }
+        for call in calls
+    )
 
 
 def test_build_qick_program_reuses_runtime_conversion_without_hardware():

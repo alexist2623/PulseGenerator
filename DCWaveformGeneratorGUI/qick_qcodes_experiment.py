@@ -42,6 +42,10 @@ try:
     )
     from .dc_voltage_calibration import load_dc_voltage_calibration
     from .fir_ddr_profile import resolve_fir_ddr_profile
+    from .power_calibration import (
+        CalibrationDatabase,
+        MAX_DMEM_GAIN_ENTRIES,
+    )
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_QICK_FULL_SCALE_MV,
@@ -53,6 +57,7 @@ except ImportError:
     )
     from dc_voltage_calibration import load_dc_voltage_calibration
     from fir_ddr_profile import resolve_fir_ddr_profile
+    from power_calibration import CalibrationDatabase, MAX_DMEM_GAIN_ENTRIES
 
 
 def _runtime_types():
@@ -354,6 +359,102 @@ def build_runtime_rf_pulses(
     pulses = []
     for spec in specs:
         gen_cfg = soccfg["gens"][spec.gen_ch]
+        frequency_points = np.asarray(
+            (
+                np.linspace(
+                    spec.frequency_sweep_start_mhz,
+                    spec.frequency_sweep_stop_mhz,
+                    spec.frequency_sweep_count,
+                    dtype=np.float64,
+                )
+                if spec.frequency_sweep_enabled
+                else [spec.frequency_mhz]
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+        power_points = np.asarray(
+            (
+                np.linspace(
+                    spec.power_sweep_start_dbm,
+                    spec.power_sweep_stop_dbm,
+                    spec.power_sweep_count,
+                    dtype=np.float64,
+                )
+                if spec.power_sweep_enabled
+                else [spec.target_output_power_dbm]
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+        sweep_gain_codes = ()
+        sweep_gain_shape = (0, 0)
+        calibration_run_id = None
+        runtime_gain = int(spec.gain)
+        if spec.power_calibration_enabled:
+            table_words = int(frequency_points.size * power_points.size)
+            frequency_table_words = (
+                int(frequency_points.size)
+                if spec.frequency_sweep_enabled
+                and frequency_points.size > 1
+                else 0
+            )
+            gain_table_words = (
+                table_words
+                if (
+                    frequency_points.size > 1
+                    or power_points.size > 1
+                )
+                else 0
+            )
+            total_rf_table_words = (
+                frequency_table_words + gain_table_words
+            )
+            if total_rf_table_words > MAX_DMEM_GAIN_ENTRIES:
+                raise ValueError(
+                    "RF frequency/power sweep requires "
+                    f"{total_rf_table_words} frequency/gain words, "
+                    "exceeding the tProcessor "
+                    f"DMEM table limit {MAX_DMEM_GAIN_ENTRIES}; reduce RF "
+                    "frequency or power sweep points"
+                )
+            catalog = CalibrationDatabase(
+                spec.power_calibration_database_path
+            )
+            calibration = catalog.output_calibration(
+                spec.output_board_type,
+                frequency_points,
+                run_id=(
+                    None
+                    if spec.power_calibration_run_id == 0
+                    else int(spec.power_calibration_run_id)
+                ),
+                nqz=int(spec.nqz),
+                output_filter_type=str(spec.filter_type),
+                output_filter_cutoff_ghz=float(spec.filter_cutoff),
+                output_filter_bandwidth_ghz=float(spec.filter_bandwidth),
+            )
+            gain_matrix = np.empty(
+                (frequency_points.size, power_points.size),
+                dtype=np.int32,
+            )
+            for power_index, target_power_dbm in enumerate(power_points):
+                schedule = calibration.build_gain_schedule(
+                    frequency_points,
+                    float(target_power_dbm),
+                    output_att1_db=float(spec.effective_att1_db),
+                    output_att2_db=float(spec.effective_att2_db),
+                    max_entries=int(frequency_points.size),
+                )
+                if len(schedule.gain_codes) != frequency_points.size:
+                    raise RuntimeError(
+                        "RF calibration gain schedule was unexpectedly compressed"
+                    )
+                gain_matrix[:, power_index] = schedule.gain_codes
+            sweep_gain_codes = tuple(
+                int(value) for value in gain_matrix.reshape(-1)
+            )
+            sweep_gain_shape = tuple(int(value) for value in gain_matrix.shape)
+            calibration_run_id = int(calibration.summary.run_id)
+            runtime_gain = int(gain_matrix[0, 0])
         delay_cycles = (
             0
             if spec.delay_us <= 0.0
@@ -370,12 +471,15 @@ def build_runtime_rf_pulses(
                 ),
                 float(gen_cfg["f_fabric"]),
             ),
-            gain=spec.gain,
-            freq_mhz=spec.frequency_mhz,
+            gain=runtime_gain,
+            freq_mhz=float(frequency_points[0]),
             phase_degrees=spec.phase_degrees,
             nqz=spec.nqz,
             delay_tproc_cycles=delay_cycles,
             require_within_segment=spec.require_within_segment,
+            sweep_gain_codes=sweep_gain_codes,
+            sweep_gain_shape=sweep_gain_shape,
+            power_calibration_run_id=calibration_run_id,
         ))
     return tuple(pulses)
 
@@ -728,7 +832,10 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
         axis_kind = getattr(axis, "axis_kind", "amplitude")
         suffix = {
             "rf_duration": "duration_us",
+            "rf_frequency": "frequency_mhz",
+            "rf_power": "output_power_dbm",
             "ramp_duration": "ramp_duration_us",
+            "hold_duration": "hold_duration_us",
         }.get(axis_kind, "voltage_mv")
         base = (
             f"{_qcodes_identifier(axis.output_name)}_"
@@ -748,9 +855,48 @@ def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, floa
     axis_kind = getattr(axis, "axis_kind", "amplitude")
     if axis_kind == "rf_duration":
         return "RF pulse duration", "us", 1.0
+    if axis_kind == "rf_frequency":
+        return "RF frequency", "MHz", 1.0
+    if axis_kind == "rf_power":
+        return "Calibrated RF connector power", "dBm", 1.0
     if axis_kind == "ramp_duration":
         return "RAMP duration (rate derived)", "us", 1.0
+    if axis_kind == "hold_duration":
+        return "SET hold duration", "us", 1.0
     return "voltage", "mV", float(full_scale_mv)
+
+
+def _sweep_axis_meaning(axis: Any) -> str:
+    """Describe one stored Cartesian coordinate without nested UI logic."""
+    axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_duration":
+        meaning = (
+            f"RF pulse duration for {axis.output_name}/"
+            f"{axis.segment_name}"
+        )
+    elif axis_kind == "rf_frequency":
+        meaning = (
+            f"RF generator frequency for {axis.output_name}/"
+            f"{axis.segment_name}"
+        )
+    elif axis_kind == "rf_power":
+        meaning = (
+            f"Calibrated RF connector power for {axis.output_name}/"
+            f"{axis.segment_name}"
+        )
+    elif axis_kind == "ramp_duration":
+        meaning = (
+            f"RAMP duration for {axis.segment_name}; RAMP rate is "
+            "derived from its adjacent SET voltages"
+        )
+    elif axis_kind == "hold_duration":
+        meaning = f"SET hold duration for {axis.segment_name}"
+    else:
+        meaning = (
+            f"Voltage applied to {axis.output_name}/"
+            f"{axis.segment_name}"
+        )
+    return meaning + "; this is a directly selectable Cartesian sweep axis."
 
 
 def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
@@ -1222,6 +1368,20 @@ def store_qick_result(
                 "duration_stop_us": float(axis.stop),
                 "segment_length_mode": axis.segment_length_mode,
             })
+        elif axis_kind == "rf_frequency":
+            axis_metadata.update({
+                "frequency_start_mhz": float(axis.start),
+                "frequency_stop_mhz": float(axis.stop),
+                "execution": "tProcessor DMEM frequency-word sweep",
+            })
+        elif axis_kind == "rf_power":
+            axis_metadata.update({
+                "power_start_dbm": float(axis.start),
+                "power_stop_dbm": float(axis.stop),
+                "execution": (
+                    "tProcessor DMEM gain-code sweep from RF calibration"
+                ),
+            })
         elif axis_kind == "ramp_duration":
             axis_metadata.update({
                 "duration_start_us": float(axis.start),
@@ -1229,6 +1389,15 @@ def store_qick_result(
                 "rate_semantics": (
                     "The following SET is the target; the signed RAMP step is "
                     "derived for every duration and voltage-sweep coordinate."
+                ),
+            })
+        elif axis_kind == "hold_duration":
+            axis_metadata.update({
+                "duration_start_us": float(axis.start),
+                "duration_stop_us": float(axis.stop),
+                "timing_semantics": (
+                    "The selected SET level is held for this duration; all "
+                    "later AWG, RF, and DDR events move with the sweep."
                 ),
             })
         else:
@@ -1240,25 +1409,7 @@ def store_qick_result(
             })
         sweep_axis_metadata.append(axis_metadata)
     setpoint_meanings = {
-        parameter.name: (
-            (
-                f"RF pulse duration for {axis.output_name}/"
-                f"{axis.segment_name}"
-                if getattr(axis, "axis_kind", "amplitude")
-                == "rf_duration"
-                else (
-                    f"RAMP duration for {axis.segment_name}; RAMP rate is "
-                    "derived from its adjacent SET voltages"
-                    if getattr(axis, "axis_kind", "amplitude")
-                    == "ramp_duration"
-                    else (
-                        f"Voltage applied to {axis.output_name}/"
-                        f"{axis.segment_name}"
-                    )
-                )
-            )
-            + "; this is a directly selectable Cartesian sweep axis."
-        )
+        parameter.name: _sweep_axis_meaning(axis)
         for axis, parameter in zip(sweep_axes, sweep_parameters)
     }
     setpoint_meanings.update({

@@ -41,6 +41,8 @@ def _trace_point_records(
         flat_index = 2 * point_index
         record = {
             "point_index": point_index,
+            "x_segment_name": pulse_x.segment_name(point_index),
+            "y_segment_name": pulse_y.segment_name(point_index),
             "x_mv": float(pulse_x.v[flat_index]),
             "y_mv": float(pulse_y.v[flat_index]),
             "hold_x_ns": float(
@@ -52,6 +54,13 @@ def _trace_point_records(
             "ramp_x_ns": None,
             "ramp_y_ns": None,
         }
+        if record["x_segment_name"] == record["y_segment_name"]:
+            record["point_name"] = record["x_segment_name"]
+        else:
+            record["point_name"] = (
+                f"X {record['x_segment_name']} / "
+                f"Y {record['y_segment_name']}"
+            )
         if point_index:
             record["ramp_x_ns"] = float(
                 pulse_x.t[flat_index] - pulse_x.t[flat_index - 1]
@@ -212,7 +221,7 @@ class TracePlotWidget(pg.PlotWidget):
         if not isinstance(data, dict):
             return ""
         return (
-            f"P{data['point_index']} | "
+            f"{data['point_name']} | "
             f"X {data['x_mv']:.6g} mV | Y {data['y_mv']:.6g} mV | "
             f"{self._point_timing_text(data)}"
         )
@@ -229,7 +238,7 @@ class TracePlotWidget(pg.PlotWidget):
             self.setTitle(tooltip)
             if isinstance(data, dict):
                 self._hover_label.setText(
-                    f"P{data['point_index']}\n"
+                    f"{data['point_name']}\n"
                     f"X {data['x_mv']:.6g} mV\n"
                     f"Y {data['y_mv']:.6g} mV\n"
                     f"{self._point_timing_text(data)}"
@@ -275,7 +284,7 @@ class TracePlotWidget(pg.PlotWidget):
             label = _ClickableTraceLabel(
                 record["point_index"],
                 text=(
-                    f"P{record['point_index']}\n"
+                    f"{record['point_name']}\n"
                     + self._point_timing_text(record)
                 ),
                 color=(18, 18, 18),

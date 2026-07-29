@@ -13,7 +13,12 @@ import numpy as np
 from PyQt5 import QtWidgets
 
 import DCWaveform_Generator as gui
-from dc_waveform_core import QickRampRateSweepSpec, QickSweepSpec
+from dc_waveform_core import (
+    QickHoldDurationSweepSpec,
+    QickRampRateSweepSpec,
+    QickSweepSpec,
+    build_qick_sequence,
+)
 
 
 def _application():
@@ -71,17 +76,34 @@ def test_matching_awg_segments_share_ramp_and_hold_table_edits():
     voltage_1 = window._pulse[1].v.copy()
     control_1.refresh_table()
 
-    control_0.table.item(1, 1).setText("0.75")
+    control_0.table.item(1, 2).setText("0.75")
     app.processEvents()
     assert _segment_timing_ns(window._pulse[0], 1)[0] == 750.0
     assert _segment_timing_ns(window._pulse[1], 1)[0] == 750.0
 
-    control_1.table.item(2, 2).setText("1.25")
+    control_1.table.item(2, 3).setText("1.25")
     app.processEvents()
     assert _segment_timing_ns(window._pulse[0], 2)[1] == 1250.0
     assert _segment_timing_ns(window._pulse[1], 2)[1] == 1250.0
     assert np.array_equal(window._pulse[0].v, voltage_0)
     assert np.array_equal(window._pulse[1].v, voltage_1)
+    window.close()
+
+
+def test_matching_awg_segments_share_user_facing_name_edits():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 2)
+    window._add_port()
+    control_0, control_1 = window._multi_ctrl._ctrl_pannels
+
+    control_1.table.item(1, 1).setText("Readout gate")
+    app.processEvents()
+
+    assert window._pulse[0].segment_name(1) == "Readout gate"
+    assert window._pulse[1].segment_name(1) == "Readout gate"
+    assert control_0.table.item(1, 1).text() == "Readout gate"
+    assert control_1.table.item(1, 1).text() == "Readout gate"
     window.close()
 
 
@@ -276,6 +298,33 @@ def test_appending_voltage_segments_preserves_existing_sweeps():
     window.close()
 
 
+def test_insert_and_delete_remap_shared_hold_duration_sweep():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._sweep_specs = [
+        QickHoldDurationSweepSpec("set_2", 1.0, 5.0, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._hold_sweep_rows == {2}
+    assert control._edit_segment_structure("insert_above", 1)
+    app.processEvents()
+
+    assert _sweep_targets(window) == (("all_awg_outputs", "set_3"),)
+    assert control._hold_sweep_rows == {3}
+    marker_item = control.table.item(3, 0)
+    assert not marker_item.icon().isNull()
+    assert marker_item.toolTip() == "SET hold-duration sweep target"
+
+    assert control._edit_segment_structure("delete", 3)
+    app.processEvents()
+    assert window._sweep_specs == []
+    assert control._hold_sweep_rows == set()
+    window.close()
+
+
 def test_insert_delete_sequence_remaps_only_affected_voltage_sweeps():
     app = _application()
     window = gui.MainWindow()
@@ -407,10 +456,10 @@ def test_deleting_preceding_segment_keeps_sweep_visible_and_in_experiment():
     window.close()
 
 
-def test_insert_keeps_voltage_sweep_on_original_physical_segment():
+def test_insert_below_preceding_row_keeps_sweep_on_original_segment():
     app = _application()
     window = gui.MainWindow()
-    _add_segments(window, 4)
+    _add_segments(window, 3)
     window._sweep_specs = [
         QickSweepSpec("set_3", "awg_0", -0.2, 0.2, 5),
     ]
@@ -418,13 +467,35 @@ def test_insert_keeps_voltage_sweep_on_original_physical_segment():
     original_voltage = float(window._pulse[0].v[6])
 
     control = window._multi_ctrl._ctrl_pannels[0]
-    assert control._edit_segment_structure("insert_above", 2)
+    repaint_sweep_rows = []
+    original_refresh = control.refresh_table
+
+    def record_refresh():
+        repaint_sweep_rows.append(set(control._sweep_rows))
+        original_refresh()
+
+    control.refresh_table = record_refresh
+    assert control._edit_segment_structure("insert_below", 2)
     app.processEvents()
 
     assert _sweep_targets(window) == (("awg_0", "set_4"),)
     assert window._sweep_target_indices(window._sweep_specs[0]) == (0, 4)
     assert float(window._pulse[0].v[8]) == original_voltage
+    assert float(window._pulse[0].v[6]) != original_voltage
     assert control._sweep_rows == {4}
+    assert repaint_sweep_rows
+    assert all(rows == {4} for rows in repaint_sweep_rows)
+    assert control.table.item(3, 0).icon().isNull()
+    assert not control.table.item(4, 0).icon().isNull()
+    sequence = build_qick_sequence(
+        (window._pulse[0],),
+        sweeps=tuple(window._sweep_specs),
+    )
+    assert tuple(
+        (axis.output_name, axis.segment_name)
+        for axis in sequence.sweep_axes
+    ) == (("awg_0", "set_4"),)
+    control.refresh_table = original_refresh
     window.close()
 
 
