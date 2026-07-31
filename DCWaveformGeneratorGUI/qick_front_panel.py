@@ -283,6 +283,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         self._configuration: Optional[QickFrontPanelConfiguration] = None
         self._selected_output: Optional[int] = None
         self._selected_input: Optional[int] = None
+        self._selected_bias: Optional[int] = None
         self._hover: Optional[Tuple[str, int]] = None
         self._scope = "path"
         self._port_centers = self._build_port_centers()
@@ -310,6 +311,12 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                     group_x + 25.0 + 40.0 * visual_local,
                     155.0,
                 )
+        for visual_index in range(8):
+            panel_index = 7 - visual_index
+            centers[("bias", panel_index)] = QtCore.QPointF(
+                55.0 + 40.0 * visual_index,
+                310.0,
+            )
         return centers
 
     def sizeHint(self) -> QtCore.QSize:
@@ -344,14 +351,18 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     def set_selected(self, direction: str, panel_index: Optional[int]) -> None:
         if direction == "output":
             self._selected_output = panel_index
-        else:
+        elif direction == "input":
             self._selected_input = panel_index
+        elif direction == "bias":
+            self._selected_bias = panel_index
+        else:
+            raise ValueError("direction must be output, input, or bias")
         self.update()
 
     def select_port(self, direction: str, panel_index: int) -> None:
         """Select a port programmatically; useful for keyboard flows and tests."""
-        if direction not in ("output", "input"):
-            raise ValueError("direction must be output or input")
+        if direction not in ("output", "input", "bias"):
+            raise ValueError("direction must be output, input, or bias")
         if not self._direction_is_visible(direction):
             return
         self.port_clicked.emit(direction, int(panel_index))
@@ -401,13 +412,23 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         if hover != self._hover:
             self._hover = hover
             if hover is None or self._configuration is None:
-                self.setToolTip("")
+                if hover is not None and hover[0] == "bias":
+                    self.setToolTip(
+                        f"BIAS{hover[1]} | DAC11001 | -10 V to +10 V"
+                    )
+                else:
+                    self.setToolTip("")
             else:
-                port = self._configuration.port(*hover)
-                self.setToolTip(
-                    f"{port.label} | {port.board_label} | {port.channel_label} | "
-                    f"RFDC {port.converter_id}"
-                )
+                if hover[0] == "bias":
+                    self.setToolTip(
+                        f"BIAS{hover[1]} | DAC11001 | -10 V to +10 V"
+                    )
+                else:
+                    port = self._configuration.port(*hover)
+                    self.setToolTip(
+                        f"{port.label} | {port.board_label} | "
+                        f"{port.channel_label} | RFDC {port.converter_id}"
+                    )
             self.update()
         super().mouseMoveEvent(event)
 
@@ -444,17 +465,23 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
             if self._configuration is not None and direction in ("output", "input")
             else None
         )
-        mapped = direction == "aux" or bool(port and port.qick_channels)
+        mapped = direction in ("bias", "io") or bool(port and port.qick_channels)
         selected = (
             index == self._selected_output
             if direction == "output"
             else index == self._selected_input
             if direction == "input"
+            else index == self._selected_bias
+            if direction == "bias"
             else False
         )
         hovered = key == self._hover
         outline = QtGui.QColor(
-            "#32b6d8" if direction == "output" else "#43c581"
+            "#32b6d8"
+            if direction == "output"
+            else "#43c581"
+            if direction == "input"
+            else "#f1c84b"
         )
         if not (selected or hovered):
             outline = QtGui.QColor("#49362b" if mapped else "#756c67")
@@ -564,6 +591,8 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                 )
 
         for key, center in self._port_centers.items():
+            if key[0] not in ("output", "input"):
+                continue
             if not self._direction_is_visible(key[0]):
                 continue
             self._draw_sma(painter, key, center)
@@ -589,7 +618,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         for visual_index in range(8):
             panel_index = 7 - visual_index
             center = QtCore.QPointF(55.0 + 40.0 * visual_index, 310.0)
-            self._draw_sma(painter, ("aux", panel_index), center)
+            self._draw_sma(painter, ("bias", panel_index), center)
             painter.setPen(QtGui.QColor("#f5e4c4"))
             painter.drawText(
                 QtCore.QRectF(center.x() - 22.0, 332.0, 44.0, 18.0),
@@ -622,7 +651,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         for visual_index in range(8):
             panel_index = 7 - visual_index
             center = QtCore.QPointF(845.0 + 39.0 * visual_index, 310.0)
-            self._draw_sma(painter, ("aux", 8 + panel_index), center)
+            self._draw_sma(painter, ("io", panel_index), center)
             painter.setPen(QtGui.QColor("#f5e4c4"))
             painter.drawText(
                 QtCore.QRectF(center.x() - 20.0, 332.0, 40.0, 18.0),
@@ -996,6 +1025,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         return 0
 
     def _select_port(self, direction: str, panel_index: int) -> None:
+        if direction not in ("output", "input"):
+            return
         if self._configuration is None:
             return
         port = self._configuration.port(direction, panel_index)

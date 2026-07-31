@@ -338,6 +338,23 @@ except ImportError:
     )
     from fir_ddr_profile import format_sample_rate_hz
 
+try:
+    from .bias_control import (
+        BIAS_CHANNEL_COUNT,
+        BIAS_MAX_V,
+        BIAS_MIN_V,
+        BiasControlPanel,
+        BiasHardwareWorker,
+    )
+except ImportError:
+    from bias_control import (
+        BIAS_CHANNEL_COUNT,
+        BIAS_MAX_V,
+        BIAS_MIN_V,
+        BiasControlPanel,
+        BiasHardwareWorker,
+    )
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -347,7 +364,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 34
+SETTINGS_VERSION = 35
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -7676,6 +7693,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self,
             default_database_path=DEFAULT_QCODES_DB_PATH,
         )
+        self._bias_panel = BiasControlPanel(self)
         self._qick_configuration = None
         self._qick_front_panel_target = None
         self._qick_front_panel_dialog = QtWidgets.QDialog(self)
@@ -7783,6 +7801,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._noise_panel.front_panel_requested.connect(
             lambda target: self._show_qick_front_panel("input", target)
         )
+        self._bias_panel.read_requested.connect(
+            lambda: self._start_bias_hardware_operation("read", {})
+        )
+        self._bias_panel.set_requested.connect(
+            lambda channel, voltage: self._start_bias_hardware_operation(
+                "set",
+                {int(channel): float(voltage)},
+            )
+        )
+        self._bias_panel.set_all_requested.connect(
+            lambda values: self._start_bias_hardware_operation(
+                "set",
+                {
+                    channel: float(voltage)
+                    for channel, voltage in enumerate(values)
+                },
+            )
+        )
         self._sync_shared_qick_controls()
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
@@ -7820,6 +7856,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._sparameter_panel, "RF S-Parameter")
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
         self._control_tabs.addTab(self._noise_panel, "Noise Analysis")
+        self._control_tabs.addTab(self._bias_panel, "Bias")
         self._control_tabs.setCurrentWidget(self._awg_tuning_page)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
@@ -9805,6 +9842,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_readout_panel.set_front_panel_configuration(configuration)
         self._calibration_panel.set_front_panel_configuration(configuration)
         self._noise_panel.set_front_panel_configuration(configuration)
+        self._bias_panel.set_configuration(configuration)
         self._qick_front_panel.set_identifying(
             False,
             f"{configuration.mapped_output_count} DAC / "
@@ -9918,6 +9956,75 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage(
             f"Front-panel RF path applied only to {target.__class__.__name__}"
         )
+
+    def _start_bias_hardware_operation(
+        self,
+        operation: str,
+        values: Mapping[int, float],
+    ) -> None:
+        """Read or update DAC11001 channels without blocking the GUI."""
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish before changing bias.",
+            )
+            return
+        if operation == "read":
+            busy_message = "Reading all DAC11001 bias setpoints..."
+        else:
+            channels = ", ".join(
+                f"BIAS{int(channel)}" for channel in sorted(values)
+            )
+            busy_message = f"Applying DAC11001 setpoint(s): {channels}"
+        self._bias_panel.set_busy(True, busy_message)
+        self.statusBar().showMessage(busy_message)
+
+        thread = QtCore.QThread(self)
+        worker = BiasHardwareWorker(
+            self._shared_qick_connection(),
+            operation,
+            values,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_bias_hardware_finished)
+        worker.failed.connect(self._on_bias_hardware_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_bias_hardware_finished(
+        self,
+        values: Mapping[int, float],
+    ) -> None:
+        normalized = {
+            int(channel): float(voltage)
+            for channel, voltage in values.items()
+        }
+        self._bias_panel.apply_hardware_values(normalized)
+        message = self._bias_panel.status.text()
+        self._bias_panel.set_busy(False, message)
+        self.statusBar().showMessage(message)
+
+    def _on_bias_hardware_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown DAC11001 bias error"
+        self._bias_panel.set_busy(False, f"Failed: {summary}")
+        self.statusBar().showMessage("DAC11001 bias operation failed")
+        dialog = DetailedErrorMessageBox(
+            "DAC11001 bias operation failed",
+            summary,
+            details,
+            self,
+        )
+        dialog.exec_()
 
     def _start_rf_output_hardware_update(
         self,
@@ -11483,6 +11590,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "s_parameter": dict(self._sparameter_panel.settings_dict()),
             "calibration": dict(self._calibration_panel.settings_dict()),
             "noise_analysis": dict(self._noise_panel.settings_dict()),
+            "bias": self._bias_panel.settings_dict(),
         }
 
     @staticmethod
@@ -11821,6 +11929,42 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         qick = data.get("qick", {})
         if not all(isinstance(item, dict) for item in (display, grid, awg, qick)):
             raise TypeError("display, grid, awg, and qick must be JSON objects")
+        raw_bias = data.get("bias", {})
+        if raw_bias is None:
+            raw_bias = {}
+        if not isinstance(raw_bias, dict):
+            raise TypeError("bias must be a JSON object")
+        bias_selected_channel = self._json_int(
+            raw_bias.get("selected_channel", 0),
+            "bias selected_channel",
+        )
+        if bias_selected_channel >= BIAS_CHANNEL_COUNT:
+            raise ValueError(
+                f"bias selected_channel must be below {BIAS_CHANNEL_COUNT}"
+            )
+        raw_bias_setpoints = raw_bias.get(
+            "setpoints_v",
+            [0.0] * BIAS_CHANNEL_COUNT,
+        )
+        if (
+            not isinstance(raw_bias_setpoints, list)
+            or len(raw_bias_setpoints) != BIAS_CHANNEL_COUNT
+        ):
+            raise ValueError(
+                f"bias setpoints_v must contain {BIAS_CHANNEL_COUNT} values"
+            )
+        bias_setpoints_v = []
+        for channel, raw_voltage in enumerate(raw_bias_setpoints):
+            voltage = self._json_finite_float(
+                raw_voltage,
+                f"BIAS{channel} setpoint",
+            )
+            if not BIAS_MIN_V <= voltage <= BIAS_MAX_V:
+                raise ValueError(
+                    f"BIAS{channel} setpoint must be between "
+                    f"{BIAS_MIN_V:g} V and {BIAS_MAX_V:g} V"
+                )
+            bias_setpoints_v.append(voltage)
 
         time_unit = str(display.get("time_unit", DEFAULT_TIME_UNIT))
         if time_unit not in TIME_UNIT_NS:
@@ -12835,6 +12979,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
             "calibration": calibration_settings,
             "noise_analysis": noise_analysis_settings,
+            "bias": {
+                "selected_channel": bias_selected_channel,
+                "setpoints_v": tuple(bias_setpoints_v),
+            },
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -12939,6 +13087,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._sparameter_panel.load_settings(settings["s_parameter"])
         self._calibration_panel.load_settings(settings["calibration"])
         self._noise_panel.load_settings(settings["noise_analysis"])
+        self._bias_panel.load_settings(settings["bias"])
         self._sync_shared_qick_controls()
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()
