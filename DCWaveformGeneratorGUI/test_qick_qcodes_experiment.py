@@ -5,6 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import sqlite3
 import tracemalloc
@@ -50,6 +51,7 @@ from qick_qcodes_experiment import (
     load_qick_iq_arrays,
     normalize_compile_validation_mode,
     run_qick_qcodes_experiment,
+    store_experiment_result,
     store_qick_result,
     write_awg_vertex_metadata_jsonl,
 )
@@ -364,7 +366,10 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
                 time_parameter
             ).shape == (2, 2)
     metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
+    assert "qick_experiment_json" in dataset.metadata
+    assert "qcs_experiment_json" not in dataset.metadata
     assert metadata["qick_connection"]["host"] == "192.0.2.10"
+    assert "qcs_connection" not in metadata
     assert metadata["measurement_layout"]["iq_shape"] == [2, 2, 3, 2]
     assert metadata["measurement_layout"]["awg_vertex_shape"] == [2, 2, 2]
     assert "awg_waveform_vertices" not in metadata["gui_settings"]
@@ -407,6 +412,48 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
         item[0] for item in progress_updates
     )
     assert not list(staging_root.glob("qick_qcodes_*"))
+
+
+def test_store_experiment_result_uses_qcs_metadata_names(
+    tmp_path,
+    monkeypatch,
+):
+    @dataclass(frozen=True)
+    class QcsConnectionConfig:
+        host: str
+        chassis: int
+        awg_slots: tuple[int, ...]
+
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    dataset, row_count = store_experiment_result(
+        _ddr_result(),
+        run_config=QcodesRunConfig(
+            str(tmp_path / "qcs_trace.db"),
+            experiment_name="QCS test",
+            sample_name="simulated QCS",
+        ),
+        connection_config=QcsConnectionConfig(
+            host="192.0.2.20",
+            chassis=1,
+            awg_slots=(2, 3),
+        ),
+        program_summary={"program_layers": 4},
+        gui_settings=_gui_metadata(),
+        rf_settings={},
+        backend_name="qcs",
+    )
+
+    assert row_count == 12
+    assert "qcs_experiment_json" in dataset.metadata
+    assert "qick_experiment_json" not in dataset.metadata
+    metadata = json.loads(dataset.get_metadata("qcs_experiment_json"))
+    assert metadata["qcs_connection"] == {
+        "host": "192.0.2.20",
+        "chassis": 1,
+        "awg_slots": [2, 3],
+    }
+    assert "qick_connection" not in metadata
+    assert metadata["program_summary"] == {"program_layers": 4}
 
 
 def test_store_qick_result_converts_dc_input_iq_to_current(

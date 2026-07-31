@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import DCWaveform_Generator as gui
+import qcs_front_panel
 from dc_waveform_core import (
     DEFAULT_QICK_FULL_SCALE_MV,
     PulseSequence,
@@ -33,8 +34,17 @@ from stability_diagram import DEFAULT_STABILITY_POINT_GUARD_US
 from qick_fine_tune_sweep import FineTuneSequence
 
 
+_APP = None
+
+
 def _application():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    global _APP
+    if _APP is None:
+        _APP = (
+            QtWidgets.QApplication.instance()
+            or QtWidgets.QApplication([])
+        )
+    return _APP
 
 
 def _send_wheel(widget, delta=120):
@@ -207,6 +217,9 @@ def test_shared_qick_setup_replaces_duplicate_tab_controls():
 def test_awg_front_panel_mapping_and_horizontal_port_scroll():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     window.resize(860, 720)
     window.show()
     for _ in range(3):
@@ -394,7 +407,7 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
     ] == [
         "AWG Outputs",
         "RF Outputs",
-        "RF Readout",
+        "QCS Acquisition",
         "Experiment",
     ]
     window._show_rf_editor()
@@ -426,6 +439,262 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
     assert len(window._rf_ports_panel.specs()) == 1
     assert len(window._rf_timelines) == 1
     window.close()
+
+
+def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
+    app = _application()
+    window = gui.MainWindow()
+    window.show()
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_readout_panel)
+    panel = window._rf_readout_panel
+    experiment = window._experiment_panel
+    app.processEvents()
+
+    qick_only_fields = (
+        panel.input_board_type,
+        panel.input_condition_stack,
+        panel.measurement_unit,
+        panel.dc_measure_gain_v_per_a,
+        panel.dc_voltage_calibration_enabled,
+        panel.calibration_path_widget,
+        panel.dc_voltage_calibration_run_id,
+        panel.filter_type,
+        panel.filter_cutoff,
+        panel.filter_bandwidth,
+        panel.margin_samples,
+        panel.fpga_delay_widget,
+        panel.post_run_read_delay,
+        panel.force_overwrite,
+        panel.fir_profile_note,
+    )
+    assert experiment.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert panel.title() == "QCS Acquisition 1"
+    assert (
+        window._awg_tuning_tabs.tabText(
+            window._awg_tuning_tabs.indexOf(panel)
+        )
+        == "QCS Acquisition"
+    )
+    assert all(field.isHidden() for field in qick_only_fields)
+    assert panel.ro_ch.isHidden() is True
+    assert panel.segment.isHidden() is False
+    assert panel.delay.isHidden() is False
+    assert panel.samples.isHidden() is False
+    assert panel.frequency_mhz.isHidden() is False
+    assert panel.segment_label.text() == "Acquisition segment:"
+    assert panel._delay_label.text() == "Acquisition pre-delay [us]:"
+    assert (
+        panel.samples_label.text()
+        == "Integration length (M5200 samples):"
+    )
+    assert (
+        panel.frequency_label.text()
+        == "Integration-filter RF frequency:"
+    )
+    acquisition_note = panel.qcs_acquisition_note.text()
+    assert "IntegrationFilter" in acquisition_note
+    assert "64 M5200 ADC samples at 4.8 GSPS" in acquisition_note
+    assert "13.3333 ns integration duration" in acquisition_note
+    assert experiment.qcs_sample_rate_hz.text() == "4.8 GSPS"
+    assert experiment.qcs_sample_rate_hz.isReadOnly() is True
+    assert panel.samples.singleStep() == 16
+    panel.samples.setValue(65)
+    app.processEvents()
+    assert "invalid" in panel.qcs_acquisition_note.text()
+    assert "multiple of 16" in panel.qcs_acquisition_note.text()
+    panel.samples.setValue(64)
+    visible_text = "\n".join(
+        label.text()
+        for label in panel.findChildren(QtWidgets.QLabel)
+        if label.isVisible()
+    ).lower()
+    assert all(
+        legacy_word not in visible_text
+        for legacy_word in ("fir", "ddr", "ddc", "hwh")
+    )
+
+    panel.margin_samples.setValue(4321)
+    panel.override_fpga_trigger_delay.setChecked(True)
+    panel.fpga_trigger_delay_us.setValue(17.5)
+    panel.input_board_type.setCurrentText("DC_In")
+    panel.measurement_unit.setCurrentIndex(
+        panel.measurement_unit.findData("current")
+    )
+    experiment.qcs_hw_demod.setChecked(False)
+    app.processEvents()
+
+    assert panel.frequency_mhz.isHidden() is True
+    assert panel.frequency_label.isHidden() is True
+    assert panel.samples_label.text() == "Raw acquisition samples:"
+    assert "Raw acquisition" in panel.qcs_acquisition_note.text()
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    app.processEvents()
+
+    assert panel.title() == "RF Readout 1"
+    assert (
+        window._awg_tuning_tabs.tabText(
+            window._awg_tuning_tabs.indexOf(panel)
+        )
+        == "RF Readout"
+    )
+    assert all(not field.isHidden() for field in qick_only_fields)
+    assert panel.ro_ch.isHidden() is False
+    assert panel.qcs_acquisition_note.isHidden() is True
+    assert panel.segment_label.text() == "Anchor SET:"
+    assert panel._delay_label.text() == "Trigger delay [us]:"
+    assert panel.samples_label.text() == "Stored FIR samples:"
+    assert panel.frequency_label.text() == "Readout/DDC frequency:"
+    assert panel.margin_samples.value() == 4321
+    assert panel.override_fpga_trigger_delay.isChecked() is True
+    assert panel.fpga_trigger_delay_us.value() == pytest.approx(17.5)
+    assert panel.measurement_unit.currentData() == "current"
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    panel = window._rf_ports_panel._panels[0]
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    panel.output_board_type.setCurrentText("DC_Out")
+    panel.gain.setValue(-12345)
+    panel.nqz.setValue(2)
+    panel.att1_db.setValue(7.25)
+    panel.att2_db.setValue(12.5)
+    panel.filter_type.setCurrentText("bandpass")
+    panel.filter_cutoff.setValue(3.25)
+    panel.filter_bandwidth.setValue(0.75)
+    panel.power_calibration_database_path.setText("legacy_power.db")
+    panel.target_output_power_dbm.setValue(-31.5)
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+    window.show()
+    app.processEvents()
+
+    module_items = [
+        (
+            panel.qcs_module_model.itemText(index),
+            panel.qcs_module_model.itemData(index),
+        )
+        for index in range(panel.qcs_module_model.count())
+    ]
+    assert module_items == [
+        ("M5300A RF AWG", "M5300A"),
+        ("M5301A Precision AWG", "M5301A"),
+    ]
+    assert panel.qcs_module_model.isVisible() is True
+    assert panel.qcs_module_model.isEnabled() is False
+    assert panel.qcs_amplitude.isVisible() is True
+    assert window._rf_ports_panel.add_button.text() == "Add RF Output"
+    assert panel.remove_button.text() == "Remove RF Output"
+    assert panel.qcs_amplitude.minimum() == pytest.approx(-1.0)
+    assert panel.qcs_amplitude.maximum() == pytest.approx(1.0)
+    assert panel.qcs_amplitude.value() == pytest.approx(
+        -12345 / 32768,
+        abs=0.5e-6,
+    )
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("gate",),
+        {panel.gen_ch.value(): "rf_drive"},
+        "digitizer",
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    assert panel.qcs_module_model.currentData() == "M5300A"
+    moved_mappings = []
+    for mapping in configuration["channel_mappings"]:
+        mapping = dict(mapping)
+        if mapping["role"] == "rf":
+            mapping.update(
+                slot=2,
+                channel=2,
+                absolute_phase=False,
+                lo_frequency_hz=None,
+            )
+        moved_mappings.append(mapping)
+    configuration = qcs_front_panel.normalize_qcs_hardware_configuration(
+        {
+            **configuration,
+            "channel_mappings": moved_mappings,
+        }
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    assert panel.qcs_module_model.currentData() == "M5301A"
+    assert "slot 2, SMA CH 2" in panel.qcs_module_model.toolTip()
+
+    form = panel._form_layout
+    assert form.labelForField(panel.qcs_module_model).text() == "Module:"
+    assert form.labelForField(panel.segment).text() == "Waveform segment:"
+    assert form.labelForField(panel.delay).text() == "Pre-delay [us]:"
+    assert form.labelForField(panel.duration).text() == "Waveform duration [us]:"
+    assert form.labelForField(panel.frequency_mhz).text() == "RF frequency:"
+    assert form.labelForField(panel.qcs_amplitude).text() == "Relative amplitude:"
+    assert form.labelForField(panel.phase_degrees).text() == "Instantaneous phase:"
+
+    qick_only_fields = (
+        panel.output_board_type,
+        panel.power_calibration_group,
+        panel.gain,
+        panel.nqz,
+    )
+    for field in qick_only_fields:
+        assert field.isHidden() is True
+        label = form.labelForField(field)
+        if label is not None:
+            assert label.isHidden() is True
+    visible_text = " ".join(
+        label.text()
+        for label in panel.findChildren(QtWidgets.QLabel)
+        if label.isVisible()
+    )
+    assert "HWH" not in visible_text
+    assert "Nyquist" not in visible_text
+    assert "RF_Out" not in visible_text
+    assert "DC_Out" not in visible_text
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    app.processEvents()
+
+    assert panel.qcs_module_model.isHidden() is True
+    assert panel.qcs_amplitude.isHidden() is True
+    assert window._rf_ports_panel.add_button.text() == "Add RF Port"
+    assert panel.remove_button.text() == "Remove RF Port"
+    for field in qick_only_fields:
+        assert field.isHidden() is False
+    assert form.labelForField(panel.output_board_type).text() == "Output board:"
+    assert form.labelForField(panel.segment).text() == "Anchor SET:"
+    assert form.labelForField(panel.delay).text() == "Delay [us]:"
+    assert form.labelForField(panel.duration).text() == "Duration [us]:"
+    assert form.labelForField(panel.frequency_mhz).text() == "Frequency:"
+    assert form.labelForField(panel.gain).text() == "Gain:"
+    assert form.labelForField(panel.phase_degrees).text() == "Phase:"
+    assert form.labelForField(panel.nqz).text() == "Nyquist zone:"
+    assert panel.output_board_type.currentText() == "DC_Out"
+    assert panel.gain.value() == -12345
+    assert panel.nqz.value() == 2
+    assert panel.att1_db.value() == pytest.approx(7.25)
+    assert panel.att2_db.value() == pytest.approx(12.5)
+    assert panel.filter_type.currentText() == "bandpass"
+    assert panel.filter_cutoff.value() == pytest.approx(3.25)
+    assert panel.filter_bandwidth.value() == pytest.approx(0.75)
+    assert panel.power_calibration_database_path.text() == "legacy_power.db"
+    assert panel.target_output_power_dbm.value() == pytest.approx(-31.5)
+    visible_text = " ".join(
+        label.text()
+        for label in panel.findChildren(QtWidgets.QLabel)
+        if label.isVisible()
+    )
+    assert "HWH-backed Front Panel" in visible_text
+
+    window.close()
+    app.processEvents()
 
 
 def test_rf_duration_sweep_controls_build_sequence_axis_and_round_trip():
@@ -1066,6 +1335,9 @@ def test_dc_measure_mode_converts_iq_and_is_available_only_for_dc_input():
 def test_awg_tuning_rf_readout_exposes_calibration_and_unit_selection(tmp_path):
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     panel = window._rf_readout_panel
     panel.setChecked(True)
     panel.input_board_type.setCurrentText("DC_In")
@@ -1427,6 +1699,9 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
 def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     window._add_port()
     window._rf_readout_panel.setChecked(True)
     window._rf_readout_panel.samples.setValue(16)
@@ -1521,6 +1796,9 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
 def test_stability_run_arguments_use_identified_50ksps_timing():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     window._add_port()
     window._qick_configuration = SimpleNamespace(
         fir_sample_rate_hz=50_000.0,
@@ -1547,6 +1825,88 @@ def test_stability_run_arguments_use_identified_50ksps_timing():
     window.close()
 
 
+def test_qcs_stability_arguments_build_native_hardware_sweep(
+    tmp_path,
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    mapper_path = tmp_path / "stability_mapper.qcs"
+    mapper_path.write_bytes(b"offline mapper placeholder")
+    connection = gui.QcsConnectionConfig(
+        mapper_path=str(mapper_path),
+        dc_channel_names=("dc_x", "dc_y"),
+        dc_full_scale_v=2.5,
+        rf_channel_names={7: "rf_drive"},
+        acquisition_channel_name="digitizer",
+        hw_demod=True,
+        blocking=True,
+    )
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_x", "dc_y"),
+        {7: "rf_drive"},
+        "digitizer",
+    )
+    window._stability_panel.set_qcs_front_panel_configuration(
+        configuration
+    )
+    window._stability_panel.set_hardware_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    window._stability_panel.repetitions.setValue(4)
+    window._stability_panel.x_axis.points.setValue(3)
+    window._stability_panel.y_axis.points.setValue(2)
+    window._stability_panel.x_axis.start_mv.setValue(-1000.0)
+    window._stability_panel.x_axis.stop_mv.setValue(1000.0)
+    window._stability_panel.trace_samples.setValue(80)
+    window._stability_panel.settle_time_us.setValue(25.0)
+    window._stability_panel.modulation_frequency_mhz.setValue(125.0)
+    window._stability_panel.qcs_modulation_amplitude.setValue(0.25)
+    window._stability_panel.bias_t_group.setChecked(True)
+    window._experiment_panel.qcs_sample_rate_hz.setValue(2.0e6)
+    assert window._experiment_panel.qcs_sample_rate_hz.value() == pytest.approx(
+        4.8e9
+    )
+    window._experiment_panel.qick_host.clear()
+    window._experiment_panel.proxy_name.clear()
+    window._experiment_panel.awg_channels.setText("invalid dormant value")
+    monkeypatch.setattr(
+        window._experiment_panel,
+        "qcs_connection_values",
+        lambda _output_count: connection,
+    )
+    monkeypatch.setattr(
+        window._experiment_panel,
+        "run_config_values",
+        lambda **_kwargs: None,
+    )
+    arguments = window._stability_run_arguments(save=False)
+
+    assert arguments["connection_config"] == connection
+    assert arguments["repetitions_per_point"] == 4
+    assert arguments["full_scale_mv"] == pytest.approx(2500.0)
+    assert arguments["sequence"].sweep_shape == (3, 2)
+    np.testing.assert_allclose(
+        arguments["sequence"].sweep_axes[0].points,
+        [-0.4, 0.0, 0.4],
+    )
+    assert arguments["sequence"].bias_t_compensation is None
+    assert window._stability_panel.bias_t_group.isChecked() is True
+    assert arguments["rf_pulses"][0].gen_ch == 7
+    assert arguments["rf_pulses"][0].amplitude == pytest.approx(
+        window._stability_panel.qcs_modulation_amplitude.value()
+    )
+    assert arguments["rf_pulses"][0].frequency_hz == pytest.approx(125e6)
+    assert arguments["acquisition"].duration_s == pytest.approx(80 / 4.8e9)
+    assert arguments["acquisition"].sample_rate_hz == pytest.approx(4.8e9)
+    assert arguments["acquisition"].pre_delay_s == pytest.approx(25e-6)
+    assert arguments["acquisition"].sample_count == 80
+    assert arguments["readout_spec"] is None
+    app.processEvents()
+    window.close()
+
+
 def test_experiment_panel_exposes_show_program_action():
     app = _application()
     panel = gui.ExperimentPanel(
@@ -1556,6 +1916,7 @@ def test_experiment_panel_exposes_show_program_action():
         awg_channels=(1,),
         repetitions=1,
     )
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
     emitted = []
     panel.show_program_requested.connect(lambda: emitted.append(True))
 
@@ -1569,6 +1930,208 @@ def test_experiment_panel_exposes_show_program_action():
     assert panel.show_program_button.isEnabled() is False
     assert panel.progress.isVisible() is False
     panel.close()
+
+
+def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+
+    assert panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert panel.run_button.text() == "Run QCS Experiment"
+    assert panel.backend_selector.isHidden() is True
+    assert panel.execution_system_label.text() == "Keysight QCS / M5000"
+    assert panel.show_program_button.isHidden() is True
+    assert panel.ddr_usage_group.isHidden() is True
+    assert panel.compile_validation_mode.isHidden() is True
+    assert panel.qcs_mapper_path.isReadOnly() is True
+    assert panel.qcs_dc_channel_names.isReadOnly() is True
+    assert panel.qcs_rf_channel_names.isReadOnly() is True
+    assert panel.qcs_acquisition_channel_name.isReadOnly() is True
+
+    panel.qcs_mapper_path.setText(str(tmp_path / "mapper.json"))
+    panel.qcs_dc_channel_names.setText("gate_a")
+    panel.qcs_dc_full_scale_v.setValue(2.5)
+    panel.qcs_rf_channel_names.setText("0=rf_drive, 2=rf_probe")
+    panel.qcs_acquisition_channel_name.setText("digitizer")
+    panel.qcs_hw_demod.setChecked(False)
+    panel.qcs_init_time_us.setValue(0.125)
+    app.processEvents()
+
+    assert panel.run_button.text() == "Run QCS Experiment"
+    assert panel.qcs_connection_group.isHidden() is False
+    assert panel.show_program_button.isEnabled() is False
+    assert panel.ddr_usage_group.isEnabled() is False
+    assert panel.compile_validation_mode.isEnabled() is False
+    values = panel.values(1)
+    assert values["execution_backend"] == gui.EXECUTION_BACKEND_QCS
+    assert isinstance(values["connection"], gui.QickConnectionConfig)
+    assert values["connection"].host == gui.DEFAULT_QICK_HOST
+    qcs_connection = values["qcs_connection"]
+    assert qcs_connection.mapper_path == str(tmp_path / "mapper.json")
+    assert tuple(qcs_connection.dc_channel_names) == ("gate_a",)
+    assert qcs_connection.dc_full_scale_v == pytest.approx(2.5)
+    assert dict(qcs_connection.rf_channel_names) == {
+        0: "rf_drive",
+        2: "rf_probe",
+    }
+    assert qcs_connection.acquisition_channel_name == "digitizer"
+    assert qcs_connection.hw_demod is False
+    assert qcs_connection.init_time_s == pytest.approx(0.125e-6)
+    panel.close()
+
+
+def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    mapper_path = tmp_path / "mapper.json"
+    mapper_path.write_text("{}", encoding="utf-8")
+    experiment.qcs_mapper_path.setText(str(mapper_path))
+    experiment.qcs_dc_channel_names.setText("gate_a")
+    experiment.qcs_rf_channel_names.setText("1=rf_drive")
+    experiment.qcs_acquisition_channel_name.setText("digitizer")
+    experiment.database_path.setText(str(tmp_path / "qcs_run.db"))
+
+    rf_panel = window._rf_ports_panel._panels[0]
+    rf_panel.setChecked(True)
+    rf_panel.gen_ch.setValue(1)
+    rf_panel.delay.setValue(0.25)
+    rf_panel.duration.setValue(2.5)
+    rf_panel.frequency_mhz.setValue(75.0)
+    rf_panel.qcs_amplitude.setValue(-0.25)
+    assert rf_panel.gain.value() == -8192
+    rf_panel.phase_degrees.setValue(90.0)
+
+    readout = window._rf_readout_panel
+    readout.setChecked(True)
+    readout.delay.setValue(0.5)
+    readout.samples.setValue(32)
+    readout.frequency_mhz.setValue(42.0)
+    readout.margin_samples.setValue(9876)
+    readout.override_fpga_trigger_delay.setChecked(True)
+    readout.fpga_trigger_delay_us.setValue(13.25)
+    readout.input_board_type.setCurrentText("DC_In")
+    readout.measurement_unit.setCurrentIndex(
+        readout.measurement_unit.findData("current")
+    )
+    app.processEvents()
+
+    arguments = window._qcs_experiment_run_arguments()
+    assert isinstance(arguments["connection_config"], gui.QcsConnectionConfig)
+    assert arguments["connection_config"].acquisition_channel_name == "digitizer"
+    assert arguments["repetitions_per_sweep"] == 1
+    assert arguments["fabric_mhz"] == 300.0
+    assert arguments["source_full_scale_mv"] == pytest.approx(800.0)
+    assert len(arguments["rf_pulses"]) == 1
+    qcs_rf = arguments["rf_pulses"][0]
+    assert qcs_rf.gen_ch == 1
+    assert qcs_rf.at_segment == "set_0"
+    assert qcs_rf.delay_s == pytest.approx(0.25e-6)
+    assert qcs_rf.duration_s == pytest.approx(2.5e-6)
+    assert qcs_rf.amplitude == pytest.approx(-0.25)
+    assert qcs_rf.frequency_hz == pytest.approx(75.0e6)
+    assert qcs_rf.phase_rad == pytest.approx(np.pi / 2)
+    assert qcs_rf.require_within_segment is True
+    acquisition = arguments["acquisition"]
+    assert acquisition.at_segment == "set_0"
+    assert acquisition.pre_delay_s == pytest.approx(0.5e-6)
+    assert acquisition.sample_rate_hz == pytest.approx(4.8e9)
+    assert acquisition.sample_count == 32
+    assert acquisition.duration_s == pytest.approx(32 / 4.8e9)
+    assert acquisition.frequency_hz == pytest.approx(42.0e6)
+    assert arguments["gui_settings"]["experiment"]["execution_backend"] == "qcs"
+
+    experiment.qcs_hw_demod.setChecked(False)
+    app.processEvents()
+    raw_arguments = window._qcs_experiment_run_arguments()
+    assert raw_arguments["connection_config"].hw_demod is False
+    assert raw_arguments["acquisition"].sample_count == 32
+    assert raw_arguments["acquisition"].frequency_hz == 0.0
+    assert readout.frequency_mhz.isHidden() is True
+    assert readout.margin_samples.value() == 9876
+    assert readout.fpga_trigger_delay_us.value() == pytest.approx(13.25)
+    assert readout.measurement_unit.currentData() == "current"
+    app.processEvents()
+    window.close()
+
+
+def test_generated_qcs_code_uses_configured_dc_full_scale():
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.qcs_dc_channel_names.setText("gate_plunger")
+    window._experiment_panel.qcs_dc_full_scale_v.setValue(2.5)
+
+    code = window._generate_qcs_code()
+
+    assert "QCS_FULL_SCALE_V = 2.5" in code
+    assert "gate_plunger: qcs.Channels" in code
+    assert "dc_ch_1: qcs.Channels" not in code
+    window._experiment_panel.qcs_dc_full_scale_v.setValue(0.05)
+    with pytest.raises(ValueError, match=r"exceeding.*\+/-50 mV"):
+        window._generate_qcs_code()
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_ignores_dormant_qick_rf_power_calibration_without_mutation(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    experiment.qcs_mapper_path.setText(str(tmp_path / "mapper.json"))
+    (tmp_path / "mapper.json").write_text("{}", encoding="utf-8")
+    experiment.qcs_dc_channel_names.setText("gate_a")
+    experiment.qcs_rf_channel_names.setText("0=rf_drive")
+    experiment.qcs_acquisition_channel_name.setText("digitizer")
+    rf_panel = window._rf_ports_panel._panels[0]
+    rf_panel.setChecked(True)
+    rf_panel.gen_ch.setValue(0)
+    rf_panel.gain.setValue(8192)
+    rf_panel.duration_sweep_enabled.setChecked(True)
+    rf_panel.duration_sweep_start.setValue(1.0)
+    rf_panel.duration_sweep_stop.setValue(2.0)
+    rf_panel.duration_sweep_count.setValue(3)
+    rf_panel.frequency_sweep_enabled.setChecked(True)
+    rf_panel.frequency_sweep_start_mhz.setValue(100.0)
+    rf_panel.frequency_sweep_stop_mhz.setValue(200.0)
+    rf_panel.frequency_sweep_count.setValue(5)
+    rf_panel.power_calibration_group.setChecked(True)
+    rf_panel.power_calibration_database_path.setText(str(tmp_path / "power.db"))
+    rf_panel.power_calibration_run_id.setValue(17)
+    rf_panel.target_output_power_dbm.setValue(-27.5)
+    rf_panel.power_sweep_enabled.setChecked(True)
+    rf_panel.power_sweep_start_dbm.setValue(-40.0)
+    rf_panel.power_sweep_stop_dbm.setValue(-20.0)
+    rf_panel.power_sweep_count.setValue(7)
+    window._rf_readout_panel.setChecked(True)
+    legacy_settings = rf_panel.settings_dict()
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    arguments = window._qcs_experiment_run_arguments()
+
+    assert len(arguments["rf_pulses"]) == 1
+    assert arguments["rf_pulses"][0].amplitude == pytest.approx(8192 / 32767)
+    assert [
+        axis.axis_kind for axis in arguments["sequence"].sweep_axes
+    ] == ["rf_duration", "rf_frequency"]
+    assert rf_panel.settings_dict() == legacy_settings
+    assert rf_panel.power_calibration_group.isChecked() is True
+    assert rf_panel.power_sweep_enabled.isChecked() is True
+    assert arguments["gui_settings"]["rf_outputs"][0] == legacy_settings
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    assert rf_panel.settings_dict() == legacy_settings
+    app.processEvents()
+    window.close()
 
 
 def test_experiment_panel_records_run_elapsed_time_and_stage_events():
@@ -1778,6 +2341,47 @@ def test_qick_program_worker_compiles_and_returns_assembly(monkeypatch):
     assert "regwi" in results[0]["assembly"]
 
 
+def test_qcs_experiment_worker_forwards_progress_and_events(monkeypatch):
+    app = _application()
+    sentinel = object()
+    received = {}
+
+    def fake_run_qcs_qcodes_experiment(**kwargs):
+        received.update(kwargs)
+        kwargs["progress_callback"](42, "Executing QCS")
+        kwargs["event_callback"](
+            "execution",
+            "started",
+            "Keysight executor started",
+        )
+        return sentinel
+
+    monkeypatch.setattr(
+        gui,
+        "run_qcs_qcodes_experiment",
+        fake_run_qcs_qcodes_experiment,
+    )
+    results = []
+    failures = []
+    progress = []
+    events = []
+    worker = gui.QcsExperimentWorker({"sequence": object()})
+    worker.finished.connect(results.append)
+    worker.failed.connect(failures.append)
+    worker.progress_changed.connect(lambda *args: progress.append(args))
+    worker.event_changed.connect(lambda *args: events.append(args))
+    worker.run()
+    app.processEvents()
+
+    assert failures == []
+    assert results == [sentinel]
+    assert received["sequence"] is not None
+    assert progress == [(42, "Executing QCS")]
+    assert events == [
+        ("execution", "started", "Keysight executor started")
+    ]
+
+
 def test_qick_assembly_dialog_is_read_only_and_copyable():
     app = _application()
     assembly = "// Program\nregwi 0, 1, 2;\nend;"
@@ -1880,6 +2484,555 @@ def test_settings_without_tproc_clock_use_300_mhz_default():
     window.close()
 
 
+def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path):
+    app = _application()
+    source = gui.MainWindow()
+    panel = source._experiment_panel
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    panel.qcs_mapper_path.setText(str(tmp_path / "mapper.json"))
+    panel.qcs_dc_channel_names.setText("gate_a")
+    panel.qcs_dc_full_scale_v.setValue(2.5)
+    panel.qcs_rf_channel_names.setText("0=rf_drive")
+    panel.qcs_acquisition_channel_name.setText("digitizer")
+    panel.qcs_hw_demod.setChecked(False)
+    panel.qcs_sample_rate_hz.setValue(2.4e9)
+    assert panel.qcs_sample_rate_hz.value() == pytest.approx(4.8e9)
+    panel.qcs_init_time_us.setValue(0.25)
+
+    document = source._settings_to_dict()
+    assert document["version"] == 36
+    assert document["experiment"]["execution_backend"] == "qcs"
+    assert document["qcs"] == {
+        "mapper_path": str(tmp_path / "mapper.json"),
+        "dc_channel_names": ["gate_a"],
+        "dc_full_scale_v": 2.5,
+        "rf_channel_names": {"0": "rf_drive"},
+        "acquisition_channel_name": "digitizer",
+        "hw_demod": False,
+        "sample_rate_hz": 4.8e9,
+        "init_time_s": pytest.approx(0.25e-6),
+        "blocking": True,
+        "hardware_configuration": None,
+        "hardware_configuration_state": "external",
+        "hardware_mapper_sha256": None,
+    }
+
+    restored = gui.MainWindow()
+    restored._apply_decoded_settings(restored._decode_settings(document))
+    restored_panel = restored._experiment_panel
+    assert restored_panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert restored_panel.qcs_mapper_path.text() == str(tmp_path / "mapper.json")
+    assert restored_panel.qcs_dc_channel_names.text() == "gate_a"
+    assert restored_panel.qcs_dc_full_scale_v.value() == pytest.approx(2.5)
+    assert restored_panel.qcs_rf_channel_names.text() == "0=rf_drive"
+    assert restored_panel.qcs_acquisition_channel_name.text() == "digitizer"
+    assert restored_panel.qcs_hw_demod.isChecked() is False
+    assert restored_panel.qcs_sample_rate_hz.value() == pytest.approx(4.8e9)
+    assert restored_panel.qcs_init_time_us.value() == pytest.approx(0.25)
+
+    legacy_rate_document = json.loads(json.dumps(document))
+    legacy_rate_document["qcs"]["sample_rate_hz"] = 1.0e6
+    decoded_legacy_rate = source._decode_settings(legacy_rate_document)
+    assert decoded_legacy_rate["qcs_settings"]["sample_rate_hz"] == (
+        pytest.approx(4.8e9)
+    )
+
+    version_35 = json.loads(json.dumps(document))
+    version_35["version"] = 35
+    version_35["qcs"].pop("hardware_configuration")
+    version_35["qcs"].pop("hardware_configuration_state")
+    version_35["qcs"].pop("hardware_mapper_sha256")
+    decoded_version_35 = source._decode_settings(version_35)
+    assert (
+        decoded_version_35["qcs_settings"]["hardware_configuration"] is None
+    )
+    restored_version_35 = gui.MainWindow()
+    restored_version_35._apply_decoded_settings(decoded_version_35)
+    upgraded_qcs = restored_version_35._settings_to_dict()["qcs"]
+    assert upgraded_qcs["hardware_configuration"] is None
+    assert upgraded_qcs["hardware_configuration_state"] == "external"
+    assert upgraded_qcs["hardware_mapper_sha256"] is None
+
+    legacy = json.loads(json.dumps(document))
+    legacy["version"] = 34
+    legacy.pop("qcs")
+    legacy["experiment"].pop("execution_backend")
+    decoded_legacy = source._decode_settings(legacy)
+    assert decoded_legacy["execution_backend"] == gui.EXECUTION_BACKEND_QICK
+    assert (
+        decoded_legacy["qcs_settings"]["mapper_path"]
+        == gui.DEFAULT_QCS_MAPPER_PATH
+    )
+    assert decoded_legacy["qcs_settings"]["dc_channel_names"] == ["dc_ch_1"]
+    assert decoded_legacy["qcs_settings"]["dc_full_scale_v"] == pytest.approx(
+        gui.DEFAULT_QCS_FULL_SCALE_V
+    )
+    assert decoded_legacy["qcs_settings"]["init_time_s"] == pytest.approx(
+        100e-6
+    )
+    for window in (
+        restored_version_35,
+        restored,
+        source,
+    ):
+        window.close()
+        window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
+def test_qcs_unsaved_front_panel_configuration_blocks_run(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    settings = panel.qcs_settings_dict()
+    mapper_path = tmp_path / "mapper.qcs"
+    mapper_path.write_bytes(b"saved mapper contents")
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "draft",
+            "hardware_mapper_sha256": None,
+        }
+    )
+    panel.set_qcs_settings(settings, 1)
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+
+    with pytest.raises(ValueError, match="unsaved physical changes"):
+        panel.qcs_connection_values(1)
+
+    settings["hardware_configuration_state"] = "saved"
+    settings["hardware_mapper_sha256"] = (
+        qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+    )
+    panel.set_qcs_settings(settings, 1)
+    assert panel.qcs_connection_values(1).mapper_path == str(mapper_path)
+    mapper_path.write_bytes(b"replacement mapper contents")
+    with pytest.raises(ValueError, match="file changed"):
+        panel.qcs_connection_values(1)
+    mapper_path.write_bytes(b"saved mapper contents")
+    panel.qcs_mapper_path.setText(str(tmp_path / "different_mapper.qcs"))
+    with pytest.raises(ValueError, match="unsaved physical changes"):
+        panel.qcs_connection_values(1)
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_saved_dc_name_reorder_changes_gui_bindings_not_native_names(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("left", "right"),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "two_dc.qcs"
+    mapper_path.write_bytes(b"two channel mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["left", "right"],
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 2)
+    panel.qcs_dc_channel_names.setText("right, left")
+
+    reordered = panel.qcs_settings_dict()
+    assert reordered["hardware_configuration_state"] == "saved"
+    dc_mappings = [
+        mapping
+        for mapping in reordered["hardware_configuration"][
+            "channel_mappings"
+        ]
+        if mapping["role"] == "dc"
+    ]
+    assert [
+        (
+            mapping["logical_index"],
+            mapping["virtual_name"],
+            mapping["channel"],
+        )
+        for mapping in dc_mappings
+    ] == [(0, "right", 2), (1, "left", 1)]
+    window._add_port()
+    assert panel.qcs_dc_channel_names.text() == "right, left, dc_ch_1"
+    window._delete_port(0)
+    assert panel.qcs_dc_channel_names.text() == "left, dc_ch_1"
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_anticipatory_added_name_preserves_reordered_physical_bindings(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("left", "right"),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "two_dc.qcs"
+    mapper_path.write_bytes(b"two channel mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["left", "right"],
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 2)
+
+    panel.qcs_dc_channel_names.setText("right, left, third")
+    window._add_port()
+
+    assert panel.qcs_dc_channel_names.text() == "right, left, third"
+    resized = panel.qcs_settings_dict()["hardware_configuration"]
+    dc_mappings = [
+        mapping
+        for mapping in resized["channel_mappings"]
+        if mapping["role"] == "dc"
+    ]
+    assert [
+        (
+            mapping["logical_index"],
+            mapping["virtual_name"],
+            mapping["channel"],
+        )
+        for mapping in dc_mappings
+    ] == [(0, "right", 2), (1, "left", 1), (2, "third", 3)]
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_anticipatory_inserted_name_uses_new_physical_binding(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("left", "right"),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "two_dc.qcs"
+    mapper_path.write_bytes(b"two channel mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["left", "right"],
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 2)
+
+    panel.qcs_dc_channel_names.setText("third, left, right")
+    window._add_port()
+
+    resized = panel.qcs_settings_dict()["hardware_configuration"]
+    dc_mappings = [
+        mapping
+        for mapping in resized["channel_mappings"]
+        if mapping["role"] == "dc"
+    ]
+    assert [
+        (
+            mapping["logical_index"],
+            mapping["virtual_name"],
+            mapping["channel"],
+        )
+        for mapping in dc_mappings
+    ] == [(0, "third", 3), (1, "left", 1), (2, "right", 2)]
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_output_add_remove_reuses_imported_unassigned_m5301(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("left",),
+        {},
+        None,
+    )
+    configuration["channel_mappings"].append(
+        {
+            "role": "unassigned",
+            "logical_index": 0,
+            "virtual_name": "spare",
+            "label": 0,
+            "absolute_phase": False,
+            "lo_frequency_hz": None,
+            "slot": 2,
+            "channel": 2,
+        }
+    )
+    configuration = qcs_front_panel.normalize_qcs_hardware_configuration(
+        configuration
+    )
+    mapper_path = tmp_path / "imported_spare.qcs"
+    mapper_path.write_bytes(b"imported mapper with spare")
+    digest = qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["left"],
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "imported",
+            "hardware_mapper_sha256": digest,
+        }
+    )
+    panel.set_qcs_settings(settings, 1)
+
+    window._add_port()
+
+    expanded = panel.qcs_settings_dict()
+    assert panel.qcs_dc_channel_names.text() == "left, spare"
+    assert expanded["hardware_configuration_state"] == "imported"
+    assert expanded["hardware_mapper_sha256"] == digest
+    assert qcs_front_panel.qcs_role_bindings(
+        expanded["hardware_configuration"],
+        required_dc_count=2,
+    )[0] == ["left", "spare"]
+
+    window._delete_port(1)
+
+    contracted = panel.qcs_settings_dict()
+    assert panel.qcs_dc_channel_names.text() == "left"
+    assert contracted["hardware_configuration_state"] == "imported"
+    assert contracted["hardware_mapper_sha256"] == digest
+    assert any(
+        mapping["role"] == "unassigned"
+        and mapping["virtual_name"] == "spare"
+        for mapping in contracted["hardware_configuration"][
+            "channel_mappings"
+        ]
+    )
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_delete_does_not_mask_pending_native_name_change(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("left", "right"),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "saved_two_dc.qcs"
+    mapper_path.write_bytes(b"saved mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["left", "right"],
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 2)
+    panel.qcs_dc_channel_names.setText("right, new")
+
+    window._delete_port(0)
+
+    current = panel.qcs_settings_dict()
+    assert current["dc_channel_names"] == ["new"]
+    assert current["hardware_configuration_state"] == "draft"
+    assert current["hardware_mapper_sha256"] is None
+    with pytest.raises(ValueError, match="unsaved physical changes"):
+        panel.qcs_connection_values(1)
+    window.close()
+    app.processEvents()
+
+
+def test_adding_output_uses_known_qcs_bindings_not_dormant_invalid_text(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "known_mapper.qcs"
+    mapper_path.write_bytes(b"known mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 1)
+    panel.qcs_dc_channel_names.setText("dup, dup")
+
+    window._add_port()
+    updated = panel.qcs_settings_dict()
+    assert len(window._pulse) == 2
+    assert updated["dc_channel_names"] == ["dc_ch_1", "dc_ch_2"]
+    assert "dc_channel_names_text" not in updated
+    assert updated["hardware_configuration_state"] == "draft"
+    window.close()
+    app.processEvents()
+
+
+def test_dormant_invalid_qcs_text_survives_qick_settings_round_trip():
+    app = _application()
+    source = gui.MainWindow()
+    panel = source._experiment_panel
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    panel.qcs_dc_channel_names.setText("gate_a, gate_a")
+    panel.qcs_rf_channel_names.setText("not-a-generator-mapping")
+
+    document = source._settings_to_dict()
+    assert document["experiment"]["execution_backend"] == "qick"
+    assert document["qcs"]["dc_channel_names"] == []
+    assert document["qcs"]["rf_channel_names"] == {}
+    assert document["qcs"]["dc_channel_names_text"] == "gate_a, gate_a"
+    assert (
+        document["qcs"]["rf_channel_names_text"]
+        == "not-a-generator-mapping"
+    )
+    assert document["qcs"]["hardware_configuration"] is None
+
+    restored = gui.MainWindow()
+    restored._apply_decoded_settings(restored._decode_settings(document))
+    assert (
+        restored._experiment_panel.qcs_dc_channel_names.text()
+        == "gate_a, gate_a"
+    )
+    assert (
+        restored._experiment_panel.qcs_rf_channel_names.text()
+        == "not-a-generator-mapping"
+    )
+    restored.close()
+    source.close()
+    app.processEvents()
+
+
+def test_dormant_valid_qcs_role_shape_edit_preserves_known_recipe(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    mapper_path = tmp_path / "known_mapper.qcs"
+    mapper_path.write_bytes(b"known mapper")
+    settings = panel.qcs_settings_dict()
+    settings.update(
+        {
+            "mapper_path": str(mapper_path),
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": "saved",
+            "hardware_mapper_sha256": (
+                qcs_front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        }
+    )
+    panel.set_qcs_settings(settings, 1)
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    panel.qcs_rf_channel_names.setText("0=rf_drive")
+
+    document = window._settings_to_dict()
+    assert document["qcs"]["rf_channel_names"] == {}
+    assert document["qcs"]["rf_channel_names_text"] == "0=rf_drive"
+    assert document["qcs"]["hardware_configuration"] == configuration
+    assert document["qcs"]["hardware_configuration_state"] == "saved"
+
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    with pytest.raises(ValueError, match="roles differ"):
+        panel.qcs_settings_dict()
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    window._show_qcs_front_panel()
+    window._qcs_front_panel.apply_settings()
+    refreshed = panel.qcs_settings_dict()
+    assert panel.qcs_rf_channel_names.text() == ""
+    assert "rf_channel_names_text" not in refreshed
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_front_panel_closes_when_waveform_output_count_changes():
+    app = _application()
+    window = gui.MainWindow()
+    window._show_qcs_front_panel()
+    app.processEvents()
+    assert window._qcs_front_panel_dialog.isVisible() is True
+
+    window._add_port()
+    app.processEvents()
+    assert window._qcs_front_panel_dialog.isVisible() is False
+    window.close()
+    app.processEvents()
+
+
+def test_settings_decoder_rejects_divergent_qcs_role_bindings():
+    app = _application()
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["qcs"]["hardware_configuration"] = (
+        qcs_front_panel.default_qcs_hardware_configuration(
+            ("different_dc_name",),
+            {},
+            None,
+        )
+    )
+    document["qcs"]["hardware_configuration_state"] = "draft"
+
+    with pytest.raises(ValueError, match="role bindings must exactly match"):
+        window._decode_settings(document)
+    window.close()
+    app.processEvents()
+
+
 @pytest.mark.parametrize(
     ("old_index", "panel_name"),
     ((1, "_sparameter_panel"), (2, "_calibration_panel")),
@@ -1949,7 +3102,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 34
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 36
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

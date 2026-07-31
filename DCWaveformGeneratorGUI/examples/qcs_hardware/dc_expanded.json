@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "chassis_model": "M9046A",
+  "chassis": 1,
+  "host_controller": 1,
+  "ip_address": "192.168.2.105",
+  "modules": [
+    {"slot": 2, "model": "M5301A"},
+    {"slot": 3, "model": "M5301A"},
+    {"slot": 8, "model": "M5300A"},
+    {"slot": 14, "model": "M5200A"}
+  ],
+  "channel_mappings": [
+    {"role": "dc", "logical_index": 0, "virtual_name": "dc_gate_1", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 2, "channel": 1},
+    {"role": "dc", "logical_index": 1, "virtual_name": "dc_gate_2", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 2, "channel": 2},
+    {"role": "dc", "logical_index": 2, "virtual_name": "dc_gate_3", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 2, "channel": 3},
+    {"role": "dc", "logical_index": 3, "virtual_name": "dc_gate_4", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 2, "channel": 4},
+    {"role": "dc", "logical_index": 4, "virtual_name": "dc_gate_5", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 3, "channel": 1},
+    {"role": "dc", "logical_index": 5, "virtual_name": "dc_gate_6", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 3, "channel": 2},
+    {"role": "dc", "logical_index": 6, "virtual_name": "dc_gate_7", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 3, "channel": 3},
+    {"role": "dc", "logical_index": 7, "virtual_name": "dc_gate_8", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 3, "channel": 4},
+    {"role": "rf", "logical_index": 0, "virtual_name": "qubit_drive", "label": 0, "absolute_phase": true, "lo_frequency_hz": 5800000000.0, "slot": 8, "channel": 1},
+    {"role": "rf", "logical_index": 1, "virtual_name": "readout_drive", "label": 0, "absolute_phase": true, "lo_frequency_hz": 7100000000.0, "slot": 8, "channel": 2},
+    {"role": "rf", "logical_index": 2, "virtual_name": "pump", "label": 0, "absolute_phase": true, "lo_frequency_hz": 4600000000.0, "slot": 8, "channel": 3},
+    {"role": "rf", "logical_index": 3, "virtual_name": "reference", "label": 0, "absolute_phase": true, "lo_frequency_hz": 6400000000.0, "slot": 8, "channel": 4},
+    {"role": "acquisition", "logical_index": 0, "virtual_name": "digitizer", "label": 0, "absolute_phase": true, "lo_frequency_hz": null, "slot": 14, "channel": 1}
+  ]
+}

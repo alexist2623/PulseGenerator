@@ -24,6 +24,8 @@ from qick_qcodes_experiment import (
     QickConnectionConfig,
     store_qick_result,
 )
+from qcs_qcodes_experiment import QcsConnectionConfig
+import qcs_front_panel as front_panel
 import stability_diagram as stability
 from fir_ddr_profile import FirDdrProfile
 
@@ -517,6 +519,28 @@ def test_stability_panel_measurement_representation_round_trip():
     panel.close()
 
 
+def test_stability_qcs_picker_uses_current_logical_output_channel():
+    _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_2", "awg_0"), (2, 0))
+    panel.set_hardware_backend("qcs")
+    panel.set_qcs_front_panel_configuration(
+        front_panel.default_qcs_hardware_configuration(
+            ("zero", "one", "two"),
+            {},
+            None,
+        )
+    )
+
+    panel.x_axis.output.setCurrentIndex(0)
+    assert panel.x_axis.qcs_front_panel_selection() == ("dc", 2)
+    assert "two /" in panel.x_axis.front_panel_status.text()
+    panel.x_axis.output.setCurrentIndex(1)
+    assert panel.x_axis.qcs_front_panel_selection() == ("dc", 0)
+    assert "zero /" in panel.x_axis.front_panel_status.text()
+    panel.close()
+
+
 def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
     calls = {"execute": 0, "store": 0}
 
@@ -561,6 +585,242 @@ def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
     assert calls == {"execute": 1, "store": 0}
     assert len(scans) == 1
     assert stopped == [True]
+
+
+def test_qcs_continuous_worker_runs_one_native_grid_without_storage(
+    monkeypatch,
+):
+    calls = {"execute": 0, "store": 0}
+    config = _config()
+    sequence = stability.build_stability_hold_sequence(
+        config,
+        output_names=("awg_0", "awg_1"),
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+    )
+    compiled = SimpleNamespace(
+        program=object(),
+        sweep_shape=(2, 2),
+        acquisition_duration_s=3e-6,
+    )
+    execution = SimpleNamespace(
+        ddr_result=_ddr_result(),
+        programs=(compiled.program,),
+        raw_results=("raw",),
+        program_summary={"backend": "qcs", "hardware_sweep": True},
+        rf_settings={"backend": "qcs"},
+    )
+    monkeypatch.setattr(
+        stability,
+        "load_qcs_channel_mapper",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        stability,
+        "compile_qcs_stability_hardware_sweep",
+        lambda *_args, **_kwargs: compiled,
+    )
+    monkeypatch.setattr(
+        stability,
+        "build_qcs_executor",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def fake_execute(**_kwargs):
+        calls["execute"] += 1
+        return execution
+
+    def forbidden_store(*_args, **_kwargs):
+        calls["store"] += 1
+        raise AssertionError("continuous QCS scan must not write QCoDeS")
+
+    monkeypatch.setattr(
+        stability,
+        "execute_qcs_stability_hardware_sweep",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        stability,
+        "store_experiment_result",
+        forbidden_store,
+    )
+    worker = stability.QcsStabilityDiagramWorker(
+        {
+            "connection_config": QcsConnectionConfig(
+                mapper_path="unused.qcs",
+                dc_channel_names=("dc_x", "dc_y"),
+                acquisition_channel_name="digitizer",
+            ),
+            "run_config": None,
+            "gui_settings": None,
+            "stability_config": config,
+            "full_scale_mv": 100.0,
+            "sequence": sequence,
+            "repetitions_per_point": 2,
+            "fabric_mhz": 300.0,
+            "rf_pulses": (),
+            "acquisition": SimpleNamespace(sample_count=3),
+            "readout_spec": None,
+        },
+        continuous=True,
+    )
+    scans = []
+    stopped = []
+    worker.scan_ready.connect(
+        lambda result: (scans.append(result), worker.request_stop())
+    )
+    worker.stopped.connect(lambda: stopped.append(True))
+
+    worker.run()
+
+    assert calls == {"execute": 1, "store": 0}
+    assert len(scans) == 1
+    assert scans[0].magnitude.shape == (2, 2)
+    assert stopped == [True]
+
+
+def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
+    tmp_path,
+    monkeypatch,
+):
+    config = _config()
+    full_scale_mv = 2500.0
+    sequence = stability.build_stability_hold_sequence(
+        config,
+        output_names=("awg_0", "awg_1"),
+        fabric_mhz=300.0,
+        full_scale_mv=full_scale_mv,
+    )
+    iq = np.zeros((4, 2, 1, 2), dtype=float)
+    ddr_result = FineTuneDdrResult(
+        sweep_points=np.asarray(sequence.sweep_points),
+        iq=iq,
+        sweep_axes=tuple(sequence.sweep_axes),
+        sweep_shape=tuple(sequence.sweep_shape),
+        cross_capacitance=np.eye(2),
+        sample_rate_hz=2.0e6,
+        fir_rate_profile="qcs_hardware_demod",
+    )
+    compiled = SimpleNamespace(
+        program=object(),
+        sweep_shape=(2, 2),
+        acquisition_duration_s=1.5e-6,
+    )
+    execution = SimpleNamespace(
+        ddr_result=ddr_result,
+        programs=(compiled.program,),
+        raw_results=("raw",),
+        program_summary={
+            "backend": "qcs",
+            "hardware_sweep": True,
+            "source_full_scale_mv": full_scale_mv,
+        },
+        rf_settings={"backend": "qcs"},
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        stability,
+        "load_qcs_channel_mapper",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        stability,
+        "compile_qcs_stability_hardware_sweep",
+        lambda *_args, **_kwargs: compiled,
+    )
+    monkeypatch.setattr(
+        stability,
+        "build_qcs_executor",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def fake_execute(**kwargs):
+        kwargs["progress_callback"](0, "execute start")
+        kwargs["progress_callback"](100, "execute complete")
+        return execution
+
+    def fake_store(_result, **kwargs):
+        captured.update(kwargs)
+        kwargs["progress_callback"](kwargs["progress_start"], "save start")
+        kwargs["progress_callback"](kwargs["progress_end"], "save complete")
+        return SimpleNamespace(run_id=7, guid="qcs-guid"), 8
+
+    monkeypatch.setattr(
+        stability,
+        "execute_qcs_stability_hardware_sweep",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        stability,
+        "store_experiment_result",
+        fake_store,
+    )
+    worker = stability.QcsStabilityDiagramWorker(
+        {
+            "connection_config": QcsConnectionConfig(
+                mapper_path="unused.qcs",
+                dc_channel_names=("dc_x", "dc_y"),
+                acquisition_channel_name="digitizer",
+            ),
+            "run_config": QcodesRunConfig(
+                database_path=str(tmp_path / "qcs_stability.db")
+            ),
+            "gui_settings": {
+                "qick": {
+                    "fabric_mhz": 300.0,
+                    "full_scale_mv": 800.0,
+                },
+                "stability_diagram": {},
+                "awg": {"outputs": []},
+            },
+            "stability_config": config,
+            "full_scale_mv": full_scale_mv,
+            "sequence": sequence,
+            "repetitions_per_point": 2,
+            "fabric_mhz": 300.0,
+            "rf_pulses": (),
+            "acquisition": SimpleNamespace(sample_count=3),
+            "readout_spec": None,
+        },
+        continuous=False,
+    )
+    progress = []
+    finished = []
+    worker.progress_changed.connect(
+        lambda percent, _message: progress.append(percent)
+    )
+    worker.single_finished.connect(finished.append)
+
+    worker.run()
+
+    assert len(finished) == 1
+    assert progress == sorted(progress)
+    assert progress[-1] == 100
+    assert captured["progress_start"] == 65
+    assert captured["progress_end"] == 100
+    stored = captured["gui_settings"]
+    assert stored["qick"]["full_scale_mv"] == 800.0
+    assert (
+        stored["stability_diagram"]["coordinate_full_scale_mv"]
+        == full_scale_mv
+    )
+    assert (
+        stored["stability_diagram"]["bias_t_compensation_applied"]
+        is False
+    )
+    metadata = {
+        "gui_settings": stored,
+        "program_summary": execution.program_summary,
+    }
+    np.testing.assert_allclose(
+        stability._stored_coordinate_mv(
+            np.asarray([-0.04, 0.04]),
+            {"unit": "normalized"},
+            metadata,
+        ),
+        [-100.0, 100.0],
+    )
 
 
 def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
@@ -690,6 +950,258 @@ def test_stability_front_panel_remains_visible_while_controls_scroll():
     assert panel.front_panel_preview.parentWidget() is panel
     assert panel.front_panel_preview.isVisible()
     assert panel.front_panel_preview.y() < panel.controls_scroll.y()
+    panel.close()
+
+
+def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.resize(900, 1200)
+    panel.show()
+    app.processEvents()
+
+    legacy_path = {
+        **stability.DEFAULT_STABILITY_RF_PATH,
+        "output_board_type": "RF_Out",
+        "input_board_type": "RF_In",
+        "output_nqz": 2,
+        "readout_nqz": 2,
+        "output_att1_db": 7.25,
+        "output_att2_db": 12.5,
+        "readout_attenuation_db": 18.75,
+    }
+    panel.apply_path_settings(legacy_path)
+    panel.trace_samples.setValue(4321)
+    panel.override_fpga_trigger_delay.setChecked(True)
+    panel.fpga_trigger_delay_us.setValue(17.5)
+    panel.modulation_frequency_mhz.setValue(123.25)
+    panel.modulation_gain.setValue(12345)
+    panel.dc_calibration_path.setText("legacy_dc_calibration.db")
+    panel.dc_calibration_run_id.setValue(29)
+    panel.dc_calibration_group.setChecked(True)
+    legacy_settings = panel.settings_dict()
+
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {0: "rf_drive"},
+        "digitizer",
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    panel.set_hardware_backend("qcs")
+    app.processEvents()
+
+    path = panel.path_diagram
+    module_items = [
+        (
+            path.qcs_output_module_model.itemText(index),
+            path.qcs_output_module_model.itemData(index),
+        )
+        for index in range(path.qcs_output_module_model.count())
+    ]
+    assert module_items == [
+        ("M5300A RF AWG", "M5300A"),
+        ("M5301A Precision AWG", "M5301A"),
+    ]
+    assert path.qcs_output_mapping_selector.currentData() == 0
+    assert path.qcs_output_module_model.currentData() == "M5300A"
+    assert "M5300A, slot 3, SMA CH 1" in (
+        path.qcs_output_mapping_selector.currentText()
+    )
+    assert path.qcs_acquisition_mapping_selector.currentData() == 0
+    assert path.qcs_acquisition_module_model.currentData() == "M5200A"
+    assert "M5200A, slot 5, SMA CH 1" in (
+        path.qcs_acquisition_mapping_selector.currentText()
+    )
+
+    assert path.qcs_output_endpoint.isVisible() is True
+    assert path.qcs_input_endpoint.isVisible() is True
+    output_nodes, input_nodes = path._active_arrow_nodes()
+    assert output_nodes == (
+        path.qcs_output_endpoint,
+        path.loss1_component,
+    )
+    assert input_nodes == (
+        path.loss2_component,
+        path.amplifier_component,
+        path.qcs_input_endpoint,
+    )
+    assert (
+        path.minimumSizeHint().width()
+        <= panel.controls_scroll.viewport().width()
+    )
+    assert path.width() <= panel.controls_scroll.viewport().width()
+    assert path.qcs_output_endpoint.geometry().right() <= path.rect().right()
+    assert path.qcs_input_endpoint.geometry().right() <= path.rect().right()
+    for legacy_widget in (
+        path.output_endpoint,
+        path.input_endpoint,
+        path.output_board_type,
+        path.input_board_type,
+        path.output_nqz,
+        path.readout_nqz,
+        path.output_att1_component,
+        path.output_att2_component,
+        path.input_condition,
+    ):
+        assert legacy_widget.isVisible() is False
+
+    assert panel.qcs_modulation_amplitude.isVisible() is True
+    assert panel.qcs_modulation_amplitude.value() == pytest.approx(
+        12345 / 32767,
+        abs=0.5e-9,
+    )
+    assert panel.modulation_gain.isVisible() is False
+    assert panel.fpga_delay_widget.isVisible() is False
+    assert panel.fir_profile_status.isVisible() is False
+    assert panel.measurement_unit.isVisible() is False
+    assert panel.dc_measure_gain_v_per_a.isVisible() is False
+    assert panel.dc_calibration_group.isVisible() is False
+    assert panel.trace_samples.isVisible() is True
+    assert (
+        panel.trace_samples_label.text()
+        == "Integration length (M5200 samples):"
+    )
+    assert panel.trace_samples.singleStep() == 16
+    assert panel.modulation_frequency_label.text() == "RF frequency:"
+    assert (
+        panel._acquisition_form.labelForField(
+            panel.qcs_modulation_amplitude
+        ).text()
+        == "Relative amplitude:"
+    )
+    visible_labels = " ".join(
+        label.text()
+        for label in panel.findChildren(QtWidgets.QLabel)
+        if label.isVisible()
+    )
+    for qick_term in ("Output board", "Input board", "Nyquist", "HWH", "FIR"):
+        assert qick_term not in visible_labels
+    assert panel.start_button.isEnabled() is True
+    assert panel.single_shot_button.isEnabled() is True
+    assert panel.bias_t_group.isVisible() is False
+    assert "native M5301 X/Y hardware-sweep" in panel.backend_warning.text()
+    assert "4.8 GSPS" in panel.backend_warning.text()
+    assert "multiples of 16 samples" in panel.backend_warning.text()
+    panel.set_running(True, "Running QCS hardware sweep")
+    assert panel.start_button.isEnabled() is False
+    assert panel.single_shot_button.isEnabled() is False
+    panel.set_running(False, "Ready")
+    assert panel.start_button.isEnabled() is True
+    assert panel.single_shot_button.isEnabled() is True
+    panel.set_saved_run_loading(True, run_id=1)
+    assert panel.start_button.isEnabled() is False
+    panel.set_saved_run_loading(False)
+    assert panel.start_button.isEnabled() is True
+
+    moved_mappings = []
+    for mapping in configuration["channel_mappings"]:
+        mapping = dict(mapping)
+        if mapping["role"] == "rf":
+            mapping.update(
+                slot=2,
+                channel=3,
+                absolute_phase=False,
+                lo_frequency_hz=None,
+            )
+        moved_mappings.append(mapping)
+    moved_configuration = front_panel.normalize_qcs_hardware_configuration(
+        {
+            **configuration,
+            "channel_mappings": moved_mappings,
+        }
+    )
+    panel.set_qcs_front_panel_configuration(moved_configuration)
+    app.processEvents()
+
+    assert path.qcs_output_module_model.currentData() == "M5301A"
+    assert "M5301A, slot 2, SMA CH 3" in (
+        path.qcs_output_mapping_selector.currentText()
+    )
+    assert path.qcs_acquisition_module_model.currentData() == "M5200A"
+
+    panel.set_hardware_backend("qick")
+    app.processEvents()
+
+    assert path.output_endpoint.isVisible() is True
+    assert path.input_endpoint.isVisible() is True
+    assert path.qcs_output_endpoint.isVisible() is False
+    assert path.qcs_input_endpoint.isVisible() is False
+    assert path.output_board_type.currentText() == "RF_Out"
+    assert path.input_board_type.currentText() == "RF_In"
+    assert path.output_nqz.value() == 2
+    assert path.readout_nqz.value() == 2
+    assert path.output_att1_db.value() == pytest.approx(7.25)
+    assert path.output_att2_db.value() == pytest.approx(12.5)
+    assert path.readout_attenuation_db.value() == pytest.approx(18.75)
+    assert path.output_att1_component.isVisible() is True
+    assert path.output_att2_component.isVisible() is True
+    assert path.input_condition.isVisible() is True
+    output_nodes, input_nodes = path._active_arrow_nodes()
+    assert output_nodes == (
+        path.output_endpoint,
+        path.output_att1_component,
+        path.output_att2_component,
+        path.loss1_component,
+    )
+    assert input_nodes == (
+        path.loss2_component,
+        path.amplifier_component,
+        path.input_condition,
+        path.input_endpoint,
+    )
+    assert panel.modulation_gain.isVisible() is True
+    assert panel.modulation_gain.value() == 12345
+    assert panel.qcs_modulation_amplitude.isVisible() is False
+    assert panel.fpga_delay_widget.isVisible() is True
+    assert panel.override_fpga_trigger_delay.isVisible() is True
+    assert panel.override_fpga_trigger_delay.isChecked() is True
+    assert panel.fpga_trigger_delay_us.value() == pytest.approx(17.5)
+    assert panel.fir_profile_status.isVisible() is True
+    assert panel.fir_profile_label.text() == "HWH FIR DDR:"
+    assert panel.trace_samples_label.text() == "FIR trace samples / point:"
+    assert panel.modulation_frequency_label.text() == "Modulation frequency:"
+    assert panel.measurement_unit.isVisible() is True
+    assert panel.dc_measure_gain_v_per_a.isVisible() is True
+    assert panel.dc_calibration_group.isVisible() is True
+    assert panel.dc_calibration_group.isChecked() is True
+    assert panel.dc_calibration_path.text() == "legacy_dc_calibration.db"
+    assert panel.dc_calibration_run_id.value() == 29
+    assert panel.settings_dict() == legacy_settings
+    assert panel.start_button.isEnabled() is True
+    assert panel.single_shot_button.isEnabled() is True
+
+    panel.close()
+
+
+def test_stability_qcs_rf_output_selection_round_trips():
+    app = _application()
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_x", "dc_y"),
+        {0: "rf_primary", 1: "rf_secondary"},
+        "digitizer",
+    )
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (0, 1))
+    panel.set_qcs_front_panel_configuration(configuration)
+    panel.set_hardware_backend("qcs")
+    selector = panel.path_diagram.qcs_output_mapping_selector
+    selector.setCurrentIndex(selector.findData(1))
+    settings = panel.settings_dict()
+
+    assert settings["qcs_rf_output_logical_index"] == 1
+
+    restored = stability.StabilityDiagramPanel()
+    restored.refresh_targets(("awg_0", "awg_1"), (0, 1))
+    restored.set_qcs_front_panel_configuration(configuration)
+    restored.set_hardware_backend("qcs")
+    restored.load_settings(settings)
+    app.processEvents()
+
+    assert (
+        restored.path_diagram.qcs_output_mapping_selector.currentData() == 1
+    )
+    restored.close()
     panel.close()
 
 
@@ -843,12 +1355,21 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.bias_t_group.isEnabled() is False
     panel.set_stopping()
     assert panel.stop_button.isEnabled() is False
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    assert panel.start_button.isEnabled() is False
+    assert panel.single_shot_button.isEnabled() is False
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
     assert panel.trace_samples.isEnabled() is True
     assert panel.settle_time_us.isEnabled() is True
     assert panel.modulation_frequency_mhz.isEnabled() is True
     assert panel.bias_t_group.isEnabled() is True
+    panel.set_saved_run_loading(True, run_id=29)
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    assert panel.start_button.isEnabled() is False
+    assert panel.single_shot_button.isEnabled() is False
+    panel.set_saved_run_loading(False)
+    assert panel.start_button.isEnabled() is True
     panel.close()
     restored.close()
 
@@ -1157,3 +1678,96 @@ def test_saved_stability_run_loads_from_real_qcodes_database(
     np.testing.assert_allclose(result.q_mean, [[-20.0, -22.0], [-21.0, -23.0]])
     assert result.source_label == f"QCoDeS Run {dataset.run_id}"
     assert result.sample_rate_hz == 50_000.0
+
+
+def test_saved_qcs_hardware_stability_run_is_listed_and_loaded(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "qcs_stability_qcodes.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    axes = (
+        AmplitudeSweep(
+            stability.STABILITY_HOLD_SEGMENT,
+            "awg_0",
+            -0.5,
+            0.5,
+            2,
+        ),
+        AmplitudeSweep(
+            stability.STABILITY_HOLD_SEGMENT,
+            "awg_1",
+            -0.25,
+            0.25,
+            2,
+        ),
+    )
+    iq = np.empty((4, 2, 1, 2), dtype=float)
+    for point_index in range(4):
+        iq[point_index, :, 0, 0] = point_index + np.arange(2)
+        iq[point_index, :, 0, 1] = -point_index
+    ddr_result = FineTuneDdrResult(
+        sweep_points=np.asarray([
+            [-0.5, -0.25],
+            [-0.5, 0.25],
+            [0.5, -0.25],
+            [0.5, 0.25],
+        ]),
+        iq=iq,
+        sweep_axes=axes,
+        sweep_shape=(2, 2),
+        cross_capacitance=np.eye(2),
+        sample_rate_hz=1_000_000.0,
+        fir_rate_profile="qcs_hardware_demod",
+    )
+    gui_settings = {
+        "qick": {
+            "fabric_mhz": 300.0,
+            "full_scale_mv": 800.0,
+        },
+        "stability_diagram": {
+            "capture_mode": "qcs_hardware_sweep",
+            "x_axis": {"output_name": "awg_0"},
+            "y_axis": {"output_name": "awg_1"},
+        },
+        "awg": {"cross_capacitance": np.eye(2).tolist()},
+    }
+    dataset, _row_count = store_qick_result(
+        ddr_result,
+        run_config=QcodesRunConfig(
+            database_path=str(database_path),
+            experiment_name="QCS Stability loader test",
+            sample_name="simulated device",
+            sample_rate_hz=1_000_000.0,
+        ),
+        connection_config=QcsConnectionConfig(
+            mapper_path="qcs_mapper.qcs",
+            dc_channel_names=("dc_x", "dc_y"),
+            acquisition_channel_name="digitizer",
+        ),
+        program_summary={
+            "backend": "qcs",
+            "hardware_sweep": True,
+            "program_count": 1,
+        },
+        gui_settings=gui_settings,
+        rf_settings={"readout_details": {"hw_demod": True}},
+        backend_name="qcs",
+    )
+
+    summaries = stability.list_stability_runs(database_path)
+    result = stability.load_stability_diagram_run(
+        database_path,
+        dataset.run_id,
+    )
+
+    assert [summary.run_id for summary in summaries] == [dataset.run_id]
+    np.testing.assert_allclose(result.x_voltage_mv, [-400.0, 400.0])
+    np.testing.assert_allclose(result.y_voltage_mv, [-200.0, 200.0])
+    np.testing.assert_allclose(
+        result.i_mean,
+        [[0.5, 2.5], [1.5, 3.5]],
+    )
+    assert result.repetition_count == 2
+    assert result.samples_per_trace == 1
+    assert result.fir_rate_profile == "qcs_hardware_demod"

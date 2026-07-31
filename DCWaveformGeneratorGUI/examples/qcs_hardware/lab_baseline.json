@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "chassis_model": "M9046A",
+  "chassis": 1,
+  "host_controller": 1,
+  "ip_address": "192.168.2.105",
+  "modules": [
+    {"slot": 4, "model": "M5300A"},
+    {"slot": 7, "model": "M5301A"},
+    {"slot": 18, "model": "M5200A"}
+  ],
+  "channel_mappings": [
+    {"role": "dc", "logical_index": 0, "virtual_name": "gate_left", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 7, "channel": 1},
+    {"role": "dc", "logical_index": 1, "virtual_name": "gate_right", "label": 0, "absolute_phase": false, "lo_frequency_hz": null, "slot": 7, "channel": 2},
+    {"role": "rf", "logical_index": 0, "virtual_name": "qubit_drive", "label": 0, "absolute_phase": true, "lo_frequency_hz": 6000000000.0, "slot": 4, "channel": 1},
+    {"role": "rf", "logical_index": 1, "virtual_name": "readout_drive", "label": 0, "absolute_phase": true, "lo_frequency_hz": 7250000000.0, "slot": 4, "channel": 2},
+    {"role": "acquisition", "logical_index": 0, "virtual_name": "digitizer", "label": 0, "absolute_phase": true, "lo_frequency_hz": null, "slot": 18, "channel": 1}
+  ]
+}

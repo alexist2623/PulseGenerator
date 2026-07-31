@@ -35,7 +35,7 @@ try:
         run_sparameter_sweep,
     )
     from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
-    from .qick_front_panel import QickFrontPanelPreview
+    from .hardware_front_panel import HardwareFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from qick_sparameter_sweep import (
@@ -48,7 +48,7 @@ except ImportError:
         run_sparameter_sweep,
     )
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
-    from qick_front_panel import QickFrontPanelPreview
+    from hardware_front_panel import HardwareFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
 
 
@@ -100,6 +100,10 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
     def __init__(self, parent=None, *, compact: bool = False):
         super().__init__("RF Path and DUT De-embedding", parent)
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._hardware_backend = "qick"
+        self._qcs_focus_role = "rf"
+        self._qcs_focus_logical_index = None
         self._compact = bool(compact)
         self.setMinimumHeight(500 if self._compact else 540)
         self.setStyleSheet(
@@ -116,6 +120,46 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         self.readout_nqz = self._nyquist_spin()
         self.output_board_type = self._board_combo(OUTPUT_BOARD_TYPES, "RF_Out")
         self.input_board_type = self._board_combo(INPUT_BOARD_TYPES, "DC_In")
+        self.qcs_output_mapping_selector = QtWidgets.QComboBox(self)
+        self.qcs_acquisition_mapping_selector = QtWidgets.QComboBox(self)
+        self.qcs_output_module_model = QtWidgets.QComboBox(self)
+        self.qcs_output_module_model.addItem("M5300A RF AWG", "M5300A")
+        self.qcs_output_module_model.addItem(
+            "M5301A Precision AWG",
+            "M5301A",
+        )
+        self.qcs_output_module_model.setPlaceholderText("Not mapped")
+        self.qcs_output_module_model.setEnabled(False)
+        self.qcs_output_module_model.setToolTip(
+            "The RF module comes from the QCS front-panel mapping. Click the "
+            "front panel to change the module or SMA output."
+        )
+        self.qcs_acquisition_module_model = QtWidgets.QComboBox(self)
+        self.qcs_acquisition_module_model.addItem(
+            "M5200A Digitizer",
+            "M5200A",
+        )
+        self.qcs_acquisition_module_model.setPlaceholderText("Not mapped")
+        self.qcs_acquisition_module_model.setEnabled(False)
+        self.qcs_acquisition_module_model.setToolTip(
+            "The acquisition module comes from the QCS front-panel mapping. "
+            "Click the front panel to change the digitizer SMA input."
+        )
+        if self._compact:
+            # Mapping labels include virtual name, module, slot, and SMA.  A
+            # combo box normally contributes that entire string to the
+            # layout's minimum width, which can push the right QCS endpoint
+            # (and its arrows) outside compact Stability/Calibration views.
+            for combo in (
+                self.qcs_output_mapping_selector,
+                self.qcs_acquisition_mapping_selector,
+                self.qcs_output_module_model,
+                self.qcs_acquisition_module_model,
+            ):
+                combo.setSizePolicy(
+                    QtWidgets.QSizePolicy.Ignored,
+                    QtWidgets.QSizePolicy.Fixed,
+                )
 
         self.output_att1_db = self._attenuation_spin(10.0)
         self.output_att2_db = self._attenuation_spin(10.0)
@@ -143,6 +187,27 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             ),
             self,
         )
+        self.qcs_input_endpoint = _PathComponent(
+            "QCS ACQUISITION",
+            self._endpoint_form(
+                (
+                    "Virtual channel",
+                    self.qcs_acquisition_mapping_selector,
+                ),
+                ("Module", self.qcs_acquisition_module_model),
+            ),
+            self,
+        )
+        self.qcs_output_endpoint = _PathComponent(
+            "QCS RF OUTPUT",
+            self._endpoint_form(
+                ("Virtual channel", self.qcs_output_mapping_selector),
+                ("Module", self.qcs_output_module_model),
+            ),
+            self,
+        )
+        self.qcs_input_endpoint.hide()
+        self.qcs_output_endpoint.hide()
         self.input_condition_stack = QtWidgets.QStackedWidget(self)
         self.input_condition_stack.addWidget(self.readout_attenuation_db)
         self.input_condition_stack.addWidget(self.readout_dc_gain_db)
@@ -173,7 +238,9 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         self.dut_component = _PathComponent("DUT", dut_label, self)
         self.dut_component.setMinimumWidth(180)
 
-        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview = HardwareFrontPanelPreview(self)
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self.front_panel_preview.set_scope("path")
         self.front_panel_preview.activated.connect(self.front_panel_requested.emit)
         self.update_button = QtWidgets.QPushButton("Update", self)
         self.update_button.setIcon(
@@ -196,6 +263,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.front_panel_preview, 0, 0, 1, 2)
         layout.addWidget(self.input_endpoint, 1, 0)
         layout.addWidget(self.output_endpoint, 1, 1)
+        layout.addWidget(self.qcs_input_endpoint, 1, 0)
+        layout.addWidget(self.qcs_output_endpoint, 1, 1)
         layout.addWidget(self.input_condition, 2, 0)
         layout.addWidget(self.output_att1_component, 2, 1)
         layout.addWidget(self.amplifier_component, 3, 0)
@@ -212,6 +281,29 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         )
         layout.addWidget(self.update_button, 6, 0, 1, 2)
         layout.addWidget(self.apply_status, 7, 0, 1, 2)
+        self.qcs_mapping_widget = QtWidgets.QWidget(self)
+        qcs_mapping_layout = QtWidgets.QHBoxLayout(self.qcs_mapping_widget)
+        qcs_mapping_layout.setContentsMargins(0, 0, 0, 0)
+        self.qcs_mapping_label = QtWidgets.QLabel(self.qcs_mapping_widget)
+        self.qcs_mapping_selector = QtWidgets.QComboBox(
+            self.qcs_mapping_widget
+        )
+        self.qcs_mapping_selector.currentIndexChanged.connect(
+            self._qcs_mapping_changed
+        )
+        self.qcs_output_mapping_selector.currentIndexChanged.connect(
+            lambda index: self._qcs_native_mapping_changed("rf", index)
+        )
+        self.qcs_acquisition_mapping_selector.currentIndexChanged.connect(
+            lambda index: self._qcs_native_mapping_changed(
+                "acquisition",
+                index,
+            )
+        )
+        qcs_mapping_layout.addWidget(self.qcs_mapping_label)
+        qcs_mapping_layout.addWidget(self.qcs_mapping_selector, 1)
+        layout.addWidget(self.qcs_mapping_widget, 8, 0, 1, 2)
+        self.qcs_mapping_widget.hide()
 
         self.output_board_type.currentTextChanged.connect(self._update_board_controls)
         self.input_board_type.currentTextChanged.connect(self._update_board_controls)
@@ -237,6 +329,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         self._applied_values = {}
         self._update_board_controls()
         self.apply_settings(emit=False)
+        self._update_backend_presentation()
 
     @staticmethod
     def _channel_spin() -> QtWidgets.QSpinBox:
@@ -293,12 +386,14 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         return widget
 
     def _update_board_controls(self, *_args) -> None:
+        native_qcs = self._compact and self._hardware_backend == "qcs"
         rf_output = self.output_board_type.currentText() == "RF_Out"
-        self.output_att1_component.setVisible(rf_output)
-        self.output_att2_component.setVisible(rf_output)
+        self.output_att1_component.setVisible(rf_output and not native_qcs)
+        self.output_att2_component.setVisible(rf_output and not native_qcs)
         rf_input = self.input_board_type.currentText() == "RF_In"
         self.input_condition_stack.setCurrentIndex(0 if rf_input else 1)
         self.input_condition.set_title("INPUT ATT" if rf_input else "DC INPUT GAIN")
+        self.input_condition.setVisible(not native_qcs)
         self._update_summary()
         self.updateGeometry()
         self.update()
@@ -326,6 +421,10 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
 
     def apply_external_settings(self, values: Mapping[str, Any]) -> None:
         """Adopt a committed path without emitting another update."""
+        # The QCS preview choice is transient UI state.  Reset it when a
+        # settings document supplies a path so an existing widget resolves
+        # the same mapping as a freshly constructed widget.
+        self._qcs_focus_logical_index = None
         assignments = (
             (self.output_ch, "output_ch"),
             (self.readout_ch, "readout_ch"),
@@ -348,6 +447,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             self.input_board_type.setCurrentText(str(values["input_board_type"]))
         self._update_board_controls()
         self.apply_settings(emit=False)
+        self._populate_qcs_mapping_selector()
+        self._sync_front_panel_selection()
 
     def apply_settings(self, _checked=False, *, emit: bool = True) -> None:
         """Commit edited path values and optionally notify linked panels."""
@@ -383,6 +484,47 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             output_ch=int(values["output_ch"]),
             input_ch=int(values["readout_ch"]),
         )
+        role, logical_index = self.qcs_front_panel_selection()
+        self.front_panel_preview.set_qcs_selection(role, logical_index)
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        """Return the QCS role highlighted when this path opens the mapper."""
+
+        logical_index = self._qcs_focus_logical_index
+        if logical_index is None:
+            mappings = self._qcs_role_mappings()
+            preferred_index = (
+                int(self.output_ch.value())
+                if self._qcs_focus_role == "rf"
+                else 0
+            )
+            logical_index = next(
+                (
+                    int(mapping["logical_index"])
+                    for mapping in mappings
+                    if int(mapping["logical_index"]) == preferred_index
+                ),
+                (
+                    int(mappings[0]["logical_index"])
+                    if mappings
+                    else preferred_index
+                ),
+            )
+        return self._qcs_focus_role, int(logical_index)
+
+    def set_qcs_front_panel_focus(
+        self,
+        role: str,
+        logical_index: int | None = None,
+    ) -> None:
+        """Choose which logical QCS binding represents this measurement path."""
+
+        self._qcs_focus_role = str(role).strip().lower()
+        self._qcs_focus_logical_index = (
+            None if logical_index is None else int(logical_index)
+        )
+        self._populate_qcs_mapping_selector()
+        self._sync_front_panel_selection()
 
     def set_front_panel_configuration(self, configuration) -> None:
         """Display live HWH routing and adopt detected board types by channel."""
@@ -390,7 +532,232 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         self.front_panel_preview.set_configuration(configuration)
         self._sync_front_panel_selection()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        """Select the preview matching the application execution backend."""
+
+        self._hardware_backend = str(backend).strip().lower()
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self._update_backend_presentation()
+        self._populate_qcs_mapping_selector()
+        self._sync_front_panel_selection()
+
+    def _update_backend_presentation(self) -> None:
+        native_qcs = self._compact and self._hardware_backend == "qcs"
+        self.setTitle(
+            "QCS RF Path and DUT De-embedding"
+            if native_qcs
+            else "RF Path and DUT De-embedding"
+        )
+        self.input_endpoint.setVisible(not native_qcs)
+        self.output_endpoint.setVisible(not native_qcs)
+        self.qcs_input_endpoint.setVisible(native_qcs)
+        self.qcs_output_endpoint.setVisible(native_qcs)
+        self.qcs_mapping_widget.setVisible(
+            self._hardware_backend == "qcs" and not native_qcs
+        )
+        self._populate_qcs_native_bindings()
+        self._update_board_controls()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        """Render the shared QCS chassis without changing QICK path settings."""
+
+        self._qcs_front_panel_configuration = configuration
+        self._populate_qcs_mapping_selector()
+        self.front_panel_preview.set_qcs_configuration(configuration)
+        self._sync_front_panel_selection()
+
+    def _qcs_role_mappings(
+        self,
+        role: str | None = None,
+    ) -> list[Mapping[str, object]]:
+        if self._qcs_front_panel_configuration is None:
+            return []
+        selected_role = (
+            self._qcs_focus_role if role is None else str(role).strip().lower()
+        )
+        return sorted(
+            (
+                mapping
+                for mapping in self._qcs_front_panel_configuration[
+                    "channel_mappings"
+                ]
+                if mapping["role"] == selected_role
+            ),
+            key=lambda mapping: int(mapping["logical_index"]),
+        )
+
+    def _populate_qcs_mapping_selector(self) -> None:
+        self._populate_qcs_native_bindings()
+        labels = {
+            "dc": "QCS DC preview mapping:",
+            "rf": "QCS RF preview mapping:",
+            "acquisition": "QCS acquisition preview mapping:",
+        }
+        self.qcs_mapping_label.setText(
+            labels.get(self._qcs_focus_role, "QCS preview mapping:")
+        )
+        mappings = self._qcs_role_mappings()
+        preferred = self._qcs_focus_logical_index
+        if preferred is None:
+            preferred = (
+                int(self.output_ch.value())
+                if self._qcs_focus_role == "rf"
+                else 0
+            )
+        with QtCore.QSignalBlocker(self.qcs_mapping_selector):
+            self.qcs_mapping_selector.clear()
+            for mapping in mappings:
+                logical_index = int(mapping["logical_index"])
+                self.qcs_mapping_selector.addItem(
+                    f"{self._qcs_focus_role.upper()} {logical_index}: "
+                    f"{mapping['virtual_name']} | slot "
+                    f"{int(mapping['slot'])} ch{int(mapping['channel'])}",
+                    logical_index,
+                )
+            selected = self.qcs_mapping_selector.findData(int(preferred))
+            if selected < 0 and self.qcs_mapping_selector.count():
+                selected = 0
+            self.qcs_mapping_selector.setCurrentIndex(selected)
+            if selected >= 0:
+                self._qcs_focus_logical_index = int(
+                    self.qcs_mapping_selector.itemData(selected)
+                )
+        self.qcs_mapping_selector.setEnabled(bool(mappings))
+
+    def _populate_qcs_native_bindings(self) -> None:
+        if not hasattr(self, "qcs_output_mapping_selector"):
+            return
+        modules_by_slot = {}
+        if self._qcs_front_panel_configuration is not None:
+            modules_by_slot = {
+                int(module["slot"]): str(module["model"])
+                for module in self._qcs_front_panel_configuration["modules"]
+            }
+        for role, selector, module_selector, preferred in (
+            (
+                "rf",
+                self.qcs_output_mapping_selector,
+                self.qcs_output_module_model,
+                int(self.output_ch.value()),
+            ),
+            (
+                "acquisition",
+                self.qcs_acquisition_mapping_selector,
+                self.qcs_acquisition_module_model,
+                0,
+            ),
+        ):
+            mappings = self._qcs_role_mappings(role)
+            current = selector.currentData()
+            if (
+                self._qcs_focus_role == role
+                and self._qcs_focus_logical_index is not None
+            ):
+                current = int(self._qcs_focus_logical_index)
+            if current is None:
+                current = preferred
+            with QtCore.QSignalBlocker(selector):
+                selector.clear()
+                for mapping in mappings:
+                    logical_index = int(mapping["logical_index"])
+                    model = modules_by_slot.get(int(mapping["slot"]), "Unknown")
+                    selector.addItem(
+                        f"{logical_index}: {mapping['virtual_name']} | "
+                        f"{model}, slot {int(mapping['slot'])}, "
+                        f"SMA CH {int(mapping['channel'])}",
+                        logical_index,
+                    )
+                selected = selector.findData(int(current))
+                if selected < 0 and selector.count():
+                    selected = 0
+                selector.setCurrentIndex(selected)
+            selector.setEnabled(bool(mappings))
+            selector.setToolTip(selector.currentText())
+            self._sync_qcs_native_module(
+                role,
+                selector=selector,
+                module_selector=module_selector,
+                modules_by_slot=modules_by_slot,
+            )
+
+    def _sync_qcs_native_module(
+        self,
+        role: str,
+        *,
+        selector: QtWidgets.QComboBox | None = None,
+        module_selector: QtWidgets.QComboBox | None = None,
+        modules_by_slot: Mapping[int, str] | None = None,
+    ) -> None:
+        if selector is None:
+            selector = (
+                self.qcs_output_mapping_selector
+                if role == "rf"
+                else self.qcs_acquisition_mapping_selector
+            )
+        if module_selector is None:
+            module_selector = (
+                self.qcs_output_module_model
+                if role == "rf"
+                else self.qcs_acquisition_module_model
+            )
+        if modules_by_slot is None:
+            modules_by_slot = (
+                {}
+                if self._qcs_front_panel_configuration is None
+                else {
+                    int(module["slot"]): str(module["model"])
+                    for module in self._qcs_front_panel_configuration["modules"]
+                }
+            )
+        logical_index = selector.currentData()
+        mapping = next(
+            (
+                candidate
+                for candidate in self._qcs_role_mappings(role)
+                if int(candidate["logical_index"]) == logical_index
+            ),
+            None,
+        )
+        model = (
+            None
+            if mapping is None
+            else modules_by_slot.get(int(mapping["slot"]))
+        )
+        with QtCore.QSignalBlocker(module_selector):
+            module_selector.setCurrentIndex(module_selector.findData(model))
+
+    def _qcs_native_mapping_changed(self, role: str, index: int) -> None:
+        selector = (
+            self.qcs_output_mapping_selector
+            if role == "rf"
+            else self.qcs_acquisition_mapping_selector
+        )
+        if index < 0:
+            return
+        logical_index = selector.itemData(index)
+        if logical_index is None:
+            return
+        self._qcs_focus_role = str(role)
+        self._qcs_focus_logical_index = int(logical_index)
+        selector.setToolTip(selector.currentText())
+        self._sync_qcs_native_module(role, selector=selector)
+        self._sync_front_panel_selection()
+
+    def _qcs_mapping_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        logical_index = self.qcs_mapping_selector.itemData(index)
+        if logical_index is None:
+            return
+        self._qcs_focus_logical_index = int(logical_index)
+        self._sync_front_panel_selection()
+
     def _sync_front_panel_selection(self, *_args) -> None:
+        role, logical_index = self.qcs_front_panel_selection()
+        self.front_panel_preview.set_qcs_selection(role, logical_index)
         if self._front_panel_configuration is None:
             return
         configuration = self._front_panel_configuration
@@ -465,6 +832,39 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         painter.setBrush(color)
         painter.drawPolygon(arrow)
 
+    def _active_arrow_nodes(self):
+        """Return the visible output/input signal chains for arrow painting.
+
+        Compact QCS path editors replace the legacy QICK endpoint widgets in
+        the same grid cells.  Hidden widgets keep their old geometry (often
+        the default top-left rectangle), so they must never be used as arrow
+        anchors.
+        """
+
+        native_qcs = self._compact and self._hardware_backend == "qcs"
+        output_endpoint = (
+            self.qcs_output_endpoint if native_qcs else self.output_endpoint
+        )
+        input_endpoint = (
+            self.qcs_input_endpoint if native_qcs else self.input_endpoint
+        )
+        output_nodes = (
+            output_endpoint,
+            self.output_att1_component,
+            self.output_att2_component,
+            self.loss1_component,
+        )
+        input_nodes = (
+            self.loss2_component,
+            self.amplifier_component,
+            self.input_condition,
+            input_endpoint,
+        )
+        return (
+            tuple(node for node in output_nodes if not node.isHidden()),
+            tuple(node for node in input_nodes if not node.isHidden()),
+        )
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QtGui.QPainter(self)
@@ -472,13 +872,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
         output_color = QtGui.QColor("#b85f26")
         input_color = QtGui.QColor("#237a72")
 
-        output_nodes = [self.output_endpoint]
-        output_nodes.extend(
-            node
-            for node in (self.output_att1_component, self.output_att2_component)
-            if node.isVisible()
-        )
-        output_nodes.append(self.loss1_component)
+        output_nodes, input_nodes = self._active_arrow_nodes()
         for first, second in zip(output_nodes, output_nodes[1:]):
             self._draw_arrow(
                 painter,
@@ -509,12 +903,6 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             ],
             input_color,
         )
-        input_nodes = [
-            self.loss2_component,
-            self.amplifier_component,
-            self.input_condition,
-            self.input_endpoint,
-        ]
         for first, second in zip(input_nodes, input_nodes[1:]):
             self._draw_arrow(
                 painter,
@@ -536,7 +924,22 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._fir_sample_rate_hz = None
         self._fir_trigger_delay_us = 0.0
         self._fir_uses_fpga_trigger_delay = None
+        self._hardware_backend = "qick"
+        self._running = False
         outer = QtWidgets.QVBoxLayout(self)
+        self.backend_warning = QtWidgets.QLabel(
+            "QCS front-panel mapping is available, but RF S-parameter "
+            "execution is still QICK-only. Run is disabled while QCS is "
+            "selected.",
+            self,
+        )
+        self.backend_warning.setWordWrap(True)
+        self.backend_warning.setStyleSheet(
+            "QLabel { color: #8a4b08; background: #fff4d6; "
+            "border: 1px solid #e0b96a; padding: 6px; }"
+        )
+        self.backend_warning.hide()
+        outer.addWidget(self.backend_warning)
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         content = QtWidgets.QWidget(scroll)
@@ -1026,6 +1429,22 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
         self._update_fir_profile_status()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.path_diagram.set_hardware_backend(backend)
+        is_qcs = self._hardware_backend == "qcs"
+        self.backend_warning.setVisible(is_qcs)
+        self.run_button.setEnabled(not self._running and not is_qcs)
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        self.path_diagram.set_qcs_front_panel_configuration(configuration)
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        return self.path_diagram.qcs_front_panel_selection()
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
         self.override_fpga_trigger_delay.setEnabled(supported)
@@ -1230,7 +1649,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
-        self.run_button.setEnabled(not running)
+        self._running = bool(running)
+        self.run_button.setEnabled(
+            not running and self._hardware_backend == "qick"
+        )
         self.load_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)

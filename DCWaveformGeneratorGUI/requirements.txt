@@ -2,6 +2,7 @@
 numpy==2.4.6
 scipy==1.17.1
 PyQt5==5.15.11
+Pillow==12.3.0
 pyqtgraph==0.14.0
 matplotlib==3.11.0
 qcodes==0.58.0

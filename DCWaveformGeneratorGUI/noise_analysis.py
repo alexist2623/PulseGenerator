@@ -35,7 +35,7 @@ try:
         NoiseAcquisitionConfig,
         acquire_noise_fir_trace,
     )
-    from .qick_front_panel import QickFrontPanelPreview
+    from .hardware_front_panel import HardwareFrontPanelPreview
 except ImportError:
     from qick_qcodes_experiment import load_qick_iq_arrays
     from dc_voltage_calibration import load_dc_voltage_calibration
@@ -43,7 +43,7 @@ except ImportError:
         NoiseAcquisitionConfig,
         acquire_noise_fir_trace,
     )
-    from qick_front_panel import QickFrontPanelPreview
+    from hardware_front_panel import HardwareFrontPanelPreview
 
 
 INPUT_MODES = ("voltage", "adc", "current")
@@ -637,8 +637,25 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self._result: Optional[NoiseAnalysisResult] = None
         self._dc_calibration_cache_key = None
         self._dc_calibration_cache = None
+        self._hardware_backend = "qick"
+        self._qcs_front_panel_configuration = None
+        self._loading = False
+        self._acquiring = False
         page_layout = QtWidgets.QVBoxLayout(self)
         page_layout.setContentsMargins(0, 0, 0, 0)
+        self.backend_warning = QtWidgets.QLabel(
+            "QCS front-panel mapping is available, but direct FIR-DDR "
+            "acquisition is still QICK-only. Acquisition is disabled while "
+            "QCS is selected; saved-trace analysis remains available.",
+            self,
+        )
+        self.backend_warning.setWordWrap(True)
+        self.backend_warning.setStyleSheet(
+            "QLabel { color: #8a4b08; background: #fff4d6; "
+            "border: 1px solid #e0b96a; padding: 6px; }"
+        )
+        self.backend_warning.hide()
+        page_layout.addWidget(self.backend_warning)
         control_scroll = QtWidgets.QScrollArea(self)
         control_scroll.setWidgetResizable(True)
         control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -680,7 +697,10 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             self.acquisition_proxy,
         ):
             connection_widget.hide()
-        self.front_panel_preview = QickFrontPanelPreview(acquisition_group)
+        self.front_panel_preview = HardwareFrontPanelPreview(acquisition_group)
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self.front_panel_preview.set_scope("input")
+        self.front_panel_preview.set_qcs_selection("acquisition", 0)
         self.readout_channel = QtWidgets.QSpinBox(acquisition_group)
         self.readout_channel.setRange(0, 255)
         self.input_board = QtWidgets.QComboBox(acquisition_group)
@@ -1063,6 +1083,10 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         """Expose the selected input through the shared front-panel API."""
         return self.acquisition_config().readout_spec()
 
+    @staticmethod
+    def qcs_front_panel_selection() -> tuple[str, int]:
+        return "acquisition", 0
+
     def apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
         """Apply one graphical ADC selection only to this Noise tab."""
         self.readout_channel.setValue(int(values["readout_ch"]))
@@ -1125,6 +1149,20 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             )
         self._update_fpga_trigger_delay_controls()
         self._update_capture_duration()
+
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self.backend_warning.setVisible(self._hardware_backend == "qcs")
+        self._refresh_acquire_button()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        self._qcs_front_panel_configuration = configuration
+        self.front_panel_preview.set_qcs_configuration(configuration)
+        self.front_panel_preview.set_qcs_selection("acquisition", 0)
 
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
@@ -1387,21 +1425,30 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         return result
 
     def set_loading(self, loading: bool, message: str = "") -> None:
+        self._loading = bool(loading)
         self.load_button.setEnabled(not loading)
         self.run_id.setEnabled(not loading)
         self.database_path.setEnabled(not loading)
         self.browse_database.setEnabled(not loading)
-        self.acquire_button.setEnabled(not loading)
+        self._refresh_acquire_button()
         self.analyze_button.setEnabled(not loading)
         if message:
             self.source_status.setText(str(message))
 
     def set_acquiring(self, acquiring: bool, message: str = "") -> None:
-        self.acquire_button.setEnabled(not acquiring)
+        self._acquiring = bool(acquiring)
+        self._refresh_acquire_button()
         self.load_button.setEnabled(not acquiring)
         self.analyze_button.setEnabled(not acquiring)
         if message:
             self.acquisition_status.setText(str(message))
+
+    def _refresh_acquire_button(self) -> None:
+        self.acquire_button.setEnabled(
+            self._hardware_backend == "qick"
+            and not self._loading
+            and not self._acquiring
+        )
 
     def update_acquisition_progress(self, percent: int, message: str) -> None:
         self.acquisition_status.setText(f"{int(percent)}% | {message}")

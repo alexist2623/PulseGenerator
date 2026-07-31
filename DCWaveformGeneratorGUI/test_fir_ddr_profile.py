@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import pytest
 
-from fir_ddr_profile import resolve_fir_ddr_profile
+from fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
+
+
+def test_formats_qcs_digitizer_rate_in_gsps():
+    assert format_sample_rate_hz(4.8e9) == "4.8 GSPS"
 
 
 def _soccfg(

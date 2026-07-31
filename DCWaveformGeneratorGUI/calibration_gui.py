@@ -188,9 +188,13 @@ class _CalibrationPathWidget(RfPathCorrectionWidget):
     """RF path editor bound to exactly one Calibration sub-tab."""
 
     def __init__(self, owner, mode: str):
-        super().__init__(owner, compact=True)
         self._calibration_owner = owner
         self._calibration_mode = mode
+        super().__init__(owner, compact=True)
+        if mode == "input":
+            self.set_qcs_front_panel_focus("acquisition", 0)
+        elif mode == "dc_voltage":
+            self.set_qcs_front_panel_focus("dc")
 
     def front_panel_values(self) -> Mapping[str, Any]:
         return self._calibration_owner._front_panel_values_for(
@@ -606,9 +610,24 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._fir_sample_rate_hz = None
         self._fir_trigger_delay_us = 0.0
         self._fir_uses_fpga_trigger_delay = None
+        self._hardware_backend = "qick"
+        self._running = False
         layout = QtWidgets.QVBoxLayout(self)
         self._path_diagrams: dict[str, RfPathCorrectionWidget] = {}
         self._front_panel_mode = "output"
+        self.backend_warning = QtWidgets.QLabel(
+            "QCS front-panel mapping is available, but calibration execution "
+            "is still QICK-only. Calibration runs are disabled while QCS is "
+            "selected.",
+            self,
+        )
+        self.backend_warning.setWordWrap(True)
+        self.backend_warning.setStyleSheet(
+            "QLabel { color: #8a4b08; background: #fff4d6; "
+            "border: 1px solid #e0b96a; padding: 6px; }"
+        )
+        self.backend_warning.hide()
+        layout.addWidget(self.backend_warning)
 
         database_group = QtWidgets.QGroupBox("Calibration Database")
         database_form = QtWidgets.QFormLayout(database_group)
@@ -804,12 +823,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.output_sample_name = QtWidgets.QLineEdit()
         self.output_sample_name.setPlaceholderText("Auto: RF_Out_<range>MHz")
-        form.addRow(
-            QtWidgets.QLabel(
-                "Board, channel, ATT, filter, and Nyquist settings use this "
-                "sub-tab's independent RF path above."
-            )
+        output_path_note = QtWidgets.QLabel(
+            "Board, channel, ATT, filter, and Nyquist settings use this "
+            "sub-tab's independent RF path above."
         )
+        output_path_note.setWordWrap(True)
+        output_path_note.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        form.addRow(output_path_note)
         for label, widget in (
             ("Start frequency:", self.output_frequency_start),
             ("End frequency:", self.output_frequency_end),
@@ -933,12 +956,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.input_sample_name = QtWidgets.QLineEdit()
         self.input_sample_name.setPlaceholderText("Auto: RF_In_<range>MHz")
-        form.addRow(
-            QtWidgets.QLabel(
-                "Board, channel, ATT, filter, and Nyquist settings use this "
-                "sub-tab's independent RF path above."
-            )
+        input_path_note = QtWidgets.QLabel(
+            "Board, channel, ATT, filter, and Nyquist settings use this "
+            "sub-tab's independent RF path above."
         )
+        input_path_note.setWordWrap(True)
+        input_path_note.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        form.addRow(input_path_note)
         for label, widget in (
             ("Start frequency:", self.input_frequency_start),
             ("End frequency:", self.input_frequency_end),
@@ -1543,6 +1570,27 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
         self._update_fir_profile_status()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        for diagram in self._path_diagrams.values():
+            diagram.set_hardware_backend(backend)
+        is_qcs = self._hardware_backend == "qcs"
+        self.backend_warning.setVisible(is_qcs)
+        enabled = not self._running and not is_qcs
+        self.run_output_button.setEnabled(enabled)
+        self.run_input_button.setEnabled(enabled)
+        self.run_dc_voltage_button.setEnabled(enabled)
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        for diagram in self._path_diagrams.values():
+            diagram.set_qcs_front_panel_configuration(configuration)
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        return self.path_diagram.qcs_front_panel_selection()
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
         for override, editor in (
@@ -1749,9 +1797,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
-        self.run_output_button.setEnabled(not running)
-        self.run_input_button.setEnabled(not running)
-        self.run_dc_voltage_button.setEnabled(not running)
+        self._running = bool(running)
+        run_enabled = not running and self._hardware_backend == "qick"
+        self.run_output_button.setEnabled(run_enabled)
+        self.run_input_button.setEnabled(run_enabled)
+        self.run_dc_voltage_button.setEnabled(run_enabled)
         self.dc_application_group.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)

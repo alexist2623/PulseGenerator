@@ -52,6 +52,160 @@ Keysight QCS is a separate vendor package and is not installed by these public
 requirements. Install it in the Keysight-supported environment when generated
 QCS programs need to be executed.
 
+## Keysight QCS 2.5.5 environment
+
+QCS 2.5.5 requires NumPy below 2.0, while the validated QICK-only profile uses
+NumPy 2.4.6. Keep the runtimes isolated and use `requirements-qcs.txt` for the
+QCS application:
+
+```powershell
+conda create -y -n qcs python=3.12 pip
+conda activate qcs
+python -m pip install keysight-qcs==2.5.5 --extra-index-url $env:KEYSIGHT_QCS_INDEX
+python -m pip install -r requirements-qcs.txt
+python DCWaveform_Generator.py
+```
+
+Set `KEYSIGHT_QCS_INDEX` to the authenticated package-index URL supplied by
+Keysight. Do not save an access token in this repository. QCS Common 0.10.20
+still imports `pkg_resources`; `requirements-qcs.txt` therefore pins
+Setuptools below version 81.
+
+The QCS Experiment backend loads a serialized `ChannelMapper`. The GUI can
+build this file: select **Keysight QCS** in the **Experiment** tab, click
+**Configure M5000 front panel...**, then click an empty chassis slot to install
+a module. Clicking an installed module opens the same module list plus a
+**Remove** action. Open the front panel from a DC, RF, or acquisition control
+and click the required physical SMA; the GUI updates the virtual binding and
+generates/applies the native mapper automatically once the required channels
+are complete. Optional inspection, validation, imported-mapper, and explicit
+Save As controls remain in **Advanced Hardware Settings**, outside the normal
+front-panel window. The builder writes and reloads the native `.qcs` file
+through the QCS 2.5.5 API; it never edits the serialized mapper as ordinary
+JSON. The same editor is available from **Setup > Keysight QCS M5000 Front
+Panel...**.
+
+An M5201A is an analog Down Converter with four RF-input/IF-output channel
+pairs; it is not a separate digitizer. First install both an M5200A and an
+M5201A in the Front panel. From the Acquisition tab, open the front panel and
+click the M5201A module or one of its RF/IF connectors. In the route window,
+choose the M5201A pair, the physically connected M5200A SMA, and the shared LO,
+then click **Apply Route Automatically**. The GUI creates or moves the
+acquisition binding, records the explicit cable, and applies the resulting
+ChannelMapper without requiring the user to edit mapping tables. A digitizer
+channel and a Down Converter pair can each appear in only one link. The LO must
+be in the hardware-supported 1-18 GHz range, and every link targeting the same
+physical M5201A module uses the same value because its four pairs share one
+internal LO. The native mapper is written with
+`ChannelMapper.add_downconverters()` and the shared LO is applied to every
+linked pair on that module.
+
+The Front panel defaults to QCS controller IP `192.168.2.105`; edit that field
+when using another controller. **Identify Hardware Configuration** reads the
+installed module model, host-controller number, chassis number, and slot from
+the QCS Common system inventory service, then replaces the displayed topology.
+Mappings and explicit Down Converter links that still target compatible
+connectors are preserved. The GUI asks before removing incompatible items and
+never guesses external cables or silently reroutes channels. In particular,
+module inventory cannot reveal which M5201A IF output is physically cabled to
+which M5200A input, so identification never creates an M5200A-to-M5201A link
+from module presence alone. Identification uses an existing QCS access token
+from the current user's `.qcs_token.json`; it does not store credentials or
+attempt a default login. If the saved token has expired, refresh it once in an
+interactive `qcs` shell and click Identify again:
+
+```powershell
+conda activate qcs
+python -c "import keysight.qcs as q; m=q.ChannelMapper(ip_address='192.168.2.105'); q.HclBackend(m).login()"
+```
+
+**Load Mapper...** resolves an existing mapper for inspection and for choosing
+the experiment's role bindings. Imported mappers are read-only for **Save
+Mapper As...** even though their M5200A-to-M5201A pair associations and shared
+M5201A LO values can be displayed by this editor. A native mapper can contain
+other channel settings, constraints, and relationships that the focused GUI
+does not model; allowing Save As could silently discard them. Use **Restore
+diagram layout** to explicitly start a fresh, editable mapper recipe. Imported
+phase, M5300 LO, M5201 link, and M5201 shared-LO values are shown and preserved
+for inspection. Channels that do not match an existing DC, RF, or acquisition
+name remain **Unassigned** until a role is selected. The original imported file
+name is protected; restoring the diagram proposes a separate
+`_front_panel.qcs` file. For a run-eligible imported mapping, the GUI reads the
+native file to require an LO on every active M5300 RF channel and on an M5201
+linked to the active acquisition channel. Adding or removing waveform outputs
+promotes or demotes matching unassigned M5301 channels as role-only changes,
+preserving the native mapper whenever its channel definitions do not need to
+change.
+
+For automation, this abbreviated equivalent maps two DC outputs, one RF
+output, and one M5200A digitizer input through an M5201A Down Converter pair:
+
+```python
+import keysight.qcs as qcs
+
+mapper = qcs.ChannelMapper()
+
+dc_left = qcs.Channels(0, "dc_left")
+dc_right = qcs.Channels(0, "dc_right")
+rf_readout = qcs.Channels(0, "rf_readout", absolute_phase=True)
+digitizer = qcs.Channels(0, "digitizer", absolute_phase=True)
+
+mapper.add_channel_mapping(
+    dc_left, [(1, 2, 1)], qcs.InstrumentEnum.M5301AWG
+)
+mapper.add_channel_mapping(
+    dc_right, [(1, 2, 2)], qcs.InstrumentEnum.M5301AWG
+)
+rf_address = qcs.Address(1, 3, 1)
+mapper.add_channel_mapping(
+    rf_readout, rf_address, qcs.InstrumentEnum.M5300AWG
+)
+mapper.set_lo_frequencies(rf_address, 6.0e9)
+digitizer_address = qcs.Address(1, 5, 1)
+downconverter_address = qcs.Address(1, 6, 1)
+mapper.add_channel_mapping(
+    digitizer, digitizer_address, qcs.InstrumentEnum.M5200Digitizer
+)
+mapper.add_downconverters(digitizer_address, downconverter_address)
+mapper.set_lo_frequencies(downconverter_address, 6.0e9)
+qcs.save(mapper, "lab_channel_mapper.qcs")
+```
+
+The addresses above and the packaged front-panel diagram are starting points,
+not a claim about the laboratory wiring. The mapper builder validates module
+overlap, connector ranges, QCS-compatible channel names, one DC mapping per
+waveform output, role/module compatibility, an explicit 0-18 GHz LO for every
+M5300 channel, one-to-one M5200A/M5201A pair associations, and one shared
+1-18 GHz LO for every linked M5201A module. **Apply to Experiment**
+synchronizes the DC names in output order, RF generator-number bindings, and
+the digitizer binding with the existing QCS controls. **Save Mapper As...**
+also applies those bindings after a save/reload check. Applying a new or
+physically modified layout records it as a draft and blocks **Run QCS
+Experiment** until a matching native mapper is saved. Existing external
+mappers remain authoritative until the front-panel builder is explicitly
+applied. Saved and imported configurations also record the mapper file's
+SHA-256 identity; if that file is replaced or edited later, Run is blocked
+until it is reloaded or saved again. Set **DC full scale
+(+/-)** to the physical voltage represented by QCS amplitude `+1.0`; the
+M5301A default is 2.5 V. The backend uses this value to preserve the millivolt
+levels shown in the waveform editor.
+
+The QCS path currently covers the primary Experiment workflow: physical DC
+waveforms (including cross-capacitance and Bias-T compensation), Cartesian
+software sweeps (up to 10,000 Cartesian points), RF pulses, digitizer
+acquisition, and QCoDeS persistence. The QCS hardware-demod timing-rate control
+converts the existing samples-per-trigger value into an integration duration.
+In raw mode, the requested sample count is converted using the physical
+digitizer rate reported by the channel mapper (4.8 GS/s for M5200), and that
+hardware rate is saved with the trace. Hardware-demodulation mode requests an
+RF integration filter; raw mode requests a duration-based trace acquisition
+and reads it with `get_trace()`. Experiment runs are blocking so every
+software-sweep point is complete before its data is normalized and written to
+QCoDeS.
+QICK-specific DDR controls, tProcessor assembly preview, calibrated QICK RF
+power sweeps, Stability Diagram, RF S-Parameter, and Noise Analysis remain
+QICK-only and are not silently translated.
+
 ## Direct QICK experiment runs
 
 The **Experiment** tab connects to the configured QICK Pyro nameserver, runs

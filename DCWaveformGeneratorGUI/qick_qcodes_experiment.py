@@ -1116,6 +1116,28 @@ def _qcodes_identifier(value: Any) -> str:
     return identifier
 
 
+def _backend_metadata_names(backend_name: str) -> Tuple[str, str]:
+    """Return safe connection and experiment metadata names for a backend."""
+    backend = str(backend_name).strip().lower()
+    if not backend or _qcodes_identifier(backend) != backend:
+        raise ValueError(
+            "backend_name must start with a letter and contain only "
+            "lowercase letters, numbers, and underscores"
+        )
+    return f"{backend}_connection", f"{backend}_experiment_json"
+
+
+def _connection_config_metadata(connection_config: Any) -> Mapping[str, Any]:
+    """Serialize a backend-specific connection dataclass or mapping."""
+    if is_dataclass(connection_config) and not isinstance(connection_config, type):
+        return asdict(connection_config)
+    if isinstance(connection_config, Mapping):
+        return dict(connection_config)
+    raise TypeError(
+        "connection_config must be a dataclass instance or mapping"
+    )
+
+
 def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
     """Name sweep axes by their physical output and segment target."""
     used = set()
@@ -1272,9 +1294,20 @@ def _first_value_per_trace(values: Any, trace_count: int) -> np.ndarray:
     return array.reshape(trace_count, -1)[:, 0]
 
 
-def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
-    """Load split or legacy packed IQ trace arrays and derived quantities."""
-    metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
+def load_qick_iq_arrays(
+    dataset: Any,
+    *,
+    backend_name: str = "qick",
+) -> Mapping[str, Any]:
+    """Load split or legacy packed IQ arrays for any stored backend.
+
+    The historical function name remains for compatibility. ``backend_name``
+    selects the matching ``*_experiment_json`` metadata payload.
+    """
+    _connection_name, experiment_name = _backend_metadata_names(
+        backend_name
+    )
+    metadata = json.loads(dataset.get_metadata(experiment_name))
     layout = metadata["measurement_layout"]
     expected_shape = tuple(int(value) for value in layout["iq_shape"])
     if len(expected_shape) != 4 or expected_shape[-1] != 2:
@@ -1470,16 +1503,17 @@ def store_qick_result(
     ddr_result: Any,
     *,
     run_config: QcodesRunConfig,
-    connection_config: QickConnectionConfig,
+    connection_config: Any,
     program_summary: Mapping[str, Any],
     gui_settings: Mapping[str, Any],
     rf_settings: Mapping[str, Any],
+    backend_name: str = "qick",
     progress_callback: Optional[ProgressCallback] = None,
     progress_start: int = 65,
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
 ) -> Tuple[Any, int]:
-    """Store one I array and one Q array per point/repetition acquisition."""
+    """Store one I/Q array pair per point/repetition for any backend."""
     try:
         from qcodes import (
             Measurement,
@@ -1512,6 +1546,10 @@ def store_qick_result(
     if total_rows < 1:
         raise ValueError("DDR IQ result contains no samples")
 
+    connection_metadata_name, experiment_metadata_name = (
+        _backend_metadata_names(backend_name)
+    )
+    connection_metadata = _connection_config_metadata(connection_config)
     stored_gui_settings = dict(gui_settings)
     awg_vertices = stored_gui_settings.pop("awg_waveform_vertices", {})
     awg_recipe = stored_gui_settings.get("awg_waveform_recipe", {})
@@ -1715,7 +1753,7 @@ def store_qick_result(
     sample_index_values = np.arange(sample_count, dtype=np.int32)
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "qick_connection": asdict(connection_config),
+        connection_metadata_name: connection_metadata,
         "qcodes_run": {
             **asdict(run_config),
             "database_path": str(database_path),
@@ -1823,7 +1861,7 @@ def store_qick_result(
         in_memory_cache=False,
     ) as datasaver:
         dataset = datasaver.dataset
-        dataset.add_metadata("qick_experiment_json", _json_text(metadata))
+        dataset.add_metadata(experiment_metadata_name, _json_text(metadata))
         dataset.add_metadata(
             "output_waveforms_json",
             _json_text(
@@ -1973,6 +2011,36 @@ def store_qick_result(
         "QCoDeS database copied and WAL checkpoint completed",
     )
     return dataset, row_count
+
+
+def store_experiment_result(
+    acquisition_result: Any,
+    *,
+    run_config: QcodesRunConfig,
+    connection_config: Any,
+    program_summary: Mapping[str, Any],
+    gui_settings: Mapping[str, Any],
+    rf_settings: Mapping[str, Any],
+    backend_name: str = "qick",
+    progress_callback: Optional[ProgressCallback] = None,
+    progress_start: int = 65,
+    progress_end: int = 99,
+    batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
+) -> Tuple[Any, int]:
+    """Backend-neutral entry point for persisting an acquisition result."""
+    return store_qick_result(
+        acquisition_result,
+        run_config=run_config,
+        connection_config=connection_config,
+        program_summary=program_summary,
+        gui_settings=gui_settings,
+        rf_settings=rf_settings,
+        backend_name=backend_name,
+        progress_callback=progress_callback,
+        progress_start=progress_start,
+        progress_end=progress_end,
+        batch_rows=batch_rows,
+    )
 
 
 def run_qick_qcodes_experiment(
@@ -2180,6 +2248,7 @@ __all__ = [
     "normalize_awg_metadata_mode",
     "normalize_compile_validation_mode",
     "run_qick_qcodes_experiment",
+    "store_experiment_result",
     "store_qick_result",
     "write_awg_vertex_metadata_jsonl",
 ]

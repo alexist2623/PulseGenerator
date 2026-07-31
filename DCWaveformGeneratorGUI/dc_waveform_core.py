@@ -25,7 +25,7 @@ DEFAULT_INITIAL_DURATION_NS = 100.0
 DEFAULT_INSERT_RAMP_NS = 50.0
 DEFAULT_INSERT_FLAT_NS = 100.0
 DEFAULT_MIN_DURATION_NS = 1.0e-6
-DEFAULT_QCS_FULL_SCALE_V = 5.0
+DEFAULT_QCS_FULL_SCALE_V = 2.5
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 800.0
@@ -1211,7 +1211,13 @@ def _qcs_channel_code(pulse: PulseSequence, channel_name: str) -> str:
     return _qcs_channel_samples_code(pulse.t, pulse.v, channel_name)
 
 
-def _qcs_channel_samples_code(time_ns, voltage_mv, channel_name: str) -> str:
+def _qcs_channel_samples_code(
+    time_ns,
+    voltage_mv,
+    channel_name: str,
+    *,
+    include_adds: bool = True,
+) -> str:
     """Generate QCS segments from an arbitrary piecewise-linear trace."""
     time_values = np.asarray(time_ns, dtype=float)
     voltage_values = np.asarray(voltage_mv, dtype=float)
@@ -1274,10 +1280,12 @@ def _qcs_channel_samples_code(time_ns, voltage_mv, channel_name: str) -> str:
                     "",
                 ]
             )
-    for index in range(time_values.size - 1):
-        lines.append(
-            f"    program.add_waveform({channel_name}_dc_segment_{index}, {channel_name})"
-        )
+    if include_adds:
+        for index in range(time_values.size - 1):
+            lines.append(
+                f"    program.add_waveform({channel_name}_dc_segment_{index}, "
+                f"{channel_name})"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -1300,14 +1308,21 @@ def generate_qcs_program_code(
     if len(channel_names) != len(pulses):
         raise ValueError("channel_names length must match the pulse count")
     matrix = _coerce_cross_capacitance(cross_capacitance, len(pulses))
-    if np.allclose(matrix, np.eye(len(pulses)), rtol=0.0, atol=1.0e-12):
-        traces = tuple((pulse.t, pulse.v) for pulse in pulses)
-    else:
-        time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
-            pulses,
-            matrix,
-        )
-        traces = tuple((time_ns, physical_mv[index]) for index in range(len(pulses)))
+    common_time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
+        pulses,
+        matrix,
+    )
+    traces = tuple(
+        (common_time_ns, physical_mv[index]) for index in range(len(pulses))
+    )
+    qcs_limit_mv = full_scale_v * 1000.0
+    for name, (_time_ns, voltage_mv) in zip(channel_names, traces):
+        peak_mv = float(np.max(np.abs(voltage_mv), initial=0.0))
+        if peak_mv > qcs_limit_mv + 1.0e-9:
+            raise ValueError(
+                f"QCS output {name!r} reaches {peak_mv:.6g} mV, exceeding "
+                f"the configured +/-{qcs_limit_mv:.6g} mV full scale"
+            )
 
     lines = [
         '"""Generated Keysight QCS DC waveforms."""',
@@ -1326,10 +1341,24 @@ def generate_qcs_program_code(
     for name in channel_names:
         lines.append(f"    {name}: qcs.Channels,")
     lines.extend([") -> qcs.Program:", "    # RAMP envelopes are unit-normalized; amplitude carries physical scale."])
-    for (time_ns, voltage_mv), name in zip(traces, channel_names):
+    for (trace_time_ns, voltage_mv), name in zip(traces, channel_names):
         lines.append(
-            _qcs_channel_samples_code(time_ns, voltage_mv, name).rstrip()
+            _qcs_channel_samples_code(
+                trace_time_ns,
+                voltage_mv,
+                name,
+                include_adds=False,
+            ).rstrip()
         )
+    lines.append("    # All outputs for one interval share a QCS layer.")
+    for interval_index in range(len(common_time_ns) - 1):
+        for channel_index, name in enumerate(channel_names):
+            lines.append(
+                f"    program.add_waveform("
+                f"{name}_dc_segment_{interval_index}, {name}, "
+                f"new_layer={channel_index == 0})"
+            )
+    lines.append("")
     lines.extend(["    return program", ""])
     return "\n".join(lines)
 

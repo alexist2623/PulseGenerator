@@ -43,7 +43,17 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from qick.averager_program import RAveragerProgram
+try:
+    from qick.averager_program import RAveragerProgram
+except ImportError:
+    class RAveragerProgram:
+        """Import-time placeholder used by the QCS-only application path."""
+
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError(
+                "QICK is required to compile or execute a QICK tProcessor "
+                "program. Install QICK or select the Keysight QCS backend."
+            )
 
 try:
     from .fir_ddr_profile import resolve_fir_ddr_profile

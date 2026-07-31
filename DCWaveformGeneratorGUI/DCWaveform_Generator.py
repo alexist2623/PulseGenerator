@@ -119,6 +119,7 @@ try:
         DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
+        DEFAULT_QCS_FULL_SCALE_V,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
@@ -147,6 +148,7 @@ except ImportError:
         DEFAULT_BIAS_T_FILTER_TAU_US,
         DEFAULT_DC_MEASURE_GAIN_V_PER_A,
         DEFAULT_INITIAL_VOLTAGE_MV,
+        DEFAULT_QCS_FULL_SCALE_V,
         DEFAULT_QICK_FABRIC_MHZ,
         DEFAULT_QICK_TPROC_MHZ,
         DEFAULT_QICK_FULL_SCALE_MV,
@@ -210,6 +212,25 @@ except ImportError:
     )
 
 try:
+    from .qcs_qcodes_experiment import (
+        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        QCS_M5200_SAMPLE_RATE_HZ,
+        QcsAcquisitionConfig,
+        QcsConnectionConfig,
+        QcsRfPulseConfig,
+        run_qcs_qcodes_experiment,
+    )
+except ImportError:
+    from qcs_qcodes_experiment import (
+        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        QCS_M5200_SAMPLE_RATE_HZ,
+        QcsAcquisitionConfig,
+        QcsConnectionConfig,
+        QcsRfPulseConfig,
+        run_qcs_qcodes_experiment,
+    )
+
+try:
     from .awg_sweep_map import (
         AwgSweepMapLoadWorker,
         AwgSweepMapPlotWidget,
@@ -250,6 +271,7 @@ except ImportError:
 try:
     from .stability_diagram import (
         DEFAULT_STABILITY_DB_PATH,
+        QcsStabilityDiagramWorker,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -260,6 +282,7 @@ try:
 except ImportError:
     from stability_diagram import (
         DEFAULT_STABILITY_DB_PATH,
+        QcsStabilityDiagramWorker,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -335,6 +358,54 @@ except ImportError:
     )
     from fir_ddr_profile import format_sample_rate_hz
 
+try:
+    from .qcs_front_panel import (
+        QCS_HARDWARE_STATE_DRAFT,
+        QCS_HARDWARE_STATE_EXTERNAL,
+        QCS_HARDWARE_STATE_IMPORTED,
+        QCS_HARDWARE_STATE_IMPORTED_DIRTY,
+        QCS_HARDWARE_STATE_SAVED,
+        QCS_HARDWARE_STATES,
+        QCS_MODULE_MODELS,
+        QcsFrontPanelControl,
+        QcsFrontPanelPreview,
+        identify_qcs_hardware_configuration,
+        normalize_qcs_hardware_configuration,
+        normalize_qcs_mapper_sha256,
+        qcs_hardware_mapper_fingerprint,
+        qcs_mapper_file_sha256,
+        qcs_role_bindings,
+        resize_qcs_dc_mappings,
+        synchronize_qcs_hardware_role_names,
+        validate_imported_qcs_role_configuration,
+    )
+except ImportError:
+    from qcs_front_panel import (
+        QCS_HARDWARE_STATE_DRAFT,
+        QCS_HARDWARE_STATE_EXTERNAL,
+        QCS_HARDWARE_STATE_IMPORTED,
+        QCS_HARDWARE_STATE_IMPORTED_DIRTY,
+        QCS_HARDWARE_STATE_SAVED,
+        QCS_HARDWARE_STATES,
+        QCS_MODULE_MODELS,
+        QcsFrontPanelControl,
+        QcsFrontPanelPreview,
+        identify_qcs_hardware_configuration,
+        normalize_qcs_hardware_configuration,
+        normalize_qcs_mapper_sha256,
+        qcs_hardware_mapper_fingerprint,
+        qcs_mapper_file_sha256,
+        qcs_role_bindings,
+        resize_qcs_dc_mappings,
+        synchronize_qcs_hardware_role_names,
+        validate_imported_qcs_role_configuration,
+    )
+
+try:
+    from .hardware_front_panel import HardwareFrontPanelPreview
+except ImportError:
+    from hardware_front_panel import HardwareFrontPanelPreview
+
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
 DEFAULT_QSTL_RF_CHANNELS = (0, 2, 4, 6, 12, 13, 14, 15)
@@ -344,12 +415,19 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 34
+SETTINGS_VERSION = 36
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
+EXECUTION_BACKEND_QICK = "qick"
+EXECUTION_BACKEND_QCS = "qcs"
+EXECUTION_BACKENDS = (EXECUTION_BACKEND_QICK, EXECUTION_BACKEND_QCS)
+DEFAULT_EXECUTION_BACKEND = EXECUTION_BACKEND_QCS
 DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
+DEFAULT_QCS_MAPPER_PATH = "qcs_channel_mapper.qcs"
+DEFAULT_QCS_INIT_TIME_US = 100.0
+DEFAULT_QCS_SAMPLE_RATE_HZ = QCS_M5200_SAMPLE_RATE_HZ
 DEFAULT_QCODES_DB_PATH = str(Path.home() / "qick_experiments.db")
 DEFAULT_POWER_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
 DEFAULT_BIAS_T_COMPENSATION_MV = (
@@ -2041,6 +2119,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         """Emit signal to select this port."""
         self.port_is_selected.emit(self.idx)
 
+
 class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     """Multi-waveform editor with HWH-backed AWG output mapping."""
 
@@ -2061,6 +2140,9 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self._selected_index = 0
         self._awg_channels = tuple(int(channel) for channel in awg_channels)
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._qcs_dc_channel_names: Tuple[str, ...] = ()
+        self._hardware_backend = EXECUTION_BACKEND_QCS
         self._ctrl_pannels: List[ControlPanel] = [
             ControlPanel(pulse, time_unit=time_unit)
         ]
@@ -2068,8 +2150,9 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self.splitter                           = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
         self.splitter.setChildrenCollapsible(False)
 
-        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview = HardwareFrontPanelPreview(self)
         self.front_panel_preview.set_scope("output")
+        self.front_panel_preview.set_qcs_selection("dc", 0)
         self.front_panel_preview.setToolTip(
             "Select the DAC SMA used by the active AWG output"
         )
@@ -2080,8 +2163,11 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self.mapping_summary.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        front_panel_group = QtWidgets.QGroupBox("AWG Output Channel", self)
-        front_panel_layout = QtWidgets.QVBoxLayout(front_panel_group)
+        self.front_panel_group = QtWidgets.QGroupBox(
+            "QCS DC Output Channel",
+            self,
+        )
+        front_panel_layout = QtWidgets.QVBoxLayout(self.front_panel_group)
         front_panel_layout.setContentsMargins(6, 6, 6, 6)
         front_panel_layout.setSpacing(2)
         front_panel_layout.addWidget(self.front_panel_preview)
@@ -2119,7 +2205,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         # Control Panels list
         self.panel_table                        = QtWidgets.QTableWidget(0, 5)
         self.panel_table.setHorizontalHeaderLabels(
-            ["#", "Color", "QICK output", "set_x", "set_y"]
+            ["#", "Color", "QCS channel", "set_x", "set_y"]
         )
         self.panel_table.verticalHeader().setVisible(False)
         self.panel_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -2140,7 +2226,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
 
         layout                                  = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(front_panel_group)
+        layout.addWidget(self.front_panel_group)
         layout.addWidget(control_panel_v_splitter)
         self.set_awg_channels(self._awg_channels)
         self.update_port_strip_geometry()
@@ -2172,6 +2258,10 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         if not 0 <= int(index) < len(self._ctrl_pannels):
             raise IndexError("selected AWG output is out of range")
         self._selected_index = int(index)
+        self.front_panel_preview.set_qcs_selection(
+            "dc",
+            self._selected_index,
+        )
         self._refresh_mapping_summary()
         QtCore.QTimer.singleShot(
             0,
@@ -2183,6 +2273,32 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
     def set_front_panel_configuration(self, configuration) -> None:
         self._front_panel_configuration = configuration
         self.front_panel_preview.set_configuration(configuration)
+        self._refresh_mapping_summary()
+
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self.front_panel_group.setTitle(
+            "QCS DC Output Channel"
+            if self._hardware_backend == EXECUTION_BACKEND_QCS
+            else "AWG Output Channel"
+        )
+        self._refresh_mapping_summary()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+        dc_channel_names: Sequence[str],
+    ) -> None:
+        self._qcs_front_panel_configuration = configuration
+        self._qcs_dc_channel_names = tuple(
+            str(name) for name in dc_channel_names
+        )
+        self.front_panel_preview.set_qcs_configuration(configuration)
+        self.front_panel_preview.set_qcs_selection(
+            "dc",
+            self._selected_index,
+        )
         self._refresh_mapping_summary()
 
     def front_panel_values(self) -> dict:
@@ -2215,6 +2331,21 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         )
 
     def _refresh_mapping_summary(self) -> None:
+        if self._hardware_backend == EXECUTION_BACKEND_QCS:
+            if self._selected_index < len(self._qcs_dc_channel_names):
+                name = self._qcs_dc_channel_names[self._selected_index]
+                details = f"awg_{self._selected_index} | QCS {name}"
+            else:
+                details = (
+                    f"awg_{self._selected_index} | "
+                    "QCS DC channel not mapped"
+                )
+            self.mapping_summary.setText(details)
+            self.front_panel_preview.set_qcs_selection(
+                "dc",
+                self._selected_index,
+            )
+            return
         if not self._awg_channels:
             self.mapping_summary.setText("No AWG output mapping")
             return
@@ -2898,15 +3029,27 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._index = index
         self._time_unit = time_unit
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._hardware_backend = EXECUTION_BACKEND_QCS
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
+        self._form_layout = form
 
         self.gen_ch = QtWidgets.QSpinBox()
         self.gen_ch.setRange(0, 255)
         self.gen_ch.setValue(index if default_gen_ch is None else default_gen_ch)
         self.output_board_type = QtWidgets.QComboBox()
         self.output_board_type.addItems(QICK_OUTPUT_BOARD_TYPES)
+        self.qcs_module_model = QtWidgets.QComboBox()
+        self.qcs_module_model.addItem("M5300A RF AWG", "M5300A")
+        self.qcs_module_model.addItem("M5301A Precision AWG", "M5301A")
+        self.qcs_module_model.setPlaceholderText("Not mapped")
+        self.qcs_module_model.setEnabled(False)
+        self.qcs_module_model.setToolTip(
+            "The QCS module is determined by the front-panel mapping. Click "
+            "the front-panel preview to select a different module or SMA output."
+        )
         self.segment = QtWidgets.QComboBox()
         self.delay = QtWidgets.QDoubleSpinBox()
         self.duration = QtWidgets.QDoubleSpinBox()
@@ -2963,6 +3106,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.gain = QtWidgets.QSpinBox()
         self.gain.setRange(-32768, 32767)
         self.gain.setValue(20000)
+        self.qcs_amplitude = QtWidgets.QDoubleSpinBox()
+        self.qcs_amplitude.setRange(-1.0, 1.0)
+        self.qcs_amplitude.setDecimals(9)
+        self.qcs_amplitude.setSingleStep(0.01)
+        self.qcs_amplitude.setValue(self._gain_to_qcs_amplitude(self.gain.value()))
+        self.qcs_amplitude.setToolTip(
+            "QCS RF waveform amplitude relative to the configured "
+            "signal-generator output range"
+        )
         self._power_calibration_resolved_signature = None
         self.power_calibration_group = QtWidgets.QGroupBox(
             "Calibrated output power"
@@ -3114,7 +3266,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.require_within = QtWidgets.QCheckBox("Keep pulse inside anchor SET")
         self.require_within.setChecked(True)
 
-        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview = HardwareFrontPanelPreview(self)
+        self.front_panel_preview.set_qcs_selection(
+            "rf",
+            self.gen_ch.value(),
+        )
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
@@ -3124,9 +3280,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
         front_panel_row.addWidget(self.front_panel_preview)
         form.addRow(front_panel_row)
-        form.addRow("Generator index:", self.gen_ch)
-        form.addRow("Output board:", self.output_board_type)
-        form.addRow("Anchor SET:", self.segment)
+        self.gen_ch_label = QtWidgets.QLabel("QCS RF logical channel:")
+        form.addRow(self.gen_ch_label, self.gen_ch)
+        self.output_board_label = QtWidgets.QLabel("Output board:")
+        self.qcs_module_label = QtWidgets.QLabel("Module:")
+        form.addRow(self.output_board_label, self.output_board_type)
+        form.addRow(self.qcs_module_label, self.qcs_module_model)
+        self.segment_label = QtWidgets.QLabel("Anchor SET:")
+        form.addRow(self.segment_label, self.segment)
         self._delay_label = QtWidgets.QLabel()
         self._duration_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
@@ -3142,27 +3303,66 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self._duration_sweep_stop_label,
             self.duration_sweep_stop,
         )
-        form.addRow("Duration sweep points:", self.duration_sweep_count)
-        form.addRow("AWG segment timing:", self.segment_length_mode)
-        form.addRow("Frequency:", self.frequency_mhz)
+        self.duration_sweep_count_label = QtWidgets.QLabel(
+            "Duration sweep points:"
+        )
+        form.addRow(self.duration_sweep_count_label, self.duration_sweep_count)
+        self.segment_length_mode_label = QtWidgets.QLabel(
+            "AWG segment timing:"
+        )
+        form.addRow(self.segment_length_mode_label, self.segment_length_mode)
+        self.frequency_label = QtWidgets.QLabel("Frequency:")
+        form.addRow(self.frequency_label, self.frequency_mhz)
         form.addRow(self.frequency_sweep_enabled)
-        form.addRow("Frequency sweep start:", self.frequency_sweep_start_mhz)
-        form.addRow("Frequency sweep stop:", self.frequency_sweep_stop_mhz)
-        form.addRow("Frequency sweep points:", self.frequency_sweep_count)
-        form.addRow("Gain:", self.gain)
+        self.frequency_sweep_start_label = QtWidgets.QLabel(
+            "Frequency sweep start:"
+        )
+        self.frequency_sweep_stop_label = QtWidgets.QLabel(
+            "Frequency sweep stop:"
+        )
+        self.frequency_sweep_count_label = QtWidgets.QLabel(
+            "Frequency sweep points:"
+        )
+        form.addRow(
+            self.frequency_sweep_start_label,
+            self.frequency_sweep_start_mhz,
+        )
+        form.addRow(
+            self.frequency_sweep_stop_label,
+            self.frequency_sweep_stop_mhz,
+        )
+        form.addRow(
+            self.frequency_sweep_count_label,
+            self.frequency_sweep_count,
+        )
+        self.gain_label = QtWidgets.QLabel("Gain:")
+        self.qcs_amplitude_label = QtWidgets.QLabel("Relative amplitude:")
+        form.addRow(self.gain_label, self.gain)
+        form.addRow(self.qcs_amplitude_label, self.qcs_amplitude)
         form.addRow(self.power_calibration_group)
-        shared_path_note = QtWidgets.QLabel(
+        self.shared_path_note = QtWidgets.QLabel(
             "ATT and filter settings are edited from the HWH-backed Front Panel."
         )
-        shared_path_note.setWordWrap(True)
-        shared_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
-        form.addRow(shared_path_note)
-        form.addRow("Phase:", self.phase_degrees)
-        form.addRow("Nyquist zone:", self.nqz)
+        self.shared_path_note.setWordWrap(True)
+        self.shared_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
+        form.addRow(self.shared_path_note)
+        self.qcs_path_note = QtWidgets.QLabel(
+            "Module and SMA connector follow the QCS front-panel mapping. "
+            "Relative amplitude is a fraction of the configured output range."
+        )
+        self.qcs_path_note.setWordWrap(True)
+        self.qcs_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
+        form.addRow(self.qcs_path_note)
+        self.phase_label = QtWidgets.QLabel("Phase:")
+        form.addRow(self.phase_label, self.phase_degrees)
+        self.nqz_label = QtWidgets.QLabel("Nyquist zone:")
+        form.addRow(self.nqz_label, self.nqz)
         form.addRow(self.require_within)
-        remove_button = QtWidgets.QPushButton("Remove RF Port")
-        remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
-        form.addRow(remove_button)
+        self.remove_button = QtWidgets.QPushButton("Remove RF Port")
+        self.remove_button.clicked.connect(
+            lambda: self.remove_requested.emit(self)
+        )
+        form.addRow(self.remove_button)
 
         self.refresh_segments(pulse)
         self.set_time_unit(time_unit, force=True)
@@ -3202,6 +3402,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if signal is None:
                 signal = getattr(widget, "toggled", None)
             signal.connect(self.changed.emit)
+        self.qcs_amplitude.valueChanged.connect(
+            self._apply_qcs_amplitude_to_gain
+        )
+        self.gain.valueChanged.connect(self._sync_qcs_amplitude_from_gain)
         self.toggled.connect(self.changed.emit)
         self.output_board_type.currentTextChanged.connect(
             self._update_board_controls
@@ -3266,7 +3470,164 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_frequency_sweep_controls()
         self._update_power_calibration_controls()
         self._update_power_sweep_controls()
+        self.set_hardware_backend(self._hardware_backend)
         self.set_index(index)
+
+    @staticmethod
+    def _gain_to_qcs_amplitude(gain: int) -> float:
+        gain = int(gain)
+        return float(gain) / (32767.0 if gain >= 0 else 32768.0)
+
+    @staticmethod
+    def _qcs_amplitude_to_gain(amplitude: float) -> int:
+        amplitude = float(np.clip(amplitude, -1.0, 1.0))
+        scale = 32767.0 if amplitude >= 0.0 else 32768.0
+        return int(np.clip(round(amplitude * scale), -32768, 32767))
+
+    def _sync_qcs_amplitude_from_gain(self, *_args) -> None:
+        with QtCore.QSignalBlocker(self.qcs_amplitude):
+            self.qcs_amplitude.setValue(
+                self._gain_to_qcs_amplitude(self.gain.value())
+            )
+
+    def _apply_qcs_amplitude_to_gain(self, *_args) -> None:
+        gain = self._qcs_amplitude_to_gain(self.qcs_amplitude.value())
+        with QtCore.QSignalBlocker(self.gain):
+            self.gain.setValue(gain)
+        with QtCore.QSignalBlocker(self.qcs_amplitude):
+            self.qcs_amplitude.setValue(
+                self._gain_to_qcs_amplitude(gain)
+            )
+        self._mark_power_calibration_stale()
+        self.changed.emit()
+
+    def _set_form_row_visible(
+        self,
+        field: QtWidgets.QWidget,
+        visible: bool,
+    ) -> None:
+        """Show or hide both halves of one QFormLayout row."""
+
+        label = self._form_layout.labelForField(field)
+        if label is not None:
+            label.setVisible(bool(visible))
+        field.setVisible(bool(visible))
+
+    def _update_time_labels(self) -> None:
+        is_qcs = self._hardware_backend == EXECUTION_BACKEND_QCS
+        self._delay_label.setText(
+            (
+                "Pre-delay"
+                if is_qcs
+                else "Delay"
+            )
+            + f" [{self._time_unit}]:"
+        )
+        self._duration_label.setText(
+            (
+                "Waveform duration"
+                if is_qcs
+                else "Duration"
+            )
+            + f" [{self._time_unit}]:"
+        )
+        sweep_prefix = (
+            "Waveform duration sweep"
+            if is_qcs
+            else "Sweep"
+        )
+        self._duration_sweep_start_label.setText(
+            f"{sweep_prefix} start [{self._time_unit}]:"
+        )
+        self._duration_sweep_stop_label.setText(
+            f"{sweep_prefix} stop [{self._time_unit}]:"
+        )
+
+    def _update_backend_presentation(self) -> None:
+        is_qcs = self._hardware_backend == EXECUTION_BACKEND_QCS
+        self.gen_ch_label.setText(
+            "RF virtual channel index:" if is_qcs else "Generator index:"
+        )
+        self.gen_ch.setEnabled(not is_qcs)
+        self._set_form_row_visible(self.output_board_type, not is_qcs)
+        self._set_form_row_visible(self.qcs_module_model, is_qcs)
+        self._set_form_row_visible(self.gain, not is_qcs)
+        self._set_form_row_visible(self.qcs_amplitude, is_qcs)
+        self._set_form_row_visible(self.power_calibration_group, not is_qcs)
+        self._set_form_row_visible(self.shared_path_note, not is_qcs)
+        self._set_form_row_visible(self.qcs_path_note, is_qcs)
+        self._set_form_row_visible(self.nqz, not is_qcs)
+        self.segment_label.setText(
+            "Waveform segment:" if is_qcs else "Anchor SET:"
+        )
+        self.duration_sweep_enabled.setText(
+            "Sweep waveform duration"
+            if is_qcs
+            else "Sweep RF pulse duration"
+        )
+        self.duration_sweep_count_label.setText(
+            "Waveform duration sweep points:"
+            if is_qcs
+            else "Duration sweep points:"
+        )
+        self.segment_length_mode_label.setText(
+            "Segment duration behavior:"
+            if is_qcs
+            else "AWG segment timing:"
+        )
+        current_mode = self.segment_length_mode.currentData()
+        with QtCore.QSignalBlocker(self.segment_length_mode):
+            self.segment_length_mode.setItemText(
+                0,
+                (
+                    "Keep segment duration fixed"
+                    if is_qcs
+                    else "Keep AWG segment length fixed"
+                ),
+            )
+            self.segment_length_mode.setItemText(
+                1,
+                (
+                    "Extend segment by RF waveform duration"
+                    if is_qcs
+                    else "Original AWG segment + RF duration"
+                ),
+            )
+            mode_index = self.segment_length_mode.findData(current_mode)
+            if mode_index >= 0:
+                self.segment_length_mode.setCurrentIndex(mode_index)
+        self.frequency_label.setText(
+            "RF frequency:" if is_qcs else "Frequency:"
+        )
+        self.frequency_sweep_start_label.setText(
+            "RF frequency sweep start:"
+            if is_qcs
+            else "Frequency sweep start:"
+        )
+        self.frequency_sweep_stop_label.setText(
+            "RF frequency sweep stop:"
+            if is_qcs
+            else "Frequency sweep stop:"
+        )
+        self.frequency_sweep_count_label.setText(
+            "RF frequency sweep points:"
+            if is_qcs
+            else "Frequency sweep points:"
+        )
+        self.phase_label.setText(
+            "Instantaneous phase:" if is_qcs else "Phase:"
+        )
+        self.require_within.setText(
+            "Keep waveform inside selected segment"
+            if is_qcs
+            else "Keep pulse inside anchor SET"
+        )
+        self.remove_button.setText(
+            "Remove RF Output" if is_qcs else "Remove RF Port"
+        )
+        self._sync_qcs_amplitude_from_gain()
+        self._sync_qcs_module_model()
+        self._update_time_labels()
 
     def _update_duration_sweep_controls(self, *_args) -> None:
         enabled = self.duration_sweep_enabled.isChecked()
@@ -3755,7 +4116,84 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.front_panel_preview.set_configuration(configuration)
         self._sync_front_panel_selection()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        backend = str(backend).strip().lower()
+        if backend not in EXECUTION_BACKENDS:
+            raise ValueError(f"unsupported execution backend {backend!r}")
+        self._hardware_backend = backend
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self._update_backend_presentation()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+    ) -> None:
+        self._qcs_front_panel_configuration = configuration
+        self.front_panel_preview.set_qcs_configuration(configuration)
+        self.front_panel_preview.set_qcs_selection(
+            "rf",
+            self.gen_ch.value(),
+        )
+        self._sync_qcs_module_model()
+
+    def _sync_qcs_module_model(self) -> None:
+        """Reflect the module bound by the QCS front-panel configuration."""
+
+        selected_model = None
+        binding_tooltip = (
+            "No QCS RF module is mapped to this virtual channel. Click the "
+            "front-panel preview to configure its module and SMA output."
+        )
+        if self._qcs_front_panel_configuration is not None:
+            try:
+                configuration = normalize_qcs_hardware_configuration(
+                    self._qcs_front_panel_configuration
+                )
+            except (TypeError, ValueError):
+                configuration = None
+            if configuration is not None:
+                mapping = next(
+                    (
+                        candidate
+                        for candidate in configuration["channel_mappings"]
+                        if (
+                            candidate["role"] == "rf"
+                            and int(candidate["logical_index"])
+                            == self.gen_ch.value()
+                        )
+                    ),
+                    None,
+                )
+                if mapping is not None:
+                    module = next(
+                        (
+                            candidate
+                            for candidate in configuration["modules"]
+                            if int(candidate["slot"]) == int(mapping["slot"])
+                        ),
+                        None,
+                    )
+                    if module is not None:
+                        selected_model = str(module["model"])
+                        binding_tooltip = (
+                            f"{selected_model}, chassis "
+                            f"{configuration['chassis']}, slot "
+                            f"{mapping['slot']}, SMA CH {mapping['channel']}; "
+                            f"QCS virtual channel "
+                            f"{mapping['virtual_name']!r}. Click the front-panel "
+                            "preview to change the physical binding."
+                        )
+        with QtCore.QSignalBlocker(self.qcs_module_model):
+            model_index = self.qcs_module_model.findData(selected_model)
+            self.qcs_module_model.setCurrentIndex(model_index)
+        self.qcs_module_model.setToolTip(binding_tooltip)
+
     def _sync_front_panel_selection(self, *_args) -> None:
+        self.front_panel_preview.set_qcs_selection(
+            "rf",
+            self.gen_ch.value(),
+        )
+        self._sync_qcs_module_model()
         self.front_panel_preview.set_channels(output_ch=self.gen_ch.value())
         if self._front_panel_configuration is None:
             return
@@ -3817,14 +4255,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.duration.setSuffix(f" {unit}")
             self.duration_sweep_start.setSuffix(f" {unit}")
             self.duration_sweep_stop.setSuffix(f" {unit}")
-        self._delay_label.setText(f"Delay [{unit}]:")
-        self._duration_label.setText(f"Duration [{unit}]:")
-        self._duration_sweep_start_label.setText(
-            f"Sweep start [{unit}]:"
-        )
-        self._duration_sweep_stop_label.setText(
-            f"Sweep stop [{unit}]:"
-        )
+        self._update_time_labels()
 
     def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
         if pulse is not None:
@@ -3839,7 +4270,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if match >= 0:
                 self.segment.setCurrentIndex(match)
 
-    def configured_spec(self) -> QickRfPulseSpec:
+    def configured_spec(
+        self,
+        *,
+        for_qcs: bool = False,
+    ) -> QickRfPulseSpec:
         """Return the editor values even when this output is disabled."""
         return QickRfPulseSpec(
             gen_ch=self.gen_ch.value(),
@@ -3887,14 +4322,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             frequency_sweep_count=self.frequency_sweep_count.value(),
             power_sweep_enabled=(
-                self.power_calibration_group.isChecked()
+                not for_qcs
+                and self.power_calibration_group.isChecked()
                 and self.power_sweep_enabled.isChecked()
             ),
             power_sweep_start_dbm=self.power_sweep_start_dbm.value(),
             power_sweep_stop_dbm=self.power_sweep_stop_dbm.value(),
             power_sweep_count=self.power_sweep_count.value(),
             power_calibration_enabled=(
-                self.power_calibration_group.isChecked()
+                not for_qcs and self.power_calibration_group.isChecked()
             ),
             power_calibration_database_path=(
                 self.power_calibration_database_path.text().strip()
@@ -3903,10 +4339,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             target_output_power_dbm=self.target_output_power_dbm.value(),
         )
 
-    def spec(self) -> Optional[QickRfPulseSpec]:
+    def spec(self, *, for_qcs: bool = False) -> Optional[QickRfPulseSpec]:
         if not self.isChecked():
             return None
-        return self.configured_spec()
+        return self.configured_spec(for_qcs=for_qcs)
 
     def settings_dict(self) -> dict:
         spec = self.configured_spec()
@@ -4147,7 +4583,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
 
 class RfPortsPanel(QtWidgets.QWidget):
-    """Add/remove editor for up to eight normal QICK RF outputs."""
+    """Add/remove editor for up to eight RF waveform outputs."""
 
     specs_changed = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
@@ -4159,6 +4595,8 @@ class RfPortsPanel(QtWidgets.QWidget):
         self._time_unit = time_unit
         self._panels: List[RfPulsePortPanel] = []
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._hardware_backend = EXECUTION_BACKEND_QCS
         layout = QtWidgets.QVBoxLayout(self)
         self._scroll = QtWidgets.QScrollArea(self)
         self._scroll.setWidgetResizable(True)
@@ -4194,6 +4632,10 @@ class RfPortsPanel(QtWidgets.QWidget):
         panel.front_panel_requested.connect(self.front_panel_requested.emit)
         if self._front_panel_configuration is not None:
             panel.set_front_panel_configuration(self._front_panel_configuration)
+        panel.set_hardware_backend(self._hardware_backend)
+        panel.set_qcs_front_panel_configuration(
+            self._qcs_front_panel_configuration
+        )
         self._content_layout.insertWidget(self._content_layout.count() - 1, panel)
         self._panels.append(panel)
         if spec is not None:
@@ -4263,8 +4705,114 @@ class RfPortsPanel(QtWidgets.QWidget):
         for panel in self._panels:
             panel.set_front_panel_configuration(configuration)
 
-    def specs(self) -> Tuple[QickRfPulseSpec, ...]:
-        specs = tuple(spec for panel in self._panels if (spec := panel.spec()) is not None)
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.add_button.setText(
+            "Add RF Output"
+            if self._hardware_backend == EXECUTION_BACKEND_QCS
+            else "Add RF Port"
+        )
+        for panel in self._panels:
+            panel.set_hardware_backend(self._hardware_backend)
+
+    def validate_qcs_rf_channel_names(
+        self,
+        rf_channel_names: Mapping[int, str],
+    ) -> Tuple[int, ...]:
+        """Validate that active RF editors can be bound without data loss."""
+        raw_indices = tuple(int(index) for index in rf_channel_names)
+        if len(set(raw_indices)) != len(raw_indices):
+            raise ValueError(
+                "QCS RF logical channel numbers must be unique"
+            )
+        logical_indices = tuple(sorted(raw_indices))
+        if len(logical_indices) > self.MAX_PORTS:
+            raise ValueError(
+                f"QCS defines {len(logical_indices)} RF channels, but the "
+                f"GUI supports at most {self.MAX_PORTS}"
+            )
+        enabled_count = sum(panel.isChecked() for panel in self._panels)
+        if enabled_count > len(logical_indices):
+            raise ValueError(
+                f"{enabled_count} RF outputs are enabled, but the QCS "
+                f"hardware configuration defines only "
+                f"{len(logical_indices)} RF role(s). Add RF mappings or "
+                "disable the extra RF outputs before applying."
+            )
+        return logical_indices
+
+    def set_qcs_front_panel_preview_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+    ) -> None:
+        """Refresh QCS diagrams without changing RF logical identities."""
+        self._qcs_front_panel_configuration = configuration
+        for panel in self._panels:
+            panel.set_qcs_front_panel_configuration(configuration)
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+        rf_channel_names: Mapping[int, str],
+    ) -> None:
+        logical_indices = self.validate_qcs_rf_channel_names(
+            rf_channel_names
+        )
+        self._qcs_front_panel_configuration = configuration
+        assignments = {}
+        with QtCore.QSignalBlocker(self):
+            while len(self._panels) < len(logical_indices):
+                previous_count = len(self._panels)
+                self.add_port()
+                if len(self._panels) == previous_count:
+                    raise ValueError(
+                        "QCS RF roles exceed the available RF editor panels"
+                    )
+
+            remaining = list(logical_indices)
+            enabled_panels = [
+                panel for panel in self._panels if panel.isChecked()
+            ]
+            disabled_panels = [
+                panel for panel in self._panels if not panel.isChecked()
+            ]
+
+            for panel in enabled_panels:
+                current = panel.gen_ch.value()
+                if current in remaining:
+                    assignments[panel] = current
+                    remaining.remove(current)
+            for panel in enabled_panels:
+                if panel not in assignments:
+                    assignments[panel] = remaining.pop(0)
+
+            for panel in disabled_panels:
+                current = panel.gen_ch.value()
+                if current in remaining:
+                    assignments[panel] = current
+                    remaining.remove(current)
+            for panel in disabled_panels:
+                if not remaining:
+                    break
+                if panel not in assignments:
+                    assignments[panel] = remaining.pop(0)
+
+            for panel, logical_index in assignments.items():
+                with QtCore.QSignalBlocker(panel.gen_ch):
+                    panel.gen_ch.setValue(logical_index)
+            self.set_qcs_front_panel_preview_configuration(configuration)
+        self._emit_specs()
+
+    def specs(
+        self,
+        *,
+        for_qcs: bool = False,
+    ) -> Tuple[QickRfPulseSpec, ...]:
+        specs = tuple(
+            spec
+            for panel in self._panels
+            if (spec := panel.spec(for_qcs=for_qcs)) is not None
+        )
         channels = tuple(spec.gen_ch for spec in specs)
         if len(set(channels)) != len(channels):
             raise ValueError("enabled RF output ports must use unique generator indices")
@@ -4374,7 +4922,7 @@ class RfPortsPanel(QtWidgets.QWidget):
 
 
 class RfReadoutPanel(QtWidgets.QGroupBox):
-    """RF input and FIR-decimated DDR capture configuration."""
+    """Backend-aware digitizer acquisition configuration."""
 
     spec_changed = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
@@ -4384,12 +4932,19 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._pulse = pulse
         self._time_unit = time_unit
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._hardware_backend = EXECUTION_BACKEND_QCS
+        self._qcs_hardware_demodulation = True
+        self._qcs_acquisition_timing_rate_hz = (
+            DEFAULT_QCS_SAMPLE_RATE_HZ
+        )
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
         self._fir_uses_fpga_trigger_delay: Optional[bool] = None
         self.setCheckable(True)
         self.setChecked(False)
         form = QtWidgets.QFormLayout(self)
+        self._form_layout = form
         self.ro_ch = QtWidgets.QSpinBox()
         self.ro_ch.setRange(0, 255)
         self.input_board_type = QtWidgets.QComboBox()
@@ -4489,6 +5044,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         fpga_delay_row.setContentsMargins(0, 0, 0, 0)
         fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
         fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
+        self.fpga_delay_widget = QtWidgets.QWidget()
+        self.fpga_delay_widget.setLayout(fpga_delay_row)
         self.force_overwrite = QtWidgets.QCheckBox("Allow overwrite of reserved DDR range")
         self.post_run_read_delay = QtWidgets.QDoubleSpinBox()
         self.post_run_read_delay.setRange(0.0, 60.0)
@@ -4521,8 +5078,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         calibration_path_row.setContentsMargins(0, 0, 0, 0)
         calibration_path_row.addWidget(self.dc_voltage_calibration_path, 1)
         calibration_path_row.addWidget(self.dc_voltage_calibration_browse)
+        self.calibration_path_widget = QtWidgets.QWidget()
+        self.calibration_path_widget.setLayout(calibration_path_row)
 
-        self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview = HardwareFrontPanelPreview(self)
+        self.front_panel_preview.set_qcs_selection("acquisition", 0)
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
@@ -4532,25 +5092,42 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
         front_panel_row.addWidget(self.front_panel_preview)
         form.addRow(front_panel_row)
-        form.addRow("Readout index:", self.ro_ch)
+        # The physical input must remain selectable even while acquisition is
+        # unchecked. QGroupBox normally disables every child in that state.
+        self.front_panel_preview.setEnabled(True)
+        self.toggled.connect(self._keep_front_panel_preview_enabled)
+        QtCore.QTimer.singleShot(
+            0,
+            self._keep_front_panel_preview_enabled,
+        )
+        self.ro_ch_label = QtWidgets.QLabel("Readout index:")
+        form.addRow(self.ro_ch_label, self.ro_ch)
         form.addRow("Input board:", self.input_board_type)
-        form.addRow("Anchor SET:", self.segment)
+        self.segment_label = QtWidgets.QLabel("Anchor SET:")
+        form.addRow(self.segment_label, self.segment)
         self._delay_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
-        form.addRow("Stored FIR samples:", self.samples)
-        form.addRow("Readout/DDC frequency:", self.frequency_mhz)
+        self.samples_label = QtWidgets.QLabel("Stored FIR samples:")
+        form.addRow(self.samples_label, self.samples)
+        self.frequency_label = QtWidgets.QLabel(
+            "Readout/DDC frequency:"
+        )
+        form.addRow(self.frequency_label, self.frequency_mhz)
         self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
         form.addRow(self.input_condition_label, self.input_condition_stack)
         form.addRow("Stored/display unit:", self.measurement_unit)
         form.addRow("DC measurement gain:", self.dc_measure_gain_v_per_a)
         form.addRow(self.dc_voltage_calibration_enabled)
-        form.addRow("Calibration DB:", calibration_path_row)
+        form.addRow("Calibration DB:", self.calibration_path_widget)
         form.addRow("Calibration Run ID:", self.dc_voltage_calibration_run_id)
         form.addRow("Input filter:", self.filter_type)
         form.addRow("Filter cutoff/center:", self.filter_cutoff)
         form.addRow("Filter bandwidth:", self.filter_bandwidth)
         form.addRow("FIR input margin:", self.margin_samples)
-        form.addRow("FPGA trigger-to-store delay:", fpga_delay_row)
+        form.addRow(
+            "FPGA trigger-to-store delay:",
+            self.fpga_delay_widget,
+        )
         form.addRow("DDR read delay after run:", self.post_run_read_delay)
         form.addRow(self.force_overwrite)
         self.fir_profile_note = QtWidgets.QLabel(
@@ -4561,6 +5138,29 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             QtCore.Qt.TextSelectableByMouse
         )
         form.addRow("HWH FIR DDR:", self.fir_profile_note)
+        self.qcs_acquisition_note = QtWidgets.QLabel()
+        self.qcs_acquisition_note.setWordWrap(True)
+        self.qcs_acquisition_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        form.addRow("Acquisition mode:", self.qcs_acquisition_note)
+        self._qick_only_rows = (
+            self.input_board_type,
+            self.input_condition_stack,
+            self.measurement_unit,
+            self.dc_measure_gain_v_per_a,
+            self.dc_voltage_calibration_enabled,
+            self.calibration_path_widget,
+            self.dc_voltage_calibration_run_id,
+            self.filter_type,
+            self.filter_cutoff,
+            self.filter_bandwidth,
+            self.margin_samples,
+            self.fpga_delay_widget,
+            self.post_run_read_delay,
+            self.force_overwrite,
+            self.fir_profile_note,
+        )
 
         self.refresh_segments(pulse)
         self.set_time_unit(time_unit, force=True)
@@ -4598,6 +5198,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 signal = getattr(widget, "textChanged", None)
             signal.connect(self._emit_spec)
         self.samples.valueChanged.connect(self._update_fir_profile_note)
+        self.samples.valueChanged.connect(
+            self._update_qcs_acquisition_note
+        )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -4623,6 +5226,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.ro_ch.valueChanged.connect(self._sync_front_panel_selection)
         self._update_board_controls()
         self._update_fpga_trigger_delay_controls()
+        self.set_hardware_backend(self._hardware_backend)
 
     def _update_board_controls(self, *_args) -> None:
         rf_input = self.input_board_type.currentText() == "RF_In"
@@ -4739,6 +5343,124 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._update_fir_profile_note()
         self._sync_front_panel_selection()
 
+    def _set_form_row_visible(
+        self,
+        field: QtWidgets.QWidget,
+        visible: bool,
+    ) -> None:
+        """Show or hide both halves of one QFormLayout row."""
+
+        label = self._form_layout.labelForField(field)
+        if label is not None:
+            label.setVisible(bool(visible))
+        field.setVisible(bool(visible))
+
+    def _update_backend_presentation(self) -> None:
+        is_qick = self._hardware_backend == EXECUTION_BACKEND_QICK
+        self.setTitle(
+            "RF Readout 1" if is_qick else "QCS Acquisition 1"
+        )
+        self.ro_ch_label.setVisible(is_qick)
+        self.ro_ch.setVisible(is_qick)
+        for field in self._qick_only_rows:
+            self._set_form_row_visible(field, is_qick)
+        self._set_form_row_visible(
+            self.qcs_acquisition_note,
+            not is_qick,
+        )
+        self._set_form_row_visible(
+            self.frequency_mhz,
+            is_qick or self._qcs_hardware_demodulation,
+        )
+        self.segment_label.setText(
+            "Anchor SET:" if is_qick else "Acquisition segment:"
+        )
+        self.samples_label.setText(
+            "Stored FIR samples:"
+            if is_qick
+            else (
+                "Integration length (M5200 samples):"
+                if self._qcs_hardware_demodulation
+                else "Raw acquisition samples:"
+            )
+        )
+        self.samples.setSingleStep(
+            QCS_M5200_INTEGRATION_BLOCK_SAMPLES
+            if not is_qick and self._qcs_hardware_demodulation
+            else 1
+        )
+        self.frequency_label.setText(
+            "Readout/DDC frequency:"
+            if is_qick
+            else "Integration-filter RF frequency:"
+        )
+        self._delay_label.setText(
+            (
+                "Trigger delay"
+                if is_qick
+                else "Acquisition pre-delay"
+            )
+            + f" [{self._time_unit}]:"
+        )
+        self.samples.setToolTip(
+            "Number of post-FIR samples stored in QICK DDR"
+            if is_qick
+            else (
+                "M5200 ADC samples used to set the QCS IntegrationFilter "
+                "duration. Hardware-demodulated acquisitions require a "
+                f"multiple of {QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples."
+                if self._qcs_hardware_demodulation
+                else "Number of raw trace samples requested from the mapped "
+                "QCS digitizer channel"
+            )
+        )
+        self.frequency_mhz.setToolTip(
+            "QICK digital downconversion frequency"
+            if is_qick
+            else (
+                "RF frequency of the QCS IntegrationFilter used for hardware "
+                "I/Q demodulation"
+            )
+        )
+        self._update_qcs_acquisition_note()
+
+    def set_hardware_backend(self, backend: str) -> None:
+        backend = str(backend).strip().lower()
+        if backend not in EXECUTION_BACKENDS:
+            raise ValueError(f"unsupported execution backend {backend!r}")
+        self._hardware_backend = backend
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self._keep_front_panel_preview_enabled()
+        self._update_backend_presentation()
+
+    def _keep_front_panel_preview_enabled(self, *_args) -> None:
+        """Allow physical-input selection before acquisition is enabled."""
+
+        self.front_panel_preview.setEnabled(True)
+        self.front_panel_preview.currentWidget().setEnabled(True)
+
+    def set_qcs_hardware_demodulation(self, enabled: bool) -> None:
+        self._qcs_hardware_demodulation = bool(enabled)
+        if self._hardware_backend == EXECUTION_BACKEND_QCS:
+            self._update_backend_presentation()
+
+    def set_qcs_acquisition_timing_rate(self, sample_rate_hz: float) -> None:
+        sample_rate_hz = float(sample_rate_hz)
+        if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+            raise ValueError(
+                "QCS acquisition timing rate must be positive and finite"
+            )
+        self._qcs_acquisition_timing_rate_hz = sample_rate_hz
+        self._update_qcs_acquisition_note()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+    ) -> None:
+        self._qcs_front_panel_configuration = configuration
+        self.front_panel_preview.set_qcs_configuration(configuration)
+        self.front_panel_preview.set_qcs_selection("acquisition", 0)
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
         self.override_fpga_trigger_delay.setEnabled(supported)
@@ -4772,7 +5494,41 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             f"{delay}"
         )
 
+    def _update_qcs_acquisition_note(self, *_args) -> None:
+        if self._qcs_hardware_demodulation:
+            sample_count = self.samples.value()
+            duration_s = (
+                sample_count / self._qcs_acquisition_timing_rate_hz
+            )
+            duration_text = (
+                f"{duration_s * 1.0e9:g} ns"
+                if duration_s < 1.0e-6
+                else f"{duration_s * 1.0e6:g} us"
+            )
+            alignment_text = (
+                ""
+                if sample_count % QCS_M5200_INTEGRATION_BLOCK_SAMPLES == 0
+                else (
+                    " This count is invalid: QCS requires a multiple of "
+                    f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} M5200 samples."
+                )
+            )
+            self.qcs_acquisition_note.setText(
+                "Hardware demodulation uses a QCS IntegrationFilter. "
+                f"{sample_count:,} M5200 ADC samples at "
+                f"{format_sample_rate_hz(self._qcs_acquisition_timing_rate_hz)} "
+                f"set a {duration_text} integration duration; QCS returns "
+                f"one integrated I/Q value per shot.{alignment_text}"
+            )
+            return
+        self.qcs_acquisition_note.setText(
+            f"Raw acquisition requests {self.samples.value():,} trace "
+            "samples. The mapped M5200 digitizer channel determines the "
+            "hardware sample rate and trace duration."
+        )
+
     def _sync_front_panel_selection(self, *_args) -> None:
+        self.front_panel_preview.set_qcs_selection("acquisition", 0)
         self.front_panel_preview.set_channels(input_ch=self.ro_ch.value())
         if self._front_panel_configuration is None:
             return
@@ -4807,7 +5563,14 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         with QtCore.QSignalBlocker(self.delay):
             self.delay.setValue(_time_from_ns(delay_ns, unit))
             self.delay.setSuffix(f" {unit}")
-        self._delay_label.setText(f"Trigger delay [{unit}]:")
+        self._delay_label.setText(
+            (
+                "Trigger delay"
+                if self._hardware_backend == EXECUTION_BACKEND_QICK
+                else "Acquisition pre-delay"
+            )
+            + f" [{unit}]:"
+        )
 
     def refresh_segments(self, pulse: Optional[PulseSequence] = None) -> None:
         if pulse is not None:
@@ -5183,6 +5946,11 @@ class ExperimentPanel(QtWidgets.QWidget):
     sweep_remove_requested = QtCore.pyqtSignal(object)
     bias_t_changed = QtCore.pyqtSignal(bool, str, float, str, float, float)
     ddr_capacity_refresh_requested = QtCore.pyqtSignal()
+    qcs_hardware_configuration_requested = QtCore.pyqtSignal()
+    qcs_output_count_changed = QtCore.pyqtSignal(int)
+    qcs_output_sync_warning = QtCore.pyqtSignal(str)
+    run_state_changed = QtCore.pyqtSignal(bool)
+    execution_backend_changed = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -5207,6 +5975,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         content = QtWidgets.QWidget(scroll)
         form = QtWidgets.QFormLayout(content)
+        self._form_layout = form
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
@@ -5215,6 +5984,144 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.ns_port.setRange(1, 65535)
         self.ns_port.setValue(DEFAULT_QICK_NS_PORT)
         self.proxy_name = QtWidgets.QLineEdit(DEFAULT_QICK_PROXY_NAME)
+
+        self.backend_selector = QtWidgets.QComboBox(self)
+        self.backend_selector.addItem("Keysight QCS", EXECUTION_BACKEND_QCS)
+        self.backend_selector.addItem("QICK", EXECUTION_BACKEND_QICK)
+        self.backend_selector.setCurrentIndex(
+            self.backend_selector.findData(DEFAULT_EXECUTION_BACKEND)
+        )
+        self.backend_selector.hide()
+        self.execution_system_label = QtWidgets.QLabel("Keysight QCS")
+        self.execution_system_label.setToolTip(
+            "Hardware execution follows the applied M5000 configuration. "
+            "Legacy QICK settings remain loadable for compatibility."
+        )
+        self._last_execution_backend = None
+        self.qcs_connection_group = QtWidgets.QGroupBox(
+            "Keysight QCS connection and channel mapping"
+        )
+        qcs_form = QtWidgets.QFormLayout(self.qcs_connection_group)
+        self.qcs_mapper_path = QtWidgets.QLineEdit(DEFAULT_QCS_MAPPER_PATH)
+        self.qcs_mapper_path.setPlaceholderText(
+            "Path to the native Keysight QCS .qcs ChannelMapper file"
+        )
+        self.browse_qcs_mapper = QtWidgets.QToolButton()
+        self.browse_qcs_mapper.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_qcs_mapper.setToolTip(
+            "Choose a Keysight QCS channel-mapper file"
+        )
+        self.browse_qcs_mapper.clicked.connect(self._browse_qcs_mapper)
+        self.browse_qcs_mapper.hide()
+        qcs_mapper_row = QtWidgets.QHBoxLayout()
+        qcs_mapper_row.addWidget(self.qcs_mapper_path, 1)
+        qcs_mapper_row.addWidget(self.browse_qcs_mapper)
+        self.qcs_dc_channel_names = QtWidgets.QLineEdit(
+            ", ".join(
+                f"dc_ch_{index + 1}" for index in range(len(awg_channels))
+            )
+        )
+        self.qcs_dc_channel_names.setPlaceholderText(
+            "dc_ch_1, dc_ch_2 (one virtual name per AWG output)"
+        )
+        self.qcs_dc_full_scale_v = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_full_scale_v.setRange(0.001, 1.0e6)
+        self.qcs_dc_full_scale_v.setDecimals(6)
+        self.qcs_dc_full_scale_v.setSuffix(" V")
+        self.qcs_dc_full_scale_v.setValue(DEFAULT_QCS_FULL_SCALE_V)
+        self.qcs_dc_full_scale_v.setToolTip(
+            "Physical voltage represented by QCS DC amplitude +1.0. "
+            "Match this to the configured AWG output range."
+        )
+        self.qcs_rf_channel_names = QtWidgets.QLineEdit()
+        self.qcs_rf_channel_names.setPlaceholderText(
+            "0=rf_drive, 2=rf_probe"
+        )
+        self.qcs_acquisition_channel_name = QtWidgets.QLineEdit()
+        self.qcs_acquisition_channel_name.setPlaceholderText(
+            "QCS digitizer virtual channel (required to run)"
+        )
+        for derived_field in (
+            self.qcs_mapper_path,
+            self.qcs_dc_channel_names,
+            self.qcs_rf_channel_names,
+            self.qcs_acquisition_channel_name,
+        ):
+            derived_field.setReadOnly(True)
+            derived_field.setToolTip(
+                "Derived from Configure M5000 Hardware; edit the front-panel "
+                "configuration to change this value."
+            )
+        self.qcs_hw_demod = QtWidgets.QCheckBox(
+            "Use hardware I/Q demodulation"
+        )
+        self.qcs_hw_demod.setChecked(True)
+        self.qcs_hw_demod.setToolTip(
+            "Pass an IntegrationFilter to the QCS acquisition so the "
+            "hardware returns integrated I/Q data. Disable this to request "
+            "raw trace data."
+        )
+        self.qcs_sample_rate_hz = QtWidgets.QDoubleSpinBox()
+        self.qcs_sample_rate_hz.setRange(
+            DEFAULT_QCS_SAMPLE_RATE_HZ,
+            DEFAULT_QCS_SAMPLE_RATE_HZ,
+        )
+        self.qcs_sample_rate_hz.setDecimals(0)
+        self.qcs_sample_rate_hz.setGroupSeparatorShown(True)
+        self.qcs_sample_rate_hz.setSuffix(" Hz")
+        self.qcs_sample_rate_hz.setSpecialValueText(
+            format_sample_rate_hz(DEFAULT_QCS_SAMPLE_RATE_HZ)
+        )
+        self.qcs_sample_rate_hz.setValue(DEFAULT_QCS_SAMPLE_RATE_HZ)
+        self.qcs_sample_rate_hz.setReadOnly(True)
+        self.qcs_sample_rate_hz.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.NoButtons
+        )
+        self.qcs_sample_rate_hz.setToolTip(
+            "Keysight QCS 2.5.5 defines the M5200 digitizer sample rate as "
+            "4.8 GSa/s. The mapped hardware rate is verified again when the "
+            "program is compiled."
+        )
+        self.qcs_init_time_us = QtWidgets.QDoubleSpinBox()
+        self.qcs_init_time_us.setRange(0.0, 1.0e9)
+        self.qcs_init_time_us.setDecimals(9)
+        self.qcs_init_time_us.setSuffix(" us")
+        self.qcs_init_time_us.setValue(DEFAULT_QCS_INIT_TIME_US)
+        self._qcs_blocking = True
+        self._qcs_front_panel_draft_pending = False
+        self._qcs_hardware_configuration = None
+        self._qcs_hardware_configuration_state = (
+            QCS_HARDWARE_STATE_EXTERNAL
+        )
+        self._qcs_hardware_authoritative_mapper_path = None
+        self._qcs_hardware_mapper_sha256 = None
+        self.qcs_hardware_configuration_button = QtWidgets.QPushButton(
+            "Configure M5000 front panel..."
+        )
+        self.qcs_hardware_configuration_button.setToolTip(
+            "Build, load, validate, and save the physical Keysight QCS "
+            "ChannelMapper"
+        )
+        self.qcs_hardware_configuration_button.clicked.connect(
+            lambda: self.qcs_hardware_configuration_requested.emit()
+        )
+        qcs_form.addRow("Channel mapper file:", qcs_mapper_row)
+        qcs_form.addRow(self.qcs_hardware_configuration_button)
+        qcs_form.addRow("DC virtual channel names:", self.qcs_dc_channel_names)
+        qcs_form.addRow("DC full scale (+/-):", self.qcs_dc_full_scale_v)
+        qcs_form.addRow("RF generator map:", self.qcs_rf_channel_names)
+        qcs_form.addRow(
+            "Acquisition virtual channel:",
+            self.qcs_acquisition_channel_name,
+        )
+        qcs_form.addRow(self.qcs_hw_demod)
+        qcs_form.addRow(
+            "M5200 ADC sample rate:",
+            self.qcs_sample_rate_hz,
+        )
+        qcs_form.addRow("Backend initialization time:", self.qcs_init_time_us)
 
         self.database_path = QtWidgets.QLineEdit(DEFAULT_QCODES_DB_PATH)
         browse_database = QtWidgets.QToolButton()
@@ -5227,7 +6134,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(browse_database)
 
-        self.experiment_name = QtWidgets.QLineEdit("QICK pulse experiment")
+        self.experiment_name = QtWidgets.QLineEdit("QCS pulse experiment")
         self.sample_name = QtWidgets.QLineEdit("PulseGenerator")
         self.notes = QtWidgets.QPlainTextEdit()
         self.notes.setPlaceholderText("Optional experiment notes")
@@ -5504,13 +6411,21 @@ class ExperimentPanel(QtWidgets.QWidget):
             repetitions=repetitions,
         )
 
+        form.addRow("Execution system:", self.execution_system_label)
+        form.addRow(self.qcs_connection_group)
         form.addRow("QCoDeS DB file:", database_row)
         form.addRow("Experiment name:", self.experiment_name)
         form.addRow("Sample name:", self.sample_name)
         form.addRow("AWG full scale (+/-):", self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow(self.ddr_usage_group)
-        form.addRow("Compile validation:", self.compile_validation_mode)
+        self.compile_validation_label = QtWidgets.QLabel(
+            "Compile validation:"
+        )
+        form.addRow(
+            self.compile_validation_label,
+            self.compile_validation_mode,
+        )
         form.addRow("AWG waveform metadata:", self.awg_metadata_mode)
         form.addRow(metadata_hint)
         form.addRow(self.awg_metadata_button)
@@ -5556,6 +6471,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.progress.hide()
         self.run_status = QtWidgets.QLabel("Ready")
         self.run_status.setWordWrap(True)
+        self._running = False
         self.run_timing_group = QtWidgets.QGroupBox("Run timing and events")
         run_timing_layout = QtWidgets.QVBoxLayout(self.run_timing_group)
         self.run_elapsed_label = QtWidgets.QLabel(
@@ -5568,8 +6484,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.run_event_log.setReadOnly(True)
         self.run_event_log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.run_event_log.setPlaceholderText(
-            "Compile, acquisition, DDR readback, and database events "
-            "will appear here."
+            "Program build, acquisition, result retrieval, and database "
+            "events will appear here."
         )
         self.run_event_log.setMaximumBlockCount(1000)
         self.run_event_log.setMinimumHeight(150)
@@ -5614,6 +6530,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow(self.progress)
         form.addRow("Status:", self.run_status)
         form.addRow(self.run_timing_group)
+        self.backend_selector.currentIndexChanged.connect(
+            self._update_execution_backend_controls
+        )
+        self._update_execution_backend_controls()
 
     def set_ddr_readout_spec(
         self,
@@ -5780,6 +6700,724 @@ class ExperimentPanel(QtWidgets.QWidget):
             if Path(path).suffix.lower() != ".db":
                 path = str(Path(path).with_suffix(".db"))
             self.database_path.setText(path)
+
+    def _browse_qcs_mapper(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose Keysight QCS channel mapper",
+            self.qcs_mapper_path.text().strip(),
+            "Keysight QCS mapper (*.qcs);;All files (*)",
+        )
+        if path:
+            self.qcs_mapper_path.setText(path)
+
+    def execution_backend(self) -> str:
+        backend = str(self.backend_selector.currentData())
+        if backend not in EXECUTION_BACKENDS:
+            raise ValueError(f"unsupported execution backend {backend!r}")
+        return backend
+
+    def set_execution_backend(self, backend: str) -> None:
+        backend = str(backend).strip().lower()
+        if backend not in EXECUTION_BACKENDS:
+            raise ValueError(f"unsupported execution backend {backend!r}")
+        index = self.backend_selector.findData(backend)
+        if index < 0:
+            raise ValueError(f"execution backend {backend!r} is unavailable")
+        self.backend_selector.setCurrentIndex(index)
+        self._update_execution_backend_controls()
+
+    def _update_execution_backend_controls(self, *_args) -> None:
+        backend = self.execution_backend()
+        is_qick = backend == EXECUTION_BACKEND_QICK
+        self.execution_system_label.setText(
+            "QICK (legacy settings)"
+            if is_qick
+            else "Keysight QCS / M5000"
+        )
+        self.qcs_connection_group.setVisible(not is_qick)
+        self.qcs_connection_group.setEnabled(not is_qick and not self._running)
+        self.ddr_usage_group.setVisible(is_qick)
+        self.ddr_usage_group.setEnabled(is_qick and not self._running)
+        self.compile_validation_label.setVisible(is_qick)
+        self.compile_validation_mode.setVisible(is_qick)
+        self.compile_validation_mode.setEnabled(is_qick and not self._running)
+        self.show_program_button.setVisible(is_qick)
+        self.show_program_button.setEnabled(is_qick and not self._running)
+        self.show_program_button.setToolTip(
+            "Compile the current settings and show the tProcessor assembly"
+            if is_qick
+            else "QICK tProcessor assembly is unavailable for Keysight QCS"
+        )
+        self.run_button.setText(
+            "Run QICK Experiment" if is_qick else "Run QCS Experiment"
+        )
+        if hasattr(self, "sweep_map_status"):
+            self._update_sweep_map_status()
+        if backend != self._last_execution_backend:
+            self._last_execution_backend = backend
+            self.execution_backend_changed.emit(backend)
+
+    @staticmethod
+    def _comma_separated_names(text: str, description: str) -> Tuple[str, ...]:
+        names = tuple(item.strip() for item in str(text).split(",") if item.strip())
+        if not names:
+            raise ValueError(f"{description} must contain at least one name")
+        if len(set(names)) != len(names):
+            raise ValueError(f"{description} must contain unique names")
+        return names
+
+    def _parse_qcs_dc_channel_names(
+        self,
+        output_count: Optional[int] = None,
+    ) -> Tuple[str, ...]:
+        names = self._comma_separated_names(
+            self.qcs_dc_channel_names.text(),
+            "QCS DC virtual channel names",
+        )
+        if output_count is not None and len(names) != int(output_count):
+            raise ValueError(
+                f"exactly {int(output_count)} QCS DC virtual channel names are "
+                "required, one for each AWG output"
+            )
+        return names
+
+    def _parse_qcs_rf_channel_names(self) -> dict:
+        text = self.qcs_rf_channel_names.text().strip()
+        if not text:
+            return {}
+        mapping = {}
+        used_names = set()
+        for entry in text.split(","):
+            fields = entry.split("=", 1)
+            if len(fields) != 2:
+                raise ValueError(
+                    "QCS RF channel map entries must use gen_ch=name"
+                )
+            channel_text, name_text = (field.strip() for field in fields)
+            try:
+                channel = int(channel_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "QCS RF generator identifiers must be integers"
+                ) from exc
+            if channel < 0:
+                raise ValueError(
+                    "QCS RF generator identifiers must be nonnegative"
+                )
+            if not name_text:
+                raise ValueError("QCS RF virtual channel names must not be empty")
+            if channel in mapping:
+                raise ValueError(
+                    f"QCS RF generator {channel} is mapped more than once"
+                )
+            if name_text in used_names:
+                raise ValueError(
+                    "QCS RF virtual channel names must be unique"
+                )
+            mapping[channel] = name_text
+            used_names.add(name_text)
+        return mapping
+
+    @staticmethod
+    def _normalized_qcs_mapper_path(path: str) -> str:
+        return str(Path(path).expanduser().resolve()).casefold()
+
+    @staticmethod
+    def _qcs_state_after_mapper_change(state: str) -> str:
+        if state in {
+            QCS_HARDWARE_STATE_IMPORTED,
+            QCS_HARDWARE_STATE_IMPORTED_DIRTY,
+        }:
+            return QCS_HARDWARE_STATE_IMPORTED_DIRTY
+        return QCS_HARDWARE_STATE_DRAFT
+
+    def qcs_settings_dict(self) -> dict:
+        strict = self.execution_backend() == EXECUTION_BACKEND_QCS
+        acquisition_name = self.qcs_acquisition_channel_name.text().strip()
+        raw_dc_names_text = self.qcs_dc_channel_names.text()
+        raw_rf_names_text = self.qcs_rf_channel_names.text()
+        dc_names_text_override = None
+        rf_names_text_override = None
+        acquisition_name_text_override = None
+        try:
+            dc_names = (
+                self._parse_qcs_dc_channel_names()
+                if raw_dc_names_text.strip() or strict
+                else ()
+            )
+        except ValueError:
+            if strict:
+                raise
+            dc_names = ()
+            dc_names_text_override = raw_dc_names_text
+        try:
+            rf_names = self._parse_qcs_rf_channel_names()
+        except ValueError:
+            if strict:
+                raise
+            rf_names = {}
+            rf_names_text_override = raw_rf_names_text
+
+        mapper_path = self.qcs_mapper_path.text().strip()
+        hardware_configuration = self._qcs_hardware_configuration
+        state = self._qcs_hardware_configuration_state
+        mapper_file_sha256 = self._qcs_hardware_mapper_sha256
+        if state not in QCS_HARDWARE_STATES:
+            state = QCS_HARDWARE_STATE_EXTERNAL
+        if hardware_configuration is None:
+            state = QCS_HARDWARE_STATE_EXTERNAL
+            mapper_file_sha256 = None
+            self._qcs_hardware_authoritative_mapper_path = None
+        else:
+            hardware_configuration = normalize_qcs_hardware_configuration(
+                hardware_configuration
+            )
+            if state == QCS_HARDWARE_STATE_EXTERNAL:
+                state = QCS_HARDWARE_STATE_DRAFT
+            if (
+                dc_names_text_override is not None
+                or rf_names_text_override is not None
+            ):
+                dc_count = sum(
+                    mapping["role"] == "dc"
+                    for mapping in hardware_configuration[
+                        "channel_mappings"
+                    ]
+                )
+                bound_dc, bound_rf, _bound_acquisition = qcs_role_bindings(
+                    hardware_configuration,
+                    required_dc_count=dc_count,
+                )
+                if dc_names_text_override is not None:
+                    dc_names = tuple(bound_dc)
+                if rf_names_text_override is not None:
+                    rf_names = {
+                        int(channel): name
+                        for channel, name in bound_rf.items()
+                    }
+            original_fingerprint = qcs_hardware_mapper_fingerprint(
+                hardware_configuration
+            )
+            try:
+                synchronized_configuration = (
+                    synchronize_qcs_hardware_role_names(
+                        hardware_configuration,
+                        dc_names,
+                        rf_names,
+                        acquisition_name or None,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                if strict:
+                    raise ValueError(
+                        "QCS DC, RF, or acquisition roles differ from the "
+                        "known hardware configuration. Use Configure M5000 "
+                        "front panel to change role assignments."
+                    ) from exc
+                dc_count = sum(
+                    mapping["role"] == "dc"
+                    for mapping in hardware_configuration[
+                        "channel_mappings"
+                    ]
+                )
+                bound_dc, bound_rf, bound_acquisition = qcs_role_bindings(
+                    hardware_configuration,
+                    required_dc_count=dc_count,
+                )
+                dc_names = tuple(bound_dc)
+                rf_names = {
+                    int(channel): name
+                    for channel, name in bound_rf.items()
+                }
+                acquisition_name = bound_acquisition or ""
+                dc_names_text_override = raw_dc_names_text
+                rf_names_text_override = raw_rf_names_text
+                acquisition_name_text_override = (
+                    self.qcs_acquisition_channel_name.text()
+                )
+                synchronized_configuration = hardware_configuration
+
+            hardware_configuration = synchronized_configuration
+            mapper_changed = (
+                qcs_hardware_mapper_fingerprint(hardware_configuration)
+                != original_fingerprint
+            )
+            if mapper_changed:
+                state = self._qcs_state_after_mapper_change(state)
+            if (
+                state
+                in {
+                    QCS_HARDWARE_STATE_SAVED,
+                    QCS_HARDWARE_STATE_IMPORTED,
+                }
+                and (
+                    self._qcs_hardware_authoritative_mapper_path is None
+                    or self._normalized_qcs_mapper_path(mapper_path)
+                    != self._qcs_hardware_authoritative_mapper_path
+                )
+            ):
+                state = self._qcs_state_after_mapper_change(state)
+        if state not in {
+            QCS_HARDWARE_STATE_SAVED,
+            QCS_HARDWARE_STATE_IMPORTED,
+        }:
+            mapper_file_sha256 = None
+
+        self._qcs_hardware_configuration = hardware_configuration
+        self._qcs_hardware_configuration_state = state
+        self._qcs_hardware_mapper_sha256 = mapper_file_sha256
+        result = {
+            "mapper_path": mapper_path,
+            "dc_channel_names": list(dc_names),
+            "dc_full_scale_v": self.qcs_dc_full_scale_v.value(),
+            "rf_channel_names": {
+                str(channel): name
+                for channel, name in rf_names.items()
+            },
+            "acquisition_channel_name": acquisition_name or None,
+            "hw_demod": self.qcs_hw_demod.isChecked(),
+            "sample_rate_hz": self.qcs_sample_rate_hz.value(),
+            "init_time_s": self.qcs_init_time_us.value() * 1.0e-6,
+            "blocking": bool(self._qcs_blocking),
+            "hardware_configuration": hardware_configuration,
+            "hardware_configuration_state": state,
+            "hardware_mapper_sha256": mapper_file_sha256,
+        }
+        if dc_names_text_override is not None:
+            result["dc_channel_names_text"] = dc_names_text_override
+        if rf_names_text_override is not None:
+            result["rf_channel_names_text"] = rf_names_text_override
+        if acquisition_name_text_override is not None:
+            result["acquisition_channel_name_text"] = (
+                acquisition_name_text_override
+            )
+        return result
+
+    def set_qcs_front_panel_draft_pending(self, pending: bool) -> None:
+        """Block hardware use while the graphical mapper is incomplete."""
+
+        self._qcs_front_panel_draft_pending = bool(pending)
+
+    def qcs_connection_values(self, output_count: int) -> QcsConnectionConfig:
+        if self._qcs_front_panel_draft_pending:
+            raise ValueError(
+                "The QCS front-panel assignment is incomplete. Finish "
+                "selecting the highlighted DC output and acquisition SMA "
+                "channels before running hardware."
+            )
+        settings = self.qcs_settings_dict()
+        state = settings["hardware_configuration_state"]
+        if state == QCS_HARDWARE_STATE_DRAFT:
+            raise ValueError(
+                "The QCS front-panel configuration has unsaved physical "
+                "changes. Open Configure M5000 front panel and save a native "
+                ".qcs mapper before running."
+            )
+        if state == QCS_HARDWARE_STATE_IMPORTED_DIRTY:
+            raise ValueError(
+                "The imported QCS topology has unsaved edits. Reload the "
+                "original mapper to discard them, or use Restore diagram "
+                "layout and save a new mapper before running."
+            )
+        if state in {
+            QCS_HARDWARE_STATE_SAVED,
+            QCS_HARDWARE_STATE_IMPORTED,
+        }:
+            expected_digest = settings["hardware_mapper_sha256"]
+            if expected_digest is None:
+                raise ValueError(
+                    "The QCS mapper identity is unknown. Reload or save the "
+                    "front-panel mapper before running."
+                )
+            actual_digest = qcs_mapper_file_sha256(
+                settings["mapper_path"]
+            )
+            if actual_digest != expected_digest:
+                raise ValueError(
+                    "The QCS ChannelMapper file changed after the hardware "
+                    "configuration was applied. Reload or save it before "
+                    "running."
+                )
+            if state == QCS_HARDWARE_STATE_IMPORTED:
+                validate_imported_qcs_role_configuration(
+                    settings["hardware_configuration"],
+                    settings["mapper_path"],
+                )
+        dc_names = self._parse_qcs_dc_channel_names(output_count)
+        return QcsConnectionConfig(
+            mapper_path=settings["mapper_path"],
+            dc_channel_names=dc_names,
+            mapper_sha256=settings["hardware_mapper_sha256"],
+            dc_full_scale_v=settings["dc_full_scale_v"],
+            rf_channel_names={
+                int(channel): name
+                for channel, name in settings["rf_channel_names"].items()
+            },
+            acquisition_channel_name=settings["acquisition_channel_name"],
+            hw_demod=settings["hw_demod"],
+            init_time_s=settings["init_time_s"],
+            blocking=settings["blocking"],
+        )
+
+    def _qcs_dc_topology_source(
+        self,
+        *,
+        target_output_count: Optional[int] = None,
+    ) -> tuple[Optional[dict], list[str]]:
+        configuration = self._qcs_hardware_configuration
+        if configuration is None:
+            return None, [
+                item.strip()
+                for item in self.qcs_dc_channel_names.text().split(",")
+                if item.strip()
+            ]
+
+        current_dc_count = sum(
+            mapping["role"] == "dc"
+            for mapping in configuration["channel_mappings"]
+        )
+        current_dc, current_rf, current_acquisition = qcs_role_bindings(
+            configuration,
+            required_dc_count=current_dc_count,
+        )
+        try:
+            visible_dc = list(self._parse_qcs_dc_channel_names())
+        except ValueError as exc:
+            self.qcs_output_sync_warning.emit(
+                "Invalid dormant QCS DC names were reset to the known "
+                f"hardware bindings before changing outputs: {exc}"
+            )
+            return configuration, current_dc
+
+        if len(visible_dc) == current_dc_count:
+            try:
+                synchronized = synchronize_qcs_hardware_role_names(
+                    configuration,
+                    visible_dc,
+                    {
+                        int(channel): name
+                        for channel, name in current_rf.items()
+                    },
+                    current_acquisition,
+                )
+            except (TypeError, ValueError) as exc:
+                self.qcs_output_sync_warning.emit(
+                    "QCS DC names could not be synchronized with the known "
+                    f"hardware bindings and were reset before changing "
+                    f"outputs: {exc}"
+                )
+                return configuration, current_dc
+            return synchronized, visible_dc
+        if (
+            target_output_count is not None
+            and target_output_count > current_dc_count
+            and len(visible_dc) == target_output_count
+        ):
+            existing_names = visible_dc[:current_dc_count]
+            if set(existing_names) == set(current_dc):
+                try:
+                    configuration = synchronize_qcs_hardware_role_names(
+                        configuration,
+                        existing_names,
+                        {
+                            int(channel): name
+                            for channel, name in current_rf.items()
+                        },
+                        current_acquisition,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self.qcs_output_sync_warning.emit(
+                        "QCS DC names could not be synchronized with the "
+                        "known hardware bindings and were reset before "
+                        f"adding an output: {exc}"
+                    )
+                    return configuration, current_dc
+            return configuration, visible_dc
+
+        self.qcs_output_sync_warning.emit(
+            "QCS DC names did not match the current waveform count and were "
+            "reset to the known hardware bindings before changing outputs."
+        )
+        return configuration, current_dc
+
+    def set_qcs_output_count(self, output_count: int) -> None:
+        output_count = int(output_count)
+        if output_count < 1:
+            raise ValueError("QCS requires at least one DC output channel")
+        original_configuration = self._qcs_hardware_configuration
+        base_configuration, names = self._qcs_dc_topology_source(
+            target_output_count=output_count
+        )
+        names = names[:output_count]
+        used = set(names)
+        spare_names = iter(())
+        if base_configuration is not None:
+            modules_by_slot = {
+                module["slot"]: module
+                for module in base_configuration["modules"]
+            }
+            spare_names = iter(
+                mapping["virtual_name"]
+                for mapping in base_configuration["channel_mappings"]
+                if (
+                    mapping["role"] == "unassigned"
+                    and QCS_MODULE_MODELS[
+                        modules_by_slot[mapping["slot"]]["model"]
+                    ]["instrument"]
+                    == "M5301AWG"
+                    and mapping["virtual_name"] not in used
+                )
+            )
+        next_index = 1
+        while len(names) < output_count:
+            candidate = next(spare_names, None)
+            if candidate is None:
+                candidate = f"dc_ch_{next_index}"
+                next_index += 1
+            if candidate in used:
+                continue
+            names.append(candidate)
+            used.add(candidate)
+        resized_configuration = None
+        if base_configuration is not None:
+            resized_configuration = resize_qcs_dc_mappings(
+                base_configuration,
+                names,
+            )
+        self.qcs_dc_channel_names.setText(", ".join(names))
+        if resized_configuration is not None:
+            mapper_changed = (
+                qcs_hardware_mapper_fingerprint(resized_configuration)
+                != qcs_hardware_mapper_fingerprint(
+                    original_configuration
+                )
+            )
+            self._qcs_hardware_configuration = resized_configuration
+            if mapper_changed:
+                self._qcs_hardware_configuration_state = (
+                    self._qcs_state_after_mapper_change(
+                        self._qcs_hardware_configuration_state
+                    )
+                )
+                self._qcs_hardware_mapper_sha256 = None
+        self.qcs_output_count_changed.emit(output_count)
+
+    def remove_qcs_output(
+        self,
+        output_index: int,
+        *,
+        output_count: Optional[int] = None,
+    ) -> None:
+        requested_output_count = (
+            None if output_count is None else int(output_count)
+        )
+        if requested_output_count is not None and requested_output_count < 1:
+            raise ValueError("QCS requires at least one DC output channel")
+        original_configuration = self._qcs_hardware_configuration
+        base_configuration, names = self._qcs_dc_topology_source()
+        output_index = int(output_index)
+        removed = False
+        if 0 <= output_index < len(names):
+            names.pop(output_index)
+            removed = True
+        resized_configuration = None
+        if (
+            removed
+            and base_configuration is not None
+            and names
+        ):
+            resized_configuration = resize_qcs_dc_mappings(
+                base_configuration,
+                names,
+                removed_index=output_index,
+            )
+        self.qcs_dc_channel_names.setText(", ".join(names))
+        if resized_configuration is not None:
+            mapper_changed = (
+                qcs_hardware_mapper_fingerprint(resized_configuration)
+                != qcs_hardware_mapper_fingerprint(
+                    original_configuration
+                )
+            )
+            self._qcs_hardware_configuration = resized_configuration
+            if mapper_changed:
+                self._qcs_hardware_configuration_state = (
+                    self._qcs_state_after_mapper_change(
+                        self._qcs_hardware_configuration_state
+                    )
+                )
+                self._qcs_hardware_mapper_sha256 = None
+        resulting_output_count = (
+            len(names)
+            if requested_output_count is None
+            else requested_output_count
+        )
+        if resulting_output_count < 1:
+            raise ValueError("QCS requires at least one DC output channel")
+        self.qcs_output_count_changed.emit(resulting_output_count)
+
+    def set_qcs_settings(self, settings: Mapping[str, object], output_count: int) -> None:
+        settings = dict(settings)
+        dc_names = settings.get("dc_channel_names")
+        if dc_names is None:
+            dc_names = tuple(
+                f"dc_ch_{index + 1}" for index in range(int(output_count))
+            )
+        rf_names = dict(settings.get("rf_channel_names", {}))
+        acquisition_name = settings.get("acquisition_channel_name")
+        mapper_path = str(
+            settings.get("mapper_path", DEFAULT_QCS_MAPPER_PATH)
+        )
+        dc_names = tuple(str(name).strip() for name in dc_names)
+        normalized_rf_names = {
+            int(channel): str(name).strip()
+            for channel, name in rf_names.items()
+        }
+        hardware_configuration = settings.get("hardware_configuration")
+        mapper_file_sha256 = normalize_qcs_mapper_sha256(
+            settings.get("hardware_mapper_sha256")
+        )
+        state = str(
+            settings.get(
+                "hardware_configuration_state",
+                (
+                    QCS_HARDWARE_STATE_EXTERNAL
+                    if hardware_configuration is None
+                    else QCS_HARDWARE_STATE_DRAFT
+                ),
+            )
+        )
+        if state not in QCS_HARDWARE_STATES:
+            raise ValueError(
+                f"unsupported QCS hardware configuration state {state!r}"
+            )
+        if hardware_configuration is None:
+            state = QCS_HARDWARE_STATE_EXTERNAL
+            normalized_hardware_configuration = None
+            mapper_file_sha256 = None
+        else:
+            if state == QCS_HARDWARE_STATE_EXTERNAL:
+                state = QCS_HARDWARE_STATE_DRAFT
+            normalized_hardware_configuration = (
+                normalize_qcs_hardware_configuration(
+                    hardware_configuration,
+                    required_dc_count=int(output_count),
+                )
+            )
+            bound_dc, bound_rf, bound_acquisition = qcs_role_bindings(
+                normalized_hardware_configuration,
+                required_dc_count=int(output_count),
+            )
+            expected_rf = {
+                str(channel): name
+                for channel, name in normalized_rf_names.items()
+            }
+            if (
+                bound_dc != list(dc_names)
+                or bound_rf != expected_rf
+                or bound_acquisition
+                != (
+                    None
+                    if acquisition_name is None
+                    else str(acquisition_name).strip() or None
+                )
+            ):
+                raise ValueError(
+                    "QCS hardware role bindings must exactly match the "
+                    "experiment DC, RF, and acquisition channel names"
+                )
+            if (
+                state == QCS_HARDWARE_STATE_SAVED
+                and mapper_file_sha256 is None
+            ):
+                state = QCS_HARDWARE_STATE_DRAFT
+            elif (
+                state == QCS_HARDWARE_STATE_IMPORTED
+                and mapper_file_sha256 is None
+            ):
+                state = QCS_HARDWARE_STATE_IMPORTED_DIRTY
+
+        dc_names_text = settings.get("dc_channel_names_text")
+        rf_names_text = settings.get("rf_channel_names_text")
+        acquisition_name_text = settings.get(
+            "acquisition_channel_name_text"
+        )
+        if dc_names_text is not None and not isinstance(dc_names_text, str):
+            raise TypeError("QCS dc_channel_names_text must be a string")
+        if rf_names_text is not None and not isinstance(rf_names_text, str):
+            raise TypeError("QCS rf_channel_names_text must be a string")
+        if (
+            acquisition_name_text is not None
+            and not isinstance(acquisition_name_text, str)
+        ):
+            raise TypeError(
+                "QCS acquisition_channel_name_text must be a string"
+            )
+        self.qcs_mapper_path.setText(
+            mapper_path
+        )
+        self.qcs_dc_channel_names.setText(
+            (
+                dc_names_text
+                if dc_names_text is not None
+                else ", ".join(dc_names)
+            )
+        )
+        self.qcs_dc_full_scale_v.setValue(
+            float(
+                settings.get(
+                    "dc_full_scale_v", DEFAULT_QCS_FULL_SCALE_V
+                )
+            )
+        )
+        self.qcs_rf_channel_names.setText(
+            (
+                rf_names_text
+                if rf_names_text is not None
+                else ", ".join(
+                    f"{channel}={name}"
+                    for channel, name in sorted(
+                        normalized_rf_names.items(),
+                        key=lambda item: item[0],
+                    )
+                )
+            )
+        )
+        self.qcs_acquisition_channel_name.setText(
+            (
+                acquisition_name_text
+                if acquisition_name_text is not None
+                else (
+                    ""
+                    if acquisition_name is None
+                    else str(acquisition_name)
+                )
+            )
+        )
+        self.qcs_hw_demod.setChecked(bool(settings.get("hw_demod", True)))
+        # Versions through settings schema 36 stored a user-editable timing
+        # rate which defaulted incorrectly to the QICK 1 MSPS FIR rate. QCS
+        # M5200 timing is fixed by the hardware and mapper, so migrate it.
+        self.qcs_sample_rate_hz.setValue(DEFAULT_QCS_SAMPLE_RATE_HZ)
+        self.qcs_init_time_us.setValue(
+            float(settings.get("init_time_s", DEFAULT_QCS_INIT_TIME_US * 1.0e-6))
+            * 1.0e6
+        )
+        self._qcs_blocking = bool(settings.get("blocking", True))
+        self._qcs_hardware_configuration = normalized_hardware_configuration
+        self._qcs_hardware_configuration_state = state
+        self._qcs_hardware_mapper_sha256 = mapper_file_sha256
+        self._qcs_front_panel_draft_pending = False
+        self._qcs_hardware_authoritative_mapper_path = (
+            self._normalized_qcs_mapper_path(mapper_path)
+            if state
+            in {
+                QCS_HARDWARE_STATE_SAVED,
+                QCS_HARDWARE_STATE_IMPORTED,
+            }
+            else None
+        )
 
     @staticmethod
     def _sweep_axis_key(value) -> Optional[Tuple[str, str]]:
@@ -6139,9 +7777,14 @@ class ExperimentPanel(QtWidgets.QWidget):
             if omitted
             else ""
         )
+        averaging_values = (
+            "QCS acquisition values"
+            if self.execution_backend() == EXECUTION_BACKEND_QCS
+            else "FIR samples"
+        )
         self.sweep_map_status.setText(
             f"{point_count:,} Cartesian points; I/Q are averaged over "
-            f"repetitions and FIR samples.{suffix}"
+            f"repetitions and {averaging_values}.{suffix}"
         )
 
     def _parse_awg_channels(self, output_count: int) -> Tuple[int, ...]:
@@ -6166,18 +7809,51 @@ class ExperimentPanel(QtWidgets.QWidget):
         *,
         require_run_config: bool = True,
         database_path: Optional[str] = None,
+        validate_qcs_hardware: bool = True,
     ) -> dict:
-        connection, run = self.connection_values(
-            require_run_config=require_run_config,
-            database_path=database_path,
-        )
+        backend = self.execution_backend()
+        if backend == EXECUTION_BACKEND_QCS:
+            # QICK fields are deliberately dormant under QCS. Keep exported
+            # settings loadable without allowing a blank QICK host/proxy or a
+            # malformed hidden AWG-index list to veto QCS hardware.
+            defaults = QickConnectionConfig()
+            connection = QickConnectionConfig(
+                host=self.qick_host.text().strip() or defaults.host,
+                ns_port=self.ns_port.value(),
+                proxy_name=(
+                    self.proxy_name.text().strip() or defaults.proxy_name
+                ),
+            )
+            run = self.run_config_values(
+                require_run_config=require_run_config,
+                database_path=database_path,
+            )
+            try:
+                awg_channels = self._parse_awg_channels(output_count)
+            except ValueError:
+                awg_channels = tuple(range(output_count))
+        else:
+            connection, run = self.connection_values(
+                require_run_config=require_run_config,
+                database_path=database_path,
+            )
+            awg_channels = self._parse_awg_channels(output_count)
         return {
             "connection": connection,
             "run": run,
+            "execution_backend": backend,
+            "qcs_connection": (
+                self.qcs_connection_values(output_count)
+                if (
+                    backend == EXECUTION_BACKEND_QCS
+                    and validate_qcs_hardware
+                )
+                else None
+            ),
             "fabric_mhz": self.fabric_mhz.value(),
             "tproc_mhz": self.tproc_mhz.value(),
             "full_scale_mv": self.full_scale_mv.value(),
-            "awg_channels": self._parse_awg_channels(output_count),
+            "awg_channels": awg_channels,
             "repetitions_per_sweep": self.repetitions.value(),
             "awg_metadata_mode": normalize_awg_metadata_mode(
                 self.awg_metadata_mode.currentData()
@@ -6205,7 +7881,19 @@ class ExperimentPanel(QtWidgets.QWidget):
             ns_port=self.ns_port.value(),
             proxy_name=self.proxy_name.text().strip(),
         )
-        run = (
+        return connection, self.run_config_values(
+            require_run_config=require_run_config,
+            database_path=database_path,
+        )
+
+    def run_config_values(
+        self,
+        *,
+        require_run_config: bool = True,
+        database_path: Optional[str] = None,
+    ) -> Optional[QcodesRunConfig]:
+        """Return QCoDeS settings without constructing a QICK connection."""
+        return (
             QcodesRunConfig(
                 database_path=(
                     self.database_path.text().strip()
@@ -6219,10 +7907,12 @@ class ExperimentPanel(QtWidgets.QWidget):
             if require_run_config
             else None
         )
-        return connection, run
 
     def settings_dict(self, output_count: int) -> dict:
-        values = self.values(output_count)
+        values = self.values(
+            output_count,
+            validate_qcs_hardware=False,
+        )
         connection = values["connection"]
         run = values["run"]
         return {
@@ -6233,6 +7923,8 @@ class ExperimentPanel(QtWidgets.QWidget):
             "experiment_name": run.experiment_name,
             "sample_name": run.sample_name,
             "notes": run.notes,
+            "execution_backend": values["execution_backend"],
+            "qcs": self.qcs_settings_dict(),
         }
 
     def set_qick_values(
@@ -6325,6 +8017,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
         awg_metadata_mode: str = DEFAULT_AWG_METADATA_MODE,
         compile_validation_mode: str = DEFAULT_GUI_COMPILE_VALIDATION_MODE,
+        execution_backend: str = DEFAULT_EXECUTION_BACKEND,
+        qcs_settings: Optional[Mapping[str, object]] = None,
     ) -> None:
         self.qick_host.setText(connection.host)
         self.ns_port.setValue(connection.ns_port)
@@ -6342,6 +8036,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         self.set_awg_metadata_mode(awg_metadata_mode)
         self.set_compile_validation_mode(compile_validation_mode)
+        self.set_qcs_settings(qcs_settings or {}, len(awg_channels))
+        self.set_execution_backend(execution_backend)
         self.set_bias_t_values(
             enabled=bias_t_enabled,
             compensation_type=bias_t_compensation_type,
@@ -6354,12 +8050,15 @@ class ExperimentPanel(QtWidgets.QWidget):
     def set_running(
         self, running: bool, message: str, *, show_progress: bool = True
     ) -> None:
+        self._running = bool(running)
         self.run_button.setEnabled(not running)
-        self.show_program_button.setEnabled(not running)
+        self.backend_selector.setEnabled(not running)
+        self._update_execution_backend_controls()
         if running:
             self.progress.setValue(0)
         self.progress.setVisible(running and show_progress)
         self.run_status.setText(message)
+        self.run_state_changed.emit(self._running)
 
     @staticmethod
     def _format_elapsed_ms(elapsed_ms: int) -> str:
@@ -6377,7 +8076,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         return {
             "experiment": "Experiment",
             "validation": "Run validation",
-            "connection": "QICK connection",
+            "connection": "Hardware connection",
+            "channel_mapping": "QCS channel mapping",
+            "program_build": "QCS program build",
+            "execution": "Hardware execution",
             "awg_recipe": "AWG recipe",
             "awg_vertices": "Expanded AWG vertices",
             "rf_setup": "RF readout setup",
@@ -6499,7 +8201,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.run_status.setText(f"{percent}% - {message}")
 
     def show_result(self, result) -> None:
-        output_details = tuple(result.rf_settings.get("output_details", ()))
+        rf_settings = getattr(result, "rf_settings", {}) or {}
+        output_details = tuple(rf_settings.get("output_details", ()))
         rf_summary = ""
         if output_details:
             entries = [
@@ -6523,11 +8226,31 @@ class ExperimentPanel(QtWidgets.QWidget):
             trace_time_us = (
                 samples_per_trace * 1_000_000.0 / float(sample_rate_hz)
             )
-            fir_summary = (
-                f"\nFIR DDR: {format_sample_rate_hz(sample_rate_hz)}, "
-                f"{samples_per_trace:,} samples/trace = "
-                f"{trace_time_us:g} us"
-            )
+            if rf_settings.get("backend") == EXECUTION_BACKEND_QCS:
+                readout_details = rf_settings.get("readout_details", {})
+                if readout_details.get("hw_demod", False):
+                    integration_us = (
+                        float(readout_details.get("duration_s", 0.0))
+                        * 1.0e6
+                    )
+                    fir_summary = (
+                        f"\nQCS hardware-demodulated IQ: "
+                        f"{samples_per_trace:,} value(s)/shot, "
+                        f"{integration_us:g} us integration window"
+                    )
+                else:
+                    fir_summary = (
+                        f"\nQCS trace: "
+                        f"{format_sample_rate_hz(sample_rate_hz)}, "
+                        f"{samples_per_trace:,} samples/trace = "
+                        f"{trace_time_us:g} us"
+                    )
+            else:
+                fir_summary = (
+                    f"\nFIR DDR: {format_sample_rate_hz(sample_rate_hz)}, "
+                    f"{samples_per_trace:,} samples/trace = "
+                    f"{trace_time_us:g} us"
+                )
         self.set_running(
             False,
             f"Run {result.run_id}, {result.row_count} IQ samples\n"
@@ -6554,6 +8277,31 @@ class QickExperimentWorker(QtCore.QObject):
             kwargs["progress_callback"] = self.progress_changed.emit
             kwargs["event_callback"] = self.event_changed.emit
             result = run_qick_qcodes_experiment(**kwargs)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
+class QcsExperimentWorker(QtCore.QObject):
+    """Run blocking Keysight QCS/QCoDeS work outside the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
+    event_changed = QtCore.pyqtSignal(str, str, str)
+
+    def __init__(self, kwargs: dict, parent=None):
+        super().__init__(parent)
+        self._kwargs = kwargs
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            kwargs = dict(self._kwargs)
+            kwargs["progress_callback"] = self.progress_changed.emit
+            kwargs["event_callback"] = self.event_changed.emit
+            result = run_qcs_qcodes_experiment(**kwargs)
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -6606,6 +8354,28 @@ class QickConfigurationWorker(QtCore.QObject):
         try:
             _soc, soccfg = connect_qick(self._connection_config)
             configuration = identify_qick_front_panel(soccfg)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(configuration)
+
+
+class QcsHardwareIdentificationWorker(QtCore.QObject):
+    """Fetch the QCS controller's read-only installed-module inventory."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, ip_address: str, parent=None):
+        super().__init__(parent)
+        self._ip_address = str(ip_address)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            configuration = identify_qcs_hardware_configuration(
+                self._ip_address
+            )
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -7522,9 +9292,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def __init__(self):
         super().__init__()
         _install_value_input_wheel_guard()
-        self.setWindowTitle("DC Waveform Generator - QCS and QICK")
+        self.setWindowTitle("DC Waveform Generator - Keysight QCS")
 
         self._settings_path: Optional[Path] = None
+        self._suspend_qcs_output_sync = False
         self._time_unit = DEFAULT_TIME_UNIT
         self._pulse: List[PulseSequence] = [
             PulseSequence(
@@ -7560,6 +9331,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_filter_tau_us = float(DEFAULT_BIAS_T_FILTER_TAU_US)
         self._experiment_thread: Optional[QtCore.QThread] = None
         self._experiment_worker: Optional[QtCore.QObject] = None
+        self._active_experiment_backend = DEFAULT_EXECUTION_BACKEND
         self._last_experiment_result = None
         self._last_stability_result = None
         self._trace_overlay_result = None
@@ -7625,6 +9397,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._qick_configuration = None
         self._qick_front_panel_target = None
+        self._qcs_front_panel_source_snapshot = None
+        self._qcs_front_panel_editor_initialized = False
+        self._qcs_front_panel_auto_apply_selection = None
+        self._pending_qcs_hardware_inventory = None
+        self._pending_qcs_hardware_error = None
         self._qick_front_panel_dialog = QtWidgets.QDialog(self)
         self._qick_front_panel_dialog.setModal(False)
         self._qick_front_panel_dialog.setWindowTitle("QICK Front Panel")
@@ -7643,13 +9420,66 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()
         )
+        self._qcs_front_panel_dialog = QtWidgets.QDialog(self)
+        self._qcs_front_panel_dialog.setModal(False)
+        self._qcs_front_panel_dialog.setWindowTitle(
+            "Keysight QCS M5000 Front Panel"
+        )
+        self._qcs_front_panel_dialog.resize(1280, 850)
+        qcs_front_panel_layout = QtWidgets.QVBoxLayout(
+            self._qcs_front_panel_dialog
+        )
+        self._qcs_front_panel = QcsFrontPanelControl(
+            self._qcs_front_panel_dialog
+        )
+        self._qcs_front_panel.set_apply_preflight(
+            self._validate_qcs_front_panel_source_snapshot
+        )
+        qcs_front_panel_layout.addWidget(self._qcs_front_panel)
+        qcs_front_panel_buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Close,
+            parent=self._qcs_front_panel_dialog,
+        )
+        qcs_front_panel_buttons.rejected.connect(
+            self._qcs_front_panel_dialog.close
+        )
+        qcs_front_panel_layout.addWidget(qcs_front_panel_buttons)
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
         self._experiment_panel.set_ddr_readout_spec(
             self._rf_readout_panel.spec()
         )
         self.sweep_state_changed.connect(self._synchronize_sweep_views)
-        self._experiment_panel.run_requested.connect(self._run_qick_experiment)
+        self._experiment_panel.run_requested.connect(self._run_experiment)
+        self._experiment_panel.qcs_hardware_configuration_requested.connect(
+            self._show_qcs_front_panel
+        )
+        self._experiment_panel.execution_backend_changed.connect(
+            self._on_execution_backend_changed
+        )
+        self._experiment_panel.qcs_hw_demod.toggled.connect(
+            self._rf_readout_panel.set_qcs_hardware_demodulation
+        )
+        self._experiment_panel.qcs_sample_rate_hz.valueChanged.connect(
+            self._rf_readout_panel.set_qcs_acquisition_timing_rate
+        )
+        self._rf_readout_panel.set_qcs_hardware_demodulation(
+            self._experiment_panel.qcs_hw_demod.isChecked()
+        )
+        self._rf_readout_panel.set_qcs_acquisition_timing_rate(
+            self._experiment_panel.qcs_sample_rate_hz.value()
+        )
+        self._experiment_panel.qcs_output_count_changed.connect(
+            self._on_qcs_output_count_changed
+        )
+        self._experiment_panel.qcs_output_sync_warning.connect(
+            lambda message: self.statusBar().showMessage(message, 12000)
+        )
+        self._experiment_panel.run_state_changed.connect(
+            lambda running: self._qcs_front_panel.set_editing_enabled(
+                not running
+            )
+        )
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
         )
@@ -7682,10 +9512,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._load_stability_saved_run
         )
         self._stability_panel.front_panel_requested.connect(
-            lambda: self._show_qick_front_panel("path", self._stability_panel)
+            lambda: self._show_active_front_panel(
+                "path",
+                self._stability_panel,
+            )
         )
         self._stability_panel.electrode_front_panel_requested.connect(
-            lambda editor: self._show_qick_front_panel("output", editor)
+            lambda editor: self._show_active_front_panel("output", editor)
         )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
@@ -7694,19 +9527,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._load_sparameter_run
         )
         self._sparameter_panel.front_panel_requested.connect(
-            lambda: self._show_qick_front_panel("path", self._sparameter_panel)
+            lambda: self._show_active_front_panel(
+                "path",
+                self._sparameter_panel,
+            )
         )
         self._rf_ports_panel.front_panel_requested.connect(
-            lambda panel: self._show_qick_front_panel("output", panel)
+            lambda panel: self._show_active_front_panel("output", panel)
         )
         self._multi_ctrl.front_panel_requested.connect(
-            lambda target: self._show_qick_front_panel("output", target)
+            lambda target: self._show_active_front_panel("output", target)
         )
         self._multi_ctrl.awg_channel_changed.connect(
             self._set_awg_output_channel
         )
         self._rf_readout_panel.front_panel_requested.connect(
-            lambda panel: self._show_qick_front_panel("input", panel)
+            lambda panel: self._show_active_front_panel("input", panel)
         )
         self._calibration_panel.output_requested.connect(
             lambda: self._run_power_calibration("output")
@@ -7718,14 +9554,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             lambda: self._run_power_calibration("dc_voltage")
         )
         self._calibration_panel.front_panel_requested.connect(
-            lambda target: self._show_qick_front_panel("path", target)
+            lambda target: self._show_active_front_panel("path", target)
         )
         self._noise_panel.load_requested.connect(self._load_noise_trace)
         self._noise_panel.acquire_requested.connect(
             self._run_noise_acquisition
         )
         self._noise_panel.front_panel_requested.connect(
-            lambda target: self._show_qick_front_panel("input", target)
+            lambda target: self._show_active_front_panel("input", target)
         )
         self._sync_shared_qick_controls()
         self._qick_front_panel.identify_requested.connect(
@@ -7733,6 +9569,23 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._qick_front_panel.settings_applied.connect(
             self._apply_front_panel_settings
+        )
+        self._qcs_front_panel.settings_applied.connect(
+            self._apply_qcs_front_panel_settings
+        )
+        self._qcs_front_panel.connector_selected.connect(
+            self._on_qcs_front_panel_connector_selected
+        )
+        self._qcs_front_panel.draft_staged.connect(
+            self._on_qcs_front_panel_draft_staged
+        )
+        self._qcs_front_panel.identify_requested.connect(
+            self._identify_qcs_hardware_configuration
+        )
+        self._qcs_front_panel.mapper_saved.connect(
+            lambda path: self.statusBar().showMessage(
+                f"QCS ChannelMapper saved: {path}", 10000
+            )
         )
 
         self._time_unit_combo = QtWidgets.QComboBox()
@@ -7927,6 +9780,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         self._build_menu()
         self._build_toolbar()
+        self._on_execution_backend_changed(
+            self._experiment_panel.execution_backend()
+        )
         self._set_grid_settings(
             time_step_ns=self._grid_time_ns,
             voltage_step_mv=self._grid_voltage_mv,
@@ -7975,6 +9831,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _delete_port(self, idx: int) -> None:
         """Completely remove pulse, plot line and control panel at index idx."""
+        if (
+            hasattr(self, "_experiment_panel")
+            and not self._suspend_qcs_output_sync
+        ):
+            self._experiment_panel.remove_qcs_output(
+                idx,
+                output_count=len(self._pulse) - 1,
+            )
         sweep_entries = [
             (spec, self._sweep_target_indices(spec)) for spec in self._sweep_specs
         ]
@@ -8007,6 +9871,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ctrl.idx = i
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._multi_ctrl.update_port_strip_geometry()
+        if (
+            not self._suspend_qcs_output_sync
+            and self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        ):
+            self._propagate_qcs_hardware_configuration(
+                *self._qcs_bindings_from_settings(
+                    self._experiment_panel.qcs_settings_dict()
+                ),
+                require_complete_rf=False,
+            )
 
         if idx < self._selected_port_idx:
             self._selected_port_idx -= 1
@@ -8112,6 +9987,805 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             break
 
+    def _qcs_bindings_from_settings(
+        self,
+        settings: Mapping[str, object],
+    ) -> tuple[
+        Optional[dict],
+        Tuple[str, ...],
+        dict[int, str],
+        Optional[str],
+    ]:
+        """Return normalized QCS bindings used by every experiment editor."""
+        settings = dict(settings)
+        configuration = settings.get("hardware_configuration")
+        if configuration is not None:
+            configuration = normalize_qcs_hardware_configuration(
+                configuration,
+                required_dc_count=len(self._pulse),
+            )
+            dc_names, rf_names, acquisition_name = qcs_role_bindings(
+                configuration,
+                required_dc_count=len(self._pulse),
+            )
+            return (
+                configuration,
+                tuple(str(name) for name in dc_names),
+                {
+                    int(index): str(name)
+                    for index, name in rf_names.items()
+                },
+                acquisition_name,
+            )
+
+        dc_names = tuple(
+            str(name).strip()
+            for name in settings.get("dc_channel_names", ())
+            if str(name).strip()
+        )
+        if len(dc_names) != len(self._pulse):
+            raise ValueError(
+                "QCS requires one DC role for every waveform output"
+            )
+        rf_names = {
+            int(index): str(name).strip()
+            for index, name in dict(
+                settings.get("rf_channel_names", {})
+            ).items()
+        }
+        acquisition_name = settings.get("acquisition_channel_name")
+        acquisition_name = (
+            None
+            if acquisition_name is None
+            else str(acquisition_name).strip() or None
+        )
+        return configuration, dc_names, rf_names, acquisition_name
+
+    def _propagate_qcs_hardware_configuration(
+        self,
+        configuration: Optional[Mapping[str, object]],
+        dc_channel_names: Sequence[str],
+        rf_channel_names: Mapping[int, str],
+        acquisition_channel_name: Optional[str],
+        *,
+        require_complete_rf: bool = True,
+    ) -> None:
+        """Apply QCS role identities to all integrated experiment editors."""
+        del acquisition_channel_name  # The acquisition role is always index 0.
+        rf_binding_error = None
+        try:
+            self._rf_ports_panel.validate_qcs_rf_channel_names(
+                rf_channel_names
+            )
+        except ValueError as exc:
+            if require_complete_rf:
+                raise
+            rf_binding_error = exc
+        self._multi_ctrl.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._rf_ports_panel.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._rf_readout_panel.set_hardware_backend(
+            EXECUTION_BACKEND_QCS
+        )
+        self._stability_panel.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._sparameter_panel.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._calibration_panel.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._noise_panel.set_hardware_backend(EXECUTION_BACKEND_QCS)
+        self._multi_ctrl.set_qcs_front_panel_configuration(
+            configuration,
+            dc_channel_names,
+        )
+        if rf_binding_error is None:
+            self._rf_ports_panel.set_qcs_front_panel_configuration(
+                configuration,
+                rf_channel_names,
+            )
+        else:
+            self._rf_ports_panel.set_qcs_front_panel_preview_configuration(
+                configuration
+            )
+        self._rf_readout_panel.set_qcs_front_panel_configuration(
+            configuration
+        )
+        self._stability_panel.set_qcs_front_panel_configuration(configuration)
+        self._sparameter_panel.set_qcs_front_panel_configuration(configuration)
+        self._calibration_panel.set_qcs_front_panel_configuration(configuration)
+        self._noise_panel.set_qcs_front_panel_configuration(configuration)
+        self.refresh_panel_table()
+        if rf_binding_error is not None:
+            self.statusBar().showMessage(
+                f"QCS hardware configuration needs attention: "
+                f"{rf_binding_error}",
+                12000,
+            )
+
+    def _on_execution_backend_changed(self, backend: str) -> None:
+        """Synchronize every hardware preview with the execution system."""
+        backend = str(backend).strip().lower()
+        if backend not in EXECUTION_BACKENDS:
+            raise ValueError(f"unsupported execution backend {backend!r}")
+        self._multi_ctrl.set_hardware_backend(backend)
+        self._rf_ports_panel.set_hardware_backend(backend)
+        self._rf_readout_panel.set_hardware_backend(backend)
+        self._rf_readout_panel.set_qcs_hardware_demodulation(
+            self._experiment_panel.qcs_hw_demod.isChecked()
+        )
+        self._rf_readout_panel.set_qcs_acquisition_timing_rate(
+            self._experiment_panel.qcs_sample_rate_hz.value()
+        )
+        self._stability_panel.set_hardware_backend(backend)
+        self._sparameter_panel.set_hardware_backend(backend)
+        self._calibration_panel.set_hardware_backend(backend)
+        self._noise_panel.set_hardware_backend(backend)
+
+        if backend == EXECUTION_BACKEND_QCS:
+            try:
+                bindings = self._qcs_bindings_from_settings(
+                    self._experiment_panel.qcs_settings_dict()
+                )
+                self._propagate_qcs_hardware_configuration(
+                    *bindings,
+                    require_complete_rf=False,
+                )
+            except (TypeError, ValueError) as exc:
+                # Do not leave a previously valid mapper visible after the
+                # current Experiment settings fail validation.
+                self._multi_ctrl.set_qcs_front_panel_configuration(None, ())
+                self._rf_ports_panel.set_qcs_front_panel_preview_configuration(
+                    None
+                )
+                self._rf_readout_panel.set_qcs_front_panel_configuration(None)
+                self._stability_panel.set_qcs_front_panel_configuration(None)
+                self._sparameter_panel.set_qcs_front_panel_configuration(None)
+                self._calibration_panel.set_qcs_front_panel_configuration(None)
+                self._noise_panel.set_qcs_front_panel_configuration(None)
+                self.refresh_panel_table()
+                self.statusBar().showMessage(
+                    f"QCS hardware configuration needs attention: {exc}",
+                    12000,
+                )
+        else:
+            self.refresh_panel_table()
+
+        is_qick = backend == EXECUTION_BACKEND_QICK
+        if hasattr(self, "_qick_setup_action"):
+            self._qick_setup_action.setVisible(is_qick)
+        if hasattr(self, "_generate_qick_action"):
+            self._generate_qick_action.setVisible(is_qick)
+        if hasattr(self, "_preview_qick_action"):
+            self._preview_qick_action.setVisible(is_qick)
+        if hasattr(self, "_qcs_setup_action"):
+            self._qcs_setup_action.setVisible(True)
+        if hasattr(self, "_awg_tuning_tabs"):
+            readout_index = self._awg_tuning_tabs.indexOf(
+                self._rf_readout_panel
+            )
+            if readout_index >= 0:
+                self._awg_tuning_tabs.setTabText(
+                    readout_index,
+                    "RF Readout" if is_qick else "QCS Acquisition",
+                )
+        if hasattr(self, "_control_tabs"):
+            legacy_tab_names = {
+                1: "Stability Diagram",
+                2: "RF S-Parameter",
+                3: "Calibration",
+                4: "Noise Analysis",
+            }
+            for index, name in legacy_tab_names.items():
+                if index >= self._control_tabs.count():
+                    continue
+                self._control_tabs.setTabEnabled(index, True)
+                self._control_tabs.setTabText(index, name)
+                self._control_tabs.setTabToolTip(
+                    index,
+                    (
+                        ""
+                        if is_qick
+                        else (
+                            "The front panel shows the shared QCS hardware "
+                            "mapping, but measurement execution in this tab "
+                            "still uses the legacy QICK path."
+                        )
+                    ),
+                )
+
+    def _show_active_front_panel(self, scope: str, target=None) -> None:
+        """Open the front panel for the currently active execution system."""
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QICK
+        ):
+            self._show_qick_front_panel(scope, target)
+            return
+        role = None
+        logical_index = 0
+        if target is not None and hasattr(
+            target,
+            "qcs_front_panel_selection",
+        ):
+            role, logical_index = target.qcs_front_panel_selection()
+        elif isinstance(target, MultiControlPanel):
+            role = "dc"
+            logical_index = target._selected_index
+        elif isinstance(target, RfPulsePortPanel):
+            role = "rf"
+            logical_index = target.gen_ch.value()
+        elif isinstance(target, RfReadoutPanel):
+            role = "acquisition"
+        shown = self._show_qcs_front_panel(role, logical_index)
+        if (
+            shown
+            and target is not None
+            and role in {"dc", "acquisition"}
+        ):
+            self._qcs_front_panel_auto_apply_selection = (
+                role,
+                int(logical_index),
+            )
+
+    def _show_qcs_front_panel(
+        self,
+        role: Optional[str] = None,
+        logical_index: int = 0,
+    ) -> bool:
+        """Open the editable QCS mapper builder for the current experiment."""
+        self._qcs_front_panel_auto_apply_selection = None
+        if isinstance(role, bool):
+            role = None
+        if (
+            self._experiment_thread is not None
+            and self._experiment_thread.isRunning()
+        ) or self._experiment_panel._running:
+            QtWidgets.QMessageBox.information(
+                self,
+                "QCS task running",
+                "Wait for the current experiment to finish before changing "
+                "the QCS hardware configuration.",
+            )
+            return False
+        try:
+            source_snapshot = self._current_qcs_front_panel_source_snapshot()
+            if (
+                not self._qcs_front_panel_editor_initialized
+                or self._qcs_front_panel_source_snapshot != source_snapshot
+            ):
+                try:
+                    settings = self._experiment_panel.qcs_settings_dict()
+                except ValueError:
+                    if (
+                        self._experiment_panel._qcs_hardware_configuration
+                        is not None
+                    ):
+                        raise
+                    self._experiment_panel.set_qcs_output_count(
+                        len(self._pulse)
+                    )
+                    settings = self._experiment_panel.qcs_settings_dict()
+                self._qcs_front_panel.set_settings(
+                    settings,
+                    output_count=len(self._pulse),
+                )
+                self._qcs_front_panel_editor_initialized = True
+                # A source change replaces any unfinished graphical draft.
+                # Restore every preview from the canonical Experiment state
+                # and release the temporary hardware-execution guard only
+                # after the editor reload itself has succeeded.
+                self._experiment_panel.set_qcs_front_panel_draft_pending(
+                    False
+                )
+                self._on_execution_backend_changed(
+                    self._experiment_panel.execution_backend()
+                )
+            self._qcs_front_panel.show_front_panel()
+            if role is not None:
+                self._qcs_front_panel.focus_mapping(
+                    role,
+                    logical_index,
+                )
+            else:
+                self._qcs_front_panel.clear_mapping_focus()
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid QCS configuration",
+                str(exc),
+            )
+            return False
+        self._qcs_front_panel_source_snapshot = (
+            self._current_qcs_front_panel_source_snapshot()
+        )
+        self._qcs_front_panel.set_editing_enabled(True)
+        self._qcs_front_panel_dialog.show()
+        self._qcs_front_panel_dialog.raise_()
+        self._qcs_front_panel_dialog.activateWindow()
+        return True
+
+    def _on_qcs_front_panel_connector_selected(
+        self,
+        role: str,
+        logical_index: int,
+        slot: int,
+        channel: int,
+        changed: bool,
+    ) -> None:
+        """Commit a contextual DC/acquisition SMA selection automatically."""
+
+        selection = (str(role), int(logical_index))
+        if selection != self._qcs_front_panel_auto_apply_selection:
+            return
+        try:
+            working_configuration = (
+                self._qcs_front_panel.working_configuration()
+            )
+        except (TypeError, ValueError):
+            return
+        module_model = next(
+            (
+                str(module["model"])
+                for module in working_configuration["modules"]
+                if int(module["slot"]) == int(slot)
+            ),
+            "QCS module",
+        )
+        selection_name = (
+            f"QCS DC output {selection[1]}"
+            if selection[0] == "dc"
+            else "QCS acquisition input"
+        )
+        physical_name = (
+            f"{module_model} slot {int(slot)} CH{int(channel)}"
+        )
+        if not bool(changed):
+            try:
+                experiment_settings = self._experiment_panel.qcs_settings_dict()
+                run_ready = experiment_settings[
+                    "hardware_configuration_state"
+                ] in {
+                    QCS_HARDWARE_STATE_SAVED,
+                    QCS_HARDWARE_STATE_IMPORTED,
+                }
+                if run_ready:
+                    self._experiment_panel.qcs_connection_values(
+                        len(self._pulse)
+                    )
+                    experiment_mapping = next(
+                        candidate
+                        for candidate in experiment_settings[
+                            "hardware_configuration"
+                        ]["channel_mappings"]
+                        if (
+                            str(candidate["role"]) == selection[0]
+                            and int(candidate["logical_index"])
+                            == selection[1]
+                        )
+                    )
+                    run_ready = (
+                        int(experiment_mapping["slot"]),
+                        int(experiment_mapping["channel"]),
+                    ) == (int(slot), int(channel))
+                    run_ready = run_ready and (
+                        experiment_settings["hardware_configuration"]
+                        == working_configuration
+                    )
+            except (
+                ImportError,
+                KeyError,
+                OSError,
+                StopIteration,
+                TypeError,
+                ValueError,
+            ):
+                run_ready = False
+            if run_ready:
+                self._qcs_front_panel_auto_apply_selection = None
+                self._experiment_panel.set_qcs_front_panel_draft_pending(
+                    False
+                )
+                self._qcs_front_panel_dialog.close()
+                self.statusBar().showMessage(
+                    f"{selection_name} already uses {physical_name}",
+                    10000,
+                )
+                return
+        self._on_qcs_front_panel_draft_staged(working_configuration)
+        mapped_dc_indices = {
+            int(mapping["logical_index"])
+            for mapping in working_configuration["channel_mappings"]
+            if str(mapping["role"]) == "dc"
+        }
+        required_dc_indices = set(range(len(self._pulse)))
+        if mapped_dc_indices != required_dc_indices:
+            missing = sorted(required_dc_indices - mapped_dc_indices)
+            self._qcs_front_panel_auto_apply_selection = None
+            self._qcs_front_panel_dialog.close()
+            self.statusBar().showMessage(
+                f"Mapped {selection_name} to {physical_name}; select SMA "
+                "output(s) "
+                + ", ".join(str(index) for index in missing)
+                + " to finish the automatic mapper",
+                12000,
+            )
+            return
+        if not self._qcs_front_panel.apply_connector_selection(
+            self._apply_qcs_front_panel_settings
+        ):
+            return
+        # A true result means the commit callback accepted a run-ready saved
+        # or imported mapper. Clear the preview-only guard before performing
+        # the defensive address verification below.
+        self._experiment_panel.set_qcs_front_panel_draft_pending(False)
+
+        try:
+            configuration = self._experiment_panel.qcs_settings_dict()[
+                "hardware_configuration"
+            ]
+            mapping = next(
+                candidate
+                for candidate in configuration["channel_mappings"]
+                if (
+                    str(candidate["role"]) == selection[0]
+                    and int(candidate["logical_index"]) == selection[1]
+                )
+            )
+        except (KeyError, StopIteration, TypeError, ValueError):
+            return
+        if (
+            int(mapping["slot"]),
+            int(mapping["channel"]),
+        ) != (int(slot), int(channel)):
+            return
+
+        self._qcs_front_panel_auto_apply_selection = None
+        self._experiment_panel.set_qcs_front_panel_draft_pending(False)
+        self._qcs_front_panel_dialog.close()
+        self.statusBar().showMessage(
+            f"Mapped {selection_name} to {physical_name}",
+            10000,
+        )
+
+    def _on_qcs_front_panel_draft_staged(
+        self,
+        configuration: Mapping[str, object],
+    ) -> None:
+        """Preview an incomplete editor draft while keeping it non-executable."""
+
+        try:
+            normalized = normalize_qcs_hardware_configuration(configuration)
+            dc_names, rf_names, acquisition_name = (
+                self._qcs_front_panel.working_source_bindings()
+            )
+            self._experiment_panel.set_qcs_front_panel_draft_pending(True)
+            self._propagate_qcs_hardware_configuration(
+                normalized,
+                tuple(dc_names),
+                rf_names,
+                acquisition_name,
+                require_complete_rf=False,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.statusBar().showMessage(
+                f"QCS front-panel draft could not be previewed: {exc}",
+                12000,
+            )
+
+    def _identify_qcs_hardware_configuration(
+        self,
+        ip_address: str,
+    ) -> None:
+        """Read installed QCS modules without blocking the Qt GUI thread."""
+
+        if (
+            self._experiment_thread is not None
+            and self._experiment_thread.isRunning()
+        ) or self._experiment_panel._running:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Hardware task running",
+                "Wait for the current hardware task to finish before "
+                "identifying the QCS chassis.",
+            )
+            return
+
+        self._pending_qcs_hardware_inventory = None
+        self._pending_qcs_hardware_error = None
+        self._qcs_front_panel.set_identifying(
+            True,
+            f"Connecting to {ip_address} and reading installed modules...",
+        )
+        self.statusBar().showMessage(
+            f"Identifying QCS hardware at {ip_address}"
+        )
+        thread = QtCore.QThread(self)
+        worker = QcsHardwareIdentificationWorker(ip_address)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            self._on_qcs_hardware_inventory_received
+        )
+        worker.failed.connect(
+            self._on_qcs_hardware_identification_failed
+        )
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(
+            self._finish_qcs_hardware_identification
+        )
+        thread.finished.connect(thread.deleteLater)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_qcs_hardware_inventory_received(
+        self,
+        inventory: Mapping[str, object],
+    ) -> None:
+        self._pending_qcs_hardware_inventory = dict(inventory)
+
+    def _on_qcs_hardware_identification_failed(
+        self,
+        details: str,
+    ) -> None:
+        self._pending_qcs_hardware_error = str(details)
+
+    def _finish_qcs_hardware_identification(self) -> None:
+        inventory = self._pending_qcs_hardware_inventory
+        details = self._pending_qcs_hardware_error
+        self._pending_qcs_hardware_inventory = None
+        self._pending_qcs_hardware_error = None
+        self._clear_experiment_thread()
+
+        if details is not None:
+            lines = [
+                line
+                for line in details.rstrip().splitlines()
+                if line.strip()
+            ]
+            summary = (
+                lines[-1]
+                if lines
+                else "Unknown QCS hardware identification error"
+            )
+            self._qcs_front_panel.set_identifying(
+                False,
+                f"Hardware identification failed: {summary}",
+                error=True,
+            )
+            self.statusBar().showMessage(
+                "QCS hardware identification failed"
+            )
+            dialog = DetailedErrorMessageBox(
+                "QCS hardware identification failed",
+                summary,
+                details,
+                self,
+            )
+            dialog.exec_()
+            return
+
+        if inventory is None:
+            summary = "QCS hardware identification returned no result"
+            self._qcs_front_panel.set_identifying(
+                False,
+                summary,
+                error=True,
+            )
+            self.statusBar().showMessage(summary)
+            return
+
+        try:
+            self._validate_qcs_front_panel_source_snapshot()
+        except ValueError as exc:
+            self._qcs_front_panel.set_identifying(
+                False,
+                "The QCS inventory was not applied because the experiment "
+                f"configuration changed: {exc}",
+                error=True,
+            )
+            self.statusBar().showMessage(
+                "QCS inventory ignored because its source settings changed",
+                10000,
+            )
+            return
+
+        self._qcs_front_panel.set_identifying(
+            False,
+            "QCS inventory received; updating the front panel...",
+        )
+        try:
+            applied = (
+                self._qcs_front_panel
+                .apply_discovered_hardware_configuration(inventory)
+            )
+        except Exception:
+            details = traceback.format_exc()
+            lines = [
+                line
+                for line in details.rstrip().splitlines()
+                if line.strip()
+            ]
+            summary = (
+                lines[-1]
+                if lines
+                else "Unknown QCS inventory application error"
+            )
+            self._qcs_front_panel.set_identifying(
+                False,
+                f"Discovered hardware was not applied: {summary}",
+                error=True,
+            )
+            dialog = DetailedErrorMessageBox(
+                "QCS hardware inventory could not be applied",
+                summary,
+                details,
+                self,
+            )
+            dialog.exec_()
+            return
+        self.statusBar().showMessage(
+            "QCS hardware identified and front panel updated"
+            if applied
+            else "QCS hardware identified; current configuration unchanged",
+            10000,
+        )
+
+    def _apply_qcs_front_panel_settings(
+        self,
+        front_panel_settings: Mapping[str, object],
+    ) -> bool:
+        """Synchronize mapper-builder role bindings with Experiment controls."""
+        try:
+            self._validate_qcs_front_panel_source_snapshot()
+            payload = dict(front_panel_settings)
+            configuration = normalize_qcs_hardware_configuration(
+                payload.get("hardware_configuration"),
+                required_dc_count=len(self._pulse),
+            )
+            bound_dc, bound_rf, bound_acquisition = qcs_role_bindings(
+                configuration,
+                required_dc_count=len(self._pulse),
+            )
+            payload_dc = [
+                str(name) for name in payload.get("dc_channel_names", ())
+            ]
+            payload_rf = {
+                str(int(channel)): str(name)
+                for channel, name in dict(
+                    payload.get("rf_channel_names", {})
+                ).items()
+            }
+            payload_acquisition = payload.get("acquisition_channel_name")
+            payload_acquisition = (
+                None
+                if payload_acquisition is None
+                else str(payload_acquisition).strip() or None
+            )
+            if (
+                bound_dc != payload_dc
+                or bound_rf != payload_rf
+                or bound_acquisition != payload_acquisition
+            ):
+                raise ValueError(
+                    "The front-panel role bindings are inconsistent with "
+                    "the current experiment"
+                )
+            normalized_rf_bindings = {
+                int(index): str(name)
+                for index, name in bound_rf.items()
+            }
+            self._rf_ports_panel.validate_qcs_rf_channel_names(
+                normalized_rf_bindings
+            )
+            state = str(
+                payload.get(
+                    "hardware_configuration_state",
+                    QCS_HARDWARE_STATE_DRAFT,
+                )
+            )
+            if state not in QCS_HARDWARE_STATES:
+                raise ValueError(
+                    f"unsupported QCS hardware configuration state {state!r}"
+                )
+            payload["hardware_configuration"] = configuration
+            payload["hardware_configuration_state"] = state
+            settings = self._experiment_panel.qcs_settings_dict()
+            for override_key in (
+                "dc_channel_names_text",
+                "rf_channel_names_text",
+                "acquisition_channel_name_text",
+            ):
+                settings.pop(override_key, None)
+            settings.update(payload)
+            was_qcs = (
+                self._experiment_panel.execution_backend()
+                == EXECUTION_BACKEND_QCS
+            )
+            self._experiment_panel.set_qcs_settings(
+                settings,
+                len(self._pulse),
+            )
+            self._experiment_panel.set_execution_backend(
+                EXECUTION_BACKEND_QCS
+            )
+            if was_qcs:
+                self._propagate_qcs_hardware_configuration(
+                    configuration,
+                    tuple(bound_dc),
+                    normalized_rf_bindings,
+                    bound_acquisition,
+                )
+            self._qcs_front_panel_source_snapshot = (
+                self._current_qcs_front_panel_source_snapshot()
+            )
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "QCS front panel not applied",
+                str(exc),
+            )
+            return False
+        mapping_count = len(
+            settings["hardware_configuration"]["channel_mappings"]
+        )
+        self.statusBar().showMessage(
+            f"Applied QCS front panel with {mapping_count} channel "
+            "mapping(s)",
+            10000,
+        )
+        return True
+
+    def _current_qcs_front_panel_source_snapshot(self) -> tuple:
+        panel = self._experiment_panel
+        hardware_configuration = panel._qcs_hardware_configuration
+        hardware_fingerprint = (
+            None
+            if hardware_configuration is None
+            else qcs_hardware_mapper_fingerprint(hardware_configuration)
+        )
+        return (
+            panel.qcs_mapper_path.text(),
+            panel.qcs_dc_channel_names.text(),
+            panel.qcs_rf_channel_names.text(),
+            panel.qcs_acquisition_channel_name.text(),
+            len(self._pulse),
+            panel._qcs_hardware_configuration_state,
+            panel._qcs_hardware_mapper_sha256,
+            hardware_fingerprint,
+        )
+
+    def _validate_qcs_front_panel_source_snapshot(self) -> None:
+        if (
+            self._experiment_thread is not None
+            and self._experiment_thread.isRunning()
+        ) or self._experiment_panel._running:
+            raise ValueError(
+                "The QCS hardware configuration cannot be applied or saved "
+                "while a hardware task is running."
+            )
+        if (
+            self._qcs_front_panel_source_snapshot
+            != self._current_qcs_front_panel_source_snapshot()
+        ):
+            raise ValueError(
+                "The main QCS mapper path or channel names changed while the "
+                "front panel was open. Reopen the front panel before applying "
+                "or saving."
+            )
+
+    def _on_qcs_output_count_changed(self, output_count: int) -> None:
+        """Invalidate a modeless front-panel snapshot after AWG topology edits."""
+        self._qcs_front_panel_source_snapshot = None
+        self._qcs_front_panel_editor_initialized = False
+        self._experiment_panel.set_qcs_front_panel_draft_pending(False)
+        if self._qcs_front_panel_dialog.isVisible():
+            self._qcs_front_panel_dialog.close()
+            self.statusBar().showMessage(
+                "QCS front panel closed because the waveform output count "
+                f"changed to {int(output_count)}. Reopen it to continue.",
+                10000,
+            )
+
     def _set_awg_output_channel(self, output_index: int, channel: int) -> None:
         """Apply one front-panel generator mapping without duplicate channels."""
         output_index = int(output_index)
@@ -8160,18 +10834,38 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_setup_action.triggered.connect(
             self._configure_qick_setup
         )
+        self._qcs_setup_action = m_setup.addAction(
+            "Keysight QCS M5000 Front Panel..."
+        )
+        self._qcs_setup_action.triggered.connect(
+            self._show_qcs_front_panel
+        )
 
         # Pulse
         m_pulse     = mb.addMenu("&Pulse")
-        gen         = m_pulse.addAction("&Generate QCS string…")
-        gen.setShortcut(QtGui.QKeySequence("Ctrl+G"))
-        gen.triggered.connect(self._generate_pulse)
+        self._generate_qcs_action = m_pulse.addAction(
+            "&Generate QCS string…"
+        )
+        self._generate_qcs_action.setShortcut(
+            QtGui.QKeySequence("Ctrl+G")
+        )
+        self._generate_qcs_action.triggered.connect(self._generate_pulse)
         m_pulse.addSeparator()
-        gen_qick = m_pulse.addAction("Generate QICK program...")
-        gen_qick.setShortcut(QtGui.QKeySequence("Ctrl+Shift+G"))
-        gen_qick.triggered.connect(self._generate_qick_pulse)
-        preview_qick = m_pulse.addAction("Preview QICK waveforms...")
-        preview_qick.triggered.connect(self._preview_qick_pulse)
+        self._generate_qick_action = m_pulse.addAction(
+            "Generate QICK program..."
+        )
+        self._generate_qick_action.setShortcut(
+            QtGui.QKeySequence("Ctrl+Shift+G")
+        )
+        self._generate_qick_action.triggered.connect(
+            self._generate_qick_pulse
+        )
+        self._preview_qick_action = m_pulse.addAction(
+            "Preview QICK waveforms..."
+        )
+        self._preview_qick_action.triggered.connect(
+            self._preview_qick_pulse
+        )
         sync_timing = m_pulse.addAction("Synchronize port timing from selected port")
         sync_timing.triggered.connect(self._synchronize_port_timing)
         m_pulse.addSeparator()
@@ -9153,9 +11847,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_rf_timeline()
 
     def _active_map_sweep_specs(self) -> tuple:
+        rf_specs = tuple(getattr(self, "_rf_pulse_specs", ()))
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        ):
+            rf_specs = tuple(
+                replace(
+                    spec,
+                    power_sweep_enabled=False,
+                    power_calibration_enabled=False,
+                )
+                for spec in rf_specs
+            )
         return tuple(self._sweep_specs) + tuple(
             axis
-            for spec in getattr(self, "_rf_pulse_specs", ())
+            for spec in rf_specs
             for axis in spec.sweep_axes
         )
 
@@ -9344,8 +12051,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_readout_spec_changed(self, spec) -> None:
         self._ddr_readout_spec = spec
         self._experiment_panel.set_ddr_readout_spec(spec)
+        is_qcs = (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        )
         if spec is None:
-            self.statusBar().showMessage("RF readout disabled")
+            self.statusBar().showMessage(
+                "QCS acquisition disabled"
+                if is_qcs
+                else "RF readout disabled"
+            )
+        elif is_qcs:
+            mode = (
+                "hardware-demodulated I/Q"
+                if self._experiment_panel.qcs_hw_demod.isChecked()
+                else "raw trace"
+            )
+            self.statusBar().showMessage(
+                f"QCS {mode} acquisition: "
+                f"{spec.samples_per_trigger} sample(s), "
+                f"{spec.segment_name} + {spec.delay_us:g} us pre-delay"
+            )
         elif spec.effective_measurement_representation == "current":
             self.statusBar().showMessage(
                 f"DC current readout {spec.ro_ch}: "
@@ -9417,6 +12143,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         *,
         require_readout: bool = True,
         require_run_config: bool = True,
+        validate_qick_hardware: bool = True,
+        for_qcs: bool = False,
     ) -> dict:
         values = self._experiment_panel.values(
             len(self._pulse), require_run_config=require_run_config
@@ -9439,21 +12167,34 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias_t_compensation_duration_us"
         ]
         self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
-        for panel in self._rf_ports_panel._panels:
-            panel.validate_power_calibration()
-        rf_specs = self._rf_ports_panel.specs()
+        if validate_qick_hardware:
+            for panel in self._rf_ports_panel._panels:
+                panel.validate_power_calibration()
+        rf_specs = self._rf_ports_panel.specs(for_qcs=for_qcs)
         readout_spec = self._rf_readout_panel.spec()
         if require_readout and readout_spec is None:
             raise ValueError(
-                "enable RF Readout before running so the FIR IQ trace can be saved"
+                (
+                    "enable QCS Acquisition before running so acquisition "
+                    "results can be saved"
+                    if (
+                        self._experiment_panel.execution_backend()
+                        == EXECUTION_BACKEND_QCS
+                    )
+                    else (
+                        "enable RF Readout before running so the FIR IQ trace "
+                        "can be saved"
+                    )
+                )
             )
-        rf_channels = {spec.gen_ch for spec in rf_specs}
-        overlap = rf_channels.intersection(self._qick_awg_channels)
-        if overlap:
-            raise ValueError(
-                "RF and AWG generator indices overlap: "
-                + ", ".join(str(channel) for channel in sorted(overlap))
-            )
+        if validate_qick_hardware:
+            rf_channels = {spec.gen_ch for spec in rf_specs}
+            overlap = rf_channels.intersection(self._qick_awg_channels)
+            if overlap:
+                raise ValueError(
+                    "RF and AWG generator indices overlap: "
+                    + ", ".join(str(channel) for channel in sorted(overlap))
+                )
 
         sweep = self._sweep_specs[0] if len(self._sweep_specs) == 1 else None
         sweeps = tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None
@@ -9487,13 +12228,133 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "progress": False,
         }
 
+    def _qcs_experiment_run_arguments(self) -> dict:
+        qick_arguments = self._experiment_run_arguments(
+            validate_qick_hardware=False,
+            for_qcs=True,
+        )
+        connection = self._experiment_panel.qcs_connection_values(
+            len(self._pulse)
+        )
+        mapper_path = Path(connection.mapper_path).expanduser()
+        if not mapper_path.is_file():
+            raise ValueError(
+                f"QCS ChannelMapper file not found: {mapper_path}"
+            )
+        rf_specs = tuple(qick_arguments["rf_specs"])
+        missing_rf_channels = sorted(
+            {
+                int(spec.gen_ch)
+                for spec in rf_specs
+                if int(spec.gen_ch) not in connection.rf_channel_names
+            }
+        )
+        if missing_rf_channels:
+            raise ValueError(
+                "QCS RF channel map is missing generator "
+                + ", ".join(str(channel) for channel in missing_rf_channels)
+            )
+        rf_pulses = tuple(
+            QcsRfPulseConfig(
+                gen_ch=int(spec.gen_ch),
+                at_segment=str(spec.segment_name),
+                duration_s=float(spec.duration_us) * 1.0e-6,
+                amplitude=(
+                    float(spec.gain)
+                    / (32767.0 if int(spec.gain) >= 0 else 32768.0)
+                ),
+                frequency_hz=float(spec.frequency_mhz) * 1.0e6,
+                phase_rad=float(np.deg2rad(spec.phase_degrees)),
+                delay_s=float(spec.delay_us) * 1.0e-6,
+                envelope="constant",
+                require_within_segment=bool(spec.require_within_segment),
+            )
+            for spec in rf_specs
+        )
+
+        readout_spec = qick_arguments["readout_spec"]
+        if readout_spec is None:
+            acquisition = None
+        else:
+            # QICK-only readout values remain serialized so switching back to
+            # QICK is lossless. They are intentionally dormant here: QCS
+            # acquisition only translates the shared segment, pre-delay,
+            # integration/trace length, and optional IntegrationFilter
+            # frequency controls.
+            if connection.acquisition_channel_name is None:
+                raise ValueError(
+                    "set a QCS acquisition virtual channel before running "
+                    "with RF Readout enabled"
+                )
+            acquisition = QcsAcquisitionConfig(
+                at_segment=str(readout_spec.segment_name),
+                duration_s=(
+                    int(readout_spec.samples_per_trigger)
+                    / self._experiment_panel.qcs_sample_rate_hz.value()
+                ),
+                pre_delay_s=float(readout_spec.delay_us) * 1.0e-6,
+                sample_rate_hz=(
+                    self._experiment_panel.qcs_sample_rate_hz.value()
+                ),
+                sample_count=int(readout_spec.samples_per_trigger),
+                integration_filter=None,
+                frequency_hz=(
+                    (
+                        float(readout_spec.readout_frequency_mhz) * 1.0e6
+                    )
+                    if connection.hw_demod
+                    else 0.0
+                ),
+                phase_rad=0.0,
+                envelope="constant",
+            )
+
+        return {
+            "connection_config": connection,
+            "run_config": qick_arguments["run_config"],
+            "sequence": qick_arguments["sequence"],
+            "repetitions_per_sweep": qick_arguments[
+                "repetitions_per_sweep"
+            ],
+            "fabric_mhz": self._qick_fabric_mhz,
+            "source_full_scale_mv": self._qick_full_scale_mv,
+            "rf_pulses": rf_pulses,
+            "acquisition": acquisition,
+            "gui_settings": qick_arguments["gui_settings"],
+        }
+
     def _stability_run_arguments(self, *, save: bool) -> dict:
+        database_path = (
+            self._stability_panel.database_path_value() if save else None
+        )
+        backend = self._experiment_panel.execution_backend()
+        if backend == EXECUTION_BACKEND_QCS:
+            connection = self._experiment_panel.qcs_connection_values(
+                len(self._pulse)
+            )
+            run_config = self._experiment_panel.run_config_values(
+                require_run_config=save,
+                database_path=database_path,
+            )
+            self._stability_panel.refresh_targets(
+                self._qick_output_names(),
+                tuple(range(len(self._pulse))),
+            )
+            qcs_full_scale_mv = float(connection.dc_full_scale_v) * 1000.0
+            stability_config = self._stability_panel.config(
+                full_scale_mv=qcs_full_scale_mv
+            )
+            return self._qcs_stability_run_arguments(
+                connection=connection,
+                run_config=run_config,
+                stability_config=stability_config,
+                save=save,
+            )
+
         values = self._experiment_panel.values(
             len(self._pulse),
             require_run_config=save,
-            database_path=(
-                self._stability_panel.database_path_value() if save else None
-            ),
+            database_path=database_path,
         )
         self._qick_fabric_mhz = values["fabric_mhz"]
         self._qick_tproc_mhz = values["tproc_mhz"]
@@ -9608,6 +12469,123 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "rf_specs": rf_specs,
             "readout_spec": readout_spec,
             "progress": False,
+        }
+
+    def _qcs_stability_run_arguments(
+        self,
+        *,
+        connection: QcsConnectionConfig,
+        run_config: Optional[QcodesRunConfig],
+        stability_config,
+        save: bool,
+    ) -> dict:
+        """Translate Stability controls into one native QCS X/Y sweep."""
+        mapper_path = Path(connection.mapper_path).expanduser()
+        if not mapper_path.is_file():
+            raise ValueError(
+                f"QCS ChannelMapper file not found: {mapper_path}"
+            )
+        if not connection.hw_demod:
+            raise ValueError(
+                "QCS Stability hardware sweep requires Hardware "
+                "demodulation in the Experiment tab"
+            )
+        if not connection.blocking:
+            raise ValueError(
+                "QCS Stability hardware sweep requires blocking execution"
+            )
+        # Bias-T configuration remains dormant while QCS is selected so a
+        # round trip back to QICK preserves the user's settings.
+        stability_config = replace(
+            stability_config,
+            bias_t_compensation_enabled=False,
+        )
+
+        rf_gen_ch = (
+            self._stability_panel.path_diagram
+            .qcs_output_mapping_selector.currentData()
+        )
+        if rf_gen_ch is None:
+            raise ValueError(
+                "Select a mapped QCS RF output module for Stability"
+            )
+        rf_gen_ch = int(rf_gen_ch)
+        if rf_gen_ch not in connection.rf_channel_names:
+            raise ValueError(
+                f"QCS RF channel map has no logical output {rf_gen_ch}"
+            )
+        if connection.acquisition_channel_name is None:
+            raise ValueError(
+                "Select a mapped M5200 acquisition channel for Stability"
+            )
+
+        sample_rate_hz = float(
+            self._experiment_panel.qcs_sample_rate_hz.value()
+        )
+        qcs_full_scale_mv = float(connection.dc_full_scale_v) * 1000.0
+        qcs_sequence_fabric_mhz = 300.0
+        acquisition_duration_s = (
+            int(stability_config.trace_samples_per_point)
+            / sample_rate_hz
+        )
+        settle_s = float(stability_config.settle_time_us) * 1.0e-6
+        sequence = build_stability_hold_sequence(
+            stability_config,
+            output_names=self._qick_output_names(),
+            fabric_mhz=qcs_sequence_fabric_mhz,
+            full_scale_mv=qcs_full_scale_mv,
+            cross_capacitance=self._cross_capacitance.copy(),
+            sample_period_us=1.0e6 / sample_rate_hz,
+        )
+        rf_pulses = (
+            QcsRfPulseConfig(
+                gen_ch=rf_gen_ch,
+                at_segment=stability_config.x_axis.segment_name,
+                duration_s=acquisition_duration_s,
+                amplitude=float(
+                    self._stability_panel
+                    .qcs_modulation_amplitude.value()
+                ),
+                frequency_hz=(
+                    float(stability_config.modulation_frequency_mhz)
+                    * 1.0e6
+                ),
+                phase_rad=0.0,
+                delay_s=settle_s,
+                envelope="constant",
+                require_within_segment=False,
+            ),
+        )
+        acquisition = QcsAcquisitionConfig(
+            at_segment=stability_config.x_axis.segment_name,
+            duration_s=acquisition_duration_s,
+            pre_delay_s=settle_s,
+            sample_rate_hz=sample_rate_hz,
+            sample_count=int(
+                stability_config.trace_samples_per_point
+            ),
+            integration_filter=None,
+            frequency_hz=(
+                float(stability_config.modulation_frequency_mhz)
+                * 1.0e6
+            ),
+            phase_rad=0.0,
+            envelope="constant",
+        )
+        return {
+            "connection_config": connection,
+            "run_config": run_config,
+            "gui_settings": self._settings_to_dict() if save else None,
+            "stability_config": stability_config,
+            "full_scale_mv": qcs_full_scale_mv,
+            "sequence": sequence,
+            "repetitions_per_point": (
+                stability_config.repetitions_per_point
+            ),
+            "fabric_mhz": qcs_sequence_fabric_mhz,
+            "rf_pulses": rf_pulses,
+            "acquisition": acquisition,
+            "readout_spec": None,
         }
 
     def _sparameter_run_arguments(self) -> dict:
@@ -9916,7 +12894,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _legacy_qick_workflow_available(self, workflow: str) -> bool:
+        """Guard auxiliary acquisition engines that have not migrated to QCS."""
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QICK
+        ):
+            return True
+        QtWidgets.QMessageBox.information(
+            self,
+            f"{workflow} execution unavailable",
+            f"{workflow} now displays the shared QCS front-panel mapping, "
+            "but its hardware execution engine still uses QICK. Select the "
+            "QICK execution system to run this workflow.",
+        )
+        return False
+
     def _run_sparameter_sweep(self) -> None:
+        if not self._legacy_qick_workflow_available("RF S-parameter"):
+            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
@@ -10062,6 +13058,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _run_noise_acquisition(self, config) -> None:
         """Run the Noise tab's self-contained FIR-DDR acquisition."""
+        if not self._legacy_qick_workflow_available("Noise Analysis"):
+            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
@@ -10179,6 +13177,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         dialog.exec_()
 
     def _run_power_calibration(self, mode: str) -> None:
+        if not self._legacy_qick_workflow_available("Calibration"):
+            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
@@ -10322,11 +13322,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_plot_load_worker = None
 
     def _run_stability_diagram(self, *, continuous: bool) -> None:
+        backend = self._experiment_panel.execution_backend()
+        if (
+            self._stability_plot_load_thread is not None
+            and self._stability_plot_load_thread.isRunning()
+        ):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Stability Diagram loading",
+                "Wait for the selected saved diagram to finish loading.",
+            )
+            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
-                "QICK task running",
-                "Wait for the current QICK task to finish.",
+                "Hardware task running",
+                "Wait for the current hardware task to finish.",
             )
             return
         try:
@@ -10341,18 +13352,40 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         config = arguments["stability_config"]
         mode = "continuous" if continuous else "single shot"
+        acquisition_summary = (
+            f"{config.trace_samples_per_point:,} QCS integration samples"
+            if backend == EXECUTION_BACKEND_QCS
+            else (
+                f"{config.trace_samples_per_point:,} FIR samples / trace"
+            )
+        )
         self._stability_panel.set_running(
             True,
             (
                 f"Preparing {mode} scan: {config.x_axis.points} x "
                 f"{config.y_axis.points} points, "
                 f"{config.repetitions_per_point} repetitions / point, "
-                f"{config.trace_samples_per_point:,} FIR samples / trace"
+                f"{acquisition_summary}"
             ),
         )
-        self.statusBar().showMessage(f"QICK stability diagram {mode} running")
+        self._experiment_panel.set_running(
+            True,
+            (
+                f"{backend.upper()} Stability Diagram owns the active "
+                "hardware configuration"
+            ),
+            show_progress=False,
+        )
+        self.statusBar().showMessage(
+            f"{backend.upper()} stability diagram {mode} running"
+        )
         thread = QtCore.QThread(self)
-        worker = StabilityDiagramWorker(arguments, continuous=continuous)
+        worker_type = (
+            QcsStabilityDiagramWorker
+            if backend == EXECUTION_BACKEND_QCS
+            else StabilityDiagramWorker
+        )
+        worker = worker_type(arguments, continuous=continuous)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.scan_ready.connect(self._on_stability_scan_ready)
@@ -10374,7 +13407,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _stop_stability_diagram(self) -> None:
         worker = self._experiment_worker
-        if not isinstance(worker, StabilityDiagramWorker):
+        if not isinstance(
+            worker,
+            (StabilityDiagramWorker, QcsStabilityDiagramWorker),
+        ):
             return
         worker.request_stop()
         self._stability_panel.set_stopping()
@@ -10530,6 +13566,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_stability_single_finished(self, stored) -> None:
         self._last_stability_result = stored.diagram
         self._stability_panel.show_saved_result(stored)
+        self._experiment_panel.set_running(
+            False,
+            "Stability Diagram acquisition completed",
+            show_progress=False,
+        )
         selector = getattr(self, "_trace_overlay_selector", None)
         if selector is not None:
             selector.database_path.setText(str(stored.database_path))
@@ -10545,39 +13586,56 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_stability_stopped(self) -> None:
         self._stability_panel.set_running(False, "Continuous acquisition stopped")
+        self._experiment_panel.set_running(
+            False,
+            "Stability Diagram acquisition stopped",
+            show_progress=False,
+        )
         self.statusBar().showMessage("Stability diagram acquisition stopped")
 
     def _on_stability_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown stability-diagram error"
         self._stability_panel.set_running(False, f"Failed: {summary}")
-        self.statusBar().showMessage("QICK stability diagram failed")
+        self._experiment_panel.set_running(
+            False,
+            f"Stability Diagram failed: {summary}",
+            show_progress=False,
+        )
+        backend = self._experiment_panel.execution_backend().upper()
+        self.statusBar().showMessage(f"{backend} stability diagram failed")
         dialog = DetailedErrorMessageBox(
-            "QICK stability diagram failed",
+            f"{backend} stability diagram failed",
             summary,
             details,
             self,
         )
         dialog.exec_()
 
-    def _run_qick_experiment(self) -> None:
+    def _run_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
                 "Experiment running",
-                "Wait for the current QICK experiment to finish.",
+                "Wait for the current hardware experiment to finish.",
             )
             return
+        backend = self._experiment_panel.execution_backend()
+        backend_label = backend.upper()
+        self._active_experiment_backend = backend
         self._experiment_panel.start_run_timeline(
-            "Run button pressed; validating Experiment settings"
+            f"{backend_label} run requested; validating Experiment settings"
         )
         self._experiment_panel.record_run_event(
             "validation",
             "started",
-            "Validating waveform, sweep, RF readout, and DDR settings",
+            "Validating waveform, sweep, RF readout, and hardware settings",
         )
         try:
-            arguments = self._experiment_run_arguments()
+            if backend == EXECUTION_BACKEND_QICK:
+                arguments = self._experiment_run_arguments()
+            else:
+                arguments = self._qcs_experiment_run_arguments()
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
             self._experiment_panel.record_run_event(
                 "validation",
@@ -10596,13 +13654,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Experiment settings validated",
         )
 
-        expected_rows = (
-            arguments["sequence"].sweep_point_count
-            * arguments["repetitions_per_sweep"]
-            * arguments["readout_spec"].samples_per_trigger
-        )
         sweep_points = arguments["sequence"].sweep_point_count
         repetitions = arguments["repetitions_per_sweep"]
+        if backend == EXECUTION_BACKEND_QICK:
+            samples_per_acquisition = int(
+                arguments["readout_spec"].samples_per_trigger
+            )
+            worker_class = QickExperimentWorker
+        else:
+            acquisition = arguments["acquisition"]
+            samples_per_acquisition = (
+                0
+                if acquisition is None
+                else (
+                    1
+                    if arguments["connection_config"].hw_demod
+                    else int(
+                        acquisition.sample_count
+                        if acquisition.sample_count is not None
+                        else round(
+                            acquisition.duration_s
+                            * acquisition.sample_rate_hz
+                        )
+                    )
+                )
+            )
+            worker_class = QcsExperimentWorker
+        expected_rows = (
+            sweep_points * repetitions * samples_per_acquisition
+        )
         self._experiment_panel.set_running(
             True,
             (
@@ -10612,9 +13692,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"{expected_rows:,} IQ sample rows)"
             ),
         )
-        self.statusBar().showMessage("QICK experiment running")
+        self.statusBar().showMessage(f"{backend_label} experiment running")
         thread = QtCore.QThread(self)
-        worker = QickExperimentWorker(arguments)
+        worker = worker_class(arguments)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_experiment_finished)
@@ -10727,7 +13807,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_experiment_progress(self, percent: int, message: str) -> None:
         self._experiment_panel.update_progress(percent, message)
-        self.statusBar().showMessage(f"QICK experiment {percent}%: {message}")
+        backend = self._active_experiment_backend.upper()
+        self.statusBar().showMessage(
+            f"{backend} experiment {percent}%: {message}"
+        )
 
     def _on_experiment_event(
         self,
@@ -10879,15 +13962,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_experiment_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
-        summary = lines[-1] if lines else "Unknown QICK experiment error"
+        backend = self._active_experiment_backend.upper()
+        summary = lines[-1] if lines else f"Unknown {backend} experiment error"
         self._experiment_panel.set_running(False, f"Failed: {summary}")
         self._experiment_panel.finish_run_timeline(
             f"Run failed: {summary}",
             success=False,
         )
-        self.statusBar().showMessage("QICK experiment failed")
+        self.statusBar().showMessage(f"{backend} experiment failed")
         dialog = DetailedErrorMessageBox(
-            "QICK experiment failed", summary, details, self
+            f"{backend} experiment failed", summary, details, self
         )
         dialog.exec_()
 
@@ -11280,7 +14364,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _settings_to_dict(self) -> dict:
         """Return every user-editable experiment setting in canonical units."""
-        experiment_values = self._experiment_panel.values(len(self._pulse))
+        experiment_values = self._experiment_panel.values(
+            len(self._pulse),
+            validate_qcs_hardware=False,
+        )
         connection = experiment_values["connection"]
         run = experiment_values["run"]
         self._noise_panel.set_connection_values(connection)
@@ -11374,7 +14461,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "filter_tau_us": self._bias_t_filter_tau_us,
                 },
             },
+            "qcs": self._experiment_panel.qcs_settings_dict(),
             "experiment": {
+                "execution_backend": experiment_values["execution_backend"],
                 "qick_host": connection.host,
                 "ns_port": connection.ns_port,
                 "proxy_name": connection.proxy_name,
@@ -11726,8 +14815,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         grid = data.get("grid", {})
         awg = data.get("awg")
         qick = data.get("qick", {})
-        if not all(isinstance(item, dict) for item in (display, grid, awg, qick)):
-            raise TypeError("display, grid, awg, and qick must be JSON objects")
+        qcs = data.get("qcs", {})
+        if qcs is None:
+            qcs = {}
+        if not all(
+            isinstance(item, dict) for item in (display, grid, awg, qick, qcs)
+        ):
+            raise TypeError(
+                "display, grid, awg, qick, and qcs must be JSON objects"
+            )
 
         time_unit = str(display.get("time_unit", DEFAULT_TIME_UNIT))
         if time_unit not in TIME_UNIT_NS:
@@ -11987,13 +15083,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         noise_analysis_settings = normalize_noise_analysis_settings(
             data.get("noise_analysis")
         )
-        for axis_name in ("x_axis", "y_axis"):
-            axis = stability_settings[axis_name]
-            if max(abs(axis["start_mv"]), abs(axis["stop_mv"])) > full_scale_mv:
-                raise ValueError(
-                    f"{axis_name} stability sweep exceeds +/-{full_scale_mv:g} mV "
-                    "AWG full scale"
-                )
         raw_bias_t = qick.get("bias_t_compensation", {})
         if raw_bias_t is None:
             raw_bias_t = {}
@@ -12059,6 +15148,244 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         experiment = data.get("experiment", {})
         if not isinstance(experiment, dict):
             raise TypeError("experiment must be a JSON object")
+        execution_backend = str(
+            experiment.get(
+                "execution_backend",
+                (
+                    EXECUTION_BACKEND_QICK
+                    if settings_version < 35
+                    else DEFAULT_EXECUTION_BACKEND
+                ),
+            )
+        ).strip().lower()
+        if execution_backend not in EXECUTION_BACKENDS:
+            raise ValueError(
+                f"unsupported execution backend {execution_backend!r}"
+            )
+        qcs_mapper_path = str(
+            qcs.get("mapper_path", DEFAULT_QCS_MAPPER_PATH)
+        ).strip()
+        if execution_backend == EXECUTION_BACKEND_QCS and not qcs_mapper_path:
+            raise ValueError(
+                "QCS mapper_path must not be empty when QCS is selected"
+            )
+        raw_qcs_dc_names = qcs.get(
+            "dc_channel_names",
+            [f"dc_ch_{index + 1}" for index in range(len(pulses))],
+        )
+        if not isinstance(raw_qcs_dc_names, list):
+            raise TypeError("QCS dc_channel_names must be an array")
+        qcs_dc_channel_names = tuple(
+            str(name).strip() for name in raw_qcs_dc_names
+        )
+        if any(not name for name in qcs_dc_channel_names):
+            raise ValueError(
+                "QCS dc_channel_names entries must be nonempty"
+            )
+        if len(set(qcs_dc_channel_names)) != len(qcs_dc_channel_names):
+            raise ValueError("QCS dc_channel_names must be unique")
+        if (
+            execution_backend == EXECUTION_BACKEND_QCS
+            and len(qcs_dc_channel_names) != len(pulses)
+        ):
+            raise ValueError(
+                "QCS dc_channel_names must contain one name per AWG output"
+            )
+        raw_qcs_rf_names = qcs.get("rf_channel_names", {})
+        if not isinstance(raw_qcs_rf_names, dict):
+            raise TypeError("QCS rf_channel_names must be an object")
+        qcs_rf_channel_names = {}
+        for raw_channel, raw_name in raw_qcs_rf_names.items():
+            try:
+                channel = int(raw_channel)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "QCS rf_channel_names keys must be generator integers"
+                ) from exc
+            name = str(raw_name).strip()
+            if channel < 0 or not name:
+                raise ValueError(
+                    "QCS RF mappings require nonnegative generators and "
+                    "nonempty virtual channel names"
+                )
+            if channel in qcs_rf_channel_names:
+                raise ValueError(
+                    f"QCS RF generator {channel} is mapped more than once"
+                )
+            qcs_rf_channel_names[channel] = name
+        if len(set(qcs_rf_channel_names.values())) != len(qcs_rf_channel_names):
+            raise ValueError("QCS RF virtual channel names must be unique")
+        raw_acquisition_name = qcs.get("acquisition_channel_name")
+        qcs_acquisition_channel_name = (
+            None
+            if raw_acquisition_name is None
+            else str(raw_acquisition_name).strip() or None
+        )
+        qcs_init_time_s = self._json_finite_float(
+            qcs.get("init_time_s", DEFAULT_QCS_INIT_TIME_US * 1.0e-6),
+            "QCS init_time_s",
+        )
+        if qcs_init_time_s < 0.0:
+            raise ValueError("QCS init_time_s must be nonnegative")
+        qcs_sample_rate_hz = self._json_finite_float(
+            qcs.get("sample_rate_hz", DEFAULT_QCS_SAMPLE_RATE_HZ),
+            "QCS sample_rate_hz",
+        )
+        if qcs_sample_rate_hz <= 0.0:
+            raise ValueError("QCS sample_rate_hz must be positive")
+        # Keep accepting the legacy serialized field, but never use it as a
+        # configurable QCS clock. The M5200 rate is defined by QCS/hardware.
+        qcs_sample_rate_hz = DEFAULT_QCS_SAMPLE_RATE_HZ
+        qcs_dc_full_scale_v = self._json_finite_float(
+            qcs.get("dc_full_scale_v", DEFAULT_QCS_FULL_SCALE_V),
+            "QCS dc_full_scale_v",
+        )
+        if qcs_dc_full_scale_v <= 0.0:
+            raise ValueError("QCS dc_full_scale_v must be positive")
+        stability_full_scale_mv = (
+            qcs_dc_full_scale_v * 1000.0
+            if execution_backend == EXECUTION_BACKEND_QCS
+            else full_scale_mv
+        )
+        for axis_name in ("x_axis", "y_axis"):
+            axis = stability_settings[axis_name]
+            if (
+                max(abs(axis["start_mv"]), abs(axis["stop_mv"]))
+                > stability_full_scale_mv
+            ):
+                raise ValueError(
+                    f"{axis_name} stability sweep exceeds "
+                    f"+/-{stability_full_scale_mv:g} mV "
+                    f"{execution_backend.upper()} AWG full scale"
+                )
+        raw_qcs_hardware_configuration = qcs.get("hardware_configuration")
+        qcs_mapper_sha256 = normalize_qcs_mapper_sha256(
+            qcs.get("hardware_mapper_sha256")
+        )
+        raw_qcs_hardware_state = str(
+            qcs.get(
+                "hardware_configuration_state",
+                (
+                    QCS_HARDWARE_STATE_EXTERNAL
+                    if raw_qcs_hardware_configuration is None
+                    else QCS_HARDWARE_STATE_DRAFT
+                ),
+            )
+        )
+        if raw_qcs_hardware_state not in QCS_HARDWARE_STATES:
+            raise ValueError(
+                "QCS hardware_configuration_state must be one of "
+                f"{QCS_HARDWARE_STATES}"
+            )
+        qcs_hardware_configuration = (
+            None
+            if raw_qcs_hardware_configuration is None
+            else normalize_qcs_hardware_configuration(
+                raw_qcs_hardware_configuration,
+                required_dc_count=len(pulses),
+            )
+        )
+        if qcs_hardware_configuration is None:
+            if raw_qcs_hardware_state != QCS_HARDWARE_STATE_EXTERNAL:
+                raise ValueError(
+                    "QCS hardware_configuration_state must be external when "
+                    "hardware_configuration is null"
+                )
+            qcs_hardware_state = QCS_HARDWARE_STATE_EXTERNAL
+            qcs_mapper_sha256 = None
+        else:
+            qcs_hardware_state = (
+                QCS_HARDWARE_STATE_DRAFT
+                if raw_qcs_hardware_state == QCS_HARDWARE_STATE_EXTERNAL
+                else raw_qcs_hardware_state
+            )
+            bound_dc, bound_rf, bound_acquisition = qcs_role_bindings(
+                qcs_hardware_configuration,
+                required_dc_count=len(pulses),
+            )
+            expected_rf = {
+                str(channel): name
+                for channel, name in qcs_rf_channel_names.items()
+            }
+            if (
+                bound_dc != list(qcs_dc_channel_names)
+                or bound_rf != expected_rf
+                or bound_acquisition != qcs_acquisition_channel_name
+            ):
+                raise ValueError(
+                    "QCS hardware_configuration role bindings must exactly "
+                    "match dc_channel_names, rf_channel_names, and "
+                    "acquisition_channel_name"
+                )
+            if (
+                qcs_hardware_state == QCS_HARDWARE_STATE_SAVED
+                and qcs_mapper_sha256 is None
+            ):
+                qcs_hardware_state = QCS_HARDWARE_STATE_DRAFT
+            elif (
+                qcs_hardware_state == QCS_HARDWARE_STATE_IMPORTED
+                and qcs_mapper_sha256 is None
+            ):
+                qcs_hardware_state = QCS_HARDWARE_STATE_IMPORTED_DIRTY
+            if qcs_hardware_state not in {
+                QCS_HARDWARE_STATE_SAVED,
+                QCS_HARDWARE_STATE_IMPORTED,
+            }:
+                qcs_mapper_sha256 = None
+
+        raw_qcs_dc_names_text = qcs.get("dc_channel_names_text")
+        raw_qcs_rf_names_text = qcs.get("rf_channel_names_text")
+        raw_qcs_acquisition_name_text = qcs.get(
+            "acquisition_channel_name_text"
+        )
+        if (
+            raw_qcs_dc_names_text is not None
+            and not isinstance(raw_qcs_dc_names_text, str)
+        ):
+            raise TypeError("QCS dc_channel_names_text must be a string")
+        if (
+            raw_qcs_rf_names_text is not None
+            and not isinstance(raw_qcs_rf_names_text, str)
+        ):
+            raise TypeError("QCS rf_channel_names_text must be a string")
+        if (
+            raw_qcs_acquisition_name_text is not None
+            and not isinstance(raw_qcs_acquisition_name_text, str)
+        ):
+            raise TypeError(
+                "QCS acquisition_channel_name_text must be a string"
+            )
+        qcs_settings = {
+            "mapper_path": qcs_mapper_path,
+            "dc_channel_names": list(qcs_dc_channel_names),
+            "dc_full_scale_v": qcs_dc_full_scale_v,
+            "rf_channel_names": {
+                str(channel): name
+                for channel, name in qcs_rf_channel_names.items()
+            },
+            "acquisition_channel_name": qcs_acquisition_channel_name,
+            "hw_demod": self._json_bool(
+                qcs.get("hw_demod", True),
+                "QCS hw_demod",
+            ),
+            "sample_rate_hz": qcs_sample_rate_hz,
+            "init_time_s": qcs_init_time_s,
+            "blocking": self._json_bool(
+                qcs.get("blocking", True),
+                "QCS blocking",
+            ),
+            "hardware_configuration": qcs_hardware_configuration,
+            "hardware_configuration_state": qcs_hardware_state,
+            "hardware_mapper_sha256": qcs_mapper_sha256,
+        }
+        if raw_qcs_dc_names_text is not None:
+            qcs_settings["dc_channel_names_text"] = raw_qcs_dc_names_text
+        if raw_qcs_rf_names_text is not None:
+            qcs_settings["rf_channel_names_text"] = raw_qcs_rf_names_text
+        if raw_qcs_acquisition_name_text is not None:
+            qcs_settings["acquisition_channel_name_text"] = (
+                raw_qcs_acquisition_name_text
+            )
         raw_sweep_map = experiment.get("sweep_map", {})
         if raw_sweep_map is None:
             raw_sweep_map = {}
@@ -12728,6 +16055,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias_t_duration_us": bias_t_duration_us,
             "bias_t_filter_tau_us": bias_t_filter_tau_us,
             "connection_config": connection_config,
+            "execution_backend": execution_backend,
+            "qcs_settings": qcs_settings,
             "run_config": run_config,
             "sweep_map_axes": sweep_map_axes,
             "sweep_map_slices": sweep_map_slices,
@@ -12746,12 +16075,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _apply_decoded_settings(self, settings: dict) -> None:
         """Apply a fully validated settings object to all GUI panels."""
+        if hasattr(self, "_qcs_front_panel_dialog"):
+            self._qcs_front_panel_dialog.close()
+            self._qcs_front_panel_source_snapshot = None
+            self._qcs_front_panel_editor_initialized = False
         pulses = settings["pulses"]
         self._sweep_specs = []
-        while len(self._pulse) > len(pulses):
-            self._delete_port(len(self._pulse) - 1)
-        while len(self._pulse) < len(pulses):
-            self._add_port()
+        self._suspend_qcs_output_sync = True
+        try:
+            while len(self._pulse) > len(pulses):
+                self._delete_port(len(self._pulse) - 1)
+            while len(self._pulse) < len(pulses):
+                self._add_port()
+        finally:
+            self._suspend_qcs_output_sync = False
         for target, source in zip(self._pulse, pulses):
             target.t = source.t.copy()
             target.v = source.v.copy()
@@ -12791,6 +16128,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_mode=self._bias_t_compensation_mode,
             bias_t_duration_us=self._bias_t_compensation_duration_us,
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+            execution_backend=settings["execution_backend"],
+            qcs_settings=settings["qcs_settings"],
         )
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._refresh_stability_targets()
@@ -12856,6 +16195,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.setCurrentIndex(settings["selected_tab"])
         self._awg_tuning_tabs.setCurrentIndex(
             settings["selected_awg_tuning_tab"]
+        )
+        self._on_execution_backend_changed(
+            self._experiment_panel.execution_backend()
         )
         with QtCore.QSignalBlocker(self._voltage_view_actions[settings["voltage_view"]]):
             self._voltage_view_actions[settings["voltage_view"]].setChecked(True)
@@ -12977,6 +16319,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         """Generate QCS code for the current pulse sequence."""
         return generate_qcs_program_code(
             self._pulse,
+            channel_names=(
+                self._experiment_panel._parse_qcs_dc_channel_names(
+                    len(self._pulse)
+                )
+            ),
+            full_scale_v=(
+                self._experiment_panel.qcs_dc_full_scale_v.value()
+            ),
             cross_capacitance=self._cross_capacitance,
         )
 
@@ -13348,6 +16698,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _add_port(self):
         """Add a new control panel for a new PulseSequence."""
+        if (
+            hasattr(self, "_experiment_panel")
+            and not self._suspend_qcs_output_sync
+        ):
+            self._experiment_panel.set_qcs_output_count(
+                len(self._pulse) + 1
+            )
         # Start with the existing timing grid so multi-output QICK export is
         # immediately valid; levels remain independently editable per port.
         new_pulse       = self._pulse[0].copy()
@@ -13382,6 +16739,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl.splitter.insertWidget(len(self._multi_ctrl._ctrl_pannels) - 1, new_ctrl)
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._multi_ctrl.update_port_strip_geometry()
+        if (
+            not self._suspend_qcs_output_sync
+            and self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        ):
+            self._propagate_qcs_hardware_configuration(
+                *self._qcs_bindings_from_settings(
+                    self._experiment_panel.qcs_settings_dict()
+                ),
+                require_complete_rf=False,
+            )
         self._multi_ctrl.refresh_table()
         self.refresh_panel_table()
         self._port_select(len(self._pulse) - 1)
@@ -13417,6 +16785,50 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         return wrapper
     def refresh_panel_table(self):
         """Refresh the control panel table with current pulse data."""
+        backend = (
+            self._experiment_panel.execution_backend()
+            if hasattr(self, "_experiment_panel")
+            else DEFAULT_EXECUTION_BACKEND
+        )
+        is_qcs = backend == EXECUTION_BACKEND_QCS
+        header_item = self._multi_ctrl.panel_table.horizontalHeaderItem(2)
+        if header_item is not None:
+            header_item.setText(
+                "QCS channel" if is_qcs else "QICK output"
+            )
+        qcs_dc_names: Tuple[str, ...] = ()
+        qcs_dc_mappings = {}
+        if is_qcs and hasattr(self, "_experiment_panel"):
+            try:
+                qcs_settings = self._experiment_panel.qcs_settings_dict()
+                qcs_dc_names = tuple(
+                    str(name)
+                    for name in qcs_settings.get(
+                        "dc_channel_names",
+                        (),
+                    )
+                )
+                configuration = qcs_settings.get(
+                    "hardware_configuration"
+                )
+                if configuration is not None:
+                    normalized = normalize_qcs_hardware_configuration(
+                        configuration,
+                        required_dc_count=len(self._pulse),
+                    )
+                    qcs_dc_mappings = {
+                        int(mapping["logical_index"]): mapping
+                        for mapping in normalized["channel_mappings"]
+                        if mapping["role"] == "dc"
+                    }
+            except (TypeError, ValueError):
+                qcs_dc_names = tuple(
+                    name.strip()
+                    for name in (
+                        self._experiment_panel.qcs_dc_channel_names.text()
+                    ).split(",")
+                    if name.strip()
+                )
         self._multi_ctrl.panel_table.setRowCount(len(self._multi_ctrl._ctrl_pannels))
         for idx, _ in enumerate(self._multi_ctrl._ctrl_pannels):
             item_idx = QtWidgets.QTableWidgetItem(str(idx + 1))
@@ -13435,11 +16847,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             item_color.setBackground(table_color)
             self._multi_ctrl.panel_table.setItem(idx, 1, item_color)
 
-            item_qick = QtWidgets.QTableWidgetItem(
-                f"gen {self._qick_awg_channels[idx]}"
+            if is_qcs:
+                channel_text = (
+                    qcs_dc_names[idx]
+                    if idx < len(qcs_dc_names)
+                    else f"DC {idx}: not mapped"
+                )
+                mapping = qcs_dc_mappings.get(idx)
+                if mapping is not None:
+                    channel_text += (
+                        f" | slot {int(mapping['slot'])} "
+                        f"ch{int(mapping['channel'])}"
+                    )
+            else:
+                channel_text = f"gen {self._qick_awg_channels[idx]}"
+            item_hardware = QtWidgets.QTableWidgetItem(channel_text)
+            item_hardware.setTextAlignment(QtCore.Qt.AlignCenter)
+            self._multi_ctrl.panel_table.setItem(
+                idx,
+                2,
+                item_hardware,
             )
-            item_qick.setTextAlignment(QtCore.Qt.AlignCenter)
-            self._multi_ctrl.panel_table.setItem(idx, 2, item_qick)
 
             btn_x = QtWidgets.QPushButton("set_x")
             btn_x.clicked.connect(self._make_row_slot(self._set_x))
@@ -13454,9 +16882,18 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _refresh_stability_targets(self) -> None:
         if not hasattr(self, "_stability_panel"):
             return
+        channels = (
+            tuple(range(len(self._pulse)))
+            if (
+                hasattr(self, "_experiment_panel")
+                and self._experiment_panel.execution_backend()
+                == EXECUTION_BACKEND_QCS
+            )
+            else self._qick_awg_channels
+        )
         self._stability_panel.refresh_targets(
             self._qick_output_names(),
-            self._qick_awg_channels,
+            channels,
         )
 
     def _set_x(self, idx):
@@ -13508,8 +16945,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.warning(
                 self,
-                "QICK task running",
-                "The QICK task is still running. Wait for it to finish before closing.",
+                "Hardware task running",
+                "The hardware task is still running. Wait for it to finish before closing.",
             )
             event.ignore()
             return

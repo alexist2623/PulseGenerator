@@ -1,8 +1,8 @@
-"""Two-electrode QICK stability-diagram acquisition and display.
+"""Two-electrode QICK/QCS stability-diagram acquisition and display.
 
 Continuous acquisition intentionally bypasses QCoDeS.  A saved single shot
-uses the existing split-array FIR DDR storage path so the complete I/Q trace
-remains available in addition to the displayed coherent mean.
+uses the existing split-array storage path. QICK retains its complete FIR I/Q
+trace; QCS hardware-demodulated sweeps store one integrated IQ value per shot.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -52,7 +52,17 @@ try:
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
+        store_experiment_result,
         store_qick_result,
+    )
+    from .qcs_qcodes_experiment import (
+        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        QCS_M5200_SAMPLE_RATE_HZ,
+        StoredQcsExperiment,
+        build_qcs_executor,
+        compile_qcs_stability_hardware_sweep,
+        execute_qcs_stability_hardware_sweep,
+        load_qcs_channel_mapper,
     )
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
@@ -82,7 +92,17 @@ except ImportError:
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
+        store_experiment_result,
         store_qick_result,
+    )
+    from qcs_qcodes_experiment import (
+        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        QCS_M5200_SAMPLE_RATE_HZ,
+        StoredQcsExperiment,
+        build_qcs_executor,
+        compile_qcs_stability_hardware_sweep,
+        execute_qcs_stability_hardware_sweep,
+        load_qcs_channel_mapper,
     )
     from sparameter_gui import RfPathCorrectionWidget
 
@@ -408,7 +428,7 @@ class StoredStabilityDiagram:
     """Displayed diagram paired with its full QCoDeS single-shot run."""
 
     diagram: StabilityDiagramResult
-    experiment: StoredQickExperiment
+    experiment: Any
 
     @property
     def run_id(self) -> int:
@@ -495,6 +515,13 @@ def _is_stability_metadata(metadata: Mapping[str, Any]) -> bool:
     gui_settings = metadata.get("gui_settings", {})
     if not isinstance(gui_settings, Mapping):
         return False
+    stability_settings = gui_settings.get("stability_diagram", {})
+    if (
+        isinstance(stability_settings, Mapping)
+        and str(stability_settings.get("capture_mode", ""))
+        in {"qcs_hardware_sweep", "qick_hardware_sweep"}
+    ):
+        return True
     qick_settings = gui_settings.get("qick", {})
     return (
         isinstance(qick_settings, Mapping)
@@ -514,48 +541,81 @@ def list_stability_runs(database_path: Any) -> Tuple[StabilityRunSummary, ...]:
             str(row[1])
             for row in connection.execute("PRAGMA table_info(runs)")
         }
-        if "qick_experiment_json" not in columns:
+        metadata_columns = [
+            name
+            for name in (
+                "qick_experiment_json",
+                "qcs_experiment_json",
+            )
+            if name in columns
+        ]
+        if not metadata_columns:
             return ()
         rows = connection.execute(
-            "SELECT run_id, qick_experiment_json FROM runs "
-            "WHERE qick_experiment_json IS NOT NULL "
-            "AND qick_experiment_json != '' "
+            "SELECT run_id, "
+            + ", ".join(metadata_columns)
+            + " FROM runs WHERE "
+            + " OR ".join(
+                f"({name} IS NOT NULL AND {name} != '')"
+                for name in metadata_columns
+            )
+            + " "
             "ORDER BY run_id DESC"
         ).fetchall()
     finally:
         connection.close()
 
     summaries = []
-    for run_id, payload_text in rows:
-        try:
-            metadata = json.loads(payload_text)
-            if not isinstance(metadata, Mapping) or not _is_stability_metadata(
-                metadata
+    for row in rows:
+        run_id = row[0]
+        for payload_text in row[1:]:
+            if not payload_text:
+                continue
+            try:
+                metadata = json.loads(payload_text)
+                if (
+                    not isinstance(metadata, Mapping)
+                    or not _is_stability_metadata(metadata)
+                ):
+                    continue
+                x_axis, y_axis = _stability_axis_metadata(metadata)
+                layout = metadata.get("measurement_layout", {})
+                sample_rate_hz = float(
+                    layout.get(
+                        "sample_rate_hz",
+                        1.0e6
+                        / float(layout.get("sample_period_us", 1.0)),
+                    )
+                )
+                summaries.append(
+                    StabilityRunSummary(
+                        database_path=str(path),
+                        run_id=int(run_id),
+                        created_at_utc=str(
+                            metadata.get("created_at_utc", "")
+                        ),
+                        x_axis_label=str(
+                            x_axis.get("output_name", "X")
+                        ),
+                        y_axis_label=str(
+                            y_axis.get("output_name", "Y")
+                        ),
+                        x_points=int(x_axis.get("count", 0)),
+                        y_points=int(y_axis.get("count", 0)),
+                        iq_unit=str(
+                            layout.get("iq_unit", "ADC units")
+                        ),
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                )
+                break
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
             ):
                 continue
-            x_axis, y_axis = _stability_axis_metadata(metadata)
-            layout = metadata.get("measurement_layout", {})
-            sample_rate_hz = float(
-                layout.get(
-                    "sample_rate_hz",
-                    1.0e6 / float(layout.get("sample_period_us", 1.0)),
-                )
-            )
-            summaries.append(
-                StabilityRunSummary(
-                    database_path=str(path),
-                    run_id=int(run_id),
-                    created_at_utc=str(metadata.get("created_at_utc", "")),
-                    x_axis_label=str(x_axis.get("output_name", "X")),
-                    y_axis_label=str(y_axis.get("output_name", "Y")),
-                    x_points=int(x_axis.get("count", 0)),
-                    y_points=int(y_axis.get("count", 0)),
-                    iq_unit=str(layout.get("iq_unit", "ADC units")),
-                    sample_rate_hz=sample_rate_hz,
-                )
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            continue
     return tuple(summaries)
 
 
@@ -572,13 +632,42 @@ def _stored_coordinate_mv(
         return coordinates * 1_000.0
     if unit in {"", "normalized", "fraction"}:
         gui_settings = metadata.get("gui_settings", {})
+        stability_settings = (
+            gui_settings.get("stability_diagram", {})
+            if isinstance(gui_settings, Mapping)
+            else {}
+        )
         qick_settings = (
             gui_settings.get("qick", {})
             if isinstance(gui_settings, Mapping)
             else {}
         )
+        program_summary = metadata.get("program_summary", {})
+        explicit_scale = (
+            stability_settings.get("coordinate_full_scale_mv")
+            if isinstance(stability_settings, Mapping)
+            else None
+        )
+        qcs_scale = (
+            program_summary.get("source_full_scale_mv")
+            if (
+                isinstance(program_summary, Mapping)
+                and program_summary.get("backend") == "qcs"
+                and bool(program_summary.get("hardware_sweep"))
+            )
+            else None
+        )
         full_scale_mv = float(
-            qick_settings.get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
+            explicit_scale
+            if explicit_scale is not None
+            else (
+                qcs_scale
+                if qcs_scale is not None
+                else qick_settings.get(
+                    "full_scale_mv",
+                    DEFAULT_QICK_FULL_SCALE_MV,
+                )
+            )
         )
         return coordinates * full_scale_mv
     raise ValueError(
@@ -699,6 +788,12 @@ def stability_result_from_stored_arrays(
         if isinstance(gui_settings, Mapping)
         else {}
     )
+    program_summary = metadata.get("program_summary", {})
+    is_qcs_hardware_sweep = (
+        isinstance(program_summary, Mapping)
+        and program_summary.get("backend") == "qcs"
+        and bool(program_summary.get("hardware_sweep"))
+    )
     path = Path(database_path).expanduser().resolve()
     return StabilityDiagramResult(
         x_voltage_mv=x_voltage_mv,
@@ -717,10 +812,18 @@ def stability_result_from_stored_arrays(
         repetition_count=int(iq.shape[1]),
         samples_per_trace=int(iq.shape[2]),
         sample_rate_hz=sample_rate_hz,
-        fir_rate_profile=str(
-            qick_settings.get(
-                "fir_rate_profile",
-                "50_ksps" if np.isclose(sample_rate_hz, 50_000.0) else "1_msps",
+        fir_rate_profile=(
+            "qcs_hardware_demod"
+            if is_qcs_hardware_sweep
+            else str(
+                qick_settings.get(
+                    "fir_rate_profile",
+                    (
+                        "50_ksps"
+                        if np.isclose(sample_rate_hz, 50_000.0)
+                        else "1_msps"
+                    ),
+                )
             )
         ),
         source_label=f"QCoDeS Run {int(run_id)}",
@@ -746,11 +849,29 @@ def load_stability_diagram_run(
         ) from exc
     initialise_or_create_database_at(str(path))
     dataset = load_by_id(run_id)
-    arrays = load_qick_iq_arrays(dataset)
-    return stability_result_from_stored_arrays(
-        arrays,
-        database_path=path,
-        run_id=run_id,
+    errors = []
+    for backend_name in ("qick", "qcs"):
+        try:
+            arrays = load_qick_iq_arrays(
+                dataset,
+                backend_name=backend_name,
+            )
+        except Exception as exc:
+            errors.append(exc)
+            continue
+        metadata = arrays.get("metadata", {})
+        if isinstance(metadata, Mapping) and _is_stability_metadata(
+            metadata
+        ):
+            return stability_result_from_stored_arrays(
+                arrays,
+                database_path=path,
+                run_id=run_id,
+            )
+    detail = "; ".join(str(error) for error in errors if str(error))
+    raise ValueError(
+        f"QCoDeS Run {run_id} is not a saved Stability Diagram"
+        + (f": {detail}" if detail else "")
     )
 
 
@@ -983,6 +1104,7 @@ def default_stability_settings(
             "filter_tau_us": DEFAULT_BIAS_T_FILTER_TAU_US,
         },
         "rf_path": dict(DEFAULT_STABILITY_RF_PATH),
+        "qcs_rf_output_logical_index": 0,
         "color_ranges": {
             name: dict(values)
             for name, values in DEFAULT_STABILITY_COLOR_RANGES.items()
@@ -1178,6 +1300,14 @@ def normalize_stability_settings(
     rf_path["output_board_type"] = str(rf_path["output_board_type"])
     rf_path["input_board_type"] = str(rf_path["input_board_type"])
     normalized["rf_path"] = rf_path
+    normalized["qcs_rf_output_logical_index"] = _integer(
+        settings.get(
+            "qcs_rf_output_logical_index",
+            defaults["qcs_rf_output_logical_index"],
+        ),
+        "stability QCS RF output logical index",
+        0,
+    )
     raw_color_ranges = settings.get(
         "color_ranges",
         defaults["color_ranges"],
@@ -1538,6 +1668,9 @@ def reduce_fir_stability_result(
 def _stored_gui_settings_with_vertices(
     gui_settings: Mapping[str, Any],
     sequence: Any,
+    *,
+    fabric_mhz: Optional[float] = None,
+    full_scale_mv: Optional[float] = None,
 ) -> dict:
     stored = dict(gui_settings)
     if not hasattr(sequence, "waveform_vertices"):
@@ -1545,11 +1678,19 @@ def _stored_gui_settings_with_vertices(
     qick_settings = stored.get("qick", {})
     if not isinstance(qick_settings, Mapping):
         return stored
-    fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
+    fabric_mhz = float(
+        qick_settings.get("fabric_mhz", 300.0)
+        if fabric_mhz is None
+        else fabric_mhz
+    )
     full_scale_mv = float(
-        qick_settings.get(
-            "full_scale_mv",
-            DEFAULT_QICK_FULL_SCALE_MV,
+        (
+            qick_settings.get(
+                "full_scale_mv",
+                DEFAULT_QICK_FULL_SCALE_MV,
+            )
+            if full_scale_mv is None
+            else full_scale_mv
         )
     )
     stored["awg_waveform_recipe"] = build_awg_waveform_recipe(
@@ -1768,6 +1909,216 @@ class StabilityDiagramWorker(QtCore.QObject):
         self.stopped.emit()
 
 
+class QcsStabilityDiagramWorker(QtCore.QObject):
+    """Run native QCS Stability hardware sweeps off the GUI thread."""
+
+    scan_ready = QtCore.pyqtSignal(object)
+    single_finished = QtCore.pyqtSignal(object)
+    stopped = QtCore.pyqtSignal()
+    failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        kwargs: Mapping[str, Any],
+        *,
+        continuous: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._kwargs = dict(kwargs)
+        self._continuous = bool(continuous)
+        self._stop_event = Event()
+
+    def request_stop(self) -> None:
+        """Stop after the active complete QCS hardware grid."""
+        self._stop_event.set()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+    def _run(self) -> None:
+        kwargs = dict(self._kwargs)
+        connection_config = kwargs.pop("connection_config")
+        run_config = kwargs.pop("run_config", None)
+        gui_settings = kwargs.pop("gui_settings", None)
+        stability_config = kwargs.pop("stability_config")
+        full_scale_mv = float(kwargs.pop("full_scale_mv"))
+        sequence = kwargs.pop("sequence")
+        repetitions_per_point = int(
+            kwargs.pop("repetitions_per_point")
+        )
+        fabric_mhz = float(kwargs.pop("fabric_mhz", 300.0))
+        rf_pulses = tuple(kwargs.pop("rf_pulses", ()))
+        acquisition = kwargs.pop("acquisition")
+        readout_spec = kwargs.pop("readout_spec", None)
+        qcs_module = kwargs.pop("qcs_module", None)
+        mapper = kwargs.pop("mapper", None)
+        executor = kwargs.pop("executor", None)
+        compiled = kwargs.pop("compiled", None)
+        if kwargs:
+            raise TypeError(
+                "unexpected QCS Stability worker argument(s): "
+                + ", ".join(sorted(kwargs))
+            )
+
+        self.progress_changed.emit(1, "Loading QCS ChannelMapper")
+        if mapper is None:
+            mapper = load_qcs_channel_mapper(
+                connection_config,
+                qcs_module=qcs_module,
+            )
+        if compiled is None:
+            compiled = compile_qcs_stability_hardware_sweep(
+                sequence,
+                connection_config=connection_config,
+                mapper=mapper,
+                repetitions_per_point=repetitions_per_point,
+                fabric_mhz=fabric_mhz,
+                source_full_scale_mv=full_scale_mv,
+                rf_pulses=rf_pulses,
+                acquisition=acquisition,
+                qcs_module=qcs_module,
+            )
+        if executor is None:
+            executor = build_qcs_executor(
+                connection_config,
+                mapper,
+                qcs_module=qcs_module,
+            )
+        self.progress_changed.emit(
+            5,
+            (
+                "QCS native sweep compiled: "
+                f"{compiled.sweep_shape[0]} x "
+                f"{compiled.sweep_shape[1]} points, "
+                f"{repetitions_per_point} repetitions / point"
+            ),
+        )
+        if self._stop_event.is_set():
+            self.stopped.emit()
+            return
+
+        iteration = 0
+        while not self._stop_event.is_set():
+            iteration += 1
+            acquisition_progress_end = 99 if self._continuous else 64
+
+            def scan_progress(percent: int, message: str) -> None:
+                mapped_percent = 5 + round(
+                    max(0, min(100, int(percent)))
+                    * (acquisition_progress_end - 5)
+                    / 100
+                )
+                self.progress_changed.emit(
+                    mapped_percent,
+                    f"Scan {iteration}: {message}",
+                )
+
+            execution = execute_qcs_stability_hardware_sweep(
+                connection_config=connection_config,
+                sequence=sequence,
+                repetitions_per_point=repetitions_per_point,
+                fabric_mhz=fabric_mhz,
+                source_full_scale_mv=full_scale_mv,
+                rf_pulses=rf_pulses,
+                acquisition=acquisition,
+                progress_callback=scan_progress,
+                qcs_module=qcs_module,
+                mapper=mapper,
+                executor=executor,
+                compiled=compiled,
+            )
+            diagram = reduce_fir_stability_result(
+                execution.ddr_result,
+                stability_config,
+                full_scale_mv=full_scale_mv,
+                iteration=iteration,
+                readout_spec=readout_spec,
+            )
+            self.scan_ready.emit(diagram)
+
+            if self._continuous:
+                self.progress_changed.emit(
+                    100,
+                    f"Scan {iteration} complete; starting next hardware scan",
+                )
+                continue
+
+            if run_config is None or gui_settings is None:
+                raise RuntimeError(
+                    "single-shot QCS Stability acquisition requires "
+                    "QCoDeS settings"
+                )
+            stored_settings = _stored_gui_settings_with_vertices(
+                gui_settings,
+                sequence,
+                fabric_mhz=fabric_mhz,
+                full_scale_mv=full_scale_mv,
+            )
+            stored_stability = dict(
+                stored_settings.get("stability_diagram", {})
+            )
+            stored_stability.update({
+                "capture_mode": "qcs_hardware_sweep",
+                "hardware_sweep_shape": list(compiled.sweep_shape),
+                "hardware_sweep_program_count": 1,
+                "hardware_demodulation": True,
+                "bias_t_compensation_applied": False,
+                "measurement_representation_applied": "adc",
+                "qick_only_settings_dormant": True,
+                "coordinate_full_scale_mv": full_scale_mv,
+                "integration_duration_s": (
+                    compiled.acquisition_duration_s
+                ),
+                "requested_acquisition_samples": (
+                    acquisition.sample_count
+                ),
+            })
+            stored_settings["stability_diagram"] = stored_stability
+            effective_run_config = replace(
+                run_config,
+                sample_rate_hz=execution.ddr_result.sample_rate_hz,
+            )
+            dataset, row_count = store_experiment_result(
+                execution.ddr_result,
+                run_config=effective_run_config,
+                connection_config=connection_config,
+                program_summary=execution.program_summary,
+                gui_settings=stored_settings,
+                rf_settings=execution.rf_settings,
+                backend_name="qcs",
+                progress_callback=self.progress_changed.emit,
+                progress_start=65,
+                progress_end=100,
+            )
+            experiment = StoredQcsExperiment(
+                run_id=int(dataset.run_id),
+                guid=str(dataset.guid),
+                database_path=effective_run_config.resolved_database_path,
+                row_count=int(row_count),
+                dataset=dataset,
+                program=execution.programs[0],
+                ddr_result=execution.ddr_result,
+                rf_settings=execution.rf_settings,
+                programs=execution.programs,
+                raw_results=execution.raw_results,
+                program_summary=execution.program_summary,
+            )
+            self.single_finished.emit(
+                StoredStabilityDiagram(
+                    diagram=diagram,
+                    experiment=experiment,
+                )
+            )
+            return
+        self.stopped.emit()
+
+
 class _StabilityAxisEditor(QtWidgets.QGroupBox):
     """Compact editor for one voltage axis."""
 
@@ -1777,7 +2128,13 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         super().__init__(title, parent)
         form = QtWidgets.QFormLayout(self)
         self.output = QtWidgets.QComboBox(self)
+        self.output.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Fixed,
+        )
         self._front_panel_configuration = None
+        self._qcs_front_panel_configuration = None
+        self._hardware_backend = "qick"
         self.front_panel_button = QtWidgets.QPushButton(
             "Select DAC SMA on Front Panel",
             self,
@@ -1789,6 +2146,11 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
             lambda: self.front_panel_requested.emit(self)
         )
         self.front_panel_status = QtWidgets.QLabel("Not identified", self)
+        self.front_panel_status.setWordWrap(True)
+        self.front_panel_status.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.front_panel_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
@@ -1877,7 +2239,64 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         self._front_panel_configuration = configuration
         self._sync_front_panel_status()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.front_panel_button.setText(
+            "Configure QCS DC Channel"
+            if self._hardware_backend == "qcs"
+            else "Select DAC SMA on Front Panel"
+        )
+        self._sync_front_panel_status()
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        self._qcs_front_panel_configuration = configuration
+        self._sync_front_panel_status()
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        return "dc", max(0, self.current_gen_ch())
+
     def _sync_front_panel_status(self, *_args) -> None:
+        if self._hardware_backend == "qcs":
+            logical_index = self.current_gen_ch()
+            configuration = self._qcs_front_panel_configuration
+            if configuration is not None and logical_index >= 0:
+                mapping = next(
+                    (
+                        candidate
+                        for candidate in configuration["channel_mappings"]
+                        if (
+                            candidate["role"] == "dc"
+                            and int(candidate["logical_index"])
+                            == logical_index
+                        )
+                    ),
+                    None,
+                )
+                if mapping is not None:
+                    modules_by_slot = {
+                        int(module["slot"]): module
+                        for module in configuration["modules"]
+                    }
+                    module = modules_by_slot.get(int(mapping["slot"]))
+                    model = (
+                        "M5000"
+                        if module is None
+                        else str(module["model"])
+                    )
+                    self.front_panel_status.setText(
+                        f"{mapping['virtual_name']} / {model} slot "
+                        f"{int(mapping['slot'])} ch{int(mapping['channel'])}"
+                    )
+                    return
+            self.front_panel_status.setText(
+                "No QCS DC output selected"
+                if logical_index < 0
+                else f"QCS DC {logical_index}: not mapped"
+            )
+            return
         generator = self.current_gen_ch()
         if self._front_panel_configuration is not None:
             for port in self._front_panel_configuration.outputs:
@@ -2480,8 +2899,26 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._hardware_backend = "qick"
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
+        self.backend_warning = QtWidgets.QLabel(
+            "QCS Stability uses one native M5301 X/Y hardware-sweep program "
+            f"with M5200 hardware-demodulated acquisition at "
+            f"{format_sample_rate_hz(QCS_M5200_SAMPLE_RATE_HZ)}. Integration "
+            f"lengths must be multiples of "
+            f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples. Raw trace "
+            "capture is unavailable; saved QICK Bias-T settings remain "
+            "dormant and are not applied in this mode.",
+            self,
+        )
+        self.backend_warning.setWordWrap(True)
+        self.backend_warning.setStyleSheet(
+            "QLabel { color: #8a4b08; background: #fff4d6; "
+            "border: 1px solid #e0b96a; padding: 6px; }"
+        )
+        self.backend_warning.hide()
+        outer.addWidget(self.backend_warning)
 
         self.controls_scroll = QtWidgets.QScrollArea(self)
         self.controls_scroll.setWidgetResizable(True)
@@ -2492,6 +2929,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.setSpacing(6)
 
         self.path_diagram = RfPathCorrectionWidget(controls_content, compact=True)
+        self.path_diagram.set_qcs_front_panel_focus("acquisition", 0)
         self.path_diagram.settings_applied.connect(self._apply_local_path_settings)
         self.path_diagram.front_panel_requested.connect(
             self.front_panel_requested.emit
@@ -2518,12 +2956,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.addWidget(self.x_axis)
         controls.addWidget(self.y_axis)
 
-        acquisition = QtWidgets.QGroupBox("Acquisition", controls_content)
-        acquisition_form = QtWidgets.QFormLayout(acquisition)
-        self.repetitions = QtWidgets.QSpinBox(acquisition)
+        self.acquisition_group = QtWidgets.QGroupBox(
+            "Acquisition",
+            controls_content,
+        )
+        acquisition_form = QtWidgets.QFormLayout(self.acquisition_group)
+        acquisition_form.setRowWrapPolicy(
+            QtWidgets.QFormLayout.WrapLongRows
+        )
+        self._acquisition_form = acquisition_form
+        self.repetitions = QtWidgets.QSpinBox(self.acquisition_group)
         self.repetitions.setRange(1, 1_000_000)
         self.repetitions.setValue(DEFAULT_STABILITY_REPETITIONS)
-        self.trace_samples = QtWidgets.QSpinBox(acquisition)
+        self.trace_samples = QtWidgets.QSpinBox(self.acquisition_group)
         self.trace_samples.setRange(1, 10_000_000)
         self.trace_samples.setValue(DEFAULT_STABILITY_TRACE_SAMPLES)
         self.trace_samples.setToolTip(
@@ -2535,13 +2980,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._fir_uses_fpga_trigger_delay: Optional[bool] = None
         self.fir_profile_status = QtWidgets.QLabel(
             "Identify QICK to show the FIR DDR timing",
-            acquisition,
+            self.acquisition_group,
         )
         self.fir_profile_status.setWordWrap(True)
         self.fir_profile_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        self.settle_time_us = QtWidgets.QDoubleSpinBox(acquisition)
+        self.settle_time_us = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
         self.settle_time_us.setRange(0.0, 1.0e9)
         self.settle_time_us.setDecimals(6)
         self.settle_time_us.setValue(DEFAULT_STABILITY_SETTLE_US)
@@ -2552,9 +2999,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
             "Override HWH default",
-            acquisition,
+            self.acquisition_group,
         )
-        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox(acquisition)
+        self.fpga_trigger_delay_us = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
         self.fpga_trigger_delay_us.setRange(0.0, 10_000_000.0)
         self.fpga_trigger_delay_us.setDecimals(6)
         self.fpga_trigger_delay_us.setSuffix(" us")
@@ -2565,7 +3014,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         fpga_delay_row.setContentsMargins(0, 0, 0, 0)
         fpga_delay_row.addWidget(self.override_fpga_trigger_delay)
         fpga_delay_row.addWidget(self.fpga_trigger_delay_us, 1)
-        self.modulation_frequency_mhz = QtWidgets.QDoubleSpinBox(acquisition)
+        self.fpga_delay_widget = QtWidgets.QWidget(self.acquisition_group)
+        self.fpga_delay_widget.setLayout(fpga_delay_row)
+        self.modulation_frequency_mhz = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
         self.modulation_frequency_mhz.setRange(-10_000.0, 10_000.0)
         self.modulation_frequency_mhz.setDecimals(9)
         self.modulation_frequency_mhz.setValue(
@@ -2576,19 +3029,38 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "Shared DDS/DDC modulation frequency. The same value configures "
             "the selected RF or DC output and input; use 0 MHz for DC."
         )
-        self.modulation_gain = QtWidgets.QSpinBox(acquisition)
+        self.modulation_gain = QtWidgets.QSpinBox(self.acquisition_group)
         self.modulation_gain.setRange(0, 32767)
         self.modulation_gain.setValue(DEFAULT_STABILITY_MODULATION_GAIN)
         self.modulation_gain.setToolTip(
             "DAC gain code for the measurement modulation output"
         )
-        self.point_count = QtWidgets.QLabel("2,601", acquisition)
+        self.qcs_modulation_amplitude = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
+        self.qcs_modulation_amplitude.setRange(0.0, 1.0)
+        self.qcs_modulation_amplitude.setDecimals(9)
+        self.qcs_modulation_amplitude.setSingleStep(0.01)
+        self.qcs_modulation_amplitude.setValue(
+            self.modulation_gain.value() / 32767.0
+        )
+        self.qcs_modulation_amplitude.setToolTip(
+            "QCS RF waveform amplitude relative to the configured "
+            "signal-generator output range"
+        )
+        self.point_count = QtWidgets.QLabel(
+            "2,601",
+            self.acquisition_group,
+        )
         self.point_count.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.dc_measure_mode = QtWidgets.QCheckBox("DC measure mode", acquisition)
+        self.dc_measure_mode = QtWidgets.QCheckBox(
+            "DC measure mode",
+            self.acquisition_group,
+        )
         self.dc_measure_mode.setToolTip(
             "DC_In only: convert FIR I/Q to current using voltage / gain"
         )
-        self.measurement_unit = QtWidgets.QComboBox(acquisition)
+        self.measurement_unit = QtWidgets.QComboBox(self.acquisition_group)
         self.measurement_unit.addItem("ADC units", "adc")
         self.measurement_unit.addItem("Voltage", "voltage")
         self.measurement_unit.addItem("Current", "current")
@@ -2597,31 +3069,85 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "current require a DC_In path; current divides voltage by the "
             "measurement gain."
         )
-        self.dc_measure_gain_v_per_a = QtWidgets.QDoubleSpinBox(acquisition)
+        self.dc_measure_gain_v_per_a = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
         self.dc_measure_gain_v_per_a.setRange(1.0e-9, 1.0e15)
         self.dc_measure_gain_v_per_a.setDecimals(6)
         self.dc_measure_gain_v_per_a.setValue(1.0)
         self.dc_measure_gain_v_per_a.setSuffix(" V/A")
-        acquisition_form.addRow("Repetitions / point:", self.repetitions)
-        acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
-        acquisition_form.addRow("Settle before readout:", self.settle_time_us)
-        acquisition_form.addRow(
-            "FPGA trigger-to-store delay:",
-            fpga_delay_row,
+        self.repetitions_label = QtWidgets.QLabel("Repetitions / point:")
+        self.trace_samples_label = QtWidgets.QLabel(
+            "FIR trace samples / point:"
+        )
+        self.settle_time_label = QtWidgets.QLabel("Settle before readout:")
+        acquisition_form.addRow(self.repetitions_label, self.repetitions)
+        acquisition_form.addRow(self.trace_samples_label, self.trace_samples)
+        acquisition_form.addRow(self.settle_time_label, self.settle_time_us)
+        self.fpga_delay_label = QtWidgets.QLabel(
+            "FPGA trigger-to-store delay:"
         )
         acquisition_form.addRow(
-            "Modulation frequency:",
+            self.fpga_delay_label,
+            self.fpga_delay_widget,
+        )
+        self.modulation_frequency_label = QtWidgets.QLabel(
+            "Modulation frequency:"
+        )
+        acquisition_form.addRow(
+            self.modulation_frequency_label,
             self.modulation_frequency_mhz,
         )
-        acquisition_form.addRow("Modulation gain:", self.modulation_gain)
-        acquisition_form.addRow("Cartesian points:", self.point_count)
-        acquisition_form.addRow("HWH FIR DDR:", self.fir_profile_status)
-        acquisition_form.addRow("Display unit:", self.measurement_unit)
+        self.modulation_gain_label = QtWidgets.QLabel("Modulation gain:")
+        self.qcs_modulation_amplitude_label = QtWidgets.QLabel(
+            "Relative amplitude:"
+        )
         acquisition_form.addRow(
-            "DC measurement gain:",
+            self.modulation_gain_label,
+            self.modulation_gain,
+        )
+        acquisition_form.addRow(
+            self.qcs_modulation_amplitude_label,
+            self.qcs_modulation_amplitude,
+        )
+        self.point_count_label = QtWidgets.QLabel("Cartesian points:")
+        acquisition_form.addRow(self.point_count_label, self.point_count)
+        self.fir_profile_label = QtWidgets.QLabel("HWH FIR DDR:")
+        acquisition_form.addRow(
+            self.fir_profile_label,
+            self.fir_profile_status,
+        )
+        self.measurement_unit_label = QtWidgets.QLabel("Display unit:")
+        acquisition_form.addRow(
+            self.measurement_unit_label,
+            self.measurement_unit,
+        )
+        self.dc_measure_gain_label = QtWidgets.QLabel(
+            "DC measurement gain:"
+        )
+        acquisition_form.addRow(
+            self.dc_measure_gain_label,
             self.dc_measure_gain_v_per_a,
         )
-        controls.addWidget(acquisition)
+        for label in (
+            self.repetitions_label,
+            self.trace_samples_label,
+            self.settle_time_label,
+            self.fpga_delay_label,
+            self.modulation_frequency_label,
+            self.modulation_gain_label,
+            self.qcs_modulation_amplitude_label,
+            self.point_count_label,
+            self.fir_profile_label,
+            self.measurement_unit_label,
+            self.dc_measure_gain_label,
+        ):
+            label.setWordWrap(True)
+            label.setSizePolicy(
+                QtWidgets.QSizePolicy.Ignored,
+                QtWidgets.QSizePolicy.Preferred,
+            )
+        controls.addWidget(self.acquisition_group)
 
         self.bias_t_group = QtWidgets.QGroupBox(
             "Bias-T compensation",
@@ -2752,7 +3278,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.saved_run_combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
-        self.saved_run_combo.setMinimumContentsLength(28)
+        self.saved_run_combo.setMinimumContentsLength(12)
+        self.saved_run_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Fixed,
+        )
         self.refresh_saved_runs_button = QtWidgets.QPushButton(
             "Refresh Runs",
             saved_plot_group,
@@ -2865,6 +3395,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.fpga_trigger_delay_us.valueChanged.connect(
             self._update_fir_trace_duration
         )
+        self.modulation_gain.valueChanged.connect(
+            self._sync_qcs_modulation_amplitude
+        )
+        self.qcs_modulation_amplitude.valueChanged.connect(
+            self._apply_qcs_modulation_amplitude
+        )
         self.measurement_unit.currentIndexChanged.connect(
             self._measurement_representation_changed
         )
@@ -2901,6 +3437,104 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
+        self._update_backend_presentation()
+
+    def _set_acquisition_row_visible(
+        self,
+        field: QtWidgets.QWidget,
+        visible: bool,
+    ) -> None:
+        label = self._acquisition_form.labelForField(field)
+        if label is not None:
+            label.setVisible(bool(visible))
+        field.setVisible(bool(visible))
+
+    def _sync_qcs_modulation_amplitude(self, *_args) -> None:
+        with QtCore.QSignalBlocker(self.qcs_modulation_amplitude):
+            self.qcs_modulation_amplitude.setValue(
+                self.modulation_gain.value() / 32767.0
+            )
+
+    def _apply_qcs_modulation_amplitude(self, *_args) -> None:
+        gain = int(
+            np.clip(
+                round(self.qcs_modulation_amplitude.value() * 32767.0),
+                0,
+                32767,
+            )
+        )
+        with QtCore.QSignalBlocker(self.modulation_gain):
+            self.modulation_gain.setValue(gain)
+        with QtCore.QSignalBlocker(self.qcs_modulation_amplitude):
+            self.qcs_modulation_amplitude.setValue(gain / 32767.0)
+
+    def _update_backend_presentation(self) -> None:
+        is_qcs = self._hardware_backend == "qcs"
+        self.acquisition_group.setTitle(
+            "QCS Stability Configuration"
+            if is_qcs
+            else "Acquisition"
+        )
+        self._set_acquisition_row_visible(self.modulation_gain, not is_qcs)
+        self._set_acquisition_row_visible(
+            self.qcs_modulation_amplitude,
+            is_qcs,
+        )
+        self._set_acquisition_row_visible(self.fpga_delay_widget, not is_qcs)
+        self._set_acquisition_row_visible(self.fir_profile_status, not is_qcs)
+        self._set_acquisition_row_visible(self.measurement_unit, not is_qcs)
+        self._set_acquisition_row_visible(
+            self.dc_measure_gain_v_per_a,
+            not is_qcs,
+        )
+        self.dc_calibration_group.setVisible(not is_qcs)
+        self.bias_t_group.setVisible(not is_qcs)
+        self.trace_samples_label.setText(
+            "Integration length (M5200 samples):"
+            if is_qcs
+            else "FIR trace samples / point:"
+        )
+        self.trace_samples.setSingleStep(
+            QCS_M5200_INTEGRATION_BLOCK_SAMPLES if is_qcs else 1
+        )
+        self.settle_time_label.setText(
+            "Settle before acquisition:"
+            if is_qcs
+            else "Settle before readout:"
+        )
+        self.modulation_frequency_label.setText(
+            "RF frequency:"
+            if is_qcs
+            else "Modulation frequency:"
+        )
+        self.trace_samples.setToolTip(
+            "M5200 ADC samples integrated at every Stability point and "
+            "repetition. QCS requires a multiple of "
+            f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples."
+            if is_qcs
+            else (
+                "Number of post-FIR samples stored at the HWH-selected rate "
+                "for every stability point and repetition"
+            )
+        )
+        self.settle_time_us.setToolTip(
+            "Time to hold each new X/Y voltage before the RF waveform and "
+            "QCS acquisition begin"
+            if is_qcs
+            else (
+                "Time to hold each new X/Y voltage before RF modulation and "
+                "FIR-DDR capture begin"
+            )
+        )
+        self.modulation_frequency_mhz.setToolTip(
+            "RF frequency of the QCS waveform on the selected virtual channel"
+            if is_qcs
+            else (
+                "Shared DDS/DDC modulation frequency. The same value configures "
+                "the selected RF or DC output and input; use 0 MHz for DC."
+            )
+        )
+        self._sync_qcs_modulation_amplitude()
 
     def _update_dc_measure_controls(self) -> None:
         editable = self._dc_input_available and not self._running
@@ -3198,6 +3832,33 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
         self._update_fir_trace_duration()
 
+    def set_hardware_backend(self, backend: str) -> None:
+        self._hardware_backend = str(backend).strip().lower()
+        self.path_diagram.set_hardware_backend(backend)
+        self.x_axis.set_hardware_backend(backend)
+        self.y_axis.set_hardware_backend(backend)
+        is_qcs = self._hardware_backend == "qcs"
+        self._update_backend_presentation()
+        self.backend_warning.setVisible(is_qcs)
+        idle_enabled = (
+            not self._running
+            and not self._saved_run_loading
+            and self._targets_available
+        )
+        self.start_button.setEnabled(idle_enabled)
+        self.single_shot_button.setEnabled(idle_enabled)
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        self.path_diagram.set_qcs_front_panel_configuration(configuration)
+        self.x_axis.set_qcs_front_panel_configuration(configuration)
+        self.y_axis.set_qcs_front_panel_configuration(configuration)
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        return self.path_diagram.qcs_front_panel_selection()
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
         self.override_fpga_trigger_delay.setEnabled(supported)
@@ -3315,6 +3976,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 "filter_tau_us": self.bias_t_filter_tau_us.value(),
             },
             "rf_path": dict(self.front_panel_values()),
+            "qcs_rf_output_logical_index": int(
+                self.path_diagram.qcs_output_mapping_selector.currentData()
+                if (
+                    self.path_diagram
+                    .qcs_output_mapping_selector.currentData()
+                    is not None
+                )
+                else self.path_diagram.output_ch.value()
+            ),
             "color_ranges": self.plot.color_range_settings(),
             "visible_data": list(self.plot.visible_data()),
             "database_path": self.database_path_value(),
@@ -3404,6 +4074,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.bias_t_filter_tau_us.setValue(float(bias_t["filter_tau_us"]))
         self.apply_path_settings(
             settings.get("rf_path", DEFAULT_STABILITY_RF_PATH)
+        )
+        self.path_diagram.set_qcs_front_panel_focus(
+            "rf",
+            int(settings.get("qcs_rf_output_logical_index", 0)),
         )
         self.plot.load_color_range_settings(
             settings.get(
@@ -3519,6 +4193,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.modulation_frequency_mhz.setEnabled(not running)
         self.modulation_gain.setEnabled(not running)
+        self.qcs_modulation_amplitude.setEnabled(not running)
         self.bias_t_group.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
         database_enabled = not running and not self._saved_run_loading
@@ -3554,11 +4229,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         trace_us = (
             result.samples_per_trace * 1_000_000.0 / result.sample_rate_hz
         )
+        if result.fir_rate_profile == "qcs_hardware_demod":
+            acquisition_summary = (
+                "one hardware-demodulated IQ value / repetition"
+            )
+        else:
+            acquisition_summary = (
+                f"{result.samples_per_trace:,} samples at "
+                f"{rate_label} = {trace_us:g} us / trace"
+            )
         self.status.setText(
             f"{result.source_label or f'Scan {result.iteration}'} complete: "
             f"{result.magnitude.shape[1]} x {result.magnitude.shape[0]} points "
-            f"({result.value_unit}); {result.samples_per_trace:,} samples at "
-            f"{rate_label} = {trace_us:g} us / trace"
+            f"({result.value_unit}); {acquisition_summary}"
         )
 
     def show_loaded_run(self, result: StabilityDiagramResult) -> None:
@@ -3567,11 +4250,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.saved_run_status.setText(
             f"Loaded {result.source_label} from {result.database_path}."
         )
+        acquisition_summary = (
+            f"{result.repetition_count} repetitions, one "
+            "hardware-demodulated QCS IQ value each."
+            if result.fir_rate_profile == "qcs_hardware_demod"
+            else (
+                f"{result.repetition_count} repetitions x "
+                f"{result.samples_per_trace} FIR samples."
+            )
+        )
         self.status.setText(
             f"Displaying {result.source_label}: "
             f"{result.magnitude.shape[1]} x {result.magnitude.shape[0]} points, "
-            f"{result.repetition_count} repetitions x "
-            f"{result.samples_per_trace} FIR samples."
+            f"{acquisition_summary}"
         )
 
     def show_saved_result(self, stored: StoredStabilityDiagram) -> None:
@@ -3588,10 +4279,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         return self.plot
 
     def _set_idle_button_state(self) -> None:
-        if self.stop_button.isEnabled():
-            return
-        self.start_button.setEnabled(self._targets_available)
-        self.single_shot_button.setEnabled(self._targets_available)
+        idle_enabled = (
+            not self._running
+            and not self._saved_run_loading
+            and self._targets_available
+        )
+        self.start_button.setEnabled(idle_enabled)
+        self.single_shot_button.setEnabled(idle_enabled)
 
     def _update_point_count(self, *_args) -> None:
         self.point_count.setText(
@@ -3616,6 +4310,7 @@ __all__ = [
     "StabilityDiagramPlotWidget",
     "StabilityDiagramResult",
     "StabilityDiagramWorker",
+    "QcsStabilityDiagramWorker",
     "StabilityOverlayLoadWorker",
     "StabilityOverlaySelector",
     "StabilityRunSummary",

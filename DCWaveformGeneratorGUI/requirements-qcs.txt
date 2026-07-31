@@ -1,0 +1,17 @@
+# Keysight QCS 2.5.5 runtime profile.
+#
+# Install keysight-qcs from the authenticated Keysight package index before
+# installing this file.  QCS 2.5.5 requires NumPy < 2 and its qcs-common
+# package still imports pkg_resources, so this profile intentionally differs
+# from requirements.txt and pins setuptools below 81.
+setuptools<81
+numpy==1.26.4
+scipy==1.17.1
+PyQt5==5.15.11
+Pillow==12.3.0
+pyqtgraph==0.14.0
+matplotlib==3.11.0
+qcodes==0.58.0
+plottr==0.15.0
+PyVISA==1.16.2
+keysight-qcs==2.5.5

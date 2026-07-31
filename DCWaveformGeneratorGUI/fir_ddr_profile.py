@@ -168,6 +168,8 @@ def format_sample_rate_hz(sample_rate_hz: Any) -> str:
         return "1 MSPS"
     if abs(rate_hz - 50_000.0) <= 0.5:
         return "50 kSPS"
+    if rate_hz >= 1_000_000_000.0:
+        return f"{rate_hz / 1_000_000_000.0:g} GSPS"
     if rate_hz >= 1_000_000.0:
         return f"{rate_hz / 1_000_000.0:g} MSPS"
     if rate_hz >= 1_000.0:
