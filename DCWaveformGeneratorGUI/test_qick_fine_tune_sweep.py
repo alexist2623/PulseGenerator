@@ -1622,6 +1622,145 @@ def test_counter_progress_tracks_hardware_sweep_and_repetition_count():
     assert calls[-1] == ("source", "internal")
 
 
+def test_program_compilation_observes_cancellation_between_sweep_points():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 10)
+    sequence.set_amplitude_sweep("start", "awg_0", -0.4, 0.4, 100)
+
+    class Cancelled(RuntimeError):
+        pass
+
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        if checks >= 10:
+            raise Cancelled("compile stopped")
+
+    with pytest.raises(Cancelled, match="compile stopped"):
+        sequence.make_program(
+            _mock_soccfg(1),
+            awg_channels=(0,),
+            repetitions_per_sweep=1,
+            compile_validation_mode=COMPILE_VALIDATION_FULL,
+            cancel_check=cancel_check,
+        )
+
+    assert checks == 10
+
+
+def test_counter_progress_cancellation_stops_tprocessor():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("start", (0.0,), 10)
+    sequence.set_amplitude_sweep("start", "awg_0", -0.2, 0.2, 3)
+    program = sequence.make_program(
+        _mock_soccfg(1),
+        awg_channels=(0,),
+        repetitions_per_sweep=2,
+    )
+    calls = []
+
+    class Cancelled(RuntimeError):
+        pass
+
+    class FakeSoc:
+        def reload_mem(self):
+            calls.append("reload")
+
+        def clear_tproc_counter(self, addr):
+            calls.append(("clear", addr))
+
+        def start_src(self, source):
+            calls.append(("source", source))
+
+        def start_tproc(self):
+            calls.append("start")
+
+        def stop_tproc(self):
+            calls.append("stop")
+
+        def get_tproc_counter(self, addr):
+            calls.append(("counter", addr))
+            return 0
+
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        if checks >= 4:
+            raise Cancelled("stop")
+
+    program.config_all = lambda *args, **kwargs: calls.append("config")
+    with pytest.raises(Cancelled, match="stop"):
+        program._run_rounds_with_counter_progress(
+            FakeSoc(),
+            lambda _completed, _total: None,
+            poll_interval_seconds=0.0,
+            cancel_check=cancel_check,
+        )
+
+    assert calls.count("start") == 1
+    assert calls.count("stop") == 1
+    assert calls[-1] == ("source", "internal")
+
+
+def test_fir_ddr_cancellation_stops_between_readback_chunks(monkeypatch):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("capture", (0.0,), 300)
+    sequence.set_amplitude_sweep("capture", "awg_0", -0.2, 0.2, 3)
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="50_ksps"),
+        awg_channels=(0,),
+        repetitions_per_sweep=2,
+        ddr_readout=DdrFirReadoutConfig(
+            ro_ch=0,
+            samples_per_trigger=2,
+            at_segment="capture",
+            margin_input_samples=0,
+            settle_seconds=0.0,
+        ),
+    )
+
+    class Cancelled(RuntimeError):
+        pass
+
+    class FakeSoc:
+        def __init__(self):
+            self.cancelled = False
+            self.read_calls = 0
+
+        def arm_ddr4_fir_samples(self, **kwargs):
+            return kwargs["n_triggers"] * 8
+
+        def get_ddr4_fir_samples(self, **kwargs):
+            self.read_calls += 1
+            self.cancelled = True
+            return np.zeros((kwargs["n_triggers"] * 2, 2), dtype=np.int16)
+
+    soc = FakeSoc()
+    monkeypatch.setattr(
+        program,
+        "_run_rounds_with_counter_progress",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def cancel_check():
+        if soc.cancelled:
+            raise Cancelled("readback stopped")
+
+    with pytest.raises(Cancelled, match="readback stopped"):
+        program.acquire_fir_ddr(
+            soc,
+            progress=False,
+            cancel_check=cancel_check,
+            readback_chunk_triggers=2,
+        )
+
+    assert soc.read_calls == 1
+
+
 def test_bias_t_preview_cancels_positive_and_negative_physical_area():
     sequence = FineTuneSequence(("awg_0", "awg_1"))
     sequence.add_set("hold", (0.2, -0.1), 10)

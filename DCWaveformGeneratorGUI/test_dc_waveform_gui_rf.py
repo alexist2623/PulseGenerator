@@ -1567,7 +1567,49 @@ def test_experiment_panel_exposes_show_program_action():
     panel.set_running(True, "Compiling", show_progress=False)
     assert panel.run_button.isEnabled() is False
     assert panel.show_program_button.isEnabled() is False
+    assert panel.stop_button.isEnabled() is False
     assert panel.progress.isVisible() is False
+    panel.close()
+
+
+def test_experiment_panel_stop_button_and_worker_cancellation(monkeypatch):
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+    stop_requests = []
+    panel.stop_requested.connect(lambda: stop_requests.append(True))
+    panel.set_running(
+        True,
+        "Running",
+        show_progress=True,
+        can_cancel=True,
+    )
+    assert panel.stop_button.isEnabled() is True
+    panel.stop_button.click()
+    app.processEvents()
+    assert stop_requests == [True]
+    panel.set_running(False, "Stopped")
+    assert panel.stop_button.isEnabled() is False
+
+    def fake_run(**kwargs):
+        kwargs["cancel_check"]()
+        raise AssertionError("cancel_check should have raised")
+
+    monkeypatch.setattr(gui, "run_qick_qcodes_experiment", fake_run)
+    worker = gui.QickExperimentWorker({})
+    cancellations = []
+    failures = []
+    worker.cancelled.connect(cancellations.append)
+    worker.failed.connect(failures.append)
+    worker.request_cancel()
+    worker.run()
+    assert cancellations == ["Experiment stopped by user"]
+    assert failures == []
     panel.close()
 
 

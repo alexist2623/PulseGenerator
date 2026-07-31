@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import threading
 import traceback
 from typing import Tuple, Optional, List, Callable, Mapping, Sequence
 import numpy as np
@@ -173,6 +174,7 @@ try:
         COMPILE_VALIDATION_BOUNDARY,
         COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
+        ExperimentCancelled,
         QcodesRunConfig,
         QickConnectionConfig,
         build_awg_vertex_record,
@@ -194,6 +196,7 @@ except ImportError:
         COMPILE_VALIDATION_BOUNDARY,
         COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
+        ExperimentCancelled,
         QcodesRunConfig,
         QickConnectionConfig,
         build_awg_vertex_record,
@@ -5176,6 +5179,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     """QCoDeS database, AWG scale, and direct-run controls."""
 
     run_requested = QtCore.pyqtSignal()
+    stop_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
     awg_metadata_requested = QtCore.pyqtSignal()
     sweep_axes_changed = QtCore.pyqtSignal()
@@ -5538,6 +5542,16 @@ class ExperimentPanel(QtWidgets.QWidget):
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
         self.run_button.clicked.connect(self.run_requested.emit)
+        self.stop_button = QtWidgets.QPushButton("Stop Experiment")
+        self.stop_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        )
+        self.stop_button.setToolTip(
+            "Stop tProcessor execution and cancel pending DDR readback or "
+            "QCoDeS saving"
+        )
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_requested.emit)
         self.show_program_button = QtWidgets.QPushButton("Show QICK Program")
         self.show_program_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView)
@@ -5548,6 +5562,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.show_program_button.clicked.connect(self.show_program_requested.emit)
         action_row = QtWidgets.QHBoxLayout()
         action_row.addWidget(self.run_button)
+        action_row.addWidget(self.stop_button)
         action_row.addWidget(self.show_program_button)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
@@ -6352,10 +6367,16 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
 
     def set_running(
-        self, running: bool, message: str, *, show_progress: bool = True
+        self,
+        running: bool,
+        message: str,
+        *,
+        show_progress: bool = True,
+        can_cancel: bool = False,
     ) -> None:
         self.run_button.setEnabled(not running)
         self.show_program_button.setEnabled(not running)
+        self.stop_button.setEnabled(running and can_cancel)
         if running:
             self.progress.setValue(0)
         self.progress.setVisible(running and show_progress)
@@ -6453,6 +6474,14 @@ class ExperimentPanel(QtWidgets.QWidget):
                 f" | stage {self._format_elapsed_ms(elapsed_ms - started_ms)}"
             )
             state_text = "FAILED"
+        elif state == "cancelled":
+            started_ms = self._run_stage_starts.pop(
+                key, self._run_last_event_ms
+            )
+            duration_text = (
+                f" | stage {self._format_elapsed_ms(elapsed_ms - started_ms)}"
+            )
+            state_text = "CANCELLED"
         else:
             state_text = "INFO"
         completed_at = QtCore.QDateTime.currentDateTime().toString(
@@ -6467,7 +6496,13 @@ class ExperimentPanel(QtWidgets.QWidget):
         scrollbar.setValue(scrollbar.maximum())
         self._update_run_elapsed_label()
 
-    def finish_run_timeline(self, message: str, *, success: bool) -> None:
+    def finish_run_timeline(
+        self,
+        message: str,
+        *,
+        success: bool,
+        cancelled: bool = False,
+    ) -> None:
         if not self._run_timeline_active:
             return
         if not success:
@@ -6479,12 +6514,16 @@ class ExperimentPanel(QtWidgets.QWidget):
             for key in pending_stages:
                 self.record_run_event(
                     key,
-                    "failed",
-                    "Stage interrupted by experiment failure",
+                    "cancelled" if cancelled else "failed",
+                    (
+                        "Stage interrupted by user cancellation"
+                        if cancelled
+                        else "Stage interrupted by experiment failure"
+                    ),
                 )
         self.record_run_event(
             "experiment",
-            "completed" if success else "failed",
+            "completed" if success else ("cancelled" if cancelled else "failed"),
             message,
         )
         self._run_final_elapsed_ms = int(self._run_elapsed_timer.elapsed())
@@ -6540,12 +6579,22 @@ class QickExperimentWorker(QtCore.QObject):
 
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
+    cancelled = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
     event_changed = QtCore.pyqtSignal(str, str, str)
 
     def __init__(self, kwargs: dict, parent=None):
         super().__init__(parent)
         self._kwargs = kwargs
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        """Thread-safe request observed at cooperative cancellation points."""
+        self._cancel_event.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancel_event.is_set():
+            raise ExperimentCancelled("Experiment stopped by user")
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -6553,7 +6602,11 @@ class QickExperimentWorker(QtCore.QObject):
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
             kwargs["event_callback"] = self.event_changed.emit
+            kwargs["cancel_check"] = self._check_cancel
             result = run_qick_qcodes_experiment(**kwargs)
+        except ExperimentCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -7650,6 +7703,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self.sweep_state_changed.connect(self._synchronize_sweep_views)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
+        self._experiment_panel.stop_requested.connect(
+            self._stop_qick_experiment
+        )
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
         )
@@ -10611,6 +10667,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"({sweep_points * repetitions:,} acquisitions, "
                 f"{expected_rows:,} IQ sample rows)"
             ),
+            can_cancel=True,
         )
         self.statusBar().showMessage("QICK experiment running")
         thread = QtCore.QThread(self)
@@ -10619,17 +10676,43 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_experiment_finished)
         worker.failed.connect(self._on_experiment_failed)
+        worker.cancelled.connect(self._on_experiment_cancelled)
         worker.progress_changed.connect(self._on_experiment_progress)
         worker.event_changed.connect(self._on_experiment_event)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_experiment_thread)
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _stop_qick_experiment(self) -> None:
+        worker = self._experiment_worker
+        thread = self._experiment_thread
+        if (
+            not isinstance(worker, QickExperimentWorker)
+            or thread is None
+            or not thread.isRunning()
+        ):
+            self._experiment_panel.stop_button.setEnabled(False)
+            return
+        worker.request_cancel()
+        self._experiment_panel.stop_button.setEnabled(False)
+        self._experiment_panel.run_status.setText(
+            "Stop requested - waiting for the current hardware or file "
+            "operation to reach a safe cancellation point"
+        )
+        self._experiment_panel.record_run_event(
+            "experiment",
+            "info",
+            "User requested experiment cancellation",
+        )
+        self.statusBar().showMessage("Stopping QICK experiment")
 
     def _show_awg_metadata(self) -> None:
         try:
@@ -10890,6 +10973,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "QICK experiment failed", summary, details, self
         )
         dialog.exec_()
+
+    def _on_experiment_cancelled(self, message: str) -> None:
+        summary = str(message).strip() or "Experiment stopped by user"
+        self._experiment_panel.set_running(False, f"Stopped: {summary}")
+        self._experiment_panel.finish_run_timeline(
+            summary,
+            success=False,
+            cancelled=True,
+        )
+        self.statusBar().showMessage(summary)
 
     def _clear_experiment_thread(self) -> None:
         self._experiment_thread = None

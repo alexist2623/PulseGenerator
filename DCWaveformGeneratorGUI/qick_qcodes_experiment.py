@@ -24,6 +24,7 @@ import numpy as np
 
 ProgressCallback = Callable[[int, str], None]
 ExperimentEventCallback = Callable[[str, str, str], None]
+CancellationCheck = Callable[[], None]
 DEFAULT_QCODES_BATCH_ROWS = 8192
 QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
 # Legacy packed-IQ parameter used by runs written before split trace storage.
@@ -45,6 +46,15 @@ COMPILE_VALIDATION_MODES = (
     COMPILE_VALIDATION_FULL,
 )
 DEFAULT_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_FULL
+
+
+class ExperimentCancelled(RuntimeError):
+    """Raised when the user requests cooperative experiment cancellation."""
+
+
+def _check_cancel(cancel_check: Optional[CancellationCheck]) -> None:
+    if cancel_check is not None:
+        cancel_check()
 
 try:
     from .dc_waveform_core import (
@@ -364,6 +374,7 @@ def build_awg_vertex_metadata(
     fabric_mhz: float,
     full_scale_mv: float,
     point_indices: Optional[Sequence[int]] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> Mapping[str, Any]:
     """Build compact virtual/physical AWG vertices for every sweep point."""
     fabric_mhz = float(fabric_mhz)
@@ -381,6 +392,7 @@ def build_awg_vertex_metadata(
     physical_points = []
     coordinates = []
     for point_index in selected_indices:
+        _check_cancel(cancel_check)
         virtual_times, virtual_values, _ = sequence.waveform_vertices(
             point_index, space="virtual"
         )
@@ -762,6 +774,7 @@ def build_qick_program(
     rf_specs: Sequence[QickRfPulseSpec] = (),
     readout_spec: Optional[QickDdrReadoutSpec] = None,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
+    cancel_check: Optional[CancellationCheck] = None,
 ):
     """Build the tProcessor program without configuring or running hardware."""
     effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
@@ -780,6 +793,9 @@ def build_qick_program(
         program_kwargs["ddr_readout"] = build_runtime_ddr_readout(
             soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
         )
+    if cancel_check is not None:
+        program_kwargs["cancel_check"] = cancel_check
+    _check_cancel(cancel_check)
     return sequence.make_program(soccfg, **program_kwargs)
 
 
@@ -973,8 +989,10 @@ def execute_qick_sequence(
     progress: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[ExperimentEventCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
     """Configure the readout, execute the tProcessor program, and read DDR."""
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF readout hardware")
     _emit_experiment_event(
         event_callback,
@@ -983,6 +1001,7 @@ def execute_qick_sequence(
         "Configuring RF readout hardware",
     )
     readout_settings = configure_rf_readout(soc, readout_spec)
+    _check_cancel(cancel_check)
     _emit_experiment_event(
         event_callback,
         "rf_setup",
@@ -1017,7 +1036,9 @@ def execute_qick_sequence(
         rf_specs=rf_specs,
         readout_spec=readout_spec,
         compile_validation_mode=compile_validation_mode,
+        cancel_check=cancel_check,
     )
+    _check_cancel(cancel_check)
     _emit_experiment_event(
         event_callback,
         "compile",
@@ -1040,6 +1061,7 @@ def execute_qick_sequence(
     )
 
     def counter_progress(completed: int, total: int) -> None:
+        _check_cancel(cancel_check)
         fraction = 1.0 if total <= 0 else completed / total
         percent = 10 + round(max(0.0, min(1.0, fraction)) * 45)
         _emit_progress(
@@ -1053,6 +1075,7 @@ def execute_qick_sequence(
         )
 
     def readback_progress(completed: int, total: int) -> None:
+        _check_cancel(cancel_check)
         fraction = 1.0 if total <= 0 else completed / total
         fraction = max(0.0, min(1.0, fraction))
         percent = 55 + round(fraction * 9)
@@ -1082,7 +1105,10 @@ def execute_qick_sequence(
     }
     if event_callback is not None:
         acquire_kwargs["phase_callback"] = event_callback
+    if cancel_check is not None:
+        acquire_kwargs["cancel_check"] = cancel_check
     ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
+    _check_cancel(cancel_check)
     _emit_progress(
         progress_callback,
         64,
@@ -1214,28 +1240,58 @@ def _qcodes_staging_root() -> Path:
     return root
 
 
-def _backup_sqlite_database(source: Path, destination: Path) -> None:
+def _backup_sqlite_database(
+    source: Path,
+    destination: Path,
+    *,
+    cancel_check: Optional[CancellationCheck] = None,
+) -> None:
     """Copy a live SQLite database, including committed WAL content."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     source_uri = source.resolve().as_uri() + "?mode=ro"
     source_connection = sqlite3.connect(source_uri, uri=True, timeout=60.0)
     destination_connection = sqlite3.connect(str(destination), timeout=60.0)
     try:
-        source_connection.backup(destination_connection, pages=4096, sleep=0.01)
+        source_connection.backup(
+            destination_connection,
+            pages=4096,
+            sleep=0.01,
+            progress=(
+                None
+                if cancel_check is None
+                else lambda _status, _remaining, _total: _check_cancel(
+                    cancel_check
+                )
+            ),
+        )
         destination_connection.commit()
     finally:
         destination_connection.close()
         source_connection.close()
 
 
-def _prepare_local_database(database_path: Path) -> Tuple[Path, Path]:
+def _prepare_local_database(
+    database_path: Path,
+    *,
+    cancel_check: Optional[CancellationCheck] = None,
+) -> Tuple[Path, Path]:
     staging_directory = Path(tempfile.mkdtemp(
         prefix="qick_qcodes_",
         dir=str(_qcodes_staging_root()),
     ))
     local_database_path = staging_directory / database_path.name
-    if database_path.exists() and database_path.stat().st_size > 0:
-        _backup_sqlite_database(database_path, local_database_path)
+    try:
+        _check_cancel(cancel_check)
+        if database_path.exists() and database_path.stat().st_size > 0:
+            _backup_sqlite_database(
+                database_path,
+                local_database_path,
+                cancel_check=cancel_check,
+            )
+        _check_cancel(cancel_check)
+    except Exception:
+        shutil.rmtree(staging_directory, ignore_errors=True)
+        raise
     return staging_directory, local_database_path
 
 
@@ -1478,6 +1534,7 @@ def store_qick_result(
     progress_start: int = 65,
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> Tuple[Any, int]:
     """Store one I array and one Q array per point/repetition acquisition."""
     try:
@@ -1494,10 +1551,12 @@ def store_qick_result(
             "QCoDeS is required to save experiments; install qcodes==0.58.0"
         ) from exc
 
+    _check_cancel(cancel_check)
     raw_iq = np.asarray(ddr_result.iq)
     iq, iq_unit, measurement_mode, measurement_conversion = (
         _measurement_iq_values(raw_iq, rf_settings)
     )
+    _check_cancel(cancel_check)
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError("DDR IQ must have shape (point, repetition, sample, 2)")
     if isinstance(batch_rows, bool) or int(batch_rows) < 1:
@@ -1537,7 +1596,10 @@ def store_qick_result(
         coordinates_display[:, axis_index] *= scale
     database_path = run_config.resolved_database_path
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    staging_directory, local_database_path = _prepare_local_database(database_path)
+    staging_directory, local_database_path = _prepare_local_database(
+        database_path,
+        cancel_check=cancel_check,
+    )
     initialise_or_create_database_at(str(local_database_path))
     experiment = load_or_create_experiment(
         run_config.experiment_name,
@@ -1818,6 +1880,19 @@ def store_qick_result(
         })
 
     row_count = 0
+    cancellation_error = None
+
+    def cancellation_requested() -> bool:
+        nonlocal cancellation_error
+        if cancellation_error is not None:
+            return True
+        try:
+            _check_cancel(cancel_check)
+        except ExperimentCancelled as exc:
+            cancellation_error = exc
+            return True
+        return False
+
     with measurement.run(
         write_in_background=False,
         in_memory_cache=False,
@@ -1855,6 +1930,8 @@ def store_qick_result(
         if vertex_data is not None:
             output_names, _vertex_time_us, virtual_mv, physical_mv = vertex_data
             for point_index in range(point_count):
+                if cancellation_requested():
+                    break
                 coordinate_results = [
                     (
                         parameter,
@@ -1894,19 +1971,22 @@ def store_qick_result(
                     *coordinate_results,
                     *channel_results,
                 )
-            datasaver.flush_data_to_database()
-            _emit_progress(
-                progress_callback,
-                progress_start,
-                f"Saved per-channel AWG vertex arrays for "
-                f"{point_count:,} sweep points",
-            )
+            if cancellation_error is None:
+                datasaver.flush_data_to_database()
+                _emit_progress(
+                    progress_callback,
+                    progress_start,
+                    f"Saved per-channel AWG vertex arrays for "
+                    f"{point_count:,} sweep points",
+                )
 
         trace_count = point_count * repetition_count
         traces_per_flush = max(1, batch_rows // sample_count)
         traces_written = 0
         data_progress_end = max(progress_start, progress_end - 4)
         for point_index in range(point_count):
+            if cancellation_requested():
+                break
             coordinate_results = [
                 (
                     parameter,
@@ -1915,6 +1995,8 @@ def store_qick_result(
                 for axis_index, parameter in enumerate(sweep_parameters)
             ]
             for repetition in range(repetition_count):
+                if cancellation_requested():
+                    break
                 datasaver.add_result(
                     *coordinate_results,
                     (repetition_index, repetition),
@@ -1950,14 +2032,31 @@ def store_qick_result(
                         f"{trace_count:,} ({row_count:,}/{total_rows:,} samples)",
                     )
 
+    if cancellation_error is not None:
+        try:
+            dataset.conn.close()
+        finally:
+            shutil.rmtree(staging_directory, ignore_errors=True)
+        raise cancellation_error
+
     local_guid = str(dataset.guid)
     dataset.conn.close()
+    try:
+        _check_cancel(cancel_check)
+    except ExperimentCancelled:
+        shutil.rmtree(staging_directory, ignore_errors=True)
+        raise
     _emit_progress(
         progress_callback,
         max(progress_start, progress_end - 3),
         "Checkpointing local QCoDeS database",
     )
     _checkpoint_sqlite_database(local_database_path)
+    try:
+        _check_cancel(cancel_check)
+    except ExperimentCancelled:
+        shutil.rmtree(staging_directory, ignore_errors=True)
+        raise
     _emit_progress(
         progress_callback,
         max(progress_start, progress_end - 2),
@@ -1990,8 +2089,10 @@ def run_qick_qcodes_experiment(
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[ExperimentEventCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> StoredQickExperiment:
     """Connect, execute, acquire FIR DDR IQ, and commit one QCoDeS run."""
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 0, "Starting QICK experiment")
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
     _emit_experiment_event(
@@ -2001,6 +2102,7 @@ def run_qick_qcodes_experiment(
         "Connecting to QICK Pyro server",
     )
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _check_cancel(cancel_check)
     _emit_experiment_event(
         event_callback,
         "connection",
@@ -2052,6 +2154,7 @@ def run_qick_qcodes_experiment(
     )
     stored_qick_settings["compile_validation_mode"] = compile_validation_mode
     if hasattr(sequence, "waveform_vertices"):
+        _check_cancel(cancel_check)
         fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
         full_scale_mv = float(
             qick_settings.get(
@@ -2071,6 +2174,7 @@ def run_qick_qcodes_experiment(
             fabric_mhz=fabric_mhz,
             full_scale_mv=full_scale_mv,
         )
+        _check_cancel(cancel_check)
         _emit_experiment_event(
             event_callback,
             "awg_recipe",
@@ -2089,6 +2193,7 @@ def run_qick_qcodes_experiment(
                 sequence,
                 fabric_mhz=fabric_mhz,
                 full_scale_mv=full_scale_mv,
+                cancel_check=cancel_check,
             )
             _emit_experiment_event(
                 event_callback,
@@ -2109,7 +2214,9 @@ def run_qick_qcodes_experiment(
         progress=progress,
         progress_callback=progress_callback,
         event_callback=event_callback,
+        cancel_check=cancel_check,
     )
+    _check_cancel(cancel_check)
     _emit_experiment_event(
         event_callback,
         "qcodes_save",
@@ -2124,6 +2231,7 @@ def run_qick_qcodes_experiment(
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
         progress_callback=progress_callback,
+        cancel_check=cancel_check,
     )
     _emit_experiment_event(
         event_callback,
@@ -2154,6 +2262,8 @@ __all__ = [
     "DEFAULT_COMPILE_VALIDATION_MODE",
     "DEFAULT_AWG_METADATA_MODE",
     "DEFAULT_QCODES_BATCH_ROWS",
+    "CancellationCheck",
+    "ExperimentCancelled",
     "ExperimentEventCallback",
     "I_TRACE_PARAMETER",
     "IQ_TRACE_PARAMETER",

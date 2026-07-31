@@ -39,7 +39,7 @@ from fractions import Fraction
 from itertools import product
 from math import ceil, isclose, isfinite
 from numbers import Integral, Real
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -2179,6 +2179,7 @@ class FineTuneSequence:
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
         compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
+        cancel_check: Optional[Callable[[], None]] = None,
     ):
         return FineTuneAmplitudeSweepProgram(
             soccfg,
@@ -2195,6 +2196,7 @@ class FineTuneSequence:
             command_spacing_tproc_cycles=command_spacing_tproc_cycles,
             recovery_tproc_cycles=recovery_tproc_cycles,
             compile_validation_mode=compile_validation_mode,
+            cancel_check=cancel_check,
         )
 
 
@@ -2374,6 +2376,7 @@ def compile_sequence(
     awg_channels: Union[Sequence[int], Mapping[str, int]],
     *,
     point_indices: Optional[Iterable[int]] = None,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> Tuple[Tuple[int, ...], Tuple[CompiledPoint, ...]]:
     """Compile selected sweep points into exact five-word AWG commands."""
     sequence._validate()
@@ -2391,6 +2394,8 @@ def compile_sequence(
         point_indices = range(sequence.sweep_point_count)
     compiled_points = []
     for point_index in point_indices:
+        if cancel_check is not None:
+            cancel_check()
         point_index = _require_int(point_index, "point_index", 0)
         if point_index >= sequence.sweep_point_count:
             raise IndexError("point_index is out of range")
@@ -2503,7 +2508,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
         compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
+        cancel_check: Optional[Callable[[], None]] = None,
     ):
+        self.cancel_check = cancel_check
+        self._check_cancel()
         sequence._validate()
         self.sequence = sequence
         self.awg_channel_spec = awg_channels
@@ -2581,6 +2589,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         }
         super().__init__(soccfg, cfg)
 
+    def _check_cancel(self) -> None:
+        if self.cancel_check is not None:
+            self.cancel_check()
+
     def get_expt_pts(self):
         return self.sequence.sweep_points.copy()
 
@@ -2634,12 +2646,14 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             self.soccfg,
             self.awg_channel_spec,
             point_indices=indices,
+            cancel_check=self.cancel_check,
         )
         self._compiled_point_by_index = dict(zip(indices, points))
         self._compile_validation_point_indices = indices
         self.compiled_points = points
 
     def initialize(self):
+        self._check_cancel()
         # QICK's pulse/readout helpers use self.tproccfg for timestamp math.
         # Keep the hardware description intact and override only this program's
         # local timing view when the caller supplied a manual clock.
@@ -2647,7 +2661,10 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.tproccfg["f_time"] = self.tproc_mhz
         if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
             self.awg_channels, self.compiled_points = compile_sequence(
-                self.sequence, self.soccfg, self.awg_channel_spec
+                self.sequence,
+                self.soccfg,
+                self.awg_channel_spec,
+                cancel_check=self.cancel_check,
             )
             self._compiled_point_by_index = None
             self._compile_validation_point_indices = range(
@@ -2655,6 +2672,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             )
         else:
             self._compile_boundary_points()
+        self._check_cancel()
         self._validate_bias_t_tproc_ports()
         self.bias_t_simultaneous_start_lead_cycles = (
             BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * len(self.awg_channels)
@@ -2676,6 +2694,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         if self.rf_pulse_configs or self.ddr_readout_config is not None:
             self._build_aux_timing()
         self._build_sweep_register_plan()
+        self._check_cancel()
 
         if self.readout_config is not None:
             ro = self.readout_config
@@ -2806,8 +2825,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             for index in cls._ramp_duration_axis_indices(sweep_axes)
         }
 
-    @staticmethod
     def _duration_conditioned_values(
+        self,
         requested_values,
         sweep_axes,
         sweep_shape,
@@ -2816,7 +2835,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         quantum: int = 1,
     ):
         """Compress one nonlinear duration-dependent field into coefficients."""
-        return FineTuneAmplitudeSweepProgram._duration_axes_conditioned_values(
+        return self._duration_axes_conditioned_values(
             requested_values,
             sweep_axes,
             sweep_shape,
@@ -2824,8 +2843,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             quantum=quantum,
         )
 
-    @staticmethod
     def _duration_axes_conditioned_values(
+        self,
         requested_values,
         sweep_axes,
         sweep_shape,
@@ -2904,6 +2923,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         actual = np.empty_like(requested)
         max_error = 0
         for point_index in range(requested.size):
+            self._check_cancel()
             indices = np.unravel_index(point_index, sweep_shape, order="C")
             duration_indices = tuple(
                 int(indices[axis_index])
@@ -3010,6 +3030,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             model.update(metadata[output_index])
             models.append(model)
             for point_index in range(len(self.compiled_points)):
+                self._check_cancel()
                 indices = (
                     np.unravel_index(point_index, sweep_shape, order="C")
                     if sweep_axes
@@ -3078,6 +3099,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
             requested = []
             for point_index, point in enumerate(self.compiled_points):
+                self._check_cancel()
                 point_values = []
                 for output_index, signed_area2 in enumerate(
                     self._compiled_point_area2(point_index, point)
@@ -3138,6 +3160,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         requested = []
         for point_index, point in enumerate(self.compiled_points):
+            self._check_cancel()
             area2 = self._compiled_point_area2(point_index, point)
             point_values = []
             for output_index, signed_area2 in enumerate(area2):
@@ -3610,6 +3633,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             validation_indices,
             self.compiled_points,
         )):
+            self._check_cancel()
             point_map = {}
             for commands in point.segment_commands:
                 for command in commands:
@@ -3834,6 +3858,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             validation_indices,
             requested_points,
         ):
+            self._check_cancel()
             if sweep_axes:
                 indices = np.unravel_index(point_index, sweep_shape, order="C")
             else:
@@ -5229,6 +5254,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             else self._compile_validation_point_indices
         )
         for point_index in point_indices:
+            self._check_cancel()
             indices = (
                 np.unravel_index(point_index, shape, order="C")
                 if self.sequence.sweep_axes
@@ -6660,6 +6686,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         progress_callback,
         *,
         poll_interval_seconds: float = 0.02,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> None:
         """Run without readout streaming and report the real tProc loop count."""
         import time
@@ -6667,17 +6694,25 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         total_per_round = int(np.prod(self.loop_dims, dtype=np.int64))
         rounds = int(self.rounds)
         total = total_per_round * rounds
+        if cancel_check is not None:
+            cancel_check()
         self.config_all(soc, load_envelopes=True, load_mem=False)
         progress_callback(0, total)
         completed_rounds = 0
+        tproc_running = False
         try:
             for _round_index in range(rounds):
+                if cancel_check is not None:
+                    cancel_check()
                 self._load_runtime_dmem(soc, reload_mem=True)
                 soc.clear_tproc_counter(addr=self.counter_addr)
                 soc.start_src("internal")
                 soc.start_tproc()
+                tproc_running = True
                 count = 0
                 while count < total_per_round:
+                    if cancel_check is not None:
+                        cancel_check()
                     count = min(
                         total_per_round,
                         int(soc.get_tproc_counter(addr=self.counter_addr)),
@@ -6685,8 +6720,14 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     progress_callback(completed_rounds + count, total)
                     if count < total_per_round:
                         time.sleep(poll_interval_seconds)
+                tproc_running = False
                 completed_rounds += total_per_round
         finally:
+            if tproc_running:
+                try:
+                    soc.stop_tproc()
+                except Exception:
+                    pass
             soc.start_src("internal")
 
     def acquire_fir_ddr(
@@ -6697,6 +6738,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         counter_progress=None,
         readback_progress=None,
         phase_callback=None,
+        cancel_check: Optional[Callable[[], None]] = None,
         readback_chunk_triggers: int = DEFAULT_DDR_READBACK_TRIGGER_CHUNK,
         **run_kwargs,
     ):
@@ -6720,6 +6762,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if phase_callback is not None:
                 phase_callback(str(key), str(state), str(message))
 
+        def check_cancel():
+            if cancel_check is not None:
+                cancel_check()
+
+        check_cancel()
         readback_chunk_triggers = _require_int(
             readback_chunk_triggers,
             "readback_chunk_triggers",
@@ -6741,6 +6788,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             f"Arming FIR DDR for {n_triggers:,} trigger(s)",
         )
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
+        check_cancel()
         emit_phase(
             "ddr_arm",
             "completed",
@@ -6754,7 +6802,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 f"{repetitions:,} repetition(s)"
             ),
         )
-        if counter_progress is None:
+        if counter_progress is None and cancel_check is None:
             self.run_rounds(soc, progress=progress, **run_kwargs)
         else:
             if run_kwargs:
@@ -6763,7 +6811,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     "counter-progress execution does not support extra run "
                     f"arguments: {unexpected}"
                 )
-            self._run_rounds_with_counter_progress(soc, counter_progress)
+            self._run_rounds_with_counter_progress(
+                soc,
+                counter_progress or (lambda _completed, _total: None),
+                cancel_check=cancel_check,
+            )
+        check_cancel()
         emit_phase(
             "acquisition",
             "completed",
@@ -6778,7 +6831,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     f"({float(ddr.settle_seconds):g} s)"
                 ),
             )
-            time.sleep(float(ddr.settle_seconds))
+            deadline = time.monotonic() + float(ddr.settle_seconds)
+            while True:
+                check_cancel()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.05, remaining))
             emit_phase(
                 "ddr_wait",
                 "completed",
@@ -6820,6 +6879,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             n_triggers,
             readback_chunk_triggers,
         ):
+            check_cancel()
             chunk_trigger_count = min(
                 readback_chunk_triggers,
                 n_triggers - first_trigger,
@@ -6831,6 +6891,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 start=chunk_start_word,
                 stride_bytes=ddr.stride_bytes,
             ))
+            check_cancel()
             expected_chunk_shape = (
                 chunk_trigger_count * ddr.samples_per_trigger,
                 2,
@@ -6857,6 +6918,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
 
         if raw is None:
             raise RuntimeError("DDR readback produced no chunks")
+        check_cancel()
         emit_phase(
             "ddr_readback",
             "completed",

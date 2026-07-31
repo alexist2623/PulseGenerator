@@ -30,6 +30,7 @@ from qick_qcodes_experiment import (
     COMPILE_VALIDATION_BOUNDARY,
     DEFAULT_COMPILE_VALIDATION_MODE,
     DEFAULT_AWG_METADATA_MODE,
+    ExperimentCancelled,
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
     Q_TRACE_PARAMETER,
@@ -74,6 +75,38 @@ def test_compile_validation_mode_normalization():
     )
     with pytest.raises(ValueError, match="compile validation mode"):
         normalize_compile_validation_mode("sampled")
+
+
+def test_experiment_cancellation_is_checked_before_connection(tmp_path):
+    connector_calls = []
+
+    def connector(**kwargs):
+        connector_calls.append(kwargs)
+        raise AssertionError("connector must not run after cancellation")
+
+    def cancel_check():
+        raise ExperimentCancelled("stopped")
+
+    with pytest.raises(ExperimentCancelled, match="stopped"):
+        run_qick_qcodes_experiment(
+            connection_config=QickConnectionConfig(
+                "198.51.100.9",
+                9999,
+                "testqick",
+            ),
+            run_config=QcodesRunConfig(str(tmp_path / "cancelled.db")),
+            sequence=object(),
+            awg_channels=(0,),
+            repetitions_per_sweep=1,
+            rf_specs=(),
+            readout_spec=QickDdrReadoutSpec(0, "set_0", 0.0, 1),
+            gui_settings={},
+            connector=connector,
+            cancel_check=cancel_check,
+        )
+
+    assert connector_calls == []
+    assert not (tmp_path / "cancelled.db").exists()
 
 
 def test_sweep_parameter_names_preserve_rf_duration_units():
@@ -180,6 +213,36 @@ def _gui_metadata():
         "rf_outputs": [{"frequency_mhz": 50.0, "gain": 12000}],
         "rf_readout": {"readout_frequency_mhz": 25.0},
     }
+
+
+def test_qcodes_save_cancellation_discards_staging_database(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "cancelled_trace.db"
+    staging_root = tmp_path / "staging"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(staging_root))
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        if checks >= 7:
+            raise ExperimentCancelled("save stopped")
+
+    with pytest.raises(ExperimentCancelled, match="save stopped"):
+        store_qick_result(
+            _ddr_result(),
+            run_config=QcodesRunConfig(str(database_path)),
+            connection_config=QickConnectionConfig(),
+            program_summary={},
+            gui_settings=_gui_metadata(),
+            rf_settings={},
+            cancel_check=cancel_check,
+        )
+
+    assert not database_path.exists()
+    assert list(staging_root.glob("qick_qcodes_*")) == []
 
 
 def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
