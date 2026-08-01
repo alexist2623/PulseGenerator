@@ -505,6 +505,9 @@ def test_calibration_places_an_independent_front_panel_in_every_subtab():
 def test_stability_electrodes_are_selected_from_front_panel_dac_smas():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     window._add_port()
     configuration = identify_qick_front_panel(_live_config())
     window._on_qick_configuration_identified(configuration)

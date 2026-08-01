@@ -67,8 +67,16 @@ ProgressCallback = Callable[[int, str], None]
 EventCallback = Callable[[str, str, str], None]
 MAX_QCS_SOFTWARE_SWEEP_POINTS = 10_000
 MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES = 24_576
-MAX_QCS_STABILITY_GRID_POINTS = 1_000_000
+# QCS 2.5.5 requires the per-channel sum to be strictly less than 24,576.
+MAX_QCS_STABILITY_GRID_POINTS = MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES - 1
 MAX_QCS_STABILITY_RESULT_VALUES = 2_000_000
+# The M5000-series synchronization fabric runs at 300 MHz. HCL represents
+# ``init_time`` as an integer number of nanoseconds, so only every third
+# fabric cycle (10 ns) can be represented without truncation.
+QCS_FABRIC_CLOCK_HZ = 300_000_000.0
+QCS_INIT_TIME_QUANTUM_NS = int(
+    round(3 * 1e9 / QCS_FABRIC_CLOCK_HZ)
+)
 # Keysight QCS 2.5.5 ``SAMPLE_RATES`` defines the M5200 digitizer at
 # 4.8 GSa/s. Integration-filter acquisitions are emitted in 16-sample blocks.
 QCS_M5200_SAMPLE_RATE_HZ = 4_800_000_000.0
@@ -91,6 +99,56 @@ def _nonnegative_finite(value: Any, label: str) -> float:
     if not isfinite(result) or result < 0.0:
         raise ValueError(f"{label} must be nonnegative and finite")
     return result
+
+
+def _canonical_qcs_init_time(value: Any) -> float:
+    """Return an HCL-safe initialization time on the 300 MHz fabric grid.
+
+    QCS 2.5.5 converts this float with ``int(init_time * 1e9)``. Values
+    produced by GUI unit conversion can otherwise lose one nanosecond (for
+    example, 100 us can become 99,999 ns). A 10 ns quantum is both exactly
+    representable by HCL's integer-nanosecond field and aligned to three
+    300 MHz fabric cycles. ``nextafter`` protects the subsequent truncation.
+    """
+    seconds = _nonnegative_finite(value, "QCS initialization time")
+    requested_quanta = seconds * 1e9 / QCS_INIT_TIME_QUANTUM_NS
+    nearest_quanta = int(round(requested_quanta))
+    if np.isclose(
+        requested_quanta,
+        nearest_quanta,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        quantum_count = nearest_quanta
+    else:
+        # Initialization is an inter-iteration hold, so alignment must not
+        # make it shorter than the value requested by the user.
+        quantum_count = int(np.ceil(requested_quanta))
+    nanoseconds = quantum_count * QCS_INIT_TIME_QUANTUM_NS
+    if nanoseconds == 0:
+        return 0.0
+    return float(np.nextafter(nanoseconds / 1e9, np.inf))
+
+
+def _fabric_aligned_seconds(
+    value: Any,
+    *,
+    fabric_hz: float,
+    label: str,
+    positive: bool = False,
+) -> float:
+    """Round a QCS program time to the nearest synchronization cycle."""
+    seconds = (
+        _positive_finite(value, label)
+        if positive
+        else _nonnegative_finite(value, label)
+    )
+    cycles = int(round(seconds * fabric_hz))
+    if positive and cycles < 1:
+        raise ValueError(
+            f"{label} must be at least one QCS fabric-clock period"
+        )
+    return cycles / fabric_hz
 
 
 def _channel_name(value: Any, label: str) -> str:
@@ -163,9 +221,7 @@ class QcsConnectionConfig:
             raise TypeError("QCS hw_demod must be boolean")
         if not isinstance(self.blocking, bool):
             raise TypeError("QCS blocking must be boolean")
-        init_time_s = _nonnegative_finite(
-            self.init_time_s, "QCS initialization time"
-        )
+        init_time_s = _canonical_qcs_init_time(self.init_time_s)
         object.__setattr__(self, "mapper_path", mapper_path)
         object.__setattr__(self, "mapper_sha256", mapper_sha256)
         object.__setattr__(self, "dc_channel_names", dc_names)
@@ -522,6 +578,9 @@ def _resolved_acquisition_timing(
                 f"samples at {sample_rate_hz:g} S/s; got "
                 f"{rendered_samples:g} samples"
             )
+        # Rebuild the duration from the validated integral sample count. This
+        # removes GUI floating-point residue before the value reaches HCL.
+        duration_s = sample_count / sample_rate_hz
     return duration_s, sample_rate_hz
 
 
@@ -1052,8 +1111,9 @@ def normalize_qcs_hardware_sweep_iq(
     """Normalize QCS hardware-sweep IQ to ``(point, shot, 1, I/Q)``.
 
     Native QCS 2.5.5 results follow the Program repetition order with the
-    shot axis first. A shot-last form is also accepted for injected adapters
-    and older result loaders.
+    shot axis first. The reference-style Stability program has one flattened
+    Cartesian hardware-sweep axis, while older saved results may retain
+    separate X and Y axes. Shot-last forms are also accepted.
     """
     repetitions = int(repetitions_per_point)
     if repetitions < 1:
@@ -1092,20 +1152,31 @@ def normalize_qcs_hardware_sweep_iq(
 
     repetition_first = (repetitions, *shape)
     repetition_last = (*shape, repetitions)
+    point_count = int(np.prod(shape))
+    flattened_repetition_first = (repetitions, point_count)
+    flattened_repetition_last = (point_count, repetitions)
     if array.shape == repetition_first:
         grid = array
     elif array.shape == repetition_last:
         grid = np.moveaxis(array, -1, 0)
+    elif array.shape == flattened_repetition_first:
+        grid = array.reshape(repetition_first)
+    elif array.shape == flattened_repetition_last:
+        grid = np.moveaxis(array, -1, 0).reshape(repetition_first)
     elif repetitions == 1 and array.shape == shape:
         grid = array[np.newaxis, ...]
+    elif repetitions == 1 and array.shape == (point_count,):
+        grid = array.reshape(repetition_first)
     elif array.ndim == 1:
-        # Native QCS repetition order is (shot, X, Y). A loader that strips
-        # shape metadata still preserves that C-order in its flat buffer.
+        # Native QCS repetition order is (shot, flattened-point). A loader
+        # that strips shape metadata still preserves that C-order.
         grid = array.reshape(repetition_first)
     else:
         raise ValueError(
             "QCS hardware-sweep IQ shape must be "
-            f"{repetition_first} or {repetition_last}; received {array.shape}"
+            f"{repetition_first}, {repetition_last}, "
+            f"{flattened_repetition_first}, or "
+            f"{flattened_repetition_last}; received {array.shape}"
         )
 
     point_shot = np.moveaxis(grid, 0, -1).reshape(-1, repetitions)
@@ -1121,7 +1192,12 @@ def build_qcs_executor(
     *,
     qcs_module=None,
 ) -> Any:
-    """Create the blocking HCL executor shared by QCS scan iterations."""
+    """Create the phase-coherent HCL executor for a Stability scan.
+
+    The QSTL hardware-IQ examples reset phase before every shot so repeated
+    integration-filter results share the same phase reference. Stability is
+    the only caller of this helper and always requires hardware demodulation.
+    """
     qcs = _import_qcs() if qcs_module is None else qcs_module
     backend = qcs.HclBackend(
         channel_mapper=mapper,
@@ -1130,6 +1206,7 @@ def build_qcs_executor(
         blocking=connection_config.blocking,
         suppress_rounding_warnings=True,
         keep_progress_bar=False,
+        reset_phase_every_shot=True,
     )
     return qcs.Executor(backend)
 
@@ -1148,9 +1225,10 @@ def compile_qcs_stability_hardware_sweep(
 ) -> QcsCompiledHardwareSweep:
     """Compile a two-axis Stability Diagram into one native QCS sweep.
 
-    The Y sweep is added first, followed by X and then ``n_shots``. QCS
-    prepends each repetition, yielding ``(shot, X, Y)`` with every loop in
-    hardware and Y as the fastest Cartesian axis.
+    Following ``QTTVideoMode/QCSVideoProcessor.py``, Python computes each
+    physical M5301 channel's full Cartesian voltage array. One direct Scalar
+    per physical output is swept simultaneously, then ``n_shots`` prepends
+    the shot axis. Y remains the fastest semantic Cartesian axis.
     """
     qcs = _import_qcs() if qcs_module is None else qcs_module
     if acquisition is None:
@@ -1198,8 +1276,9 @@ def compile_qcs_stability_hardware_sweep(
     if point_count > MAX_QCS_STABILITY_GRID_POINTS:
         raise QcsUnsupportedFeatureError(
             "QCS Stability grid contains "
-            f"{point_count:,} Cartesian points; the safe application limit "
-            f"is {MAX_QCS_STABILITY_GRID_POINTS:,}"
+            f"{point_count:,} Cartesian points; each physical M5301 "
+            "amplitude array supports at most "
+            f"{MAX_QCS_STABILITY_GRID_POINTS:,} values"
         )
     result_value_count = point_count * repetitions
     if result_value_count > MAX_QCS_STABILITY_RESULT_VALUES:
@@ -1282,9 +1361,23 @@ def compile_qcs_stability_hardware_sweep(
         )
     segment = segments[0]
     fabric_hz = _positive_finite(fabric_mhz, "fabric clock") * 1e6
-    duration_s = float(segment.duration_cycles) / fabric_hz
-    if duration_s <= 0.0:
-        raise ValueError("QCS Stability sequence duration must be positive")
+    duration_s = _fabric_aligned_seconds(
+        float(segment.duration_cycles) / fabric_hz,
+        fabric_hz=fabric_hz,
+        label="QCS Stability sequence duration",
+        positive=True,
+    )
+    acquisition_duration_s = _fabric_aligned_seconds(
+        acquisition_duration_s,
+        fabric_hz=fabric_hz,
+        label="QCS Stability acquisition duration",
+        positive=True,
+    )
+    acquisition_pre_delay_s = _fabric_aligned_seconds(
+        acquisition.pre_delay_s,
+        fabric_hz=fabric_hz,
+        label="QCS Stability acquisition pre-delay",
+    )
 
     output_names = tuple(str(name) for name in sequence.output_names)
     try:
@@ -1338,32 +1431,24 @@ def compile_qcs_stability_hardware_sweep(
     y_coefficients = (
         cross_capacitance[:, y_output_index] * qcs_scale
     )
-    array_values_by_output = tuple(
-        (
-            (int(x_values.size) if x_coefficient != 0.0 else 0)
-            + (int(y_values.size) if y_coefficient != 0.0 else 0)
+    # FineTuneSequence's authoritative coordinate table is C-order: X is the
+    # outer axis and Y varies fastest. Compute the cross-capacitance transform
+    # on the host so no waveform amplitude depends on a compound two-Scalar
+    # expression.
+    sweep_coordinates = np.asarray(sequence.sweep_coordinates, dtype=float)
+    if sweep_coordinates.shape != (point_count, 2):
+        raise ValueError(
+            "QCS Stability coordinate table must have shape "
+            f"({point_count}, 2); got {sweep_coordinates.shape}"
         )
-        for x_coefficient, y_coefficient in zip(
-            x_coefficients,
-            y_coefficients,
-        )
+    flattened_x = sweep_coordinates[:, 0]
+    flattened_y = sweep_coordinates[:, 1]
+    physical_amplitudes = (
+        physical_offset[np.newaxis, :]
+        + flattened_x[:, np.newaxis] * x_coefficients[np.newaxis, :]
+        + flattened_y[:, np.newaxis] * y_coefficients[np.newaxis, :]
     )
-    if max(array_values_by_output, default=0) > (
-        MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES
-    ):
-        output_index = int(np.argmax(array_values_by_output))
-        raise QcsUnsupportedFeatureError(
-            f"QCS DC output {output_names[output_index]!r} requires "
-            f"{array_values_by_output[output_index]:,} FPGA sweep-array "
-            "values; each M5301 channel supports at most "
-            f"{MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES:,}"
-        )
-    corner_amplitudes = np.asarray([
-        physical_offset + x_coefficients * x + y_coefficients * y
-        for x in (x_values[0], x_values[-1])
-        for y in (y_values[0], y_values[-1])
-    ])
-    peak_by_output = np.max(np.abs(corner_amplitudes), axis=0)
+    peak_by_output = np.max(np.abs(physical_amplitudes), axis=0)
     if np.any(peak_by_output > 1.0 + 1e-12):
         output_index = int(np.argmax(peak_by_output))
         peak_voltage_v = (
@@ -1377,31 +1462,26 @@ def compile_qcs_stability_hardware_sweep(
             f"{connection_config.dc_full_scale_v:.6g} V full scale"
         )
 
-    x_variable = qcs.Scalar(
-        "stability_x_voltage",
-        value=float(x_values[0]),
-        dtype=float,
-    )
-    y_variable = qcs.Scalar(
-        "stability_y_voltage",
-        value=float(y_values[0]),
-        dtype=float,
-    )
     program = qcs.Program(name="PulseGenerator QCS Stability hardware sweep")
+    physical_variables = []
+    physical_arrays = []
     for output_index, (output_name, channel_name) in enumerate(
         zip(output_names, connection_config.dc_channel_names)
     ):
-        amplitude = float(physical_offset[output_index])
-        if x_coefficients[output_index] != 0.0:
-            amplitude = (
-                amplitude
-                + x_variable * float(x_coefficients[output_index])
+        values = physical_amplitudes[:, output_index]
+        amplitude = qcs.Scalar(
+            f"stability_dc_{output_index}_amplitude",
+            value=float(values[0]),
+            dtype=float,
+        )
+        physical_variables.append(amplitude)
+        physical_arrays.append(
+            qcs.Array(
+                f"stability_dc_{output_index}_values",
+                value=values,
+                dtype=float,
             )
-        if y_coefficients[output_index] != 0.0:
-            amplitude = (
-                amplitude
-                + y_variable * float(y_coefficients[output_index])
-            )
+        )
         program.add_waveform(
             qcs.DCWaveform(
                 duration=duration_s,
@@ -1420,14 +1500,25 @@ def compile_qcs_stability_hardware_sweep(
                 f"QCS RF pulse references unknown Stability segment "
                 f"{pulse.at_segment!r}"
             )
-        if pulse.delay_s + pulse.duration_s > duration_s + 1e-15:
+        pulse_delay_s = _fabric_aligned_seconds(
+            pulse.delay_s,
+            fabric_hz=fabric_hz,
+            label=f"QCS RF gen_ch {pulse.gen_ch} delay",
+        )
+        pulse_duration_s = _fabric_aligned_seconds(
+            pulse.duration_s,
+            fabric_hz=fabric_hz,
+            label=f"QCS RF gen_ch {pulse.gen_ch} duration",
+            positive=True,
+        )
+        if pulse_delay_s + pulse_duration_s > duration_s + 1e-15:
             raise ValueError(
                 f"QCS RF pulse on gen_ch {pulse.gen_ch} exceeds the "
                 "Stability hold"
             )
         program.add_waveform(
             qcs.RFWaveform(
-                duration=pulse.duration_s,
+                duration=pulse_duration_s,
                 envelope=_qcs_envelope(qcs, pulse.envelope),
                 amplitude=pulse.amplitude,
                 rf_frequency=pulse.frequency_hz,
@@ -1438,7 +1529,7 @@ def compile_qcs_stability_hardware_sweep(
                 mapper, connection_config.rf_channel_names[pulse.gen_ch]
             ),
             new_layer=False,
-            pre_delay=pulse.delay_s,
+            pre_delay=pulse_delay_s,
         )
 
     if acquisition.at_segment != segment_name:
@@ -1446,7 +1537,10 @@ def compile_qcs_stability_hardware_sweep(
             "QCS acquisition references unknown Stability segment "
             f"{acquisition.at_segment!r}"
         )
-    if acquisition.pre_delay_s + acquisition_duration_s > duration_s + 1e-15:
+    if (
+        acquisition_pre_delay_s + acquisition_duration_s
+        > duration_s + 1e-15
+    ):
         raise ValueError("QCS acquisition exceeds the Stability hold")
     integration_filter = acquisition.integration_filter
     if integration_filter is None:
@@ -1462,26 +1556,14 @@ def compile_qcs_stability_hardware_sweep(
         integration_filter=integration_filter,
         channels=acquisition_channels,
         new_layer=False,
-        pre_delay=acquisition.pre_delay_s,
+        pre_delay=acquisition_pre_delay_s,
     )
 
-    # Program repetition calls prepend their loop. Reverse axis call order so
-    # the final native result is (shot, X, Y), with Y varying fastest.
+    # All physical outputs advance together through one flattened Cartesian
+    # hardware sweep, matching the QCSVideoProcessor reference design.
     program.sweep(
-        qcs.Array(
-            "stability_y_values",
-            value=y_values,
-            dtype=float,
-        ),
-        y_variable,
-    )
-    program.sweep(
-        qcs.Array(
-            "stability_x_values",
-            value=x_values,
-            dtype=float,
-        ),
-        x_variable,
+        physical_arrays,
+        physical_variables,
     )
     program.n_shots(repetitions)
     return QcsCompiledHardwareSweep(
@@ -1524,7 +1606,10 @@ def execute_qcs_stability_hardware_sweep(
         )
     if compiled is None:
         if progress_callback is not None:
-            progress_callback(10, "Compiling one native QCS X/Y sweep")
+            progress_callback(
+                10,
+                "Compiling one native QCS physical-channel sweep",
+            )
         compiled = compile_qcs_stability_hardware_sweep(
             sequence,
             connection_config=connection_config,
@@ -1578,8 +1663,10 @@ def execute_qcs_stability_hardware_sweep(
     summary = {
         "backend": "qcs",
         "hardware_sweep": True,
-        "hardware_sweep_dimensions": 2,
-        "hardware_sweep_shape": list(compiled.sweep_shape),
+        "hardware_sweep_dimensions": 1,
+        "hardware_sweep_shape": [point_count],
+        "stability_grid_dimensions": 2,
+        "stability_grid_shape": list(compiled.sweep_shape),
         "hardware_sweep_points": point_count,
         "software_sweep_points": 0,
         "program_count": 1,
@@ -1596,6 +1683,8 @@ def execute_qcs_stability_hardware_sweep(
             connection_config.acquisition_channel_name
         ),
         "hw_demod": True,
+        "reset_phase_every_shot": True,
+        "acquisition_result_type": "integrated_iq",
         "sample_rate_hz": compiled.acquisition_sample_rate_hz,
         "acquisition_duration_s": compiled.acquisition_duration_s,
         "requested_sample_count": (
@@ -1617,6 +1706,8 @@ def execute_qcs_stability_hardware_sweep(
         "readout_details": {
             "sample_rate_hz": compiled.acquisition_sample_rate_hz,
             "hw_demod": True,
+            "reset_phase_every_shot": True,
+            "acquisition_result_type": "integrated_iq",
             "frequency_hz": (
                 0.0 if acquisition is None else acquisition.frequency_hz
             ),
@@ -1624,6 +1715,8 @@ def execute_qcs_stability_hardware_sweep(
             "requested_sample_count": (
                 None if acquisition is None else acquisition.sample_count
             ),
+            # "adc" denotes the GUI's uncalibrated numeric representation;
+            # the QCS payload itself is integrated I/Q, not a raw ADC trace.
             "measurement_representation": "adc",
         },
     }
@@ -1985,6 +2078,7 @@ __all__ = [
     "MAX_QCS_STABILITY_GRID_POINTS",
     "MAX_QCS_STABILITY_RESULT_VALUES",
     "MAX_QCS_SOFTWARE_SWEEP_POINTS",
+    "QCS_FABRIC_CLOCK_HZ",
     "QCS_M5200_INTEGRATION_BLOCK_SAMPLES",
     "QCS_M5200_SAMPLE_RATE_HZ",
     "QcsAcquisitionConfig",

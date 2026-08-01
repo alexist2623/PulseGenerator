@@ -683,6 +683,157 @@ def test_focused_sma_click_creates_missing_dc_mapping(tmp_path):
     control.close()
 
 
+def test_focused_sma_click_creates_missing_rf_mapping(tmp_path):
+    _application()
+    configuration = _example_configuration("lab_baseline")
+    configuration["channel_mappings"] = [
+        mapping
+        for mapping in configuration["channel_mappings"]
+        if not (
+            mapping["role"] == "rf" and mapping["logical_index"] == 1
+        )
+    ]
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+        },
+        output_count=2,
+    )
+
+    assert control.focus_mapping("rf", 1) is True
+    assert control._focused_mapping_row() is None
+    assert control.select_connector(7, 3) is True
+
+    mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "rf" and mapping["logical_index"] == 1
+    )
+    assert mapping["virtual_name"] == "readout_drive"
+    assert mapping["absolute_phase"] is True
+    assert mapping["lo_frequency_hz"] is None
+    assert (mapping["slot"], mapping["channel"]) == (7, 3)
+    assert control.working_source_bindings()[1] == {
+        0: "qubit_drive",
+        1: "readout_drive",
+    }
+    assert "Created and selected" in control.status.text()
+    control.close()
+
+
+def test_focused_sma_click_generates_first_rf_binding(tmp_path):
+    _application()
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["dc_ch_1"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+        },
+        output_count=1,
+    )
+
+    assert control.focus_mapping("rf", 0) is True
+    assert control.select_connector(2, 2) is True
+
+    mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "rf"
+    )
+    assert mapping["logical_index"] == 0
+    assert mapping["virtual_name"] == "rf_drive"
+    assert (mapping["slot"], mapping["channel"]) == (2, 2)
+    assert control.working_source_bindings()[1] == {0: "rf_drive"}
+    control.close()
+
+
+def test_focused_m5300_sma_requests_required_lo(monkeypatch, tmp_path):
+    _application()
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["dc_ch_1"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+        },
+        output_count=1,
+    )
+    prompts = []
+
+    def fake_get_double(*args):
+        prompts.append(args)
+        return 6.25, True
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getDouble", fake_get_double)
+    assert control.focus_mapping("rf", 0) is True
+    assert control.select_connector(3, 1) is True
+
+    mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "rf"
+    )
+    assert len(prompts) == 1
+    assert mapping["virtual_name"] == "rf_drive"
+    assert mapping["lo_frequency_hz"] == pytest.approx(6.25e9)
+    assert (mapping["slot"], mapping["channel"]) == (3, 1)
+    control.close()
+
+
+def test_rf_mapping_can_move_from_m5300_to_m5301(tmp_path):
+    _application()
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": _example_configuration(
+                "lab_baseline"
+            ),
+        },
+        output_count=2,
+    )
+
+    assert control.focus_mapping("rf", 0) is True
+    assert control.select_connector(7, 3) is True
+    mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "rf" and mapping["logical_index"] == 0
+    )
+    assert (mapping["slot"], mapping["channel"]) == (7, 3)
+    assert mapping["lo_frequency_hz"] is None
+    control.close()
+
+
 def test_focused_sma_click_creates_missing_acquisition_mapping(tmp_path):
     _application()
     configuration = front_panel.default_qcs_hardware_configuration(
@@ -717,6 +868,64 @@ def test_focused_sma_click_creates_missing_acquisition_mapping(tmp_path):
     assert (mapping["slot"], mapping["channel"]) == (5, 2)
     assert control.working_source_bindings()[2] == "digitizer"
     assert "Created and selected" in control.status.text()
+    control.close()
+
+
+def test_stability_path_focus_routes_sma_click_by_module(tmp_path):
+    _application()
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {0: "rf_drive"},
+        "digitizer",
+    )
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["dc_ch_1"],
+            "rf_channel_names": {"0": "rf_drive"},
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+        },
+        output_count=1,
+    )
+    selected = []
+    control.connector_selected.connect(
+        lambda role, logical_index, slot, channel, changed: selected.append(
+            (role, logical_index, slot, channel, changed)
+        )
+    )
+
+    assert control.focus_rf_acquisition_path(0, 0) is True
+    assert control.select_connector(2, 2) is True
+    assert control._focused_mapping == ("rf", 0)
+    rf_mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "rf"
+    )
+    assert (rf_mapping["slot"], rf_mapping["channel"]) == (2, 2)
+
+    assert control.select_connector(5, 2) is True
+    assert control._focused_mapping == ("acquisition", 0)
+    acquisition_mapping = next(
+        mapping
+        for mapping in control._mappings_from_widgets()
+        if mapping["role"] == "acquisition"
+    )
+    assert (
+        acquisition_mapping["slot"],
+        acquisition_mapping["channel"],
+    ) == (5, 2)
+    assert [item[:4] for item in selected] == [
+        ("rf", 0, 2, 2),
+        ("acquisition", 0, 5, 2),
+    ]
+
+    # Leaving the Stability path restores the strict single-role picker.
+    assert control.focus_mapping("dc", 0) is True
+    assert control._rf_acquisition_path_focus is None
+    assert control.select_connector(5, 3) is False
     control.close()
 
 
@@ -2098,6 +2307,128 @@ def test_awg_edit_opens_focused_qcs_sma_picker_and_applies_selection(
     app.processEvents()
 
 
+def test_unchecked_rf_output_preview_remains_clickable():
+    app = _application()
+    panel = gui.RfPulsePortPanel(
+        gui.PulseSequence(),
+        0,
+        time_unit="us",
+    )
+    panel.set_hardware_backend(gui.EXECUTION_BACKEND_QCS)
+    panel.resize(720, 900)
+    panel.show()
+    app.processEvents()
+
+    requested = QtTest.QSignalSpy(panel.front_panel_requested)
+    assert panel.isChecked() is False
+    assert panel.front_panel_preview.isEnabled() is True
+    assert panel.front_panel_preview.currentWidget().isEnabled() is True
+    QtTest.QTest.mouseClick(
+        panel.front_panel_preview.currentWidget(),
+        QtCore.Qt.LeftButton,
+    )
+    assert len(requested) == 1
+
+    panel.setChecked(True)
+    panel.setChecked(False)
+    app.processEvents()
+    assert panel.front_panel_preview.isEnabled() is True
+    assert panel.front_panel_preview.currentWidget().isEnabled() is True
+    QtTest.QTest.mouseClick(
+        panel.front_panel_preview.currentWidget(),
+        QtCore.Qt.LeftButton,
+    )
+    assert len(requested) == 2
+    panel.close()
+
+
+def test_rf_output_front_panel_sma_selection_auto_applies(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    monkeypatch.setattr(
+        front_panel,
+        "build_qcs_channel_mapper",
+        lambda configuration: object(),
+    )
+    automatic_mapper = tmp_path / "automatic_rf_mapper.qcs"
+
+    def fake_save(_configuration, path):
+        output_path = Path(path)
+        output_path.write_bytes(b"automatic RF mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", fake_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_only",),
+        {},
+        None,
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "dc_channel_names": ["dc_only"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+            "hardware_mapper_sha256": None,
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    rf_output = window._rf_ports_panel._panels[0]
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+    app.processEvents()
+
+    QtTest.QTest.mouseClick(
+        rf_output.front_panel_preview.currentWidget(),
+        QtCore.Qt.LeftButton,
+    )
+    app.processEvents()
+    assert window._qcs_front_panel._focused_mapping == ("rf", 0)
+    assert window._qcs_front_panel_auto_apply_selection == ("rf", 0)
+
+    assert window._qcs_front_panel.select_connector(2, 2) is True
+    app.processEvents()
+    applied_configuration = experiment.qcs_settings_dict()[
+        "hardware_configuration"
+    ]
+    applied_mapping = next(
+        mapping
+        for mapping in applied_configuration["channel_mappings"]
+        if mapping["role"] == "rf" and mapping["logical_index"] == 0
+    )
+    assert applied_mapping["virtual_name"] == "rf_drive"
+    assert (applied_mapping["slot"], applied_mapping["channel"]) == (2, 2)
+    assert experiment.qcs_settings_dict()["rf_channel_names"] == {
+        "0": "rf_drive"
+    }
+    assert (
+        rf_output.front_panel_preview.qcs_preview._selected_address()
+        == (2, 2)
+    )
+    assert automatic_mapper.is_file()
+    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert "Mapped QCS RF output 0" in window.statusBar().currentMessage()
+    window.close()
+
+
 def test_stability_same_sma_draft_retries_automatic_mapper_save(
     monkeypatch,
     tmp_path,
@@ -2153,10 +2484,7 @@ def test_stability_same_sma_draft_retries_automatic_mapper_save(
     )
     assert window._apply_qcs_front_panel_settings(payload) is True
 
-    QtTest.QTest.mouseClick(
-        window._stability_panel.x_axis.front_panel_button,
-        QtCore.Qt.LeftButton,
-    )
+    window._show_active_front_panel("output", window._multi_ctrl)
     app.processEvents()
     assert window._qcs_front_panel._focused_mapping == ("dc", 0)
     assert (
@@ -2191,10 +2519,7 @@ def test_stability_same_sma_draft_retries_automatic_mapper_save(
     connection = experiment.qcs_connection_values(1)
     assert connection.dc_channel_names == ("dc_only",)
 
-    QtTest.QTest.mouseClick(
-        window._stability_panel.x_axis.front_panel_button,
-        QtCore.Qt.LeftButton,
-    )
+    window._show_active_front_panel("output", window._multi_ctrl)
     app.processEvents()
     assert window._qcs_front_panel.select_connector(2, 1) is True
     app.processEvents()
@@ -2657,7 +2982,7 @@ def test_qcs_front_panel_is_shared_by_auxiliary_measurement_tabs(monkeypatch):
         for preview in previews
     )
     assert (
-        "digitizer"
+        "rf_drive"
         in window._stability_panel.front_panel_preview.qcs_preview.binding_label.text()
     )
     assert (
@@ -2716,7 +3041,7 @@ def test_qcs_front_panel_is_shared_by_auxiliary_measurement_tabs(monkeypatch):
     window._noise_panel.front_panel_requested.emit(window._noise_panel)
 
     assert qcs_calls == [
-        ("acquisition", 0),
+        ("rf", 0),
         ("dc", 0),
         ("rf", 0),
         ("rf", 0),
@@ -2737,6 +3062,155 @@ def test_qcs_front_panel_is_shared_by_auxiliary_measurement_tabs(monkeypatch):
     )
     window._noise_panel.front_panel_requested.emit(window._noise_panel)
     assert qick_calls == [("input", window._noise_panel)]
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
+def test_stability_front_panel_enables_rf_and_acquisition_path_focus(
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {3: "rf_drive"},
+        "digitizer",
+    )
+    window._propagate_qcs_hardware_configuration(
+        configuration,
+        ("dc_gate",),
+        {3: "rf_drive"},
+        "digitizer",
+    )
+    path = window._stability_panel.path_diagram
+    path.qcs_output_mapping_selector.setCurrentIndex(
+        path.qcs_output_mapping_selector.findData(3)
+    )
+    focused = []
+    monkeypatch.setattr(
+        window,
+        "_show_qcs_front_panel",
+        lambda role=None, logical_index=0: True,
+    )
+    monkeypatch.setattr(
+        window._qcs_front_panel,
+        "focus_rf_acquisition_path",
+        lambda rf_index, acquisition_index=0: focused.append(
+            (rf_index, acquisition_index)
+        ),
+    )
+
+    window._show_active_front_panel("path", window._stability_panel)
+
+    assert focused == [(3, 0)]
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 3), ("acquisition", 0)}
+    )
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_stability_path_sma_clicks_auto_apply_both_endpoints(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    monkeypatch.setattr(
+        front_panel,
+        "build_qcs_channel_mapper",
+        lambda configuration: object(),
+    )
+    automatic_mapper = tmp_path / "automatic_stability_path_mapper.qcs"
+
+    def fake_save(_configuration, path):
+        output_path = Path(path)
+        output_path.write_bytes(b"automatic Stability RF path mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", fake_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {0: "rf_drive"},
+        "digitizer",
+    )
+    for mapping in configuration["channel_mappings"]:
+        if mapping["role"] == "rf":
+            mapping["lo_frequency_hz"] = 1.2e9
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "dc_channel_names": ["dc_gate"],
+            "rf_channel_names": {"0": "rf_drive"},
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+            "hardware_mapper_sha256": None,
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+
+    window._show_active_front_panel("path", window._stability_panel)
+    app.processEvents()
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 0), ("acquisition", 0)}
+    )
+    assert window._qcs_front_panel.select_connector(3, 2) is True
+    app.processEvents()
+    first_configuration = experiment.qcs_settings_dict()[
+        "hardware_configuration"
+    ]
+    rf_mapping = next(
+        mapping
+        for mapping in first_configuration["channel_mappings"]
+        if mapping["role"] == "rf"
+    )
+    assert (rf_mapping["slot"], rf_mapping["channel"]) == (3, 2)
+    assert window._qcs_front_panel_dialog.isVisible() is False
+
+    window._show_active_front_panel("path", window._stability_panel)
+    app.processEvents()
+    assert window._qcs_front_panel.select_connector(5, 2) is True
+    app.processEvents()
+    second_configuration = experiment.qcs_settings_dict()[
+        "hardware_configuration"
+    ]
+    acquisition_mapping = next(
+        mapping
+        for mapping in second_configuration["channel_mappings"]
+        if mapping["role"] == "acquisition"
+    )
+    assert (
+        acquisition_mapping["slot"],
+        acquisition_mapping["channel"],
+    ) == (5, 2)
+    assert automatic_mapper.is_file()
+    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert "Mapped QCS acquisition input" in (
+        window.statusBar().currentMessage()
+    )
     window.close()
     window.deleteLater()
     QtCore.QCoreApplication.sendPostedEvents(
@@ -2778,8 +3252,9 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
     window.show()
     experiment = window._experiment_panel
     experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
-    window._add_port()
     app.processEvents()
+    assert len(window._pulse) == 1
+    assert window._stability_panel.y_axis.output.currentData() is None
 
     assert window._show_qcs_front_panel() is True
     assert window._qcs_front_panel.apply_discovered_hardware_configuration(
@@ -2816,10 +3291,13 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
 
     window._qcs_front_panel_dialog.close()
     QtTest.QTest.mouseClick(
-        window._stability_panel.x_axis.front_panel_button,
+        window._stability_panel.x_axis.front_panel_preview.currentWidget(),
         QtCore.Qt.LeftButton,
     )
     app.processEvents()
+    assert len(window._pulse) == 2
+    assert window._stability_panel.x_axis.current_gen_ch() == 0
+    assert window._stability_panel.y_axis.current_gen_ch() == 1
     assert window._qcs_front_panel._focused_mapping == ("dc", 0)
     assert window._qcs_front_panel.select_connector(7, 3) is True
     app.processEvents()
@@ -2835,11 +3313,17 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
         experiment.qcs_connection_values(2)
 
     QtTest.QTest.mouseClick(
-        window._stability_panel.y_axis.front_panel_button,
+        window._stability_panel.y_axis.front_panel_preview.currentWidget(),
         QtCore.Qt.LeftButton,
     )
     app.processEvents()
     assert window._qcs_front_panel._focused_mapping == ("dc", 1)
+    assert window._qcs_front_panel.select_connector(7, 3) is False
+    assert {
+        (mapping["slot"], mapping["channel"])
+        for mapping in window._qcs_front_panel._mappings_from_widgets()
+        if mapping["role"] == "dc"
+    } == {(7, 3)}
     assert window._qcs_front_panel.select_connector(7, 4) is True
     app.processEvents()
 

@@ -512,6 +512,45 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             )
         return self._qcs_focus_role, int(logical_index)
 
+    def qcs_rf_acquisition_front_panel_selections(
+        self,
+    ) -> tuple[tuple[str, int], tuple[str, int]]:
+        """Return both native endpoints represented by this RF path."""
+
+        def selected_index(
+            role: str,
+            selector: QtWidgets.QComboBox,
+            fallback: int,
+        ) -> int:
+            logical_index = selector.currentData()
+            if logical_index is not None:
+                return int(logical_index)
+            mappings = self._qcs_role_mappings(role)
+            return (
+                int(mappings[0]["logical_index"])
+                if mappings
+                else int(fallback)
+            )
+
+        return (
+            (
+                "rf",
+                selected_index(
+                    "rf",
+                    self.qcs_output_mapping_selector,
+                    self.output_ch.value(),
+                ),
+            ),
+            (
+                "acquisition",
+                selected_index(
+                    "acquisition",
+                    self.qcs_acquisition_mapping_selector,
+                    0,
+                ),
+            ),
+        )
+
     def set_qcs_front_panel_focus(
         self,
         role: str,

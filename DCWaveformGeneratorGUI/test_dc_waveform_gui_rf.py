@@ -1982,7 +1982,9 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     }
     assert qcs_connection.acquisition_channel_name == "digitizer"
     assert qcs_connection.hw_demod is False
-    assert qcs_connection.init_time_s == pytest.approx(0.125e-6)
+    # HCL stores whole nanoseconds, and 300 MHz timing is exactly representable
+    # every 10 ns. Inter-shot initialization rounds upward, never shorter.
+    assert qcs_connection.init_time_s == pytest.approx(0.130e-6)
     panel.close()
 
 

@@ -248,6 +248,28 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
         )
 
 
+def test_stability_settings_repair_duplicate_axes_but_allow_one_output():
+    duplicate = stability.default_stability_settings(
+        ("awg_0", "awg_1", "awg_2")
+    )
+    duplicate["y_axis"]["output_name"] = "awg_0"
+
+    normalized = stability.normalize_stability_settings(
+        duplicate,
+        output_names=("awg_0", "awg_1", "awg_2"),
+    )
+
+    assert normalized["x_axis"]["output_name"] == "awg_0"
+    assert normalized["y_axis"]["output_name"] == "awg_1"
+
+    single_output = stability.normalize_stability_settings(
+        stability.default_stability_settings(("awg_0",)),
+        output_names=("awg_0",),
+    )
+    assert single_output["x_axis"]["output_name"] == "awg_0"
+    assert single_output["y_axis"]["output_name"] == "awg_0"
+
+
 def test_stability_builds_dedicated_set_hold_sequence_without_awg_waveform():
     config = _config()
     sequence = stability.build_stability_hold_sequence(
@@ -520,7 +542,7 @@ def test_stability_panel_measurement_representation_round_trip():
 
 
 def test_stability_qcs_picker_uses_current_logical_output_channel():
-    _application()
+    app = _application()
     panel = stability.StabilityDiagramPanel()
     panel.refresh_targets(("awg_2", "awg_0"), (2, 0))
     panel.set_hardware_backend("qcs")
@@ -538,6 +560,118 @@ def test_stability_qcs_picker_uses_current_logical_output_channel():
     panel.x_axis.output.setCurrentIndex(1)
     assert panel.x_axis.qcs_front_panel_selection() == ("dc", 0)
     assert "zero /" in panel.x_axis.front_panel_status.text()
+    assert panel.y_axis.qcs_front_panel_selection() == ("dc", 2)
+    assert "two /" in panel.y_axis.front_panel_status.text()
+    assert (
+        panel.x_axis.output.currentData()
+        != panel.y_axis.output.currentData()
+    )
+    app.processEvents()
+    panel.close()
+
+
+def test_stability_electrodes_show_independent_clickable_qcs_previews():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(
+        ("awg_0", "awg_1", "awg_2"),
+        (0, 1, 2),
+    )
+    panel.set_hardware_backend("qcs")
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("x_gate", "y_gate", "spare_gate"),
+        {},
+        None,
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    panel.resize(760, 1200)
+    panel.show()
+    app.processEvents()
+
+    x_preview = panel.x_axis.front_panel_preview
+    y_preview = panel.y_axis.front_panel_preview
+    mappings = {
+        int(mapping["logical_index"]): (
+            int(mapping["slot"]),
+            int(mapping["channel"]),
+        )
+        for mapping in configuration["channel_mappings"]
+        if mapping["role"] == "dc"
+    }
+    assert x_preview is not y_preview
+    assert x_preview.currentWidget() is x_preview.qcs_preview
+    assert y_preview.currentWidget() is y_preview.qcs_preview
+    assert x_preview.isVisible() is True
+    assert y_preview.isVisible() is True
+    assert x_preview.qcs_preview._selected_address() == mappings[0]
+    assert y_preview.qcs_preview._selected_address() == mappings[1]
+    assert "x_gate" in x_preview.qcs_preview.binding_label.text()
+    assert "y_gate" in y_preview.qcs_preview.binding_label.text()
+
+    requested = []
+    panel.electrode_front_panel_requested.connect(requested.append)
+    x_preview.activated.emit()
+    y_preview.activated.emit()
+    assert requested == [panel.x_axis, panel.y_axis]
+
+    panel.x_axis.output.setCurrentIndex(
+        panel.x_axis.output.findData("awg_2")
+    )
+    app.processEvents()
+    assert x_preview.qcs_preview._selected_address() == mappings[2]
+    assert y_preview.qcs_preview._selected_address() == mappings[1]
+    panel.close()
+
+
+def test_stability_axis_selectors_swap_instead_of_sharing_an_output():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(
+        ("awg_0", "awg_1", "awg_2"),
+        (0, 1, 2),
+    )
+
+    panel.x_axis.output.setCurrentIndex(
+        panel.x_axis.output.findData("awg_1")
+    )
+    assert panel.x_axis.output.currentData() == "awg_1"
+    assert panel.y_axis.output.currentData() == "awg_0"
+
+    panel.y_axis.output.setCurrentIndex(
+        panel.y_axis.output.findData("awg_1")
+    )
+    assert panel.y_axis.output.currentData() == "awg_1"
+    assert panel.x_axis.output.currentData() == "awg_0"
+    assert (
+        panel.x_axis.qcs_front_panel_selection()
+        != panel.y_axis.qcs_front_panel_selection()
+    )
+    assert panel.config(full_scale_mv=1000.0).x_axis.output_name == "awg_0"
+    app.processEvents()
+    panel.close()
+
+
+def test_stability_one_output_leaves_y_unassigned_and_measurement_disabled():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0",), (0,))
+
+    assert panel.x_axis.output.currentData() == "awg_0"
+    assert panel.y_axis.output.currentData() is None
+    assert panel.x_axis.front_panel_preview.isHidden() is False
+    assert panel.y_axis.front_panel_preview.isHidden() is False
+    assert (
+        panel.y_axis.front_panel_preview.qcs_preview._selected_address()
+        is None
+    )
+    assert "no logical channel selected" in (
+        panel.y_axis.front_panel_preview.qcs_preview.binding_label.text()
+    )
+    assert panel.y_axis.settings_dict()["output_name"] == "awg_0"
+    assert panel.start_button.isEnabled() is False
+    with pytest.raises(ValueError, match="at least two AWG outputs"):
+        panel.config(full_scale_mv=1000.0)
+    app.processEvents()
     panel.close()
 
 
@@ -809,6 +943,12 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
         stored["stability_diagram"]["bias_t_compensation_applied"]
         is False
     )
+    assert stored["stability_diagram"]["hardware_sweep_shape"] == [4]
+    assert stored["stability_diagram"]["stability_grid_shape"] == [2, 2]
+    assert (
+        stored["stability_diagram"]["acquisition_result_type"]
+        == "integrated_iq"
+    )
     metadata = {
         "gui_settings": stored,
         "program_summary": execution.program_summary,
@@ -1004,6 +1144,11 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
         ("M5301A Precision AWG", "M5301A"),
     ]
     assert path.qcs_output_mapping_selector.currentData() == 0
+    assert path.qcs_front_panel_selection() == ("rf", 0)
+    assert panel.qcs_rf_acquisition_front_panel_selections() == (
+        ("rf", 0),
+        ("acquisition", 0),
+    )
     assert path.qcs_output_module_model.currentData() == "M5300A"
     assert "M5300A, slot 3, SMA CH 1" in (
         path.qcs_output_mapping_selector.currentText()
@@ -1200,6 +1345,10 @@ def test_stability_qcs_rf_output_selection_round_trips():
 
     assert (
         restored.path_diagram.qcs_output_mapping_selector.currentData() == 1
+    )
+    assert restored.qcs_rf_acquisition_front_panel_selections() == (
+        ("rf", 1),
+        ("acquisition", 0),
     )
     restored.close()
     panel.close()

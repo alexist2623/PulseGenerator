@@ -168,6 +168,19 @@ class HardwareFrontPanelPreview(QtWidgets.QStackedWidget):
             input_ch=input_ch,
         )
 
+    def clear_channels(
+        self,
+        *,
+        output: bool = False,
+        input_channel: bool = False,
+    ) -> None:
+        """Remove a stale QICK highlight for an unassigned endpoint."""
+
+        if output:
+            self.qick_preview.set_selected("output", None)
+        if input_channel:
+            self.qick_preview.set_selected("input", None)
+
     def set_configuration(self, configuration) -> None:
         """Set the live QICK HWH configuration."""
 
@@ -181,7 +194,11 @@ class HardwareFrontPanelPreview(QtWidgets.QStackedWidget):
 
         self.qcs_preview.set_configuration(configuration)
 
-    def set_qcs_selection(self, role: str, logical_index: int = 0) -> None:
+    def set_qcs_selection(
+        self,
+        role: str,
+        logical_index: Optional[int] = 0,
+    ) -> None:
         self.qcs_preview.set_selection(role, logical_index)
 
 

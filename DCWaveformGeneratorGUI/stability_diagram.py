@@ -64,6 +64,7 @@ try:
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
     )
+    from .hardware_front_panel import HardwareFrontPanelPreview
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
     from dc_waveform_core import (
@@ -104,6 +105,7 @@ except ImportError:
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
     )
+    from hardware_front_panel import HardwareFrontPanelPreview
     from sparameter_gui import RfPathCorrectionWidget
 
 
@@ -1167,6 +1169,19 @@ def normalize_stability_settings(
                 2,
             ),
         }
+    if (
+        len(set(outputs)) >= 2
+        and normalized["x_axis"]["output_name"]
+        == normalized["y_axis"]["output_name"]
+    ):
+        # Older GUI versions could save both selectors on the same output.
+        # Preserve X and move Y to the first independent output so those
+        # projects remain loadable without reviving the invalid UI state.
+        normalized["y_axis"]["output_name"] = next(
+            output_name
+            for output_name in outputs
+            if output_name != normalized["x_axis"]["output_name"]
+        )
     normalized["repetitions_per_point"] = _integer(
         settings.get(
             "repetitions_per_point",
@@ -2065,9 +2080,13 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
             )
             stored_stability.update({
                 "capture_mode": "qcs_hardware_sweep",
-                "hardware_sweep_shape": list(compiled.sweep_shape),
+                "hardware_sweep_shape": [
+                    int(np.prod(compiled.sweep_shape))
+                ],
+                "stability_grid_shape": list(compiled.sweep_shape),
                 "hardware_sweep_program_count": 1,
                 "hardware_demodulation": True,
+                "acquisition_result_type": "integrated_iq",
                 "bias_t_compensation_applied": False,
                 "measurement_representation_applied": "adc",
                 "qick_only_settings_dormant": True,
@@ -2128,6 +2147,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         super().__init__(title, parent)
         form = QtWidgets.QFormLayout(self)
         self.output = QtWidgets.QComboBox(self)
+        self.output.setPlaceholderText("Independent output required")
         self.output.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Fixed,
@@ -2154,6 +2174,16 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         self.front_panel_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
+        self.front_panel_preview = HardwareFrontPanelPreview(self)
+        self.front_panel_preview.set_backend(self._hardware_backend)
+        self.front_panel_preview.set_scope("output")
+        self.front_panel_preview.set_qcs_selection("dc", 0)
+        self.front_panel_preview.setToolTip(
+            f"Open the full front panel and select the DC SMA for {title}"
+        )
+        self.front_panel_preview.activated.connect(
+            lambda: self.front_panel_requested.emit(self)
+        )
         front_panel_row = QtWidgets.QHBoxLayout()
         front_panel_row.addWidget(self.front_panel_button)
         front_panel_row.addWidget(self.front_panel_status, 1)
@@ -2163,6 +2193,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         self.points.setRange(2, 1_000_000)
         self.points.setValue(DEFAULT_STABILITY_POINTS)
         form.addRow("Electrode SMA:", front_panel_row)
+        form.addRow(self.front_panel_preview)
         form.addRow("AWG electrode:", self.output)
         form.addRow("Start:", self.start_mv)
         form.addRow("Stop:", self.stop_mv)
@@ -2196,7 +2227,11 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
                 )
             output_index = self.output.findData(previous_output)
             if output_index < 0 and self.output.count():
-                output_index = min(preferred_output_index, self.output.count() - 1)
+                output_index = (
+                    preferred_output_index
+                    if preferred_output_index < self.output.count()
+                    else -1
+                )
             self.output.setCurrentIndex(output_index)
         self._sync_front_panel_status()
 
@@ -2237,10 +2272,12 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
     def set_front_panel_configuration(self, configuration) -> None:
         self._front_panel_configuration = configuration
+        self.front_panel_preview.set_configuration(configuration)
         self._sync_front_panel_status()
 
     def set_hardware_backend(self, backend: str) -> None:
         self._hardware_backend = str(backend).strip().lower()
+        self.front_panel_preview.set_backend(self._hardware_backend)
         self.front_panel_button.setText(
             "Configure QCS DC Channel"
             if self._hardware_backend == "qcs"
@@ -2253,14 +2290,21 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         configuration: Mapping[str, object] | None,
     ) -> None:
         self._qcs_front_panel_configuration = configuration
+        self.front_panel_preview.set_qcs_configuration(configuration)
         self._sync_front_panel_status()
 
     def qcs_front_panel_selection(self) -> tuple[str, int]:
         return "dc", max(0, self.current_gen_ch())
 
     def _sync_front_panel_status(self, *_args) -> None:
+        logical_index = self.current_gen_ch()
+        if logical_index >= 0:
+            self.front_panel_preview.set_channels(output_ch=logical_index)
+            self.front_panel_preview.set_qcs_selection("dc", logical_index)
+        else:
+            self.front_panel_preview.clear_channels(output=True)
+            self.front_panel_preview.set_qcs_selection("dc", None)
         if self._hardware_backend == "qcs":
-            logical_index = self.current_gen_ch()
             configuration = self._qcs_front_panel_configuration
             if configuration is not None and logical_index >= 0:
                 mapping = next(
@@ -2310,8 +2354,13 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         )
 
     def settings_dict(self) -> dict:
+        output_name = self.output.currentData()
+        if output_name is None and self.output.count():
+            # A one-output project deliberately leaves Y unselected in the
+            # GUI, but the disabled Stability settings must still round-trip.
+            output_name = self.output.itemData(0)
         return {
-            "output_name": str(self.output.currentData() or ""),
+            "output_name": str(output_name or ""),
             "start_mv": self.start_mv.value(),
             "stop_mv": self.stop_mv.value(),
             "points": self.points.value(),
@@ -2929,7 +2978,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         controls.setSpacing(6)
 
         self.path_diagram = RfPathCorrectionWidget(controls_content, compact=True)
-        self.path_diagram.set_qcs_front_panel_focus("acquisition", 0)
+        # The embedded preview initially highlights the drive endpoint. The
+        # full Stability chassis picker accepts both RF-output and acquisition
+        # SMA clicks and resolves the endpoint from the clicked module.
+        self.path_diagram.set_qcs_front_panel_focus("rf", 0)
         self.path_diagram.settings_applied.connect(self._apply_local_path_settings)
         self.path_diagram.front_panel_requested.connect(
             self.front_panel_requested.emit
@@ -2947,6 +2999,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
         self.x_axis = _StabilityAxisEditor("X Electrode", controls_content)
         self.y_axis = _StabilityAxisEditor("Y Electrode", controls_content)
+        self._axis_output_change_in_progress = False
+        self._previous_axis_output_names = {"x": None, "y": None}
         self.x_axis.front_panel_requested.connect(
             self.electrode_front_panel_requested.emit
         )
@@ -3388,6 +3442,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.fit_button.clicked.connect(self.plot.fit_view)
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
+        self.x_axis.output.currentIndexChanged.connect(
+            lambda _index: self._enforce_independent_axis_outputs(self.x_axis)
+        )
+        self.y_axis.output.currentIndexChanged.connect(
+            lambda _index: self._enforce_independent_axis_outputs(self.y_axis)
+        )
         self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
@@ -3669,21 +3729,85 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         outputs = tuple(zip(output_names, awg_channels))
         self.x_axis.refresh_targets(outputs, preferred_output_index=0)
         self.y_axis.refresh_targets(outputs, preferred_output_index=1)
-        if (
-            len(outputs) >= 2
-            and self.x_axis.output.currentData() == self.y_axis.output.currentData()
-        ):
-            for index in range(self.y_axis.output.count()):
-                if (
-                    self.y_axis.output.itemData(index)
-                    != self.x_axis.output.currentData()
-                ):
-                    self.y_axis.output.setCurrentIndex(index)
-                    break
-        self._targets_available = len(outputs) >= 2
+        self._enforce_independent_axis_outputs()
         if not self._targets_available:
-            self.status.setText("Add at least two AWG outputs to run a stability scan")
+            self.status.setText(
+                "Add at least two independent waveform outputs to run a "
+                "stability scan"
+            )
         self._set_idle_button_state()
+
+    @staticmethod
+    def _axis_output_name(editor: _StabilityAxisEditor) -> Optional[str]:
+        output_name = editor.output.currentData()
+        return None if output_name is None else str(output_name)
+
+    def _enforce_independent_axis_outputs(
+        self,
+        changed_editor: Optional[_StabilityAxisEditor] = None,
+    ) -> None:
+        """Keep X and Y on separate logical outputs at all times."""
+
+        if self._axis_output_change_in_progress:
+            return
+        self._axis_output_change_in_progress = True
+        try:
+            x_name = self._axis_output_name(self.x_axis)
+            y_name = self._axis_output_name(self.y_axis)
+            if x_name is not None and x_name == y_name:
+                if changed_editor is self.y_axis:
+                    changed_key = "y"
+                    other_editor = self.x_axis
+                else:
+                    changed_key = "x"
+                    other_editor = self.y_axis
+
+                replacement_index = -1
+                previous_name = self._previous_axis_output_names[changed_key]
+                if previous_name is not None and previous_name != x_name:
+                    replacement_index = other_editor.output.findData(
+                        previous_name
+                    )
+                if replacement_index < 0:
+                    replacement_index = next(
+                        (
+                            index
+                            for index in range(other_editor.output.count())
+                            if str(other_editor.output.itemData(index)) != x_name
+                        ),
+                        -1,
+                    )
+
+                if replacement_index >= 0:
+                    with QtCore.QSignalBlocker(other_editor.output):
+                        other_editor.output.setCurrentIndex(replacement_index)
+                else:
+                    # With only one waveform output, X remains valid and Y is
+                    # explicitly unassigned instead of pretending to be X.
+                    with QtCore.QSignalBlocker(self.y_axis.output):
+                        self.y_axis.output.setCurrentIndex(-1)
+
+            self.x_axis._sync_front_panel_status()
+            self.y_axis._sync_front_panel_status()
+            x_name = self._axis_output_name(self.x_axis)
+            y_name = self._axis_output_name(self.y_axis)
+            self._previous_axis_output_names = {
+                "x": x_name,
+                "y": y_name,
+            }
+            self._targets_available = (
+                x_name is not None
+                and y_name is not None
+                and x_name != y_name
+            )
+            if (
+                self._targets_available
+                and self.status.text().startswith("Add at least two independent")
+            ):
+                self.status.setText("Ready")
+            self._set_idle_button_state()
+        finally:
+            self._axis_output_change_in_progress = False
 
     def _browse_database(self) -> None:
         path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
@@ -3859,6 +3983,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def qcs_front_panel_selection(self) -> tuple[str, int]:
         return self.path_diagram.qcs_front_panel_selection()
 
+    def qcs_rf_acquisition_front_panel_selections(
+        self,
+    ) -> tuple[tuple[str, int], tuple[str, int]]:
+        """Return the two endpoints selectable from the Stability chassis."""
+
+        return self.path_diagram.qcs_rf_acquisition_front_panel_selections()
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
         self.override_fpga_trigger_delay.setEnabled(supported)
@@ -4014,8 +4145,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
-        self.x_axis.load_settings(settings["x_axis"])
-        self.y_axis.load_settings(settings["y_axis"])
+        self._axis_output_change_in_progress = True
+        try:
+            self.x_axis.load_settings(settings["x_axis"])
+            self.y_axis.load_settings(settings["y_axis"])
+        finally:
+            self._axis_output_change_in_progress = False
+        self._enforce_independent_axis_outputs()
         self.repetitions.setValue(int(settings["repetitions_per_point"]))
         self.trace_samples.setValue(
             int(

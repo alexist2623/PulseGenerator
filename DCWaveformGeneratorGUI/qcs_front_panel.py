@@ -2012,7 +2012,7 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         super().__init__(parent)
         self._configuration = None
         self._role = "dc"
-        self._logical_index = 0
+        self._logical_index: Optional[int] = 0
         self._render_error = None
         self._fallback_pixmap = QtGui.QPixmap(
             str(
@@ -2109,7 +2109,7 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         self.updateGeometry()
 
     def _selected_address(self) -> Optional[tuple[int, int]]:
-        if self._configuration is None:
+        if self._configuration is None or self._logical_index is None:
             return None
         mapping = next(
             (
@@ -2145,14 +2145,19 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         self._pixmap = pixmap
         self._refresh_image()
 
-    def set_selection(self, role: str, logical_index: int = 0) -> None:
+    def set_selection(
+        self,
+        role: str,
+        logical_index: Optional[int] = 0,
+    ) -> None:
         role = str(role).strip().lower()
         if role not in QCS_ROLE_LABELS or role == "unassigned":
             raise ValueError(f"unsupported QCS preview role {role!r}")
-        logical_index = _nonnegative_integer(
-            logical_index,
-            "QCS preview logical index",
-        )
+        if logical_index is not None:
+            logical_index = _nonnegative_integer(
+                logical_index,
+                "QCS preview logical index",
+            )
         self._role = role
         self._logical_index = logical_index
         self._refresh_pixmap()
@@ -2179,6 +2184,12 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
 
     def _refresh_binding(self) -> None:
         role_label = QCS_ROLE_LABELS[self._role]
+        if self._logical_index is None:
+            self.binding_label.setText(
+                f"{role_label}: no logical channel selected; "
+                "click to configure"
+            )
+            return
         if self._configuration is None:
             self.binding_label.setText(
                 f"{role_label} {self._logical_index}: "
@@ -2448,6 +2459,11 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._identifying_hardware = False
         self._syncing_downconverter_lo = False
         self._focused_mapping: Optional[tuple[str, int]] = None
+        # Stability's RF-path preview selects either endpoint from one full
+        # chassis view.  Other callers retain a strict single-role focus.
+        self._rf_acquisition_path_focus: Optional[
+            tuple[tuple[str, int], tuple[str, int]]
+        ] = None
         self._module_models_by_slot: dict[int, str] = {}
         self._image_scale = 0.45
         self._image_pixmap = QtGui.QPixmap()
@@ -3620,7 +3636,10 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                     )
                     if configuration is not None:
                         role, _logical_index = self._focused_mapping
-                        if role == "acquisition":
+                        if (
+                            role == "acquisition"
+                            or self._rf_acquisition_path_focus is not None
+                        ):
                             downconverter = (
                                 qcs_chassis_connector_at_point(
                                     configuration,
@@ -3630,6 +3649,13 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                                 )
                             )
                             if downconverter is not None:
+                                if self._rf_acquisition_path_focus is not None:
+                                    self._focused_mapping = (
+                                        "acquisition",
+                                        dict(
+                                            self._rf_acquisition_path_focus
+                                        )["acquisition"],
+                                    )
                                 self.show_m5201_route_dialog(
                                     int(downconverter["slot"]),
                                     int(downconverter["channel"]),
@@ -3666,11 +3692,21 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                             return True
                 slot = qcs_chassis_slot_at_point(source_x, source_y)
                 if slot is not None:
-                    if self._focused_mapping == ("acquisition", 0):
+                    if (
+                        self._focused_mapping == ("acquisition", 0)
+                        or self._rf_acquisition_path_focus is not None
+                    ):
                         module_slot, module_model = (
                             self._module_covering_slot(slot)
                         )
                         if module_model == "M5201A":
+                            if self._rf_acquisition_path_focus is not None:
+                                self._focused_mapping = (
+                                    "acquisition",
+                                    dict(
+                                        self._rf_acquisition_path_focus
+                                    )["acquisition"],
+                                )
                             self.show_m5201_route_dialog(module_slot)
                             return True
                     self._show_module_menu_for_slot(
@@ -4633,8 +4669,9 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         Selecting an SMA already used by another mapping of the same role
         swaps the two addresses, matching the QICK AWG-output selector.  A
         connector owned by a different role is never silently reassigned.
-        A missing focused DC or acquisition mapping is created directly from
-        the SMA click.
+        A missing focused DC, RF, or acquisition mapping is created directly
+        from the SMA click. A newly selected M5300 output still requires its
+        LO frequency before the native mapper can be saved.
         """
 
         if not self.tabs.isEnabled() or self._focused_mapping is None:
@@ -4644,9 +4681,27 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             channel,
             "QCS selected connector channel",
         )
-        role, logical_index = self._focused_mapping
         model = self._module_models_by_slot.get(slot)
         spec = None if model is None else QCS_MODULE_MODELS[model]
+        if self._rf_acquisition_path_focus is not None:
+            path_mappings = dict(self._rf_acquisition_path_focus)
+            instrument = None if spec is None else spec["instrument"]
+            if instrument in QCS_ROLE_INSTRUMENTS["acquisition"]:
+                self._focused_mapping = (
+                    "acquisition",
+                    path_mappings["acquisition"],
+                )
+            elif instrument in QCS_ROLE_INSTRUMENTS["rf"]:
+                self._focused_mapping = ("rf", path_mappings["rf"])
+            else:
+                self._set_status(
+                    "Stability RF-path selection requires an RF output SMA "
+                    "on M5300A/M5301A or an acquisition input SMA on "
+                    "M5200A.",
+                    error=True,
+                )
+                return False
+        role, logical_index = self._focused_mapping
         compatible = (
             spec is not None
             and spec["instrument"] is not None
@@ -4683,7 +4738,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         selected_address = (slot, channel)
         target_row = self._focused_mapping_row()
         creating_mapping = target_row is None
-        if creating_mapping and role not in {"dc", "acquisition"}:
+        if creating_mapping and role not in {"dc", "rf", "acquisition"}:
             self._set_status(
                 f"No mapping exists for "
                 f"{_qcs_mapping_display_name(role, logical_index)}.",
@@ -4694,6 +4749,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         target_slot_widget = None
         target_channel_widget = None
         previous_address = None
+        requested_m5300_lo_frequency_hz = None
         if target_row is not None:
             target_slot_widget = self.mapping_table.cellWidget(target_row, 6)
             target_channel_widget = self.mapping_table.cellWidget(target_row, 7)
@@ -4701,7 +4757,39 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 int(target_slot_widget.value()),
                 int(target_channel_widget.value()),
             )
-        if previous_address == selected_address:
+        if role == "rf" and model == "M5300A":
+            existing_lo_frequency_hz = (
+                None
+                if target_row is None
+                else self._mappings_from_widgets()[target_row][
+                    "lo_frequency_hz"
+                ]
+            )
+            if existing_lo_frequency_hz is None:
+                lo_frequency_ghz, accepted = QtWidgets.QInputDialog.getDouble(
+                    self,
+                    "M5300 RF Output LO",
+                    "M5300 local-oscillator frequency [GHz]:",
+                    5.0,
+                    0.0,
+                    18.0,
+                    9,
+                )
+                if not accepted:
+                    self._set_status(
+                        f"M5300 LO entry was cancelled; "
+                        f"{_qcs_mapping_display_name(role, logical_index)} "
+                        "was not changed.",
+                        error=False,
+                    )
+                    return False
+                requested_m5300_lo_frequency_hz = (
+                    float(lo_frequency_ghz) * 1.0e9
+                )
+        if (
+            previous_address == selected_address
+            and requested_m5300_lo_frequency_hz is None
+        ):
             self._set_status(
                 f"{_qcs_mapping_display_name(role, logical_index)} already "
                 "uses "
@@ -4889,9 +4977,10 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         proposed_mappings = self._mappings_from_widgets()
         proposed_links = self._downconverter_links_from_widgets()
         created_mapping = None
+        generated_rf_name = None
         generated_acquisition_name = None
         if creating_mapping:
-            dc_names, _rf_names, acquisition_name = (
+            dc_names, rf_names, acquisition_name = (
                 self._current_source_bindings()
             )
             if role == "dc":
@@ -4903,6 +4992,28 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                     )
                     return False
                 virtual_name = dc_names[logical_index]
+            elif role == "rf":
+                virtual_name = rf_names.get(logical_index)
+                if virtual_name is None:
+                    used_names = {
+                        str(mapping["virtual_name"])
+                        for mapping in proposed_mappings
+                    }
+                    used_names.update(dc_names)
+                    used_names.update(rf_names.values())
+                    if acquisition_name is not None:
+                        used_names.add(acquisition_name)
+                    virtual_name = (
+                        "rf_drive"
+                        if logical_index == 0
+                        else f"rf_drive_{logical_index}"
+                    )
+                    suffix = 2
+                    base_name = virtual_name
+                    while virtual_name in used_names:
+                        virtual_name = f"{base_name}_{suffix}"
+                        suffix += 1
+                    generated_rf_name = virtual_name
             else:
                 if logical_index != 0:
                     self._set_status(
@@ -4928,7 +5039,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 "virtual_name": virtual_name,
                 "label": 0,
                 "absolute_phase": role != "dc",
-                "lo_frequency_hz": None,
+                "lo_frequency_hz": requested_m5300_lo_frequency_hz,
                 "slot": slot,
                 "channel": channel,
             }
@@ -4936,6 +5047,15 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         else:
             proposed_mappings[target_row]["slot"] = slot
             proposed_mappings[target_row]["channel"] = channel
+            if role == "rf":
+                if model == "M5300A":
+                    if requested_m5300_lo_frequency_hz is not None:
+                        proposed_mappings[target_row]["lo_frequency_hz"] = (
+                            requested_m5300_lo_frequency_hz
+                        )
+                else:
+                    # M5301 mappings do not expose a mapper-level LO setting.
+                    proposed_mappings[target_row]["lo_frequency_hz"] = None
         linked_rows = []
         if role == "acquisition" and previous_address is not None:
             for link_row, link in enumerate(proposed_links):
@@ -4977,6 +5097,12 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             return False
 
         if creating_mapping:
+            if generated_rf_name is not None:
+                source_rf_names = dict(
+                    self._source_settings.get("rf_channel_names", {})
+                )
+                source_rf_names[int(logical_index)] = generated_rf_name
+                self._source_settings["rf_channel_names"] = source_rf_names
             if generated_acquisition_name is not None:
                 self._source_settings["acquisition_channel_name"] = (
                     generated_acquisition_name
@@ -4993,6 +5119,14 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             target_channel_widget = self.mapping_table.cellWidget(target_row, 7)
 
         widgets = [target_slot_widget, target_channel_widget]
+        target_lo_widget = None
+        target_lo_frequency_hz = None
+        if role == "rf":
+            target_lo_widget = self.mapping_table.cellWidget(target_row, 5)
+            target_lo_frequency_hz = proposed_mappings[target_row][
+                "lo_frequency_hz"
+            ]
+            widgets.append(target_lo_widget)
         if occupied_row is not None:
             widgets.extend(
                 (
@@ -5006,6 +5140,12 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         try:
             target_slot_widget.setValue(slot)
             target_channel_widget.setValue(channel)
+            if target_lo_widget is not None:
+                target_lo_widget.setText(
+                    ""
+                    if target_lo_frequency_hz is None
+                    else f"{float(target_lo_frequency_hz) / 1.0e9:.12g}"
+                )
             if occupied_row is not None:
                 self.mapping_table.cellWidget(
                     occupied_row,
@@ -5360,6 +5500,29 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
 
         return self._current_source_bindings()
 
+    def update_source_dc_channels(
+        self,
+        dc_channel_names: Sequence[str],
+        *,
+        output_count: int,
+    ) -> None:
+        """Expand draft source bindings without replacing its hardware layout."""
+
+        output_count = _positive_integer(
+            output_count,
+            "QCS output count",
+        )
+        names = tuple(_virtual_name(name) for name in dc_channel_names)
+        if len(names) != output_count:
+            raise ValueError(
+                "QCS DC source bindings must contain one name per output"
+            )
+        if len(set(names)) != len(names):
+            raise ValueError("QCS DC source binding names must be unique")
+        self._output_count = output_count
+        self._source_settings = dict(self._source_settings)
+        self._source_settings["dc_channel_names"] = names
+
     def _set_configuration_widgets(
         self,
         configuration: Mapping[str, Any],
@@ -5390,6 +5553,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     ) -> None:
         """Populate the builder without changing live experiment settings."""
         self._close_m5201_route_dialog()
+        self._rf_acquisition_path_focus = None
         self._focused_mapping = None
         self.reference_label.setToolTip(
             "Click an empty slot to install a module, or click a module to "
@@ -5866,6 +6030,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         """Leave connector-selection mode without discarding editor changes."""
 
         self._close_m5201_route_dialog()
+        self._rf_acquisition_path_focus = None
         self._focused_mapping = None
         self.mapping_table.clearSelection()
         self.reference_label.setToolTip(
@@ -5878,6 +6043,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     def focus_mapping(self, role: str, logical_index: int = 0) -> bool:
         """Highlight and enable SMA selection for one logical mapping."""
         self._close_m5201_route_dialog()
+        self._rf_acquisition_path_focus = None
         role = str(role).strip().lower()
         if role not in QCS_ROLE_LABELS or role == "unassigned":
             raise ValueError(f"unsupported QCS mapping role {role!r}")
@@ -5903,7 +6069,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._refresh_reference_preview()
         if row is None:
             self.mapping_table.clearSelection()
-            if role in {"dc", "acquisition"}:
+            if role in {"dc", "rf", "acquisition"}:
                 self._set_status(
                     f"{_qcs_mapping_display_name(role, logical_index)} is not "
                     f"mapped. Click a {model_text} channel SMA to create and "
@@ -5937,6 +6103,46 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             error=False,
         )
         return True
+
+    def focus_rf_acquisition_path(
+        self,
+        rf_logical_index: int = 0,
+        acquisition_logical_index: int = 0,
+    ) -> bool:
+        """Select an RF output or acquisition input by the clicked module.
+
+        This scoped mode is used by the Stability RF-path preview. M5300A or
+        M5301A SMA clicks target the selected RF virtual channel, while M5200A
+        SMA clicks target the acquisition virtual channel. M5201A clicks keep
+        using the existing graphical downconverter-route editor.
+        """
+
+        rf_logical_index = _nonnegative_integer(
+            rf_logical_index,
+            "QCS RF path logical index",
+        )
+        acquisition_logical_index = _nonnegative_integer(
+            acquisition_logical_index,
+            "QCS acquisition path logical index",
+        )
+        # Reuse the established RF focus for its current highlight and table
+        # selection, then enable module-driven endpoint routing.
+        focused = self.focus_mapping("rf", rf_logical_index)
+        self._rf_acquisition_path_focus = (
+            ("rf", rf_logical_index),
+            ("acquisition", acquisition_logical_index),
+        )
+        self.reference_label.setToolTip(
+            "Click an M5300A/M5301A SMA to select the Stability RF output, "
+            "or an M5200A SMA to select the Stability acquisition input. "
+            "Click an M5201A pair to configure its acquisition route."
+        )
+        self._set_status(
+            "Select a Stability RF-path endpoint: click an RF output SMA on "
+            "M5300A/M5301A, or an acquisition input SMA on M5200A.",
+            error=False,
+        )
+        return focused
 
     def _refresh_editing_enabled_state(self) -> None:
         enabled = self._editing_enabled and not self._identifying_hardware

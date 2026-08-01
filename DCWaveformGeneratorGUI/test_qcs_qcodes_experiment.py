@@ -184,6 +184,53 @@ def test_connection_config_is_qcodes_metadata_serializable():
     assert payload["init_time_s"] == pytest.approx(100e-6)
 
 
+def test_connection_config_prevents_hcl_init_time_nanosecond_truncation():
+    # This is the exact float produced by the GUI's 100 us -> seconds path.
+    requested = 100.0 * 1e-6
+    assert int(requested * 1e9) == 99_999
+
+    connection = _connection(init_time_s=requested)
+
+    assert connection.init_time_s == pytest.approx(100e-6)
+    assert int(connection.init_time_s * 1e9) == 100_000
+    assert int(connection.init_time_s * 1e9) % 10 == 0
+
+    rounded_up = _connection(init_time_s=0.125e-6)
+    assert rounded_up.init_time_s == pytest.approx(0.130e-6)
+    assert int(rounded_up.init_time_s * 1e9) == 130
+
+
+def test_stability_executor_resets_phase_for_hardware_iq():
+    captured = {}
+
+    class HclBackend:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class Executor:
+        def __init__(self, hcl_backend):
+            self.backend = hcl_backend
+
+    Qcs = type(
+        "Qcs",
+        (),
+        {"HclBackend": HclBackend, "Executor": Executor},
+    )
+
+    mapper = object()
+    executor = backend.build_qcs_executor(
+        _connection(),
+        mapper,
+        qcs_module=Qcs,
+    )
+
+    assert isinstance(executor, Executor)
+    assert captured["channel_mapper"] is mapper
+    assert captured["hw_demod"] is True
+    assert captured["reset_phase_every_shot"] is True
+    assert captured["init_time"] == pytest.approx(100e-6)
+
+
 def test_compile_converts_gui_millivolts_to_qcs_relative_amplitude():
     compiled = compile_qcs_point(
         _sequence(),
@@ -282,13 +329,14 @@ def test_qcs_stability_hardware_sweep_executes_one_program_in_c_order():
         dc_channel_names=("dc_x", "dc_y"),
         dc_full_scale_v=1.0,
     )
-    raw = np.empty((4, 3, 2), dtype=complex)
+    semantic_raw = np.empty((4, 3, 2), dtype=complex)
     for repetition in range(4):
         for x_index in range(3):
             for y_index in range(2):
-                raw[repetition, x_index, y_index] = (
+                semantic_raw[repetition, x_index, y_index] = (
                     100 * x_index + 10 * y_index + repetition
                 ) + 1j * repetition
+    raw = semantic_raw.reshape(4, 6)
 
     calls = {"execute": 0}
 
@@ -296,10 +344,28 @@ def test_qcs_stability_hardware_sweep_executes_one_program_in_c_order():
         def execute(self, program):
             calls["execute"] += 1
             assert program.shots == 4
-            assert [entry[1].name for entry in program.sweeps] == [
-                "stability_y_voltage",
-                "stability_x_voltage",
+            assert len(program.sweeps) == 1
+            arrays, variables = program.sweeps[0]
+            assert [variable.name for variable in variables] == [
+                "stability_dc_0_amplitude",
+                "stability_dc_1_amplitude",
             ]
+            np.testing.assert_allclose(
+                arrays[0].value,
+                [-0.24, -0.16, -0.04, 0.04, 0.16, 0.24],
+            )
+            np.testing.assert_allclose(
+                arrays[1].value,
+                [-0.36, 0.44, -0.4, 0.4, -0.44, 0.36],
+            )
+            dc_amplitudes = [
+                waveform[0].kwargs["amplitude"]
+                for waveform in program.waveforms[:2]
+            ]
+            assert all(
+                isinstance(amplitude, _Scalar)
+                for amplitude in dc_amplitudes
+            )
             return raw
 
     result = backend.execute_qcs_stability_hardware_sweep(
@@ -323,6 +389,19 @@ def test_qcs_stability_hardware_sweep_executes_one_program_in_c_order():
     assert len(result.programs) == 1
     assert len(result.raw_results) == 1
     assert result.program_summary["hardware_sweep"] is True
+    assert result.program_summary["hardware_sweep_dimensions"] == 1
+    assert result.program_summary["hardware_sweep_shape"] == [6]
+    assert result.program_summary["stability_grid_shape"] == [3, 2]
+    assert result.program_summary["reset_phase_every_shot"] is True
+    assert result.program_summary["acquisition_result_type"] == "integrated_iq"
+    assert (
+        result.rf_settings["readout_details"]["reset_phase_every_shot"]
+        is True
+    )
+    assert (
+        result.rf_settings["readout_details"]["acquisition_result_type"]
+        == "integrated_iq"
+    )
     assert result.program_summary["program_count"] == 1
     assert result.ddr_result.iq.shape == (6, 4, 1, 2)
     np.testing.assert_array_equal(
@@ -380,13 +459,26 @@ def test_qcs_stability_flat_result_uses_native_shot_x_y_order():
         np.moveaxis(native, 0, -1).reshape(6, 2),
     )
 
+    flattened = normalize_qcs_hardware_sweep_iq(
+        native.reshape(2, 6),
+        repetitions_per_point=2,
+        sweep_shape=(3, 2),
+    )
+    flattened_shot_last = normalize_qcs_hardware_sweep_iq(
+        native.reshape(2, 6).T,
+        repetitions_per_point=2,
+        sweep_shape=(3, 2),
+    )
+    np.testing.assert_array_equal(flattened, normalized)
+    np.testing.assert_array_equal(flattened_shot_last, normalized)
 
-def test_qcs_stability_hardware_array_budget_is_per_dc_channel():
+
+def test_qcs_stability_flattened_hardware_array_budget():
     sequence = (
         FineTuneSequence(("x_gate", "y_gate"))
         .add_set("set_0", [0.0, 0.0], 30_000)
-        .add_amplitude_sweep("set_0", "x_gate", -0.25, 0.25, 24_575)
-        .add_amplitude_sweep("set_0", "y_gate", -0.5, 0.5, 2)
+        .add_amplitude_sweep("set_0", "x_gate", -0.25, 0.25, 983)
+        .add_amplitude_sweep("set_0", "y_gate", -0.5, 0.5, 25)
         .set_cross_capacitance(np.eye(2))
     )
     connection = _connection(
@@ -402,15 +494,24 @@ def test_qcs_stability_hardware_array_budget_is_per_dc_channel():
         qcs_module=_FakeQcs,
     )
 
-    assert compiled.sweep_shape == (24_575, 2)
+    assert compiled.sweep_shape == (983, 25)
+    arrays, variables = compiled.program.sweeps[0]
+    assert len(arrays) == len(variables) == 2
+    assert all(array.value.size == 24_575 for array in arrays)
 
-    mixed = sequence.set_cross_capacitance([[1.0, 0.1], [0.2, 1.0]])
+    oversized = (
+        FineTuneSequence(("x_gate", "y_gate"))
+        .add_set("set_0", [0.0, 0.0], 30_000)
+        .add_amplitude_sweep("set_0", "x_gate", -0.25, 0.25, 1_024)
+        .add_amplitude_sweep("set_0", "y_gate", -0.5, 0.5, 24)
+        .set_cross_capacitance(np.eye(2))
+    )
     with pytest.raises(
         QcsUnsupportedFeatureError,
-        match="FPGA sweep-array values",
+        match="24,575",
     ):
         backend.compile_qcs_stability_hardware_sweep(
-            mixed,
+            oversized,
             connection_config=connection,
             mapper=_Mapper("dc_x", "dc_y", "digitizer"),
             repetitions_per_point=1,
@@ -422,8 +523,8 @@ def test_qcs_stability_hardware_array_budget_is_per_dc_channel():
 @pytest.mark.parametrize(
     ("x_count", "y_count", "repetitions", "message"),
     (
-        (1500, 1000, 1, "Cartesian points"),
-        (1000, 1000, 3, "hardware-demodulated IQ values"),
+        (257, 96, 1, "Cartesian points"),
+        (200, 100, 101, "hardware-demodulated IQ values"),
     ),
 )
 def test_qcs_stability_rejects_unsafe_scan_budget(
@@ -865,11 +966,11 @@ def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
             QcsRfPulseConfig(
                 gen_ch=0,
                 at_segment="set_0",
-                duration_s=20e-6,
+                duration_s=20.001e-6,
                 amplitude=0.2,
                 frequency_hz=50e6,
                 phase_rad=0.0,
-                delay_s=10e-6,
+                delay_s=10.001e-6,
                 envelope="constant",
                 require_within_segment=False,
             ),
@@ -877,7 +978,7 @@ def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
         acquisition=_acquisition(
             at_segment="set_0",
             duration_s=20e-6,
-            pre_delay_s=10e-6,
+            pre_delay_s=10.001e-6,
             sample_count=32,
         ),
         qcs_module=qcs,
@@ -887,15 +988,46 @@ def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
     assert [type(item).__name__ for item in repetitions.items] == [
         "Repeat",
         "Sweep",
-        "Sweep",
     ]
-    assert repetitions.shape == (4, 3, 2)
-    assert repetitions.averaged_shape == (3, 2)
-    assert repetitions.num_hw_items == 3
+    assert repetitions.shape == (4, 6)
+    assert repetitions.averaged_shape == (6,)
+    assert repetitions.num_hw_items == 2
+    sweep = repetitions.items[1]
+    association_by_name = {
+        variable.name: array.value
+        for variable, array in sweep.associations.items()
+    }
+    assert set(association_by_name) == {
+        "stability_dc_0_amplitude",
+        "stability_dc_1_amplitude",
+    }
+    np.testing.assert_allclose(
+        association_by_name["stability_dc_0_amplitude"],
+        [-0.24, -0.16, -0.04, 0.04, 0.16, 0.24],
+    )
+    np.testing.assert_allclose(
+        association_by_name["stability_dc_1_amplitude"],
+        [-0.36, 0.44, -0.4, 0.4, -0.44, 0.36],
+    )
     assert compiled.sweep_shape == (3, 2)
     assert len(compiled.program.layers) == 1
     assert len(compiled.program.layers[0].operations) == 4
-    assert compiled.program.render(mapper) is not None
+    for channel in (dc_x, dc_y):
+        waveform = compiled.program.layers[0].operations[channel][0]
+        assert len(waveform.amplitudes) == 1
+        assert isinstance(waveform.amplitudes[0], qcs.Scalar)
+
+    def assert_300_mhz_aligned(seconds):
+        ticks = seconds * 300e6
+        assert ticks == pytest.approx(round(ticks), abs=1e-7)
+
+    generated, _ = qcs.SequenceBuilder(channel_map=mapper).build(
+        compiled.program
+    )
+    for operations in generated.layers[0].operations.values():
+        for operation in operations:
+            assert_300_mhz_aligned(operation.duration.value)
+    assert compiled.program.render(mapper=mapper) is not None
 
 
 def test_generated_qcs_code_aligns_outputs_in_parallel_layers():

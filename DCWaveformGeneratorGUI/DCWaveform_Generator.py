@@ -3280,6 +3280,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         front_panel_row.addWidget(QtWidgets.QLabel("Front panel:"))
         front_panel_row.addWidget(self.front_panel_preview)
         form.addRow(front_panel_row)
+        # Selecting a physical RF connector is configuration, not execution.
+        # Keep the picker usable before this optional RF output is enabled;
+        # an unchecked QGroupBox otherwise disables all of its children.
+        self.front_panel_preview.setEnabled(True)
+        self.toggled.connect(self._keep_front_panel_preview_enabled)
+        QtCore.QTimer.singleShot(
+            0,
+            self._keep_front_panel_preview_enabled,
+        )
         self.gen_ch_label = QtWidgets.QLabel("QCS RF logical channel:")
         form.addRow(self.gen_ch_label, self.gen_ch)
         self.output_board_label = QtWidgets.QLabel("Output board:")
@@ -4122,7 +4131,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             raise ValueError(f"unsupported execution backend {backend!r}")
         self._hardware_backend = backend
         self.front_panel_preview.set_backend(self._hardware_backend)
+        self._keep_front_panel_preview_enabled()
         self._update_backend_presentation()
+
+    def _keep_front_panel_preview_enabled(self, *_args) -> None:
+        """Allow physical RF-output selection before the output is enabled."""
+
+        self.front_panel_preview.setEnabled(True)
+        self.front_panel_preview.currentWidget().setEnabled(True)
 
     def set_qcs_front_panel_configuration(
         self,
@@ -9400,6 +9416,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qcs_front_panel_source_snapshot = None
         self._qcs_front_panel_editor_initialized = False
         self._qcs_front_panel_auto_apply_selection = None
+        self._preserve_qcs_front_panel_draft_on_output_count_change = False
         self._pending_qcs_hardware_inventory = None
         self._pending_qcs_hardware_error = None
         self._qick_front_panel_dialog = QtWidgets.QDialog(self)
@@ -9518,7 +9535,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
         )
         self._stability_panel.electrode_front_panel_requested.connect(
-            lambda editor: self._show_active_front_panel("output", editor)
+            self._show_stability_electrode_front_panel
         )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
@@ -10199,6 +10216,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
         role = None
         logical_index = 0
+        path_selections = None
+        if target is self._stability_panel and hasattr(
+            target,
+            "qcs_rf_acquisition_front_panel_selections",
+        ):
+            path_selections = tuple(
+                (str(candidate_role), int(candidate_index))
+                for candidate_role, candidate_index in (
+                    target.qcs_rf_acquisition_front_panel_selections()
+                )
+            )
         if target is not None and hasattr(
             target,
             "qcs_front_panel_selection",
@@ -10213,14 +10241,85 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif isinstance(target, RfReadoutPanel):
             role = "acquisition"
         shown = self._show_qcs_front_panel(role, logical_index)
+        if shown and path_selections is not None:
+            selections_by_role = dict(path_selections)
+            self._qcs_front_panel.focus_rf_acquisition_path(
+                selections_by_role["rf"],
+                selections_by_role["acquisition"],
+            )
+            self._qcs_front_panel_auto_apply_selection = frozenset(
+                path_selections
+            )
+            return
         if (
             shown
             and target is not None
-            and role in {"dc", "acquisition"}
+            and role in {"dc", "rf", "acquisition"}
         ):
             self._qcs_front_panel_auto_apply_selection = (
                 role,
                 int(logical_index),
+            )
+
+    def _show_stability_electrode_front_panel(self, editor) -> None:
+        """Provision and open one of two independent Stability outputs."""
+
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+            and (
+                (
+                    self._experiment_thread is not None
+                    and self._experiment_thread.isRunning()
+                )
+                or self._experiment_panel._running
+            )
+        ):
+            self._show_active_front_panel("output", editor)
+            return
+
+        added_output = False
+        if len(self._pulse) < 2:
+            preserve_draft = (
+                self._qcs_front_panel_editor_initialized
+                and self._experiment_panel._qcs_front_panel_draft_pending
+            )
+            self._preserve_qcs_front_panel_draft_on_output_count_change = (
+                preserve_draft
+            )
+            try:
+                self._add_port()
+            finally:
+                self._preserve_qcs_front_panel_draft_on_output_count_change = (
+                    False
+                )
+            if preserve_draft:
+                dc_names_text = (
+                    self._experiment_panel.qcs_dc_channel_names.text()
+                )
+                dc_channel_names = tuple(
+                    name.strip()
+                    for name in dc_names_text.split(",")
+                    if name.strip()
+                )
+                self._qcs_front_panel.update_source_dc_channels(
+                    dc_channel_names,
+                    output_count=len(self._pulse),
+                )
+                self._qcs_front_panel_editor_initialized = True
+                self._qcs_front_panel_source_snapshot = (
+                    self._current_qcs_front_panel_source_snapshot()
+                )
+                self._experiment_panel.set_qcs_front_panel_draft_pending(True)
+            self._refresh_stability_targets()
+            added_output = True
+
+        self._show_active_front_panel("output", editor)
+        if added_output:
+            self.statusBar().showMessage(
+                "Added a second waveform output so Stability X and Y use "
+                "independent DC channels.",
+                10000,
             )
 
     def _show_qcs_front_panel(
@@ -10308,10 +10407,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         channel: int,
         changed: bool,
     ) -> None:
-        """Commit a contextual DC/acquisition SMA selection automatically."""
+        """Commit a contextual DC, RF, or acquisition SMA selection."""
 
         selection = (str(role), int(logical_index))
-        if selection != self._qcs_front_panel_auto_apply_selection:
+        automatic_selection = self._qcs_front_panel_auto_apply_selection
+        if isinstance(automatic_selection, frozenset):
+            selection_matches = selection in automatic_selection
+        else:
+            selection_matches = selection == automatic_selection
+        if not selection_matches:
             return
         try:
             working_configuration = (
@@ -10327,11 +10431,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
             "QCS module",
         )
-        selection_name = (
-            f"QCS DC output {selection[1]}"
-            if selection[0] == "dc"
-            else "QCS acquisition input"
-        )
+        selection_name = {
+            "dc": f"QCS DC output {selection[1]}",
+            "rf": f"QCS RF output {selection[1]}",
+            "acquisition": "QCS acquisition input",
+        }.get(selection[0], f"QCS {selection[0]} channel {selection[1]}")
         physical_name = (
             f"{module_model} slot {int(slot)} CH{int(channel)}"
         )
@@ -10775,6 +10879,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_qcs_output_count_changed(self, output_count: int) -> None:
         """Invalidate a modeless front-panel snapshot after AWG topology edits."""
+        if self._preserve_qcs_front_panel_draft_on_output_count_change:
+            return
         self._qcs_front_panel_source_snapshot = None
         self._qcs_front_panel_editor_initialized = False
         self._experiment_panel.set_qcs_front_panel_draft_pending(False)
@@ -12771,7 +12877,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
                 return
             try:
-                target.apply_front_panel_settings(values)
+                if target in (
+                    self._stability_panel.x_axis,
+                    self._stability_panel.y_axis,
+                ):
+                    self._apply_qick_stability_output_selection(target, values)
+                else:
+                    target.apply_front_panel_settings(values)
             except (TypeError, ValueError) as exc:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -12840,6 +12952,43 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage(
             f"Front-panel RF path applied only to {target.__class__.__name__}"
         )
+
+    def _apply_qick_stability_output_selection(
+        self,
+        target,
+        values: Mapping[str, object],
+    ) -> None:
+        """Map the selected Stability electrode itself to a QICK DAC."""
+
+        generator = int(values["output_ch"])
+        configuration = target._front_panel_configuration
+        if configuration is not None:
+            port_index = QickFrontPanelControl._find_port_for_channel(
+                configuration.outputs,
+                generator,
+            )
+            if port_index is None:
+                raise ValueError(
+                    f"generator {generator} is not mapped to a front-panel DAC"
+                )
+            port = configuration.port("output", port_index)
+            channel_position = port.qick_channels.index(generator)
+            if "axis_awg_tuning_v1" not in (
+                port.block_paths[channel_position].lower()
+            ):
+                raise ValueError(
+                    f"generator {generator} is not an axis_awg_tuning_v1 "
+                    "channel"
+                )
+
+        output_name = str(target.output.currentData() or "")
+        try:
+            output_index = self._qick_output_names().index(output_name)
+        except ValueError as exc:
+            raise ValueError(
+                "the selected Stability electrode is no longer present"
+            ) from exc
+        self._set_awg_output_channel(output_index, generator)
 
     def _start_rf_output_hardware_update(
         self,
