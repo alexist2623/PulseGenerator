@@ -9416,6 +9416,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qcs_front_panel_source_snapshot = None
         self._qcs_front_panel_editor_initialized = False
         self._qcs_front_panel_auto_apply_selection = None
+        self._qcs_front_panel_keep_open_after_selection = False
         self._preserve_qcs_front_panel_draft_on_output_count_change = False
         self._pending_qcs_hardware_inventory = None
         self._pending_qcs_hardware_error = None
@@ -10241,6 +10242,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif isinstance(target, RfReadoutPanel):
             role = "acquisition"
         shown = self._show_qcs_front_panel(role, logical_index)
+        if shown:
+            self._qcs_front_panel_keep_open_after_selection = (
+                target is self._stability_panel
+                or target is self._stability_panel.x_axis
+                or target is self._stability_panel.y_axis
+            )
         if shown and path_selections is not None:
             selections_by_role = dict(path_selections)
             self._qcs_front_panel.focus_rf_acquisition_path(
@@ -10329,6 +10336,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     ) -> bool:
         """Open the editable QCS mapper builder for the current experiment."""
         self._qcs_front_panel_auto_apply_selection = None
+        self._qcs_front_panel_keep_open_after_selection = False
         if isinstance(role, bool):
             role = None
         if (
@@ -10407,7 +10415,47 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         channel: int,
         changed: bool,
     ) -> None:
-        """Commit a contextual DC, RF, or acquisition SMA selection."""
+        """Queue Stability commits after its selected SMA can be painted."""
+
+        keep_open = self._qcs_front_panel_keep_open_after_selection
+        if keep_open:
+            # ``connector_selected`` is emitted directly from the mouse event.
+            # Painting now gives immediate feedback before native QCS mapper
+            # generation performs its comparatively expensive first import,
+            # save, reload, hash, and experiment propagation on this thread.
+            self._qcs_front_panel.reference_label.repaint()
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._commit_qcs_front_panel_connector_selection(
+                    role,
+                    logical_index,
+                    slot,
+                    channel,
+                    changed,
+                    keep_open=True,
+                ),
+            )
+            return
+        self._commit_qcs_front_panel_connector_selection(
+            role,
+            logical_index,
+            slot,
+            channel,
+            changed,
+            keep_open=False,
+        )
+
+    def _commit_qcs_front_panel_connector_selection(
+        self,
+        role: str,
+        logical_index: int,
+        slot: int,
+        channel: int,
+        changed: bool,
+        *,
+        keep_open: bool,
+    ) -> None:
+        """Commit one contextual SMA selection to the native QCS mapper."""
 
         selection = (str(role), int(logical_index))
         automatic_selection = self._qcs_front_panel_auto_apply_selection
@@ -10481,17 +10529,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ):
                 run_ready = False
             if run_ready:
-                self._qcs_front_panel_auto_apply_selection = None
                 self._experiment_panel.set_qcs_front_panel_draft_pending(
                     False
                 )
-                self._qcs_front_panel_dialog.close()
+                if not keep_open:
+                    self._qcs_front_panel_auto_apply_selection = None
+                    self._qcs_front_panel_dialog.close()
                 self.statusBar().showMessage(
                     f"{selection_name} already uses {physical_name}",
                     10000,
                 )
                 return
-        self._on_qcs_front_panel_draft_staged(working_configuration)
         mapped_dc_indices = {
             int(mapping["logical_index"])
             for mapping in working_configuration["channel_mappings"]
@@ -10499,9 +10547,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         }
         required_dc_indices = set(range(len(self._pulse)))
         if mapped_dc_indices != required_dc_indices:
+            self._on_qcs_front_panel_draft_staged(working_configuration)
             missing = sorted(required_dc_indices - mapped_dc_indices)
-            self._qcs_front_panel_auto_apply_selection = None
-            self._qcs_front_panel_dialog.close()
+            if not keep_open:
+                self._qcs_front_panel_auto_apply_selection = None
+                self._qcs_front_panel_dialog.close()
             self.statusBar().showMessage(
                 f"Mapped {selection_name} to {physical_name}; select SMA "
                 "output(s) "
@@ -10513,6 +10563,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if not self._qcs_front_panel.apply_connector_selection(
             self._apply_qcs_front_panel_settings
         ):
+            # Preserve a failed automatic-save selection as an editable draft.
+            # Successful complete selections are propagated only once by the
+            # commit callback, avoiding a redundant full-panel redraw.
+            self._on_qcs_front_panel_draft_staged(working_configuration)
             return
         # A true result means the commit callback accepted a run-ready saved
         # or imported mapper. Clear the preview-only guard before performing
@@ -10539,9 +10593,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ) != (int(slot), int(channel)):
             return
 
-        self._qcs_front_panel_auto_apply_selection = None
         self._experiment_panel.set_qcs_front_panel_draft_pending(False)
-        self._qcs_front_panel_dialog.close()
+        if not keep_open:
+            self._qcs_front_panel_auto_apply_selection = None
+            self._qcs_front_panel_dialog.close()
         self.statusBar().showMessage(
             f"Mapped {selection_name} to {physical_name}",
             10000,

@@ -3111,6 +3111,7 @@ def test_stability_front_panel_enables_rf_and_acquisition_path_focus(
     window._show_active_front_panel("path", window._stability_panel)
 
     assert focused == [(3, 0)]
+    assert window._qcs_front_panel_keep_open_after_selection is True
     assert window._qcs_front_panel_auto_apply_selection == frozenset(
         {("rf", 3), ("acquisition", 0)}
     )
@@ -3130,8 +3131,12 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
         lambda configuration: object(),
     )
     automatic_mapper = tmp_path / "automatic_stability_path_mapper.qcs"
+    saved_configurations = []
 
-    def fake_save(_configuration, path):
+    def fake_save(configuration, path):
+        saved_configurations.append(
+            front_panel.normalize_qcs_hardware_configuration(configuration)
+        )
         output_path = Path(path)
         output_path.write_bytes(b"automatic Stability RF path mapper")
         return output_path.resolve()
@@ -3177,7 +3182,27 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
     assert window._qcs_front_panel_auto_apply_selection == frozenset(
         {("rf", 0), ("acquisition", 0)}
     )
+    previous_panel_png = _pixmap_png(window._qcs_front_panel._image_pixmap)
     assert window._qcs_front_panel.select_connector(3, 2) is True
+    # Selection feedback is ready before the expensive native mapper commit
+    # is dispatched on the next event-loop turn.
+    assert window._qcs_front_panel._focused_mapping == ("rf", 0)
+    assert window._qcs_front_panel._focused_mapping_address(
+        window._qcs_front_panel._preview_configuration_from_widgets()
+    ) == (3, 2)
+    expected_rf_highlight = front_panel._qcs_front_panel_pixmap(
+        window._qcs_front_panel.working_configuration(),
+        (3, 2),
+    )
+    assert _pixmap_png(window._qcs_front_panel._image_pixmap) == (
+        _pixmap_png(expected_rf_highlight)
+    )
+    assert _pixmap_png(window._qcs_front_panel._image_pixmap) != (
+        previous_panel_png
+    )
+    assert experiment.qcs_settings_dict()["hardware_configuration"] != (
+        window._qcs_front_panel.working_configuration()
+    )
     app.processEvents()
     first_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
@@ -3188,11 +3213,25 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
         if mapping["role"] == "rf"
     )
     assert (rf_mapping["slot"], rf_mapping["channel"]) == (3, 2)
-    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert len(saved_configurations) == 1
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 0), ("acquisition", 0)}
+    )
 
-    window._show_active_front_panel("path", window._stability_panel)
-    app.processEvents()
     assert window._qcs_front_panel.select_connector(5, 2) is True
+    assert window._qcs_front_panel._focused_mapping == ("acquisition", 0)
+    assert window._qcs_front_panel._focused_mapping_address(
+        window._qcs_front_panel._preview_configuration_from_widgets()
+    ) == (5, 2)
+    assert len(saved_configurations) == 1
+    expected_acquisition_highlight = front_panel._qcs_front_panel_pixmap(
+        window._qcs_front_panel.working_configuration(),
+        (5, 2),
+    )
+    assert _pixmap_png(window._qcs_front_panel._image_pixmap) == (
+        _pixmap_png(expected_acquisition_highlight)
+    )
     app.processEvents()
     second_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
@@ -3206,8 +3245,12 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
         acquisition_mapping["slot"],
         acquisition_mapping["channel"],
     ) == (5, 2)
+    assert len(saved_configurations) == 2
     assert automatic_mapper.is_file()
-    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 0), ("acquisition", 0)}
+    )
     assert "Mapped QCS acquisition input" in (
         window.statusBar().currentMessage()
     )
@@ -3307,7 +3350,11 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
         window._stability_panel.x_axis.front_panel_status.text()
     )
     assert window._stability_panel.x_axis.current_gen_ch() == 0
-    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == ("dc", 0)
+    assert window._qcs_front_panel._focused_mapping_address(
+        window._qcs_front_panel._preview_configuration_from_widgets()
+    ) == (7, 3)
     assert automatic_mapper.is_file() is False
     with pytest.raises(ValueError, match="assignment is incomplete"):
         experiment.qcs_connection_values(2)
@@ -3344,7 +3391,11 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
         window._stability_panel.y_axis.front_panel_status.text()
     )
     assert window._stability_panel.y_axis.current_gen_ch() == 1
-    assert window._qcs_front_panel_dialog.isVisible() is False
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == ("dc", 1)
+    assert window._qcs_front_panel._focused_mapping_address(
+        window._qcs_front_panel._preview_configuration_from_widgets()
+    ) == (7, 4)
     assert automatic_mapper.is_file()
     assert (
         experiment.qcs_settings_dict()["hardware_configuration_state"]
