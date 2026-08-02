@@ -190,13 +190,14 @@ def default_bias_measurement_settings() -> dict:
     })
     gate = _common_defaults("QICK gate-controlled sweep")
     gate.update({
-        "gate_channel": 0,
+        "gate_channels": [0],
         "gate_start_v": 0.0,
         "gate_stop_v": -0.7,
         "points_per_leg": 41,
         "loops": 1,
         "return_leg": True,
         "largest_loop_first": False,
+        "restore_bias_after_run": False,
     })
     wall = _common_defaults("QICK wall-wall sweep")
     wall.update({
@@ -402,6 +403,10 @@ def normalize_bias_measurement_settings(settings: Any) -> dict:
         raw = settings.get(kind, {})
         if not isinstance(raw, Mapping):
             raise TypeError(f"bias {kind} settings must be a JSON object")
+        if kind == "gate":
+            raw = dict(raw)
+            if "gate_channels" not in raw and "gate_channel" in raw:
+                raw["gate_channels"] = [raw["gate_channel"]]
         values = _normalize_common(raw, defaults[kind])
         if kind == "two_point":
             for name in ("bias_start_v", "bias_stop_v"):
@@ -412,11 +417,26 @@ def normalize_bias_measurement_settings(settings: Any) -> dict:
                 raise ValueError("SR860 sine bias sweep cannot exceed 2 V")
             values["points"] = _integer(values["points"], "2P points", 2)
         elif kind == "gate":
-            values["gate_channel"] = _integer(
-                values["gate_channel"], "gate channel"
-            )
-            if values["gate_channel"] >= BIAS_CHANNEL_COUNT:
-                raise ValueError("gate channel must be between 0 and 7")
+            raw_channels = values.get("gate_channels")
+            if (
+                not isinstance(raw_channels, Sequence)
+                or isinstance(raw_channels, (str, bytes))
+                or not raw_channels
+            ):
+                raise ValueError("gate sweep needs at least one checked channel")
+            gate_channels = []
+            for raw_channel in raw_channels:
+                channel = _integer(raw_channel, "gate channel")
+                if channel >= BIAS_CHANNEL_COUNT:
+                    raise ValueError("gate channels must be between 0 and 7")
+                if channel in gate_channels:
+                    raise ValueError(f"BIAS{channel} is duplicated in gate channels")
+                gate_channels.append(channel)
+            values["gate_channels"] = gate_channels
+            values.pop("gate_channel", None)
+            # A gate scan leaves the selected DACs at the final trajectory point.
+            # Include-return-leg remains an explicit trajectory option.
+            values["restore_bias_after_run"] = False
             for name in ("gate_start_v", "gate_stop_v"):
                 values[name] = _finite(values[name], name)
             values["points_per_leg"] = _integer(
@@ -618,10 +638,12 @@ def validate_bias_sweep_voltage_limit(
         # This axis is the SR860 sine-output amplitude, not a DAC11001 BIAS.
         return
     if kind == "gate":
-        endpoints = [
-            (f"BIAS{config['gate_channel']} gate start", config["gate_start_v"]),
-            (f"BIAS{config['gate_channel']} gate stop", config["gate_stop_v"]),
-        ]
+        endpoints = []
+        for channel in config["gate_channels"]:
+            endpoints.extend((
+                (f"BIAS{channel} gate start", config["gate_start_v"]),
+                (f"BIAS{channel} gate stop", config["gate_stop_v"]),
+            ))
     elif kind == "wall_wall":
         endpoints = [
             (f"BIAS{config['slow_channel']} slow start", config["slow_start_v"]),
@@ -1100,7 +1122,13 @@ def run_bias_measurement(
             largest_loop_first=config["largest_loop_first"],
         )
         points = [(index, float(value)) for index, value in enumerate(x_values)]
-        x_label = f"BIAS{config['gate_channel']} gate voltage [V]"
+        selected_labels = []
+        for channel in config["gate_channels"]:
+            name = str(channel_names[channel]).strip()
+            selected_labels.append(
+                name if name else f"BIAS{channel}"
+            )
+        x_label = f"{', '.join(selected_labels)} gate voltage [V]"
         y_values = None
         y_label = ""
     elif kind == "wall_wall":
@@ -1197,24 +1225,9 @@ def run_bias_measurement(
     axes, repetition_parameter, measured = _register_measurement_parameters(
         measurement, kind, config
     )
-    run_metadata = {
-        "schema": BIAS_MEASUREMENT_SCHEMA,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "kind": kind,
-        "configuration": config,
-        "current_mode": config["current_mode"],
-        "bias_channel_names": list(map(str, channel_names)),
-        "bias_initial_snapshot": initial_snapshot,
-        "qick_connection": {
-            "host": connection_config.host,
-            "ns_port": connection_config.ns_port,
-            "proxy_name": connection_config.proxy_name,
-        },
-    }
-
     changed_channels = []
     if kind == "gate":
-        changed_channels = [int(config["gate_channel"])]
+        changed_channels = list(map(int, config["gate_channels"]))
     elif kind == "wall_wall":
         changed_channels = [int(config["slow_channel"]), int(config["fast_channel"])]
     elif kind == "nested":
@@ -1223,6 +1236,30 @@ def run_bias_measurement(
             for axis in config["axes"]
             for channel in axis["channels"]
         })
+    swept_bias_channels = [
+        {
+            "channel": channel,
+            "hardware_name": f"BIAS{channel}",
+            "name": str(channel_names[channel]).strip(),
+        }
+        for channel in changed_channels
+    ]
+
+    run_metadata = {
+        "schema": BIAS_MEASUREMENT_SCHEMA,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "configuration": config,
+        "current_mode": config["current_mode"],
+        "bias_channel_names": list(map(str, channel_names)),
+        "swept_bias_channels": swept_bias_channels,
+        "bias_initial_snapshot": initial_snapshot,
+        "qick_connection": {
+            "host": connection_config.host,
+            "ns_port": connection_config.ns_port,
+            "proxy_name": connection_config.proxy_name,
+        },
+    }
 
     dataset = None
     try:
@@ -1234,6 +1271,9 @@ def run_bias_measurement(
             dataset.add_metadata("bias_measurement_json", _json_text(run_metadata))
             dataset.add_metadata(
                 "bias_channel_voltages_initial_json", _json_text(initial_snapshot)
+            )
+            dataset.add_metadata(
+                "swept_bias_channels_json", _json_text(swept_bias_channels)
             )
             dataset.add_metadata("sr860_settings_json", _json_text(config["sr860"]))
             dataset.add_metadata("qick_adc_settings_json", _json_text(config["qick_adc"]))
@@ -1254,10 +1294,12 @@ def run_bias_measurement(
                     axis_results = ((axes[0], point[0]),)
                     excitation_v = point[0]
                 elif kind == "gate":
-                    ramp_bias_channel(
+                    ramp_bias_channels(
                         soc,
-                        config["gate_channel"],
-                        point[1],
+                        {
+                            channel: point[1]
+                            for channel in config["gate_channels"]
+                        },
                         max_step_v=config["ramp_max_step_v"],
                         pause_s=config["ramp_pause_s"],
                         voltage_limit_v=voltage_limit_v,
@@ -1411,7 +1453,7 @@ def run_bias_measurement(
         run_id = int(dataset.run_id)
         guid = str(dataset.guid)
     finally:
-        if config["restore_bias_after_run"]:
+        if kind != "gate" and config["restore_bias_after_run"]:
             for channel in changed_channels:
                 try:
                     ramp_bias_channel(

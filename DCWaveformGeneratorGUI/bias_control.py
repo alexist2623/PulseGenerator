@@ -341,7 +341,9 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.editors = []
         for channel in range(BIAS_CHANNEL_COUNT):
             editor = BiasChannelEditor(channel, editor_content)
-            editor.selected.connect(self.select_channel)
+            editor.selected.connect(
+                lambda channel: self.select_channel(channel, focus=False)
+            )
             editor.apply_requested.connect(self.set_requested.emit)
             editor.name_changed.connect(self._channel_name_changed)
             self.editors.append(editor)

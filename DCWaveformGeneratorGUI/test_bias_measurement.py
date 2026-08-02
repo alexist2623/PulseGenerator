@@ -290,10 +290,58 @@ def test_bias_measurement_settings_round_trip_and_legacy_defaults():
     app.processEvents()
     persisted = tabs.settings_dict()
     assert persisted == defaults
-    assert tabs.pages["gate"].gate_channel.itemText(1) == "BIAS1 (BL)"
-    assert "BIAS0 (P)" in (
+    assert tabs.pages["gate"].gate_channel_checks[1].text() == "BL"
+    assert tabs.pages["gate"].gate_channel_checks[1].toolTip() == "BIAS1 | BL"
+    assert "P (BIAS0)" in (
         tabs.pages["nested"].nested_axis_editors[1].channel_summary.text()
     )
+    tabs.close()
+
+
+def test_two_point_current_mode_hides_inactive_instrument_settings():
+    app = _application()
+    tabs = BiasMeasurementTabs()
+    page = tabs.pages["two_point"]
+    page.show()
+
+    page.current.mode.setCurrentIndex(
+        page.current.mode.findData("qick_adc")
+    )
+    app.processEvents()
+    assert page.current.adc_group.isHidden() is False
+    assert page.current.sr_group.isHidden() is True
+
+    page.current.mode.setCurrentIndex(
+        page.current.mode.findData("sr860")
+    )
+    app.processEvents()
+    assert page.current.adc_group.isHidden() is True
+    assert page.current.sr_group.isHidden() is False
+    tabs.close()
+
+
+def test_legacy_single_gate_channel_migrates_to_checked_channel_list():
+    normalized = normalize_bias_measurement_settings({
+        "gate": {
+            "gate_channel": 3,
+            "restore_bias_after_run": True,
+        }
+    })
+    assert normalized["gate"]["gate_channels"] == [3]
+    assert "gate_channel" not in normalized["gate"]
+    assert normalized["gate"]["restore_bias_after_run"] is False
+
+    app = _application()
+    tabs = BiasMeasurementTabs()
+    tabs.set_channel_names(["P", "BL", "BR", "S0", "AccL", "AccR", "", ""])
+    tabs.load_settings({"gate": {"gate_channel": 3}})
+    app.processEvents()
+    checked = [
+        index
+        for index, checkbox in enumerate(tabs.pages["gate"].gate_channel_checks)
+        if checkbox.isChecked()
+    ]
+    assert checked == [3]
     tabs.close()
 
 
@@ -486,6 +534,40 @@ def test_nested_axis_gui_add_remove_and_reorder():
     tabs.close()
 
 
+def test_nested_axis_adds_independent_sweep_channel_rows():
+    app = _application()
+    tabs = BiasMeasurementTabs()
+    tabs.set_channel_names(["P", "BL", "BR", "S0", "AccL", "AccR", "", ""])
+    page = tabs.pages["nested"]
+    axis = page.nested_axis_editors[0]
+    assert len(axis.channel_rows) == 1
+
+    axis.add_channel_button.click()
+    app.processEvents()
+    assert len(axis.channel_rows) == 2
+    added = axis.channel_rows[1]
+    added.channel.setCurrentIndex(added.channel.findData(4))
+    added.start_v.setValue(-0.25)
+    added.stop_v.setValue(0.35)
+    first = axis.channel_rows[0]
+    first.start_v.setValue(-0.1)
+    first.stop_v.setValue(0.2)
+    app.processEvents()
+
+    settings = axis.settings_dict()
+    assert settings["channels"] == [2, 4]
+    assert settings["start_v"] == pytest.approx([-0.1, -0.25])
+    assert settings["stop_v"] == pytest.approx([0.2, 0.35])
+    assert added.channel.currentText() == "AccL (BIAS4)"
+    assert "AccL (BIAS4)" in axis.channel_summary.text()
+
+    added.remove_button.click()
+    app.processEvents()
+    assert len(axis.channel_rows) == 1
+    assert axis.channel_rows[0].remove_button.isEnabled() is False
+    tabs.close()
+
+
 def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
     database = tmp_path / "bias_measurement.db"
     settings = default_bias_measurement_settings()["gate"]
@@ -493,7 +575,7 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
         "database_path": str(database),
         "sample_name": "GateTest",
         "current_mode": "qick_adc",
-        "gate_channel": 2,
+        "gate_channels": [1, 2],
         "gate_start_v": -0.1,
         "gate_stop_v": 0.1,
         "points_per_leg": 3,
@@ -535,7 +617,10 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
     ]
     assert live_points[-1].completed_reads == 6
     assert live_points[-1].total_reads == 6
-    assert soc.values == pytest.approx(initial)
+    assert soc.values[1] == pytest.approx(0.1)
+    assert soc.values[2] == pytest.approx(0.1)
+    for channel in set(initial) - {1, 2}:
+        assert soc.values[channel] == pytest.approx(initial[channel])
 
     from qcodes import initialise_or_create_database_at, load_by_id
 
@@ -549,7 +634,18 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
     )
     assert len(initial_metadata["channels"]) == 8
     assert initial_metadata["channels"][2]["name"] == "BR"
+    assert final_metadata["channels"][1]["voltage_v"] == pytest.approx(0.1)
     assert final_metadata["channels"][2]["voltage_v"] == pytest.approx(0.1)
+    swept_metadata = json.loads(
+        dataset.get_metadata("swept_bias_channels_json")
+    )
+    assert swept_metadata == [
+        {"channel": 1, "hardware_name": "BIAS1", "name": "BL"},
+        {"channel": 2, "hardware_name": "BIAS2", "name": "BR"},
+    ]
+    run_metadata = json.loads(dataset.get_metadata("bias_measurement_json"))
+    assert run_metadata["configuration"]["gate_channels"] == [1, 2]
+    assert run_metadata["swept_bias_channels"] == swept_metadata
     adc_metadata = json.loads(dataset.get_metadata("qick_adc_settings_json"))
     assert adc_metadata["readout_ch"] == settings["qick_adc"]["readout_ch"]
     assert adc_metadata["fir_samples"] == settings["qick_adc"]["fir_samples"]

@@ -89,16 +89,6 @@ def _engineering(value: float, unit: str) -> str:
     return f"{value:g} {unit}"
 
 
-def _parse_csv(text: str, caster, label: str) -> list:
-    cleaned = str(text).strip().strip("[]()")
-    if not cleaned:
-        raise ValueError(f"{label} must not be empty")
-    try:
-        return [caster(token.strip()) for token in cleaned.split(",")]
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be a comma-separated list") from exc
-
-
 class CurrentMeasurementSettings(QtWidgets.QGroupBox):
     """Instrument settings shared by all Bias measurement types."""
 
@@ -235,7 +225,7 @@ class CurrentMeasurementSettings(QtWidgets.QGroupBox):
     def _update_mode(self, *_args) -> None:
         adc = self.mode.currentData() == "qick_adc"
         self.adc_group.setVisible(adc)
-        self.sr_group.setVisible(self._two_point or not adc)
+        self.sr_group.setVisible(not adc)
 
     def settings_dict(self) -> dict:
         return {
@@ -313,6 +303,92 @@ class CurrentMeasurementSettings(QtWidgets.QGroupBox):
         self._update_mode()
 
 
+class NestedSweepChannelRow(QtWidgets.QWidget):
+    """One independently editable channel inside a nested sweep axis."""
+
+    remove_requested = QtCore.pyqtSignal(object)
+    channel_changed = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        channel: int,
+        start_v: float,
+        stop_v: float,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._channel_names = [""] * 8
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        row.addWidget(QtWidgets.QLabel("Channel:", self))
+        self.channel = QtWidgets.QComboBox(self)
+        self.channel.setMinimumWidth(150)
+        row.addWidget(self.channel, 2)
+
+        row.addWidget(QtWidgets.QLabel("Start:", self))
+        self.start_v = _double(
+            -10.0, 10.0, float(start_v),
+            decimals=9, suffix=" V", step=0.001,
+        )
+        self.start_v.setMinimumWidth(125)
+        row.addWidget(self.start_v, 1)
+
+        row.addWidget(QtWidgets.QLabel("Stop:", self))
+        self.stop_v = _double(
+            -10.0, 10.0, float(stop_v),
+            decimals=9, suffix=" V", step=0.001,
+        )
+        self.stop_v.setMinimumWidth(125)
+        row.addWidget(self.stop_v, 1)
+
+        self.remove_button = QtWidgets.QToolButton(self)
+        self.remove_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon)
+        )
+        self.remove_button.setToolTip("Remove this channel from the axis")
+        row.addWidget(self.remove_button)
+
+        self.set_channel_names(self._channel_names)
+        self.set_channel(channel)
+        self.channel.currentIndexChanged.connect(
+            lambda _index: self.channel_changed.emit()
+        )
+        self.remove_button.clicked.connect(
+            lambda: self.remove_requested.emit(self)
+        )
+
+    @property
+    def selected_channel(self) -> int:
+        return int(self.channel.currentData())
+
+    def set_channel(self, channel: int) -> None:
+        index = self.channel.findData(int(channel))
+        if index < 0:
+            raise ValueError("nested Bias channel must be between 0 and 7")
+        self.channel.setCurrentIndex(index)
+
+    def set_channel_names(self, names: Sequence[str]) -> None:
+        if len(names) != 8:
+            raise ValueError("Bias channel names must contain eight entries")
+        selected = self.channel.currentData()
+        self._channel_names = list(map(str, names))
+        with QtCore.QSignalBlocker(self.channel):
+            self.channel.clear()
+            for channel, raw_name in enumerate(self._channel_names):
+                name = raw_name.strip()
+                label = (
+                    f"{name} (BIAS{channel})" if name else f"BIAS{channel}"
+                )
+                self.channel.addItem(label, channel)
+            index = self.channel.findData(selected)
+            self.channel.setCurrentIndex(max(0, index))
+
+    def set_removable(self, removable: bool) -> None:
+        self.remove_button.setEnabled(bool(removable))
+
+
 class NestedAxisEditor(QtWidgets.QGroupBox):
     """Edit one outer-to-inner vector sweep axis."""
 
@@ -322,6 +398,7 @@ class NestedAxisEditor(QtWidgets.QGroupBox):
     def __init__(self, axis: Mapping[str, object], parent=None):
         super().__init__(parent)
         self._channel_names = [""] * 8
+        self.channel_rows = []
         layout = QtWidgets.QVBoxLayout(self)
 
         header = QtWidgets.QHBoxLayout()
@@ -350,20 +427,23 @@ class NestedAxisEditor(QtWidgets.QGroupBox):
 
         form = QtWidgets.QFormLayout()
         self.name = QtWidgets.QLineEdit(self)
-        self.channels = QtWidgets.QLineEdit(self)
-        self.channels.setPlaceholderText("0,1")
-        self.channels.setToolTip("Comma-separated BIAS channel indices")
-        self.start_v = QtWidgets.QLineEdit(self)
-        self.start_v.setPlaceholderText("-0.1,-0.2")
-        self.stop_v = QtWidgets.QLineEdit(self)
-        self.stop_v.setPlaceholderText("0.1,0.2")
         self.points = _integer(2, 1_000_000, 11)
         form.addRow("Axis name:", self.name)
-        form.addRow("BIAS channels:", self.channels)
-        form.addRow("Start vector [V]:", self.start_v)
-        form.addRow("Stop vector [V]:", self.stop_v)
         form.addRow("Points:", self.points)
         layout.addLayout(form)
+
+        self.channel_rows_layout = QtWidgets.QVBoxLayout()
+        self.channel_rows_layout.setSpacing(5)
+        layout.addLayout(self.channel_rows_layout)
+
+        self.add_channel_button = QtWidgets.QPushButton(
+            "Add sweep channel", self
+        )
+        self.add_channel_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogNewFolder)
+        )
+        self.add_channel_button.clicked.connect(self._add_channel_row)
+        layout.addWidget(self.add_channel_button)
 
         self.channel_summary = QtWidgets.QLabel(self)
         self.channel_summary.setWordWrap(True)
@@ -378,7 +458,6 @@ class NestedAxisEditor(QtWidgets.QGroupBox):
         self.remove_button.clicked.connect(
             lambda: self.remove_requested.emit(self)
         )
-        self.channels.textChanged.connect(self._update_channel_summary)
         self.load_settings(axis)
 
     def set_order(self, index: int, count: int) -> None:
@@ -390,65 +469,110 @@ class NestedAxisEditor(QtWidgets.QGroupBox):
             role = "nested"
         self.setTitle(f"Axis {index + 1}: {role}")
         self.order_label.setText(
-            "All selected channels move together along this vector."
+            "All channels below move together, each with its own voltage range."
         )
         self.move_up.setEnabled(index > 0)
         self.move_down.setEnabled(index < count - 1)
         self.remove_button.setEnabled(count > 1)
 
     def set_channel_names(self, names: Sequence[str]) -> None:
+        if len(names) != 8:
+            raise ValueError("Bias channel names must contain eight entries")
         self._channel_names = list(map(str, names))
+        for row in self.channel_rows:
+            row.set_channel_names(self._channel_names)
+        self._update_channel_summary()
+
+    def _next_unused_channel(self) -> int:
+        used = {row.selected_channel for row in self.channel_rows}
+        return next(
+            (channel for channel in range(8) if channel not in used),
+            0,
+        )
+
+    def _add_channel_row(
+        self,
+        _checked: bool = False,
+        *,
+        channel: int | None = None,
+        start_v: float = 0.0,
+        stop_v: float = 0.0,
+    ) -> None:
+        if len(self.channel_rows) >= 8:
+            return
+        if channel is None:
+            channel = self._next_unused_channel()
+        row = NestedSweepChannelRow(
+            channel, start_v, stop_v, parent=self
+        )
+        row.set_channel_names(self._channel_names)
+        row.channel_changed.connect(self._update_channel_summary)
+        row.remove_requested.connect(self._remove_channel_row)
+        self.channel_rows.append(row)
+        self.channel_rows_layout.addWidget(row)
+        self._refresh_channel_rows()
+
+    def _remove_channel_row(self, row: NestedSweepChannelRow) -> None:
+        if len(self.channel_rows) <= 1 or row not in self.channel_rows:
+            return
+        self.channel_rows.remove(row)
+        self.channel_rows_layout.removeWidget(row)
+        row.deleteLater()
+        self._refresh_channel_rows()
+
+    def _clear_channel_rows(self) -> None:
+        for row in self.channel_rows:
+            self.channel_rows_layout.removeWidget(row)
+            row.deleteLater()
+        self.channel_rows = []
+
+    def _refresh_channel_rows(self) -> None:
+        removable = len(self.channel_rows) > 1
+        for row in self.channel_rows:
+            row.set_removable(removable)
+        self.add_channel_button.setEnabled(len(self.channel_rows) < 8)
         self._update_channel_summary()
 
     def _update_channel_summary(self, *_args) -> None:
-        try:
-            channels = _parse_csv(
-                self.channels.text(), int, "BIAS channels"
-            )
-        except ValueError:
-            self.channel_summary.setText(
-                "Enter channel indices such as 0,1."
-            )
-            return
         labels = []
-        for channel in channels:
-            if 0 <= channel < len(self._channel_names):
-                name = self._channel_names[channel].strip()
-                labels.append(
-                    f"BIAS{channel}" + (f" ({name})" if name else "")
-                )
-            else:
-                labels.append(f"BIAS{channel} (invalid)")
+        for row in self.channel_rows:
+            channel = row.selected_channel
+            name = self._channel_names[channel].strip()
+            labels.append(
+                f"{name} (BIAS{channel})" if name else f"BIAS{channel}"
+            )
         self.channel_summary.setText("Vector: " + " + ".join(labels))
 
     def settings_dict(self) -> dict:
         return {
             "name": self.name.text().strip(),
-            "channels": _parse_csv(
-                self.channels.text(), int, "BIAS channels"
-            ),
-            "start_v": _parse_csv(
-                self.start_v.text(), float, "start voltage vector"
-            ),
-            "stop_v": _parse_csv(
-                self.stop_v.text(), float, "stop voltage vector"
-            ),
+            "channels": [row.selected_channel for row in self.channel_rows],
+            "start_v": [row.start_v.value() for row in self.channel_rows],
+            "stop_v": [row.stop_v.value() for row in self.channel_rows],
             "points": self.points.value(),
         }
 
     def load_settings(self, axis: Mapping[str, object]) -> None:
+        channels = list(axis["channels"])
+        start_v = list(axis["start_v"])
+        stop_v = list(axis["stop_v"])
+        if not channels or not (
+            len(channels) == len(start_v) == len(stop_v)
+        ):
+            raise ValueError(
+                "nested axis channels, start_v, and stop_v must have "
+                "the same nonzero length"
+            )
         self.name.setText(str(axis["name"]))
-        self.channels.setText(
-            ",".join(str(int(value)) for value in axis["channels"])
-        )
-        self.start_v.setText(
-            ",".join(f"{float(value):g}" for value in axis["start_v"])
-        )
-        self.stop_v.setText(
-            ",".join(f"{float(value):g}" for value in axis["stop_v"])
-        )
         self.points.setValue(int(axis["points"]))
-        self._update_channel_summary()
+        self._clear_channel_rows()
+        for channel, start, stop in zip(channels, start_v, stop_v):
+            self._add_channel_row(
+                channel=int(channel),
+                start_v=float(start),
+                stop_v=float(stop),
+            )
+        self._refresh_channel_rows()
 
 
 class BiasMeasurementPage(QtWidgets.QWidget):
@@ -537,8 +661,39 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             form.addRow("Sine bias stop:", self.bias_stop_uv)
             form.addRow("Points:", self.points)
         elif self.kind == "gate":
-            self.gate_channel = QtWidgets.QComboBox(sweep_group)
-            self.channel_combos.append(self.gate_channel)
+            self.gate_channels_widget = QtWidgets.QWidget(sweep_group)
+            gate_channels_layout = QtWidgets.QGridLayout(
+                self.gate_channels_widget
+            )
+            gate_channels_layout.setContentsMargins(0, 0, 0, 0)
+            gate_channels_layout.setHorizontalSpacing(12)
+            gate_channels_layout.setVerticalSpacing(4)
+            self.gate_channel_checks = []
+            for channel in range(8):
+                checkbox = QtWidgets.QCheckBox(
+                    f"BIAS{channel}", self.gate_channels_widget
+                )
+                checkbox.setProperty("bias_channel", channel)
+                checkbox.setChecked(channel in defaults["gate_channels"])
+                self.gate_channel_checks.append(checkbox)
+                gate_channels_layout.addWidget(
+                    checkbox, channel // 4, channel % 4
+                )
+            gate_channel_buttons = QtWidgets.QHBoxLayout()
+            select_all = QtWidgets.QToolButton(self.gate_channels_widget)
+            select_all.setText("Select all")
+            clear_all = QtWidgets.QToolButton(self.gate_channels_widget)
+            clear_all.setText("Clear")
+            select_all.clicked.connect(
+                lambda: self._set_all_gate_channels(True)
+            )
+            clear_all.clicked.connect(
+                lambda: self._set_all_gate_channels(False)
+            )
+            gate_channel_buttons.addWidget(select_all)
+            gate_channel_buttons.addWidget(clear_all)
+            gate_channel_buttons.addStretch(1)
+            gate_channels_layout.addLayout(gate_channel_buttons, 2, 0, 1, 4)
             self.gate_start = _double(-10.0, 10.0, defaults["gate_start_v"], suffix=" V")
             self.gate_stop = _double(-10.0, 10.0, defaults["gate_stop_v"], suffix=" V")
             self.points_per_leg = _integer(2, 1_000_000, defaults["points_per_leg"])
@@ -549,7 +704,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
                 "Largest loop first", sweep_group
             )
             self.largest_first.setChecked(defaults["largest_loop_first"])
-            form.addRow("Gate BIAS channel:", self.gate_channel)
+            form.addRow("Gate BIAS channels:", self.gate_channels_widget)
             form.addRow("Start:", self.gate_start)
             form.addRow("Stop:", self.gate_stop)
             form.addRow("Points / leg:", self.points_per_leg)
@@ -575,11 +730,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             form.addRow("Fast stop:", self.fast_stop)
             form.addRow("Fast points:", self.fast_points)
         self.set_channel_names([""] * 8)
-        if self.kind == "gate":
-            self.gate_channel.setCurrentIndex(
-                self.gate_channel.findData(defaults["gate_channel"])
-            )
-        elif self.kind == "wall_wall":
+        if self.kind == "wall_wall":
             self.slow_channel.setCurrentIndex(
                 self.slow_channel.findData(defaults["slow_channel"])
             )
@@ -612,7 +763,17 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         timing.addRow("Settle after BIAS move:", self.settle)
         timing.addRow("Maximum ramp step:", self.ramp_step)
         timing.addRow("Pause / ramp step:", self.ramp_pause)
-        timing.addRow(self.restore)
+        if self.kind == "gate":
+            self.restore.hide()
+            final_voltage_note = QtWidgets.QLabel(
+                "Keep the final measured sweep voltage. An enabled return "
+                "leg ends at the configured start voltage.",
+                timing_group,
+            )
+            final_voltage_note.setWordWrap(True)
+            timing.addRow("After sweep:", final_voltage_note)
+        else:
+            timing.addRow(self.restore)
         layout.addWidget(timing_group)
 
         self.current = CurrentMeasurementSettings(
@@ -774,6 +935,15 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         if len(names) != 8:
             raise ValueError("Bias channel names must contain eight entries")
         self._channel_names = list(map(str, names))
+        if self.kind == "gate":
+            for channel, checkbox in enumerate(self.gate_channel_checks):
+                name = str(names[channel]).strip()
+                checkbox.setText(
+                    name if name else f"BIAS{channel}"
+                )
+                checkbox.setToolTip(
+                    f"BIAS{channel}" + (f" | {name}" if name else "")
+                )
         for combo in self.channel_combos:
             selected = combo.currentData()
             combo.clear()
@@ -786,6 +956,12 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             combo.setCurrentIndex(max(0, index))
         for editor in self.nested_axis_editors:
             editor.set_channel_names(self._channel_names)
+
+    def _set_all_gate_channels(self, checked: bool) -> None:
+        if self.kind != "gate":
+            return
+        for checkbox in self.gate_channel_checks:
+            checkbox.setChecked(bool(checked))
 
     def _browse_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -821,7 +997,11 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             })
         elif self.kind == "gate":
             result.update({
-                "gate_channel": int(self.gate_channel.currentData()),
+                "gate_channels": [
+                    channel
+                    for channel, checkbox in enumerate(self.gate_channel_checks)
+                    if checkbox.isChecked()
+                ],
                 "gate_start_v": self.gate_start.value(),
                 "gate_stop_v": self.gate_stop.value(),
                 "points_per_leg": self.points_per_leg.value(),
@@ -864,9 +1044,9 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             self.bias_stop_uv.setValue(values["bias_stop_v"] * 1e6)
             self.points.setValue(values["points"])
         elif self.kind == "gate":
-            self.gate_channel.setCurrentIndex(
-                self.gate_channel.findData(values["gate_channel"])
-            )
+            selected_channels = set(values["gate_channels"])
+            for channel, checkbox in enumerate(self.gate_channel_checks):
+                checkbox.setChecked(channel in selected_channels)
             self.gate_start.setValue(values["gate_start_v"])
             self.gate_stop.setValue(values["gate_stop_v"])
             self.points_per_leg.setValue(values["points_per_leg"])

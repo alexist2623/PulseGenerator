@@ -126,6 +126,23 @@ def test_bias_channel_name_is_editable_and_used_in_status():
     panel.close()
 
 
+def test_bias_channel_name_keeps_keyboard_focus_while_typing():
+    app = _application()
+    panel = BiasControlPanel()
+    panel.resize(1200, 700)
+    panel.show()
+    editor = panel.editors[2]
+    editor.name_edit.setFocus()
+    QtTest.QTest.keyClicks(editor.name_edit, "BR gate")
+    app.processEvents()
+
+    assert editor.name_edit.hasFocus() is True
+    assert editor.channel_name == "BR gate"
+    assert panel.selected_channel == 2
+    assert panel.measurements.pages["gate"].gate_channel_checks[2].text() == "BR gate"
+    panel.close()
+
+
 def test_bias_voltage_limit_updates_every_editor_and_rejects_loaded_overage():
     app = _application()
     panel = BiasControlPanel()
