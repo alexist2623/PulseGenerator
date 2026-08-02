@@ -86,6 +86,8 @@ def test_bias_settings_round_trip_without_touching_hardware():
     settings = {
         "selected_channel": 6,
         "voltage_limit_v": 4.0,
+        "ramp_max_step_v": 0.005,
+        "ramp_pause_s": 0.02,
         "channel_names": ["P", "BL", "BR", "S0", "AccL", "AccR", "", ""],
         "setpoints_v": [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0],
     }
@@ -164,16 +166,20 @@ def test_bias_busy_state_does_not_move_selection_to_last_editor():
     panel.close()
 
 
-def test_bias_voltage_limit_is_locked_for_measurement_duration():
+def test_bias_ramp_controls_are_locked_for_measurement_duration():
     app = _application()
     panel = BiasControlPanel()
     panel.set_measurement_running("nested", True, "Running nested sweep")
     app.processEvents()
     assert panel.voltage_limit.isEnabled() is False
+    assert panel.ramp_max_step.isEnabled() is False
+    assert panel.ramp_pause.isEnabled() is False
 
     panel.set_measurement_running("nested", False, "Stopped")
     app.processEvents()
     assert panel.voltage_limit.isEnabled() is True
+    assert panel.ramp_max_step.isEnabled() is True
+    assert panel.ramp_pause.isEnabled() is True
     panel.close()
 
 
@@ -181,12 +187,14 @@ def test_bias_worker_reads_and_sets_dac11001(monkeypatch):
     class FakeSoc:
         def __init__(self):
             self.values = {channel: channel / 10.0 for channel in range(8)}
+            self.writes = []
 
         def rfb_get_bias(self, channel):
             return self.values[channel]
 
         def rfb_set_bias(self, channel, voltage):
             self.values[channel] = float(voltage)
+            self.writes.append((int(channel), float(voltage)))
             return float(voltage)
 
     soc = FakeSoc()
@@ -208,12 +216,29 @@ def test_bias_worker_reads_and_sets_dac11001(monkeypatch):
     assert read_results[0][7] == pytest.approx(0.7)
 
     set_results = []
-    writer = BiasHardwareWorker(connection, "set", {2: -1.25, 6: 3.5})
+    writer = BiasHardwareWorker(
+        connection,
+        "set",
+        {2: -1.25, 6: 3.5},
+        ramp_max_step_v=1.0,
+        ramp_pause_s=0.0,
+    )
     writer.finished.connect(set_results.append)
     writer.run()
     assert set_results[0] == {2: pytest.approx(-1.25), 6: pytest.approx(3.5)}
     assert soc.values[2] == pytest.approx(-1.25)
     assert soc.values[6] == pytest.approx(3.5)
+    assert [channel for channel, _value in soc.writes] == [2, 6] * 3
+    channel_writes = {
+        channel: [value for write_channel, value in soc.writes if write_channel == channel]
+        for channel in (2, 6)
+    }
+    for channel, start in ((2, 0.2), (6, 0.6)):
+        values = [start, *channel_writes[channel]]
+        assert all(
+            abs(after - before) <= 1.0 + 1.0e-12
+            for before, after in zip(values, values[1:])
+        )
 
     with pytest.raises(ValueError, match="exceeds"):
         BiasHardwareWorker(
@@ -239,23 +264,31 @@ def test_main_window_contains_bias_tab_and_persists_setpoints():
         }
     )
     document = window._settings_to_dict()
-    assert document["version"] == 35
+    assert document["version"] == 36
     assert document["bias"]["selected_channel"] == 3
     assert document["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert document["bias"]["ramp_max_step_v"] == pytest.approx(0.001)
+    assert document["bias"]["ramp_pause_s"] == pytest.approx(0.01)
     assert document["bias"]["channel_names"][3] == "S0"
     assert document["bias"]["setpoints_v"][7] == pytest.approx(0.7)
 
     decoded = window._decode_settings(document)
     assert decoded["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert decoded["bias"]["ramp_max_step_v"] == pytest.approx(0.001)
+    assert decoded["bias"]["ramp_pause_s"] == pytest.approx(0.01)
     assert decoded["bias"]["channel_names"][4] == "AccL"
     assert decoded["bias"]["setpoints_v"][3] == pytest.approx(0.3)
 
     legacy_document = dict(document)
     legacy_document["bias"] = dict(document["bias"])
     legacy_document["bias"].pop("voltage_limit_v")
+    legacy_document["bias"].pop("ramp_max_step_v")
+    legacy_document["bias"].pop("ramp_pause_s")
     legacy_document["bias"].pop("channel_names")
     legacy_decoded = window._decode_settings(legacy_document)
     assert legacy_decoded["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert legacy_decoded["bias"]["ramp_max_step_v"] == pytest.approx(0.001)
+    assert legacy_decoded["bias"]["ramp_pause_s"] == pytest.approx(0.01)
     assert legacy_decoded["bias"]["channel_names"] == ("",) * 8
     window.close()
     app.processEvents()

@@ -342,6 +342,8 @@ try:
     from .bias_control import (
         BIAS_CHANNEL_COUNT,
         BIAS_DEFAULT_LIMIT_V,
+        BIAS_DEFAULT_RAMP_MAX_STEP_V,
+        BIAS_DEFAULT_RAMP_PAUSE_S,
         BIAS_MAX_V,
         BIAS_MIN_V,
         BIAS_NAME_MAX_LENGTH,
@@ -354,6 +356,8 @@ except ImportError:
     from bias_control import (
         BIAS_CHANNEL_COUNT,
         BIAS_DEFAULT_LIMIT_V,
+        BIAS_DEFAULT_RAMP_MAX_STEP_V,
+        BIAS_DEFAULT_RAMP_PAUSE_S,
         BIAS_MAX_V,
         BIAS_MIN_V,
         BIAS_NAME_MAX_LENGTH,
@@ -372,7 +376,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 35
+SETTINGS_VERSION = 36
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -9988,7 +9992,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._bias_panel.channel_description(int(channel))
                 for channel in sorted(values)
             )
-            busy_message = f"Applying DAC11001 setpoint(s): {channels}"
+            busy_message = f"Ramping DAC11001 setpoint(s): {channels}"
         self._bias_panel.set_busy(True, busy_message)
         self.statusBar().showMessage(busy_message)
 
@@ -9998,6 +10002,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             operation,
             values,
             voltage_limit_v=self._bias_panel.voltage_limit_v,
+            ramp_max_step_v=self._bias_panel.ramp_max_step_v,
+            ramp_pause_s=self._bias_panel.ramp_pause_s,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -12057,6 +12063,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError(
                 f"bias voltage_limit_v must be in (0, {BIAS_MAX_V:g}] V"
             )
+        bias_ramp_max_step_v = self._json_finite_float(
+            raw_bias.get(
+                "ramp_max_step_v",
+                BIAS_DEFAULT_RAMP_MAX_STEP_V,
+            ),
+            "bias ramp_max_step_v",
+        )
+        if bias_ramp_max_step_v <= 0.0:
+            raise ValueError("bias ramp_max_step_v must be positive")
+        bias_ramp_pause_s = self._json_finite_float(
+            raw_bias.get("ramp_pause_s", BIAS_DEFAULT_RAMP_PAUSE_S),
+            "bias ramp_pause_s",
+        )
+        if bias_ramp_pause_s < 0.0:
+            raise ValueError("bias ramp_pause_s must be nonnegative")
         raw_bias_names = raw_bias.get(
             "channel_names",
             [""] * BIAS_CHANNEL_COUNT,
@@ -13122,6 +13143,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias": {
                 "selected_channel": bias_selected_channel,
                 "voltage_limit_v": bias_voltage_limit_v,
+                "ramp_max_step_v": bias_ramp_max_step_v,
+                "ramp_pause_s": bias_ramp_pause_s,
                 "channel_names": tuple(bias_channel_names),
                 "setpoints_v": tuple(bias_setpoints_v),
                 "measurements": bias_measurements,

@@ -5,6 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+from math import isfinite
 import traceback
 from typing import Mapping, Optional, Sequence
 
@@ -14,6 +15,7 @@ try:
     from .bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
         normalize_bias_measurement_settings,
+        ramp_bias_channels,
         run_bias_measurement,
     )
     from .bias_measurement_gui import BiasMeasurementTabs
@@ -29,6 +31,7 @@ except ImportError:
     from bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
         normalize_bias_measurement_settings,
+        ramp_bias_channels,
         run_bias_measurement,
     )
     from bias_measurement_gui import BiasMeasurementTabs
@@ -47,6 +50,8 @@ BIAS_MIN_V = -10.0
 BIAS_MAX_V = 10.0
 BIAS_DEFAULT_V = 0.0
 BIAS_DEFAULT_LIMIT_V = 10.0
+BIAS_DEFAULT_RAMP_MAX_STEP_V = 0.001
+BIAS_DEFAULT_RAMP_PAUSE_S = 0.01
 BIAS_NAME_MAX_LENGTH = 32
 
 
@@ -271,6 +276,41 @@ class BiasControlPanel(QtWidgets.QWidget):
         header.addWidget(self.apply_all_button)
         layout.addLayout(header)
 
+        ramp_row = QtWidgets.QHBoxLayout()
+        ramp_label = QtWidgets.QLabel("Setpoint ramp")
+        ramp_font = ramp_label.font()
+        ramp_font.setBold(True)
+        ramp_label.setFont(ramp_font)
+        self.ramp_max_step = QtWidgets.QDoubleSpinBox(self)
+        self.ramp_max_step.setRange(1.0e-6, BIAS_MAX_V)
+        self.ramp_max_step.setDecimals(6)
+        self.ramp_max_step.setSingleStep(0.001)
+        self.ramp_max_step.setSuffix(" V/step")
+        self.ramp_max_step.setValue(BIAS_DEFAULT_RAMP_MAX_STEP_V)
+        self.ramp_max_step.setKeyboardTracking(False)
+        self.ramp_max_step.setToolTip(
+            "Maximum voltage change written in each DAC11001 ramp step"
+        )
+        self.ramp_pause = QtWidgets.QDoubleSpinBox(self)
+        self.ramp_pause.setRange(0.0, 60.0)
+        self.ramp_pause.setDecimals(6)
+        self.ramp_pause.setSingleStep(0.001)
+        self.ramp_pause.setSuffix(" s/step")
+        self.ramp_pause.setValue(BIAS_DEFAULT_RAMP_PAUSE_S)
+        self.ramp_pause.setKeyboardTracking(False)
+        self.ramp_pause.setToolTip(
+            "Software wait inserted after each DAC11001 ramp step"
+        )
+        self.ramp_rate_label = QtWidgets.QLabel(self)
+        ramp_row.addWidget(ramp_label)
+        ramp_row.addWidget(QtWidgets.QLabel("Maximum step:"))
+        ramp_row.addWidget(self.ramp_max_step)
+        ramp_row.addWidget(QtWidgets.QLabel("Pause:"))
+        ramp_row.addWidget(self.ramp_pause)
+        ramp_row.addWidget(self.ramp_rate_label)
+        ramp_row.addStretch(1)
+        layout.addLayout(ramp_row)
+
         self.front_panel = QickFrontPanelCanvas(self)
         self.front_panel.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
@@ -319,6 +359,9 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.read_button.clicked.connect(self.read_requested.emit)
         self.apply_all_button.clicked.connect(self._apply_all)
         self.voltage_limit.valueChanged.connect(self.set_voltage_limit)
+        self.ramp_max_step.valueChanged.connect(self._update_ramp_rate_label)
+        self.ramp_pause.valueChanged.connect(self._update_ramp_rate_label)
+        self._update_ramp_rate_label()
         self.select_channel(0, focus=False)
 
         self.bias_tabs.addTab(self.setpoint_page, "Setpoints")
@@ -340,6 +383,21 @@ class BiasControlPanel(QtWidgets.QWidget):
     @property
     def voltage_limit_v(self) -> float:
         return float(self.voltage_limit.value())
+
+    @property
+    def ramp_max_step_v(self) -> float:
+        return float(self.ramp_max_step.value())
+
+    @property
+    def ramp_pause_s(self) -> float:
+        return float(self.ramp_pause.value())
+
+    def _update_ramp_rate_label(self, *_args) -> None:
+        if self.ramp_pause_s > 0.0:
+            rate = self.ramp_max_step_v / self.ramp_pause_s
+            self.ramp_rate_label.setText(f"Maximum nominal rate: {rate:g} V/s")
+        else:
+            self.ramp_rate_label.setText("No programmed step pause")
 
     def set_configuration(
         self,
@@ -426,6 +484,8 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.read_button.setEnabled(not busy)
         self.apply_all_button.setEnabled(not busy)
         self.voltage_limit.setEnabled(not busy)
+        self.ramp_max_step.setEnabled(not busy)
+        self.ramp_pause.setEnabled(not busy)
         for editor in self.editors:
             editor.set_busy(busy)
         for page in self.measurements.pages.values():
@@ -443,6 +503,8 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.read_button.setEnabled(not running)
         self.apply_all_button.setEnabled(not running)
         self.voltage_limit.setEnabled(not running)
+        self.ramp_max_step.setEnabled(not running)
+        self.ramp_pause.setEnabled(not running)
         for editor in self.editors:
             editor.set_busy(running)
 
@@ -459,6 +521,8 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.read_button.setEnabled(True)
         self.apply_all_button.setEnabled(True)
         self.voltage_limit.setEnabled(True)
+        self.ramp_max_step.setEnabled(True)
+        self.ramp_pause.setEnabled(True)
         for editor in self.editors:
             editor.set_busy(False)
 
@@ -480,6 +544,8 @@ class BiasControlPanel(QtWidgets.QWidget):
         return {
             "selected_channel": self._selected_channel,
             "voltage_limit_v": self.voltage_limit_v,
+            "ramp_max_step_v": self.ramp_max_step_v,
+            "ramp_pause_s": self.ramp_pause_s,
             "channel_names": [editor.channel_name for editor in self.editors],
             "setpoints_v": [
                 editor.voltage.value() for editor in self.editors
@@ -495,6 +561,19 @@ class BiasControlPanel(QtWidgets.QWidget):
             raise ValueError(
                 f"bias voltage_limit_v must be in (0, {BIAS_MAX_V:g}] V"
             )
+        ramp_max_step_v = float(
+            settings.get(
+                "ramp_max_step_v",
+                BIAS_DEFAULT_RAMP_MAX_STEP_V,
+            )
+        )
+        ramp_pause_s = float(
+            settings.get("ramp_pause_s", BIAS_DEFAULT_RAMP_PAUSE_S)
+        )
+        if not isfinite(ramp_max_step_v) or ramp_max_step_v <= 0.0:
+            raise ValueError("bias ramp_max_step_v must be finite and positive")
+        if not isfinite(ramp_pause_s) or ramp_pause_s < 0.0:
+            raise ValueError("bias ramp_pause_s must be finite and nonnegative")
         names = settings.get("channel_names", [""] * BIAS_CHANNEL_COUNT)
         if (
             not isinstance(names, Sequence)
@@ -533,6 +612,8 @@ class BiasControlPanel(QtWidgets.QWidget):
                 )
             parsed_values.append((editor, value))
         self.set_voltage_limit(voltage_limit_v)
+        self.ramp_max_step.setValue(ramp_max_step_v)
+        self.ramp_pause.setValue(ramp_pause_s)
         for editor, name in zip(self.editors, parsed_names):
             editor.set_channel_name(name)
         for editor, value in parsed_values:
@@ -562,6 +643,8 @@ class BiasHardwareWorker(QtCore.QObject):
         operation: str,
         values: Optional[Mapping[int, float]] = None,
         voltage_limit_v: float = BIAS_DEFAULT_LIMIT_V,
+        ramp_max_step_v: float = BIAS_DEFAULT_RAMP_MAX_STEP_V,
+        ramp_pause_s: float = BIAS_DEFAULT_RAMP_PAUSE_S,
         parent=None,
     ):
         super().__init__(parent)
@@ -574,6 +657,12 @@ class BiasHardwareWorker(QtCore.QObject):
             raise ValueError(
                 f"bias voltage limit must be in (0, {BIAS_MAX_V:g}] V"
             )
+        self._ramp_max_step_v = float(ramp_max_step_v)
+        self._ramp_pause_s = float(ramp_pause_s)
+        if not isfinite(self._ramp_max_step_v) or self._ramp_max_step_v <= 0.0:
+            raise ValueError("bias ramp maximum step must be finite and positive")
+        if not isfinite(self._ramp_pause_s) or self._ramp_pause_s < 0.0:
+            raise ValueError("bias ramp pause must be finite and nonnegative")
         self._values = {
             int(channel): float(voltage)
             for channel, voltage in (values or {}).items()
@@ -597,10 +686,13 @@ class BiasHardwareWorker(QtCore.QObject):
                     for channel in range(BIAS_CHANNEL_COUNT)
                 }
             else:
-                values = {
-                    channel: float(soc.rfb_set_bias(channel, voltage))
-                    for channel, voltage in sorted(self._values.items())
-                }
+                values = ramp_bias_channels(
+                    soc,
+                    self._values,
+                    max_step_v=self._ramp_max_step_v,
+                    pause_s=self._ramp_pause_s,
+                    voltage_limit_v=self._voltage_limit_v,
+                )
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -652,6 +744,8 @@ __all__ = [
     "BIAS_CHANNEL_COUNT",
     "BIAS_DEFAULT_V",
     "BIAS_DEFAULT_LIMIT_V",
+    "BIAS_DEFAULT_RAMP_MAX_STEP_V",
+    "BIAS_DEFAULT_RAMP_PAUSE_S",
     "BIAS_MAX_V",
     "BIAS_MIN_V",
     "BIAS_NAME_MAX_LENGTH",
