@@ -63,51 +63,63 @@ class FakeAdcReader:
         self.closed = True
 
 
-class FakeParameter:
-    def __init__(self, value):
-        self.value = value
-
-    def __call__(self, *args):
-        if args:
-            self.value = args[0]
-        return self.value
+class FakeSr860Reference:
+    def __init__(self):
+        self.reference_source = "external"
+        self.frequency = 1.0
+        self.phase = 0.0
+        self.sine_out_amplitude = 0.0
 
 
-class FakeSr860:
-    last = None
+class FakeSr860Signal:
+    def __init__(self):
+        self.input_mode = "voltage"
+        self.current_input_gain = 1e6
+        self.current_sensitivity = 1e-9
+        self.filter_slope = 6
+        self.time_constant = 1e-3
 
-    def __init__(self, _name, address):
-        FakeSr860.last = self
-        self.address = address
-        self.reference_source = FakeParameter("EXT")
-        self.frequency = FakeParameter(1.0)
-        self.phase = FakeParameter(0.0)
-        self.signal_input = FakeParameter("voltage")
-        self.input_gain = FakeParameter(1e6)
-        self.sensitivity = FakeParameter(1e-9)
-        self.filter_slope = FakeParameter(6)
-        self.time_constant = FakeParameter(1e-3)
-        self.amplitude = FakeParameter(0.0)
-        self.closed = False
-        self.value_requests = []
+
+class FakeSr860Data:
+    def __init__(self, instrument):
+        self.instrument = instrument
 
     def get_values(self, *names):
+        if self.instrument.always_fail or self.instrument.fail_read:
+            self.instrument.fail_read = False
+            raise FakeVisaIOError("temporary timeout")
         if not 2 <= len(names) <= 3:
             raise KeyError(
                 "It is only possible to request values of 2 or 3 parameters "
                 "at a time."
             )
-        current = float(self.amplitude()) * 2.0
+        current = float(self.instrument.ref.sine_out_amplitude) * 2.0
         values = {
             "X": current,
             "Y": 0.0,
             "R": abs(current),
-            "P": 0.0,
+            "Theta": 0.0,
         }
-        self.value_requests.append(tuple(names))
+        self.instrument.value_requests.append(tuple(names))
         return tuple(values[name] for name in names)
 
-    def close(self):
+
+class FakeSr860:
+    last = None
+
+    def __init__(self, interface_type, address):
+        FakeSr860.last = self
+        self.interface_type = interface_type
+        self.address = address
+        self.ref = FakeSr860Reference()
+        self.signal = FakeSr860Signal()
+        self.data = FakeSr860Data(self)
+        self.closed = False
+        self.value_requests = []
+        self.fail_read = False
+        self.always_fail = False
+
+    def disconnect(self):
         self.closed = True
 
 
@@ -359,19 +371,13 @@ def test_sr860_reader_reconnects_and_pauses_between_snap_queries():
     retries = []
 
     class FlakySr860(FakeSr860):
-        def __init__(self, name, address, *, fail_read):
-            super().__init__(name, address)
+        def __init__(self, interface_type, address, *, fail_read):
+            super().__init__(interface_type, address)
             self.fail_read = fail_read
 
-        def get_values(self, *names):
-            if self.fail_read:
-                self.fail_read = False
-                raise FakeVisaIOError("temporary timeout")
-            return super().get_values(*names)
-
-    def factory(name, address):
+    def factory(interface_type, address):
         instrument = FlakySr860(
-            name,
+            interface_type,
             address,
             fail_read=not instruments,
         )
@@ -389,8 +395,12 @@ def test_sr860_reader_reconnects_and_pauses_between_snap_queries():
 
     assert len(instruments) == 2
     assert instruments[0].closed is True
-    assert instruments[1].amplitude() == pytest.approx(0.125)
-    assert instruments[1].value_requests == [("X", "Y"), ("R", "P")]
+    assert {item.interface_type for item in instruments} == {"visa"}
+    assert instruments[1].ref.sine_out_amplitude == pytest.approx(0.125)
+    assert instruments[1].value_requests == [
+        ("X", "Y"),
+        ("R", "Theta"),
+    ]
     assert sleeps == pytest.approx([
         SR860_RECONNECT_PAUSE_S,
         SR860_QUERY_PAUSE_S,
@@ -408,8 +418,9 @@ def test_sr860_reconnect_wait_can_be_cancelled():
     cancelled = False
 
     class AlwaysFailSr860(FakeSr860):
-        def get_values(self, *_names):
-            raise FakeVisaIOError("still disconnected")
+        def __init__(self, interface_type, address):
+            super().__init__(interface_type, address)
+            self.always_fail = True
 
     def cancel_check():
         if cancelled:
@@ -679,13 +690,14 @@ def test_two_point_sr860_sweeps_bias_and_saves_settings(tmp_path):
     )
     assert result.x_values.tolist() == pytest.approx([0.0, 50e-6, 100e-6])
     assert result.magnitude_a.tolist() == pytest.approx([0.0, 100e-6, 200e-6])
-    assert FakeSr860.last.frequency() == pytest.approx(43.5371)
-    assert FakeSr860.last.filter_slope() == 24
-    assert FakeSr860.last.amplitude() == pytest.approx(0.0)
+    assert FakeSr860.last.interface_type == "visa"
+    assert FakeSr860.last.ref.frequency == pytest.approx(43.5371)
+    assert FakeSr860.last.signal.filter_slope == 24
+    assert FakeSr860.last.ref.sine_out_amplitude == pytest.approx(0.0)
     assert FakeSr860.last.closed is True
     assert FakeSr860.last.value_requests == [
         ("X", "Y"),
-        ("R", "P"),
+        ("R", "Theta"),
     ] * 3
 
     from qcodes import initialise_or_create_database_at, load_by_id

@@ -92,13 +92,20 @@ def _sleep_with_cancel(
 
 
 def _is_visa_transport_error(exc: BaseException) -> bool:
-    """Recognize PyVISA transport failures without importing PyVISA in tests."""
+    """Recognize PyVISA/SRS transport failures without importing either package."""
     error_type = type(exc)
     return (
         isinstance(exc, (TimeoutError, OSError))
         or (
             error_type.__name__ == "VisaIOError"
             and error_type.__module__.startswith("pyvisa")
+        )
+        or (
+            error_type.__name__ in {
+                "InstCommunicationError",
+                "InstQueryError",
+            }
+            and error_type.__module__.startswith("srsgui")
         )
     )
 
@@ -667,10 +674,11 @@ class Sr860CurrentReader:
     ):
         if instrument_factory is None:
             try:
-                from qcodes.instrument_drivers.stanford_research.SR860 import SR860
-            except ImportError as exc:
+                from srsinst.sr860 import SR860
+            except (ImportError, ValueError) as exc:
                 raise RuntimeError(
-                    "QCoDeS SR860 driver and PyVISA are required for SR860 current measurement"
+                    "srsinst.sr860 and a working VISA implementation are required "
+                    "for SR860 current measurement"
                 ) from exc
             instrument_factory = SR860
         self.settings = dict(settings)
@@ -685,23 +693,33 @@ class Sr860CurrentReader:
 
     def _configure_instrument(self, *, capture_initial_amplitude: bool) -> None:
         if capture_initial_amplitude:
-            self._initial_amplitude_v = float(self.instrument.amplitude())
-        self.instrument.reference_source("INT")
-        self.instrument.frequency(float(self.settings["frequency_hz"]))
-        self.instrument.phase(float(self.settings["phase_deg"]))
-        self.instrument.signal_input("current")
-        self.instrument.input_gain(float(self.settings["input_gain_ohm"]))
-        self.instrument.sensitivity(float(self.settings["sensitivity_a"]))
-        self.instrument.filter_slope(int(self.settings["filter_slope_db_oct"]))
-        self.instrument.time_constant(float(self.settings["time_constant_s"]))
-        self.instrument.amplitude(self._bias_v)
+            self._initial_amplitude_v = float(
+                self.instrument.ref.sine_out_amplitude
+            )
+        self.instrument.ref.reference_source = "internal"
+        self.instrument.ref.frequency = float(self.settings["frequency_hz"])
+        self.instrument.ref.phase = float(self.settings["phase_deg"])
+        self.instrument.signal.input_mode = "current"
+        self.instrument.signal.current_input_gain = float(
+            self.settings["input_gain_ohm"]
+        )
+        self.instrument.signal.current_sensitivity = float(
+            self.settings["sensitivity_a"]
+        )
+        self.instrument.signal.filter_slope = int(
+            self.settings["filter_slope_db_oct"]
+        )
+        self.instrument.signal.time_constant = float(
+            self.settings["time_constant_s"]
+        )
+        self.instrument.ref.sine_out_amplitude = self._bias_v
 
     def _safe_close_instrument(self) -> None:
         instrument, self.instrument = self.instrument, None
         if instrument is None:
             return
         try:
-            instrument.close()
+            instrument.disconnect()
         except Exception:
             pass
 
@@ -715,7 +733,7 @@ class Sr860CurrentReader:
             _check_cancel(self._cancel_check)
             try:
                 self.instrument = self._instrument_factory(
-                    "bias_sr860",
+                    "visa",
                     self.settings["visa_address"],
                 )
                 self._configure_instrument(
@@ -736,7 +754,7 @@ class Sr860CurrentReader:
 
     def set_bias(self, voltage_v: float) -> None:
         self._bias_v = float(voltage_v)
-        self.instrument.amplitude(self._bias_v)
+        self.instrument.ref.sine_out_amplitude = self._bias_v
 
     def read(self) -> CurrentReading:
         delay = (
@@ -753,13 +771,13 @@ class Sr860CurrentReader:
         while True:
             _check_cancel(self._cancel_check)
             try:
-                x, y = self.instrument.get_values("X", "Y")
+                x, y = self.instrument.data.get_values("X", "Y")
                 _sleep_with_cancel(
                     SR860_QUERY_PAUSE_S,
                     sleeper=self._sleeper,
                     cancel_check=self._cancel_check,
                 )
-                r, theta = self.instrument.get_values("R", "P")
+                r, theta = self.instrument.data.get_values("R", "Theta")
                 return CurrentReading(float(x), float(y), float(r), float(theta))
             except Exception as exc:
                 if not _is_visa_transport_error(exc):
@@ -781,7 +799,9 @@ class Sr860CurrentReader:
                 and self.instrument is not None
                 and self._initial_amplitude_v is not None
             ):
-                self.instrument.amplitude(self._initial_amplitude_v)
+                self.instrument.ref.sine_out_amplitude = (
+                    self._initial_amplitude_v
+                )
         except Exception:
             pass
         finally:

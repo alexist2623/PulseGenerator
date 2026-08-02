@@ -12,6 +12,7 @@ The application was validated with this exact profile:
 | PyQtGraph | 0.14.0 |
 | Matplotlib | 3.11.0 |
 | QCoDeS | 0.58.0 |
+| srsinst.sr860 | 0.3.2 |
 | pytest (development only) | 9.0.3 |
 
 PyQtGraph is the primary interactive plotting backend. Matplotlib is kept for
@@ -195,7 +196,7 @@ run to the selected DB after a WAL checkpoint.
 ## Verification
 
 ```powershell
-python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes, plottr, pyvisa; print('GUI dependencies OK')"
+python -c "import numpy, PyQt5, pyqtgraph, matplotlib, qcodes, plottr, pyvisa; from srsinst.sr860 import SR860; print('GUI dependencies OK')"
 python DCWaveform_Generator.py
 ```
 

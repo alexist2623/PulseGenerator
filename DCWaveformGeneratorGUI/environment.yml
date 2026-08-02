@@ -12,4 +12,6 @@ dependencies:
       - matplotlib==3.11.0
       - qcodes==0.58.0
       - plottr==0.15.0
+      - PyVISA==1.16.2
+      - srsinst.sr860==0.3.2
       - pytest==9.0.3
