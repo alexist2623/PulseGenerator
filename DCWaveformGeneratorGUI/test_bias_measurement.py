@@ -83,10 +83,23 @@ class FakeSr860:
         self.time_constant = FakeParameter(1e-3)
         self.amplitude = FakeParameter(0.0)
         self.closed = False
+        self.value_requests = []
 
-    def get_values(self, *_names):
+    def get_values(self, *names):
+        if not 2 <= len(names) <= 3:
+            raise KeyError(
+                "It is only possible to request values of 2 or 3 parameters "
+                "at a time."
+            )
         current = float(self.amplitude()) * 2.0
-        return current, 0.0, abs(current), 0.0
+        values = {
+            "X": current,
+            "Y": 0.0,
+            "R": abs(current),
+            "P": 0.0,
+        }
+        self.value_requests.append(tuple(names))
+        return tuple(values[name] for name in names)
 
     def close(self):
         self.closed = True
@@ -493,6 +506,10 @@ def test_two_point_sr860_sweeps_bias_and_saves_settings(tmp_path):
     assert FakeSr860.last.filter_slope() == 24
     assert FakeSr860.last.amplitude() == pytest.approx(0.0)
     assert FakeSr860.last.closed is True
+    assert FakeSr860.last.value_requests == [
+        ("X", "Y"),
+        ("R", "P"),
+    ] * 3
 
     from qcodes import initialise_or_create_database_at, load_by_id
 

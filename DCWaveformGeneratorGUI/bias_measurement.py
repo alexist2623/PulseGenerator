@@ -642,7 +642,8 @@ class Sr860CurrentReader:
         )
         if delay > 0.0:
             self._sleeper(delay)
-        x, y, r, theta = self.instrument.get_values("X", "Y", "R", "P")
+        x, y = self.instrument.get_values("X", "Y")
+        r, theta = self.instrument.get_values("R", "P")
         return CurrentReading(float(x), float(y), float(r), float(theta))
 
     def close(self, *, restore_amplitude: bool = True) -> None:
