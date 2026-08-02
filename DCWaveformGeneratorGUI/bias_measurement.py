@@ -757,6 +757,30 @@ class BiasMeasurementResult:
     y_label: str = ""
 
 
+@dataclass(frozen=True)
+class BiasMeasurementLiveLayout:
+    """Coordinates and shape for a live Bias measurement plot."""
+
+    kind: str
+    x_values: np.ndarray
+    x_label: str
+    data_shape: Tuple[int, ...]
+    y_values: Optional[np.ndarray] = None
+    y_label: str = ""
+
+
+@dataclass(frozen=True)
+class BiasMeasurementLivePoint:
+    """One current reading mapped onto the displayed live-plot cell."""
+
+    kind: str
+    plot_index: Tuple[int, ...]
+    repetition_index: int
+    magnitude_a: float
+    completed_reads: int
+    total_reads: int
+
+
 def _safe_transport(current_a: float, bias_v: float) -> Tuple[float, float]:
     if not isfinite(bias_v) or bias_v == 0.0 or current_a == 0.0:
         return np.nan, np.nan
@@ -838,6 +862,12 @@ def run_bias_measurement(
     adc_reader_factory: Optional[Callable[..., Any]] = None,
     sleeper: Callable[[float], None] = time.sleep,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    live_layout_callback: Optional[
+        Callable[[BiasMeasurementLiveLayout], None]
+    ] = None,
+    live_point_callback: Optional[
+        Callable[[BiasMeasurementLivePoint], None]
+    ] = None,
 ) -> BiasMeasurementResult:
     """Execute one Bias measurement and persist point data plus hardware metadata."""
     if kind not in BIAS_MEASUREMENT_KINDS:
@@ -959,6 +989,24 @@ def run_bias_measurement(
     else:
         total_reads = len(points) * int(config["repetitions_per_point"])
         magnitude_sum = np.zeros(len(points), dtype=np.float64)
+    live_shape = (
+        (len(x_values),)
+        if y_values is None
+        else (len(y_values), len(x_values))
+    )
+    if live_layout_callback is not None:
+        live_layout_callback(BiasMeasurementLiveLayout(
+            kind=kind,
+            x_values=np.asarray(x_values, dtype=np.float64).copy(),
+            x_label=x_label,
+            data_shape=tuple(map(int, live_shape)),
+            y_values=(
+                None
+                if y_values is None
+                else np.asarray(y_values, dtype=np.float64).copy()
+            ),
+            y_label=y_label,
+        ))
     database_path = Path(config["database_path"]).expanduser().resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1140,6 +1188,28 @@ def run_bias_measurement(
                     )
                     magnitude_sum[point_index] += reading.r_a
                     completed += 1
+                    if live_point_callback is not None:
+                        if kind in {"two_point", "gate"}:
+                            plot_index = (int(point_index),)
+                        elif kind == "wall_wall":
+                            plot_index = divmod(
+                                int(point_index),
+                                len(x_values),
+                            )
+                        elif len(point_index) == 1:
+                            plot_index = (int(point_index[0]),)
+                        else:
+                            plot_index = tuple(
+                                map(int, point_index[-2:])
+                            )
+                        live_point_callback(BiasMeasurementLivePoint(
+                            kind=kind,
+                            plot_index=plot_index,
+                            repetition_index=int(repetition),
+                            magnitude_a=float(reading.r_a),
+                            completed_reads=completed,
+                            total_reads=total_reads,
+                        ))
                     progress(
                         8 + int(84 * completed / total_reads),
                         f"Measured {completed:,}/{total_reads:,} current readings",
@@ -1197,6 +1267,8 @@ __all__ = [
     "CURRENT_MEASUREMENT_MODES",
     "SR860_CURRENT_SENSITIVITIES_A",
     "SR860_TIME_CONSTANTS_S",
+    "BiasMeasurementLiveLayout",
+    "BiasMeasurementLivePoint",
     "BiasMeasurementResult",
     "CurrentReading",
     "QickAdcCurrentReader",

@@ -15,6 +15,8 @@ from PyQt5 import QtWidgets
 import pytest
 
 from bias_measurement import (
+    BiasMeasurementLiveLayout,
+    BiasMeasurementLivePoint,
     CurrentReading,
     default_bias_measurement_settings,
     make_gate_sweep,
@@ -272,6 +274,50 @@ def test_bias_measurement_settings_round_trip_and_legacy_defaults():
     tabs.close()
 
 
+def test_bias_live_plot_accumulates_repetitions_and_2d_cells():
+    app = _application()
+    tabs = BiasMeasurementTabs()
+    page = tabs.pages["wall_wall"]
+    layout = BiasMeasurementLiveLayout(
+        kind="wall_wall",
+        x_values=np.asarray([-0.1, 0.0, 0.1]),
+        x_label="Fast voltage [V]",
+        data_shape=(2, 3),
+        y_values=np.asarray([0.0, 0.2]),
+        y_label="Slow voltage [V]",
+    )
+    tabs.begin_live_plot(layout)
+    tabs.update_live_point(BiasMeasurementLivePoint(
+        kind="wall_wall",
+        plot_index=(0, 1),
+        repetition_index=0,
+        magnitude_a=2.0e-9,
+        completed_reads=1,
+        total_reads=12,
+    ))
+    tabs.update_live_point(BiasMeasurementLivePoint(
+        kind="wall_wall",
+        plot_index=(0, 1),
+        repetition_index=1,
+        magnitude_a=4.0e-9,
+        completed_reads=2,
+        total_reads=12,
+    ))
+    page._flush_live_plot()
+    app.processEvents()
+
+    assert page._live_values[0, 1] == pytest.approx(3.0e-9)
+    assert page._live_count[0, 1] == 2
+    assert np.isnan(page._live_values[1, 2])
+    assert page._live_completed_reads == 2
+    assert page._live_total_reads == 12
+    assert page._live_timer.isActive() is True
+
+    tabs.set_running("wall_wall", False, "Stopped")
+    assert page._live_timer.isActive() is False
+    tabs.close()
+
+
 def test_nested_settings_reject_reused_channels_and_bad_vectors():
     settings = default_bias_measurement_settings()["nested"]
     settings = json.loads(json.dumps(settings))
@@ -337,6 +383,8 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
     })
     soc = FakeSoc()
     initial = dict(soc.values)
+    live_layouts = []
+    live_points = []
 
     result = run_bias_measurement(
         connection_config=QickConnectionConfig("127.0.0.1", 8888, "myqick"),
@@ -347,11 +395,23 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
         connector=lambda **_kwargs: (soc, {}),
         adc_reader_factory=FakeAdcReader,
         sleeper=lambda _seconds: None,
+        live_layout_callback=live_layouts.append,
+        live_point_callback=live_points.append,
     )
 
     assert result.run_id >= 1
     assert result.x_values.tolist() == pytest.approx([-0.1, 0.0, 0.1])
     assert result.magnitude_a.shape == (3,)
+    assert len(live_layouts) == 1
+    assert live_layouts[0].data_shape == (3,)
+    assert live_layouts[0].x_values.tolist() == pytest.approx(
+        [-0.1, 0.0, 0.1]
+    )
+    assert [point.plot_index for point in live_points] == [
+        (0,), (0,), (1,), (1,), (2,), (2,),
+    ]
+    assert live_points[-1].completed_reads == 6
+    assert live_points[-1].total_reads == 6
     assert soc.values == pytest.approx(initial)
 
     from qcodes import initialise_or_create_database_at, load_by_id
@@ -394,6 +454,7 @@ def test_wall_wall_result_shape_with_qick_adc(tmp_path):
         "ramp_pause_s": 0.0,
     })
     soc = FakeSoc()
+    live_points = []
     result = run_bias_measurement(
         connection_config=QickConnectionConfig("127.0.0.1", 8888, "myqick"),
         kind="wall_wall",
@@ -403,10 +464,14 @@ def test_wall_wall_result_shape_with_qick_adc(tmp_path):
         connector=lambda **_kwargs: (soc, {}),
         adc_reader_factory=FakeAdcReader,
         sleeper=lambda _seconds: None,
+        live_point_callback=live_points.append,
     )
     assert result.magnitude_a.shape == (2, 3)
     assert result.x_values.tolist() == pytest.approx([-0.1, 0.0, 0.1])
     assert result.y_values.tolist() == pytest.approx([0.0, 0.1])
+    assert [point.plot_index for point in live_points] == [
+        (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2),
+    ]
 
 
 def test_general_nested_vector_sweep_saves_all_axis_setpoints(tmp_path):

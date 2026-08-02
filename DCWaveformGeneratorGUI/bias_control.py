@@ -516,6 +516,14 @@ class BiasControlPanel(QtWidgets.QWidget):
     ) -> None:
         self.measurements.update_progress(kind, percent, message)
 
+    @QtCore.pyqtSlot(object)
+    def begin_measurement_live_plot(self, layout) -> None:
+        self.measurements.begin_live_plot(layout)
+
+    @QtCore.pyqtSlot(object)
+    def update_measurement_live_point(self, point) -> None:
+        self.measurements.update_live_point(point)
+
     def show_measurement_result(self, result) -> None:
         self.measurements.show_result(result)
         self.read_button.setEnabled(True)
@@ -705,6 +713,8 @@ class BiasMeasurementWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
+    live_layout_ready = QtCore.pyqtSignal(object)
+    live_point_ready = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -733,6 +743,8 @@ class BiasMeasurementWorker(QtCore.QObject):
                 channel_names=self._channel_names,
                 voltage_limit_v=self._voltage_limit_v,
                 progress_callback=self.progress_changed.emit,
+                live_layout_callback=self.live_layout_ready.emit,
+                live_point_callback=self.live_point_ready.emit,
             )
         except Exception:
             self.failed.emit(traceback.format_exc())

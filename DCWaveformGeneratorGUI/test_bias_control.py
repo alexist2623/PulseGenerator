@@ -14,7 +14,11 @@ import pytest
 
 import bias_control
 import DCWaveform_Generator as gui
-from bias_control import BiasControlPanel, BiasHardwareWorker
+from bias_control import (
+    BiasControlPanel,
+    BiasHardwareWorker,
+    BiasMeasurementWorker,
+)
 from qick_front_panel import identify_qick_front_panel
 from qick_qcodes_experiment import QickConnectionConfig
 
@@ -247,6 +251,47 @@ def test_bias_worker_reads_and_sets_dac11001(monkeypatch):
             {1: 1.01},
             voltage_limit_v=1.0,
         )
+
+
+def test_bias_measurement_worker_forwards_live_plot_events(monkeypatch):
+    layout = object()
+    point = object()
+    result = object()
+
+    def fake_run_bias_measurement(**kwargs):
+        kwargs["progress_callback"](50, "Half complete")
+        kwargs["live_layout_callback"](layout)
+        kwargs["live_point_callback"](point)
+        return result
+
+    monkeypatch.setattr(
+        bias_control,
+        "run_bias_measurement",
+        fake_run_bias_measurement,
+    )
+    worker = BiasMeasurementWorker(
+        QickConnectionConfig("127.0.0.1", 8888, "myqick"),
+        "gate",
+        {},
+        channel_names=("",) * 8,
+        voltage_limit_v=1.0,
+    )
+    progress_events = []
+    layouts = []
+    points = []
+    results = []
+    worker.progress_changed.connect(
+        lambda percent, message: progress_events.append((percent, message))
+    )
+    worker.live_layout_ready.connect(layouts.append)
+    worker.live_point_ready.connect(points.append)
+    worker.finished.connect(results.append)
+    worker.run()
+
+    assert progress_events == [(50, "Half complete")]
+    assert layouts == [layout]
+    assert points == [point]
+    assert results == [result]
 
 
 def test_main_window_contains_bias_tab_and_persists_setpoints():

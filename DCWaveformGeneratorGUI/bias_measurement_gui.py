@@ -21,6 +21,8 @@ try:
         BIAS_MEASUREMENT_KINDS,
         SR860_CURRENT_SENSITIVITIES_A,
         SR860_TIME_CONSTANTS_S,
+        BiasMeasurementLiveLayout,
+        BiasMeasurementLivePoint,
         default_bias_measurement_settings,
         normalize_bias_measurement_settings,
     )
@@ -29,9 +31,14 @@ except ImportError:
         BIAS_MEASUREMENT_KINDS,
         SR860_CURRENT_SENSITIVITIES_A,
         SR860_TIME_CONSTANTS_S,
+        BiasMeasurementLiveLayout,
+        BiasMeasurementLivePoint,
         default_bias_measurement_settings,
         normalize_bias_measurement_settings,
     )
+
+
+LIVE_PLOT_REFRESH_MS = 75
 
 
 def _double(
@@ -471,6 +478,18 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         self._channel_names = [""] * 8
         self.channel_combos = []
         self.nested_axis_editors = []
+        self._live_layout = None
+        self._live_sum = None
+        self._live_count = None
+        self._live_values = None
+        self._live_curve = None
+        self._live_image = None
+        self._live_dirty = False
+        self._live_completed_reads = 0
+        self._live_total_reads = 0
+        self._live_timer = QtCore.QTimer(self)
+        self._live_timer.setInterval(LIVE_PLOT_REFRESH_MS)
+        self._live_timer.timeout.connect(self._flush_live_plot)
         sweep_group = QtWidgets.QGroupBox(self.LABELS[self.kind], content)
         if self.kind == "nested":
             nested_layout = QtWidgets.QVBoxLayout(sweep_group)
@@ -872,11 +891,138 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             return
         self.run_requested.emit(self.kind, settings)
 
+    def begin_live_plot(self, layout: BiasMeasurementLiveLayout) -> None:
+        """Initialize an empty line or image for an active measurement."""
+        if str(layout.kind) != self.kind:
+            return
+        shape = tuple(map(int, layout.data_shape))
+        expected_shape = (
+            (len(layout.x_values),)
+            if layout.y_values is None
+            else (len(layout.y_values), len(layout.x_values))
+        )
+        if shape != expected_shape or len(shape) not in {1, 2}:
+            self.status.setText(
+                f"Live plot shape {shape} does not match coordinates "
+                f"{expected_shape}"
+            )
+            return
+
+        self._live_layout = layout
+        self._live_sum = np.zeros(shape, dtype=np.float64)
+        self._live_count = np.zeros(shape, dtype=np.int64)
+        self._live_values = np.full(shape, np.nan, dtype=np.float64)
+        self._live_curve = None
+        self._live_image = None
+        self._live_dirty = False
+        self._live_completed_reads = 0
+        self._live_total_reads = 0
+        if self.plot is None:
+            return
+
+        self.plot.clear()
+        self.plot.setTitle("Live current magnitude")
+        if layout.y_values is None:
+            self._live_curve = self.plot.plot(
+                np.asarray(layout.x_values, dtype=np.float64),
+                self._live_values,
+                pen=pg.mkPen("#087f8c", width=2),
+                symbol="o",
+                symbolSize=5,
+                symbolBrush="#087f8c",
+                connect="finite",
+            )
+            self.plot.setLabel("bottom", layout.x_label)
+            self.plot.setLabel("left", "Current magnitude", units="A")
+        else:
+            self._live_image = pg.ImageItem(axisOrder="row-major")
+            self._live_image.setColorMap(pg.colormap.get("viridis"))
+            x = np.asarray(layout.x_values, dtype=np.float64)
+            y = np.asarray(layout.y_values, dtype=np.float64)
+            self._live_image.setRect(QtCore.QRectF(
+                float(x[0]),
+                float(y[0]),
+                float(x[-1] - x[0]),
+                float(y[-1] - y[0]),
+            ))
+            self.plot.addItem(self._live_image)
+            self.plot.setLabel("bottom", layout.x_label)
+            self.plot.setLabel("left", layout.y_label)
+        self._live_timer.start()
+
+    def update_live_point(self, point: BiasMeasurementLivePoint) -> None:
+        """Accumulate one reading and defer the visual redraw to the timer."""
+        if self._live_layout is None or str(point.kind) != self.kind:
+            return
+        index = tuple(map(int, point.plot_index))
+        if len(index) != len(self._live_values.shape):
+            return
+        if any(
+            coordinate < 0 or coordinate >= extent
+            for coordinate, extent in zip(index, self._live_values.shape)
+        ):
+            return
+        magnitude = float(point.magnitude_a)
+        if not np.isfinite(magnitude):
+            return
+        self._live_sum[index] += magnitude
+        self._live_count[index] += 1
+        self._live_values[index] = (
+            self._live_sum[index] / self._live_count[index]
+        )
+        self._live_completed_reads = int(point.completed_reads)
+        self._live_total_reads = int(point.total_reads)
+        self._live_dirty = True
+
+    def _flush_live_plot(self) -> None:
+        if not self._live_dirty or self.plot is None:
+            return
+        if self._live_curve is not None:
+            self._live_curve.setData(
+                np.asarray(self._live_layout.x_values, dtype=np.float64),
+                self._live_values,
+                connect="finite",
+            )
+        elif self._live_image is not None:
+            finite_values = self._live_values[
+                np.isfinite(self._live_values)
+            ]
+            if finite_values.size:
+                low = float(np.min(finite_values))
+                high = float(np.max(finite_values))
+                if low == high:
+                    padding = max(abs(low) * 0.01, 1.0e-18)
+                    low -= padding
+                    high += padding
+                self._live_image.setImage(
+                    self._live_values,
+                    autoLevels=False,
+                    levels=(low, high),
+                )
+        self.plot.setTitle(
+            "Live current magnitude | "
+            f"{self._live_completed_reads:,}/{self._live_total_reads:,} reads"
+        )
+        self._live_dirty = False
+
+    def _finish_live_plot(self) -> None:
+        self._flush_live_plot()
+        self._live_timer.stop()
+        self._live_layout = None
+        self._live_sum = None
+        self._live_count = None
+        self._live_values = None
+        self._live_curve = None
+        self._live_image = None
+        self._live_dirty = False
+
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
         self.status.setText(str(message))
         if running:
             self.progress.setValue(0)
+        else:
+            self._finish_live_plot()
 
     def update_progress(self, percent: int, message: str) -> None:
         self.progress.setValue(int(percent))
@@ -891,6 +1037,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         if self.plot is None:
             return
         self.plot.clear()
+        self.plot.setTitle("")
         if result.y_values is None:
             self.plot.plot(
                 np.asarray(result.x_values),
@@ -950,6 +1097,12 @@ class BiasMeasurementTabs(QtWidgets.QTabWidget):
 
     def update_progress(self, kind: str, percent: int, message: str) -> None:
         self.pages[str(kind)].update_progress(percent, message)
+
+    def begin_live_plot(self, layout: BiasMeasurementLiveLayout) -> None:
+        self.pages[str(layout.kind)].begin_live_plot(layout)
+
+    def update_live_point(self, point: BiasMeasurementLivePoint) -> None:
+        self.pages[str(point.kind)].update_live_point(point)
 
     def show_result(self, result) -> None:
         self.pages[result.kind].show_result(result)

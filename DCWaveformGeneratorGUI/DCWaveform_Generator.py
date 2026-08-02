@@ -10089,6 +10089,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 text,
             )
         )
+        worker.live_layout_ready.connect(
+            self._bias_panel.begin_measurement_live_plot
+        )
+        worker.live_point_ready.connect(
+            self._bias_panel.update_measurement_live_point
+        )
         worker.finished.connect(self._on_bias_measurement_finished)
         worker.failed.connect(
             lambda details, active_kind=kind: self._on_bias_measurement_failed(
