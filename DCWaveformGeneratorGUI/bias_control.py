@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from math import isfinite
+import threading
 import traceback
 from typing import Mapping, Optional, Sequence
 
@@ -14,6 +15,7 @@ from PyQt5 import QtCore, QtWidgets
 try:
     from .bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
+        BiasMeasurementCancelled,
         normalize_bias_measurement_settings,
         ramp_bias_channels,
         run_bias_measurement,
@@ -30,6 +32,7 @@ try:
 except ImportError:
     from bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
+        BiasMeasurementCancelled,
         normalize_bias_measurement_settings,
         ramp_bias_channels,
         run_bias_measurement,
@@ -220,6 +223,7 @@ class BiasControlPanel(QtWidgets.QWidget):
     set_requested = QtCore.pyqtSignal(int, float)
     set_all_requested = QtCore.pyqtSignal(object)
     measurement_requested = QtCore.pyqtSignal(str, object)
+    measurement_stop_requested = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,6 +376,9 @@ class BiasControlPanel(QtWidgets.QWidget):
             self.bias_tabs.addTab(page, page.LABELS[kind])
         self.measurements.hide()
         self.measurements.run_requested.connect(self.measurement_requested.emit)
+        self.measurements.stop_requested.connect(
+            self.measurement_stop_requested.emit
+        )
         self.measurements.set_channel_names(
             [editor.channel_name for editor in self.editors]
         )
@@ -515,6 +522,9 @@ class BiasControlPanel(QtWidgets.QWidget):
         message: str,
     ) -> None:
         self.measurements.update_progress(kind, percent, message)
+
+    def set_measurement_stopping(self, kind: str, message: str) -> None:
+        self.measurements.set_stopping(kind, message)
 
     @QtCore.pyqtSlot(object)
     def begin_measurement_live_plot(self, layout) -> None:
@@ -712,6 +722,7 @@ class BiasMeasurementWorker(QtCore.QObject):
 
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
+    cancelled = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
     live_layout_ready = QtCore.pyqtSignal(object)
     live_point_ready = QtCore.pyqtSignal(object)
@@ -732,6 +743,15 @@ class BiasMeasurementWorker(QtCore.QObject):
         self._settings = dict(settings)
         self._channel_names = tuple(map(str, channel_names))
         self._voltage_limit_v = float(voltage_limit_v)
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        """Thread-safe cooperative stop request."""
+        self._cancel_event.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancel_event.is_set():
+            raise BiasMeasurementCancelled("Bias measurement stopped by user")
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -745,7 +765,11 @@ class BiasMeasurementWorker(QtCore.QObject):
                 progress_callback=self.progress_changed.emit,
                 live_layout_callback=self.live_layout_ready.emit,
                 live_point_callback=self.live_point_ready.emit,
+                cancel_check=self._check_cancel,
             )
+        except BiasMeasurementCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception:
             self.failed.emit(traceback.format_exc())
             return

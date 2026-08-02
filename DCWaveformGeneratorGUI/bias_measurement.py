@@ -54,6 +54,53 @@ SR860_CURRENT_SENSITIVITIES_A = (
     1e-9, 2e-9, 5e-9, 10e-9, 20e-9, 50e-9,
     100e-9, 200e-9, 500e-9, 1e-6,
 )
+SR860_QUERY_PAUSE_S = 0.05
+SR860_RECONNECT_PAUSE_S = 1.0
+CANCEL_POLL_INTERVAL_S = 0.1
+
+
+class BiasMeasurementCancelled(RuntimeError):
+    """Raised at a safe boundary after a Bias stop request."""
+
+
+def _check_cancel(cancel_check: Optional[Callable[[], None]]) -> None:
+    if cancel_check is not None:
+        cancel_check()
+
+
+def _sleep_with_cancel(
+    duration_s: float,
+    *,
+    sleeper: Callable[[float], None],
+    cancel_check: Optional[Callable[[], None]],
+) -> None:
+    """Sleep in short intervals so a worker stop request remains responsive."""
+    duration_s = max(0.0, float(duration_s))
+    if duration_s == 0.0:
+        _check_cancel(cancel_check)
+        return
+    if cancel_check is None:
+        sleeper(duration_s)
+        return
+    remaining = duration_s
+    while remaining > 0.0:
+        _check_cancel(cancel_check)
+        interval = min(CANCEL_POLL_INTERVAL_S, remaining)
+        sleeper(interval)
+        remaining -= interval
+    _check_cancel(cancel_check)
+
+
+def _is_visa_transport_error(exc: BaseException) -> bool:
+    """Recognize PyVISA transport failures without importing PyVISA in tests."""
+    error_type = type(exc)
+    return (
+        isinstance(exc, (TimeoutError, OSError))
+        or (
+            error_type.__name__ == "VisaIOError"
+            and error_type.__module__.startswith("pyvisa")
+        )
+    )
 
 
 def _finite(value: Any, name: str) -> float:
@@ -432,6 +479,7 @@ def ramp_bias_channel(
     pause_s: float,
     voltage_limit_v: float,
     sleeper: Callable[[float], None] = time.sleep,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> float:
     """Move one DAC11001 channel to a target using bounded voltage increments."""
     result = ramp_bias_channels(
@@ -441,6 +489,7 @@ def ramp_bias_channel(
         pause_s=pause_s,
         voltage_limit_v=voltage_limit_v,
         sleeper=sleeper,
+        cancel_check=cancel_check,
     )
     return result[int(channel)]
 
@@ -453,6 +502,7 @@ def ramp_bias_channels(
     pause_s: float,
     voltage_limit_v: float,
     sleeper: Callable[[float], None] = time.sleep,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> dict:
     """Ramp several Bias channels along one shared linear interpolation path."""
     if not targets_v:
@@ -501,6 +551,7 @@ def ramp_bias_channels(
         ),
     )
     for step in range(1, steps + 1):
+        _check_cancel(cancel_check)
         fraction = step / steps
         for channel in sorted(targets):
             value = starts[channel] + fraction * (
@@ -513,7 +564,12 @@ def ramp_bias_channels(
                 )
             soc.rfb_set_bias(channel, float(value))
         if pause_s > 0.0:
-            sleeper(pause_s)
+            _sleep_with_cancel(
+                pause_s,
+                sleeper=sleeper,
+                cancel_check=cancel_check,
+            )
+    _check_cancel(cancel_check)
     return {
         channel: float(soc.rfb_get_bias(channel))
         for channel in sorted(targets)
@@ -606,6 +662,8 @@ class Sr860CurrentReader:
         *,
         instrument_factory: Optional[Callable[..., Any]] = None,
         sleeper: Callable[[float], None] = time.sleep,
+        cancel_check: Optional[Callable[[], None]] = None,
+        retry_callback: Optional[Callable[[int, BaseException], None]] = None,
     ):
         if instrument_factory is None:
             try:
@@ -617,11 +675,17 @@ class Sr860CurrentReader:
             instrument_factory = SR860
         self.settings = dict(settings)
         self._sleeper = sleeper
-        self.instrument = instrument_factory(
-            "bias_sr860",
-            self.settings["visa_address"],
-        )
-        self._initial_amplitude_v = float(self.instrument.amplitude())
+        self._instrument_factory = instrument_factory
+        self._cancel_check = cancel_check
+        self._retry_callback = retry_callback
+        self._bias_v = float(self.settings["sine_bias_v"])
+        self._initial_amplitude_v = None
+        self.instrument = None
+        self._connect_with_retry(capture_initial_amplitude=True)
+
+    def _configure_instrument(self, *, capture_initial_amplitude: bool) -> None:
+        if capture_initial_amplitude:
+            self._initial_amplitude_v = float(self.instrument.amplitude())
         self.instrument.reference_source("INT")
         self.instrument.frequency(float(self.settings["frequency_hz"]))
         self.instrument.phase(float(self.settings["phase_deg"]))
@@ -630,10 +694,49 @@ class Sr860CurrentReader:
         self.instrument.sensitivity(float(self.settings["sensitivity_a"]))
         self.instrument.filter_slope(int(self.settings["filter_slope_db_oct"]))
         self.instrument.time_constant(float(self.settings["time_constant_s"]))
-        self.instrument.amplitude(float(self.settings["sine_bias_v"]))
+        self.instrument.amplitude(self._bias_v)
+
+    def _safe_close_instrument(self) -> None:
+        instrument, self.instrument = self.instrument, None
+        if instrument is None:
+            return
+        try:
+            instrument.close()
+        except Exception:
+            pass
+
+    def _report_retry(self, attempt: int, exc: BaseException) -> None:
+        if self._retry_callback is not None:
+            self._retry_callback(int(attempt), exc)
+
+    def _connect_with_retry(self, *, capture_initial_amplitude: bool) -> None:
+        attempt = 0
+        while True:
+            _check_cancel(self._cancel_check)
+            try:
+                self.instrument = self._instrument_factory(
+                    "bias_sr860",
+                    self.settings["visa_address"],
+                )
+                self._configure_instrument(
+                    capture_initial_amplitude=capture_initial_amplitude
+                )
+                return
+            except Exception as exc:
+                self._safe_close_instrument()
+                if not _is_visa_transport_error(exc):
+                    raise
+                attempt += 1
+                self._report_retry(attempt, exc)
+                _sleep_with_cancel(
+                    SR860_RECONNECT_PAUSE_S,
+                    sleeper=self._sleeper,
+                    cancel_check=self._cancel_check,
+                )
 
     def set_bias(self, voltage_v: float) -> None:
-        self.instrument.amplitude(float(voltage_v))
+        self._bias_v = float(voltage_v)
+        self.instrument.amplitude(self._bias_v)
 
     def read(self) -> CurrentReading:
         delay = (
@@ -641,17 +744,48 @@ class Sr860CurrentReader:
             * float(self.settings["settle_time_constants"])
         )
         if delay > 0.0:
-            self._sleeper(delay)
-        x, y = self.instrument.get_values("X", "Y")
-        r, theta = self.instrument.get_values("R", "P")
-        return CurrentReading(float(x), float(y), float(r), float(theta))
+            _sleep_with_cancel(
+                delay,
+                sleeper=self._sleeper,
+                cancel_check=self._cancel_check,
+            )
+        attempt = 0
+        while True:
+            _check_cancel(self._cancel_check)
+            try:
+                x, y = self.instrument.get_values("X", "Y")
+                _sleep_with_cancel(
+                    SR860_QUERY_PAUSE_S,
+                    sleeper=self._sleeper,
+                    cancel_check=self._cancel_check,
+                )
+                r, theta = self.instrument.get_values("R", "P")
+                return CurrentReading(float(x), float(y), float(r), float(theta))
+            except Exception as exc:
+                if not _is_visa_transport_error(exc):
+                    raise
+                attempt += 1
+                self._report_retry(attempt, exc)
+                self._safe_close_instrument()
+                _sleep_with_cancel(
+                    SR860_RECONNECT_PAUSE_S,
+                    sleeper=self._sleeper,
+                    cancel_check=self._cancel_check,
+                )
+                self._connect_with_retry(capture_initial_amplitude=False)
 
     def close(self, *, restore_amplitude: bool = True) -> None:
         try:
-            if restore_amplitude:
+            if (
+                restore_amplitude
+                and self.instrument is not None
+                and self._initial_amplitude_v is not None
+            ):
                 self.instrument.amplitude(self._initial_amplitude_v)
+        except Exception:
+            pass
         finally:
-            self.instrument.close()
+            self._safe_close_instrument()
 
 
 class QickAdcCurrentReader:
@@ -868,6 +1002,7 @@ def run_bias_measurement(
     live_point_callback: Optional[
         Callable[[BiasMeasurementLivePoint], None]
     ] = None,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> BiasMeasurementResult:
     """Execute one Bias measurement and persist point data plus hardware metadata."""
     if kind not in BIAS_MEASUREMENT_KINDS:
@@ -879,12 +1014,20 @@ def run_bias_measurement(
     if len(channel_names) != BIAS_CHANNEL_COUNT:
         raise ValueError("channel_names must contain eight names")
 
-    def progress(percent: int, message: str) -> None:
-        if progress_callback is not None:
-            progress_callback(int(percent), str(message))
+    progress_state = {"percent": 0}
 
+    def progress(percent: int, message: str) -> None:
+        progress_state["percent"] = max(
+            progress_state["percent"],
+            int(percent),
+        )
+        if progress_callback is not None:
+            progress_callback(progress_state["percent"], str(message))
+
+    _check_cancel(cancel_check)
     progress(1, "Connecting to QICK and reading all BIAS voltages")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _check_cancel(cancel_check)
     initial_snapshot = read_bias_snapshot(soc, channel_names)
     initial_voltages = {
         item["channel"]: item["voltage_v"]
@@ -899,6 +1042,12 @@ def run_bias_measurement(
             config["sr860"],
             instrument_factory=sr860_factory,
             sleeper=sleeper,
+            cancel_check=cancel_check,
+            retry_callback=lambda attempt, exc: progress(
+                progress_state["percent"],
+                "SR860 communication failed; reconnecting "
+                f"(attempt {attempt}: {exc})",
+            ),
         )
     if config["current_mode"] == "sr860":
         current_reader = sr_reader
@@ -1079,6 +1228,7 @@ def run_bias_measurement(
                 else enumerate(points)
             )
             for point_index, point in point_iterator:
+                _check_cancel(cancel_check)
                 if kind == "two_point":
                     sr_reader.set_bias(point[0])
                     axis_results = ((axes[0], point[0]),)
@@ -1092,9 +1242,14 @@ def run_bias_measurement(
                         pause_s=config["ramp_pause_s"],
                         voltage_limit_v=voltage_limit_v,
                         sleeper=sleeper,
+                        cancel_check=cancel_check,
                     )
                     if config["settle_s"] > 0.0:
-                        sleeper(config["settle_s"])
+                        _sleep_with_cancel(
+                            config["settle_s"],
+                            sleeper=sleeper,
+                            cancel_check=cancel_check,
+                        )
                     axis_results = ((axes[0], point[0]), (axes[1], point[1]))
                     excitation_v = (
                         float(config["sr860"]["sine_bias_v"])
@@ -1112,6 +1267,7 @@ def run_bias_measurement(
                             pause_s=config["ramp_pause_s"],
                             voltage_limit_v=voltage_limit_v,
                             sleeper=sleeper,
+                            cancel_check=cancel_check,
                         )
                         ramp_bias_channel(
                             soc,
@@ -1121,6 +1277,7 @@ def run_bias_measurement(
                             pause_s=config["ramp_pause_s"],
                             voltage_limit_v=voltage_limit_v,
                             sleeper=sleeper,
+                            cancel_check=cancel_check,
                         )
                         current_slow = slow_v
                     ramp_bias_channel(
@@ -1131,9 +1288,14 @@ def run_bias_measurement(
                         pause_s=config["ramp_pause_s"],
                         voltage_limit_v=voltage_limit_v,
                         sleeper=sleeper,
+                        cancel_check=cancel_check,
                     )
                     if config["settle_s"] > 0.0:
-                        sleeper(config["settle_s"])
+                        _sleep_with_cancel(
+                            config["settle_s"],
+                            sleeper=sleeper,
+                            cancel_check=cancel_check,
+                        )
                     axis_results = ((axes[0], slow_v), (axes[1], fast_v))
                     excitation_v = (
                         float(config["sr860"]["sine_bias_v"])
@@ -1162,9 +1324,14 @@ def run_bias_measurement(
                         pause_s=config["ramp_pause_s"],
                         voltage_limit_v=voltage_limit_v,
                         sleeper=sleeper,
+                        cancel_check=cancel_check,
                     )
                     if config["settle_s"] > 0.0:
-                        sleeper(config["settle_s"])
+                        _sleep_with_cancel(
+                            config["settle_s"],
+                            sleeper=sleeper,
+                            cancel_check=cancel_check,
+                        )
                     excitation_v = (
                         float(config["sr860"]["sine_bias_v"])
                         if config["current_mode"] == "sr860"
@@ -1172,7 +1339,9 @@ def run_bias_measurement(
                     )
 
                 for repetition in range(config["repetitions_per_point"]):
+                    _check_cancel(cancel_check)
                     reading = current_reader.read()
+                    _check_cancel(cancel_check)
                     conductance, resistance = _safe_transport(
                         reading.r_a, excitation_v
                     )
@@ -1264,8 +1433,11 @@ def run_bias_measurement(
 __all__ = [
     "BIAS_MEASUREMENT_KINDS",
     "BIAS_MEASUREMENT_SCHEMA",
+    "BiasMeasurementCancelled",
     "CURRENT_MEASUREMENT_MODES",
     "SR860_CURRENT_SENSITIVITIES_A",
+    "SR860_QUERY_PAUSE_S",
+    "SR860_RECONNECT_PAUSE_S",
     "SR860_TIME_CONSTANTS_S",
     "BiasMeasurementLiveLayout",
     "BiasMeasurementLivePoint",

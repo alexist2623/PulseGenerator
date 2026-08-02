@@ -294,6 +294,33 @@ def test_bias_measurement_worker_forwards_live_plot_events(monkeypatch):
     assert results == [result]
 
 
+def test_bias_measurement_worker_emits_cancelled(monkeypatch):
+    def fake_run_bias_measurement(**kwargs):
+        kwargs["cancel_check"]()
+
+    monkeypatch.setattr(
+        bias_control,
+        "run_bias_measurement",
+        fake_run_bias_measurement,
+    )
+    worker = BiasMeasurementWorker(
+        QickConnectionConfig("127.0.0.1", 8888, "myqick"),
+        "gate",
+        {},
+        channel_names=("",) * 8,
+        voltage_limit_v=1.0,
+    )
+    cancelled = []
+    failed = []
+    worker.cancelled.connect(cancelled.append)
+    worker.failed.connect(failed.append)
+    worker.request_cancel()
+    worker.run()
+
+    assert cancelled == ["Bias measurement stopped by user"]
+    assert failed == []
+
+
 def test_main_window_contains_bias_tab_and_persists_setpoints():
     app = _application()
     window = gui.MainWindow()

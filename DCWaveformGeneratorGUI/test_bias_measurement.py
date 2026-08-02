@@ -15,9 +15,13 @@ from PyQt5 import QtWidgets
 import pytest
 
 from bias_measurement import (
+    BiasMeasurementCancelled,
     BiasMeasurementLiveLayout,
     BiasMeasurementLivePoint,
     CurrentReading,
+    SR860_QUERY_PAUSE_S,
+    SR860_RECONNECT_PAUSE_S,
+    Sr860CurrentReader,
     default_bias_measurement_settings,
     make_gate_sweep,
     normalize_bias_measurement_settings,
@@ -105,6 +109,13 @@ class FakeSr860:
 
     def close(self):
         self.closed = True
+
+
+FakeVisaIOError = type(
+    "VisaIOError",
+    (Exception,),
+    {"__module__": "pyvisa.errors"},
+)
 
 
 def test_nested_gate_sweep_and_ramp_are_bounded():
@@ -316,6 +327,107 @@ def test_bias_live_plot_accumulates_repetitions_and_2d_cells():
     tabs.set_running("wall_wall", False, "Stopped")
     assert page._live_timer.isActive() is False
     tabs.close()
+
+
+def test_bias_measurement_stop_button_emits_active_kind():
+    app = _application()
+    tabs = BiasMeasurementTabs()
+    stops = []
+    tabs.stop_requested.connect(stops.append)
+
+    tabs.set_running("gate", True, "Running")
+    page = tabs.pages["gate"]
+    assert page.run_button.isEnabled() is False
+    assert page.stop_button.isEnabled() is True
+    page.stop_button.click()
+    app.processEvents()
+
+    assert stops == ["gate"]
+    tabs.set_stopping("gate", "Stopping")
+    assert page.stop_button.isEnabled() is False
+    tabs.set_running("gate", False, "Stopped")
+    assert page.run_button.isEnabled() is True
+    tabs.close()
+
+
+def test_sr860_reader_reconnects_and_pauses_between_snap_queries():
+    settings = default_bias_measurement_settings()["two_point"]["sr860"]
+    settings = dict(settings)
+    settings["settle_time_constants"] = 0.0
+    instruments = []
+    sleeps = []
+    retries = []
+
+    class FlakySr860(FakeSr860):
+        def __init__(self, name, address, *, fail_read):
+            super().__init__(name, address)
+            self.fail_read = fail_read
+
+        def get_values(self, *names):
+            if self.fail_read:
+                self.fail_read = False
+                raise FakeVisaIOError("temporary timeout")
+            return super().get_values(*names)
+
+    def factory(name, address):
+        instrument = FlakySr860(
+            name,
+            address,
+            fail_read=not instruments,
+        )
+        instruments.append(instrument)
+        return instrument
+
+    reader = Sr860CurrentReader(
+        settings,
+        instrument_factory=factory,
+        sleeper=sleeps.append,
+        retry_callback=lambda attempt, exc: retries.append((attempt, str(exc))),
+    )
+    reader.set_bias(0.125)
+    reading = reader.read()
+
+    assert len(instruments) == 2
+    assert instruments[0].closed is True
+    assert instruments[1].amplitude() == pytest.approx(0.125)
+    assert instruments[1].value_requests == [("X", "Y"), ("R", "P")]
+    assert sleeps == pytest.approx([
+        SR860_RECONNECT_PAUSE_S,
+        SR860_QUERY_PAUSE_S,
+    ])
+    assert retries == [(1, "temporary timeout")]
+    assert reading.r_a == pytest.approx(0.25)
+    reader.close()
+    assert instruments[1].closed is True
+
+
+def test_sr860_reconnect_wait_can_be_cancelled():
+    settings = default_bias_measurement_settings()["two_point"]["sr860"]
+    settings = dict(settings)
+    settings["settle_time_constants"] = 0.0
+    cancelled = False
+
+    class AlwaysFailSr860(FakeSr860):
+        def get_values(self, *_names):
+            raise FakeVisaIOError("still disconnected")
+
+    def cancel_check():
+        if cancelled:
+            raise BiasMeasurementCancelled("stop")
+
+    def sleeper(_seconds):
+        nonlocal cancelled
+        cancelled = True
+
+    reader = Sr860CurrentReader(
+        settings,
+        instrument_factory=AlwaysFailSr860,
+        sleeper=sleeper,
+        cancel_check=cancel_check,
+    )
+    with pytest.raises(BiasMeasurementCancelled, match="stop"):
+        reader.read()
+    reader.close()
 
 
 def test_nested_settings_reject_reused_channels_and_bad_vectors():

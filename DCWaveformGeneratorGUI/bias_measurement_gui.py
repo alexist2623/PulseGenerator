@@ -455,6 +455,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
     """One fully independent Bias measurement configuration page."""
 
     run_requested = QtCore.pyqtSignal(str, object)
+    stop_requested = QtCore.pyqtSignal(str)
 
     LABELS = {
         "two_point": "2P Sweep",
@@ -643,7 +644,18 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         )
         self.run_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
         self.run_button.clicked.connect(self._run)
-        layout.addWidget(self.run_button)
+        self.stop_button = QtWidgets.QPushButton("Stop", content)
+        self.stop_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        )
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(
+            lambda: self.stop_requested.emit(self.kind)
+        )
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.addWidget(self.run_button, 1)
+        run_row.addWidget(self.stop_button)
+        layout.addLayout(run_row)
         self.progress = QtWidgets.QProgressBar(content)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -1018,11 +1030,17 @@ class BiasMeasurementPage(QtWidgets.QWidget):
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
         self.status.setText(str(message))
         if running:
             self.progress.setValue(0)
         else:
             self._finish_live_plot()
+
+    def set_stopping(self, message: str) -> None:
+        self.run_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.status.setText(str(message))
 
     def update_progress(self, percent: int, message: str) -> None:
         self.progress.setValue(int(percent))
@@ -1064,6 +1082,7 @@ class BiasMeasurementTabs(QtWidgets.QTabWidget):
     """Nested Bias measurement tabs embedded below the DAC setpoint page."""
 
     run_requested = QtCore.pyqtSignal(str, object)
+    stop_requested = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1075,6 +1094,7 @@ class BiasMeasurementTabs(QtWidgets.QTabWidget):
             page = self.pages[kind]
             self.addTab(page, page.LABELS[kind])
             page.run_requested.connect(self.run_requested.emit)
+            page.stop_requested.connect(self.stop_requested.emit)
 
     def set_channel_names(self, names: Sequence[str]) -> None:
         for page in self.pages.values():
@@ -1097,6 +1117,9 @@ class BiasMeasurementTabs(QtWidgets.QTabWidget):
 
     def update_progress(self, kind: str, percent: int, message: str) -> None:
         self.pages[str(kind)].update_progress(percent, message)
+
+    def set_stopping(self, kind: str, message: str) -> None:
+        self.pages[str(kind)].set_stopping(message)
 
     def begin_live_plot(self, layout: BiasMeasurementLiveLayout) -> None:
         self.pages[str(layout.kind)].begin_live_plot(layout)

@@ -7834,6 +7834,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_panel.measurement_requested.connect(
             self._start_bias_measurement
         )
+        self._bias_panel.measurement_stop_requested.connect(
+            self._stop_bias_measurement
+        )
         self._sync_shared_qick_controls()
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
@@ -10096,6 +10099,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._bias_panel.update_measurement_live_point
         )
         worker.finished.connect(self._on_bias_measurement_finished)
+        worker.cancelled.connect(
+            lambda message, active_kind=kind: self._on_bias_measurement_cancelled(
+                active_kind,
+                message,
+            )
+        )
         worker.failed.connect(
             lambda details, active_kind=kind: self._on_bias_measurement_failed(
                 active_kind,
@@ -10103,14 +10112,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
         )
         worker.finished.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_experiment_thread)
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _stop_bias_measurement(self, kind: str) -> None:
+        worker = self._experiment_worker
+        if not isinstance(worker, BiasMeasurementWorker):
+            return
+        worker.request_cancel()
+        message = "Stop requested; finishing the active hardware operation"
+        self._bias_panel.set_measurement_stopping(str(kind), message)
+        self.statusBar().showMessage("Stopping Bias measurement")
 
     def _on_bias_measurement_progress(
         self,
@@ -10128,6 +10148,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage(
             f"Bias {result.kind} Run {result.run_id} saved to {result.database_path}"
         )
+
+    def _on_bias_measurement_cancelled(self, kind: str, message: str) -> None:
+        summary = str(message).strip() or "Bias measurement stopped by user"
+        self._bias_panel.set_measurement_running(
+            kind,
+            False,
+            f"Stopped: {summary}",
+        )
+        self.statusBar().showMessage(summary)
 
     def _on_bias_measurement_failed(self, kind: str, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
