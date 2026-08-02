@@ -85,13 +85,95 @@ def test_bias_settings_round_trip_without_touching_hardware():
     panel = BiasControlPanel()
     settings = {
         "selected_channel": 6,
+        "voltage_limit_v": 4.0,
+        "channel_names": ["P", "BL", "BR", "S0", "AccL", "AccR", "", ""],
         "setpoints_v": [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0],
     }
     panel.load_settings(settings)
     app.processEvents()
 
-    assert panel.settings_dict() == settings
+    persisted = panel.settings_dict()
+    for key, value in settings.items():
+        assert persisted[key] == value
+    assert set(persisted["measurements"]) == {
+        "two_point",
+        "gate",
+        "wall_wall",
+        "nested",
+    }
     assert panel.editors[6].voltage.value() == pytest.approx(3.0)
+    assert panel.editors[1].channel_name == "BL"
+    panel.close()
+
+
+def test_bias_channel_name_is_editable_and_used_in_status():
+    app = _application()
+    panel = BiasControlPanel()
+    panel.select_channel(2, focus=False)
+    panel.editors[2].name_edit.setText("BR")
+    panel.editors[2]._name_edited("BR")
+    app.processEvents()
+
+    assert panel.channel_description(2) == "BIAS2 (BR)"
+    assert "BIAS2 (BR)" in panel.status.text()
+    assert panel.settings_dict()["channel_names"][2] == "BR"
+    panel.close()
+
+
+def test_bias_voltage_limit_updates_every_editor_and_rejects_loaded_overage():
+    app = _application()
+    panel = BiasControlPanel()
+    panel.set_voltage_limit(1.25)
+
+    for editor in panel.editors:
+        assert editor.voltage.minimum() == pytest.approx(-1.25)
+        assert editor.voltage.maximum() == pytest.approx(1.25)
+    panel.editors[2].voltage.setValue(2.0)
+    assert panel.editors[2].voltage.value() == pytest.approx(1.25)
+    assert panel.settings_dict()["voltage_limit_v"] == pytest.approx(1.25)
+
+    with pytest.raises(ValueError, match="absolute values"):
+        panel.load_settings(
+            {
+                "voltage_limit_v": 1.0,
+                "setpoints_v": [0.0, 1.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            }
+        )
+    app.processEvents()
+    panel.close()
+
+
+def test_bias_busy_state_does_not_move_selection_to_last_editor():
+    app = _application()
+    panel = BiasControlPanel()
+    panel.resize(1200, 700)
+    panel.show()
+    panel.select_channel(3)
+    panel.editors[3].voltage.setFocus()
+    app.processEvents()
+
+    panel.set_busy(True, "Applying BIAS3...")
+    app.processEvents()
+    assert panel.selected_channel == 3
+    assert bool(panel.editors[3].property("selected")) is True
+    assert bool(panel.editors[7].property("selected")) is False
+
+    panel.set_busy(False, "BIAS3 applied")
+    app.processEvents()
+    assert panel.selected_channel == 3
+    panel.close()
+
+
+def test_bias_voltage_limit_is_locked_for_measurement_duration():
+    app = _application()
+    panel = BiasControlPanel()
+    panel.set_measurement_running("nested", True, "Running nested sweep")
+    app.processEvents()
+    assert panel.voltage_limit.isEnabled() is False
+
+    panel.set_measurement_running("nested", False, "Stopped")
+    app.processEvents()
+    assert panel.voltage_limit.isEnabled() is True
     panel.close()
 
 
@@ -133,6 +215,14 @@ def test_bias_worker_reads_and_sets_dac11001(monkeypatch):
     assert soc.values[2] == pytest.approx(-1.25)
     assert soc.values[6] == pytest.approx(3.5)
 
+    with pytest.raises(ValueError, match="exceeds"):
+        BiasHardwareWorker(
+            connection,
+            "set",
+            {1: 1.01},
+            voltage_limit_v=1.0,
+        )
+
 
 def test_main_window_contains_bias_tab_and_persists_setpoints():
     app = _application()
@@ -144,15 +234,28 @@ def test_main_window_contains_bias_tab_and_persists_setpoints():
     window._bias_panel.load_settings(
         {
             "selected_channel": 3,
+            "channel_names": ["P", "BL", "BR", "S0", "AccL", "AccR", "", ""],
             "setpoints_v": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
         }
     )
     document = window._settings_to_dict()
     assert document["version"] == 35
     assert document["bias"]["selected_channel"] == 3
+    assert document["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert document["bias"]["channel_names"][3] == "S0"
     assert document["bias"]["setpoints_v"][7] == pytest.approx(0.7)
 
     decoded = window._decode_settings(document)
+    assert decoded["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert decoded["bias"]["channel_names"][4] == "AccL"
     assert decoded["bias"]["setpoints_v"][3] == pytest.approx(0.3)
+
+    legacy_document = dict(document)
+    legacy_document["bias"] = dict(document["bias"])
+    legacy_document["bias"].pop("voltage_limit_v")
+    legacy_document["bias"].pop("channel_names")
+    legacy_decoded = window._decode_settings(legacy_document)
+    assert legacy_decoded["bias"]["voltage_limit_v"] == pytest.approx(10.0)
+    assert legacy_decoded["bias"]["channel_names"] == ("",) * 8
     window.close()
     app.processEvents()

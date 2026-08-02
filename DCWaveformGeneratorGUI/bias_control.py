@@ -11,6 +11,12 @@ from typing import Mapping, Optional, Sequence
 from PyQt5 import QtCore, QtWidgets
 
 try:
+    from .bias_measurement import (
+        BIAS_MEASUREMENT_KINDS,
+        normalize_bias_measurement_settings,
+        run_bias_measurement,
+    )
+    from .bias_measurement_gui import BiasMeasurementTabs
     from .qick_front_panel import (
         QickFrontPanelCanvas,
         QickFrontPanelConfiguration,
@@ -20,6 +26,12 @@ try:
         connect_qick,
     )
 except ImportError:
+    from bias_measurement import (
+        BIAS_MEASUREMENT_KINDS,
+        normalize_bias_measurement_settings,
+        run_bias_measurement,
+    )
+    from bias_measurement_gui import BiasMeasurementTabs
     from qick_front_panel import (
         QickFrontPanelCanvas,
         QickFrontPanelConfiguration,
@@ -34,6 +46,8 @@ BIAS_CHANNEL_COUNT = 8
 BIAS_MIN_V = -10.0
 BIAS_MAX_V = 10.0
 BIAS_DEFAULT_V = 0.0
+BIAS_DEFAULT_LIMIT_V = 10.0
+BIAS_NAME_MAX_LENGTH = 32
 
 
 class BiasChannelEditor(QtWidgets.QFrame):
@@ -41,6 +55,7 @@ class BiasChannelEditor(QtWidgets.QFrame):
 
     selected = QtCore.pyqtSignal(int)
     apply_requested = QtCore.pyqtSignal(int, float)
+    name_changed = QtCore.pyqtSignal(int, str)
 
     def __init__(self, channel: int, parent=None):
         super().__init__(parent)
@@ -68,6 +83,12 @@ class BiasChannelEditor(QtWidgets.QFrame):
         title_row.addWidget(self.device_label)
         layout.addLayout(title_row)
 
+        self.name_edit = QtWidgets.QLineEdit(self)
+        self.name_edit.setPlaceholderText("Channel name (e.g. BL)")
+        self.name_edit.setMaxLength(BIAS_NAME_MAX_LENGTH)
+        self.name_edit.setClearButtonEnabled(True)
+        layout.addWidget(self.name_edit)
+
         self.voltage = QtWidgets.QDoubleSpinBox(self)
         self.voltage.setRange(BIAS_MIN_V, BIAS_MAX_V)
         self.voltage.setDecimals(6)
@@ -93,15 +114,16 @@ class BiasChannelEditor(QtWidgets.QFrame):
         self.voltage.valueChanged.connect(
             lambda _value: self.selected.emit(self.channel)
         )
+        self.name_edit.textEdited.connect(self._name_edited)
+        self.name_edit.installEventFilter(self)
         self.voltage.installEventFilter(self)
         self.apply_button.installEventFilter(self)
         self._refresh_style()
 
     def eventFilter(self, watched, event) -> bool:
         if (
-            watched in (self.voltage, self.apply_button)
-            and event.type()
-            in (QtCore.QEvent.FocusIn, QtCore.QEvent.MouseButtonPress)
+            watched in (self.name_edit, self.voltage, self.apply_button)
+            and event.type() == QtCore.QEvent.MouseButtonPress
         ):
             self.selected.emit(self.channel)
         return super().eventFilter(watched, event)
@@ -114,6 +136,23 @@ class BiasChannelEditor(QtWidgets.QFrame):
     def _apply(self) -> None:
         self.selected.emit(self.channel)
         self.apply_requested.emit(self.channel, self.voltage.value())
+
+    def _name_edited(self, text: str) -> None:
+        self.selected.emit(self.channel)
+        self.name_changed.emit(self.channel, str(text).strip())
+
+    @property
+    def channel_name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def set_channel_name(self, name: str) -> None:
+        name = str(name).strip()
+        if len(name) > BIAS_NAME_MAX_LENGTH:
+            raise ValueError(
+                f"bias channel name must be at most {BIAS_NAME_MAX_LENGTH} characters"
+            )
+        with QtCore.QSignalBlocker(self.name_edit):
+            self.name_edit.setText(name)
 
     def set_selected(self, selected: bool) -> None:
         selected = bool(selected)
@@ -134,11 +173,13 @@ class BiasChannelEditor(QtWidgets.QFrame):
             f"background: {background};"
             "}"
             "QFrame#biasChannelEditor QLabel, "
+            "QFrame#biasChannelEditor QLineEdit, "
             "QFrame#biasChannelEditor QDoubleSpinBox, "
             "QFrame#biasChannelEditor QPushButton {"
             "border: none;"
             "background: transparent;"
             "}"
+            "QFrame#biasChannelEditor QLineEdit, "
             "QFrame#biasChannelEditor QDoubleSpinBox {"
             "background: white;"
             "border: 1px solid #9ea8b3;"
@@ -157,7 +198,12 @@ class BiasChannelEditor(QtWidgets.QFrame):
             self.voltage.setValue(voltage)
         self.actual_label.setText(f"Setpoint: {voltage:+.6f} V")
 
+    def set_voltage_limit(self, voltage_limit_v: float) -> None:
+        voltage_limit_v = float(voltage_limit_v)
+        self.voltage.setRange(-voltage_limit_v, voltage_limit_v)
+
     def set_busy(self, busy: bool) -> None:
+        self.name_edit.setEnabled(not busy)
         self.voltage.setEnabled(not busy)
         self.apply_button.setEnabled(not busy)
 
@@ -168,6 +214,7 @@ class BiasControlPanel(QtWidgets.QWidget):
     read_requested = QtCore.pyqtSignal()
     set_requested = QtCore.pyqtSignal(int, float)
     set_all_requested = QtCore.pyqtSignal(object)
+    measurement_requested = QtCore.pyqtSignal(str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -179,7 +226,13 @@ class BiasControlPanel(QtWidgets.QWidget):
         self._selected_channel = 0
         self._busy = False
 
-        layout = QtWidgets.QVBoxLayout(self)
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.bias_tabs = QtWidgets.QTabWidget(self)
+        outer_layout.addWidget(self.bias_tabs)
+
+        self.setpoint_page = QtWidgets.QWidget(self.bias_tabs)
+        layout = QtWidgets.QVBoxLayout(self.setpoint_page)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
@@ -199,9 +252,21 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.apply_all_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
         )
+        self.voltage_limit = QtWidgets.QDoubleSpinBox(self)
+        self.voltage_limit.setRange(1.0e-6, BIAS_MAX_V)
+        self.voltage_limit.setDecimals(6)
+        self.voltage_limit.setSingleStep(0.1)
+        self.voltage_limit.setSuffix(" V")
+        self.voltage_limit.setValue(BIAS_DEFAULT_LIMIT_V)
+        self.voltage_limit.setKeyboardTracking(False)
+        self.voltage_limit.setToolTip(
+            "Maximum allowed absolute value for every BIAS setpoint"
+        )
         header.addWidget(title)
         header.addWidget(self.device_label)
         header.addStretch(1)
+        header.addWidget(QtWidgets.QLabel("Voltage limit (+/-):"))
+        header.addWidget(self.voltage_limit)
         header.addWidget(self.read_button)
         header.addWidget(self.apply_all_button)
         layout.addLayout(header)
@@ -234,6 +299,7 @@ class BiasControlPanel(QtWidgets.QWidget):
             editor = BiasChannelEditor(channel, editor_content)
             editor.selected.connect(self.select_channel)
             editor.apply_requested.connect(self.set_requested.emit)
+            editor.name_changed.connect(self._channel_name_changed)
             self.editors.append(editor)
             editor_layout.addWidget(editor)
         editor_layout.addStretch(1)
@@ -252,11 +318,28 @@ class BiasControlPanel(QtWidgets.QWidget):
 
         self.read_button.clicked.connect(self.read_requested.emit)
         self.apply_all_button.clicked.connect(self._apply_all)
+        self.voltage_limit.valueChanged.connect(self.set_voltage_limit)
         self.select_channel(0, focus=False)
+
+        self.bias_tabs.addTab(self.setpoint_page, "Setpoints")
+        self.measurements = BiasMeasurementTabs(self.bias_tabs)
+        for kind in BIAS_MEASUREMENT_KINDS:
+            page = self.measurements.pages[kind]
+            self.measurements.removeTab(self.measurements.indexOf(page))
+            self.bias_tabs.addTab(page, page.LABELS[kind])
+        self.measurements.hide()
+        self.measurements.run_requested.connect(self.measurement_requested.emit)
+        self.measurements.set_channel_names(
+            [editor.channel_name for editor in self.editors]
+        )
 
     @property
     def selected_channel(self) -> int:
         return self._selected_channel
+
+    @property
+    def voltage_limit_v(self) -> float:
+        return float(self.voltage_limit.value())
 
     def set_configuration(
         self,
@@ -265,12 +348,53 @@ class BiasControlPanel(QtWidgets.QWidget):
         self._configuration = configuration
         self.front_panel.set_configuration(configuration)
         self.device_label.setText(
-            f"{configuration.board} | 8 DAC11001 channels | -10 V to +10 V"
+            f"{configuration.board} | 8 DAC11001 channels | "
+            f"limit +/-{self.voltage_limit_v:g} V"
+        )
+
+    @QtCore.pyqtSlot(float)
+    def set_voltage_limit(self, voltage_limit_v: float) -> None:
+        voltage_limit_v = float(voltage_limit_v)
+        if not 0.0 < voltage_limit_v <= BIAS_MAX_V:
+            raise ValueError(
+                f"bias voltage limit must be in (0, {BIAS_MAX_V:g}] V"
+            )
+        with QtCore.QSignalBlocker(self.voltage_limit):
+            self.voltage_limit.setValue(voltage_limit_v)
+        for editor in self.editors:
+            editor.set_voltage_limit(voltage_limit_v)
+        if self._configuration is not None:
+            self.device_label.setText(
+                f"{self._configuration.board} | 8 DAC11001 channels | "
+                f"limit +/-{voltage_limit_v:g} V"
+            )
+        self.status.setText(
+            f"Voltage limit +/-{voltage_limit_v:g} V | "
+            f"selected BIAS{self._selected_channel}"
         )
 
     def _front_panel_clicked(self, direction: str, channel: int) -> None:
         if direction == "bias":
             self.select_channel(channel)
+
+    def channel_description(self, channel: int) -> str:
+        channel = int(channel)
+        if not 0 <= channel < BIAS_CHANNEL_COUNT:
+            raise IndexError("bias channel must be between 0 and 7")
+        name = self.editors[channel].channel_name
+        return f"BIAS{channel} ({name})" if name else f"BIAS{channel}"
+
+    @QtCore.pyqtSlot(int, str)
+    def _channel_name_changed(self, channel: int, _name: str) -> None:
+        self.measurements.set_channel_names(
+            [editor.channel_name for editor in self.editors]
+        )
+        if int(channel) == self._selected_channel:
+            selected = self.editors[self._selected_channel]
+            self.status.setText(
+                f"Ready | selected {self.channel_description(channel)} | "
+                f"requested {selected.voltage.value():+.6f} V"
+            )
 
     @QtCore.pyqtSlot(int)
     def select_channel(self, channel: int, *, focus: bool = True) -> None:
@@ -289,7 +413,7 @@ class BiasControlPanel(QtWidgets.QWidget):
         if focus:
             selected.voltage.setFocus(QtCore.Qt.MouseFocusReason)
         self.status.setText(
-            f"Ready | selected BIAS{channel} | "
+            f"Ready | selected {self.channel_description(channel)} | "
             f"requested {selected.voltage.value():+.6f} V"
         )
 
@@ -301,9 +425,42 @@ class BiasControlPanel(QtWidgets.QWidget):
         self._busy = bool(busy)
         self.read_button.setEnabled(not busy)
         self.apply_all_button.setEnabled(not busy)
+        self.voltage_limit.setEnabled(not busy)
         for editor in self.editors:
             editor.set_busy(busy)
+        for page in self.measurements.pages.values():
+            page.setEnabled(not busy)
         self.status.setText(str(message))
+
+    def set_measurement_running(
+        self,
+        kind: str,
+        running: bool,
+        message: str,
+    ) -> None:
+        """Update the selected measurement page without disabling its status."""
+        self.measurements.set_running(kind, running, message)
+        self.read_button.setEnabled(not running)
+        self.apply_all_button.setEnabled(not running)
+        self.voltage_limit.setEnabled(not running)
+        for editor in self.editors:
+            editor.set_busy(running)
+
+    def update_measurement_progress(
+        self,
+        kind: str,
+        percent: int,
+        message: str,
+    ) -> None:
+        self.measurements.update_progress(kind, percent, message)
+
+    def show_measurement_result(self, result) -> None:
+        self.measurements.show_result(result)
+        self.read_button.setEnabled(True)
+        self.apply_all_button.setEnabled(True)
+        self.voltage_limit.setEnabled(True)
+        for editor in self.editors:
+            editor.set_busy(False)
 
     def apply_hardware_values(self, values: Mapping[int, float]) -> None:
         for channel, voltage in values.items():
@@ -315,18 +472,47 @@ class BiasControlPanel(QtWidgets.QWidget):
         ].voltage.value()
         self.status.setText(
             f"Updated {len(values)} channel(s) | selected "
-            f"BIAS{self._selected_channel} = {selected_voltage:+.6f} V"
+            f"{self.channel_description(self._selected_channel)} = "
+            f"{selected_voltage:+.6f} V"
         )
 
     def settings_dict(self) -> dict:
         return {
             "selected_channel": self._selected_channel,
+            "voltage_limit_v": self.voltage_limit_v,
+            "channel_names": [editor.channel_name for editor in self.editors],
             "setpoints_v": [
                 editor.voltage.value() for editor in self.editors
             ],
+            "measurements": self.measurements.settings_dict(),
         }
 
     def load_settings(self, settings: Mapping[str, object]) -> None:
+        voltage_limit_v = float(
+            settings.get("voltage_limit_v", BIAS_DEFAULT_LIMIT_V)
+        )
+        if not 0.0 < voltage_limit_v <= BIAS_MAX_V:
+            raise ValueError(
+                f"bias voltage_limit_v must be in (0, {BIAS_MAX_V:g}] V"
+            )
+        names = settings.get("channel_names", [""] * BIAS_CHANNEL_COUNT)
+        if (
+            not isinstance(names, Sequence)
+            or isinstance(names, (str, bytes))
+            or len(names) != BIAS_CHANNEL_COUNT
+        ):
+            raise ValueError("bias channel_names must contain eight names")
+        parsed_names = []
+        for channel, name in enumerate(names):
+            if not isinstance(name, str):
+                raise TypeError(f"BIAS{channel} channel name must be a string")
+            name = name.strip()
+            if len(name) > BIAS_NAME_MAX_LENGTH:
+                raise ValueError(
+                    f"BIAS{channel} channel name must be at most "
+                    f"{BIAS_NAME_MAX_LENGTH} characters"
+                )
+            parsed_names.append(name)
         values = settings.get(
             "setpoints_v",
             [BIAS_DEFAULT_V] * BIAS_CHANNEL_COUNT,
@@ -337,14 +523,27 @@ class BiasControlPanel(QtWidgets.QWidget):
             or len(values) != BIAS_CHANNEL_COUNT
         ):
             raise ValueError("bias setpoints_v must contain eight values")
+        parsed_values = []
         for editor, value in zip(self.editors, values):
             value = float(value)
-            if not BIAS_MIN_V <= value <= BIAS_MAX_V:
+            if abs(value) > voltage_limit_v:
                 raise ValueError(
-                    "bias setpoints must be between -10 V and +10 V"
+                    "bias setpoint absolute values must not exceed "
+                    f"voltage_limit_v ({voltage_limit_v:g} V)"
                 )
+            parsed_values.append((editor, value))
+        self.set_voltage_limit(voltage_limit_v)
+        for editor, name in zip(self.editors, parsed_names):
+            editor.set_channel_name(name)
+        for editor, value in parsed_values:
             with QtCore.QSignalBlocker(editor.voltage):
                 editor.voltage.setValue(value)
+        self.measurements.set_channel_names(parsed_names)
+        self.measurements.load_settings(
+            normalize_bias_measurement_settings(
+                settings.get("measurements", {})
+            )
+        )
         self.select_channel(
             int(settings.get("selected_channel", 0)),
             focus=False,
@@ -362,6 +561,7 @@ class BiasHardwareWorker(QtCore.QObject):
         connection_config: QickConnectionConfig,
         operation: str,
         values: Optional[Mapping[int, float]] = None,
+        voltage_limit_v: float = BIAS_DEFAULT_LIMIT_V,
         parent=None,
     ):
         super().__init__(parent)
@@ -369,10 +569,23 @@ class BiasHardwareWorker(QtCore.QObject):
             raise ValueError("bias operation must be read or set")
         self._connection_config = connection_config
         self._operation = operation
+        self._voltage_limit_v = float(voltage_limit_v)
+        if not 0.0 < self._voltage_limit_v <= BIAS_MAX_V:
+            raise ValueError(
+                f"bias voltage limit must be in (0, {BIAS_MAX_V:g}] V"
+            )
         self._values = {
             int(channel): float(voltage)
             for channel, voltage in (values or {}).items()
         }
+        for channel, voltage in self._values.items():
+            if not 0 <= channel < BIAS_CHANNEL_COUNT:
+                raise ValueError("bias channel must be between 0 and 7")
+            if abs(voltage) > self._voltage_limit_v:
+                raise ValueError(
+                    f"BIAS{channel} setpoint {voltage:g} V exceeds "
+                    f"the +/-{self._voltage_limit_v:g} V limit"
+                )
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -394,12 +607,56 @@ class BiasHardwareWorker(QtCore.QObject):
         self.finished.emit(values)
 
 
+class BiasMeasurementWorker(QtCore.QObject):
+    """Execute one Bias sweep and QCoDeS save outside the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        connection_config: QickConnectionConfig,
+        kind: str,
+        settings: Mapping[str, object],
+        *,
+        channel_names: Sequence[str],
+        voltage_limit_v: float,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._connection_config = connection_config
+        self._kind = str(kind)
+        self._settings = dict(settings)
+        self._channel_names = tuple(map(str, channel_names))
+        self._voltage_limit_v = float(voltage_limit_v)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = run_bias_measurement(
+                connection_config=self._connection_config,
+                kind=self._kind,
+                settings=self._settings,
+                channel_names=self._channel_names,
+                voltage_limit_v=self._voltage_limit_v,
+                progress_callback=self.progress_changed.emit,
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
 __all__ = [
     "BIAS_CHANNEL_COUNT",
     "BIAS_DEFAULT_V",
+    "BIAS_DEFAULT_LIMIT_V",
     "BIAS_MAX_V",
     "BIAS_MIN_V",
+    "BIAS_NAME_MAX_LENGTH",
     "BiasChannelEditor",
     "BiasControlPanel",
     "BiasHardwareWorker",
+    "BiasMeasurementWorker",
 ]

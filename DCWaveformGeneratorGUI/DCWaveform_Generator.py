@@ -341,19 +341,27 @@ except ImportError:
 try:
     from .bias_control import (
         BIAS_CHANNEL_COUNT,
+        BIAS_DEFAULT_LIMIT_V,
         BIAS_MAX_V,
         BIAS_MIN_V,
+        BIAS_NAME_MAX_LENGTH,
         BiasControlPanel,
         BiasHardwareWorker,
+        BiasMeasurementWorker,
     )
+    from .bias_measurement import normalize_bias_measurement_settings
 except ImportError:
     from bias_control import (
         BIAS_CHANNEL_COUNT,
+        BIAS_DEFAULT_LIMIT_V,
         BIAS_MAX_V,
         BIAS_MIN_V,
+        BIAS_NAME_MAX_LENGTH,
         BiasControlPanel,
         BiasHardwareWorker,
+        BiasMeasurementWorker,
     )
+    from bias_measurement import normalize_bias_measurement_settings
 
 
 DEFAULT_QSTL_AWG_CHANNELS = (1, 3, 5, 7, 8, 9, 10, 11)
@@ -7819,6 +7827,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 },
             )
         )
+        self._bias_panel.measurement_requested.connect(
+            self._start_bias_measurement
+        )
         self._sync_shared_qick_controls()
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
@@ -9974,7 +9985,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             busy_message = "Reading all DAC11001 bias setpoints..."
         else:
             channels = ", ".join(
-                f"BIAS{int(channel)}" for channel in sorted(values)
+                self._bias_panel.channel_description(int(channel))
+                for channel in sorted(values)
             )
             busy_message = f"Applying DAC11001 setpoint(s): {channels}"
         self._bias_panel.set_busy(True, busy_message)
@@ -9985,6 +9997,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._shared_qick_connection(),
             operation,
             values,
+            voltage_limit_v=self._bias_panel.voltage_limit_v,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -10025,6 +10038,100 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self,
         )
         dialog.exec_()
+
+    def _start_bias_measurement(
+        self,
+        kind: str,
+        settings: Mapping[str, object],
+    ) -> None:
+        """Run a configured Bias measurement asynchronously."""
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QICK task running",
+                "Wait for the current QICK task to finish before starting a Bias measurement.",
+            )
+            return
+        kind = str(kind)
+        labels = {
+            "two_point": "2P sweep",
+            "gate": "gate-controlled sweep",
+            "wall_wall": "wall-wall sweep",
+            "nested": "general nested sweep",
+        }
+        label = labels.get(kind, kind)
+        message = f"Starting Bias {label}..."
+        self._bias_panel.set_measurement_running(kind, True, message)
+        self.statusBar().showMessage(message)
+
+        thread = QtCore.QThread(self)
+        worker = BiasMeasurementWorker(
+            self._shared_qick_connection(),
+            kind,
+            settings,
+            channel_names=[
+                editor.channel_name for editor in self._bias_panel.editors
+            ],
+            voltage_limit_v=self._bias_panel.voltage_limit_v,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress_changed.connect(
+            lambda percent, text, active_kind=kind: self._on_bias_measurement_progress(
+                active_kind,
+                percent,
+                text,
+            )
+        )
+        worker.finished.connect(self._on_bias_measurement_finished)
+        worker.failed.connect(
+            lambda details, active_kind=kind: self._on_bias_measurement_failed(
+                active_kind,
+                details,
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _on_bias_measurement_progress(
+        self,
+        kind: str,
+        percent: int,
+        message: str,
+    ) -> None:
+        self._bias_panel.update_measurement_progress(kind, percent, message)
+        self.statusBar().showMessage(
+            f"Bias measurement {int(percent)}%: {message}"
+        )
+
+    def _on_bias_measurement_finished(self, result) -> None:
+        self._bias_panel.show_measurement_result(result)
+        self.statusBar().showMessage(
+            f"Bias {result.kind} Run {result.run_id} saved to {result.database_path}"
+        )
+
+    def _on_bias_measurement_failed(self, kind: str, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown Bias measurement error"
+        self._bias_panel.set_measurement_running(
+            kind,
+            False,
+            f"Failed: {summary}",
+        )
+        self.statusBar().showMessage("Bias measurement failed")
+        DetailedErrorMessageBox(
+            "Bias measurement failed",
+            summary,
+            details,
+            self,
+        ).exec_()
 
     def _start_rf_output_hardware_update(
         self,
@@ -11942,6 +12049,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError(
                 f"bias selected_channel must be below {BIAS_CHANNEL_COUNT}"
             )
+        bias_voltage_limit_v = self._json_finite_float(
+            raw_bias.get("voltage_limit_v", BIAS_DEFAULT_LIMIT_V),
+            "bias voltage_limit_v",
+        )
+        if not 0.0 < bias_voltage_limit_v <= BIAS_MAX_V:
+            raise ValueError(
+                f"bias voltage_limit_v must be in (0, {BIAS_MAX_V:g}] V"
+            )
+        raw_bias_names = raw_bias.get(
+            "channel_names",
+            [""] * BIAS_CHANNEL_COUNT,
+        )
+        if (
+            not isinstance(raw_bias_names, list)
+            or len(raw_bias_names) != BIAS_CHANNEL_COUNT
+        ):
+            raise ValueError(
+                f"bias channel_names must contain {BIAS_CHANNEL_COUNT} names"
+            )
+        bias_channel_names = []
+        for channel, raw_name in enumerate(raw_bias_names):
+            if not isinstance(raw_name, str):
+                raise TypeError(f"BIAS{channel} channel name must be a string")
+            name = raw_name.strip()
+            if len(name) > BIAS_NAME_MAX_LENGTH:
+                raise ValueError(
+                    f"BIAS{channel} channel name must be at most "
+                    f"{BIAS_NAME_MAX_LENGTH} characters"
+                )
+            bias_channel_names.append(name)
         raw_bias_setpoints = raw_bias.get(
             "setpoints_v",
             [0.0] * BIAS_CHANNEL_COUNT,
@@ -11959,12 +12096,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 raw_voltage,
                 f"BIAS{channel} setpoint",
             )
-            if not BIAS_MIN_V <= voltage <= BIAS_MAX_V:
+            if abs(voltage) > bias_voltage_limit_v:
                 raise ValueError(
-                    f"BIAS{channel} setpoint must be between "
-                    f"{BIAS_MIN_V:g} V and {BIAS_MAX_V:g} V"
+                    f"BIAS{channel} setpoint absolute value must not exceed "
+                    f"bias voltage_limit_v ({bias_voltage_limit_v:g} V)"
                 )
             bias_setpoints_v.append(voltage)
+        bias_measurements = normalize_bias_measurement_settings(
+            raw_bias.get("measurements", {})
+        )
 
         time_unit = str(display.get("time_unit", DEFAULT_TIME_UNIT))
         if time_unit not in TIME_UNIT_NS:
@@ -12981,7 +13121,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "noise_analysis": noise_analysis_settings,
             "bias": {
                 "selected_channel": bias_selected_channel,
+                "voltage_limit_v": bias_voltage_limit_v,
+                "channel_names": tuple(bias_channel_names),
                 "setpoints_v": tuple(bias_setpoints_v),
+                "measurements": bias_measurements,
             },
         }
 
