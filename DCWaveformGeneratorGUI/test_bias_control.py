@@ -167,24 +167,31 @@ def test_bias_voltage_limit_updates_every_editor_and_rejects_loaded_overage():
     panel.close()
 
 
-def test_bias_busy_state_does_not_move_selection_to_last_editor():
+def test_bias_busy_state_does_not_move_selection_or_scroll_to_last_editor():
     app = _application()
     panel = BiasControlPanel()
-    panel.resize(1200, 700)
+    panel.setFixedWidth(520)
+    panel.resize(520, 700)
     panel.show()
-    panel.select_channel(3)
-    panel.editors[3].voltage.setFocus()
+    app.processEvents()
+    scrollbar = panel.editor_scroll.horizontalScrollBar()
+    assert scrollbar.maximum() > 0
+    panel.select_channel(0, focus=False)
+    scrollbar.setValue(0)
+    panel.editors[0].apply_button.setFocus()
     app.processEvents()
 
-    panel.set_busy(True, "Applying BIAS3...")
+    panel.set_busy(True, "Applying BIAS0...")
     app.processEvents()
-    assert panel.selected_channel == 3
-    assert bool(panel.editors[3].property("selected")) is True
+    assert panel.selected_channel == 0
+    assert bool(panel.editors[0].property("selected")) is True
     assert bool(panel.editors[7].property("selected")) is False
+    assert scrollbar.value() == 0
 
-    panel.set_busy(False, "BIAS3 applied")
+    panel.set_busy(False, "BIAS0 applied")
     app.processEvents()
-    assert panel.selected_channel == 3
+    assert panel.selected_channel == 0
+    assert scrollbar.value() == 0
     panel.close()
 
 

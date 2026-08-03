@@ -548,6 +548,16 @@ class BiasControlPanel(QtWidgets.QWidget):
 
     def set_busy(self, busy: bool, message: str) -> None:
         self._busy = bool(busy)
+        scrollbar = self.editor_scroll.horizontalScrollBar()
+        scroll_position = scrollbar.value()
+        focus_widget = QtWidgets.QApplication.focusWidget()
+        if (
+            focus_widget is not None
+            and self.editor_scroll.isAncestorOf(focus_widget)
+        ):
+            # Disabling the focused Apply button otherwise advances focus through
+            # every channel editor and scrolls the viewport to the final channel.
+            focus_widget.clearFocus()
         self.read_button.setEnabled(not busy)
         self.apply_all_button.setEnabled(not busy)
         self.voltage_limit.setEnabled(not busy)
@@ -557,6 +567,7 @@ class BiasControlPanel(QtWidgets.QWidget):
             editor.set_busy(busy)
         for page in self.measurements.pages.values():
             page.setEnabled(not busy)
+        scrollbar.setValue(scroll_position)
         self.status.setText(str(message))
 
     def set_measurement_running(
