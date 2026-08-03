@@ -38,7 +38,9 @@ except ImportError:
 
 
 BIAS_MEASUREMENT_SCHEMA = "qstl-qick-bias-measurement-v1"
-BIAS_MEASUREMENT_KINDS = ("two_point", "gate", "wall_wall", "nested")
+BIAS_MEASUREMENT_KINDS = (
+    "two_point", "gate", "wall_wall", "nested", "time_trace",
+)
 CURRENT_MEASUREMENT_MODES = ("sr860", "qick_adc")
 BIAS_CHANNEL_COUNT = 8
 BIAS_HARDWARE_MAX_V = 10.0
@@ -229,11 +231,19 @@ def default_bias_measurement_settings() -> dict:
             },
         ],
     })
+    time_trace = _common_defaults("QICK bias current time trace")
+    time_trace.update({
+        "samples": 1_000,
+        "sample_interval_s": 0.1,
+        "repetitions_per_point": 1,
+        "restore_bias_after_run": False,
+    })
     return {
         "two_point": two_point,
         "gate": gate,
         "wall_wall": wall,
         "nested": nested,
+        "time_trace": time_trace,
     }
 
 
@@ -463,8 +473,19 @@ def normalize_bias_measurement_settings(settings: Any) -> dict:
             values["fast_points"] = _integer(
                 values["fast_points"], "wall-wall fast points", 2
             )
-        else:
+        elif kind == "nested":
             values["axes"] = _normalize_nested_axes(values.get("axes"))
+        else:
+            values["samples"] = _integer(
+                values["samples"], "time trace samples", 1
+            )
+            values["sample_interval_s"] = _finite(
+                values["sample_interval_s"], "time trace sample interval"
+            )
+            if values["sample_interval_s"] < 0.0:
+                raise ValueError("time trace sample interval must be nonnegative")
+            values["repetitions_per_point"] = 1
+            values["restore_bias_after_run"] = False
         normalized[kind] = values
     return normalized
 
@@ -662,6 +683,8 @@ def validate_bias_sweep_voltage_limit(
                         f"{endpoint_name}",
                         value,
                     ))
+    elif kind == "time_trace":
+        return
     else:
         raise ValueError(f"unsupported Bias measurement kind {kind!r}")
 
@@ -987,6 +1010,11 @@ def _register_measurement_parameters(
             Parameter("slow_voltage_v", label="Slow wall voltage", unit="V"),
             Parameter("fast_voltage_v", label="Fast wall voltage", unit="V"),
         ]
+    elif kind == "time_trace":
+        axes = [
+            Parameter("sample_index", label="Sample index", unit=""),
+            Parameter("elapsed_time_s", label="Elapsed time", unit="s"),
+        ]
     else:
         axes = []
         flat_axes = []
@@ -1045,6 +1073,7 @@ def run_bias_measurement(
         Callable[[BiasMeasurementLivePoint], None]
     ] = None,
     cancel_check: Optional[Callable[[], None]] = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> BiasMeasurementResult:
     """Execute one Bias measurement and persist point data plus hardware metadata."""
     if kind not in BIAS_MEASUREMENT_KINDS:
@@ -1145,7 +1174,7 @@ def run_bias_measurement(
         ]
         x_label = f"BIAS{config['fast_channel']} fast voltage [V]"
         y_label = f"BIAS{config['slow_channel']} slow voltage [V]"
-    else:
+    elif kind == "nested":
         nested_axes = config["axes"]
         nested_grids = [
             np.linspace(
@@ -1179,6 +1208,15 @@ def run_bias_measurement(
             y_values = None
             y_label = ""
         points = None
+    else:
+        x_values = (
+            np.arange(config["samples"], dtype=np.float64)
+            * float(config["sample_interval_s"])
+        )
+        points = [(index,) for index in range(config["samples"])]
+        x_label = "Elapsed time [s]"
+        y_values = None
+        y_label = ""
 
     if kind == "nested":
         total_reads = total_nested_points * int(config["repetitions_per_point"])
@@ -1273,6 +1311,9 @@ def run_bias_measurement(
                 "bias_channel_voltages_initial_json", _json_text(initial_snapshot)
             )
             dataset.add_metadata(
+                "bias_voltage_metadata_json", _json_text(initial_snapshot)
+            )
+            dataset.add_metadata(
                 "swept_bias_channels_json", _json_text(swept_bias_channels)
             )
             dataset.add_metadata("sr860_settings_json", _json_text(config["sr860"]))
@@ -1282,6 +1323,9 @@ def run_bias_measurement(
 
             completed = 0
             current_slow = None
+            time_trace_started_at = (
+                clock() if kind == "time_trace" else None
+            )
             point_iterator = (
                 ((index_tuple, index_tuple) for index_tuple in np.ndindex(nested_shape))
                 if kind == "nested"
@@ -1364,7 +1408,7 @@ def run_bias_measurement(
                         if config["current_mode"] == "sr860"
                         else np.nan
                     )
-                else:
+                elif kind == "nested":
                     targets = {}
                     axis_results = []
                     for axis_index, (axis, grid, parameters) in enumerate(zip(
@@ -1399,6 +1443,29 @@ def run_bias_measurement(
                         if config["current_mode"] == "sr860"
                         else np.nan
                     )
+                else:
+                    sample_index = int(point[0])
+                    target_elapsed_s = (
+                        sample_index * float(config["sample_interval_s"])
+                    )
+                    elapsed_s = max(0.0, clock() - time_trace_started_at)
+                    if target_elapsed_s > elapsed_s:
+                        _sleep_with_cancel(
+                            target_elapsed_s - elapsed_s,
+                            sleeper=sleeper,
+                            cancel_check=cancel_check,
+                        )
+                    elapsed_s = max(0.0, clock() - time_trace_started_at)
+                    x_values[sample_index] = elapsed_s
+                    axis_results = (
+                        (axes[0], sample_index),
+                        (axes[1], elapsed_s),
+                    )
+                    excitation_v = (
+                        float(config["sr860"]["sine_bias_v"])
+                        if config["current_mode"] == "sr860"
+                        else np.nan
+                    )
 
                 for repetition in range(config["repetitions_per_point"]):
                     _check_cancel(cancel_check)
@@ -1420,7 +1487,7 @@ def run_bias_measurement(
                     magnitude_sum[point_index] += reading.r_a
                     completed += 1
                     if live_point_callback is not None:
-                        if kind in {"two_point", "gate"}:
+                        if kind in {"two_point", "gate", "time_trace"}:
                             plot_index = (int(point_index),)
                         elif kind == "wall_wall":
                             plot_index = divmod(

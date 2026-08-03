@@ -586,6 +586,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         "gate": "Gate-Controlled Sweep",
         "wall_wall": "Wall-Wall Plot",
         "nested": "Nested Sweep",
+        "time_trace": "Time Trace",
     }
 
     def __init__(self, kind: str, parent=None):
@@ -599,6 +600,8 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         content = QtWidgets.QWidget(scroll)
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(6, 6, 6, 6)
+        self._content = content
+        self._content_layout = layout
 
         self._channel_names = [""] * 8
         self.channel_combos = []
@@ -729,6 +732,28 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             form.addRow("Fast start:", self.fast_start)
             form.addRow("Fast stop:", self.fast_stop)
             form.addRow("Fast points:", self.fast_points)
+        elif self.kind == "time_trace":
+            self.time_samples = _integer(
+                1, 100_000_000, defaults["samples"]
+            )
+            self.time_interval = _double(
+                0.0, 3600.0, defaults["sample_interval_s"],
+                decimals=9, suffix=" s", step=0.01,
+            )
+            self.time_trace_summary = QtWidgets.QLabel(sweep_group)
+            self.time_trace_summary.setTextInteractionFlags(
+                QtCore.Qt.TextSelectableByMouse
+            )
+            self.time_samples.valueChanged.connect(
+                self._update_time_trace_summary
+            )
+            self.time_interval.valueChanged.connect(
+                self._update_time_trace_summary
+            )
+            form.addRow("Current samples:", self.time_samples)
+            form.addRow("Requested interval:", self.time_interval)
+            form.addRow("Requested span:", self.time_trace_summary)
+            self._update_time_trace_summary()
         self.set_channel_names([""] * 8)
         if self.kind == "wall_wall":
             self.slow_channel.setCurrentIndex(
@@ -775,6 +800,8 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         else:
             timing.addRow(self.restore)
         layout.addWidget(timing_group)
+        if self.kind == "time_trace":
+            timing_group.hide()
 
         self.current = CurrentMeasurementSettings(
             two_point=self.kind == "two_point", parent=content
@@ -826,14 +853,10 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
 
-        if pg is not None:
-            self.plot = pg.PlotWidget(content)
-            self.plot.showGrid(x=True, y=True, alpha=0.2)
-            self.plot.setMinimumHeight(260)
-            layout.addWidget(self.plot)
-        else:
-            self.plot = None
+        self.plot = None
         layout.addStretch(1)
+        if pg is not None and self.kind != "time_trace":
+            self._ensure_plot()
         scroll.setWidget(content)
         root.addWidget(scroll)
         self._update_nested_total()
@@ -963,6 +986,17 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         for checkbox in self.gate_channel_checks:
             checkbox.setChecked(bool(checked))
 
+    def _update_time_trace_summary(self, *_args) -> None:
+        if self.kind != "time_trace":
+            return
+        span_s = max(0, self.time_samples.value() - 1) * self.time_interval.value()
+        if self.time_interval.value() == 0.0:
+            self.time_trace_summary.setText(
+                "As fast as the selected current reader permits"
+            )
+        else:
+            self.time_trace_summary.setText(f"{span_s:g} s")
+
     def _browse_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -1020,11 +1054,16 @@ class BiasMeasurementPage(QtWidgets.QWidget):
                 "fast_stop_v": self.fast_stop.value(),
                 "fast_points": self.fast_points.value(),
             })
-        else:
+        elif self.kind == "nested":
             result["axes"] = [
                 editor.settings_dict()
                 for editor in self.nested_axis_editors
             ]
+        else:
+            result.update({
+                "samples": self.time_samples.value(),
+                "sample_interval_s": self.time_interval.value(),
+            })
         return normalize_bias_measurement_settings({self.kind: result})[self.kind]
 
     def load_settings(self, settings: Mapping[str, object]) -> None:
@@ -1066,7 +1105,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             self.fast_start.setValue(values["fast_start_v"])
             self.fast_stop.setValue(values["fast_stop_v"])
             self.fast_points.setValue(values["fast_points"])
-        else:
+        elif self.kind == "nested":
             for editor in tuple(self.nested_axis_editors):
                 self.nested_axes_layout.removeWidget(editor)
                 editor.deleteLater()
@@ -1074,6 +1113,10 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             for axis in values["axes"]:
                 self._add_nested_axis(axis)
             self._refresh_nested_axes()
+        else:
+            self.time_samples.setValue(values["samples"])
+            self.time_interval.setValue(values["sample_interval_s"])
+            self._update_time_trace_summary()
 
     def _run(self) -> None:
         try:
@@ -1082,6 +1125,19 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Invalid Bias sweep", str(exc))
             return
         self.run_requested.emit(self.kind, settings)
+
+    def _ensure_plot(self):
+        """Create the pyqtgraph widget only when this page needs it."""
+        if self.plot is not None or pg is None:
+            return self.plot
+        self.plot = pg.PlotWidget(self._content)
+        self.plot.showGrid(x=True, y=True, alpha=0.2)
+        self.plot.setMinimumHeight(260)
+        self._content_layout.insertWidget(
+            max(0, self._content_layout.count() - 1),
+            self.plot,
+        )
+        return self.plot
 
     def begin_live_plot(self, layout: BiasMeasurementLiveLayout) -> None:
         """Initialize an empty line or image for an active measurement."""
@@ -1109,7 +1165,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
         self._live_dirty = False
         self._live_completed_reads = 0
         self._live_total_reads = 0
-        if self.plot is None:
+        if self._ensure_plot() is None:
             return
 
         self.plot.clear()
@@ -1232,7 +1288,7 @@ class BiasMeasurementPage(QtWidgets.QWidget):
             f"QCoDeS Run {result.run_id} saved to {result.database_path}",
         )
         self.progress.setValue(100)
-        if self.plot is None:
+        if self._ensure_plot() is None:
             return
         self.plot.clear()
         self.plot.setTitle("")
@@ -1259,29 +1315,44 @@ class BiasMeasurementPage(QtWidgets.QWidget):
 
 
 class BiasMeasurementTabs(QtWidgets.QTabWidget):
-    """Nested Bias measurement tabs embedded below the DAC setpoint page."""
+    """Own and coordinate the independent Bias measurement pages."""
 
     run_requested = QtCore.pyqtSignal(str, object)
     stop_requested = QtCore.pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, kinds: Sequence[str] | None = None):
         super().__init__(parent)
+        requested_kinds = (
+            tuple(
+                kind
+                for kind in BIAS_MEASUREMENT_KINDS
+                if kind != "time_trace"
+            )
+            if kinds is None
+            else tuple(map(str, kinds))
+        )
+        unknown = set(requested_kinds).difference(BIAS_MEASUREMENT_KINDS)
+        if unknown:
+            raise ValueError(f"unknown Bias measurement kinds: {sorted(unknown)}")
         self.pages = {
             kind: BiasMeasurementPage(kind, self)
-            for kind in BIAS_MEASUREMENT_KINDS
+            for kind in requested_kinds
         }
-        for kind in BIAS_MEASUREMENT_KINDS:
+        for kind in requested_kinds:
             page = self.pages[kind]
-            self.addTab(page, page.LABELS[kind])
             page.run_requested.connect(self.run_requested.emit)
             page.stop_requested.connect(self.stop_requested.emit)
+            self.addTab(page, page.LABELS[kind])
 
     def set_channel_names(self, names: Sequence[str]) -> None:
         for page in self.pages.values():
             page.set_channel_names(names)
 
     def settings_dict(self) -> dict:
-        return {kind: page.settings_dict() for kind, page in self.pages.items()}
+        return normalize_bias_measurement_settings({
+            kind: page.settings_dict()
+            for kind, page in self.pages.items()
+        })
 
     def load_settings(self, settings: Mapping[str, object]) -> None:
         normalized = normalize_bias_measurement_settings(settings)
@@ -1312,7 +1383,6 @@ class BiasMeasurementTabs(QtWidgets.QTabWidget):
         for kind, page in self.pages.items():
             if kind != result.kind:
                 page.run_button.setEnabled(True)
-
 
 __all__ = [
     "BiasMeasurementPage",

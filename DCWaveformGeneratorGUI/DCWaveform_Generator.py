@@ -13188,6 +13188,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _apply_decoded_settings(self, settings: dict) -> None:
         """Apply a fully validated settings object to all GUI panels."""
+        self._bias_panel.prepare_for_settings_load()
         pulses = settings["pulses"]
         self._sweep_specs = []
         while len(self._pulse) > len(pulses):

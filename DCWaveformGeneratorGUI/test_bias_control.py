@@ -106,6 +106,7 @@ def test_bias_settings_round_trip_without_touching_hardware():
         "gate",
         "wall_wall",
         "nested",
+        "time_trace",
     }
     assert panel.editors[6].voltage.value() == pytest.approx(3.0)
     assert panel.editors[1].channel_name == "BL"

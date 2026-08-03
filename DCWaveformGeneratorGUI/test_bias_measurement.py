@@ -282,6 +282,8 @@ def test_bias_measurement_settings_round_trip_and_legacy_defaults():
     assert normalized["two_point"]["sr860"]["filter_slope_db_oct"] == 24
     assert normalized["wall_wall"]["fast_channel"] == 1
     assert normalized["nested"]["axes"][1]["channels"] == [0, 1]
+    assert normalized["time_trace"]["samples"] == 1_000
+    assert normalized["time_trace"]["sample_interval_s"] == pytest.approx(0.1)
 
     app = _application()
     tabs = BiasMeasurementTabs()
@@ -651,6 +653,77 @@ def test_gate_qick_adc_measurement_saves_bias_metadata(tmp_path):
     assert adc_metadata["fir_samples"] == settings["qick_adc"]["fir_samples"]
     # QCoDeS counts the six dependent values written for each of six reads.
     assert dataset.number_of_results == 36
+
+
+def test_time_trace_saves_actual_elapsed_time_and_bias_voltage_metadata(tmp_path):
+    database = tmp_path / "bias_time_trace.db"
+    settings = default_bias_measurement_settings()["time_trace"]
+    settings.update({
+        "database_path": str(database),
+        "sample_name": "TimeTraceTest",
+        "current_mode": "qick_adc",
+        "samples": 4,
+        "sample_interval_s": 0.25,
+    })
+    soc = FakeSoc()
+    initial = dict(soc.values)
+    now = [10.0]
+
+    def clock():
+        return now[0]
+
+    def sleeper(duration_s):
+        now[0] += float(duration_s)
+
+    live_points = []
+    result = run_bias_measurement(
+        connection_config=QickConnectionConfig("127.0.0.1", 8888, "myqick"),
+        kind="time_trace",
+        settings=settings,
+        channel_names=("P", "BL", "BR", "S0", "AccL", "AccR", "", ""),
+        voltage_limit_v=1.0,
+        connector=lambda **_kwargs: (soc, {}),
+        adc_reader_factory=FakeAdcReader,
+        sleeper=sleeper,
+        clock=clock,
+        live_point_callback=live_points.append,
+    )
+
+    assert result.x_values.tolist() == pytest.approx([0.0, 0.25, 0.5, 0.75])
+    assert result.x_label == "Elapsed time [s]"
+    assert result.magnitude_a.tolist() == pytest.approx(
+        [np.hypot(0.02, -0.02)] * 4
+    )
+    assert [point.plot_index for point in live_points] == [
+        (0,), (1,), (2,), (3,),
+    ]
+    assert soc.values == pytest.approx(initial)
+
+    from qcodes import initialise_or_create_database_at, load_by_id
+
+    initialise_or_create_database_at(str(database))
+    dataset = load_by_id(result.run_id)
+    parameter_data = dataset.get_parameter_data("i_r_a")["i_r_a"]
+    assert parameter_data["sample_index"].tolist() == [0, 1, 2, 3]
+    assert parameter_data["elapsed_time_s"].tolist() == pytest.approx(
+        [0.0, 0.25, 0.5, 0.75]
+    )
+    voltage_metadata = json.loads(
+        dataset.get_metadata("bias_voltage_metadata_json")
+    )
+    assert len(voltage_metadata["channels"]) == 8
+    assert voltage_metadata["channels"][0] == {
+        "channel": 0,
+        "name": "P",
+        "voltage_v": 0.0,
+    }
+    final_metadata = json.loads(
+        dataset.get_metadata("bias_channel_voltages_final_json")
+    )
+    assert [item["voltage_v"] for item in final_metadata["channels"]] == pytest.approx(
+        [initial[channel] for channel in range(8)]
+    )
+    assert dataset.number_of_results == 24
 
 
 def test_wall_wall_result_shape_with_qick_adc(tmp_path):

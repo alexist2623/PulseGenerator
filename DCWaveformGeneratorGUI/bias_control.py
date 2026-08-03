@@ -16,11 +16,12 @@ try:
     from .bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
         BiasMeasurementCancelled,
+        default_bias_measurement_settings,
         normalize_bias_measurement_settings,
         ramp_bias_channels,
         run_bias_measurement,
     )
-    from .bias_measurement_gui import BiasMeasurementTabs
+    from .bias_measurement_gui import BiasMeasurementPage, BiasMeasurementTabs
     from .qick_front_panel import (
         QickFrontPanelCanvas,
         QickFrontPanelConfiguration,
@@ -33,11 +34,12 @@ except ImportError:
     from bias_measurement import (
         BIAS_MEASUREMENT_KINDS,
         BiasMeasurementCancelled,
+        default_bias_measurement_settings,
         normalize_bias_measurement_settings,
         ramp_bias_channels,
         run_bias_measurement,
     )
-    from bias_measurement_gui import BiasMeasurementTabs
+    from bias_measurement_gui import BiasMeasurementPage, BiasMeasurementTabs
     from qick_front_panel import (
         QickFrontPanelCanvas,
         QickFrontPanelConfiguration,
@@ -261,6 +263,10 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.apply_all_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
         )
+        self.time_trace_button = QtWidgets.QPushButton("Current vs Time")
+        self.time_trace_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+        )
         self.voltage_limit = QtWidgets.QDoubleSpinBox(self)
         self.voltage_limit.setRange(1.0e-6, BIAS_MAX_V)
         self.voltage_limit.setDecimals(6)
@@ -278,6 +284,7 @@ class BiasControlPanel(QtWidgets.QWidget):
         header.addWidget(self.voltage_limit)
         header.addWidget(self.read_button)
         header.addWidget(self.apply_all_button)
+        header.addWidget(self.time_trace_button)
         layout.addLayout(header)
 
         ramp_row = QtWidgets.QHBoxLayout()
@@ -371,18 +378,69 @@ class BiasControlPanel(QtWidgets.QWidget):
         self.select_channel(0, focus=False)
 
         self.bias_tabs.addTab(self.setpoint_page, "Setpoints")
-        self.measurements = BiasMeasurementTabs(self.bias_tabs)
-        for kind in BIAS_MEASUREMENT_KINDS:
+        eager_measurements = tuple(
+            kind for kind in BIAS_MEASUREMENT_KINDS if kind != "time_trace"
+        )
+        self.measurements = BiasMeasurementTabs(self, kinds=eager_measurements)
+        self._time_trace_settings = default_bias_measurement_settings()[
+            "time_trace"
+        ]
+        for kind in eager_measurements:
             page = self.measurements.pages[kind]
             self.measurements.removeTab(self.measurements.indexOf(page))
             self.bias_tabs.addTab(page, page.LABELS[kind])
         self.measurements.hide()
+        self._time_trace_dialog = None
+        self.time_trace_button.clicked.connect(self._show_time_trace_dialog)
         self.measurements.run_requested.connect(self.measurement_requested.emit)
         self.measurements.stop_requested.connect(
             self.measurement_stop_requested.emit
         )
         self.measurements.set_channel_names(
             [editor.channel_name for editor in self.editors]
+        )
+
+    def _show_time_trace_dialog(self) -> None:
+        """Open the independent current-versus-time acquisition controls."""
+        if self._time_trace_dialog is not None:
+            self._time_trace_dialog.show()
+            self._time_trace_dialog.raise_()
+            self._time_trace_dialog.activateWindow()
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Bias Current vs Time")
+        dialog.resize(760, 820)
+        dialog_layout = QtWidgets.QVBoxLayout(dialog)
+        page = BiasMeasurementPage("time_trace", dialog)
+        page.set_channel_names(
+            [editor.channel_name for editor in self.editors]
+        )
+        page.load_settings(self._time_trace_settings)
+        page.run_requested.connect(self.measurement_requested.emit)
+        page.stop_requested.connect(self.measurement_stop_requested.emit)
+        self.measurements.pages["time_trace"] = page
+        dialog_layout.addWidget(page)
+        dialog.finished.connect(dialog.hide)
+        self._time_trace_dialog = dialog
+        dialog.show()
+
+    def prepare_for_settings_load(self) -> None:
+        """Close the lazy Time Trace window before rebuilding GUI settings."""
+        if self._time_trace_dialog is None:
+            return
+        dialog = self._time_trace_dialog
+        dialog.hide()
+        page = self.measurements.pages.pop("time_trace", None)
+        if page is not None:
+            self._time_trace_settings = page.settings_dict()
+            page._finish_live_plot()
+            page.setParent(None)
+            page.deleteLater()
+        dialog.deleteLater()
+        self._time_trace_dialog = None
+        QtWidgets.QApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
         )
 
     @property
@@ -561,6 +619,11 @@ class BiasControlPanel(QtWidgets.QWidget):
         )
 
     def settings_dict(self) -> dict:
+        measurements = self.measurements.settings_dict()
+        measurements.setdefault(
+            "time_trace",
+            dict(self._time_trace_settings),
+        )
         return {
             "selected_channel": self._selected_channel,
             "voltage_limit_v": self.voltage_limit_v,
@@ -570,7 +633,7 @@ class BiasControlPanel(QtWidgets.QWidget):
             "setpoints_v": [
                 editor.voltage.value() for editor in self.editors
             ],
-            "measurements": self.measurements.settings_dict(),
+            "measurements": measurements,
         }
 
     def load_settings(self, settings: Mapping[str, object]) -> None:
@@ -640,11 +703,11 @@ class BiasControlPanel(QtWidgets.QWidget):
             with QtCore.QSignalBlocker(editor.voltage):
                 editor.voltage.setValue(value)
         self.measurements.set_channel_names(parsed_names)
-        self.measurements.load_settings(
-            normalize_bias_measurement_settings(
-                settings.get("measurements", {})
-            )
+        measurement_settings = normalize_bias_measurement_settings(
+            settings.get("measurements", {})
         )
+        self._time_trace_settings = measurement_settings["time_trace"]
+        self.measurements.load_settings(measurement_settings)
         self.select_channel(
             int(settings.get("selected_channel", 0)),
             focus=False,
