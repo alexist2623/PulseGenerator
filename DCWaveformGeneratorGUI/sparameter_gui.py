@@ -34,7 +34,11 @@ try:
         load_sparameter_run,
         run_sparameter_sweep,
     )
-    from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
+    from .power_calibration import (
+        CalibrationDatabase,
+        INPUT_BOARD_TYPES,
+        OUTPUT_BOARD_TYPES,
+    )
     from .qick_front_panel import QickFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
@@ -47,7 +51,11 @@ except ImportError:
         load_sparameter_run,
         run_sparameter_sweep,
     )
-    from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
+    from power_calibration import (
+        CalibrationDatabase,
+        INPUT_BOARD_TYPES,
+        OUTPUT_BOARD_TYPES,
+    )
     from qick_front_panel import QickFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
 
@@ -583,17 +591,48 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.gain.setValue(20000)
         self.gain.setSuffix(f" / {MAX_RF_OUTPUT_GAIN}")
         self.output_power_dbm = self._power_spin(-20.0)
+        self.calculated_gain_status = QtWidgets.QLabel(
+            "Enable frequency-response compensation to calculate gain"
+        )
+        self.calculated_gain_status.setWordWrap(True)
+        self.calculated_gain_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.calculated_gain_status.setToolTip(
+            "Nominal gain is the gain at the weakest calibrated frequency. "
+            "The applied range includes the per-frequency correction loaded "
+            "into tProcessor DMEM."
+        )
+        self._gain_preview_timer = QtCore.QTimer(self)
+        self._gain_preview_timer.setSingleShot(True)
+        self._gain_preview_timer.setInterval(200)
+        self._gain_preview_timer.timeout.connect(
+            self._update_calibrated_gain_preview
+        )
         self.scan_time_us = QtWidgets.QDoubleSpinBox()
         self.scan_time_us.setRange(0.001, 1.0e6)
         self.scan_time_us.setDecimals(6)
         self.scan_time_us.setValue(10.0)
         self.scan_time_us.setSuffix(" us")
+        self.minimum_coherent_samples = QtWidgets.QSpinBox()
+        self.minimum_coherent_samples.setRange(1, 10_000_000)
+        self.minimum_coherent_samples.setValue(100)
+        self.minimum_coherent_samples.setToolTip(
+            "Minimum number of FIR samples coherently averaged at every RF "
+            "frequency. At 50 kSPS, 100 samples require 2 ms per point and "
+            "avoid multi-dB integer-I/Q quantization steps at low power."
+        )
         sweep_form.addRow("Start frequency:", self.frequency_start_mhz)
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
-        sweep_form.addRow("Single output gain:", self.gain)
+        sweep_form.addRow("Manual output gain:", self.gain)
         sweep_form.addRow("Single target power:", self.output_power_dbm)
+        sweep_form.addRow("dBm -> applied gain:", self.calculated_gain_status)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
+        sweep_form.addRow(
+            "Minimum coherent samples:",
+            self.minimum_coherent_samples,
+        )
         content_layout.addWidget(sweep_group)
 
         self.power_calibration_enabled = QtWidgets.QGroupBox(
@@ -678,6 +717,22 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.power_calibration_enabled.toggled.connect(self._update_power_control_state)
         self.input_calibration_selection.currentIndexChanged.connect(
             self._update_power_control_state
+        )
+        for widget in (
+            self.frequency_start_mhz,
+            self.frequency_end_mhz,
+            self.frequency_points,
+            self.output_power_dbm,
+            self.power_start_dbm,
+            self.power_end_dbm,
+            self.power_points,
+        ):
+            widget.valueChanged.connect(self._schedule_calibrated_gain_preview)
+        self.power_scale.currentIndexChanged.connect(
+            self._schedule_calibrated_gain_preview
+        )
+        self.calibration_database_path.textChanged.connect(
+            self._schedule_calibrated_gain_preview
         )
         content_layout.addWidget(self.power_sweep_enabled)
         self._update_power_control_state(False)
@@ -804,6 +859,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
         self.scan_time_us.valueChanged.connect(self._update_fir_profile_status)
+        self.minimum_coherent_samples.valueChanged.connect(
+            self._update_fir_profile_status
+        )
 
         self._internal_settings = {
             "settle_seconds": 0.05,
@@ -888,6 +946,84 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.requested_input_calibration_run_id.setEnabled(
             calibrated and manual_input_run
         )
+        self._schedule_calibrated_gain_preview()
+
+    def _schedule_calibrated_gain_preview(self, *_args) -> None:
+        self._gain_preview_timer.start()
+
+    def _update_calibrated_gain_preview(self) -> None:
+        if not self.power_calibration_enabled.isChecked():
+            self.calculated_gain_status.setText(
+                f"Manual gain {self.gain.value():,} / {MAX_RF_OUTPUT_GAIN:,}"
+            )
+            self.calculated_gain_status.setStyleSheet("")
+            return
+
+        database_path = self.calibration_database_path.text().strip()
+        if not database_path:
+            self.calculated_gain_status.setText("Select a calibration DB")
+            self.calculated_gain_status.setStyleSheet(
+                "QLabel { color: #9a5b00; font-weight: 600; }"
+            )
+            return
+
+        try:
+            point_count = min(self.frequency_points.value(), 4000)
+            frequencies = np.linspace(
+                self.frequency_start_mhz.value(),
+                self.frequency_end_mhz.value(),
+                point_count,
+                dtype=float,
+            )
+            calibration = CalibrationDatabase(database_path).output_calibration(
+                self.output_board_type.currentText(),
+                frequencies,
+            )
+            if self.power_sweep_enabled.isChecked():
+                targets = (
+                    self.power_start_dbm.value(),
+                    self.power_end_dbm.value(),
+                )
+            else:
+                targets = (self.output_power_dbm.value(),)
+
+            path = self.path_diagram.applied_values()
+            schedules = [
+                calibration.build_gain_schedule(
+                    frequencies,
+                    target,
+                    output_att1_db=path["output_att1_db"],
+                    output_att2_db=path["output_att2_db"],
+                )
+                for target in targets
+            ]
+            nominal_min = min(schedule.nominal_gain_code for schedule in schedules)
+            nominal_max = max(schedule.nominal_gain_code for schedule in schedules)
+            applied_min = min(int(np.min(schedule.gain_codes)) for schedule in schedules)
+            applied_max = max(int(np.max(schedule.gain_codes)) for schedule in schedules)
+            nominal_text = (
+                f"{nominal_min:,}"
+                if nominal_min == nominal_max
+                else f"{nominal_min:,}-{nominal_max:,}"
+            )
+            applied_text = (
+                f"{applied_min:,}"
+                if applied_min == applied_max
+                else f"{applied_min:,}-{applied_max:,}"
+            )
+            self.calculated_gain_status.setText(
+                f"Nominal {nominal_text}; applied {applied_text} / "
+                f"{MAX_RF_OUTPUT_GAIN:,} (calibration Run "
+                f"{calibration.summary.run_id})"
+            )
+            self.calculated_gain_status.setStyleSheet(
+                "QLabel { color: #176b38; font-weight: 600; }"
+            )
+        except Exception as exc:
+            self.calculated_gain_status.setText(f"Gain unavailable: {exc}")
+            self.calculated_gain_status.setStyleSheet(
+                "QLabel { color: #a32626; font-weight: 600; }"
+            )
 
     def _update_filter_control_state(self, *_args) -> None:
         output_rf = self.output_board_type.currentText() == "RF_Out"
@@ -956,6 +1092,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             }
         )
         self.path_settings_applied.emit(linked)
+        self._schedule_calibrated_gain_preview()
 
     def front_panel_values(self) -> Mapping[str, Any]:
         """Return this tab's complete RF path for the graphical editor."""
@@ -995,6 +1132,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.readout_filter_bandwidth_ghz.setValue(
             float(values["readout_filter_bandwidth_ghz"])
         )
+        self._schedule_calibrated_gain_preview()
         self.path_diagram._update_board_controls()
         self.path_diagram.apply_settings(emit=False)
 
@@ -1040,7 +1178,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 "Identify QICK to show the FIR DDR timing"
             )
             return
-        sample_count = max(
+        requested_sample_count = max(
             1,
             int(
                 np.ceil(
@@ -1049,6 +1187,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                     / 1_000_000.0
                 )
             ),
+        )
+        sample_count = max(
+            requested_sample_count,
+            self.minimum_coherent_samples.value(),
         )
         actual_time_us = (
             sample_count * 1_000_000.0 / float(self._fir_sample_rate_hz)
@@ -1063,10 +1205,20 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
         else:
             delay = "; no FPGA trigger-delay register"
+        if sample_count > requested_sample_count:
+            sample_text = (
+                f"requested {requested_sample_count:,} samples; "
+                f"minimum {sample_count:,} enforced = {actual_time_us:g} us actual"
+            )
+            self.fir_profile_status.setStyleSheet(
+                "QLabel { color: #9a5b00; font-weight: 600; }"
+            )
+        else:
+            sample_text = f"{sample_count:,} samples = {actual_time_us:g} us actual"
+            self.fir_profile_status.setStyleSheet("")
         self.fir_profile_status.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
-            f"{sample_count:,} samples = {actual_time_us:g} us actual"
-            f"{delay}"
+            f"{sample_text}{delay}"
         )
 
     def config(self) -> SParameterSweepConfig:
@@ -1097,6 +1249,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             power_points=self.power_points.value(),
             power_scale=str(self.power_scale.currentData()),
             scan_time_us=self.scan_time_us.value(),
+            minimum_coherent_samples=self.minimum_coherent_samples.value(),
             output_att1_db=path["output_att1_db"],
             output_att2_db=path["output_att2_db"],
             output_filter_type=self.output_filter_type.currentText(),
@@ -1137,6 +1290,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         values = dict(settings)
+        values.setdefault("minimum_coherent_samples", 100)
         database_path = str(
             values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
         ).strip()
@@ -1159,6 +1313,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.power_end_dbm, config.power_end_dbm),
             (self.power_points, config.power_points),
             (self.scan_time_us, config.scan_time_us),
+            (
+                self.minimum_coherent_samples,
+                config.minimum_coherent_samples,
+            ),
             (self.output_att1_db, config.output_att1_db),
             (self.output_att2_db, config.output_att2_db),
             (self.output_filter_cutoff_ghz, config.output_filter_cutoff_ghz),

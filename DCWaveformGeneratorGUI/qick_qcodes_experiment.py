@@ -181,16 +181,18 @@ def _json_ready(value: Any) -> Any:
     if is_dataclass(value):
         return _json_ready(asdict(value))
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _json_ready(value.tolist())
     if isinstance(value, np.generic):
-        return value.item()
+        return _json_ready(value.item())
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
         return {str(key): _json_ready(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_json_ready(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
         return value
     if hasattr(value, "__dict__"):
         return _json_ready(vars(value))

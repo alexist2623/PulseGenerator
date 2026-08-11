@@ -145,17 +145,66 @@ def _warn_unmeasurable_points(
     *,
     context: str,
 ) -> None:
-    values = np.asarray(result.magnitude_db, dtype=float)
-    count = int(np.count_nonzero(~np.isfinite(values)))
-    if count:
+    diagnostics = _response_diagnostics(result)
+    all_zero_count = diagnostics["all_zero_fir_trace_points"]
+    cancelled_count = diagnostics["nonzero_trace_zero_mean_points"]
+    other_count = diagnostics["other_nonfinite_response_points"]
+    if all_zero_count:
         _emit_warning(
             callback,
             (
-                f"{context}: {count} S-parameter point(s) have zero mean I/Q "
-                "and were saved "
-                "as NaN instead of an artificial -6000 dB value"
+                f"{context}: {all_zero_count} raw FIR trace(s) contain only "
+                "zeros; verify DDR triggering, readout routing, RF gain, and "
+                "ADC/FIR quantization. Their response was saved as NaN."
             ),
         )
+    if cancelled_count:
+        _emit_warning(
+            callback,
+            (
+                f"{context}: {cancelled_count} nonzero/noisy FIR trace(s) have "
+                "exactly zero coherent mean I/Q. The noise samples are present, "
+                "but their complex mean cancels, so magnitude and phase were "
+                "saved as NaN rather than an artificial -6000 dB value."
+            ),
+        )
+    if other_count:
+        _emit_warning(
+            callback,
+            (
+                f"{context}: {other_count} additional response point(s) are "
+                "non-finite, usually because calibrated input power is outside "
+                "the measurable calibration range."
+            ),
+        )
+
+
+def _response_diagnostics(result: Any) -> Mapping[str, int]:
+    """Distinguish empty FIR captures from a cancelled coherent IQ mean."""
+    mean_i = np.asarray(result.mean_i, dtype=np.float64)
+    mean_q = np.asarray(result.mean_q, dtype=np.float64)
+    zero_mean = (
+        np.isfinite(mean_i)
+        & np.isfinite(mean_q)
+        & (mean_i == 0.0)
+        & (mean_q == 0.0)
+    )
+    iq = np.asarray(result.iq_traces)
+    all_zero_trace = np.all(iq == 0, axis=(-2, -1))
+    if all_zero_trace.shape != zero_mean.shape:
+        raise RuntimeError(
+            "internal S-parameter IQ diagnostic shape does not match mean IQ"
+        )
+    all_zero = zero_mean & all_zero_trace
+    cancelled = zero_mean & ~all_zero_trace
+    nonfinite = ~np.isfinite(np.asarray(result.magnitude_db, dtype=np.float64))
+    other_nonfinite = nonfinite & ~zero_mean
+    return {
+        "zero_mean_iq_points": int(np.count_nonzero(zero_mean)),
+        "all_zero_fir_trace_points": int(np.count_nonzero(all_zero)),
+        "nonzero_trace_zero_mean_points": int(np.count_nonzero(cancelled)),
+        "other_nonfinite_response_points": int(np.count_nonzero(other_nonfinite)),
+    }
 
 
 def _iq_response_metrics(
@@ -230,6 +279,7 @@ class SParameterSweepConfig:
     power_points: int = 5
     power_scale: str = "linear"
     scan_time_us: float = 10.0
+    minimum_coherent_samples: int = 1
     output_att1_db: float = 10.0
     output_att2_db: float = 10.0
     output_filter_type: str = "bypass"
@@ -339,6 +389,11 @@ class SParameterSweepConfig:
                         "reduce the point count or widen the gain range"
                     )
         _require_finite(self.scan_time_us, "scan_time_us", positive=True)
+        _require_int(
+            self.minimum_coherent_samples,
+            "minimum_coherent_samples",
+            1,
+        )
         _require_attenuation(self.output_att1_db, "output_att1_db")
         _require_attenuation(self.output_att2_db, "output_att2_db")
         _require_attenuation(self.readout_attenuation_db, "readout_attenuation_db")
@@ -1235,9 +1290,13 @@ class SParameterSweepProgram(RAveragerProgram):
             ch=self.sweep.output_ch,
             nqz=self.sweep.nqz,
         )
-        self.scan_samples = max(
+        self.requested_scan_samples = max(
             1,
             int(ceil(self.sweep.scan_time_us * self.fir_output_rate_msps)),
+        )
+        self.scan_samples = max(
+            self.requested_scan_samples,
+            int(self.sweep.minimum_coherent_samples),
         )
         monitor_length = min(
             self.scan_samples,
@@ -1712,6 +1771,11 @@ class SParameterSweepProgram(RAveragerProgram):
                 and self._gain_table.size < self.sweep.frequency_points
             ),
             "scan_time_requested_us": self.sweep.scan_time_us,
+            "scan_samples_requested": self.requested_scan_samples,
+            "minimum_coherent_samples": self.sweep.minimum_coherent_samples,
+            "minimum_coherent_samples_enforced": (
+                self.scan_samples > self.requested_scan_samples
+            ),
             "scan_samples": self.scan_samples,
             "scan_time_actual_us": (self.scan_samples / self.fir_output_rate_msps),
             "fir_output_rate_msps": self.fir_output_rate_msps,
@@ -2048,6 +2112,7 @@ def _power_result_payload(
         "sample_rate_hz": result.sample_rate_hz,
         "iq_shape": list(result.iq_traces.shape),
         "physical_power_calibrated": result.physical_power_calibrated,
+        "response_diagnostics": dict(_response_diagnostics(result)),
     }
     if result.calibrated:
         payload.update(
@@ -2610,6 +2675,7 @@ def store_sparameter_result(
                 else result.input_powers_dbm.tolist()
             ),
             "physical_power_calibrated": result.physical_power_calibrated,
+            "response_diagnostics": dict(_response_diagnostics(result)),
         },
         "formulas": {
             "mean_i": "mean(i_trace)",

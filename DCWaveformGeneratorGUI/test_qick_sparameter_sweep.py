@@ -28,6 +28,7 @@ from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
     QcodesRunConfig,
     QickConnectionConfig,
+    _json_text,
 )
 from qick_sparameter_sweep import (
     CALIBRATED_GAIN_PARAMETER,
@@ -163,6 +164,7 @@ def _config(**updates):
         "frequency_end_mhz": 20.0,
         "frequency_points": 11,
         "scan_time_us": 4.0,
+        "minimum_coherent_samples": 1,
         "settle_seconds": 0.0,
     }
     values.update(updates)
@@ -222,7 +224,7 @@ def test_zero_mean_iq_is_unmeasurable_instead_of_minus_6000_db():
     iq = np.asarray(
         [
             [[1, 0], [1, 0]],
-            [[0, 0], [0, 0]],
+            [[4, -2], [-4, 2]],
             [[-1, 0], [-1, 0]],
             [[0, -1], [0, -1]],
         ],
@@ -242,6 +244,40 @@ def test_zero_mean_iq_is_unmeasurable_instead_of_minus_6000_db():
         result.phase_unwrapped_deg[[0, 2, 3]],
         [0.0, 180.0, 270.0],
     )
+
+
+def test_zero_mean_diagnostics_distinguish_empty_and_noisy_traces():
+    frequencies = np.asarray([10.0, 11.0])
+    iq = np.asarray(
+        [
+            [[0, 0], [0, 0]],
+            [[5, -3], [-5, 3]],
+        ],
+        dtype=np.int32,
+    )
+    result = SParameterSweepResult.from_iq(frequencies, frequencies, iq)
+
+    diagnostics = sparameter_module._response_diagnostics(result)
+
+    assert diagnostics == {
+        "zero_mean_iq_points": 2,
+        "all_zero_fir_trace_points": 1,
+        "nonzero_trace_zero_mean_points": 1,
+        "other_nonfinite_response_points": 0,
+    }
+
+
+def test_strict_json_serialization_replaces_nested_nonfinite_values_with_null():
+    payload = json.loads(
+        _json_text(
+            {
+                "scalar": np.float64(np.nan),
+                "array": np.asarray([1.0, np.inf, -np.inf, np.nan]),
+            }
+        )
+    )
+
+    assert payload == {"scalar": None, "array": [1.0, None, None, None]}
 
 
 def test_power_sweep_zero_mean_iq_is_unmeasurable():
@@ -826,6 +862,25 @@ def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
     assert result.iq_traces.shape == (3, 50, 2)
 
 
+def test_minimum_coherent_samples_expand_short_50_ksps_capture():
+    program = SParameterSweepProgram(
+        _mock_soccfg(fir_rate_profile="50_ksps"),
+        _config(
+            frequency_points=3,
+            scan_time_us=100.0,
+            minimum_coherent_samples=100,
+        ),
+    )
+
+    summary = program.summary()
+    assert program.requested_scan_samples == 5
+    assert program.scan_samples == 100
+    assert summary["scan_samples_requested"] == 5
+    assert summary["minimum_coherent_samples"] == 100
+    assert summary["minimum_coherent_samples_enforced"] is True
+    assert summary["scan_time_actual_us"] == pytest.approx(2000.0)
+
+
 def test_rf_board_output_and_readout_controls_are_applied():
     calls = []
 
@@ -963,6 +1018,56 @@ def test_qcodes_round_trip_stores_split_traces_and_derived_response(
 
     latest_sparameter = load_sparameter_run(database_path, 0)
     assert latest_sparameter.run_id == dataset.run_id
+
+
+def test_qcodes_round_trip_keeps_noisy_trace_with_zero_coherent_mean(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "zero_mean_sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging-zero-mean"))
+    frequencies = np.asarray([10.0, 11.0])
+    iq = np.asarray(
+        [
+            [[8, -4], [-8, 4]],
+            [[3, 4], [3, 4]],
+        ],
+        dtype=np.int32,
+    )
+    result = SParameterSweepResult.from_iq(frequencies, frequencies, iq)
+
+    dataset, _row_count = store_sparameter_result(
+        result,
+        config=_config(frequency_points=2),
+        connection_config=QickConnectionConfig(host="127.0.0.1"),
+        run_config=QcodesRunConfig(
+            database_path=str(database_path),
+            experiment_name="Zero coherent mean",
+            sample_name="unit-test",
+        ),
+        program_summary={"sweep_execution": "tproc_hardware_register_add"},
+        rf_settings={"output": {}, "readout": {}},
+    )
+
+    with sqlite3.connect(database_path) as connection_db:
+        payload_text = connection_db.execute(
+            "SELECT sparameter_result_json FROM runs WHERE run_id = ?",
+            (dataset.run_id,),
+        ).fetchone()[0]
+    payload = json.loads(payload_text)
+    assert payload["adc_magnitude_db"][0] is None
+    assert payload["phase_unwrapped_deg"][0] is None
+    assert payload["response_diagnostics"] == {
+        "zero_mean_iq_points": 1,
+        "all_zero_fir_trace_points": 0,
+        "nonzero_trace_zero_mean_points": 1,
+        "other_nonfinite_response_points": 0,
+    }
+
+    loaded = load_sparameter_run(database_path, dataset.run_id)
+    np.testing.assert_array_equal(loaded.result.iq_traces, iq)
+    assert np.any(loaded.result.iq_traces[0] != 0)
+    assert np.isnan(loaded.result.magnitude_db[0])
+    assert np.isnan(loaded.result.phase_unwrapped_deg[0])
 
 
 def test_calibrated_single_power_round_trip_stores_applied_gain_per_frequency(
@@ -1414,6 +1519,63 @@ def test_gui_round_trips_board_types_calibration_database_and_dbm_power(tmp_path
     )
     app.processEvents()
     window.close()
+
+
+def test_gui_displays_dbm_to_frequency_gain_preview(monkeypatch, tmp_path):
+    app = _application()
+
+    class FakeOutputCalibration:
+        summary = SimpleNamespace(run_id=91)
+
+        def build_gain_schedule(
+            self,
+            frequencies,
+            target_power_dbm,
+            *,
+            output_att1_db,
+            output_att2_db,
+        ):
+            assert np.asarray(frequencies).size == 101
+            assert target_power_dbm == -75.0
+            assert output_att1_db == 10.0
+            assert output_att2_db == 10.0
+            return SimpleNamespace(
+                nominal_gain_code=1392,
+                gain_codes=np.asarray([1210, 1392, 1584], dtype=np.int32),
+            )
+
+    class FakeCalibrationDatabase:
+        def __init__(self, path):
+            assert path == str(tmp_path / "gain_pwr_calb.db")
+
+        def output_calibration(self, board_type, frequencies):
+            assert board_type == "RF_Out"
+            return FakeOutputCalibration()
+
+    monkeypatch.setattr(
+        sparameter_gui_module,
+        "CalibrationDatabase",
+        FakeCalibrationDatabase,
+    )
+    window = gui.MainWindow()
+    panel = window._sparameter_panel
+    panel.calibration_database_path.setText(str(tmp_path / "gain_pwr_calb.db"))
+    panel.frequency_start_mhz.setValue(400.0)
+    panel.frequency_end_mhz.setValue(500.0)
+    panel.frequency_points.setValue(101)
+    panel.output_power_dbm.setValue(-75.0)
+    panel.power_calibration_enabled.setChecked(True)
+    panel._gain_preview_timer.stop()
+    panel._update_calibrated_gain_preview()
+
+    assert panel.gain.isEnabled() is False
+    assert panel.calculated_gain_status.text() == (
+        "Nominal 1,392; applied 1,210-1,584 / 32,766 "
+        "(calibration Run 91)"
+    )
+
+    window.close()
+    app.processEvents()
 
 
 def test_rf_path_update_commits_only_sparameter_values():
