@@ -339,6 +339,51 @@ def test_dc_voltage_calibration_rejects_disconnected_loopback(tmp_path):
     assert database_path.exists() is False
 
 
+def test_dc_voltage_calibration_cancel_discards_acquired_data(tmp_path):
+    database_path = tmp_path / "cancelled_dc_voltage.db"
+    config = DcVoltageCalibrationConfig(
+        database_path=str(database_path),
+        output_ch=1,
+        readout_ch=2,
+        voltage_points=3,
+        samples_per_point=2,
+        repetitions_per_point=1,
+    )
+    state = {"acquired": False}
+
+    class CalibrationStopped(RuntimeError):
+        pass
+
+    class FakeSoc:
+        def rfb_set_gen_dc(self, _channel):
+            pass
+
+        def rfb_set_ro_dc(self, _channel, gain):
+            return float(gain)
+
+    def acquire(_soc, _program):
+        state["acquired"] = True
+        iq = np.zeros((3, 1, 2, 2), dtype=float)
+        return SimpleNamespace(iq=iq)
+
+    def cancel_check():
+        if state["acquired"]:
+            raise CalibrationStopped("stopped")
+
+    with pytest.raises(CalibrationStopped, match="stopped"):
+        run_dc_voltage_calibration(
+            connection_config=QickConnectionConfig(host="127.0.0.1"),
+            calibration_config=config,
+            connector=lambda **_kwargs: (FakeSoc(), object()),
+            program_factory=lambda *_args, **_kwargs: object(),
+            acquisition_callback=acquire,
+            cancel_check=cancel_check,
+        )
+
+    assert state["acquired"] is True
+    assert not database_path.exists()
+
+
 def test_dc_voltage_config_rejects_points_outside_full_scale():
     try:
         DcVoltageCalibrationConfig(

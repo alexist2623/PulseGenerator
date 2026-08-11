@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import threading
 import traceback
 from typing import Any, Mapping
 
@@ -62,6 +63,10 @@ except ImportError:
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
 MAX_INPUT_CALIBRATION_PLOT_CURVES = 32
 CALIBRATION_PATH_MODES = ("output", "input", "dc_voltage")
+
+
+class CalibrationCancelled(RuntimeError):
+    """Raised when the user stops an active calibration workflow."""
 
 
 def _legacy_calibration_paths(
@@ -597,6 +602,7 @@ class CalibrationPanel(QtWidgets.QWidget):
     output_requested = QtCore.pyqtSignal()
     input_requested = QtCore.pyqtSignal()
     dc_voltage_requested = QtCore.pyqtSignal()
+    stop_requested = QtCore.pyqtSignal()
     dc_application_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
@@ -657,9 +663,22 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.hide()
+        self.stop_button = QtWidgets.QPushButton("Stop Calibration")
+        self.stop_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        )
+        self.stop_button.setToolTip(
+            "Stop at the next safe hardware or file-operation boundary"
+        )
+        self.stop_button.setEnabled(False)
+        self.stop_button.hide()
+        self.stop_button.clicked.connect(self.stop_requested.emit)
+        progress_row = QtWidgets.QHBoxLayout()
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.stop_button)
         self.status = QtWidgets.QLabel("Ready")
         self.status.setWordWrap(True)
-        layout.addWidget(self.progress)
+        layout.addLayout(progress_row)
         layout.addWidget(self.status)
 
     @staticmethod
@@ -1767,9 +1786,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         for diagram in self._path_diagrams.values():
             diagram.setEnabled(not running)
         self.progress.setVisible(running)
+        self.stop_button.setVisible(running)
+        self.stop_button.setEnabled(running)
         if running:
             self.progress.setValue(0)
         self.status.setText(message)
+
+    def set_stopping(self, message: str) -> None:
+        """Show that cancellation was requested while work winds down safely."""
+        self.stop_button.setEnabled(False)
+        self.status.setText(str(message))
 
     def update_progress(self, percent: int, message: str) -> None:
         percent = max(0, min(100, int(percent)))
@@ -1831,6 +1857,7 @@ class CalibrationWorker(QtCore.QObject):
 
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
+    cancelled = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
 
     def __init__(self, mode: str, kwargs: Mapping[str, Any], parent=None):
@@ -1839,18 +1866,31 @@ class CalibrationWorker(QtCore.QObject):
             raise ValueError("calibration mode must be output, input, or dc_voltage")
         self.mode = mode
         self.kwargs = dict(kwargs)
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        """Thread-safe request observed at cooperative cancellation points."""
+        self._cancel_event.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancel_event.is_set():
+            raise CalibrationCancelled("Calibration stopped by user")
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
             kwargs = dict(self.kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
+            kwargs["cancel_check"] = self._check_cancel
             runners = {
                 "output": run_output_power_calibration,
                 "input": run_input_power_calibration,
                 "dc_voltage": run_dc_voltage_calibration,
             }
             stored = runners[self.mode](**kwargs)
+        except CalibrationCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -1897,6 +1937,7 @@ def default_calibration_settings() -> Mapping[str, Any]:
 
 __all__ = [
     "CALIBRATION_PATH_MODES",
+    "CalibrationCancelled",
     "CalibrationPanel",
     "CalibrationWorker",
     "DEFAULT_CALIBRATION_DB_PATH",

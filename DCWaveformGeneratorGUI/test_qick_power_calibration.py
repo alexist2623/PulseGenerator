@@ -16,9 +16,12 @@ from PyQt5 import QtWidgets
 import pytest
 import qick.asm_v1 as qick_asm_v1
 
+import calibration_gui as calibration_gui_module
 import qick_power_calibration as calibration_module
 from calibration_gui import (
+    CalibrationCancelled,
     CalibrationPanel,
+    CalibrationWorker,
     dc_voltage_calibration_plot_data,
     input_calibration_plot_data,
 )
@@ -38,6 +41,55 @@ from qick_sparameter_sweep import SParameterSweepResult, apply_power_calibration
 
 def _application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_calibration_panel_stop_button_tracks_running_state():
+    app = _application()
+    panel = CalibrationPanel()
+    stops = []
+    panel.stop_requested.connect(lambda: stops.append(True))
+
+    assert panel.stop_button.isHidden()
+    assert not panel.stop_button.isEnabled()
+
+    panel.set_running(True, "Running")
+    app.processEvents()
+    assert not panel.stop_button.isHidden()
+    assert panel.stop_button.isEnabled()
+    panel.stop_button.click()
+    assert stops == [True]
+
+    panel.set_stopping("Stopping safely")
+    assert not panel.stop_button.isEnabled()
+    assert panel.status.text() == "Stopping safely"
+
+    panel.set_running(False, "Stopped")
+    app.processEvents()
+    assert panel.stop_button.isHidden()
+    assert not panel.stop_button.isEnabled()
+    panel.close()
+
+
+def test_calibration_worker_emits_cancelled(monkeypatch):
+    def cancelled_runner(**kwargs):
+        kwargs["cancel_check"]()
+        raise AssertionError("cancel_check should have raised")
+
+    monkeypatch.setattr(
+        calibration_gui_module,
+        "run_output_power_calibration",
+        cancelled_runner,
+    )
+    worker = CalibrationWorker("output", {})
+    cancellations = []
+    failures = []
+    worker.cancelled.connect(cancellations.append)
+    worker.failed.connect(failures.append)
+    worker.request_cancel()
+    worker.run()
+
+    assert cancellations == ["Calibration stopped by user"]
+    assert failures == []
 
 
 class _FakeSoc:
@@ -519,6 +571,68 @@ def _create_output_calibration(tmp_path, monkeypatch):
     assert stored.row_count == 9
     assert tone_calls[-1][3] == 0
     return database_path, stored
+
+
+def test_output_calibration_cancel_stops_tone_without_saving(tmp_path):
+    database_path = tmp_path / "cancelled_gain_pwr_calb.db"
+    state = {"gain": 0, "measurements": 0}
+    tone_calls = []
+
+    def tone_runner(
+        _soc,
+        _soccfg,
+        output_ch,
+        nqz,
+        frequency_mhz,
+        gain,
+        length_cycles,
+    ):
+        state["gain"] = int(gain)
+        tone_calls.append((output_ch, nqz, frequency_mhz, gain, length_cycles))
+        return float(frequency_mhz)
+
+    class Meter:
+        idn = "MOCK"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def measure_power_dbm(self, _frequency_mhz):
+            state["measurements"] += 1
+            return -30.0
+
+    def cancel_check():
+        if state["measurements"] >= 1:
+            raise CalibrationCancelled("Calibration stopped by user")
+
+    config = OutputPowerCalibrationConfig(
+        database_path=str(database_path),
+        output_board_type="RF_Out",
+        frequency_start_mhz=400.0,
+        frequency_end_mhz=420.0,
+        frequency_points=3,
+        gain_start=1000,
+        gain_end=10_000,
+        gain_points=3,
+        oscilloscope=OscilloscopeConfig(visa_resource="MOCK"),
+    )
+
+    with pytest.raises(CalibrationCancelled, match="stopped by user"):
+        run_output_power_calibration(
+            connection_config=QickConnectionConfig(host="127.0.0.1"),
+            calibration_config=config,
+            connector=lambda **_kwargs: (_FakeSoc(), object()),
+            power_meter_factory=lambda _config: Meter(),
+            tone_runner=tone_runner,
+            cancel_check=cancel_check,
+        )
+
+    assert state["measurements"] == 1
+    assert tone_calls[-1][3] == 0
+    assert not database_path.exists()
 
 
 def test_output_calibration_excludes_absurd_scope_point(tmp_path, monkeypatch):

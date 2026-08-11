@@ -29,6 +29,7 @@ import numpy as np
 
 
 ProgressCallback = Callable[[int, str], None]
+CancellationCheck = Callable[[], None]
 DC_VOLTAGE_CALIBRATION_SCHEMA = "qstl-qick-dc-voltage-calibration-v1"
 DEFAULT_DC_VOLTAGE_START_MV = -800.0
 DEFAULT_DC_VOLTAGE_STOP_MV = 800.0
@@ -63,6 +64,11 @@ def _emit_progress(
 ) -> None:
     if callback is not None:
         callback(max(0, min(100, int(percent))), str(message))
+
+
+def _check_cancel(callback: Optional[CancellationCheck]) -> None:
+    if callback is not None:
+        callback()
 
 
 def _json_mapping(value: Any) -> Mapping[str, Any]:
@@ -518,11 +524,14 @@ def run_dc_voltage_calibration(
     program_factory: Optional[Callable[..., Any]] = None,
     acquisition_callback: Optional[Callable[[Any, Any], Any]] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> StoredDcVoltageCalibrationRun:
     """Sweep DC_Out, acquire DC_In FIR samples, fit, and save calibration."""
+    _check_cancel(cancel_check)
     *_storage, connect_qick = _runtime_storage_helpers()
     _emit_progress(progress_callback, 0, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 4, "Configuring DC output and DC input")
     soc.rfb_set_gen_dc(int(calibration_config.output_ch))
     actual_gain = float(
@@ -532,9 +541,11 @@ def run_dc_voltage_calibration(
         )
     )
     adjusted_config = replace(calibration_config, input_dc_gain_db=actual_gain)
+    _check_cancel(cancel_check)
     factory = program_factory or build_dc_voltage_calibration_program
     _emit_progress(progress_callback, 8, "Compiling hardware voltage sweep")
     program = factory(soccfg, adjusted_config, tproc_mhz=tproc_mhz)
+    _check_cancel(cancel_check)
     _emit_progress(
         progress_callback,
         12,
@@ -543,11 +554,11 @@ def run_dc_voltage_calibration(
             f"{adjusted_config.repetitions_per_point} repetitions"
         ),
     )
-    result = (
-        acquisition_callback(soc, program)
-        if acquisition_callback is not None
-        else program.acquire_fir_ddr(soc)
-    )
+    if acquisition_callback is not None:
+        result = acquisition_callback(soc, program)
+    else:
+        result = program.acquire_fir_ddr(soc, cancel_check=cancel_check)
+    _check_cancel(cancel_check)
     iq = np.asarray(result.iq, dtype=np.float64)
     expected_shape = (
         int(adjusted_config.voltage_points),
@@ -571,6 +582,7 @@ def run_dc_voltage_calibration(
         readout_ch=adjusted_config.readout_ch,
         input_dc_gain_db=actual_gain,
     )
+    _check_cancel(cancel_check)
     if calibration.r_squared < MIN_DC_VOLTAGE_CALIBRATION_R_SQUARED:
         raise RuntimeError(
             "DC voltage calibration did not detect a linear loopback response: "
@@ -585,6 +597,7 @@ def run_dc_voltage_calibration(
         85,
         f"Fitted DC response (R^2={calibration.r_squared:.8f})",
     )
+    _check_cancel(cancel_check)
     stored = _store_dc_voltage_calibration(
         adjusted_config,
         voltages_mv,

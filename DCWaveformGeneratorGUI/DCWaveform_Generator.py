@@ -9678,6 +9678,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.dc_voltage_requested.connect(
             lambda: self._run_power_calibration("dc_voltage")
         )
+        self._calibration_panel.stop_requested.connect(
+            self._stop_power_calibration
+        )
         self._calibration_panel.front_panel_requested.connect(
             lambda target: self._show_qick_front_panel("path", target)
         )
@@ -12458,16 +12461,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_calibration_finished)
         worker.failed.connect(self._on_calibration_failed)
+        worker.cancelled.connect(self._on_calibration_cancelled)
         worker.progress_changed.connect(self._on_calibration_progress)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_experiment_thread)
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _stop_power_calibration(self) -> None:
+        worker = self._experiment_worker
+        thread = self._experiment_thread
+        if (
+            not isinstance(worker, CalibrationWorker)
+            or thread is None
+            or not thread.isRunning()
+        ):
+            self._calibration_panel.stop_button.setEnabled(False)
+            return
+        worker.request_cancel()
+        self._calibration_panel.set_stopping(
+            "Stop requested - waiting for the current hardware or file "
+            "operation to reach a safe cancellation point"
+        )
+        self.statusBar().showMessage("Stopping QICK calibration")
 
     def _on_calibration_progress(self, percent: int, message: str) -> None:
         self._calibration_panel.update_progress(percent, message)
@@ -12488,6 +12511,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "QICK calibration failed", summary, details, self
         )
         dialog.exec_()
+
+    def _on_calibration_cancelled(self, message: str) -> None:
+        summary = str(message).strip() or "Calibration stopped by user"
+        self._calibration_panel.set_running(False, f"Stopped: {summary}")
+        self.statusBar().showMessage(summary)
 
     def _load_stability_saved_run(
         self,

@@ -71,6 +71,7 @@ except ImportError:
 
 
 ProgressCallback = Callable[[int, str], None]
+CancellationCheck = Callable[[], None]
 ToneRunner = Callable[[Any, Any, int, int, float, int, int], float]
 MAX_RF_PERIODIC_WORD_CYCLES = 65535
 RF_STOP_WORD_CYCLES = 3
@@ -108,6 +109,11 @@ def _emit_progress(
 ) -> None:
     if callback is not None:
         callback(max(0, min(100, int(percent))), str(message))
+
+
+def _check_cancel(callback: Optional[CancellationCheck]) -> None:
+    if callback is not None:
+        callback()
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -458,6 +464,7 @@ class KeysightFftPowerMeter:
         self.idn = ""
         self.last_reading_count = 0
         self.last_rejected_reading_count = 0
+        self.cancel_check: Optional[CancellationCheck] = None
 
     def __enter__(self) -> "KeysightFftPowerMeter":
         if not self.config.visa_resource.strip():
@@ -509,15 +516,31 @@ class KeysightFftPowerMeter:
             self.instrument.write(command)
 
     def measure_power_dbm(self, frequency_mhz: float) -> float:
+        _check_cancel(self.cancel_check)
         self.configure_frequency(frequency_mhz)
         if self.config.settle_seconds:
-            time.sleep(self.config.settle_seconds)
+            deadline = time.monotonic() + float(self.config.settle_seconds)
+            while True:
+                _check_cancel(self.cancel_check)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.05, remaining))
         readings = []
         for _index in range(int(self.config.average_count)):
+            _check_cancel(self.cancel_check)
             response = self.instrument.query(":MARKer:Y1Position?")
             readings.append(float(str(response).strip()))
             if self.config.sample_interval_seconds:
-                time.sleep(self.config.sample_interval_seconds)
+                deadline = (
+                    time.monotonic() + float(self.config.sample_interval_seconds)
+                )
+                while True:
+                    _check_cancel(self.cancel_check)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    time.sleep(min(0.05, remaining))
         values = np.asarray(readings, dtype=float)
         valid = np.asarray(
             [_valid_oscilloscope_power_dbm(value) for value in values],
@@ -767,6 +790,7 @@ def run_output_power_calibration(
     power_meter_factory: Optional[Callable[[OscilloscopeConfig], Any]] = None,
     tone_runner: Optional[ToneRunner] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> StoredCalibrationRun:
     """Measure QICK output power over gain and frequency and save one run."""
     if (
@@ -779,10 +803,13 @@ def run_output_power_calibration(
     frequencies = calibration_config.frequencies_mhz
     gains = calibration_config.gains
     total = int(frequencies.size * gains.size)
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 0, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 3, "Configuring calibrated RF output chain")
     rf_settings = _configure_output_chain(soc, calibration_config)
+    _check_cancel(cancel_check)
     measured = np.full((gains.size, frequencies.size), np.nan, dtype=float)
     actual_frequencies = np.empty(frequencies.size, dtype=float)
     completed = 0
@@ -790,9 +817,12 @@ def run_output_power_calibration(
     excluded_points = []
     try:
         with power_meter_factory(calibration_config.oscilloscope) as meter:
+            if isinstance(meter, KeysightFftPowerMeter):
+                meter.cancel_check = cancel_check
             scope_identity = str(getattr(meter, "idn", ""))
             for frequency_index, requested_frequency in enumerate(frequencies):
                 for gain_index, gain in enumerate(gains):
+                    _check_cancel(cancel_check)
                     actual_frequency = tone_runner(
                         soc,
                         soccfg,
@@ -816,6 +846,7 @@ def run_output_power_calibration(
                         else:
                             invalid_reason = _invalid_power_message(measured_power)
                             measured_power = np.nan
+                    _check_cancel(cancel_check)
                     measured[gain_index, frequency_index] = measured_power
                     if invalid_reason:
                         excluded_points.append(
@@ -852,6 +883,7 @@ def run_output_power_calibration(
             )
         except Exception:
             pass
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 90, "Saving output calibration to QCoDeS")
     stored = _store_output_calibration(
         calibration_config,
@@ -1057,20 +1089,26 @@ def run_input_power_calibration(
     program_factory: Optional[Callable[..., Any]] = None,
     acquisition_callback: Optional[Callable[[Any, Any], Any]] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
 ) -> StoredCalibrationRun:
     """Fit ADC dB values to actual connector input power at each frequency."""
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 0, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    _check_cancel(cancel_check)
     gains = calibration_config.gains
     program_factory = program_factory or build_sparameter_program
-    programs = [
-        program_factory(
-            soccfg,
-            calibration_config.sweep_config(int(gain)),
-            tproc_mhz=tproc_mhz,
+    programs = []
+    for gain in gains:
+        _check_cancel(cancel_check)
+        programs.append(
+            program_factory(
+                soccfg,
+                calibration_config.sweep_config(int(gain)),
+                tproc_mhz=tproc_mhz,
+            )
         )
-        for gain in gains
-    ]
+    _check_cancel(cancel_check)
     frequencies = np.asarray(programs[0].frequencies_mhz, dtype=float)
     for program in programs[1:]:
         if not np.array_equal(program.frequencies_mhz, frequencies):
@@ -1082,6 +1120,7 @@ def run_input_power_calibration(
         calibration_config.output_board_type,
         frequencies,
     )
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF output and input chains")
     rf_settings = configure_sparameter_rf_board(
         soc,
@@ -1118,11 +1157,12 @@ def run_input_power_calibration(
     measured_db = np.empty((gains.size, frequencies.size), dtype=float)
     known_input_dbm = np.empty_like(measured_db)
     for gain_index, (gain, program) in enumerate(zip(gains, programs)):
-        result = (
-            acquisition_callback(soc, program)
-            if acquisition_callback is not None
-            else program.acquire_fir_ddr(soc)
-        )
+        _check_cancel(cancel_check)
+        if acquisition_callback is not None:
+            result = acquisition_callback(soc, program)
+        else:
+            result = program.acquire_fir_ddr(soc, cancel_check=cancel_check)
+        _check_cancel(cancel_check)
         if not np.array_equal(result.frequencies_mhz, frequencies):
             raise RuntimeError("acquired input-calibration frequency grid changed")
         measured_db[gain_index] = np.asarray(result.magnitude_db, dtype=float)
@@ -1144,6 +1184,7 @@ def run_input_power_calibration(
     slopes = np.empty(frequencies.size, dtype=float)
     intercepts = np.empty(frequencies.size, dtype=float)
     for frequency_index in range(frequencies.size):
+        _check_cancel(cancel_check)
         x_values = measured_db[fit_slice, frequency_index]
         y_values = known_input_dbm[fit_slice, frequency_index]
         if np.unique(x_values).size < 2:
@@ -1163,6 +1204,7 @@ def run_input_power_calibration(
         output_att1_db=output_att1,
         output_att2_db=output_att2,
     )
+    _check_cancel(cancel_check)
     _emit_progress(progress_callback, 86, "Saving ADC input calibration to QCoDeS")
     stored = _store_input_calibration(
         adjusted_config,

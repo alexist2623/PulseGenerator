@@ -1443,6 +1443,7 @@ class SParameterSweepProgram(RAveragerProgram):
         progress_callback: Callable[[int, int], None],
         *,
         poll_interval_seconds: float = 0.02,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> None:
         total = int(np.prod(self.loop_dims, dtype=np.int64))
         expected_seconds = (
@@ -1450,15 +1451,20 @@ class SParameterSweepProgram(RAveragerProgram):
         )
         timeout_seconds = max(30.0, 5.0 * expected_seconds + 10.0)
         deadline = time.monotonic() + timeout_seconds
+        if cancel_check is not None:
+            cancel_check()
         self.config_all(soc, load_envelopes=True, load_mem=False)
         progress_callback(0, total)
         self._load_runtime_dmem(soc)
         soc.clear_tproc_counter(addr=self.counter_addr)
         soc.start_src("internal")
         soc.start_tproc()
+        tproc_running = True
         try:
             completed = 0
             while completed < total:
+                if cancel_check is not None:
+                    cancel_check()
                 completed = min(
                     total,
                     int(soc.get_tproc_counter(addr=self.counter_addr)),
@@ -1471,7 +1477,13 @@ class SParameterSweepProgram(RAveragerProgram):
                             f"{timeout_seconds:.1f} s at {completed}/{total} points"
                         )
                     time.sleep(poll_interval_seconds)
+            tproc_running = False
         finally:
+            if tproc_running:
+                try:
+                    soc.stop_tproc()
+                except Exception:
+                    pass
             soc.start_src("internal")
 
     def acquire_fir_ddr(
@@ -1480,7 +1492,13 @@ class SParameterSweepProgram(RAveragerProgram):
         *,
         progress: bool = False,
         counter_progress: Optional[Callable[[int, int], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> SParameterSweepResult:
+        def check_cancel() -> None:
+            if cancel_check is not None:
+                cancel_check()
+
+        check_cancel()
         n_triggers = self.sweep.frequency_points
         arm_kwargs = dict(
             ch=self.sweep.readout_ch,
@@ -1497,15 +1515,29 @@ class SParameterSweepProgram(RAveragerProgram):
                 )
             )
         reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
-        if counter_progress is None and not self._uses_gain_table:
+        check_cancel()
+        if (
+            counter_progress is None
+            and not self._uses_gain_table
+            and cancel_check is None
+        ):
             self.run_rounds(soc, progress=progress)
         else:
             self._run_with_counter_progress(
                 soc,
                 counter_progress or (lambda _completed, _total: None),
+                cancel_check=cancel_check,
             )
+        check_cancel()
         if self.sweep.settle_seconds:
-            time.sleep(self.sweep.settle_seconds)
+            deadline = time.monotonic() + float(self.sweep.settle_seconds)
+            while True:
+                check_cancel()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.05, remaining))
+        check_cancel()
         raw = np.asarray(
             soc.get_ddr4_fir_samples(
                 n_samples=self.scan_samples,
@@ -1514,6 +1546,7 @@ class SParameterSweepProgram(RAveragerProgram):
                 stride_bytes=self.sweep.stride_bytes,
             )
         )
+        check_cancel()
         expected = (n_triggers * self.scan_samples, 2)
         if raw.shape != expected:
             raise RuntimeError(

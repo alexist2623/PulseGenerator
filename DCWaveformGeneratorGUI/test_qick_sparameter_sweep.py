@@ -666,6 +666,54 @@ def test_fir_ddr_acquisition_keeps_one_trace_per_frequency(monkeypatch):
     np.testing.assert_allclose(result.mean_i, raw.reshape(3, 4, 2)[:, :, 0].mean(1))
 
 
+def test_counter_progress_cancellation_stops_tprocessor(monkeypatch):
+    program = SParameterSweepProgram(
+        _mock_soccfg(), _config(frequency_points=3, scan_time_us=4.0)
+    )
+    calls = []
+
+    class CalibrationStopped(RuntimeError):
+        pass
+
+    class FakeSoc:
+        def clear_tproc_counter(self, *, addr):
+            calls.append(("clear", addr))
+
+        def start_src(self, source):
+            calls.append(("source", source))
+
+        def start_tproc(self):
+            calls.append(("start",))
+
+        def stop_tproc(self):
+            calls.append(("stop",))
+
+        def get_tproc_counter(self, *, addr):
+            calls.append(("counter", addr))
+            return 0
+
+    monkeypatch.setattr(program, "config_all", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(program, "_load_runtime_dmem", lambda *_args: None)
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        if checks >= 2:
+            raise CalibrationStopped("stopped")
+
+    with pytest.raises(CalibrationStopped, match="stopped"):
+        program._run_with_counter_progress(
+            FakeSoc(),
+            lambda _completed, _total: None,
+            cancel_check=cancel_check,
+        )
+
+    assert ("start",) in calls
+    assert ("stop",) in calls
+    assert calls[-1] == ("source", "internal")
+
+
 def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
     monkeypatch,
 ):
