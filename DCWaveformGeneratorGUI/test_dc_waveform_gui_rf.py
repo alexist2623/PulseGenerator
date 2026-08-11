@@ -1007,6 +1007,494 @@ def test_composite_editor_stress_round_trip_across_row_counts():
     window.close()
 
 
+def test_composite_sweep_axes_exclude_unreferenced_parameters():
+    spec = QickRfPulseSpec(
+        gen_ch=0,
+        segment_name="set_0",
+        delay_us=0.0,
+        duration_us=1.0,
+        frequency_mhz=50.0,
+        gain=1000,
+        att1_db=0.0,
+        att2_db=0.0,
+        pulse_mode="composite",
+        frequency_parameters=(
+            QickRfFrequencyParameterSpec("f_used", 100.0, True, 90.0, 110.0, 3),
+            QickRfFrequencyParameterSpec("f_orphan", 200.0, True, 180.0, 220.0, 5),
+        ),
+        duration_parameters=(
+            QickRfDurationParameterSpec("d_used", 0.1, True, 0.08, 0.12, 3),
+            QickRfDurationParameterSpec("d_orphan", 0.2, True, 0.15, 0.25, 5),
+        ),
+        composite_items=(
+            QickRfCompositeItemSpec(
+                "pulse",
+                "kept",
+                0.1,
+                "f_used",
+                1000,
+                0.0,
+                duration_parameter="d_used",
+            ),
+        ),
+    )
+
+    assert [
+        (axis.axis_kind, axis.parameter_name)
+        for axis in spec.sweep_axes
+    ] == [
+        ("rf_duration", "d_used"),
+        ("rf_frequency", "f_used"),
+    ]
+
+
+def test_composite_editor_mutation_matrix_keeps_timeline_and_sweeps_attached():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "require_within_segment": False,
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec(
+                f"f{index}", 100.0 * (index + 1), True,
+                90.0 * (index + 1), 110.0 * (index + 1), index + 2,
+            ))
+            for index in range(4)
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec(
+                f"d{index}", 0.1 * (index + 1), True,
+                0.08 * (index + 1), 0.12 * (index + 1), index + 2,
+            ))
+            for index in range(4)
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "P0", 0.1, "f0", 1000, 0.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "wait", 0.05)),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "P1", 0.2, "f1", 2000, 10.0,
+                duration_parameter="d1",
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "P2", 0.3, "f2", 3000, 20.0,
+                duration_parameter="d2",
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "P3", 0.4, "f3", 4000, 30.0,
+                duration_parameter="d3",
+            )),
+        ],
+    })
+
+    def row_named(table, name, column):
+        return next(
+            row
+            for row in range(table.rowCount())
+            if table.cellWidget(row, column).text() == name
+        )
+
+    def parameter_row(table, name):
+        return row_named(table, name, 0)
+
+    def assert_consistent():
+        app.processEvents()
+        spec = panel.configured_spec()
+        pulse_items = tuple(
+            item for item in spec.composite_items if item.kind == "pulse"
+        )
+        pulse_names = tuple(item.name for item in pulse_items)
+        assert window._rf_pulse_specs == [spec]
+        assert window._rf_timelines[0].pulse_names == pulse_names
+        assert tuple(
+            label.textItem.toPlainText()
+            for label in window._rf_timelines[0]._pulse_labels
+        ) == pulse_names
+        expected_centers = tuple(
+            (start_us + end_us) * 500.0
+            for _event, start_us, end_us in (
+                gui.rf_pulse_event_absolute_times_us(window._pulse[0], spec)
+            )
+        )
+        assert tuple(
+            label.pos().x()
+            for label in window._rf_timelines[0]._pulse_labels
+        ) == pytest.approx(expected_centers)
+        referenced = {
+            "rf_frequency": {item.frequency_parameter for item in pulse_items},
+            "rf_duration": {item.duration_parameter for item in pulse_items},
+        }
+        assert all(
+            axis.parameter_name in referenced[axis.axis_kind]
+            for axis in spec.sweep_axes
+        )
+        assert all(
+            item.name != "P1"
+            for item in spec.composite_items
+        ) or "P1" in pulse_names
+        assert [
+            item["name"] for item in panel.settings_dict()["composite_items"]
+        ] == [item.name for item in spec.composite_items]
+        return spec
+
+    initial = assert_consistent()
+    initial_bindings = {
+        item.name: (item.frequency_parameter, item.duration_parameter)
+        for item in initial.composite_items
+        if item.kind == "pulse"
+    }
+
+    # Reorder first: identity and named-parameter bindings must follow the pulse.
+    p3_row = row_named(panel.composite_item_table, "P3", 1)
+    header = panel.composite_row_header
+    header.moveSection(header.visualIndex(p3_row), 0)
+    header.commitVisualOrder()
+    reordered = assert_consistent()
+    assert tuple(item.name for item in reordered.composite_items) == (
+        "P3", "P0", "wait", "P1", "P2"
+    )
+    assert {
+        item.name: (item.frequency_parameter, item.duration_parameter)
+        for item in reordered.composite_items
+        if item.kind == "pulse"
+    } == initial_bindings
+
+    # Deleting a uniquely referenced pulse disables only that pulse's sweeps.
+    p1_row = row_named(panel.composite_item_table, "P1", 1)
+    panel.composite_item_table.selectRow(p1_row)
+    panel._remove_composite_item()
+    after_delete = assert_consistent()
+    assert "P1" not in window._rf_timelines[0].pulse_names
+    assert not panel.frequency_parameter_table.cellWidget(
+        parameter_row(panel.frequency_parameter_table, "f1"), 2
+    ).isChecked()
+    assert not panel.duration_parameter_table.cellWidget(
+        parameter_row(panel.duration_parameter_table, "d1"), 2
+    ).isChecked()
+    assert not any(
+        axis.parameter_name in {"f1", "d1"}
+        for axis in after_delete.sweep_axes
+    )
+
+    # A new pulse must not inherit the deleted pulse's old active sweep.
+    panel._add_composite_item("pulse")
+    new_row = panel.composite_item_table.rowCount() - 1
+    name_editor = panel.composite_item_table.cellWidget(new_row, 1)
+    name_editor.setText("replacement")
+    name_editor.editingFinished.emit()
+    panel.composite_item_table.cellWidget(new_row, 4).setCurrentText("f1")
+    panel.composite_item_table.cellWidget(new_row, 3).setCurrentText("d1")
+    replacement = assert_consistent()
+    assert not any(
+        axis.parameter_name in {"f1", "d1"}
+        for axis in replacement.sweep_axes
+    )
+
+    # Explicitly re-enabling the named parameters attaches them to replacement.
+    f1_row = parameter_row(panel.frequency_parameter_table, "f1")
+    d1_row = parameter_row(panel.duration_parameter_table, "d1")
+    panel.frequency_parameter_table.cellWidget(f1_row, 2).setChecked(True)
+    panel.duration_parameter_table.cellWidget(d1_row, 2).setChecked(True)
+    reenabled = assert_consistent()
+    assert {
+        (axis.axis_kind, axis.parameter_name)
+        for axis in reenabled.sweep_axes
+    }.issuperset({
+        ("rf_frequency", "f1"),
+        ("rf_duration", "d1"),
+    })
+
+    # Moving the replacement cannot transfer its parameter bindings to a row.
+    replacement_row = row_named(panel.composite_item_table, "replacement", 1)
+    header.moveSection(header.visualIndex(replacement_row), 1)
+    header.commitVisualOrder()
+    moved = assert_consistent()
+    moved_replacement = next(
+        item for item in moved.composite_items if item.name == "replacement"
+    )
+    assert (
+        moved_replacement.frequency_parameter,
+        moved_replacement.duration_parameter,
+    ) == ("f1", "d1")
+
+    # Remove and recreate parameter rows in opposite orders. Deleted sweeps do
+    # not survive, while every pulse selector remains valid.
+    f2_row = parameter_row(panel.frequency_parameter_table, "f2")
+    panel.frequency_parameter_table.selectRow(f2_row)
+    panel._remove_frequency_parameter()
+    d2_row = parameter_row(panel.duration_parameter_table, "d2")
+    panel.duration_parameter_table.selectRow(d2_row)
+    panel._remove_duration_parameter()
+    without_f2_d2 = assert_consistent()
+    assert not any(
+        axis.parameter_name in {"f2", "d2"}
+        for axis in without_f2_d2.sweep_axes
+    )
+    panel._add_duration_parameter()
+    panel._add_frequency_parameter()
+    recreated = assert_consistent()
+    assert "d2" in {item.name for item in recreated.duration_parameters}
+    assert "f2" in {item.name for item in recreated.frequency_parameters}
+    assert not any(
+        axis.parameter_name in {"f2", "d2"}
+        for axis in recreated.sweep_axes
+    )
+    assert "P1" not in json.dumps(panel.settings_dict())
+
+    window.close()
+
+
+def test_composite_shared_sweeps_survive_until_the_last_pulse_reference():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "require_within_segment": False,
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec(
+                "f_shared", 100.0, True, 90.0, 110.0, 3
+            )),
+            asdict(QickRfFrequencyParameterSpec(
+                "f_unique", 200.0, True, 180.0, 220.0, 5
+            )),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec(
+                "d_shared", 0.1, True, 0.08, 0.12, 3
+            )),
+            asdict(QickRfDurationParameterSpec(
+                "d_unique", 0.2, True, 0.15, 0.25, 5
+            )),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "A", 0.1, "f_shared", 1000, 0.0,
+                duration_parameter="d_shared",
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "B", 0.1, "f_shared", 2000, 0.0,
+                duration_parameter="d_shared",
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "C", 0.2, "f_unique", 3000, 0.0,
+                duration_parameter="d_unique",
+            )),
+        ],
+    })
+
+    def row_named(name):
+        return next(
+            row
+            for row in range(panel.composite_item_table.rowCount())
+            if panel.composite_item_table.cellWidget(row, 1).text() == name
+        )
+
+    def parameter_row(table, name):
+        return next(
+            row
+            for row in range(table.rowCount())
+            if table.cellWidget(row, 0).text() == name
+        )
+
+    def enabled_axes():
+        return {
+            (axis.axis_kind, axis.parameter_name)
+            for axis in panel.configured_spec().sweep_axes
+        }
+
+    def assert_timeline(*names):
+        app.processEvents()
+        assert window._rf_timelines[0].pulse_names == tuple(names)
+        assert tuple(
+            label.textItem.toPlainText()
+            for label in window._rf_timelines[0]._pulse_labels
+        ) == tuple(names)
+
+    assert_timeline("A", "B", "C")
+    assert enabled_axes() == {
+        ("rf_duration", "d_shared"),
+        ("rf_duration", "d_unique"),
+        ("rf_frequency", "f_shared"),
+        ("rf_frequency", "f_unique"),
+    }
+
+    # Rebinding C removes the final references to its old parameters. Those
+    # sweeps must stop rather than silently attaching to a future pulse.
+    c_row = row_named("C")
+    panel.composite_item_table.cellWidget(c_row, 4).setCurrentText("f_shared")
+    panel.composite_item_table.cellWidget(c_row, 3).setCurrentText("d_shared")
+    assert_timeline("A", "B", "C")
+    assert enabled_axes() == {
+        ("rf_duration", "d_shared"),
+        ("rf_frequency", "f_shared"),
+    }
+    assert not panel.frequency_parameter_table.cellWidget(
+        parameter_row(panel.frequency_parameter_table, "f_unique"), 2
+    ).isChecked()
+    assert not panel.duration_parameter_table.cellWidget(
+        parameter_row(panel.duration_parameter_table, "d_unique"), 2
+    ).isChecked()
+
+    # Removing one of several shared references cannot disable the shared axes.
+    a_row = row_named("A")
+    panel.composite_item_table.cellWidget(a_row, 0).setCurrentIndex(1)
+    assert_timeline("B", "C")
+    assert enabled_axes() == {
+        ("rf_duration", "d_shared"),
+        ("rf_frequency", "f_shared"),
+    }
+    b_row = row_named("B")
+    panel.composite_item_table.selectRow(b_row)
+    panel._remove_composite_item()
+    assert_timeline("C")
+    assert enabled_axes() == {
+        ("rf_duration", "d_shared"),
+        ("rf_frequency", "f_shared"),
+    }
+
+    # Add another shared pulse, move it ahead of C, then remove C. Parameter
+    # identity follows the pulse and the timeline drops the deleted label.
+    panel._add_composite_item("pulse")
+    d_row = panel.composite_item_table.rowCount() - 1
+    d_name = panel.composite_item_table.cellWidget(d_row, 1)
+    d_name.setText("D")
+    d_name.editingFinished.emit()
+    panel.composite_item_table.cellWidget(d_row, 4).setCurrentText("f_shared")
+    panel.composite_item_table.cellWidget(d_row, 3).setCurrentText("d_shared")
+    header = panel.composite_row_header
+    header.moveSection(header.visualIndex(d_row), 0)
+    header.commitVisualOrder()
+    assert_timeline("D", "C")
+    moved_d = next(
+        item
+        for item in panel.configured_spec().composite_items
+        if item.name == "D"
+    )
+    assert (
+        moved_d.frequency_parameter,
+        moved_d.duration_parameter,
+    ) == ("f_shared", "d_shared")
+    c_row = row_named("C")
+    panel.composite_item_table.selectRow(c_row)
+    panel._remove_composite_item()
+    assert_timeline("D")
+    assert enabled_axes() == {
+        ("rf_duration", "d_shared"),
+        ("rf_frequency", "f_shared"),
+    }
+
+    # Once a different pulse exists, converting the last shared pulse to a
+    # delay removes the final reference and disables both shared sweeps.
+    panel._add_composite_item("pulse")
+    e_row = panel.composite_item_table.rowCount() - 1
+    e_name = panel.composite_item_table.cellWidget(e_row, 1)
+    e_name.setText("E")
+    e_name.editingFinished.emit()
+    panel.composite_item_table.cellWidget(e_row, 4).setCurrentText("f_unique")
+    panel.composite_item_table.cellWidget(e_row, 3).setCurrentText("d_unique")
+    d_row = row_named("D")
+    panel.composite_item_table.cellWidget(d_row, 0).setCurrentIndex(1)
+    assert_timeline("E")
+    assert enabled_axes() == set()
+    assert not panel.frequency_parameter_table.cellWidget(
+        parameter_row(panel.frequency_parameter_table, "f_shared"), 2
+    ).isChecked()
+    assert not panel.duration_parameter_table.cellWidget(
+        parameter_row(panel.duration_parameter_table, "d_shared"), 2
+    ).isChecked()
+
+    window.close()
+
+
+def test_named_composite_sweeps_edit_and_remove_the_actual_parameter_rows():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec(
+                "read_frequency", 100.0, True, 90.0, 110.0, 3
+            )),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec(
+                "read_duration", 0.2, True, 0.1, 0.3, 3
+            )),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "read", 0.2, "read_frequency", 1000, 0.0,
+                duration_parameter="read_duration",
+            )),
+        ],
+    })
+    app.processEvents()
+    axes = {
+        axis.axis_kind: axis for axis in window._active_map_sweep_specs()
+    }
+
+    window._update_sweep_parameter(axes["rf_frequency"], 80.0, 140.0, 7)
+    app.processEvents()
+    frequency = panel.configured_spec().frequency_parameters[0]
+    assert (
+        frequency.sweep_start_mhz,
+        frequency.sweep_stop_mhz,
+        frequency.sweep_count,
+    ) == (80.0, 140.0, 7)
+
+    duration_axis = next(
+        axis
+        for axis in window._active_map_sweep_specs()
+        if axis.axis_kind == "rf_duration"
+    )
+    window._update_sweep_parameter(duration_axis, 0.25, 0.75, 6)
+    app.processEvents()
+    duration = panel.configured_spec().duration_parameters[0]
+    assert (
+        duration.sweep_start_us,
+        duration.sweep_stop_us,
+        duration.sweep_count,
+    ) == pytest.approx((0.25, 0.75, 6))
+
+    frequency_axis = next(
+        axis
+        for axis in window._active_map_sweep_specs()
+        if axis.axis_kind == "rf_frequency"
+    )
+    window._remove_sweep_parameter(frequency_axis)
+    app.processEvents()
+    assert panel.configured_spec().frequency_parameters[0].sweep_enabled is False
+    assert not any(
+        axis.axis_kind == "rf_frequency"
+        for axis in window._active_map_sweep_specs()
+    )
+
+    duration_axis = next(
+        axis
+        for axis in window._active_map_sweep_specs()
+        if axis.axis_kind == "rf_duration"
+    )
+    window._remove_sweep_parameter(duration_axis)
+    app.processEvents()
+    assert panel.configured_spec().duration_parameters[0].sweep_enabled is False
+    assert not any(
+        axis.axis_kind in {"rf_frequency", "rf_duration"}
+        for axis in window._active_map_sweep_specs()
+    )
+    window.close()
+
+
 def test_composite_rf_duration_parameters_are_shared_sweep_axes():
     app = _application()
     window = gui.MainWindow()

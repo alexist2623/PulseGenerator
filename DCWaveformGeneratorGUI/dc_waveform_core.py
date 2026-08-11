@@ -1102,8 +1102,21 @@ class QickRfPulseSpec:
     def sweep_axes(self) -> Tuple[QickRfSweepAxisSpec, ...]:
         axes = []
         if self.pulse_mode == "composite":
+            referenced_durations = {
+                item.duration_parameter
+                for item in self.composite_items
+                if item.kind == "pulse"
+            }
+            referenced_frequencies = {
+                item.frequency_parameter
+                for item in self.composite_items
+                if item.kind == "pulse"
+            }
             for parameter in self.duration_parameters:
-                if not parameter.sweep_enabled:
+                if (
+                    not parameter.sweep_enabled
+                    or parameter.name not in referenced_durations
+                ):
                     continue
                 axes.append(
                     QickRfSweepAxisSpec(
@@ -1121,7 +1134,10 @@ class QickRfPulseSpec:
                     )
                 )
             for parameter in self.frequency_parameters:
-                if not parameter.sweep_enabled:
+                if (
+                    not parameter.sweep_enabled
+                    or parameter.name not in referenced_frequencies
+                ):
                     continue
                 axes.append(
                     QickRfSweepAxisSpec(

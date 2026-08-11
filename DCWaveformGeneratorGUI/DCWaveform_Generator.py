@@ -3896,6 +3896,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         frequency_name=False,
         duration_name=False,
         item_name=False,
+        item_parameter_kind="",
     ) -> None:
         self._track_table_editor(widget)
         if item_name:
@@ -3907,6 +3908,17 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             widget.editingFinished.connect(
                 lambda editor=widget: self._commit_composite_item_name(
                     editor
+                )
+            )
+            return
+        if item_parameter_kind:
+            widget.setProperty(
+                "qstl_committed_composite_parameter",
+                widget.currentText(),
+            )
+            widget.currentTextChanged.connect(
+                lambda _text, editor=widget, kind=item_parameter_kind: (
+                    self._composite_item_parameter_changed(editor, kind)
                 )
             )
             return
@@ -3933,6 +3945,75 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         if signal is None:
             signal = getattr(widget, "toggled", None)
         signal.connect(self.changed.emit)
+
+    def _composite_parameter_references(self) -> Tuple[set, set]:
+        frequency_names = set()
+        duration_names = set()
+        for row in range(self.composite_item_table.rowCount()):
+            kind_editor = self.composite_item_table.cellWidget(row, 0)
+            if kind_editor is None or kind_editor.currentData() != "pulse":
+                continue
+            frequency_names.add(
+                self.composite_item_table.cellWidget(row, 4).currentText()
+            )
+            duration_names.add(
+                self.composite_item_table.cellWidget(row, 3).currentText()
+            )
+        return frequency_names, duration_names
+
+    def _disable_orphan_composite_parameter_sweeps(
+        self,
+        *,
+        frequency_names: Sequence[str] = (),
+        duration_names: Sequence[str] = (),
+    ) -> None:
+        """Disable sweeps whose last pulse reference was just removed."""
+        referenced_frequencies, referenced_durations = (
+            self._composite_parameter_references()
+        )
+        candidates = (
+            (
+                self.frequency_parameter_table,
+                set(frequency_names) - referenced_frequencies,
+                self._update_frequency_parameter_row,
+            ),
+            (
+                self.duration_parameter_table,
+                set(duration_names) - referenced_durations,
+                self._update_duration_parameter_row,
+            ),
+        )
+        for table, orphan_names, update_row in candidates:
+            orphan_names.discard("")
+            for row in range(table.rowCount()):
+                if table.cellWidget(row, 0).text().strip() not in orphan_names:
+                    continue
+                sweep = table.cellWidget(row, 2)
+                if sweep.isChecked():
+                    with QtCore.QSignalBlocker(sweep):
+                        sweep.setChecked(False)
+                    update_row(row)
+
+    def _composite_item_parameter_changed(
+        self,
+        editor: QtWidgets.QComboBox,
+        kind: str,
+    ) -> None:
+        previous = str(
+            editor.property("qstl_committed_composite_parameter") or ""
+        )
+        current = editor.currentText()
+        editor.setProperty("qstl_committed_composite_parameter", current)
+        if previous and previous != current:
+            if kind == "frequency":
+                self._disable_orphan_composite_parameter_sweeps(
+                    frequency_names=(previous,),
+                )
+            else:
+                self._disable_orphan_composite_parameter_sweeps(
+                    duration_names=(previous,),
+                )
+        self.changed.emit()
 
     def _commit_composite_item_name(
         self,
@@ -4188,6 +4269,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 selector.addItems(names)
                 match = selector.findText(previous)
                 selector.setCurrentIndex(match if match >= 0 else (0 if fallback else -1))
+            selector.setProperty(
+                "qstl_committed_composite_parameter",
+                selector.currentText(),
+            )
             selector.setEnabled(kind == "pulse")
         self._rebuild_predefined_items()
 
@@ -4295,6 +4380,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 selector.addItems(names)
                 match = selector.findText(previous)
                 selector.setCurrentIndex(match if match >= 0 else (0 if fallback else -1))
+            selector.setProperty(
+                "qstl_committed_composite_parameter",
+                selector.currentText(),
+            )
             selector.setEnabled(kind == "pulse")
         self._rebuild_predefined_items()
 
@@ -4589,6 +4678,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 self._connect_composite_editor(
                     widget,
                     item_name=(column == 1),
+                    item_parameter_kind=(
+                        "duration"
+                        if column == 3
+                        else "frequency" if column == 4 else ""
+                    ),
                 )
         kind_editor.currentIndexChanged.connect(
             lambda _index, editor=kind_editor: self._composite_item_kind_changed(
@@ -4630,6 +4724,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         editor.setProperty("qstl_committed_composite_kind", requested)
         editor.setToolTip("")
         self._update_composite_item_row(row)
+        if previous == "pulse" and requested == "delay":
+            self._disable_orphan_composite_parameter_sweeps(
+                frequency_names=(
+                    self.composite_item_table.cellWidget(row, 4).currentText(),
+                ),
+                duration_names=(
+                    self.composite_item_table.cellWidget(row, 3).currentText(),
+                ),
+            )
         self.changed.emit()
 
     def _update_composite_item_row(self, row: int) -> None:
@@ -4711,7 +4814,21 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         if selected_kind == "pulse" and pulse_count <= 1:
             self._update_composite_remove_button()
             return
+        removed_frequency = (
+            self.composite_item_table.cellWidget(row, 4).currentText()
+            if selected_kind == "pulse"
+            else ""
+        )
+        removed_duration = (
+            self.composite_item_table.cellWidget(row, 3).currentText()
+            if selected_kind == "pulse"
+            else ""
+        )
         self.composite_item_table.removeRow(row)
+        self._disable_orphan_composite_parameter_sweeps(
+            frequency_names=(removed_frequency,),
+            duration_names=(removed_duration,),
+        )
         self._update_composite_remove_button()
         self.changed.emit()
 
@@ -11148,6 +11265,54 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             for axis in (*spec.sweep_axes, *spec.software_sweep_axes)
         )
 
+    @staticmethod
+    def _set_composite_rf_parameter_sweep(
+        panel: RfPulsePortPanel,
+        *,
+        axis_kind: str,
+        parameter_name: str,
+        enabled: bool,
+        start: Optional[float] = None,
+        stop: Optional[float] = None,
+        count: Optional[int] = None,
+    ) -> None:
+        """Update one named composite RF parameter without using legacy fields."""
+        if axis_kind == "rf_frequency":
+            table = panel.frequency_parameter_table
+            update_row = panel._update_frequency_parameter_row
+            convert = float
+        elif axis_kind == "rf_duration":
+            table = panel.duration_parameter_table
+            update_row = panel._update_duration_parameter_row
+            convert = lambda value: _time_from_ns(
+                float(value) * 1000.0,
+                panel._time_unit,
+            )
+        else:
+            raise ValueError(f"unsupported composite RF sweep {axis_kind!r}")
+
+        row = next(
+            (
+                index
+                for index in range(table.rowCount())
+                if table.cellWidget(index, 0).text().strip() == parameter_name
+            ),
+            None,
+        )
+        if row is None:
+            raise ValueError(
+                f"composite RF parameter {parameter_name!r} no longer exists"
+            )
+        if enabled:
+            if start is None or stop is None or count is None:
+                raise ValueError("enabled composite RF sweep requires endpoints")
+        table.cellWidget(row, 2).setChecked(bool(enabled))
+        if enabled:
+            table.cellWidget(row, 3).setValue(convert(start))
+            table.cellWidget(row, 4).setValue(convert(stop))
+            table.cellWidget(row, 5).setValue(int(count))
+        update_row(row)
+
     def _update_sweep_parameter(
         self,
         spec,
@@ -11182,7 +11347,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         "enabled RF Output editor"
                     )
                 with QtCore.QSignalBlocker(panel):
-                    if axis_kind == "rf_duration":
+                    parameter_name = str(
+                        getattr(spec, "parameter_name", "")
+                    )
+                    if (
+                        panel.composite_mode.isChecked()
+                        and parameter_name
+                        and axis_kind in {"rf_duration", "rf_frequency"}
+                    ):
+                        self._set_composite_rf_parameter_sweep(
+                            panel,
+                            axis_kind=axis_kind,
+                            parameter_name=parameter_name,
+                            enabled=True,
+                            start=float(start),
+                            stop=float(stop),
+                            count=int(count),
+                        )
+                    elif axis_kind == "rf_duration":
                         panel.duration_sweep_enabled.setChecked(True)
                         panel.duration_sweep_start.setValue(
                             _time_from_ns(
@@ -11330,7 +11512,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
                 return
             with QtCore.QSignalBlocker(panel):
-                if key[0] == "rf_duration":
+                parameter_name = str(
+                    getattr(spec, "parameter_name", "")
+                )
+                if (
+                    panel.composite_mode.isChecked()
+                    and parameter_name
+                    and key[0] in {"rf_duration", "rf_frequency"}
+                ):
+                    self._set_composite_rf_parameter_sweep(
+                        panel,
+                        axis_kind=key[0],
+                        parameter_name=parameter_name,
+                        enabled=False,
+                    )
+                elif key[0] == "rf_duration":
                     panel.duration_sweep_enabled.setChecked(False)
                     panel._update_duration_sweep_controls()
                 elif key[0] == "rf_frequency":
