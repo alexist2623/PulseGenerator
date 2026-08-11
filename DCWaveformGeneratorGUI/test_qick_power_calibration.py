@@ -735,30 +735,45 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
 
     slopes_expected = np.asarray([1.0, 1.1, 1.2])
     intercepts_expected = np.asarray([-60.0, -61.0, -62.0])
+    acquisition_events = []
+    progress_events = []
 
     class Program:
         def __init__(self, config):
             self.sweep = config
             self.frequencies_mhz = frequencies.copy()
 
-    def program_factory(_soccfg, config, **_kwargs):
-        return Program(config)
+        def acquire_fir_ddr(
+            self,
+            _soc,
+            *,
+            counter_progress=None,
+            cancel_check=None,
+        ):
+            acquisition_events.append(("arm", int(self.sweep.gain)))
+            if cancel_check is not None:
+                cancel_check()
+            if counter_progress is not None:
+                for completed in range(frequencies.size + 1):
+                    counter_progress(completed, frequencies.size)
+            actual_output = output_calibration.output_power_dbm(
+                frequencies,
+                self.sweep.gain,
+            )
+            known_input = actual_output - 3.0
+            adc_db = (known_input - intercepts_expected) / slopes_expected
+            amplitude = np.power(10.0, adc_db / 20.0)
+            iq = np.zeros((frequencies.size, 4, 2), dtype=float)
+            iq[:, :, 0] = amplitude[:, np.newaxis]
+            return SParameterSweepResult.from_iq(
+                frequencies,
+                frequencies,
+                iq,
+            )
 
-    def acquire(_soc, program):
-        actual_output = output_calibration.output_power_dbm(
-            frequencies,
-            program.sweep.gain,
-        )
-        known_input = actual_output - 3.0
-        adc_db = (known_input - intercepts_expected) / slopes_expected
-        amplitude = np.power(10.0, adc_db / 20.0)
-        iq = np.zeros((frequencies.size, 4, 2), dtype=float)
-        iq[:, :, 0] = amplitude[:, np.newaxis]
-        return SParameterSweepResult.from_iq(
-            frequencies,
-            frequencies,
-            iq,
-        )
+    def program_factory(_soccfg, config, **_kwargs):
+        acquisition_events.append(("build", int(config.gain)))
+        return Program(config)
 
     input_config = InputPowerCalibrationConfig(
         database_path=str(database_path),
@@ -771,6 +786,7 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
         gain_end=10000,
         gain_points=3,
         path_loss_db=3.0,
+        scan_time_us=1_000_000.0,
         settle_seconds=0.0,
     )
     input_stored = run_input_power_calibration(
@@ -778,7 +794,31 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
         calibration_config=input_config,
         connector=lambda **_kwargs: (_FakeSoc(), object()),
         program_factory=program_factory,
-        acquisition_callback=acquire,
+        progress_callback=lambda percent, message: progress_events.append(
+            (percent, message)
+        ),
+    )
+    assert acquisition_events == [
+        ("build", 1000),
+        ("arm", 1000),
+        ("build", 5500),
+        ("arm", 5500),
+        ("build", 10000),
+        ("arm", 10000),
+    ]
+    assert any(
+        "Arming FIR DDR" in message and "1000000 us" in message
+        for _percent, message in progress_events
+    )
+    assert any(
+        "FIR point 1/3" in message for _percent, message in progress_events
+    )
+    assert any(
+        "acquisition complete; reading FIR DDR" in message
+        for _percent, message in progress_events
+    )
+    assert [percent for percent, _message in progress_events] == sorted(
+        percent for percent, _message in progress_events
     )
     assert input_stored.run_id > output_stored.run_id
     input_calibration = CalibrationDatabase(database_path).input_calibration(

@@ -1098,21 +1098,29 @@ def run_input_power_calibration(
     _check_cancel(cancel_check)
     gains = calibration_config.gains
     program_factory = program_factory or build_sparameter_program
-    programs = []
-    for gain in gains:
+
+    def make_program(gain_index: int) -> Any:
         _check_cancel(cancel_check)
-        programs.append(
-            program_factory(
-                soccfg,
-                calibration_config.sweep_config(int(gain)),
-                tproc_mhz=tproc_mhz,
-            )
+        _emit_progress(
+            progress_callback,
+            1 if gain_index == 0 else 7 + round(76 * gain_index / gains.size),
+            (
+                f"Preparing ADC calibration gain {gain_index + 1}/"
+                f"{gains.size}: {int(gains[gain_index])}"
+            ),
         )
+        return program_factory(
+            soccfg,
+            calibration_config.sweep_config(int(gains[gain_index])),
+            tproc_mhz=tproc_mhz,
+        )
+
+    # Build only the first gain up front.  Long input calibrations should reach
+    # their first DDR arm immediately instead of materializing every program
+    # before acquisition starts.
+    first_program = make_program(0)
     _check_cancel(cancel_check)
-    frequencies = np.asarray(programs[0].frequencies_mhz, dtype=float)
-    for program in programs[1:]:
-        if not np.array_equal(program.frequencies_mhz, frequencies):
-            raise RuntimeError("input calibration frequency grids are inconsistent")
+    frequencies = np.asarray(first_program.frequencies_mhz, dtype=float)
     _emit_progress(progress_callback, 3, "Selecting matching output calibration")
     output_calibration = CalibrationDatabase(
         calibration_config.database_path
@@ -1156,12 +1164,54 @@ def run_input_power_calibration(
     )
     measured_db = np.empty((gains.size, frequencies.size), dtype=float)
     known_input_dbm = np.empty_like(measured_db)
-    for gain_index, (gain, program) in enumerate(zip(gains, programs)):
+    for gain_index, gain in enumerate(gains):
         _check_cancel(cancel_check)
+        program = first_program if gain_index == 0 else make_program(gain_index)
+        if not np.array_equal(program.frequencies_mhz, frequencies):
+            raise RuntimeError("input calibration frequency grids are inconsistent")
+
+        progress_start = 7 + round(76 * gain_index / gains.size)
+        progress_stop = 7 + round(76 * (gain_index + 1) / gains.size)
+        _emit_progress(
+            progress_callback,
+            progress_start,
+            (
+                f"Arming FIR DDR for ADC calibration gain "
+                f"{gain_index + 1}/{gains.size}: "
+                f"{frequencies.size} points x "
+                f"{calibration_config.scan_time_us:.9g} us"
+            ),
+        )
+
+        def counter_progress(completed: int, total: int) -> None:
+            _check_cancel(cancel_check)
+            fraction = 1.0 if total <= 0 else completed / total
+            fraction = max(0.0, min(1.0, float(fraction)))
+            percent = progress_start + round(
+                (progress_stop - progress_start) * fraction
+            )
+            if completed >= total > 0:
+                message = (
+                    f"ADC calibration gain {gain_index + 1}/{gains.size}: "
+                    "acquisition complete; reading FIR DDR"
+                )
+            else:
+                message = (
+                    f"ADC calibration gain {gain_index + 1}/{gains.size}: "
+                    f"FIR point {completed}/{total}"
+                )
+            _emit_progress(progress_callback, percent, message)
+
         if acquisition_callback is not None:
             result = acquisition_callback(soc, program)
         else:
-            result = program.acquire_fir_ddr(soc, cancel_check=cancel_check)
+            result = program.acquire_fir_ddr(
+                soc,
+                counter_progress=(
+                    counter_progress if progress_callback is not None else None
+                ),
+                cancel_check=cancel_check,
+            )
         _check_cancel(cancel_check)
         if not np.array_equal(result.frequencies_mhz, frequencies):
             raise RuntimeError("acquired input-calibration frequency grid changed")
@@ -1174,7 +1224,7 @@ def run_input_power_calibration(
         ) - float(calibration_config.path_loss_db)
         _emit_progress(
             progress_callback,
-            7 + round(76 * (gain_index + 1) / gains.size),
+            progress_stop,
             f"ADC calibration gain {gain_index + 1}/{gains.size}: {int(gain)}",
         )
     low = int(calibration_config.fit_trim_low)

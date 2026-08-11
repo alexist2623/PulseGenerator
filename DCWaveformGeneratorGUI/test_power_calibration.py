@@ -297,6 +297,12 @@ def test_schedule_uses_linear_nominal_gain_and_relative_frequency_correction(
         output_att1_db=10.0,
         output_att2_db=10.0,
     )
+    low_power = calibration.build_gain_schedule(
+        frequencies,
+        -80.0,
+        output_att1_db=30.0,
+        output_att2_db=30.0,
+    )
 
     assert schedule.nominal_gain_code == 1000
     np.testing.assert_allclose(schedule.correction_db, [0.0, -0.5, -1.0])
@@ -304,6 +310,8 @@ def test_schedule_uses_linear_nominal_gain_and_relative_frequency_correction(
     assert np.all(schedule.gain_codes <= schedule.nominal_gain_code)
     assert attenuated.nominal_gain_code == 1000
     np.testing.assert_array_equal(attenuated.gain_codes, schedule.gain_codes)
+    assert low_power.nominal_gain_code == 316
+    assert np.all(low_power.gain_codes >= 1)
     with pytest.raises(ValueError, match="outside linear gain range"):
         calibration.build_gain_schedule(frequencies, 21.0)
 
@@ -331,6 +339,11 @@ def test_output_and_input_power_calibration_use_physical_dbm(tmp_path):
         input_attenuation_db=10.0,
     )
     np.testing.assert_allclose(attenuated_measurement, [-80.0])
+    extrapolated_below_calibration_range = input_calibration.input_power_dbm(
+        [400.0],
+        [-30.0],
+    )
+    np.testing.assert_allclose(extrapolated_below_calibration_range, [-90.0])
 
 
 def test_input_calibration_selects_manual_run_or_latest_same_attenuation(tmp_path):

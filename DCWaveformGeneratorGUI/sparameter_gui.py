@@ -1303,26 +1303,31 @@ def subtract_phase_linear_fit(
         raise ValueError("phase point count must match the frequency axis")
     if frequency.size < 2 or not np.all(np.isfinite(frequency)):
         raise ValueError("phase fitting requires at least two finite frequencies")
-    if not np.all(np.isfinite(rows)):
-        raise ValueError("phase data must be finite")
+    if np.any(np.isinf(rows)):
+        raise ValueError("phase data must contain finite values or NaN")
     low, high = sorted((float(start_mhz), float(stop_mhz)))
     selected = (frequency >= low) & (frequency <= high)
     if np.count_nonzero(selected) < 2:
         raise ValueError("phase fit range must contain at least two frequency points")
-    selected_frequency = frequency[selected]
-    if np.unique(selected_frequency).size < 2:
-        raise ValueError("phase fit range must contain two distinct frequencies")
-
     corrected = np.empty_like(rows, dtype=float)
     slopes = np.empty(rows.shape[0], dtype=float)
     intercepts = np.empty(rows.shape[0], dtype=float)
-    design = np.column_stack(
-        (selected_frequency, np.ones(selected_frequency.size, dtype=float))
-    )
     for index, values in enumerate(rows):
+        usable = selected & np.isfinite(values)
+        if np.count_nonzero(usable) < 2:
+            raise ValueError(
+                f"phase trace {index + 1} has fewer than two measurable points "
+                "inside the fit range"
+            )
+        selected_frequency = frequency[usable]
+        if np.unique(selected_frequency).size < 2:
+            raise ValueError("phase fit range must contain two distinct frequencies")
+        design = np.column_stack(
+            (selected_frequency, np.ones(selected_frequency.size, dtype=float))
+        )
         slope, intercept = np.linalg.lstsq(
             design,
-            values[selected],
+            values[usable],
             rcond=None,
         )[0]
         slopes[index] = slope
@@ -1344,8 +1349,21 @@ def nearest_sparameter_point(
         rows = rows.reshape(1, -1)
     if rows.ndim != 2 or rows.shape[1] != frequency.size or frequency.size == 0:
         raise ValueError("marker data must have shape (trace, frequency)")
-    point_index = int(np.argmin(np.abs(frequency - float(x_mhz))))
-    curve_index = int(np.argmin(np.abs(rows[:, point_index] - float(y_value))))
+    finite = np.isfinite(rows)
+    if not np.any(finite):
+        raise ValueError("marker data contains no measurable points")
+    point_index = None
+    for candidate in np.argsort(np.abs(frequency - float(x_mhz))):
+        if np.any(finite[:, candidate]):
+            point_index = int(candidate)
+            break
+    if point_index is None:  # pragma: no cover - guarded by np.any(finite)
+        raise ValueError("marker data contains no measurable points")
+    candidate_curves = np.flatnonzero(finite[:, point_index])
+    nearest_candidate = int(
+        np.argmin(np.abs(rows[candidate_curves, point_index] - float(y_value)))
+    )
+    curve_index = int(candidate_curves[nearest_candidate])
     return (
         curve_index,
         point_index,
@@ -1526,9 +1544,16 @@ class _SParameterPlotMixin:
             power_text = f" | {power_text}"
         else:
             power_text = ""
+        visible_magnitude = self._visible_values(self._magnitude_values)
+        unavailable = int(np.count_nonzero(~np.isfinite(visible_magnitude)))
+        unavailable_text = (
+            ""
+            if unavailable == 0
+            else f" | {unavailable:,} point(s) have undefined zero-IQ response"
+        )
         self.plot_status.setText(
             f"{self._frequency.size:,} frequency points{power_text} | "
-            "hover for values; left-click to pin"
+            f"hover for values; left-click to pin{unavailable_text}"
         )
 
     def _visible_values(self, values: np.ndarray) -> np.ndarray:
@@ -1671,17 +1696,20 @@ if _USE_PYQTGRAPH:
             ):
                 if plot.sceneBoundingRect().contains(scene_position):
                     view_position = plot.vb.mapSceneToView(scene_position)
-                    (
-                        visible_curve_index,
-                        point_index,
-                        frequency,
-                        value,
-                    ) = nearest_sparameter_point(
-                        self._frequency,
-                        self._visible_values(values),
-                        view_position.x(),
-                        view_position.y(),
-                    )
+                    try:
+                        (
+                            visible_curve_index,
+                            point_index,
+                            frequency,
+                            value,
+                        ) = nearest_sparameter_point(
+                            self._frequency,
+                            self._visible_values(values),
+                            view_position.x(),
+                            view_position.y(),
+                        )
+                    except ValueError:
+                        return None
                     return name, plot, (
                         self._original_curve_index(visible_curve_index),
                         point_index,
@@ -1914,17 +1942,20 @@ else:
                 values = self._phase_display
             else:
                 return None
-            (
-                visible_curve_index,
-                point_index,
-                frequency,
-                value,
-            ) = nearest_sparameter_point(
-                self._frequency,
-                self._visible_values(values),
-                event.xdata,
-                event.ydata,
-            )
+            try:
+                (
+                    visible_curve_index,
+                    point_index,
+                    frequency,
+                    value,
+                ) = nearest_sparameter_point(
+                    self._frequency,
+                    self._visible_values(values),
+                    event.xdata,
+                    event.ydata,
+                )
+            except ValueError:
+                return None
             return name, event.inaxes, (
                 self._original_curve_index(visible_curve_index),
                 point_index,

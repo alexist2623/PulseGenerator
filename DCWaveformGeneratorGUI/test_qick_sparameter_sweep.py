@@ -217,6 +217,51 @@ def test_result_uses_mean_iq_db_magnitude_and_unwrapped_phase():
     assert result.mean_q[0] == 4.0
 
 
+def test_zero_mean_iq_is_unmeasurable_instead_of_minus_6000_db():
+    frequencies = np.asarray([10.0, 11.0, 12.0, 13.0])
+    iq = np.asarray(
+        [
+            [[1, 0], [1, 0]],
+            [[0, 0], [0, 0]],
+            [[-1, 0], [-1, 0]],
+            [[0, -1], [0, -1]],
+        ],
+        dtype=np.int32,
+    )
+
+    result = SParameterSweepResult.from_iq(frequencies, frequencies, iq)
+
+    np.testing.assert_allclose(
+        result.magnitude_db[[0, 2, 3]],
+        [0.0, 0.0, 0.0],
+    )
+    assert np.isnan(result.magnitude_db[1])
+    assert np.isnan(result.adc_magnitude_db[1])
+    assert np.isnan(result.phase_unwrapped_deg[1])
+    np.testing.assert_allclose(
+        result.phase_unwrapped_deg[[0, 2, 3]],
+        [0.0, 180.0, 270.0],
+    )
+
+
+def test_power_sweep_zero_mean_iq_is_unmeasurable():
+    frequencies = np.asarray([10.0, 11.0])
+    gains = np.asarray([1000, 2000])
+    iq = np.ones((2, 2, 2, 2), dtype=np.int32)
+    iq[1, 0] = 0
+
+    result = SParameterPowerSweepResult.from_iq(
+        gains,
+        frequencies,
+        frequencies,
+        iq,
+    )
+
+    assert np.isnan(result.magnitude_db[1, 0])
+    assert np.isnan(result.phase_unwrapped_deg[1, 0])
+    assert np.isfinite(result.magnitude_db[1, 1])
+
+
 def test_phase_linear_fit_subtracts_each_trace_without_changing_shape():
     frequency = np.linspace(100.0, 110.0, 11)
     phase = np.vstack((2.5 * frequency + 30.0, -0.75 * frequency - 12.0))
@@ -234,6 +279,24 @@ def test_phase_linear_fit_subtracts_each_trace_without_changing_shape():
     np.testing.assert_allclose(intercepts, [30.0, -12.0])
 
 
+def test_phase_linear_fit_ignores_unmeasurable_points():
+    frequency = np.linspace(100.0, 110.0, 11)
+    phase = 2.0 * frequency + 5.0
+    phase[5] = np.nan
+
+    corrected, slopes, intercepts = subtract_phase_linear_fit(
+        frequency,
+        phase,
+        100.0,
+        110.0,
+    )
+
+    assert np.isnan(corrected[5])
+    np.testing.assert_allclose(corrected[np.isfinite(corrected)], 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(slopes, [2.0])
+    np.testing.assert_allclose(intercepts, [5.0])
+
+
 def test_nearest_marker_selects_frequency_and_closest_trace():
     frequency = np.asarray([100.0, 101.0, 102.0])
     values = np.asarray([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])
@@ -248,6 +311,22 @@ def test_nearest_marker_selects_frequency_and_closest_trace():
     assert (curve, point) == (1, 1)
     assert selected_frequency == 101.0
     assert selected_value == 20.0
+
+
+def test_nearest_marker_skips_unmeasurable_points():
+    frequency = np.asarray([100.0, 101.0, 102.0])
+    values = np.asarray([[1.0, np.nan, 3.0], [10.0, np.nan, 30.0]])
+
+    curve, point, selected_frequency, selected_value = nearest_sparameter_point(
+        frequency,
+        values,
+        101.0,
+        2.0,
+    )
+
+    assert (curve, point) == (0, 0)
+    assert selected_frequency == 100.0
+    assert selected_value == 1.0
 
 
 def test_sparameter_plot_phase_fit_is_display_only_and_resettable():
@@ -591,14 +670,16 @@ def test_program_quantizes_from_channel_metadata_when_refclk_is_missing():
     assert sum(inst["name"] == "math" for inst in program.prog_list) == 2
 
 
-def test_long_scan_uses_periodic_start_and_timed_zero_stop():
+@pytest.mark.parametrize("scan_time_us", [1000.0, 1_000_000.0])
+def test_long_scan_uses_periodic_start_and_timed_zero_stop(scan_time_us):
     program = SParameterSweepProgram(
         _mock_soccfg(),
-        _config(scan_time_us=1000.0),
+        _config(scan_time_us=scan_time_us),
     )
     program.compile()
 
     summary = program.summary()
+    assert summary["scan_time_requested_us"] == scan_time_us
     assert summary["rf_output_mode"] == "periodic_start_timed_zero_stop"
     assert summary["rf_periodic_word_fabric_cycles"] == 3
     assert summary["rf_stop_word_fabric_cycles"] == 3

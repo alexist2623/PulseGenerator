@@ -400,7 +400,7 @@ class GainPowerCalibration:
                 * 10.0 ** ((target - full_scale_output_power) / 20.0)
             )
         )
-        return max(0, min(MAX_QICK_GAIN, mapped))
+        return max(1, min(MAX_QICK_GAIN, mapped))
 
     def output_power_dbm(
         self,
@@ -568,16 +568,21 @@ class InputPowerCalibration:
             np.asarray(frequency_mhz, dtype=float),
             np.asarray(adc_magnitude_db, dtype=float),
         )
-        if not np.all(np.isfinite(measured)):
-            raise ValueError("ADC magnitudes must be finite")
+        if np.any(np.isinf(measured)):
+            raise ValueError("ADC magnitudes must be finite or NaN")
         slopes, intercepts = self.coefficients(frequencies)
         front_end_correction = (
             float(input_attenuation_db)
             - self.summary.input_attenuation_db
             - (float(input_gain_db) - self.summary.input_gain_db)
         )
+        adjusted_measured = measured + front_end_correction
         return np.asarray(
-            slopes * (measured + front_end_correction) + intercepts,
+            np.where(
+                np.isfinite(adjusted_measured),
+                slopes * adjusted_measured + intercepts,
+                np.nan,
+            ),
             dtype=float,
         )
 

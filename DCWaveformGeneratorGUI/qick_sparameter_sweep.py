@@ -139,6 +139,72 @@ def _emit_warning(callback: Optional[WarningCallback], message: str) -> None:
         callback(str(message))
 
 
+def _warn_unmeasurable_points(
+    result: Any,
+    callback: Optional[WarningCallback],
+    *,
+    context: str,
+) -> None:
+    values = np.asarray(result.magnitude_db, dtype=float)
+    count = int(np.count_nonzero(~np.isfinite(values)))
+    if count:
+        _emit_warning(
+            callback,
+            (
+                f"{context}: {count} S-parameter point(s) have zero mean I/Q "
+                "and were saved "
+                "as NaN instead of an artificial -6000 dB value"
+            ),
+        )
+
+
+def _iq_response_metrics(
+    mean_i: Any,
+    mean_q: Any,
+    *,
+    frequency_axis: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return dB magnitude and unwrapped phase without inventing zero-IQ data.
+
+    A zero complex mean has neither a finite logarithmic magnitude nor a
+    defined phase.  Preserve it as NaN and unwrap each contiguous valid
+    frequency interval independently so one below-floor point does not poison
+    the remainder of a sweep.
+    """
+    i_values, q_values = np.broadcast_arrays(
+        np.asarray(mean_i, dtype=np.float64),
+        np.asarray(mean_q, dtype=np.float64),
+    )
+    complex_values = i_values + 1j * q_values
+    magnitude = np.hypot(i_values, q_values)
+    valid = np.isfinite(i_values) & np.isfinite(q_values) & (magnitude > 0.0)
+
+    magnitude_db = np.full(magnitude.shape, np.nan, dtype=np.float64)
+    magnitude_db[valid] = 20.0 * np.log10(magnitude[valid])
+
+    moved_values = np.moveaxis(complex_values, frequency_axis, -1)
+    moved_valid = np.moveaxis(valid, frequency_axis, -1)
+    moved_phase = np.full(moved_values.shape, np.nan, dtype=np.float64)
+    row_values = moved_values.reshape(-1, moved_values.shape[-1])
+    row_valid = moved_valid.reshape(-1, moved_valid.shape[-1])
+    row_phase = moved_phase.reshape(-1, moved_phase.shape[-1])
+    for values, valid_values, phase_values in zip(
+        row_values,
+        row_valid,
+        row_phase,
+    ):
+        valid_indices = np.flatnonzero(valid_values)
+        if valid_indices.size == 0:
+            continue
+        split_at = np.flatnonzero(np.diff(valid_indices) > 1) + 1
+        for segment in np.split(valid_indices, split_at):
+            phase_values[segment] = np.degrees(
+                np.unwrap(np.angle(values[segment]))
+            )
+    phase = np.moveaxis(moved_phase, -1, frequency_axis)
+    return magnitude_db, phase
+
+
 @dataclass(frozen=True)
 class SParameterSweepConfig:
     """Independent RF output/readout configuration for one hardware sweep."""
@@ -556,11 +622,11 @@ class SParameterSweepResult:
         mean = iq.astype(np.float64).mean(axis=1)
         mean_i = mean[:, 0]
         mean_q = mean[:, 1]
-        magnitude = np.hypot(mean_i, mean_q)
-        adc_magnitude_db = 20.0 * np.log10(
-            np.maximum(magnitude, np.finfo(np.float64).tiny)
+        adc_magnitude_db, phase = _iq_response_metrics(
+            mean_i,
+            mean_q,
+            frequency_axis=0,
         )
-        phase = np.degrees(np.unwrap(np.angle(mean_i + 1j * mean_q)))
         applied_gains = None
         if frequency_gain_codes is not None:
             applied_gains = np.asarray(frequency_gain_codes, dtype=np.int64).reshape(-1)
@@ -599,11 +665,11 @@ class SParameterSweepResult:
                 )
         if input_powers_dbm is not None:
             actual_input = np.asarray(input_powers_dbm, dtype=float).reshape(-1)
-            if actual_input.size != frequencies.size or not np.all(
-                np.isfinite(actual_input)
+            if actual_input.size != frequencies.size or np.any(
+                np.isinf(actual_input)
             ):
                 raise ValueError(
-                    "input powers must contain one finite value per frequency"
+                    "input powers must contain one finite value or NaN per frequency"
                 )
             if actual_output is None:
                 raise ValueError("input powers require actual output powers")
@@ -716,8 +782,11 @@ class SParameterPowerSweepResult:
         mean = iq.astype(np.float64).mean(axis=2)
         mean_i = mean[:, :, 0]
         mean_q = mean[:, :, 1]
-        magnitude = np.hypot(mean_i, mean_q)
-        phase = np.degrees(np.unwrap(np.angle(mean_i + 1j * mean_q), axis=1))
+        adc_magnitude_db, phase = _iq_response_metrics(
+            mean_i,
+            mean_q,
+            frequency_axis=1,
+        )
         reserved = tuple(reserved_physical_words)
         if reserved and len(reserved) != gains.size:
             raise ValueError("reserved DDR word counts must match power points")
@@ -737,9 +806,6 @@ class SParameterPowerSweepResult:
                 raise ValueError(
                     "frequency gain codes must have shape (power, frequency)"
                 )
-        adc_magnitude_db = 20.0 * np.log10(
-            np.maximum(magnitude, np.finfo(np.float64).tiny)
-        )
         actual_output = None
         actual_input = None
         if actual_output_powers_dbm is not None:
@@ -752,10 +818,13 @@ class SParameterPowerSweepResult:
                 )
         if input_powers_dbm is not None:
             actual_input = np.asarray(input_powers_dbm, dtype=float)
-            if actual_input.shape != (gains.size, frequencies.size) or not np.all(
-                np.isfinite(actual_input)
+            if actual_input.shape != (gains.size, frequencies.size) or np.any(
+                np.isinf(actual_input)
             ):
-                raise ValueError("input powers must have shape (power, frequency)")
+                raise ValueError(
+                    "input powers must have shape (power, frequency) and contain "
+                    "finite values or NaN"
+                )
             if actual_output is None:
                 raise ValueError("input powers require actual output powers")
         return cls(
@@ -2828,6 +2897,11 @@ def run_sparameter_sweep(
                         loss2_db=sweep_config.loss2_db,
                         amplifier_gain_db=sweep_config.amplifier_gain_db,
                     )
+                _warn_unmeasurable_points(
+                    result,
+                    warning_callback,
+                    context=f"Power {power_index + 1}/{len(power_coordinates)}",
+                )
                 _emit_progress(
                     progress_callback,
                     8 + round(87 * (power_index + 0.9) / len(power_coordinates)),
@@ -2923,6 +2997,11 @@ def run_sparameter_sweep(
             loss2_db=sweep_config.loss2_db,
             amplifier_gain_db=sweep_config.amplifier_gain_db,
         )
+    _warn_unmeasurable_points(
+        result,
+        warning_callback,
+        context="RF S-parameter sweep",
+    )
     _emit_progress(progress_callback, 62, "Averaging FIR IQ traces")
     dataset, row_count = store_sparameter_result(
         result,
