@@ -120,6 +120,10 @@ def sweep_axis_label(axis: Any) -> str:
     """Return the compact user-facing name for one sweep variable."""
     output_name, segment_name = sweep_axis_key(axis)
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_template_n":
+        return f"{output_name} / {segment_name} template N"
+    if axis_kind == "rf_template_tau":
+        return f"{output_name} / {segment_name} template tau"
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
@@ -139,7 +143,10 @@ def _axis_display_values(
     full_scale_mv: float,
 ) -> Tuple[np.ndarray, str]:
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_template_n":
+        return np.asarray(coordinates, dtype=np.float64), "count"
     if axis_kind in {
+        "rf_template_tau",
         "rf_duration",
         "ramp_duration",
         "hold_duration",
@@ -266,6 +273,10 @@ def _stored_axis_key(axis: Mapping[str, Any]) -> SweepAxisKey:
 def _stored_axis_label(axis: Mapping[str, Any]) -> str:
     output_name, segment_name = _stored_axis_key(axis)
     axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind == "rf_template_n":
+        return f"{output_name} / {segment_name} template N"
+    if axis_kind == "rf_template_tau":
+        return f"{output_name} / {segment_name} template tau"
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
@@ -424,7 +435,14 @@ def _stored_axis_native_values(
     coordinates = np.asarray(values, dtype=np.float64)
     unit = str(axis.get("unit", "")).strip().lower()
     axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind == "rf_template_n":
+        if unit in {"", "count", "counts", "pulse", "pulses"}:
+            return coordinates
+        raise ValueError(
+            f"unsupported stored RF template N unit {axis.get('unit')!r}"
+        )
     if axis_kind in {
+        "rf_template_tau",
         "rf_duration",
         "ramp_duration",
         "hold_duration",

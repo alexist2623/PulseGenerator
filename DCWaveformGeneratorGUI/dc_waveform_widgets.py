@@ -835,7 +835,7 @@ class RfPulsePreviewWidget(pg.PlotWidget):
 
 
 class RfPulseTimelineWidget(pg.PlotWidget):
-    """RF output lane sharing the editable DC waveform's nanosecond time axis."""
+    """One RF-generator lane containing every pulse on a shared time axis."""
 
     MAX_CARRIER_CYCLES = RfPulsePreviewWidget.MAX_CARRIER_CYCLES
     MAX_CARRIER_POINTS = RfPulsePreviewWidget.MAX_CARRIER_POINTS
@@ -852,26 +852,9 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         self.setMinimumHeight(120)
         self.setMaximumHeight(260)
 
-        color = _plot_color(6)
-        self._carrier_curve = self.plot([], [], pen=pg.mkPen(color, width=1.2))
-        self._upper_curve = self.plot([], [], pen=pg.mkPen(color, width=1.0))
-        self._lower_curve = self.plot([], [], pen=pg.mkPen(color, width=1.0))
-        self._envelope_fill = pg.FillBetweenItem(
-            self._upper_curve,
-            self._lower_curve,
-            brush=pg.mkBrush(color.red(), color.green(), color.blue(), 34),
-        )
-        self.addItem(self._envelope_fill)
-        self._start_line = pg.InfiniteLine(
-            angle=90,
-            pen=pg.mkPen(color, style=QtCore.Qt.DashLine),
-        )
-        self._end_line = pg.InfiniteLine(
-            angle=90,
-            pen=pg.mkPen(color, style=QtCore.Qt.DashLine),
-        )
-        self.addItem(self._start_line)
-        self.addItem(self._end_line)
+        self._pulse_graphics = []
+        self._pulse_labels = []
+        self.pulse_names = ()
         self.preview_mode = "empty"
         self._time_unit = "ns"
         self.start_ns = 0.0
@@ -888,18 +871,162 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         axis.setLabel(f"sequence time [{unit}]")
 
     def clear_pulse(self) -> None:
-        self._carrier_curve.setData([], [])
-        self._upper_curve.setData([], [])
-        self._lower_curve.setData([], [])
-        self._start_line.hide()
-        self._end_line.hide()
+        for item in reversed(self._pulse_graphics):
+            self.removeItem(item)
+        self._pulse_graphics.clear()
+        self._pulse_labels.clear()
+        self.pulse_names = ()
         self.setTitle("")
         self.preview_mode = "empty"
+
+    def _add_graphic(self, item) -> None:
+        self.addItem(item)
+        self._pulse_graphics.append(item)
+
+    def set_pulses(
+        self,
+        *,
+        gen_ch: int,
+        pulses: Sequence[dict],
+        att1_db: float,
+        att2_db: float,
+    ) -> None:
+        """Render an ordered RF sequence in one generator timeline.
+
+        Delay entries are already represented by gaps between ``start_ns``
+        values. Pulse names are drawn over their corresponding envelopes, and
+        repeated names use the same color (for example, every ``X`` pulse).
+        """
+        self.clear_pulse()
+        if not pulses:
+            return
+
+        normalized = tuple(dict(pulse) for pulse in pulses)
+        self.start_ns = min(float(pulse["start_ns"]) for pulse in normalized)
+        self.end_ns = max(
+            float(pulse["start_ns"]) + float(pulse["duration_ns"])
+            for pulse in normalized
+        )
+        max_amplitude = max(
+            1.0,
+            *(abs(float(pulse["gain"])) for pulse in normalized),
+        )
+        label_y = max_amplitude * 1.12
+        color_by_name = {}
+        modes = []
+        names = []
+
+        for pulse_index, pulse in enumerate(normalized):
+            name = str(pulse.get("pulse_name", "")).strip()
+            if not name:
+                name = f"pulse_{pulse_index}"
+            names.append(name)
+            if name not in color_by_name:
+                color_by_name[name] = _plot_color(6 + len(color_by_name))
+            color = color_by_name[name]
+
+            start_ns = float(pulse["start_ns"])
+            duration_ns = float(pulse["duration_ns"])
+            end_ns = start_ns + duration_ns
+            frequency_mhz = float(pulse["frequency_mhz"])
+            gain = int(pulse["gain"])
+            phase_degrees = float(pulse["phase_degrees"])
+            cycle_count = abs(frequency_mhz) * duration_ns / 1000.0
+
+            if cycle_count <= self.MAX_CARRIER_CYCLES:
+                points = min(
+                    self.MAX_CARRIER_POINTS,
+                    max(64, int(cycle_count * 16) + 2),
+                )
+                pulse_time = np.linspace(start_ns, end_ns, points, dtype=float)
+                phase = np.deg2rad(phase_degrees)
+                pulse_values = float(gain) * np.cos(
+                    2.0
+                    * np.pi
+                    * frequency_mhz
+                    * (pulse_time - start_ns)
+                    / 1000.0
+                    + phase
+                )
+                time_ns = np.concatenate(
+                    ([start_ns, start_ns], pulse_time, [end_ns, end_ns])
+                )
+                values = np.concatenate(
+                    ([0.0, 0.0], pulse_values, [0.0, 0.0])
+                )
+                curve = pg.PlotDataItem(
+                    time_ns,
+                    values,
+                    pen=pg.mkPen(color, width=1.2),
+                )
+                self._add_graphic(curve)
+                modes.append("carrier")
+            else:
+                amplitude = abs(float(gain))
+                envelope_time = np.asarray(
+                    [start_ns, start_ns, end_ns, end_ns],
+                    dtype=float,
+                )
+                upper = np.asarray([0.0, amplitude, amplitude, 0.0])
+                lower = -upper
+                upper_curve = pg.PlotDataItem(
+                    envelope_time,
+                    upper,
+                    pen=pg.mkPen(color, width=1.0),
+                )
+                lower_curve = pg.PlotDataItem(
+                    envelope_time,
+                    lower,
+                    pen=pg.mkPen(color, width=1.0),
+                )
+                fill = pg.FillBetweenItem(
+                    upper_curve,
+                    lower_curve,
+                    brush=pg.mkBrush(
+                        color.red(), color.green(), color.blue(), 34
+                    ),
+                )
+                self._add_graphic(upper_curve)
+                self._add_graphic(lower_curve)
+                self._add_graphic(fill)
+                modes.append("envelope")
+
+            label = pg.TextItem(
+                text=name,
+                color=color,
+                anchor=(0.5, 1.0),
+                fill=pg.mkBrush(255, 255, 255, 220),
+                border=pg.mkPen(color, width=1.0),
+            )
+            label.setPos((start_ns + end_ns) / 2.0, label_y)
+            label.setZValue(20)
+            label.setToolTip(
+                f"{name}: {frequency_mhz:.6g} MHz, gain {gain}, "
+                f"phase {phase_degrees:.6g} deg"
+            )
+            self._add_graphic(label)
+            self._pulse_labels.append(label)
+
+        self.pulse_names = tuple(names)
+        unique_modes = set(modes)
+        self.preview_mode = (
+            next(iter(unique_modes)) if len(unique_modes) == 1 else "mixed"
+        )
+        self.setTitle(
+            f"RF gen {gen_ch}: {len(normalized)} pulse(s), "
+            f"ATT1/ATT2 {att1_db:.2f}/{att2_db:.2f} dB"
+        )
+        self.setYRange(
+            -max_amplitude * 1.12,
+            max_amplitude * 1.35,
+            padding=0.0,
+        )
 
     def set_pulse(
         self,
         *,
         gen_ch: int,
+        pulse_name: str = "",
         start_ns: float,
         duration_ns: float,
         frequency_mhz: float,
@@ -908,62 +1035,20 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         att1_db: float,
         att2_db: float,
     ) -> None:
-        self.start_ns = float(start_ns)
-        self.end_ns = float(start_ns + duration_ns)
-        cycle_count = abs(frequency_mhz) * duration_ns / 1000.0
-        if cycle_count <= self.MAX_CARRIER_CYCLES:
-            points = min(
-                self.MAX_CARRIER_POINTS,
-                max(64, int(cycle_count * 16) + 2),
-            )
-            pulse_time = np.linspace(self.start_ns, self.end_ns, points, dtype=float)
-            phase = np.deg2rad(phase_degrees)
-            pulse_values = float(gain) * np.cos(
-                2.0
-                * np.pi
-                * frequency_mhz
-                * (pulse_time - self.start_ns)
-                / 1000.0
-                + phase
-            )
-            time_ns = np.concatenate(
-                ([self.start_ns, self.start_ns], pulse_time, [self.end_ns, self.end_ns])
-            )
-            values = np.concatenate(([0.0, 0.0], pulse_values, [0.0, 0.0]))
-            self._carrier_curve.setData(time_ns, values)
-            self._upper_curve.setData([], [])
-            self._lower_curve.setData([], [])
-            self.preview_mode = "carrier"
-            mode_text = f"representative carrier ({points} points)"
-        else:
-            amplitude = abs(float(gain))
-            envelope_time = np.asarray(
-                [
-                    self.start_ns,
-                    self.start_ns,
-                    self.start_ns,
-                    self.end_ns,
-                    self.end_ns,
-                    self.end_ns,
-                ],
-                dtype=float,
-            )
-            upper = np.asarray([0.0, 0.0, amplitude, amplitude, 0.0, 0.0])
-            self._carrier_curve.setData([], [])
-            self._upper_curve.setData(envelope_time, upper)
-            self._lower_curve.setData(envelope_time, -upper)
-            self.preview_mode = "envelope"
-            mode_text = "amplitude envelope"
-
-        self._start_line.setPos(self.start_ns)
-        self._end_line.setPos(self.end_ns)
-        self._start_line.show()
-        self._end_line.show()
-        y_limit = max(1.0, abs(float(gain)) * 1.08)
-        self.setYRange(-y_limit, y_limit, padding=0.0)
-        self.setTitle(
-            f"RF gen {gen_ch}: {frequency_mhz:.6g} MHz, gain {gain}, "
-            f"ATT1/ATT2 {att1_db:.2f}/{att2_db:.2f} dB - {mode_text}"
+        self.set_pulses(
+            gen_ch=gen_ch,
+            pulses=(
+                {
+                    "pulse_name": pulse_name,
+                    "start_ns": start_ns,
+                    "duration_ns": duration_ns,
+                    "frequency_mhz": frequency_mhz,
+                    "gain": gain,
+                    "phase_degrees": phase_degrees,
+                },
+            ),
+            att1_db=att1_db,
+            att2_db=att2_db,
         )
 
 

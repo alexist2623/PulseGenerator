@@ -208,6 +208,68 @@ def test_reduce_map_preserves_rf_duration_axis_in_microseconds():
     assert result.y_axis_label == "awg_0 / gate"
 
 
+def test_reduce_map_preserves_predefined_rf_n_and_tau_axes():
+    n_points = (2.0, 3.0, 4.0)
+    tau_points = (5.0, 10.0)
+    coordinates = np.asarray(
+        tuple(product(n_points, tau_points)),
+        dtype=float,
+    )
+    iq = np.zeros((coordinates.shape[0], 1, 1, 2), dtype=np.int16)
+    result = awg_map.reduce_awg_sweep_map(
+        SimpleNamespace(
+            sweep_axes=(
+                SimpleNamespace(
+                    output_name="rf_gen_0_cpmg_N",
+                    segment_name="gate",
+                    start=2.0,
+                    stop=4.0,
+                    count=3,
+                    axis_kind="rf_template_n",
+                ),
+                SimpleNamespace(
+                    output_name="rf_gen_0_cpmg_tau",
+                    segment_name="gate",
+                    start=5.0,
+                    stop=10.0,
+                    count=2,
+                    axis_kind="rf_template_tau",
+                ),
+            ),
+            sweep_points=coordinates,
+            iq=iq,
+            sample_rate_hz=50_000.0,
+        ),
+        x_axis_key=("rf_gen_0_cpmg_N", "gate"),
+        y_axis_key=("rf_gen_0_cpmg_tau", "gate"),
+        full_scale_mv=800.0,
+    )
+
+    np.testing.assert_allclose(result.x_values, n_points)
+    np.testing.assert_allclose(result.y_values, tau_points)
+    assert result.x_unit == "count"
+    assert result.y_unit == "us"
+    assert result.x_axis_label.endswith("template N")
+    assert result.y_axis_label.endswith("template tau")
+
+    np.testing.assert_allclose(
+        awg_map._stored_axis_native_values(
+            n_points,
+            {"axis_kind": "rf_template_n", "unit": ""},
+            full_scale_mv=800.0,
+        ),
+        n_points,
+    )
+    np.testing.assert_allclose(
+        awg_map._stored_axis_native_values(
+            (5000.0, 10000.0),
+            {"axis_kind": "rf_template_tau", "unit": "ns"},
+            full_scale_mv=800.0,
+        ),
+        tau_points,
+    )
+
+
 def test_reduce_map_preserves_ramp_duration_axis_and_derived_rate_label():
     duration_points = (0.08, 0.10, 0.12)
     voltage_points = (-0.5, 0.5)

@@ -8,8 +8,10 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
+from itertools import product
 import json
 import os
 from pathlib import Path
@@ -62,6 +64,7 @@ try:
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        QickRfSoftwareSweepAxisSpec,
         adc_iq_to_voltage,
         dc_iq_to_current,
     )
@@ -77,6 +80,7 @@ except ImportError:
         DEFAULT_QICK_TPROC_MHZ,
         QickDdrReadoutSpec,
         QickRfPulseSpec,
+        QickRfSoftwareSweepAxisSpec,
         adc_iq_to_voltage,
         dc_iq_to_current,
     )
@@ -602,20 +606,11 @@ def build_runtime_rf_pulses(
     pulses = []
     for spec in specs:
         gen_cfg = soccfg["gens"][spec.gen_ch]
-        frequency_points = np.asarray(
-            (
-                np.linspace(
-                    spec.frequency_sweep_start_mhz,
-                    spec.frequency_sweep_stop_mhz,
-                    spec.frequency_sweep_count,
-                    dtype=np.float64,
-                )
-                if spec.frequency_sweep_enabled
-                else [spec.frequency_mhz]
-            ),
-            dtype=np.float64,
-        ).reshape(-1)
-        power_points = np.asarray(
+        parameter_by_name = {
+            parameter.name: parameter
+            for parameter in spec.frequency_parameters
+        }
+        legacy_power_points = np.asarray(
             (
                 np.linspace(
                     spec.power_sweep_start_dbm,
@@ -628,102 +623,160 @@ def build_runtime_rf_pulses(
             ),
             dtype=np.float64,
         ).reshape(-1)
-        sweep_gain_codes = ()
-        sweep_gain_shape = (0, 0)
-        calibration_run_id = None
-        runtime_gain = int(spec.gain)
-        if spec.power_calibration_enabled:
-            table_words = int(frequency_points.size * power_points.size)
-            frequency_table_words = (
-                int(frequency_points.size)
-                if spec.frequency_sweep_enabled
-                and frequency_points.size > 1
-                else 0
-            )
-            gain_table_words = (
-                table_words
-                if (
-                    frequency_points.size > 1
-                    or power_points.size > 1
+        for event in spec.pulse_events:
+            if spec.pulse_mode == "composite":
+                calibration_enabled = bool(
+                    event.power_calibration_enabled
                 )
-                else 0
-            )
-            total_rf_table_words = (
-                frequency_table_words + gain_table_words
-            )
-            if total_rf_table_words > MAX_DMEM_GAIN_ENTRIES:
-                raise ValueError(
-                    "RF frequency/power sweep requires "
-                    f"{total_rf_table_words} frequency/gain words, "
-                    "exceeding the tProcessor "
-                    f"DMEM table limit {MAX_DMEM_GAIN_ENTRIES}; reduce RF "
-                    "frequency or power sweep points"
+                calibration_database_path = str(
+                    event.power_calibration_database_path
                 )
-            catalog = CalibrationDatabase(
-                spec.power_calibration_database_path
-            )
-            calibration = catalog.output_calibration(
-                spec.output_board_type,
-                frequency_points,
-                run_id=(
-                    None
-                    if spec.power_calibration_run_id == 0
-                    else int(spec.power_calibration_run_id)
-                ),
-                nqz=int(spec.nqz),
-                output_filter_type=str(spec.filter_type),
-                output_filter_cutoff_ghz=float(spec.filter_cutoff),
-                output_filter_bandwidth_ghz=float(spec.filter_bandwidth),
-            )
-            gain_matrix = np.empty(
-                (frequency_points.size, power_points.size),
-                dtype=np.int32,
-            )
-            for power_index, target_power_dbm in enumerate(power_points):
-                schedule = calibration.build_gain_schedule(
-                    frequency_points,
-                    float(target_power_dbm),
-                    output_att1_db=float(spec.effective_att1_db),
-                    output_att2_db=float(spec.effective_att2_db),
-                    max_entries=int(frequency_points.size),
+                requested_calibration_run_id = int(
+                    event.power_calibration_run_id
                 )
-                if len(schedule.gain_codes) != frequency_points.size:
-                    raise RuntimeError(
-                        "RF calibration gain schedule was unexpectedly compressed"
+                power_points = np.asarray(
+                    [event.target_output_power_dbm],
+                    dtype=np.float64,
+                )
+            else:
+                calibration_enabled = bool(spec.power_calibration_enabled)
+                calibration_database_path = str(
+                    spec.power_calibration_database_path
+                )
+                requested_calibration_run_id = int(
+                    spec.power_calibration_run_id
+                )
+                power_points = legacy_power_points
+            if event.frequency_parameter:
+                parameter = parameter_by_name[event.frequency_parameter]
+                frequency_points = np.asarray(
+                    (
+                        np.linspace(
+                            parameter.sweep_start_mhz,
+                            parameter.sweep_stop_mhz,
+                            parameter.sweep_count,
+                            dtype=np.float64,
+                        )
+                        if parameter.sweep_enabled
+                        else [parameter.frequency_mhz]
+                    ),
+                    dtype=np.float64,
+                ).reshape(-1)
+                frequency_sweep_enabled = bool(parameter.sweep_enabled)
+            else:
+                frequency_points = np.asarray(
+                    (
+                        np.linspace(
+                            spec.frequency_sweep_start_mhz,
+                            spec.frequency_sweep_stop_mhz,
+                            spec.frequency_sweep_count,
+                            dtype=np.float64,
+                        )
+                        if spec.frequency_sweep_enabled
+                        else [event.frequency_mhz]
+                    ),
+                    dtype=np.float64,
+                ).reshape(-1)
+                frequency_sweep_enabled = bool(spec.frequency_sweep_enabled)
+            sweep_gain_codes = ()
+            sweep_gain_shape = (0, 0)
+            calibration_run_id = None
+            runtime_gain = int(event.gain)
+            if calibration_enabled:
+                table_words = int(frequency_points.size * power_points.size)
+                frequency_table_words = (
+                    int(frequency_points.size)
+                    if frequency_sweep_enabled and frequency_points.size > 1
+                    else 0
+                )
+                gain_table_words = (
+                    table_words
+                    if frequency_points.size > 1 or power_points.size > 1
+                    else 0
+                )
+                total_rf_table_words = frequency_table_words + gain_table_words
+                if total_rf_table_words > MAX_DMEM_GAIN_ENTRIES:
+                    raise ValueError(
+                        "RF frequency/power sweep requires "
+                        f"{total_rf_table_words} frequency/gain words, "
+                        "exceeding the tProcessor "
+                        f"DMEM table limit {MAX_DMEM_GAIN_ENTRIES}; reduce RF "
+                        "frequency or power sweep points"
                     )
-                gain_matrix[:, power_index] = schedule.gain_codes
-            sweep_gain_codes = tuple(
-                int(value) for value in gain_matrix.reshape(-1)
+                catalog = CalibrationDatabase(
+                    calibration_database_path
+                )
+                calibration = catalog.output_calibration(
+                    spec.output_board_type,
+                    frequency_points,
+                    run_id=(
+                        None
+                        if requested_calibration_run_id == 0
+                        else requested_calibration_run_id
+                    ),
+                    nqz=int(spec.nqz),
+                    output_filter_type=str(spec.filter_type),
+                    output_filter_cutoff_ghz=float(spec.filter_cutoff),
+                    output_filter_bandwidth_ghz=float(spec.filter_bandwidth),
+                )
+                gain_matrix = np.empty(
+                    (frequency_points.size, power_points.size),
+                    dtype=np.int32,
+                )
+                for power_index, target_power_dbm in enumerate(power_points):
+                    schedule = calibration.build_gain_schedule(
+                        frequency_points,
+                        float(target_power_dbm),
+                        output_att1_db=float(spec.effective_att1_db),
+                        output_att2_db=float(spec.effective_att2_db),
+                        max_entries=int(frequency_points.size),
+                    )
+                    if len(schedule.gain_codes) != frequency_points.size:
+                        raise RuntimeError(
+                            "RF calibration gain schedule was unexpectedly compressed"
+                        )
+                    gain_matrix[:, power_index] = schedule.gain_codes
+                sweep_gain_codes = tuple(
+                    int(value) for value in gain_matrix.reshape(-1)
+                )
+                sweep_gain_shape = tuple(
+                    int(value) for value in gain_matrix.shape
+                )
+                calibration_run_id = int(calibration.summary.run_id)
+                runtime_gain = int(gain_matrix[0, 0])
+            delay_cycles = (
+                0
+                if event.delay_us <= 0.0
+                else cycles_from_us(event.delay_us, tproc_mhz)
             )
-            sweep_gain_shape = tuple(int(value) for value in gain_matrix.shape)
-            calibration_run_id = int(calibration.summary.run_id)
-            runtime_gain = int(gain_matrix[0, 0])
-        delay_cycles = (
-            0
-            if spec.delay_us <= 0.0
-            else cycles_from_us(spec.delay_us, tproc_mhz)
-        )
-        pulses.append(rf_type(
-            gen_ch=spec.gen_ch,
-            at_segment=spec.segment_name,
-            length_cycles=cycles_from_us(
-                (
-                    spec.duration_sweep_start_us
-                    if spec.duration_sweep_enabled
-                    else spec.duration_us
+            pulses.append(rf_type(
+                gen_ch=spec.gen_ch,
+                at_segment=spec.segment_name,
+                length_cycles=cycles_from_us(
+                    (
+                        spec.duration_sweep_start_us
+                        if spec.duration_sweep_enabled
+                        else event.duration_us
+                    ),
+                    float(gen_cfg["f_fabric"]),
                 ),
-                float(gen_cfg["f_fabric"]),
-            ),
-            gain=runtime_gain,
-            freq_mhz=float(frequency_points[0]),
-            phase_degrees=spec.phase_degrees,
-            nqz=spec.nqz,
-            delay_tproc_cycles=delay_cycles,
-            require_within_segment=spec.require_within_segment,
-            sweep_gain_codes=sweep_gain_codes,
-            sweep_gain_shape=sweep_gain_shape,
-            power_calibration_run_id=calibration_run_id,
-        ))
+                gain=runtime_gain,
+                freq_mhz=float(frequency_points[0]),
+                phase_degrees=event.phase_degrees,
+                nqz=spec.nqz,
+                delay_tproc_cycles=delay_cycles,
+                require_within_segment=spec.require_within_segment,
+                sweep_gain_codes=sweep_gain_codes,
+                sweep_gain_shape=sweep_gain_shape,
+                power_calibration_run_id=calibration_run_id,
+                event_id=event.event_id,
+                pulse_name=event.name,
+                frequency_parameter=event.frequency_parameter,
+                duration_parameter=event.duration_parameter,
+                preceding_duration_parameters=(
+                    event.preceding_duration_parameters
+                ),
+            ))
     return tuple(pulses)
 
 
@@ -975,7 +1028,7 @@ def configure_rf_board(
     }
 
 
-def execute_qick_sequence(
+def _execute_qick_sequence_once(
     soc,
     soccfg,
     sequence,
@@ -1117,6 +1170,299 @@ def execute_qick_sequence(
     return program, ddr_result, rf_settings
 
 
+@dataclass(frozen=True)
+class SoftwareSweepProgramBundle:
+    """Programs compiled for a predefined composite RF software sweep."""
+
+    programs: Tuple[Any, ...]
+    sweep_axes: Tuple[QickRfSoftwareSweepAxisSpec, ...]
+    sweep_coordinates: np.ndarray
+
+    def summary(self) -> Mapping[str, Any]:
+        base = dict(self.programs[-1].summary())
+        base.update({
+            "software_sweep_program_count": len(self.programs),
+            "software_sweep_axes": [asdict(axis) for axis in self.sweep_axes],
+            "software_sweep_coordinates": self.sweep_coordinates.tolist(),
+            "software_sweep_execution": (
+                "one tProcessor compile/acquisition per predefined RF point"
+            ),
+        })
+        return base
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.programs[-1], name)
+
+
+def _rf_software_sweep_bindings(
+    rf_specs: Sequence[QickRfPulseSpec],
+) -> Tuple[Tuple[int, QickRfSoftwareSweepAxisSpec], ...]:
+    return tuple(
+        (spec_index, axis)
+        for spec_index, spec in enumerate(rf_specs)
+        for axis in spec.software_sweep_axes
+    )
+
+
+def _software_sweep_coordinates(
+    bindings: Sequence[Tuple[int, QickRfSoftwareSweepAxisSpec]],
+) -> np.ndarray:
+    if not bindings:
+        return np.empty((1, 0), dtype=np.float64)
+    rows = tuple(product(*(axis.points for _index, axis in bindings)))
+    return np.asarray(rows, dtype=np.float64).reshape(len(rows), len(bindings))
+
+
+def _rf_specs_at_software_coordinate(
+    rf_specs: Sequence[QickRfPulseSpec],
+    bindings: Sequence[Tuple[int, QickRfSoftwareSweepAxisSpec]],
+    coordinate: Sequence[float],
+) -> Tuple[QickRfPulseSpec, ...]:
+    updates = {}
+    for (spec_index, axis), value in zip(bindings, coordinate):
+        point = updates.setdefault(spec_index, {})
+        if axis.axis_kind == "rf_template_n":
+            point["n_pulses"] = int(round(float(value)))
+        elif axis.axis_kind == "rf_template_tau":
+            point["tau_us"] = float(value)
+        else:
+            raise ValueError(
+                f"unsupported RF software sweep kind {axis.axis_kind!r}"
+            )
+    return tuple(
+        spec.with_predefined_parameters(**updates[index])
+        if index in updates
+        else spec
+        for index, spec in enumerate(rf_specs)
+    )
+
+
+def _sequence_at_rf_software_coordinate(
+    sequence: Any,
+    rf_specs: Sequence[QickRfPulseSpec],
+    *,
+    fabric_mhz: float,
+) -> Any:
+    """Clone a sequence and update RF-driven SET extension durations."""
+    concrete = deepcopy(sequence)
+    _ddr_type, _rf_type, cycles_from_us = _runtime_types()
+    for spec in rf_specs:
+        if spec.segment_length_mode != "extend_by_rf_duration":
+            continue
+        concrete.set_rf_segment_length_extension(
+            segment=spec.segment_name,
+            gen_ch=spec.gen_ch,
+            base_duration_cycles=sum(
+                cycles_from_us(duration_us, fabric_mhz)
+                for duration_us in spec.segment_extension_components_us
+            ),
+            parameter_multiplicities=dict(
+                spec.duration_parameter_reference_counts
+            ),
+        )
+    concrete._validate()
+    return concrete
+
+
+def _result_sweep_coordinates(result: Any) -> np.ndarray:
+    axes = tuple(result.sweep_axes)
+    point_count = int(np.asarray(result.iq).shape[0])
+    if not axes:
+        return np.empty((point_count, 0), dtype=np.float64)
+    coordinates = np.asarray(result.sweep_points, dtype=np.float64)
+    if len(axes) == 1:
+        coordinates = coordinates.reshape(-1, 1)
+    if coordinates.shape != (point_count, len(axes)):
+        raise ValueError("hardware sweep result has inconsistent coordinates")
+    return coordinates
+
+
+def _combine_software_sweep_results(
+    results: Sequence[Any],
+    bindings: Sequence[Tuple[int, QickRfSoftwareSweepAxisSpec]],
+    software_coordinates: np.ndarray,
+) -> Any:
+    if not results:
+        raise RuntimeError("RF software sweep produced no acquisition results")
+    first = results[0]
+    first_iq = np.asarray(first.iq)
+    hardware_coordinates = _result_sweep_coordinates(first)
+    hardware_axes = tuple(first.sweep_axes)
+    hardware_point_count = first_iq.shape[0]
+    for result in results[1:]:
+        if np.asarray(result.iq).shape != first_iq.shape:
+            raise RuntimeError(
+                "RF software sweep points returned different DDR IQ shapes"
+            )
+        if tuple(result.sweep_axes) != hardware_axes:
+            raise RuntimeError(
+                "RF software sweep changed the hardware sweep axes"
+            )
+        if not np.array_equal(
+            _result_sweep_coordinates(result),
+            hardware_coordinates,
+        ):
+            raise RuntimeError(
+                "RF software sweep changed hardware sweep coordinates"
+            )
+    software_expanded = np.repeat(
+        software_coordinates,
+        hardware_point_count,
+        axis=0,
+    )
+    hardware_expanded = np.tile(
+        hardware_coordinates,
+        (len(results), 1),
+    )
+    all_coordinates = np.column_stack((software_expanded, hardware_expanded))
+    final_axes = tuple(axis for _index, axis in bindings) + hardware_axes
+    final_points = (
+        all_coordinates[:, 0]
+        if len(final_axes) == 1
+        else all_coordinates
+    )
+    hardware_shape = tuple(int(axis.count) for axis in hardware_axes)
+    software_shape = tuple(int(axis.count) for _index, axis in bindings)
+    reserved_values = [
+        getattr(result, "reserved_physical_words", None)
+        for result in results
+    ]
+    reserved = (
+        max(int(value) for value in reserved_values)
+        if all(value is not None for value in reserved_values)
+        else None
+    )
+    return replace(
+        first,
+        sweep_points=final_points,
+        iq=np.concatenate(
+            [np.asarray(result.iq) for result in results],
+            axis=0,
+        ),
+        reserved_physical_words=reserved,
+        sweep_axes=final_axes,
+        sweep_shape=software_shape + hardware_shape,
+    )
+
+
+def execute_qick_sequence(
+    soc,
+    soccfg,
+    sequence,
+    *,
+    awg_channels: Sequence[int],
+    repetitions_per_sweep: int,
+    tproc_mhz: Optional[float] = None,
+    rf_specs: Sequence[QickRfPulseSpec],
+    readout_spec: QickDdrReadoutSpec,
+    sequence_fabric_mhz: float = 300.0,
+    compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
+    progress: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
+    event_callback: Optional[ExperimentEventCallback] = None,
+    cancel_check: Optional[CancellationCheck] = None,
+) -> Tuple[Any, Any, Mapping[str, Any]]:
+    """Execute once, or recompile once per predefined CPMG/UDD point."""
+    rf_specs = tuple(rf_specs)
+    bindings = _rf_software_sweep_bindings(rf_specs)
+    if not bindings:
+        return _execute_qick_sequence_once(
+            soc,
+            soccfg,
+            sequence,
+            awg_channels=awg_channels,
+            repetitions_per_sweep=repetitions_per_sweep,
+            tproc_mhz=tproc_mhz,
+            rf_specs=rf_specs,
+            readout_spec=readout_spec,
+            compile_validation_mode=compile_validation_mode,
+            progress=progress,
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+            cancel_check=cancel_check,
+        )
+
+    coordinates = _software_sweep_coordinates(bindings)
+    programs = []
+    results = []
+    first_rf_settings = None
+    total = coordinates.shape[0]
+    for point_index, coordinate in enumerate(coordinates):
+        _check_cancel(cancel_check)
+        concrete_specs = _rf_specs_at_software_coordinate(
+            rf_specs,
+            bindings,
+            coordinate,
+        )
+        concrete_sequence = _sequence_at_rf_software_coordinate(
+            sequence,
+            concrete_specs,
+            fabric_mhz=float(sequence_fabric_mhz),
+        )
+
+        def point_progress(percent: int, message: str) -> None:
+            local_fraction = max(
+                0.0,
+                min(1.0, (float(percent) - 5.0) / 59.0),
+            )
+            global_percent = 5 + round(
+                ((point_index + local_fraction) / total) * 59
+            )
+            _emit_progress(
+                progress_callback,
+                global_percent,
+                f"RF software sweep {point_index + 1:,}/{total:,}: {message}",
+            )
+
+        def point_event(key: str, state: str, message: str) -> None:
+            _emit_experiment_event(
+                event_callback,
+                key,
+                state,
+                f"RF software sweep {point_index + 1:,}/{total:,}: {message}",
+            )
+
+        program, result, rf_settings = _execute_qick_sequence_once(
+            soc,
+            soccfg,
+            concrete_sequence,
+            awg_channels=awg_channels,
+            repetitions_per_sweep=repetitions_per_sweep,
+            tproc_mhz=tproc_mhz,
+            rf_specs=concrete_specs,
+            readout_spec=readout_spec,
+            compile_validation_mode=compile_validation_mode,
+            progress=progress,
+            progress_callback=point_progress,
+            event_callback=point_event,
+            cancel_check=cancel_check,
+        )
+        programs.append(program)
+        results.append(result)
+        if first_rf_settings is None:
+            first_rf_settings = dict(rf_settings)
+
+    combined = _combine_software_sweep_results(
+        results,
+        bindings,
+        coordinates,
+    )
+    bundle = SoftwareSweepProgramBundle(
+        programs=tuple(programs),
+        sweep_axes=tuple(axis for _index, axis in bindings),
+        sweep_coordinates=coordinates,
+    )
+    first_rf_settings.update({
+        "predefined_software_sweep": {
+            "execution": "host software sweep",
+            "program_count": total,
+            "axes": [asdict(axis) for _index, axis in bindings],
+            "coordinates": coordinates.tolist(),
+        },
+    })
+    return bundle, combined, first_rf_settings
+
+
 def _sweep_coordinates(ddr_result: Any) -> np.ndarray:
     axis_count = len(tuple(ddr_result.sweep_axes))
     point_count = int(np.asarray(ddr_result.iq).shape[0])
@@ -1149,6 +1495,8 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
     for axis in axes:
         axis_kind = getattr(axis, "axis_kind", "amplitude")
         suffix = {
+            "rf_template_n": "pulse_count_n",
+            "rf_template_tau": "tau_us",
             "rf_duration": "duration_us",
             "rf_frequency": "frequency_mhz",
             "rf_power": "output_power_dbm",
@@ -1171,6 +1519,10 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
 
 def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, float]:
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind == "rf_template_n":
+        return "predefined RF pulse count N", "", 1.0
+    if axis_kind == "rf_template_tau":
+        return "predefined RF tau", "us", 1.0
     if axis_kind == "rf_duration":
         return "RF pulse duration", "us", 1.0
     if axis_kind == "rf_frequency":
@@ -1187,7 +1539,17 @@ def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, floa
 def _sweep_axis_meaning(axis: Any) -> str:
     """Describe one stored Cartesian coordinate without nested UI logic."""
     axis_kind = getattr(axis, "axis_kind", "amplitude")
-    if axis_kind == "rf_duration":
+    if axis_kind == "rf_template_n":
+        meaning = (
+            f"Predefined composite RF pulse count N for {axis.output_name}/"
+            f"{axis.segment_name}; each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_template_tau":
+        meaning = (
+            f"Predefined composite RF tau for {axis.output_name}/"
+            f"{axis.segment_name}; each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_duration":
         meaning = (
             f"RF pulse duration for {axis.output_name}/"
             f"{axis.segment_name}"
@@ -1717,7 +2079,14 @@ def store_qick_result(
             "count": int(axis.count),
         }
         axis_kind = getattr(axis, "axis_kind", "amplitude")
-        if axis_kind == "rf_duration":
+        if axis_kind in {"rf_template_n", "rf_template_tau"}:
+            axis_metadata.update({
+                "parameter_name": str(axis.parameter_name),
+                "execution": (
+                    "host software sweep; compile and acquire once per point"
+                ),
+            })
+        elif axis_kind == "rf_duration":
             axis_metadata.update({
                 "duration_start_us": float(axis.start),
                 "duration_stop_us": float(axis.stop),
@@ -2153,9 +2522,18 @@ def run_qick_qcodes_experiment(
         compile_validation_mode
     )
     stored_qick_settings["compile_validation_mode"] = compile_validation_mode
+    software_bindings = _rf_software_sweep_bindings(rf_specs)
+    software_coordinates = _software_sweep_coordinates(software_bindings)
+    if software_bindings:
+        stored_gui_settings["rf_predefined_software_sweep"] = {
+            "execution": "host software sweep",
+            "axes": [asdict(axis) for _index, axis in software_bindings],
+            "coordinates": software_coordinates.tolist(),
+            "program_count": int(software_coordinates.shape[0]),
+        }
+    fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
     if hasattr(sequence, "waveform_vertices"):
         _check_cancel(cancel_check)
-        fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
         full_scale_mv = float(
             qick_settings.get(
                 "full_scale_mv",
@@ -2169,11 +2547,34 @@ def run_qick_qcodes_experiment(
             "started",
             "Preparing parametric AWG waveform recipe",
         )
-        stored_gui_settings["awg_waveform_recipe"] = build_awg_waveform_recipe(
+        awg_recipe = dict(build_awg_waveform_recipe(
             sequence,
             fabric_mhz=fabric_mhz,
             full_scale_mv=full_scale_mv,
-        )
+        ))
+        if software_bindings:
+            software_axes = [
+                {
+                    **asdict(axis),
+                    "execution": "host software sweep",
+                }
+                for _index, axis in software_bindings
+            ]
+            awg_recipe["sweep_axes"] = (
+                software_axes + list(awg_recipe["sweep_axes"])
+            )
+            awg_recipe["sweep_shape"] = (
+                [int(axis.count) for _index, axis in software_bindings]
+                + list(awg_recipe["sweep_shape"])
+            )
+            awg_recipe["point_count"] = int(
+                awg_recipe["point_count"] * software_coordinates.shape[0]
+            )
+            awg_recipe["reconstruction"] += (
+                " Predefined RF N/tau axes are host software sweeps; RF-driven "
+                "SET extension timing is rebuilt for each coordinate."
+            )
+        stored_gui_settings["awg_waveform_recipe"] = awg_recipe
         _check_cancel(cancel_check)
         _emit_experiment_event(
             event_callback,
@@ -2181,7 +2582,18 @@ def run_qick_qcodes_experiment(
             "completed",
             "Parametric AWG waveform recipe prepared",
         )
-        if metadata_mode == AWG_METADATA_MODE_EXPANDED:
+        if metadata_mode == AWG_METADATA_MODE_EXPANDED and software_bindings:
+            # Expanded AWG vertices would require one potentially very large
+            # duplicate array per host RF point.  Preserve the exact compact
+            # recipe and make this storage downgrade explicit in metadata.
+            stored_gui_settings["awg_waveform_vertices_omitted"] = {
+                "reason": (
+                    "expanded AWG vertices are omitted for predefined RF "
+                    "software sweeps; reconstruct from the compact recipe"
+                ),
+                "requested_mode": AWG_METADATA_MODE_EXPANDED,
+            }
+        elif metadata_mode == AWG_METADATA_MODE_EXPANDED:
             _emit_progress(progress_callback, 4, "Building expanded AWG vertices")
             _emit_experiment_event(
                 event_callback,
@@ -2210,6 +2622,7 @@ def run_qick_qcodes_experiment(
         tproc_mhz=tproc_mhz,
         rf_specs=rf_specs,
         readout_spec=readout_spec,
+        sequence_fabric_mhz=fabric_mhz,
         compile_validation_mode=compile_validation_mode,
         progress=progress,
         progress_callback=progress_callback,
@@ -2272,6 +2685,7 @@ __all__ = [
     "ProgressCallback",
     "QcodesRunConfig",
     "QickConnectionConfig",
+    "SoftwareSweepProgramBundle",
     "StoredQickExperiment",
     "build_awg_vertex_record",
     "build_awg_vertex_metadata",

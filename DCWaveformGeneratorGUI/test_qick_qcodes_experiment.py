@@ -15,7 +15,13 @@ import pytest
 from plottr.data.qcodes_dataset import ds_to_datadicts
 
 import qick_qcodes_experiment as experiment_module
-from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec
+from dc_waveform_core import (
+    QickDdrReadoutSpec,
+    QickRfCompositeItemSpec,
+    QickRfDurationParameterSpec,
+    QickRfFrequencyParameterSpec,
+    QickRfPulseSpec,
+)
 from qick_fine_tune_sweep import (
     AmplitudeSweep,
     FineTuneDdrResult,
@@ -48,12 +54,98 @@ from qick_qcodes_experiment import (
     configure_rf_board,
     configure_rf_output,
     connect_qick,
+    execute_qick_sequence,
     load_qick_iq_arrays,
     normalize_compile_validation_mode,
     run_qick_qcodes_experiment,
     store_qick_result,
     write_awg_vertex_metadata_jsonl,
 )
+
+
+def test_predefined_rf_n_tau_software_sweep_executes_cartesian_programs(
+    monkeypatch,
+):
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("set_0", (0.0,), 300)
+    rf_spec = QickRfPulseSpec(
+        gen_ch=1,
+        segment_name="set_0",
+        delay_us=0.0,
+        duration_us=1.0,
+        frequency_mhz=50.0,
+        gain=20000,
+        att1_db=0.0,
+        att2_db=0.0,
+        pulse_mode="composite",
+        frequency_parameters=(
+            QickRfFrequencyParameterSpec("f0", 50.0),
+        ),
+        duration_parameters=(
+            QickRfDurationParameterSpec("d0", 0.1),
+        ),
+        predefined_template="cpmg",
+        predefined_n=2,
+        predefined_tau_us=5.0,
+        predefined_n_sweep_enabled=True,
+        predefined_n_sweep_start=2,
+        predefined_n_sweep_stop=3,
+        predefined_n_sweep_count=2,
+        predefined_tau_sweep_enabled=True,
+        predefined_tau_sweep_start_us=5.0,
+        predefined_tau_sweep_stop_us=10.0,
+        predefined_tau_sweep_count=2,
+    )
+    calls = []
+
+    def fake_execute(_soc, _soccfg, _sequence, **kwargs):
+        concrete = kwargs["rf_specs"][0]
+        calls.append((concrete.predefined_n, concrete.predefined_tau_us))
+        iq = np.asarray([[[[
+            concrete.predefined_n,
+            round(concrete.predefined_tau_us),
+        ]]]], dtype=np.int32)
+        result = FineTuneDdrResult(
+            sweep_points=np.asarray([0.0]),
+            iq=iq,
+            reserved_physical_words=128,
+            sweep_axes=(),
+            sweep_shape=(1,),
+        )
+        program = SimpleNamespace(
+            summary=lambda: {"concrete_n": concrete.predefined_n}
+        )
+        return program, result, {"outputs": []}
+
+    monkeypatch.setattr(
+        experiment_module,
+        "_execute_qick_sequence_once",
+        fake_execute,
+    )
+    program, result, rf_settings = execute_qick_sequence(
+        object(),
+        object(),
+        sequence,
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        rf_specs=(rf_spec,),
+        readout_spec=QickDdrReadoutSpec(0, "set_0", 0.0, 1),
+    )
+
+    assert calls == [(2, 5.0), (2, 10.0), (3, 5.0), (3, 10.0)]
+    assert [axis.axis_kind for axis in result.sweep_axes] == [
+        "rf_template_n",
+        "rf_template_tau",
+    ]
+    np.testing.assert_allclose(
+        result.sweep_points,
+        [[2, 5], [2, 10], [3, 5], [3, 10]],
+    )
+    assert result.sweep_shape == (2, 2)
+    assert result.iq.shape == (4, 1, 1, 2)
+    assert result.reserved_physical_words == 128
+    assert program.summary()["software_sweep_program_count"] == 4
+    assert rf_settings["predefined_software_sweep"]["program_count"] == 4
 
 
 def test_sweep_parameter_names_identify_output_segment_and_voltage_unit():
@@ -1072,6 +1164,172 @@ def test_runtime_configs_accept_manual_tproc_clock_override():
     assert build_runtime_ddr_readout(
         soccfg, ddr
     ).trigger_delay_tproc_cycles == 100
+
+
+def test_composite_runtime_expands_pulses_and_resolves_shared_frequency():
+    spec = QickRfPulseSpec(
+        0,
+        "set_0",
+        0.1,
+        1.0,
+        50.0,
+        20000,
+        0.0,
+        0.0,
+        pulse_mode="composite",
+        frequency_parameters=(
+            QickRfFrequencyParameterSpec(
+                "f0", 100.0, True, 100.0, 120.0, 3
+            ),
+        ),
+        duration_parameters=(
+            QickRfDurationParameterSpec(
+                "d0", 0.2, True, 0.2, 0.4, 3
+            ),
+            QickRfDurationParameterSpec("d1", 0.1),
+        ),
+        composite_items=(
+            QickRfCompositeItemSpec(
+                "pulse", "prepare", 0.2, "f0", 12000, 15.0,
+                duration_parameter="d0",
+            ),
+            QickRfCompositeItemSpec("delay", "wait", 0.05),
+            QickRfCompositeItemSpec(
+                "pulse", "read", 0.1, "f0", 8000, -30.0,
+                duration_parameter="d1",
+            ),
+        ),
+    )
+    runtime = build_runtime_rf_pulses(
+        {
+            "tprocs": [{"f_time": 300.0}],
+            "gens": [{"f_fabric": 300.0}],
+        },
+        (spec,),
+    )
+
+    assert len(runtime) == 2
+    assert [pulse.pulse_name for pulse in runtime] == ["prepare", "read"]
+    assert [pulse.event_id for pulse in runtime] == [
+        "rf_gen_0_composite_0",
+        "rf_gen_0_composite_1",
+    ]
+    assert [pulse.frequency_parameter for pulse in runtime] == ["f0", "f0"]
+    assert [pulse.duration_parameter for pulse in runtime] == ["d0", "d1"]
+    assert runtime[1].preceding_duration_parameters == ("d0",)
+    assert [pulse.delay_tproc_cycles for pulse in runtime] == [30, 105]
+    assert [pulse.length_cycles for pulse in runtime] == [60, 30]
+    assert [pulse.gain for pulse in runtime] == [12000, 8000]
+    assert [pulse.freq_mhz for pulse in runtime] == [100.0, 100.0]
+
+
+def test_runtime_composite_calibration_builds_gain_table_for_selected_pulse_only(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeCalibration:
+        summary = SimpleNamespace(run_id=73)
+
+        def build_gain_schedule(
+            self,
+            frequencies,
+            target_power_dbm,
+            **kwargs,
+        ):
+            calls.append((
+                tuple(float(value) for value in frequencies),
+                float(target_power_dbm),
+                kwargs,
+            ))
+            return SimpleNamespace(
+                gain_codes=np.asarray([101, 102, 103], dtype=np.int32)
+            )
+
+    class FakeCalibrationDatabase:
+        def __init__(self, path):
+            assert path == "pulse_calibration.db"
+
+        def output_calibration(self, board_type, frequencies, **kwargs):
+            assert board_type == "RF_Out"
+            assert tuple(frequencies) == (100.0, 110.0, 120.0)
+            assert kwargs == {
+                "run_id": 73,
+                "nqz": 2,
+                "output_filter_type": "highpass",
+                "output_filter_cutoff_ghz": 1.5,
+                "output_filter_bandwidth_ghz": 0.4,
+            }
+            return FakeCalibration()
+
+    monkeypatch.setattr(
+        experiment_module,
+        "CalibrationDatabase",
+        FakeCalibrationDatabase,
+    )
+    spec = QickRfPulseSpec(
+        0,
+        "set_0",
+        0.1,
+        1.0,
+        100.0,
+        20_000,
+        10.0,
+        5.0,
+        nqz=2,
+        filter_type="highpass",
+        filter_cutoff=1.5,
+        filter_bandwidth=0.4,
+        pulse_mode="composite",
+        frequency_parameters=(
+            QickRfFrequencyParameterSpec(
+                "f0", 100.0, True, 100.0, 120.0, 3
+            ),
+        ),
+        composite_items=(
+            QickRfCompositeItemSpec(
+                "pulse",
+                "calibrated",
+                0.2,
+                "f0",
+                1234,
+                0.0,
+                power_calibration_enabled=True,
+                power_calibration_database_path="pulse_calibration.db",
+                power_calibration_run_id=73,
+                target_output_power_dbm=-31.5,
+            ),
+            QickRfCompositeItemSpec(
+                "pulse", "manual", 0.1, "f0", 8000, 90.0
+            ),
+        ),
+    )
+    runtime = build_runtime_rf_pulses(
+        {
+            "tprocs": [{"f_time": 300.0}],
+            "gens": [{"f_fabric": 300.0}],
+        },
+        (spec,),
+    )
+
+    calibrated, manual = runtime
+    assert calibrated.gain == 101
+    assert calibrated.sweep_gain_codes == (101, 102, 103)
+    assert calibrated.sweep_gain_shape == (3, 1)
+    assert calibrated.power_calibration_run_id == 73
+    assert manual.gain == 8000
+    assert manual.sweep_gain_codes == ()
+    assert manual.sweep_gain_shape == (0, 0)
+    assert manual.power_calibration_run_id is None
+    assert calls == [(
+        (100.0, 110.0, 120.0),
+        -31.5,
+        {
+            "output_att1_db": 10.0,
+            "output_att2_db": 5.0,
+            "max_entries": 3,
+        },
+    )]
 
 
 def test_runtime_rf_frequency_power_sweep_builds_calibrated_gain_matrix(

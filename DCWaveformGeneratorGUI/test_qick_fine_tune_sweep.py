@@ -1463,6 +1463,146 @@ def test_rf_duration_is_a_cartesian_axis_with_amplitude_sweep():
     )
 
 
+def test_named_composite_rf_duration_axes_shift_following_pulse_timestamps():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 200)
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        10 / 300,
+        20 / 300,
+        2,
+        parameter_name="d0",
+        output_name="rf_gen_0_d0_duration",
+    )
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        30 / 300,
+        50 / 300,
+        2,
+        parameter_name="d1",
+        output_name="rf_gen_0_d1_duration",
+    )
+    pulses = (
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=10,
+            gain=12_000,
+            event_id="prepare",
+            pulse_name="prepare",
+            duration_parameter="d0",
+        ),
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=30,
+            gain=8_000,
+            delay_tproc_cycles=11,
+            event_id="read",
+            pulse_name="read",
+            duration_parameter="d1",
+            preceding_duration_parameters=("d0",),
+        ),
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulses=pulses,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    assert sequence.sweep_shape == (2, 2)
+    assert [axis.parameter_name for axis in sequence.sweep_axes] == ["d0", "d1"]
+    models = {model["key"]: model for model in program._event_timing_models}
+    assert models[("event_time", "rf_stop", 0)]["axis_deltas"] == (10, 0)
+    assert models[("event_time", "rf_start", 1)]["axis_deltas"] == (10, 0)
+    assert models[("event_time", "rf_stop", 1)]["axis_deltas"] == (10, 20)
+
+
+def test_composite_segment_extension_sums_shared_duration_parameters():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 20)
+    sequence.add_ramp("to_end", 10)
+    sequence.add_set("end", (0.25,), 20)
+    sequence.set_rf_segment_length_extension(
+        "gate",
+        0,
+        40,
+        parameter_multiplicities={"d0": 2, "d1": 1},
+    )
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        10 / 300,
+        20 / 300,
+        2,
+        segment_length_mode="extend_by_rf_duration",
+        parameter_name="d0",
+    )
+    sequence.add_rf_duration_sweep(
+        "gate",
+        0,
+        20 / 300,
+        40 / 300,
+        2,
+        segment_length_mode="extend_by_rf_duration",
+        parameter_name="d1",
+    )
+
+    assert sequence.sweep_shape == (2, 2)
+    assert [
+        sequence.segment_duration_cycles_at(point_index, 0)
+        for point_index in range(4)
+    ] == [60, 80, 80, 100]
+
+    pulses = (
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=10,
+            gain=12_000,
+            event_id="prepare_a",
+            duration_parameter="d0",
+        ),
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=10,
+            gain=12_000,
+            delay_tproc_cycles=10,
+            event_id="prepare_b",
+            duration_parameter="d0",
+            preceding_duration_parameters=("d0",),
+        ),
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=20,
+            gain=8_000,
+            delay_tproc_cycles=20,
+            event_id="read",
+            duration_parameter="d1",
+            preceding_duration_parameters=("d0", "d0"),
+        ),
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulses=pulses,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+    assert program._extension_axis_deltas(
+        1,
+        include_current=False,
+    ) == (20, 20)
+
+
 def test_rf_frequency_and_power_sweeps_load_exact_dmem_words():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("gate", (0.0,), 100)
@@ -1527,6 +1667,150 @@ def test_rf_frequency_and_power_sweeps_load_exact_dmem_words():
     assert summary["rf_power_sweeps"] == 1
     assert summary["rf_point_table_count"] == 2
     assert summary["rf_point_table_words"] == 9
+
+
+def test_composite_rf_events_share_one_named_frequency_dmem_table():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 200)
+    sequence.add_rf_frequency_sweep(
+        "gate",
+        0,
+        10.0,
+        30.0,
+        3,
+        parameter_name="f0",
+    )
+    pulses = (
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=20,
+            gain=1000,
+            freq_mhz=10.0,
+            delay_tproc_cycles=10,
+            event_id="prepare",
+            pulse_name="prepare",
+            frequency_parameter="f0",
+        ),
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=10,
+            gain=2000,
+            freq_mhz=10.0,
+            delay_tproc_cycles=60,
+            event_id="read",
+            pulse_name="read",
+            frequency_parameter="f0",
+        ),
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulses=pulses,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    summary = program.summary()
+    assert summary["rf_frequency_sweeps"] == 1
+    assert summary["rf_point_table_count"] == 1
+    assert summary["rf_point_table_words"] == 3
+    frequency_tables = [
+        table
+        for table in program._rf_point_tables
+        if table["register_name"] == "rf_frequency"
+    ]
+    assert len(frequency_tables) == 1
+    assert frequency_tables[0]["event_indices"] == (0, 1)
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=200_000)
+    rf_events = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and ((event.word >> 152) & 0xFF) == 0
+    ]
+    assert len(rf_events) == 6
+    expected = [
+        program._rf_frequency_word(pulses[0], frequency)
+        for frequency in (10.0, 10.0, 20.0, 20.0, 30.0, 30.0)
+    ]
+    assert [event.word & 0xFFFFFFFF for event in rf_events] == expected
+
+
+def test_composite_rf_calibration_uses_event_specific_gain_dmem_table():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("gate", (0.0,), 200)
+    sequence.add_rf_frequency_sweep(
+        "gate",
+        0,
+        10.0,
+        30.0,
+        3,
+        parameter_name="f0",
+    )
+    pulses = (
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=20,
+            gain=101,
+            freq_mhz=10.0,
+            delay_tproc_cycles=10,
+            sweep_gain_codes=(101, 102, 103),
+            sweep_gain_shape=(3, 1),
+            power_calibration_run_id=73,
+            event_id="calibrated",
+            pulse_name="calibrated",
+            frequency_parameter="f0",
+        ),
+        RfPulseConfig(
+            gen_ch=0,
+            at_segment="gate",
+            length_cycles=10,
+            gain=2000,
+            freq_mhz=10.0,
+            delay_tproc_cycles=60,
+            event_id="manual",
+            pulse_name="manual",
+            frequency_parameter="f0",
+        ),
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulses=pulses,
+        command_lead_tproc_cycles=0,
+        recovery_tproc_cycles=0,
+    )
+    program.compile()
+
+    summary = program.summary()
+    assert summary["rf_point_table_count"] == 2
+    assert summary["rf_point_table_words"] == 6
+    gain_tables = [
+        table
+        for table in program._rf_point_tables
+        if table["register_name"] == "rf_gain"
+    ]
+    assert len(gain_tables) == 1
+    assert gain_tables[0]["event_indices"] == (0,)
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=200_000)
+    rf_events = [
+        event
+        for event in tproc.output_events
+        if event.tproc_ch == 0 and ((event.word >> 152) & 0xFF) == 0
+    ]
+    assert len(rf_events) == 6
+    assert [
+        (event.word >> 96) & 0xFFFFFFFF for event in rf_events
+    ] == [101, 2000, 102, 2000, 103, 2000]
 
 
 def test_rf_and_readout_phase_reset_are_fixed_off():

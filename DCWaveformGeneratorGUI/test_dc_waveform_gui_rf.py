@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 import ast
+from dataclasses import asdict
 import json
 import os
 from types import SimpleNamespace
@@ -23,9 +24,13 @@ from dc_waveform_core import (
     QickDdrReadoutSpec,
     QickHoldDurationSweepSpec,
     QickRampRateSweepSpec,
+    QickRfCompositeItemSpec,
+    QickRfDurationParameterSpec,
+    QickRfFrequencyParameterSpec,
     QickRfPulseSpec,
     QickSweepSpec,
     adc_iq_to_voltage,
+    build_predefined_composite_items,
     dc_iq_to_current,
     generate_qick_program_code,
 )
@@ -426,6 +431,335 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
     app.processEvents()
     assert len(window._rf_ports_panel.specs()) == 1
     assert len(window._rf_timelines) == 1
+    window.close()
+
+
+def test_composite_rf_editor_round_trip_and_timeline_omit_delays():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    settings = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "delay_us": 0.1,
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec(
+                "f0", 100.0, True, 100.0, 120.0, 3
+            )),
+            asdict(QickRfFrequencyParameterSpec("f1", 250.0)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "prepare", 0.2, "f0", 12000, 15.0
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "wait", 0.1)),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "read", 0.2, "f1", 8000, -30.0
+            )),
+        ],
+    }
+    panel.load_settings(settings)
+    app.processEvents()
+
+    spec = panel.configured_spec()
+    assert spec.pulse_mode == "composite"
+    assert [event.name for event in spec.pulse_events] == ["prepare", "read"]
+    assert [event.delay_us for event in spec.pulse_events] == [0.1, 0.4]
+    assert [event.frequency_mhz for event in spec.pulse_events] == [100.0, 250.0]
+    assert [(axis.parameter_name, axis.count) for axis in spec.sweep_axes] == [
+        ("f0", 3)
+    ]
+    assert len(window._rf_timelines) == 1
+    timeline = window._rf_timelines[0]
+    assert timeline.pulse_names == ("prepare", "read")
+    assert [
+        label.textItem.toPlainText() for label in timeline._pulse_labels
+    ] == ["prepare", "read"]
+    assert [label.pos().x() for label in timeline._pulse_labels] == [200.0, 500.0]
+
+    restored = gui.RfPulsePortPanel(window._pulse[0], 0, time_unit="us")
+    restored.load_settings(panel.settings_dict())
+    assert restored.configured_spec() == spec
+    assert restored.composite_mode.isChecked() is True
+    restored.close()
+    window.close()
+
+
+def test_composite_rf_duration_parameters_are_shared_sweep_axes():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    settings = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "segment_length_mode": "extend_by_rf_duration",
+        "delay_us": 0.1,
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 100.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec(
+                "d0", 0.2, True, 0.1, 0.3, 3
+            )),
+            asdict(QickRfDurationParameterSpec("d1", 0.4)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "prepare", 0.2, "f0", 12000, 15.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "wait", 0.1)),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "read", 0.4, "f0", 8000, -30.0,
+                duration_parameter="d1",
+            )),
+        ],
+    }
+    panel.load_settings(settings)
+    app.processEvents()
+
+    spec = panel.configured_spec()
+    assert [item.name for item in spec.duration_parameters] == ["d0", "d1"]
+    assert [item.duration_parameter for item in spec.composite_items] == [
+        "d0", "", "d1"
+    ]
+    assert [event.duration_us for event in spec.pulse_events] == [0.1, 0.4]
+    assert [event.delay_us for event in spec.pulse_events] == pytest.approx(
+        [0.1, 0.3]
+    )
+    assert spec.pulse_events[1].preceding_duration_parameters == ("d0",)
+    assert spec.segment_extension_duration_us == pytest.approx(0.7)
+    assert spec.duration_parameter_reference_counts == (("d0", 1),)
+    assert [
+        (axis.axis_kind, axis.parameter_name, axis.count)
+        for axis in spec.sweep_axes
+    ] == [("rf_duration", "d0", 3)]
+    assert panel.composite_item_table.cellWidget(0, 3).currentText() == "d0"
+    assert panel.composite_item_table.cellWidget(2, 3).currentText() == "d1"
+    assert panel.segment_length_mode.isHidden() is False
+    assert panel.segment_length_mode.isEnabled() is True
+    assert panel.segment_length_mode.currentData() == "extend_by_rf_duration"
+    assert "total composite sequence time" in panel.segment_length_mode.itemText(1)
+
+    arguments = window._experiment_run_arguments(
+        require_readout=False,
+        require_run_config=False,
+    )
+    sequence = arguments["sequence"]
+    set_index = next(
+        index
+        for index, segment in enumerate(sequence.segments)
+        if segment.name == spec.segment_name
+    )
+    original_cycles = sequence.segments[set_index].duration_cycles
+    assert [
+        sequence.segment_duration_cycles_at(point_index, set_index)
+        - original_cycles
+        for point_index in range(3)
+    ] == [210, 240, 270]
+
+    restored = gui.RfPulsePortPanel(window._pulse[0], 0, time_unit="us")
+    restored.load_settings(panel.settings_dict())
+    assert restored.configured_spec() == spec
+    restored.close()
+    window.close()
+
+
+def test_predefined_cpmg_and_udd_item_timing():
+    cpmg = build_predefined_composite_items(
+        "cpmg",
+        n_pulses=4,
+        tau_us=10.0,
+        frequency_parameter="f0",
+        duration_parameter="d0",
+    )
+    assert [item.name for item in cpmg if item.kind == "pulse"] == [
+        "CPMG_X1",
+        "CPMG_X2",
+        "CPMG_X3",
+        "CPMG_X4",
+    ]
+    assert [item.duration_us for item in cpmg if item.kind == "delay"] == [
+        5.0,
+        10.0,
+        10.0,
+        10.0,
+        5.0,
+    ]
+
+    udd = build_predefined_composite_items(
+        "udd",
+        n_pulses=4,
+        tau_us=10.0,
+        frequency_parameter="f0",
+        duration_parameter="d0",
+    )
+    udd_delays = [item.duration_us for item in udd if item.kind == "delay"]
+    assert len(udd_delays) == 5
+    assert sum(udd_delays) == pytest.approx(10.0)
+    assert np.cumsum(udd_delays[:-1]) == pytest.approx(
+        [
+            10.0 * np.sin(np.pi * index / 10.0) ** 2
+            for index in range(1, 5)
+        ]
+    )
+
+
+def test_predefined_composite_editor_round_trip_and_software_axes():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    settings = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "predefined_template": "cpmg",
+        "predefined_n": 4,
+        "predefined_tau_us": 8.0,
+        "predefined_n_sweep_enabled": True,
+        "predefined_n_sweep_start": 2,
+        "predefined_n_sweep_stop": 4,
+        "predefined_n_sweep_count": 3,
+        "predefined_tau_sweep_enabled": True,
+        "predefined_tau_sweep_start_us": 4.0,
+        "predefined_tau_sweep_stop_us": 8.0,
+        "predefined_tau_sweep_count": 2,
+    }
+    panel.load_settings(settings)
+    app.processEvents()
+
+    spec = panel.configured_spec()
+    assert spec.predefined_template == "cpmg"
+    assert len(spec.composite_items) == 9
+    assert [axis.axis_kind for axis in spec.software_sweep_axes] == [
+        "rf_template_n",
+        "rf_template_tau",
+    ]
+    assert spec.software_sweep_axes[0].points.tolist() == [2, 3, 4]
+    assert spec.software_sweep_axes[1].points.tolist() == [4.0, 8.0]
+    assert "6 Cartesian point(s)" in (
+        window._experiment_panel.ddr_usage_summary.text()
+    )
+    assert panel.composite_item_table.rowCount() == 9
+    assert panel.composite_item_table.cellWidget(1, 1).text() == "CPMG_X1"
+    assert panel.add_composite_pulse_button.isEnabled() is False
+
+    decoded = window._decode_settings(window._settings_to_dict())
+    decoded_rf = decoded["rf_outputs"][0]
+    assert decoded_rf["predefined_template"] == "cpmg"
+    assert decoded_rf["predefined_n_sweep_enabled"] is True
+    assert decoded_rf["predefined_tau_sweep_count"] == 2
+
+    restored = gui.RfPulsePortPanel(window._pulse[0], 0, time_unit="us")
+    restored.load_settings(panel.settings_dict())
+    assert restored.configured_spec() == spec
+    restored.close()
+    window.close()
+
+
+def test_predefined_software_sweep_can_be_edited_and_removed_from_experiment():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "predefined_template": "udd",
+        "predefined_n_sweep_enabled": True,
+        "predefined_n_sweep_start": 2,
+        "predefined_n_sweep_stop": 4,
+        "predefined_n_sweep_count": 3,
+    })
+    app.processEvents()
+    n_axis = next(
+        axis
+        for axis in window._active_map_sweep_specs()
+        if axis.axis_kind == "rf_template_n"
+    )
+
+    window._update_sweep_parameter(n_axis, 3.0, 5.0, 3)
+    app.processEvents()
+    updated = next(
+        axis
+        for axis in window._active_map_sweep_specs()
+        if axis.axis_kind == "rf_template_n"
+    )
+    assert updated.points.tolist() == [3, 4, 5]
+
+    window._remove_sweep_parameter(updated)
+    app.processEvents()
+    assert not any(
+        axis.axis_kind == "rf_template_n"
+        for axis in window._active_map_sweep_specs()
+    )
+    window.close()
+
+
+def test_composite_rf_power_calibration_is_independent_per_pulse():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    settings = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "output_board_type": "RF_Out",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec(
+                "f0", 100.0, True, 100.0, 120.0, 3
+            )),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse",
+                "calibrated",
+                0.2,
+                "f0",
+                1234,
+                0.0,
+                power_calibration_enabled=True,
+                power_calibration_database_path="pulse_calibration.db",
+                power_calibration_run_id=73,
+                target_output_power_dbm=-31.5,
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "manual", 0.2, "f0", 8000, 90.0
+            )),
+        ],
+    }
+    panel.load_settings(settings)
+    app.processEvents()
+
+    spec = panel.configured_spec()
+    calibrated, manual = spec.composite_items
+    assert calibrated.power_calibration_enabled is True
+    assert calibrated.power_calibration_database_path == "pulse_calibration.db"
+    assert calibrated.power_calibration_run_id == 73
+    assert calibrated.target_output_power_dbm == -31.5
+    assert manual.power_calibration_enabled is False
+    assert manual.gain == 8000
+
+    calibrated_button = panel.composite_item_table.cellWidget(0, 6)
+    manual_button = panel.composite_item_table.cellWidget(1, 6)
+    assert calibrated_button.text() == "-31.5 dBm | Run 73"
+    assert manual_button.text() == "Manual gain"
+    assert panel.composite_item_table.cellWidget(0, 5).isEnabled() is False
+    assert panel.composite_item_table.cellWidget(1, 5).isEnabled() is True
+
+    decoded = window._decode_settings(window._settings_to_dict())
+    decoded_items = decoded["rf_outputs"][0]["composite_items"]
+    assert decoded_items[0]["power_calibration_enabled"] is True
+    assert decoded_items[0]["power_calibration_run_id"] == 73
+    assert decoded_items[0]["target_output_power_dbm"] == -31.5
+    assert decoded_items[1]["power_calibration_enabled"] is False
+
+    restored = gui.RfPulsePortPanel(window._pulse[0], 0, time_unit="us")
+    restored.load_settings(panel.settings_dict())
+    assert restored.configured_spec() == spec
+    restored.close()
     window.close()
 
 
@@ -913,6 +1247,70 @@ def test_generated_qick_module_preserves_rf_duration_sweep_mode():
     })
     assert len(runtime_rf) == 1
     assert runtime_rf[0].length_cycles == 300
+
+
+def test_generated_qick_module_preserves_composite_rf_sequence():
+    pulse = PulseSequence(0.0, initial_duration_ns=10_000.0)
+    rf_spec = QickRfPulseSpec(
+        0,
+        "set_0",
+        0.1,
+        1.0,
+        50.0,
+        12000,
+        0.0,
+        0.0,
+        pulse_mode="composite",
+        segment_length_mode="extend_by_rf_duration",
+        frequency_parameters=(
+            QickRfFrequencyParameterSpec(
+                "f0", 100.0, True, 100.0, 120.0, 3
+            ),
+        ),
+        duration_parameters=(
+            QickRfDurationParameterSpec(
+                "d0", 0.2, True, 0.2, 0.4, 3
+            ),
+            QickRfDurationParameterSpec("d1", 0.2),
+        ),
+        composite_items=(
+            QickRfCompositeItemSpec(
+                "pulse", "prepare", 0.2, "f0", 12000, 0.0,
+                duration_parameter="d0",
+            ),
+            QickRfCompositeItemSpec("delay", "wait", 0.1),
+            QickRfCompositeItemSpec(
+                "pulse", "read", 0.2, "f0", 8000, 90.0,
+                duration_parameter="d1",
+            ),
+        ),
+    )
+    code = generate_qick_program_code(
+        (pulse,),
+        output_names=("awg_0",),
+        awg_channels=(1,),
+        tproc_mhz=300.0,
+        rf_pulse_specs=(rf_spec,),
+    )
+    ast.parse(code)
+    namespace = {}
+    exec(compile(code, "<composite-rf-generated>", "exec"), namespace)
+
+    sequence = namespace["build_sequence"]()
+    assert len(sequence.sweep_axes) == 2
+    assert [axis.parameter_name for axis in sequence.sweep_axes] == ["d0", "f0"]
+    assert [
+        sequence.segment_duration_cycles_at(point_index, 0)
+        for point_index in (0, 3, 6)
+    ] == [3180, 3210, 3240]
+    runtime = namespace["build_rf_pulses"]({
+        "tprocs": [{"f_time": 300.0}],
+        "gens": [{"f_fabric": 300.0}],
+    })
+    assert [item.pulse_name for item in runtime] == ["prepare", "read"]
+    assert [item.delay_tproc_cycles for item in runtime] == [30, 120]
+    assert [item.duration_parameter for item in runtime] == ["d0", "d1"]
+    assert runtime[1].preceding_duration_parameters == ("d0",)
 
 
 def test_generated_qick_module_preserves_multiple_ramp_rate_sweeps():
@@ -1992,7 +2390,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 36
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 40
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0
