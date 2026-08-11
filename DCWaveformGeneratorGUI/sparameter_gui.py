@@ -26,6 +26,7 @@ else:
 
 try:
     from .qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
@@ -43,6 +44,7 @@ try:
     from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
     from qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
@@ -614,14 +616,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.scan_time_us.setDecimals(6)
         self.scan_time_us.setValue(10.0)
         self.scan_time_us.setSuffix(" us")
-        self.minimum_coherent_samples = QtWidgets.QSpinBox()
-        self.minimum_coherent_samples.setRange(1, 10_000_000)
-        self.minimum_coherent_samples.setValue(100)
-        self.minimum_coherent_samples.setToolTip(
-            "Minimum number of FIR samples coherently averaged at every RF "
-            "frequency. At 50 kSPS, 100 samples require 2 ms per point and "
-            "avoid multi-dB integer-I/Q quantization steps at low power."
-        )
         sweep_form.addRow("Start frequency:", self.frequency_start_mhz)
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
@@ -629,10 +623,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         sweep_form.addRow("Single target power:", self.output_power_dbm)
         sweep_form.addRow("dBm -> applied gain:", self.calculated_gain_status)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
-        sweep_form.addRow(
-            "Minimum coherent samples:",
-            self.minimum_coherent_samples,
-        )
         content_layout.addWidget(sweep_group)
 
         self.power_calibration_enabled = QtWidgets.QGroupBox(
@@ -766,8 +756,28 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         self._update_filter_control_state()
 
-        capture_group = QtWidgets.QGroupBox("FIR DDR Capture")
+        capture_group = QtWidgets.QGroupBox("I/Q Acquisition")
         capture_form = QtWidgets.QFormLayout(capture_group)
+        self.acquisition_source = QtWidgets.QComboBox()
+        acquisition_labels = {
+            "fir_ddr": "FIR DDR trace mean",
+            "avg_buffer": "AVG buffer accumulated I/Q",
+        }
+        for source in ACQUISITION_SOURCES:
+            self.acquisition_source.addItem(acquisition_labels[source], source)
+        self.acquisition_source.setToolTip(
+            "FIR DDR stores a decimated I/Q trace and averages it in Python. "
+            "AVG buffer integrates the readout window in FPGA and averages "
+            "repeated captures for one I/Q value per frequency."
+        )
+        self.avg_repetitions = QtWidgets.QSpinBox()
+        self.avg_repetitions.setRange(1, 10_000_000)
+        self.avg_repetitions.setValue(100)
+        self.avg_repetitions.setToolTip(
+            "Number of repeated AVG-buffer integrations accumulated at every "
+            "frequency. QICK returns the result normalized by integration "
+            "length and repetitions."
+        )
         self.margin_input_samples = QtWidgets.QSpinBox()
         self.margin_input_samples.setRange(0, 10_000_000)
         self.margin_input_samples.setValue(1024)
@@ -798,6 +808,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.fir_profile_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
+        capture_form.addRow("Source:", self.acquisition_source)
+        capture_form.addRow("AVG repetitions / frequency:", self.avg_repetitions)
         capture_form.addRow("FIR input margin:", self.margin_input_samples)
         capture_form.addRow(
             "FPGA trigger-to-store delay:",
@@ -805,9 +817,23 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         capture_form.addRow("DDR start address:", self.address)
         capture_form.addRow("Trigger stride (bytes):", self.stride_bytes)
-        capture_form.addRow("HWH FIR DDR:", self.fir_profile_status)
+        capture_form.addRow("Acquisition details:", self.fir_profile_status)
         capture_form.addRow(self.force_overwrite)
         content_layout.addWidget(capture_group)
+        self._fir_capture_widgets = (
+            self.margin_input_samples,
+            self.override_fpga_trigger_delay,
+            self.fpga_trigger_delay_us,
+            self.address,
+            self.stride_bytes,
+            self.force_overwrite,
+        )
+        self.acquisition_source.currentIndexChanged.connect(
+            self._update_acquisition_source_state
+        )
+        self.avg_repetitions.valueChanged.connect(
+            self._update_fir_profile_status
+        )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -859,15 +885,13 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
         self.scan_time_us.valueChanged.connect(self._update_fir_profile_status)
-        self.minimum_coherent_samples.valueChanged.connect(
-            self._update_fir_profile_status
-        )
 
         self._internal_settings = {
             "settle_seconds": 0.05,
             "trigger_width_tproc_cycles": 12,
             "recovery_tproc_cycles": 20,
         }
+        self._update_acquisition_source_state()
 
     @staticmethod
     def _frequency_spin(value: float) -> QtWidgets.QDoubleSpinBox:
@@ -1165,14 +1189,36 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_fir_profile_status()
 
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
-        supported = self._fir_uses_fpga_trigger_delay is not False
+        supported = (
+            self.acquisition_source.currentData() == "fir_ddr"
+            and self._fir_uses_fpga_trigger_delay is not False
+        )
         self.override_fpga_trigger_delay.setEnabled(supported)
         self.fpga_trigger_delay_us.setEnabled(
             supported and self.override_fpga_trigger_delay.isChecked()
         )
         self._update_fir_profile_status()
 
+    def _update_acquisition_source_state(self, *_args) -> None:
+        uses_fir = self.acquisition_source.currentData() == "fir_ddr"
+        self.avg_repetitions.setEnabled(not uses_fir)
+        for widget in self._fir_capture_widgets:
+            widget.setEnabled(uses_fir)
+        self._update_fpga_trigger_delay_controls()
+        self._update_fir_profile_status()
+
     def _update_fir_profile_status(self, *_args) -> None:
+        if self.acquisition_source.currentData() == "avg_buffer":
+            integration_us = self.scan_time_us.value()
+            repetitions = self.avg_repetitions.value()
+            self.fir_profile_status.setStyleSheet("")
+            self.fir_profile_status.setText(
+                "AVG buffer: "
+                f"{integration_us:g} us integration x {repetitions:,} "
+                "repetitions per frequency; returned I/Q is normalized by "
+                "the integration length and repetition count. DDR is unused."
+            )
+            return
         if self._fir_sample_rate_hz is None:
             self.fir_profile_status.setText(
                 "Identify QICK to show the FIR DDR timing"
@@ -1188,10 +1234,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 )
             ),
         )
-        sample_count = max(
-            requested_sample_count,
-            self.minimum_coherent_samples.value(),
-        )
+        sample_count = requested_sample_count
         actual_time_us = (
             sample_count * 1_000_000.0 / float(self._fir_sample_rate_hz)
         )
@@ -1205,17 +1248,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 delay = f"; HWH FPGA delay {self._fir_trigger_delay_us:g} us"
         else:
             delay = "; no FPGA trigger-delay register"
-        if sample_count > requested_sample_count:
-            sample_text = (
-                f"requested {requested_sample_count:,} samples; "
-                f"minimum {sample_count:,} enforced = {actual_time_us:g} us actual"
-            )
-            self.fir_profile_status.setStyleSheet(
-                "QLabel { color: #9a5b00; font-weight: 600; }"
-            )
-        else:
-            sample_text = f"{sample_count:,} samples = {actual_time_us:g} us actual"
-            self.fir_profile_status.setStyleSheet("")
+        sample_text = f"{sample_count:,} samples = {actual_time_us:g} us actual"
+        self.fir_profile_status.setStyleSheet("")
         self.fir_profile_status.setText(
             f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{sample_text}{delay}"
@@ -1248,8 +1282,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             power_end_dbm=self.power_end_dbm.value(),
             power_points=self.power_points.value(),
             power_scale=str(self.power_scale.currentData()),
+            acquisition_source=str(self.acquisition_source.currentData()),
             scan_time_us=self.scan_time_us.value(),
-            minimum_coherent_samples=self.minimum_coherent_samples.value(),
+            minimum_coherent_samples=1,
+            avg_repetitions=self.avg_repetitions.value(),
             output_att1_db=path["output_att1_db"],
             output_att2_db=path["output_att2_db"],
             output_filter_type=self.output_filter_type.currentText(),
@@ -1269,6 +1305,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             fpga_trigger_delay_us=(
                 self.fpga_trigger_delay_us.value()
                 if (
+                    self.acquisition_source.currentData() == "fir_ddr"
+                    and
                     self.override_fpga_trigger_delay.isChecked()
                     and self._fir_uses_fpga_trigger_delay is not False
                 )
@@ -1290,7 +1328,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         values = dict(settings)
-        values.setdefault("minimum_coherent_samples", 100)
+        # Older settings may contain the retired capture-floor control.
+        values["minimum_coherent_samples"] = 1
+        values.setdefault("acquisition_source", "fir_ddr")
+        values.setdefault("avg_repetitions", 100)
         database_path = str(
             values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
         ).strip()
@@ -1313,10 +1354,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.power_end_dbm, config.power_end_dbm),
             (self.power_points, config.power_points),
             (self.scan_time_us, config.scan_time_us),
-            (
-                self.minimum_coherent_samples,
-                config.minimum_coherent_samples,
-            ),
+            (self.avg_repetitions, config.avg_repetitions),
             (self.output_att1_db, config.output_att1_db),
             (self.output_att2_db, config.output_att2_db),
             (self.output_filter_cutoff_ghz, config.output_filter_cutoff_ghz),
@@ -1367,6 +1405,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         if power_scale_index < 0:
             raise ValueError(f"unsupported power scale {config.power_scale!r}")
         self.power_scale.setCurrentIndex(power_scale_index)
+        source_index = self.acquisition_source.findData(config.acquisition_source)
+        if source_index < 0:
+            raise ValueError(
+                f"unsupported acquisition source {config.acquisition_source!r}"
+            )
+        self.acquisition_source.setCurrentIndex(source_index)
         selection_index = self.input_calibration_selection.findData(
             config.input_calibration_selection
         )
@@ -1386,6 +1430,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             "recovery_tproc_cycles": config.recovery_tproc_cycles,
         }
         self._update_fpga_trigger_delay_controls()
+        self._update_acquisition_source_state()
 
     def set_running(self, running: bool, message: str) -> None:
         self.run_button.setEnabled(not running)
@@ -1394,11 +1439,19 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.browse_database.setEnabled(not running)
         self.power_calibration_enabled.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
+        self.acquisition_source.setEnabled(not running)
+        uses_fir = self.acquisition_source.currentData() == "fir_ddr"
+        self.avg_repetitions.setEnabled(not running and not uses_fir)
+        for widget in self._fir_capture_widgets:
+            widget.setEnabled(not running and uses_fir)
         self.override_fpga_trigger_delay.setEnabled(
-            not running and self._fir_uses_fpga_trigger_delay is not False
+            not running
+            and uses_fir
+            and self._fir_uses_fpga_trigger_delay is not False
         )
         self.fpga_trigger_delay_us.setEnabled(
             not running
+            and uses_fir
             and self._fir_uses_fpga_trigger_delay is not False
             and self.override_fpga_trigger_delay.isChecked()
         )
@@ -1420,14 +1473,24 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             getattr(result, "sample_rate_hz", 1_000_000.0)
         )
         trace_time_us = result.sample_count * 1_000_000.0 / sample_rate_hz
+        source = getattr(result, "acquisition_source", "fir_ddr")
+        if source == "avg_buffer":
+            acquisition_text = (
+                f"AVG buffer, {float(result.integration_time_us):g} us x "
+                f"{int(result.accumulation_repetitions):,} repetitions"
+            )
+        else:
+            acquisition_text = (
+                f"{result.sample_count} FIR samples per point at "
+                f"{format_sample_rate_hz(sample_rate_hz)} "
+                f"({trace_time_us:g} us)"
+            )
         self.set_running(
             False,
             (
                 f"Run {stored.run_id}: {power_count} power point(s) x "
                 f"{result.frequencies_mhz.size} frequency points, "
-                f"{result.sample_count} FIR samples per point at "
-                f"{format_sample_rate_hz(sample_rate_hz)} "
-                f"({trace_time_us:g} us)\n"
+                f"{acquisition_text}\n"
                 f"{stored.database_path}"
             ),
         )

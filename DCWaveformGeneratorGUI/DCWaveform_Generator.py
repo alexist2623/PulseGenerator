@@ -443,7 +443,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 40
+SETTINGS_VERSION = 41
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -12358,27 +12358,39 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
 
         config = arguments["sweep_config"]
-        identified_rate = getattr(
-            self._qick_configuration,
-            "fir_sample_rate_hz",
-            None,
-        )
-        if identified_rate is None:
+        if config.uses_avg_buffer:
             sample_summary = (
-                f"{config.scan_time_us:g} us requested; HWH selects the "
-                "stored FIR sample count"
+                f"AVG buffer {config.scan_time_us:g} us integration x "
+                f"{config.avg_repetitions:,} repetitions per frequency"
             )
         else:
-            sample_count = max(
-                1,
-                int(np.ceil(config.scan_time_us * identified_rate / 1_000_000.0)),
+            identified_rate = getattr(
+                self._qick_configuration,
+                "fir_sample_rate_hz",
+                None,
             )
-            actual_time_us = sample_count * 1_000_000.0 / identified_rate
-            sample_summary = (
-                f"{sample_count:,} samples at "
-                f"{format_sample_rate_hz(identified_rate)} "
-                f"({actual_time_us:g} us actual)"
-            )
+            if identified_rate is None:
+                sample_summary = (
+                    f"{config.scan_time_us:g} us requested; HWH selects the "
+                    "stored FIR sample count"
+                )
+            else:
+                sample_count = max(
+                    1,
+                    int(
+                        np.ceil(
+                            config.scan_time_us
+                            * identified_rate
+                            / 1_000_000.0
+                        )
+                    ),
+                )
+                actual_time_us = sample_count * 1_000_000.0 / identified_rate
+                sample_summary = (
+                    f"{sample_count:,} samples at "
+                    f"{format_sample_rate_hz(identified_rate)} "
+                    f"({actual_time_us:g} us actual)"
+                )
         power_count = int(config.power_gains.size)
         self._sparameter_panel.set_running(
             True,

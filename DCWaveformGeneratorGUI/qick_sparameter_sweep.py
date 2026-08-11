@@ -1,9 +1,9 @@
-"""Hardware RF frequency sweep and FIR-DDR S-parameter acquisition.
+"""Hardware RF frequency sweep with selectable I/Q acquisition.
 
 This module is intentionally independent of the AWG-tuning waveform path.
 The tProcessor advances the normal RF generator DDS and dynamic-readout DDS
-registers together, captures one FIR-decimated DDR trace per frequency, and
-reduces each trace to one complex I/Q value.
+registers together. Measurements can use either a FIR-decimated DDR trace or
+the QICK AVG buffer's accumulated I/Q value at every frequency.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -65,6 +65,8 @@ else:
 
 
 MAX_RF_OUTPUT_GAIN = 32766
+ACQUISITION_SOURCES = ("fir_ddr", "avg_buffer")
+AVG_ACCUM_SAFE_MAX_SAMPLES = 1 << 16
 FILTER_TYPES = ("bypass", "lowpass", "highpass", "bandpass")
 POWER_SCALES = ("linear", "log")
 INPUT_CALIBRATION_SELECTIONS = (
@@ -153,16 +155,16 @@ def _warn_unmeasurable_points(
         _emit_warning(
             callback,
             (
-                f"{context}: {all_zero_count} raw FIR trace(s) contain only "
-                "zeros; verify DDR triggering, readout routing, RF gain, and "
-                "ADC/FIR quantization. Their response was saved as NaN."
+                f"{context}: {all_zero_count} I/Q acquisition(s) contain only "
+                "zeros; verify triggering, readout routing, RF gain, and "
+                "ADC quantization. Their response was saved as NaN."
             ),
         )
     if cancelled_count:
         _emit_warning(
             callback,
             (
-                f"{context}: {cancelled_count} nonzero/noisy FIR trace(s) have "
+                f"{context}: {cancelled_count} nonzero/noisy I/Q acquisition(s) have "
                 "exactly zero coherent mean I/Q. The noise samples are present, "
                 "but their complex mean cancels, so magnitude and phase were "
                 "saved as NaN rather than an artificial -6000 dB value."
@@ -278,8 +280,12 @@ class SParameterSweepConfig:
     power_end_dbm: float = -10.0
     power_points: int = 5
     power_scale: str = "linear"
+    acquisition_source: str = "fir_ddr"
     scan_time_us: float = 10.0
+    # Legacy JSON/API field. It is accepted for backward compatibility but no
+    # longer expands the requested FIR capture length.
     minimum_coherent_samples: int = 1
+    avg_repetitions: int = 100
     output_att1_db: float = 10.0
     output_att2_db: float = 10.0
     output_filter_type: str = "bypass"
@@ -388,12 +394,18 @@ class SParameterSweepConfig:
                         "power sweep points collapse to duplicate integer gain codes; "
                         "reduce the point count or widen the gain range"
                     )
+        if self.acquisition_source not in ACQUISITION_SOURCES:
+            raise ValueError(
+                "acquisition_source must be one of "
+                f"{ACQUISITION_SOURCES}"
+            )
         _require_finite(self.scan_time_us, "scan_time_us", positive=True)
         _require_int(
             self.minimum_coherent_samples,
             "minimum_coherent_samples",
             1,
         )
+        _require_int(self.avg_repetitions, "avg_repetitions", 1)
         _require_attenuation(self.output_att1_db, "output_att1_db")
         _require_attenuation(self.output_att2_db, "output_att2_db")
         _require_attenuation(self.readout_attenuation_db, "readout_attenuation_db")
@@ -515,6 +527,14 @@ class SParameterSweepConfig:
         return self.output_board_type == "RF_Out"
 
     @property
+    def uses_fir_ddr(self) -> bool:
+        return self.acquisition_source == "fir_ddr"
+
+    @property
+    def uses_avg_buffer(self) -> bool:
+        return self.acquisition_source == "avg_buffer"
+
+    @property
     def input_has_attenuator(self) -> bool:
         return self.input_board_type == "RF_In"
 
@@ -632,7 +652,7 @@ class SParameterSweepConfig:
 
 @dataclass(frozen=True)
 class SParameterSweepResult:
-    """FIR DDR traces and derived one-complex-value response per frequency."""
+    """Stored I/Q data and derived one-complex-value response per frequency."""
 
     requested_frequencies_mhz: np.ndarray
     frequencies_mhz: np.ndarray
@@ -649,6 +669,9 @@ class SParameterSweepResult:
     frequency_gain_codes: Optional[np.ndarray] = None
     actual_output_powers_dbm: Optional[np.ndarray] = None
     input_powers_dbm: Optional[np.ndarray] = None
+    acquisition_source: str = "fir_ddr"
+    integration_time_us: Optional[float] = None
+    accumulation_repetitions: int = 1
 
     @classmethod
     def from_iq(
@@ -664,6 +687,9 @@ class SParameterSweepResult:
         frequency_gain_codes: Optional[Any] = None,
         actual_output_powers_dbm: Optional[Any] = None,
         input_powers_dbm: Optional[Any] = None,
+        acquisition_source: str = "fir_ddr",
+        integration_time_us: Optional[float] = None,
+        accumulation_repetitions: int = 1,
     ) -> "SParameterSweepResult":
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
@@ -733,6 +759,22 @@ class SParameterSweepResult:
             if actual_input is not None
             else adc_magnitude_db
         )
+        if acquisition_source not in ACQUISITION_SOURCES:
+            raise ValueError(
+                "acquisition_source must be one of "
+                f"{ACQUISITION_SOURCES}"
+            )
+        if integration_time_us is not None:
+            integration_time_us = _require_finite(
+                integration_time_us,
+                "integration_time_us",
+                positive=True,
+            )
+        accumulation_repetitions = _require_int(
+            accumulation_repetitions,
+            "accumulation_repetitions",
+            1,
+        )
         return cls(
             requested_frequencies_mhz=requested,
             frequencies_mhz=frequencies,
@@ -757,6 +799,9 @@ class SParameterSweepResult:
             input_powers_dbm=(
                 None if actual_input is None else np.ascontiguousarray(actual_input)
             ),
+            acquisition_source=acquisition_source,
+            integration_time_us=integration_time_us,
+            accumulation_repetitions=accumulation_repetitions,
         )
 
     @property
@@ -804,6 +849,9 @@ class SParameterPowerSweepResult:
     frequency_gain_codes: Optional[np.ndarray] = None
     actual_output_powers_dbm: Optional[np.ndarray] = None
     input_powers_dbm: Optional[np.ndarray] = None
+    acquisition_source: str = "fir_ddr"
+    integration_time_us: Optional[float] = None
+    accumulation_repetitions: int = 1
 
     @classmethod
     def from_iq(
@@ -819,6 +867,9 @@ class SParameterPowerSweepResult:
         frequency_gain_codes: Optional[Any] = None,
         actual_output_powers_dbm: Optional[Any] = None,
         input_powers_dbm: Optional[Any] = None,
+        acquisition_source: str = "fir_ddr",
+        integration_time_us: Optional[float] = None,
+        accumulation_repetitions: int = 1,
     ) -> "SParameterPowerSweepResult":
         gains = np.asarray(power_gains, dtype=np.int64).reshape(-1)
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
@@ -882,6 +933,22 @@ class SParameterPowerSweepResult:
                 )
             if actual_output is None:
                 raise ValueError("input powers require actual output powers")
+        if acquisition_source not in ACQUISITION_SOURCES:
+            raise ValueError(
+                "acquisition_source must be one of "
+                f"{ACQUISITION_SOURCES}"
+            )
+        if integration_time_us is not None:
+            integration_time_us = _require_finite(
+                integration_time_us,
+                "integration_time_us",
+                positive=True,
+            )
+        accumulation_repetitions = _require_int(
+            accumulation_repetitions,
+            "accumulation_repetitions",
+            1,
+        )
         return cls(
             power_gains=np.ascontiguousarray(gains),
             requested_frequencies_mhz=np.ascontiguousarray(requested),
@@ -912,6 +979,9 @@ class SParameterPowerSweepResult:
             input_powers_dbm=(
                 None if actual_input is None else np.ascontiguousarray(actual_input)
             ),
+            acquisition_source=acquisition_source,
+            integration_time_us=integration_time_us,
+            accumulation_repetitions=accumulation_repetitions,
         )
 
     @classmethod
@@ -936,6 +1006,17 @@ class SParameterPowerSweepResult:
                 raise ValueError("all power points must share one IQ trace shape")
             if result.sample_rate_hz != reference.sample_rate_hz:
                 raise ValueError("all power points must share one sample rate")
+            if result.acquisition_source != reference.acquisition_source:
+                raise ValueError("all power points must share one acquisition source")
+            if result.integration_time_us != reference.integration_time_us:
+                raise ValueError("all power points must share one integration time")
+            if (
+                result.accumulation_repetitions
+                != reference.accumulation_repetitions
+            ):
+                raise ValueError(
+                    "all power points must share one accumulation repetition count"
+                )
         return cls.from_iq(
             power_gains,
             reference.requested_frequencies_mhz,
@@ -968,6 +1049,9 @@ class SParameterPowerSweepResult:
                 if all(result.input_powers_dbm is not None for result in sweeps)
                 else None
             ),
+            acquisition_source=reference.acquisition_source,
+            integration_time_us=reference.integration_time_us,
+            accumulation_repetitions=reference.accumulation_repetitions,
         )
 
     @property
@@ -1059,6 +1143,9 @@ def apply_power_calibration(
         frequency_gain_codes=result.frequency_gain_codes,
         actual_output_powers_dbm=dut_input,
         input_powers_dbm=dut_output,
+        acquisition_source=result.acquisition_source,
+        integration_time_us=result.integration_time_us,
+        accumulation_repetitions=result.accumulation_repetitions,
     )
 
 
@@ -1136,7 +1223,9 @@ class SParameterSweepProgram(RAveragerProgram):
         super().__init__(
             soccfg,
             {
-                "reps": 1,
+                "reps": (
+                    sweep.avg_repetitions if sweep.uses_avg_buffer else 1
+                ),
                 "expts": sweep.frequency_points,
                 "start": sweep.frequency_start_mhz,
                 "step": (sweep.frequency_end_mhz - sweep.frequency_start_mhz)
@@ -1187,25 +1276,32 @@ class SParameterSweepProgram(RAveragerProgram):
                     f"{self.sweep.gain_dmem_base_address}..{table_end - 1}, "
                     f"but tProcessor DMEM depth is {dmem_size}"
                 )
-        self._fir_profile = resolve_fir_ddr_profile(
-            self.soccfg,
-            context="S-parameter sweep",
-        )
-        self._ddr_cfg = self._fir_profile.config
-        self.fir_output_rate_msps = self._fir_profile.sample_rate_msps
-        self._fir_trigger_delay_value = (
-            self._fir_profile.selected_trigger_delay_value(
-                self.sweep.fpga_trigger_delay_us
+        self._fir_profile = None
+        self._ddr_cfg = {}
+        self.fir_output_rate_msps = None
+        self._fir_trigger_delay_value = 0
+        self._fir_trigger_delay_input_cycles = 0
+        self._fir_trigger_delay_us = 0.0
+        if self.sweep.uses_fir_ddr:
+            self._fir_profile = resolve_fir_ddr_profile(
+                self.soccfg,
+                context="S-parameter sweep",
             )
-        )
-        self._fir_trigger_delay_input_cycles = (
-            self._fir_profile.trigger_delay_input_cycles_for(
+            self._ddr_cfg = self._fir_profile.config
+            self.fir_output_rate_msps = self._fir_profile.sample_rate_msps
+            self._fir_trigger_delay_value = (
+                self._fir_profile.selected_trigger_delay_value(
+                    self.sweep.fpga_trigger_delay_us
+                )
+            )
+            self._fir_trigger_delay_input_cycles = (
+                self._fir_profile.trigger_delay_input_cycles_for(
+                    self._fir_trigger_delay_value
+                )
+            )
+            self._fir_trigger_delay_us = self._fir_profile.trigger_delay_us_for(
                 self._fir_trigger_delay_value
             )
-        )
-        self._fir_trigger_delay_us = self._fir_profile.trigger_delay_us_for(
-            self._fir_trigger_delay_value
-        )
         return gen_cfg, ro_cfg
 
     def _frequency_grid(self, gen_cfg, ro_cfg) -> None:
@@ -1290,81 +1386,135 @@ class SParameterSweepProgram(RAveragerProgram):
             ch=self.sweep.output_ch,
             nqz=self.sweep.nqz,
         )
-        self.requested_scan_samples = max(
-            1,
-            int(ceil(self.sweep.scan_time_us * self.fir_output_rate_msps)),
-        )
-        self.scan_samples = max(
-            self.requested_scan_samples,
-            int(self.sweep.minimum_coherent_samples),
-        )
-        monitor_length = min(
-            self.scan_samples,
-            int(ro_cfg.get("buf_maxlen", self.scan_samples)),
-        )
-        self.declare_readout(
-            ch=self.sweep.readout_ch,
-            length=max(1, monitor_length),
-        )
-
-        decimation = self._fir_profile.decimation
-        group_delay = int(ceil(self._fir_profile.group_delay_input_samples))
-        input_fs_mhz = self._fir_profile.input_rate_mhz
-        self.fir_decimation = decimation
-        self.fir_group_delay_input_samples = group_delay
-        self.fir_input_fs_mhz = input_fs_mhz
-
         gen_port = int(gen_cfg["tproc_ch"])
         ro_port = int(ro_cfg["tproc_ctrl"])
         self.readout_command_time = 0
         self.output_command_time = 1 if gen_port == ro_port else 0
-        if self._fir_profile.software_warmup_compensation:
-            self.fir_warmup_tproc_cycles = int(
-                ceil(group_delay * self.tproc_mhz / input_fs_mhz)
+        self.avg_trigger_time = None
+        self.avg_integration_samples = None
+        self.avg_integration_time_us = None
+
+        if self.sweep.uses_fir_ddr:
+            self.requested_scan_samples = max(
+                1,
+                int(ceil(self.sweep.scan_time_us * self.fir_output_rate_msps)),
             )
-            self.ddr_trigger_time = (
-                self.output_command_time + self.fir_warmup_tproc_cycles
+            self.scan_samples = self.requested_scan_samples
+            monitor_length = min(
+                self.scan_samples,
+                int(ro_cfg.get("buf_maxlen", self.scan_samples)),
             )
-            self.fir_feed_input_samples = (
-                self.scan_samples * decimation
-                + group_delay
-                + self.sweep.margin_input_samples
+            self.declare_readout(
+                ch=self.sweep.readout_ch,
+                length=max(1, monitor_length),
             )
-            capture_cycles = int(
-                ceil(
-                    self.fir_feed_input_samples
-                    * self.tproc_mhz
-                    / input_fs_mhz
+            self.scan_time_actual_us = (
+                self.scan_samples / self.fir_output_rate_msps
+            )
+            self.acquisition_sample_rate_hz = (
+                self.fir_output_rate_msps * 1_000_000.0
+            )
+
+            decimation = self._fir_profile.decimation
+            group_delay = int(ceil(self._fir_profile.group_delay_input_samples))
+            input_fs_mhz = self._fir_profile.input_rate_mhz
+            self.fir_decimation = decimation
+            self.fir_group_delay_input_samples = group_delay
+            self.fir_input_fs_mhz = input_fs_mhz
+            if self._fir_profile.software_warmup_compensation:
+                self.fir_warmup_tproc_cycles = int(
+                    ceil(group_delay * self.tproc_mhz / input_fs_mhz)
                 )
-            )
-            self.capture_end_tproc_cycles = (
-                self.output_command_time + capture_cycles
-            )
+                self.ddr_trigger_time = (
+                    self.output_command_time + self.fir_warmup_tproc_cycles
+                )
+                self.fir_feed_input_samples = (
+                    self.scan_samples * decimation
+                    + group_delay
+                    + self.sweep.margin_input_samples
+                )
+                capture_cycles = int(
+                    ceil(
+                        self.fir_feed_input_samples
+                        * self.tproc_mhz
+                        / input_fs_mhz
+                    )
+                )
+                self.capture_end_tproc_cycles = (
+                    self.output_command_time + capture_cycles
+                )
+            else:
+                # The 50 kSPS HWH continuously filters and decimates. The V2
+                # DDR buffer applies the HWH-reported trigger delay.
+                self.fir_warmup_tproc_cycles = 0
+                self.ddr_trigger_time = self.output_command_time
+                post_trigger_input_samples = (
+                    self.scan_samples * decimation
+                    + self._fir_trigger_delay_input_cycles
+                    + self.sweep.margin_input_samples
+                )
+                self.fir_feed_input_samples = (
+                    group_delay + post_trigger_input_samples
+                )
+                filter_ready_cycles = int(
+                    ceil(group_delay * self.tproc_mhz / input_fs_mhz)
+                )
+                post_trigger_cycles = int(
+                    ceil(
+                        post_trigger_input_samples
+                        * self.tproc_mhz
+                        / input_fs_mhz
+                    )
+                )
+                self.capture_end_tproc_cycles = (
+                    max(self.output_command_time, filter_ready_cycles)
+                    + post_trigger_cycles
+                )
         else:
-            # The 50 kSPS HWH continuously filters and decimates. The V2 DDR
-            # buffer delays capture in the unit reported by HWH, so the
-            # tProcessor trigger remains aligned with RF output start.
-            self.fir_warmup_tproc_cycles = 0
-            self.ddr_trigger_time = self.output_command_time
-            post_trigger_input_samples = (
-                self.scan_samples * decimation
-                + self._fir_trigger_delay_input_cycles
-                + self.sweep.margin_input_samples
+            self.requested_scan_samples = max(
+                1,
+                int(self.us2cycles(
+                    self.sweep.scan_time_us,
+                    ro_ch=self.sweep.readout_ch,
+                )),
             )
-            self.fir_feed_input_samples = group_delay + post_trigger_input_samples
-            filter_ready_cycles = int(
-                ceil(group_delay * self.tproc_mhz / input_fs_mhz)
-            )
-            post_trigger_cycles = int(
-                ceil(
-                    post_trigger_input_samples
-                    * self.tproc_mhz
-                    / input_fs_mhz
+            self.scan_samples = self.requested_scan_samples
+            if self.scan_samples > AVG_ACCUM_SAFE_MAX_SAMPLES:
+                max_time_us = self.cycles2us(
+                    AVG_ACCUM_SAFE_MAX_SAMPLES,
+                    ro_ch=self.sweep.readout_ch,
                 )
+                raise ValueError(
+                    "AVG buffer integration exceeds the conservative signed "
+                    f"32-bit accumulator limit ({AVG_ACCUM_SAFE_MAX_SAMPLES} "
+                    f"samples, {max_time_us:.6g} us on this readout); shorten "
+                    "scan_time_us or increase avg_repetitions"
+                )
+            self.avg_integration_samples = self.scan_samples
+            self.avg_integration_time_us = self.cycles2us(
+                self.avg_integration_samples,
+                ro_ch=self.sweep.readout_ch,
+            )
+            self.scan_time_actual_us = self.avg_integration_time_us
+            self.acquisition_sample_rate_hz = (
+                float(ro_cfg["f_output"]) * 1_000_000.0
+            )
+            self.declare_readout(
+                ch=self.sweep.readout_ch,
+                length=self.avg_integration_samples,
+            )
+            self.fir_decimation = None
+            self.fir_group_delay_input_samples = None
+            self.fir_input_fs_mhz = None
+            self.fir_warmup_tproc_cycles = 0
+            self.fir_feed_input_samples = 0
+            self.ddr_trigger_time = None
+            self.avg_trigger_time = self.output_command_time
+            integration_tproc_cycles = int(
+                ceil(self.avg_integration_time_us * self.tproc_mhz)
             )
             self.capture_end_tproc_cycles = (
-                max(self.output_command_time, filter_ready_cycles)
-                + post_trigger_cycles
+                self.output_command_time + integration_tproc_cycles
             )
         self.rf_stop_command_time = self.capture_end_tproc_cycles
         self.point_period_tproc_cycles = (
@@ -1458,12 +1608,20 @@ class SParameterSweepProgram(RAveragerProgram):
                 "load frequency-calibrated gain from DMEM",
             )
         self.pulse(self.sweep.output_ch, t=self.output_command_time)
-        self.trigger(
-            ddr4=True,
-            adc_trig_offset=self.ddr_trigger_time,
-            t=0,
-            width=self.sweep.trigger_width_tproc_cycles,
-        )
+        if self.sweep.uses_fir_ddr:
+            self.trigger(
+                ddr4=True,
+                adc_trig_offset=self.ddr_trigger_time,
+                t=0,
+                width=self.sweep.trigger_width_tproc_cycles,
+            )
+        else:
+            self.trigger(
+                adcs=[self.sweep.readout_ch],
+                adc_trig_offset=self.avg_trigger_time,
+                t=0,
+                width=self.sweep.trigger_width_tproc_cycles,
+            )
 
         self.set_pulse_registers(
             ch=self.sweep.output_ch,
@@ -1477,7 +1635,7 @@ class SParameterSweepProgram(RAveragerProgram):
         self.pulse(self.sweep.output_ch, t=self.rf_stop_command_time)
         self.synci(
             self.point_period_tproc_cycles,
-            "wait for FIR DDR capture before next frequency",
+            "wait for I/Q capture before next frequency",
         )
 
     def update(self) -> None:
@@ -1551,8 +1709,8 @@ class SParameterSweepProgram(RAveragerProgram):
                     "calibrated gain mapping join",
                 )
 
-    def _load_runtime_dmem(self, soc) -> None:
-        if hasattr(soc, "reload_mem"):
+    def _load_runtime_dmem(self, soc, *, reload_mem: bool = True) -> None:
+        if reload_mem and hasattr(soc, "reload_mem"):
             soc.reload_mem()
         if self._uses_gain_table:
             # Keep the Pyro payload independent of NumPy's pickle internals.
@@ -1563,6 +1721,15 @@ class SParameterSweepProgram(RAveragerProgram):
                 gain_words,
                 mem_sel="dmem",
                 addr=int(self.sweep.gain_dmem_base_address),
+            )
+
+    def prepare_round(self) -> None:
+        """Preserve a calibrated gain table across QICK's DMEM reload."""
+        super().prepare_round()
+        if self._uses_gain_table:
+            self._load_runtime_dmem(
+                self.acquire_params["soc"],
+                reload_mem=False,
             )
 
     def _run_with_counter_progress(
@@ -1691,6 +1858,95 @@ class SParameterSweepProgram(RAveragerProgram):
             frequency_gain_codes=(
                 None if not self._uses_gain_table else self._expanded_gain_codes()
             ),
+            acquisition_source="fir_ddr",
+            integration_time_us=self.scan_time_actual_us,
+            accumulation_repetitions=1,
+        )
+
+    def acquire_avg_buffer(
+        self,
+        soc,
+        *,
+        progress: bool = False,
+        counter_progress: Optional[Callable[[int, int], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
+    ) -> SParameterSweepResult:
+        """Acquire one length-normalized AVG-buffer I/Q value per frequency."""
+        if not self.sweep.uses_avg_buffer:
+            raise RuntimeError(
+                "acquire_avg_buffer() requires acquisition_source='avg_buffer'"
+            )
+        if cancel_check is not None:
+            cancel_check()
+        total = self.sweep.frequency_points * self.sweep.avg_repetitions
+        if counter_progress is not None:
+            counter_progress(0, total)
+        _expt_points, avg_di, avg_dq = super().acquire(
+            soc,
+            progress=progress,
+        )
+        if cancel_check is not None:
+            cancel_check()
+        if counter_progress is not None:
+            counter_progress(total, total)
+        if len(avg_di) != 1 or len(avg_dq) != 1:
+            raise RuntimeError(
+                "AVG-buffer S-parameter acquisition expected exactly one "
+                f"readout channel, received I/Q channel counts "
+                f"{len(avg_di)}/{len(avg_dq)}"
+            )
+        mean_i = np.asarray(avg_di[0], dtype=float).squeeze()
+        mean_q = np.asarray(avg_dq[0], dtype=float).squeeze()
+        if mean_i.size != self.sweep.frequency_points:
+            raise RuntimeError(
+                "unexpected AVG-buffer I shape "
+                f"{np.asarray(avg_di[0]).shape}; expected "
+                f"{self.sweep.frequency_points} frequency values"
+            )
+        if mean_q.size != self.sweep.frequency_points:
+            raise RuntimeError(
+                "unexpected AVG-buffer Q shape "
+                f"{np.asarray(avg_dq[0]).shape}; expected "
+                f"{self.sweep.frequency_points} frequency values"
+            )
+        iq = np.stack((mean_i.reshape(-1), mean_q.reshape(-1)), axis=-1)
+        return SParameterSweepResult.from_iq(
+            self.requested_frequencies_mhz,
+            self.frequencies_mhz,
+            iq[:, np.newaxis, :],
+            sample_rate_hz=self.acquisition_sample_rate_hz,
+            reserved_physical_words=0,
+            output_power_dbm=self.sweep.calibrated_output_power_dbm,
+            nominal_gain_code=self.sweep.calibrated_nominal_gain_code,
+            frequency_gain_codes=(
+                None if not self._uses_gain_table else self._expanded_gain_codes()
+            ),
+            acquisition_source="avg_buffer",
+            integration_time_us=self.avg_integration_time_us,
+            accumulation_repetitions=self.sweep.avg_repetitions,
+        )
+
+    def acquire_iq(
+        self,
+        soc,
+        *,
+        progress: bool = False,
+        counter_progress: Optional[Callable[[int, int], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
+    ) -> SParameterSweepResult:
+        """Dispatch to the selected FIR DDR or AVG-buffer acquisition path."""
+        if self.sweep.uses_fir_ddr:
+            return self.acquire_fir_ddr(
+                soc,
+                progress=progress,
+                counter_progress=counter_progress,
+                cancel_check=cancel_check,
+            )
+        return self.acquire_avg_buffer(
+            soc,
+            progress=progress,
+            counter_progress=counter_progress,
+            cancel_check=cancel_check,
         )
 
     def _expanded_gain_codes(self) -> np.ndarray:
@@ -1711,6 +1967,7 @@ class SParameterSweepProgram(RAveragerProgram):
         return self.frequencies_mhz.copy()
 
     def summary(self) -> Mapping[str, Any]:
+        fir_profile = self._fir_profile
         return {
             "measurement": "rf_s_parameter",
             "awg_tuning_used": False,
@@ -1770,27 +2027,31 @@ class SParameterSweepProgram(RAveragerProgram):
                 bool(self._uses_gain_table)
                 and self._gain_table.size < self.sweep.frequency_points
             ),
+            "acquisition_source": self.sweep.acquisition_source,
             "scan_time_requested_us": self.sweep.scan_time_us,
             "scan_samples_requested": self.requested_scan_samples,
-            "minimum_coherent_samples": self.sweep.minimum_coherent_samples,
-            "minimum_coherent_samples_enforced": (
-                self.scan_samples > self.requested_scan_samples
-            ),
             "scan_samples": self.scan_samples,
-            "scan_time_actual_us": (self.scan_samples / self.fir_output_rate_msps),
+            "scan_time_actual_us": self.scan_time_actual_us,
+            "avg_integration_samples": self.avg_integration_samples,
+            "avg_integration_time_us": self.avg_integration_time_us,
+            "avg_repetitions": (
+                self.sweep.avg_repetitions if self.sweep.uses_avg_buffer else None
+            ),
             "fir_output_rate_msps": self.fir_output_rate_msps,
-            "fir_rate_profile": self._fir_profile.name,
+            "fir_rate_profile": None if fir_profile is None else fir_profile.name,
             "fir_decimation": self.fir_decimation,
             "fir_group_delay_input_samples": self.fir_group_delay_input_samples,
             "fir_warmup_tproc_cycles": self.fir_warmup_tproc_cycles,
             "fir_software_warmup_compensation": (
-                self._fir_profile.software_warmup_compensation
+                None
+                if fir_profile is None
+                else fir_profile.software_warmup_compensation
             ),
             "fir_fpga_trigger_delay_samples": (
                 self._fir_trigger_delay_value
             ),
             "fir_fpga_trigger_delay_units": (
-                self._fir_profile.trigger_delay_units
+                None if fir_profile is None else fir_profile.trigger_delay_units
             ),
             "fir_fpga_trigger_delay_us": self._fir_trigger_delay_us,
             "rf_output_mode": "periodic_start_timed_zero_stop",
@@ -1801,6 +2062,7 @@ class SParameterSweepProgram(RAveragerProgram):
             "point_period_tproc_cycles": self.point_period_tproc_cycles,
             "estimated_hardware_seconds": (
                 self.sweep.frequency_points
+                * (self.sweep.avg_repetitions if self.sweep.uses_avg_buffer else 1)
                 * self.point_period_tproc_cycles
                 / (self.tproc_mhz * 1_000_000.0)
             ),
@@ -2111,6 +2373,9 @@ def _power_result_payload(
         "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
         "sample_rate_hz": result.sample_rate_hz,
         "iq_shape": list(result.iq_traces.shape),
+        "acquisition_source": result.acquisition_source,
+        "integration_time_us": result.integration_time_us,
+        "accumulation_repetitions": result.accumulation_repetitions,
         "physical_power_calibrated": result.physical_power_calibrated,
         "response_diagnostics": dict(_response_diagnostics(result)),
     }
@@ -2252,7 +2517,7 @@ class _SParameterPowerRunWriter:
         )
         sample_index = Parameter(
             SAMPLE_INDEX_PARAMETER,
-            label="FIR sample index",
+            label="Stored I/Q sample index",
             unit="",
         )
         mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit="ADC units")
@@ -2574,7 +2839,7 @@ def store_sparameter_result(
     )
     sample_index = Parameter(
         SAMPLE_INDEX_PARAMETER,
-        label="FIR sample index",
+        label="Stored I/Q sample index",
         unit="",
     )
     mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit="ADC units")
@@ -2657,6 +2922,9 @@ def store_sparameter_result(
             "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
             "sample_rate_hz": result.sample_rate_hz,
             "iq_shape": list(result.iq_traces.shape),
+            "acquisition_source": result.acquisition_source,
+            "integration_time_us": result.integration_time_us,
+            "accumulation_repetitions": result.accumulation_repetitions,
             "output_power_dbm": result.output_power_dbm,
             "nominal_gain_code": result.nominal_gain_code,
             "frequency_gain_codes": (
@@ -2929,9 +3197,9 @@ def run_sparameter_sweep(
                     _power_index: int = power_index,
                     _power_label: str = power_label,
                 ) -> None:
-                    del total
+                    point_fraction = 1.0 if total <= 0 else completed / total
                     power_progress = (
-                        _power_index + 0.85 * completed / sweep_config.frequency_points
+                        _power_index + 0.85 * point_fraction
                     )
                     fraction = power_progress / len(power_coordinates)
                     _emit_progress(
@@ -2939,12 +3207,11 @@ def run_sparameter_sweep(
                         8 + round(87 * max(0.0, min(1.0, fraction))),
                         (
                             f"Power {_power_index + 1}/{len(power_coordinates)} "
-                            f"{_power_label}: frequency {completed}/"
-                            f"{sweep_config.frequency_points}"
+                            f"{_power_label}: acquisition {completed}/{total}"
                         ),
                     )
 
-                result = program.acquire_fir_ddr(
+                result = program.acquire_iq(
                     soc,
                     counter_progress=(
                         counter_progress if progress_callback is not None else None
@@ -3040,13 +3307,18 @@ def run_sparameter_sweep(
 
     def counter_progress(completed: int, total: int) -> None:
         fraction = 1.0 if total <= 0 else completed / total
+        progress_unit = (
+            "AVG integrations"
+            if sweep_config.uses_avg_buffer
+            else "frequency points"
+        )
         _emit_progress(
             progress_callback,
             10 + round(50 * max(0.0, min(1.0, fraction))),
-            f"RF hardware sweep {completed}/{total} frequency points",
+            f"RF hardware sweep {completed}/{total} {progress_unit}",
         )
 
-    result = program.acquire_fir_ddr(
+    result = program.acquire_iq(
         soc,
         counter_progress=(counter_progress if progress_callback is not None else None),
     )
@@ -3068,7 +3340,7 @@ def run_sparameter_sweep(
         warning_callback,
         context="RF S-parameter sweep",
     )
-    _emit_progress(progress_callback, 62, "Averaging FIR IQ traces")
+    _emit_progress(progress_callback, 62, "Reducing captured I/Q values")
     dataset, row_count = store_sparameter_result(
         result,
         config=sweep_config,
@@ -3176,6 +3448,11 @@ def load_sparameter_run(
             frequency_gain_codes=payload.get("frequency_gain_codes"),
             actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
             input_powers_dbm=payload.get("input_powers_dbm"),
+            acquisition_source=payload.get("acquisition_source", "fir_ddr"),
+            integration_time_us=payload.get("integration_time_us"),
+            accumulation_repetitions=int(
+                payload.get("accumulation_repetitions", 1)
+            ),
         )
     else:
         i_trace = _coerce_trace_rows(i_data[I_TRACE_PARAMETER], frequencies.size)
@@ -3198,6 +3475,11 @@ def load_sparameter_run(
             frequency_gain_codes=payload.get("frequency_gain_codes"),
             actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
             input_powers_dbm=payload.get("input_powers_dbm"),
+            acquisition_source=payload.get("acquisition_source", "fir_ddr"),
+            integration_time_us=payload.get("integration_time_us"),
+            accumulation_repetitions=int(
+                payload.get("accumulation_repetitions", 1)
+            ),
         )
     return StoredSParameterSweep(
         run_id=int(dataset.run_id),
@@ -3213,6 +3495,7 @@ __all__ = [
     "ACTUAL_INPUT_POWER_PARAMETER",
     "ACTUAL_OUTPUT_POWER_PARAMETER",
     "ADC_MAGNITUDE_DB_PARAMETER",
+    "ACQUISITION_SOURCES",
     "FILTER_TYPES",
     "CALIBRATED_GAIN_PARAMETER",
     "FREQUENCY_PARAMETER",

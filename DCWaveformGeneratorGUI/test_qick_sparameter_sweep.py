@@ -644,6 +644,76 @@ def test_program_is_fixed_size_hardware_sweep_and_updates_both_dds_registers():
     assert long.loop_dims == [1001, 1]
 
 
+def test_avg_buffer_program_works_without_fir_ddr_metadata():
+    soccfg = _mock_soccfg()
+    del soccfg._cfg["ddr4_buf"]
+    program = SParameterSweepProgram(
+        soccfg,
+        _config(
+            acquisition_source="avg_buffer",
+            frequency_points=3,
+            scan_time_us=4.0,
+            avg_repetitions=7,
+        ),
+    )
+    program.compile()
+
+    summary = program.summary()
+    assert program.loop_dims == [3, 7]
+    assert program.ro_chs[0]["trigs"] == 1
+    assert program.avg_integration_samples == 1200
+    assert program.ddr_trigger_time is None
+    assert summary["acquisition_source"] == "avg_buffer"
+    assert summary["avg_repetitions"] == 7
+    assert summary["avg_integration_time_us"] == pytest.approx(4.0)
+    assert summary["fir_rate_profile"] is None
+    assert summary["fir_output_rate_msps"] is None
+
+
+def test_avg_buffer_configuration_rejects_invalid_source_and_repetitions():
+    with pytest.raises(ValueError, match="acquisition_source"):
+        _config(acquisition_source="unknown")
+    with pytest.raises(ValueError, match="avg_repetitions"):
+        _config(acquisition_source="avg_buffer", avg_repetitions=0)
+
+
+def test_avg_buffer_acquisition_returns_one_iq_value_per_frequency(monkeypatch):
+    program = SParameterSweepProgram(
+        _mock_soccfg(),
+        _config(
+            acquisition_source="avg_buffer",
+            frequency_points=3,
+            scan_time_us=4.0,
+            avg_repetitions=7,
+        ),
+    )
+    progress_updates = []
+
+    def fake_acquire(_program, _soc, *, progress=False, **_kwargs):
+        assert progress is False
+        return (
+            np.asarray([10.0, 15.0, 20.0]),
+            [np.asarray([[1.25, 2.5, 3.75]])],
+            [np.asarray([[-4.0, -5.0, -6.0]])],
+        )
+
+    monkeypatch.setattr(sparameter_module.RAveragerProgram, "acquire", fake_acquire)
+    result = program.acquire_avg_buffer(
+        object(),
+        counter_progress=lambda completed, total: progress_updates.append(
+            (completed, total)
+        ),
+    )
+
+    assert progress_updates == [(0, 21), (21, 21)]
+    assert result.acquisition_source == "avg_buffer"
+    assert result.accumulation_repetitions == 7
+    assert result.integration_time_us == pytest.approx(4.0)
+    assert result.iq_traces.shape == (3, 1, 2)
+    np.testing.assert_allclose(result.mean_i, [1.25, 2.5, 3.75])
+    np.testing.assert_allclose(result.mean_q, [-4.0, -5.0, -6.0])
+
+
 def test_calibrated_program_reads_gain_table_from_dmem_and_compresses_addresses():
     gain_table = tuple(1000 + index for index in range(4000))
     config = _config(
@@ -862,7 +932,7 @@ def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
     assert result.iq_traces.shape == (3, 50, 2)
 
 
-def test_minimum_coherent_samples_expand_short_50_ksps_capture():
+def test_legacy_minimum_coherent_samples_does_not_expand_capture():
     program = SParameterSweepProgram(
         _mock_soccfg(fir_rate_profile="50_ksps"),
         _config(
@@ -874,11 +944,11 @@ def test_minimum_coherent_samples_expand_short_50_ksps_capture():
 
     summary = program.summary()
     assert program.requested_scan_samples == 5
-    assert program.scan_samples == 100
+    assert program.scan_samples == 5
     assert summary["scan_samples_requested"] == 5
-    assert summary["minimum_coherent_samples"] == 100
-    assert summary["minimum_coherent_samples_enforced"] is True
-    assert summary["scan_time_actual_us"] == pytest.approx(2000.0)
+    assert "minimum_coherent_samples" not in summary
+    assert "minimum_coherent_samples_enforced" not in summary
+    assert summary["scan_time_actual_us"] == pytest.approx(100.0)
 
 
 def test_rf_board_output_and_readout_controls_are_applied():
@@ -1018,6 +1088,52 @@ def test_qcodes_round_trip_stores_split_traces_and_derived_response(
 
     latest_sparameter = load_sparameter_run(database_path, 0)
     assert latest_sparameter.run_id == dataset.run_id
+
+
+def test_qcodes_round_trip_preserves_avg_buffer_acquisition_metadata(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "avg_sparameter.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging-avg"))
+    frequencies = np.asarray([10.0, 11.0, 12.0])
+    iq = np.asarray(
+        [[[10.5, -2.0]], [[11.5, -3.0]], [[12.5, -4.0]]],
+        dtype=float,
+    )
+    result = SParameterSweepResult.from_iq(
+        frequencies,
+        frequencies,
+        iq,
+        sample_rate_hz=300_000_000.0,
+        acquisition_source="avg_buffer",
+        integration_time_us=4.0,
+        accumulation_repetitions=25,
+    )
+    dataset, row_count = store_sparameter_result(
+        result,
+        config=_config(
+            acquisition_source="avg_buffer",
+            frequency_points=3,
+            scan_time_us=4.0,
+            avg_repetitions=25,
+        ),
+        connection_config=QickConnectionConfig(host="127.0.0.1"),
+        run_config=QcodesRunConfig(
+            database_path=str(database_path),
+            experiment_name="AVG RF response",
+            sample_name="unit-test",
+        ),
+        program_summary={"acquisition_source": "avg_buffer"},
+        rf_settings={"output": {}, "readout": {}},
+    )
+
+    assert row_count == 3
+    loaded = load_sparameter_run(database_path, dataset.run_id)
+    assert loaded.result.acquisition_source == "avg_buffer"
+    assert loaded.result.integration_time_us == pytest.approx(4.0)
+    assert loaded.result.accumulation_repetitions == 25
+    assert loaded.result.iq_traces.shape == (3, 1, 2)
+    np.testing.assert_allclose(loaded.result.iq_traces, iq)
 
 
 def test_qcodes_round_trip_keeps_noisy_trace_with_zero_coherent_mean(
@@ -1160,7 +1276,7 @@ def test_software_power_sweep_publishes_one_live_db_run_per_power(
         def __init__(self, point_config):
             self.sweep = point_config
 
-        def acquire_fir_ddr(self, _soc, counter_progress=None):
+        def acquire_iq(self, _soc, counter_progress=None):
             if counter_progress is not None:
                 counter_progress(0, self.sweep.frequency_points)
                 counter_progress(
@@ -1301,7 +1417,7 @@ def test_compensated_power_sweep_builds_one_frequency_gain_table_per_power(
             self.gains = np.asarray(gains, dtype=np.int64)
             self.frequencies_mhz = config.requested_frequencies_mhz
 
-        def acquire_fir_ddr(self, _soc, counter_progress=None):
+        def acquire_iq(self, _soc, counter_progress=None):
             if counter_progress is not None:
                 counter_progress(config.frequency_points, config.frequency_points)
             iq = np.zeros((config.frequency_points, 4, 2), dtype=np.int32)
@@ -1389,6 +1505,10 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     panel.frequency_start_mhz.setValue(42.0)
     panel.frequency_end_mhz.setValue(84.0)
     panel.frequency_points.setValue(33)
+    panel.acquisition_source.setCurrentIndex(
+        panel.acquisition_source.findData("avg_buffer")
+    )
+    panel.avg_repetitions.setValue(17)
     panel.power_sweep_enabled.setChecked(True)
     panel.power_start_gain.setValue(100)
     panel.power_end_gain.setValue(10000)
@@ -1410,6 +1530,19 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     decoded = window._decode_settings(settings)
     assert decoded["s_parameter"]["frequency_start_mhz"] == 42.0
     assert decoded["s_parameter"]["frequency_points"] == 33
+    assert decoded["s_parameter"]["acquisition_source"] == "avg_buffer"
+    assert decoded["s_parameter"]["avg_repetitions"] == 17
+    assert panel.margin_input_samples.isEnabled() is False
+    assert panel.address.isEnabled() is False
+
+    legacy_sparameter = dict(decoded["s_parameter"])
+    legacy_sparameter.pop("acquisition_source")
+    legacy_sparameter.pop("avg_repetitions")
+    panel.load_settings(legacy_sparameter)
+    assert panel.acquisition_source.currentData() == "fir_ddr"
+    assert panel.avg_repetitions.value() == 100
+    assert panel.margin_input_samples.isEnabled() is True
+    assert panel.address.isEnabled() is True
     assert decoded["s_parameter"]["power_sweep_enabled"] is True
     assert decoded["s_parameter"]["power_start_gain"] == 100
     assert decoded["s_parameter"]["power_end_gain"] == 10000
