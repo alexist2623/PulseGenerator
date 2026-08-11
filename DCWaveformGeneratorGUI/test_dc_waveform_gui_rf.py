@@ -486,6 +486,527 @@ def test_composite_rf_editor_round_trip_and_timeline_omit_delays():
     window.close()
 
 
+def test_composite_rf_rows_follow_vertical_header_drag_order():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 100.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("d0", 0.2)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "prepare", 0.2, "f0", 12000, 15.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "wait", 0.1)),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "read", 0.2, "f0", 8000, -30.0,
+                duration_parameter="d0",
+            )),
+        ],
+    })
+    app.processEvents()
+
+    header = panel.composite_row_header
+    assert header.sectionsMovable() is True
+    panel.composite_item_table.selectRow(0)
+    header.moveSection(header.visualIndex(0), 2)
+    assert header.visualOrder() == (1, 2, 0)
+    header.commitVisualOrder()
+    app.processEvents()
+
+    assert header.visualOrder() == (0, 1, 2)
+    assert [
+        panel.composite_item_table.cellWidget(row, 1).text()
+        for row in range(panel.composite_item_table.rowCount())
+    ] == ["wait", "read", "prepare"]
+    assert [
+        item.name for item in panel.configured_spec().composite_items
+    ] == ["wait", "read", "prepare"]
+    assert [
+        item["name"] for item in panel.settings_dict()["composite_items"]
+    ] == ["wait", "read", "prepare"]
+    assert panel.composite_item_table.currentRow() == 2
+
+    window.close()
+
+
+def test_composite_parameter_rename_keeps_existing_pulse_references():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 100.0)),
+            asdict(QickRfFrequencyParameterSpec("f1", 250.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("d0", 0.1)),
+            asdict(QickRfDurationParameterSpec("d1", 0.4)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "read", 0.4, "f1", 8000, -30.0,
+                duration_parameter="d1",
+            )),
+        ],
+    })
+    app.processEvents()
+
+    frequency_name = panel.frequency_parameter_table.cellWidget(1, 0)
+    frequency_name.setText("read_frequency")
+    frequency_name.editingFinished.emit()
+    duration_name = panel.duration_parameter_table.cellWidget(1, 0)
+    duration_name.setText("read_duration")
+    duration_name.editingFinished.emit()
+    app.processEvents()
+
+    assert panel.composite_item_table.cellWidget(0, 4).currentText() == (
+        "read_frequency"
+    )
+    assert panel.composite_item_table.cellWidget(0, 3).currentText() == (
+        "read_duration"
+    )
+    spec = panel.configured_spec()
+    assert spec.composite_items[0].frequency_parameter == "read_frequency"
+    assert spec.composite_items[0].duration_parameter == "read_duration"
+    assert spec.pulse_events[0].frequency_mhz == 250.0
+    assert spec.pulse_events[0].duration_us == 0.4
+
+    frequency_name.setText("f0")
+    frequency_name.editingFinished.emit()
+    assert frequency_name.text() == "read_frequency"
+    assert panel.composite_item_table.cellWidget(0, 4).currentText() == (
+        "read_frequency"
+    )
+    duration_name.setText("not a valid name")
+    duration_name.editingFinished.emit()
+    assert duration_name.text() == "read_duration"
+    assert panel.composite_item_table.cellWidget(0, 3).currentText() == (
+        "read_duration"
+    )
+
+    window.close()
+
+
+def test_composite_editor_prevents_deleting_its_last_pulse():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "only_pulse", 1.0, "f0", 1000, 0.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "tail", 2.0)),
+        ],
+    })
+    app.processEvents()
+
+    panel.composite_item_table.selectRow(0)
+    panel._remove_composite_item()
+    app.processEvents()
+
+    assert panel.composite_item_table.rowCount() == 2
+    assert [
+        panel.composite_item_table.cellWidget(row, 1).text()
+        for row in range(2)
+    ] == ["only_pulse", "tail"]
+    assert [item.kind for item in panel.configured_spec().composite_items] == [
+        "pulse",
+        "delay",
+    ]
+
+    only_name = panel.composite_item_table.cellWidget(0, 1)
+    only_name.setText("")
+    only_name.editingFinished.emit()
+    assert only_name.text() == "only_pulse"
+    tail_name = panel.composite_item_table.cellWidget(1, 1)
+    tail_name.setText("only_pulse")
+    tail_name.editingFinished.emit()
+    assert tail_name.text() == "tail"
+
+    only_kind = panel.composite_item_table.cellWidget(0, 0)
+    assert only_kind.isEnabled() is False
+    only_kind.setCurrentIndex(only_kind.findData("delay"))
+    assert only_kind.currentData() == "pulse"
+
+    panel._add_composite_item("pulse")
+    assert only_kind.isEnabled() is True
+    only_kind.setCurrentIndex(only_kind.findData("delay"))
+    assert only_kind.currentData() == "delay"
+    assert sum(
+        item.kind == "pulse"
+        for item in panel.configured_spec().composite_items
+    ) == 1
+
+    window.close()
+
+
+def test_composite_editor_repeated_mutation_and_load_leave_no_stale_rows():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    initial = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "require_within_segment": False,
+        "output_board_type": "RF_Out",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 100.0)),
+            asdict(QickRfFrequencyParameterSpec("f1", 225.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("d0", 0.2)),
+            asdict(QickRfDurationParameterSpec("d1", 0.6)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse",
+                "calibrated_old",
+                0.2,
+                "f0",
+                1234,
+                11.0,
+                power_calibration_enabled=True,
+                power_calibration_database_path="old_calibration.db",
+                power_calibration_run_id=17,
+                target_output_power_dbm=-31.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "old_wait", 0.3)),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "keeper", 0.6, "f1", 7000, -20.0,
+                duration_parameter="d1",
+            )),
+        ],
+    }
+    panel.load_settings(initial)
+    app.processEvents()
+
+    panel.composite_item_table.selectRow(0)
+    panel._remove_composite_item()
+    panel._add_composite_item("pulse")
+    new_pulse_row = panel.composite_item_table.rowCount() - 1
+    new_power = panel.composite_item_table.cellWidget(new_pulse_row, 6)
+    assert new_power.power_calibration_enabled is False
+    assert panel.composite_item_table.cellWidget(new_pulse_row, 5).value() == 20000
+    assert panel.composite_item_table.cellWidget(new_pulse_row, 7).value() == 0.0
+
+    panel.composite_item_table.cellWidget(new_pulse_row, 1).setText("fresh")
+    panel.composite_item_table.cellWidget(new_pulse_row, 3).setCurrentText("d1")
+    panel.composite_item_table.cellWidget(new_pulse_row, 4).setCurrentText("f1")
+    panel.composite_item_table.cellWidget(new_pulse_row, 5).setValue(-2345)
+    panel.composite_item_table.cellWidget(new_pulse_row, 7).setValue(45.0)
+    panel.frequency_parameter_table.cellWidget(1, 1).setValue(333.0)
+    panel.duration_parameter_table.cellWidget(1, 1).setValue(0.75)
+    panel._add_composite_item("delay")
+    new_delay_row = panel.composite_item_table.rowCount() - 1
+    panel.composite_item_table.cellWidget(new_delay_row, 1).setText("fresh_wait")
+    panel.composite_item_table.cellWidget(new_delay_row, 2).setValue(0.125)
+
+    panel.composite_item_table.cellWidget(new_pulse_row, 0).setCurrentIndex(1)
+    panel.composite_item_table.cellWidget(new_pulse_row, 0).setCurrentIndex(0)
+    assert panel.composite_item_table.cellWidget(new_pulse_row, 5).value() == -2345
+    assert panel.composite_item_table.cellWidget(new_pulse_row, 7).value() == 45.0
+
+    header = panel.composite_row_header
+    header.moveSection(header.visualIndex(new_delay_row), 0)
+    header.commitVisualOrder()
+    app.processEvents()
+    edited_spec = panel.configured_spec()
+    edited_settings = panel.settings_dict()
+    assert [item.name for item in edited_spec.composite_items] == [
+        "fresh_wait",
+        "old_wait",
+        "keeper",
+        "fresh",
+    ]
+    assert edited_spec.pulse_events[-1].frequency_mhz == 333.0
+    assert edited_spec.pulse_events[-1].duration_us == 0.75
+    app.processEvents()
+    assert window._rf_timelines[0].pulse_names == ("keeper", "fresh")
+
+    replacement = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "require_within_segment": False,
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("replacement_f", 19.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("replacement_d", 0.05)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "replacement", 0.05, "replacement_f", 99, 3.0,
+                duration_parameter="replacement_d",
+            )),
+        ],
+    }
+    for _ in range(3):
+        panel.load_settings(replacement)
+        app.processEvents()
+        assert panel.composite_item_table.rowCount() == 1
+        assert panel.frequency_parameter_table.rowCount() == 1
+        assert panel.duration_parameter_table.rowCount() == 1
+        assert panel.configured_spec().composite_items[0].name == "replacement"
+        assert "old_calibration.db" not in json.dumps(panel.settings_dict())
+        assert window._rf_timelines[0].pulse_names == ("replacement",)
+
+        panel.load_settings(edited_settings)
+        app.processEvents()
+        assert panel.configured_spec() == edited_spec
+
+    window.close()
+
+
+def test_composite_embedded_editor_focus_selects_the_row_to_remove():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    panel.load_settings({
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 100.0)),
+            asdict(QickRfFrequencyParameterSpec("f1", 200.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("d0", 0.1)),
+            asdict(QickRfDurationParameterSpec("d1", 0.2)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "first", 0.1, "f0", 1000, 0.0,
+                duration_parameter="d0",
+            )),
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "second", 0.2, "f1", 2000, 10.0,
+                duration_parameter="d1",
+            )),
+            asdict(QickRfCompositeItemSpec("delay", "tail", 0.3)),
+        ],
+    })
+    app.processEvents()
+
+    second_name = panel.composite_item_table.cellWidget(1, 1)
+    QtWidgets.QApplication.sendEvent(
+        second_name,
+        QtGui.QFocusEvent(QtCore.QEvent.FocusIn),
+    )
+    assert panel.composite_item_table.currentRow() == 1
+    panel._remove_composite_item()
+    assert [
+        item.name for item in panel.configured_spec().composite_items
+    ] == ["first", "tail"]
+
+    panel._add_composite_item("pulse")
+    assert panel.composite_item_table.currentRow() == 2
+    assert panel.composite_item_table.cellWidget(2, 1).text() == "pulse_0"
+    assert panel.composite_item_table.cellWidget(2, 4).currentText() == "f0"
+    assert panel.composite_item_table.cellWidget(2, 3).currentText() == "d0"
+
+    second_frequency_name = panel.frequency_parameter_table.cellWidget(1, 0)
+    QtWidgets.QApplication.sendEvent(
+        second_frequency_name,
+        QtGui.QFocusEvent(QtCore.QEvent.FocusIn),
+    )
+    assert panel.frequency_parameter_table.currentRow() == 1
+    panel._remove_frequency_parameter()
+    assert panel.frequency_parameter_table.rowCount() == 1
+    assert all(
+        panel.composite_item_table.cellWidget(row, 4).currentText() == "f0"
+        for row in (0, 2)
+    )
+
+    second_duration_name = panel.duration_parameter_table.cellWidget(1, 0)
+    QtWidgets.QApplication.sendEvent(
+        second_duration_name,
+        QtGui.QFocusEvent(QtCore.QEvent.FocusIn),
+    )
+    assert panel.duration_parameter_table.currentRow() == 1
+    panel._remove_duration_parameter()
+    assert panel.duration_parameter_table.rowCount() == 1
+    assert all(
+        panel.composite_item_table.cellWidget(row, 3).currentText() == "d0"
+        for row in (0, 2)
+    )
+    assert panel.configured_spec().pulse_events[1].frequency_mhz == 100.0
+    assert panel.configured_spec().pulse_events[1].duration_us == 0.1
+
+    window.close()
+
+
+def test_composite_predefined_transitions_replace_every_generated_row():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    custom_settings = {
+        **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+        "enabled": True,
+        "pulse_mode": "composite",
+        "frequency_parameters": [
+            asdict(QickRfFrequencyParameterSpec("f0", 60.0)),
+            asdict(QickRfFrequencyParameterSpec("f1", 120.0)),
+        ],
+        "duration_parameters": [
+            asdict(QickRfDurationParameterSpec("d0", 0.05)),
+            asdict(QickRfDurationParameterSpec("d1", 0.08)),
+        ],
+        "composite_items": [
+            asdict(QickRfCompositeItemSpec(
+                "pulse", "manual", 0.08, "f1", 3210, 90.0,
+                duration_parameter="d1",
+            )),
+        ],
+    }
+    panel.load_settings(custom_settings)
+    app.processEvents()
+
+    for n_pulses in (1, 2, 5, 3):
+        panel.predefined_template.setCurrentIndex(
+            panel.predefined_template.findData("cpmg")
+        )
+        panel.predefined_n.setValue(n_pulses)
+        panel.predefined_tau.setValue(7.5)
+        panel.predefined_frequency_parameter.setCurrentText("f1")
+        panel.predefined_duration_parameter.setCurrentText("d1")
+        app.processEvents()
+        cpmg = panel.configured_spec()
+        assert len(cpmg.composite_items) == 2 * n_pulses + 1
+        assert sum(item.kind == "pulse" for item in cpmg.composite_items) == (
+            n_pulses
+        )
+        assert all(
+            item.name.startswith("CPMG_")
+            for item in cpmg.composite_items
+        )
+        assert all(
+            item.frequency_parameter == "f1"
+            and item.duration_parameter == "d1"
+            for item in cpmg.composite_items
+            if item.kind == "pulse"
+        )
+
+        panel.predefined_template.setCurrentIndex(
+            panel.predefined_template.findData("udd")
+        )
+        app.processEvents()
+        udd = panel.configured_spec()
+        assert len(udd.composite_items) == 2 * n_pulses + 1
+        assert all(item.name.startswith("UDD_") for item in udd.composite_items)
+        assert not any(
+            item.name.startswith("CPMG_") for item in udd.composite_items
+        )
+
+    panel.predefined_template.setCurrentIndex(
+        panel.predefined_template.findData("custom")
+    )
+    app.processEvents()
+    assert panel.composite_item_table.isEnabled() is True
+    assert panel.composite_row_header.sectionsMovable() is True
+
+    panel.load_settings(custom_settings)
+    app.processEvents()
+    assert [
+        item.name for item in panel.configured_spec().composite_items
+    ] == ["manual"]
+    assert not any(
+        prefix in json.dumps(panel.settings_dict())
+        for prefix in ("CPMG_", "UDD_")
+    )
+
+    window.close()
+
+
+def test_composite_editor_stress_round_trip_across_row_counts():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+
+    for pulse_count in range(1, 9):
+        items = []
+        for pulse_index in range(pulse_count):
+            if pulse_index:
+                items.append(asdict(QickRfCompositeItemSpec(
+                    "delay",
+                    f"wait_{pulse_count}_{pulse_index}",
+                    0.01 * pulse_index,
+                )))
+            items.append(asdict(QickRfCompositeItemSpec(
+                "pulse",
+                f"pulse_{pulse_count}_{pulse_index}",
+                0.02 * (pulse_index + 1),
+                f"f{pulse_index % 3}",
+                1000 + pulse_index,
+                float(pulse_index * 15),
+                duration_parameter=f"d{pulse_index % 3}",
+            )))
+        settings = {
+            **gui.DEFAULT_RF_OUTPUT_SETTINGS,
+            "enabled": True,
+            "pulse_mode": "composite",
+            "require_within_segment": False,
+            "frequency_parameters": [
+                asdict(QickRfFrequencyParameterSpec(f"f{index}", 50.0 + index))
+                for index in range(3)
+            ],
+            "duration_parameters": [
+                asdict(QickRfDurationParameterSpec(
+                    f"d{index}", 0.02 * (index + 1)
+                ))
+                for index in range(3)
+            ],
+            "composite_items": items,
+        }
+        panel.load_settings(settings)
+        app.processEvents()
+        assert panel.composite_item_table.rowCount() == 2 * pulse_count - 1
+        assert len(panel.configured_spec().pulse_events) == pulse_count
+
+        panel._add_composite_item("delay")
+        added_row = panel.composite_item_table.rowCount() - 1
+        panel.composite_item_table.cellWidget(added_row, 1).setText(
+            f"added_wait_{pulse_count}"
+        )
+        panel.composite_item_table.cellWidget(added_row, 2).setValue(0.007)
+        panel.composite_row_header.moveSection(
+            panel.composite_row_header.visualIndex(added_row),
+            0,
+        )
+        panel.composite_row_header.commitVisualOrder()
+        app.processEvents()
+
+        expected = panel.configured_spec()
+        serialized = panel.settings_dict()
+        panel.load_settings(serialized)
+        app.processEvents()
+        assert panel.configured_spec() == expected
+        assert panel.configured_spec().composite_items[0].name == (
+            f"added_wait_{pulse_count}"
+        )
+
+    window.close()
+
+
 def test_composite_rf_duration_parameters_are_shared_sweep_axes():
     app = _application()
     window = gui.MainWindow()
@@ -645,6 +1166,7 @@ def test_predefined_composite_editor_round_trip_and_software_axes():
     assert panel.composite_item_table.rowCount() == 9
     assert panel.composite_item_table.cellWidget(1, 1).text() == "CPMG_X1"
     assert panel.add_composite_pulse_button.isEnabled() is False
+    assert panel.composite_row_header.sectionsMovable() is False
 
     decoded = window._decode_settings(window._settings_to_dict())
     decoded_rf = decoded["rf_outputs"][0]

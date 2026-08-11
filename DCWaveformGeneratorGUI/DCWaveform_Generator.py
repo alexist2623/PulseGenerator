@@ -79,6 +79,65 @@ class _ValueInputWheelGuard(QtCore.QObject):
         return True
 
 
+class _ReorderableRowHeader(QtWidgets.QHeaderView):
+    """Commit a vertical-header drag as a model row-order change."""
+
+    orderDropped = QtCore.pyqtSignal(tuple)
+
+    def __init__(self, parent=None):
+        super().__init__(QtCore.Qt.Vertical, parent)
+        self._press_order = None
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self.setReorderingEnabled(True)
+
+    def visualOrder(self) -> Tuple[int, ...]:
+        return tuple(
+            self.logicalIndex(visual_index)
+            for visual_index in range(self.count())
+        )
+
+    def setReorderingEnabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.setSectionsMovable(enabled)
+        self.setCursor(
+            QtCore.Qt.OpenHandCursor if enabled else QtCore.Qt.ArrowCursor
+        )
+
+    def resetVisualOrder(self) -> None:
+        for target_visual_index in range(self.count()):
+            current_visual_index = self.visualIndex(target_visual_index)
+            if current_visual_index != target_visual_index:
+                self.moveSection(current_visual_index, target_visual_index)
+
+    def commitVisualOrder(self) -> None:
+        order = self.visualOrder()
+        if order != tuple(range(self.count())):
+            self.orderDropped.emit(order)
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == QtCore.Qt.LeftButton
+            and self.sectionsMovable()
+        ):
+            self._press_order = self.visualOrder()
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+        enabled = self.sectionsMovable()
+        self.setCursor(
+            QtCore.Qt.OpenHandCursor if enabled else QtCore.Qt.ArrowCursor
+        )
+        order = self.visualOrder()
+        if self._press_order is not None and order != self._press_order:
+            self.orderDropped.emit(order)
+        self._press_order = None
+
+
 def _install_value_input_wheel_guard():
     """Install one application-wide guard and retain its QObject lifetime."""
     app = QtWidgets.QApplication.instance()
@@ -3630,6 +3689,24 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.composite_item_table.setSelectionMode(
             QtWidgets.QAbstractItemView.SingleSelection
         )
+        self.composite_item_table.itemSelectionChanged.connect(
+            self._update_composite_remove_button
+        )
+        self.composite_row_header = _ReorderableRowHeader(
+            self.composite_item_table
+        )
+        self.composite_row_header.setToolTip(
+            "Drag a row number up or down to change the execution order."
+        )
+        self.composite_item_table.setVerticalHeader(
+            self.composite_row_header
+        )
+        self.composite_row_header.sectionPressed.connect(
+            self.composite_item_table.selectRow
+        )
+        self.composite_row_header.orderDropped.connect(
+            self._reorder_composite_items
+        )
         item_header = self.composite_item_table.horizontalHeader()
         item_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         for column in range(1, 8):
@@ -3773,6 +3850,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.remove_composite_item_button,
         ):
             widget.setEnabled(not predefined)
+        self.composite_row_header.setReorderingEnabled(not predefined)
+        self._update_composite_remove_button()
         if template == "cpmg":
             text = (
                 "CPMG: N X pulses; free evolution is tau/2 at both edges "
@@ -3816,7 +3895,36 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         *,
         frequency_name=False,
         duration_name=False,
+        item_name=False,
     ) -> None:
+        self._track_table_editor(widget)
+        if item_name:
+            widget.setProperty(
+                "qstl_committed_composite_item_name",
+                widget.text().strip(),
+            )
+            widget.textChanged.connect(self.changed.emit)
+            widget.editingFinished.connect(
+                lambda editor=widget: self._commit_composite_item_name(
+                    editor
+                )
+            )
+            return
+        if frequency_name or duration_name:
+            widget.setProperty(
+                "qstl_committed_parameter_name",
+                widget.text().strip(),
+            )
+            widget.textChanged.connect(self.changed.emit)
+            widget.editingFinished.connect(
+                lambda editor=widget, is_frequency=frequency_name: (
+                    self._commit_composite_parameter_name(
+                        editor,
+                        frequency=is_frequency,
+                    )
+                )
+            )
+            return
         signal = getattr(widget, "textChanged", None)
         if signal is None:
             signal = getattr(widget, "valueChanged", None)
@@ -3824,11 +3932,127 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             signal = getattr(widget, "currentIndexChanged", None)
         if signal is None:
             signal = getattr(widget, "toggled", None)
-        if frequency_name:
-            signal.connect(self._sync_composite_frequency_choices)
-        if duration_name:
-            signal.connect(self._sync_composite_duration_choices)
         signal.connect(self.changed.emit)
+
+    def _commit_composite_item_name(
+        self,
+        editor: QtWidgets.QLineEdit,
+    ) -> None:
+        row = self._table_widget_row(self.composite_item_table, editor)
+        if row < 0:
+            return
+        previous = str(
+            editor.property("qstl_committed_composite_item_name") or ""
+        )
+        requested = editor.text().strip()
+        sibling_names = {
+            self.composite_item_table.cellWidget(
+                other_row, 1
+            ).text().strip()
+            for other_row in range(self.composite_item_table.rowCount())
+            if other_row != row
+            and self.composite_item_table.cellWidget(other_row, 1) is not None
+        }
+        if not requested or requested in sibling_names:
+            with QtCore.QSignalBlocker(editor):
+                editor.setText(previous)
+            reason = "Composite pulse/delay names must be non-empty and unique."
+            editor.setToolTip(reason)
+            QtWidgets.QToolTip.showText(
+                editor.mapToGlobal(editor.rect().bottomLeft()),
+                reason,
+                editor,
+            )
+            return
+        with QtCore.QSignalBlocker(editor):
+            editor.setText(requested)
+        editor.setProperty(
+            "qstl_committed_composite_item_name",
+            requested,
+        )
+        editor.setToolTip("")
+        self.changed.emit()
+
+    def _track_table_editor(self, widget: QtWidgets.QWidget) -> None:
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QtWidgets.QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (
+            QtCore.QEvent.FocusIn,
+            QtCore.QEvent.MouseButtonPress,
+        ):
+            candidate = watched
+            tables = tuple(
+                table
+                for table in (
+                    getattr(self, "duration_parameter_table", None),
+                    getattr(self, "frequency_parameter_table", None),
+                    getattr(self, "composite_item_table", None),
+                )
+                if table is not None
+            )
+            while isinstance(candidate, QtWidgets.QWidget):
+                for table in tables:
+                    row = self._table_widget_row(table, candidate)
+                    if row >= 0:
+                        table.selectRow(row)
+                        return super().eventFilter(watched, event)
+                candidate = candidate.parentWidget()
+        return super().eventFilter(watched, event)
+
+    def _commit_composite_parameter_name(
+        self,
+        editor: QtWidgets.QLineEdit,
+        *,
+        frequency: bool,
+    ) -> None:
+        table = (
+            self.frequency_parameter_table
+            if frequency
+            else self.duration_parameter_table
+        )
+        row = self._table_widget_row(table, editor)
+        if row < 0:
+            return
+        previous = str(
+            editor.property("qstl_committed_parameter_name") or ""
+        )
+        requested = editor.text().strip()
+        sibling_names = {
+            table.cellWidget(other_row, 0).text().strip()
+            for other_row in range(table.rowCount())
+            if other_row != row
+        }
+        valid = (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", requested) is not None
+            and requested not in sibling_names
+        )
+        if not valid:
+            with QtCore.QSignalBlocker(editor):
+                editor.setText(previous)
+            reason = (
+                "Parameter names must be unique Python-style identifiers."
+            )
+            editor.setToolTip(reason)
+            QtWidgets.QToolTip.showText(
+                editor.mapToGlobal(editor.rect().bottomLeft()),
+                reason,
+                editor,
+            )
+            return
+
+        with QtCore.QSignalBlocker(editor):
+            editor.setText(requested)
+        editor.setProperty("qstl_committed_parameter_name", requested)
+        editor.setToolTip("")
+        rename = (previous, requested)
+        if frequency:
+            self._sync_composite_frequency_choices(rename=rename)
+        else:
+            self._sync_composite_duration_choices(rename=rename)
+        self.changed.emit()
 
     @staticmethod
     def _table_widget_row(table: QtWidgets.QTableWidget, widget) -> int:
@@ -3908,6 +4132,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self._sync_composite_duration_choices()
         if emit:
+            self.duration_parameter_table.selectRow(row)
             self.changed.emit()
 
     def _update_duration_parameter_row(self, row: int) -> None:
@@ -3933,10 +4158,16 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             for row in range(self.duration_parameter_table.rowCount())
         )
 
-    def _sync_composite_duration_choices(self, *_args) -> None:
+    def _sync_composite_duration_choices(
+        self,
+        *_args,
+        rename: Optional[Tuple[str, str]] = None,
+    ) -> None:
         names = tuple(name for name in self._duration_parameter_names() if name)
         fallback = names[0] if names else ""
         previous_predefined = self.predefined_duration_parameter.currentText()
+        if rename is not None and previous_predefined == rename[0]:
+            previous_predefined = rename[1]
         with QtCore.QSignalBlocker(self.predefined_duration_parameter):
             self.predefined_duration_parameter.clear()
             self.predefined_duration_parameter.addItems(names)
@@ -3950,6 +4181,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             kind = self.composite_item_table.cellWidget(row, 0).currentData()
             selector = self.composite_item_table.cellWidget(row, 3)
             previous = selector.currentText()
+            if rename is not None and previous == rename[0]:
+                previous = rename[1]
             with QtCore.QSignalBlocker(selector):
                 selector.clear()
                 selector.addItems(names)
@@ -4006,6 +4239,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self._sync_composite_frequency_choices()
         if emit:
+            self.frequency_parameter_table.selectRow(row)
             self.changed.emit()
 
     def _update_frequency_parameter_row(self, row: int) -> None:
@@ -4031,10 +4265,16 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             for row in range(self.frequency_parameter_table.rowCount())
         )
 
-    def _sync_composite_frequency_choices(self, *_args) -> None:
+    def _sync_composite_frequency_choices(
+        self,
+        *_args,
+        rename: Optional[Tuple[str, str]] = None,
+    ) -> None:
         names = tuple(name for name in self._frequency_parameter_names() if name)
         fallback = names[0] if names else ""
         previous_predefined = self.predefined_frequency_parameter.currentText()
+        if rename is not None and previous_predefined == rename[0]:
+            previous_predefined = rename[1]
         with QtCore.QSignalBlocker(self.predefined_frequency_parameter):
             self.predefined_frequency_parameter.clear()
             self.predefined_frequency_parameter.addItems(names)
@@ -4048,6 +4288,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             kind = self.composite_item_table.cellWidget(row, 0).currentData()
             selector = self.composite_item_table.cellWidget(row, 4)
             previous = selector.currentText()
+            if rename is not None and previous == rename[0]:
+                previous = rename[1]
             with QtCore.QSignalBlocker(selector):
                 selector.clear()
                 selector.addItems(names)
@@ -4312,6 +4554,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         kind_editor.addItem("Pulse", "pulse")
         kind_editor.addItem("Delay", "delay")
         kind_editor.setCurrentIndex(0 if item.kind == "pulse" else 1)
+        kind_editor.setProperty("qstl_committed_composite_kind", item.kind)
         name = QtWidgets.QLineEdit(item.name)
         duration = self._composite_duration_spin(item.duration_us)
         duration_parameter = QtWidgets.QComboBox()
@@ -4324,6 +4567,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         gain.setRange(-32768, 32767)
         gain.setValue(item.gain)
         power = self._new_composite_power_button(item)
+        self._track_table_editor(power)
         phase = QtWidgets.QDoubleSpinBox()
         phase.setRange(-360.0, 360.0)
         phase.setDecimals(6)
@@ -4342,15 +4586,51 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         ):
             self.composite_item_table.setCellWidget(row, column, widget)
             if widget is not power:
-                self._connect_composite_editor(widget)
+                self._connect_composite_editor(
+                    widget,
+                    item_name=(column == 1),
+                )
         kind_editor.currentIndexChanged.connect(
-            lambda _index, editor=kind_editor: self._update_composite_item_row(
-                self._table_widget_row(self.composite_item_table, editor)
+            lambda _index, editor=kind_editor: self._composite_item_kind_changed(
+                editor
             )
         )
         self._update_composite_item_row(row)
         if emit:
+            self.composite_item_table.selectRow(row)
             self.changed.emit()
+
+    def _composite_item_kind_changed(
+        self,
+        editor: QtWidgets.QComboBox,
+    ) -> None:
+        row = self._table_widget_row(self.composite_item_table, editor)
+        if row < 0:
+            return
+        previous = str(
+            editor.property("qstl_committed_composite_kind") or "pulse"
+        )
+        requested = str(editor.currentData())
+        pulse_count = sum(
+            self.composite_item_table.cellWidget(index, 0) is not None
+            and self.composite_item_table.cellWidget(
+                index, 0
+            ).currentData()
+            == "pulse"
+            for index in range(self.composite_item_table.rowCount())
+        )
+        if previous == "pulse" and requested == "delay" and pulse_count == 0:
+            with QtCore.QSignalBlocker(editor):
+                editor.setCurrentIndex(editor.findData("pulse"))
+            editor.setToolTip(
+                "A composite sequence must keep at least one pulse."
+            )
+            self._update_composite_item_row(row)
+            return
+        editor.setProperty("qstl_committed_composite_kind", requested)
+        editor.setToolTip("")
+        self._update_composite_item_row(row)
+        self.changed.emit()
 
     def _update_composite_item_row(self, row: int) -> None:
         if not 0 <= int(row) < self.composite_item_table.rowCount():
@@ -4365,6 +4645,54 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.composite_item_table.cellWidget(row, 5).setEnabled(
             is_pulse and not bool(power.power_calibration_enabled)
         )
+        self._update_composite_remove_button()
+
+    def _update_composite_remove_button(self, *_args) -> None:
+        if not hasattr(self, "remove_composite_item_button"):
+            return
+        row_count = self.composite_item_table.rowCount()
+        selected_row = self.composite_item_table.currentRow()
+        if selected_row < 0 and row_count:
+            selected_row = row_count - 1
+        pulse_rows = tuple(
+            row
+            for row in range(row_count)
+            if (
+                self.composite_item_table.cellWidget(row, 0) is not None
+                and self.composite_item_table.cellWidget(
+                    row, 0
+                ).currentData()
+                == "pulse"
+            )
+        )
+        deleting_last_pulse = (
+            selected_row in pulse_rows and len(pulse_rows) <= 1
+        )
+        custom = self._predefined_template_name() == "custom"
+        for row in range(row_count):
+            kind_editor = self.composite_item_table.cellWidget(row, 0)
+            if kind_editor is None:
+                continue
+            last_pulse = row in pulse_rows and len(pulse_rows) <= 1
+            kind_editor.setEnabled(custom and not last_pulse)
+            if last_pulse:
+                kind_editor.setToolTip(
+                    "Add another pulse before changing this pulse to a delay."
+                )
+            else:
+                kind_editor.setToolTip("")
+        enabled = custom and row_count > 1 and not deleting_last_pulse
+        self.remove_composite_item_button.setEnabled(enabled)
+        if deleting_last_pulse:
+            self.remove_composite_item_button.setToolTip(
+                "A composite sequence must keep at least one pulse."
+            )
+        elif row_count <= 1:
+            self.remove_composite_item_button.setToolTip(
+                "A composite sequence must keep at least one entry."
+            )
+        else:
+            self.remove_composite_item_button.setToolTip("")
 
     def _remove_composite_item(self) -> None:
         if self.composite_item_table.rowCount() <= 1:
@@ -4372,7 +4700,44 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         row = self.composite_item_table.currentRow()
         if row < 0:
             row = self.composite_item_table.rowCount() - 1
+        selected_kind = self.composite_item_table.cellWidget(
+            row, 0
+        ).currentData()
+        pulse_count = sum(
+            self.composite_item_table.cellWidget(index, 0).currentData()
+            == "pulse"
+            for index in range(self.composite_item_table.rowCount())
+        )
+        if selected_kind == "pulse" and pulse_count <= 1:
+            self._update_composite_remove_button()
+            return
         self.composite_item_table.removeRow(row)
+        self._update_composite_remove_button()
+        self.changed.emit()
+
+    def _reorder_composite_items(self, logical_order: Sequence[int]) -> None:
+        """Make the dropped visual order the stored and executed row order."""
+        row_count = self.composite_item_table.rowCount()
+        order = tuple(int(row) for row in logical_order)
+        if (
+            self._predefined_template_name() != "custom"
+            or len(order) != row_count
+            or set(order) != set(range(row_count))
+        ):
+            self.composite_row_header.resetVisualOrder()
+            return
+        if order == tuple(range(row_count)):
+            return
+
+        selected_row = self.composite_item_table.currentRow()
+        reordered_items = self._composite_items(row_order=order)
+        with QtCore.QSignalBlocker(self.composite_item_table):
+            self.composite_item_table.setRowCount(0)
+            for item in reordered_items:
+                self._add_composite_item(item.kind, item, emit=False)
+        self.composite_row_header.resetVisualOrder()
+        if selected_row in order:
+            self.composite_item_table.selectRow(order.index(selected_row))
         self.changed.emit()
 
     def _clear_composite_tables(self) -> None:
@@ -4432,13 +4797,18 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             for row in range(self.frequency_parameter_table.rowCount())
         )
 
-    def _composite_items(self) -> Tuple[QickRfCompositeItemSpec, ...]:
+    def _composite_items(
+        self,
+        row_order: Optional[Sequence[int]] = None,
+    ) -> Tuple[QickRfCompositeItemSpec, ...]:
         durations = {
             parameter.name: parameter
             for parameter in self._composite_duration_parameters()
         }
+        if row_order is None:
+            row_order = range(self.composite_item_table.rowCount())
         items = []
-        for row in range(self.composite_item_table.rowCount()):
+        for row in row_order:
             kind = str(self.composite_item_table.cellWidget(row, 0).currentData())
             items.append(
                 QickRfCompositeItemSpec(
@@ -5649,6 +6019,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_pulse_mode_controls()
         self._update_predefined_controls()
         self.setChecked(enabled)
+        self.changed.emit()
 
 
 class RfPortsPanel(QtWidgets.QWidget):
