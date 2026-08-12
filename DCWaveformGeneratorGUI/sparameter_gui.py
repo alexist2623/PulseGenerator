@@ -27,6 +27,7 @@ else:
 try:
     from .qick_sparameter_sweep import (
         ACQUISITION_SOURCES,
+        AVG_SWEEP_MODES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
@@ -45,6 +46,7 @@ try:
 except ImportError:
     from qick_sparameter_sweep import (
         ACQUISITION_SOURCES,
+        AVG_SWEEP_MODES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
         MAX_RF_OUTPUT_GAIN,
@@ -778,6 +780,28 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             "frequency. QICK returns the result normalized by integration "
             "length and repetitions."
         )
+        self.avg_sweep_mode = QtWidgets.QComboBox()
+        self.avg_sweep_mode.addItem(
+            "Hardware repetitions (tProcessor)",
+            "hardware",
+        )
+        self.avg_sweep_mode.addItem(
+            "Software repetitions (host rounds)",
+            "software",
+        )
+        self.avg_sweep_mode.setToolTip(
+            "Hardware mode repeats every frequency point inside the "
+            "tProcessor loop. Software mode repeats the complete hardware "
+            "frequency sweep as host-controlled averaging rounds."
+        )
+        self.avg_hardware_rep_delay_us = QtWidgets.QDoubleSpinBox()
+        self.avg_hardware_rep_delay_us.setRange(0.0, 1.0e9)
+        self.avg_hardware_rep_delay_us.setDecimals(6)
+        self.avg_hardware_rep_delay_us.setSuffix(" us")
+        self.avg_hardware_rep_delay_us.setToolTip(
+            "Fixed pacing guard after every hardware AVG repetition; this "
+            "is not a PC readback handshake."
+        )
         self.margin_input_samples = QtWidgets.QSpinBox()
         self.margin_input_samples.setRange(0, 10_000_000)
         self.margin_input_samples.setValue(1024)
@@ -810,6 +834,11 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         capture_form.addRow("Source:", self.acquisition_source)
         capture_form.addRow("AVG repetitions / frequency:", self.avg_repetitions)
+        capture_form.addRow("AVG repetition mode:", self.avg_sweep_mode)
+        capture_form.addRow(
+            "Hardware repetition guard:",
+            self.avg_hardware_rep_delay_us,
+        )
         capture_form.addRow("FIR input margin:", self.margin_input_samples)
         capture_form.addRow(
             "FPGA trigger-to-store delay:",
@@ -833,6 +862,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         self.avg_repetitions.valueChanged.connect(
             self._update_fir_profile_status
+        )
+        self.avg_sweep_mode.currentIndexChanged.connect(
+            self._update_acquisition_source_state
         )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
@@ -1202,6 +1234,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def _update_acquisition_source_state(self, *_args) -> None:
         uses_fir = self.acquisition_source.currentData() == "fir_ddr"
         self.avg_repetitions.setEnabled(not uses_fir)
+        self.avg_sweep_mode.setEnabled(not uses_fir)
+        self.avg_hardware_rep_delay_us.setEnabled(
+            not uses_fir and self.avg_sweep_mode.currentData() == "hardware"
+        )
         for widget in self._fir_capture_widgets:
             widget.setEnabled(uses_fir)
         self._update_fpga_trigger_delay_controls()
@@ -1215,7 +1251,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.fir_profile_status.setText(
                 "AVG buffer: "
                 f"{integration_us:g} us integration x {repetitions:,} "
-                "repetitions per frequency; returned I/Q is normalized by "
+                f"{self.avg_sweep_mode.currentData()} repetitions per "
+                "frequency; returned I/Q is normalized by "
                 "the integration length and repetition count. DDR is unused."
             )
             return
@@ -1286,6 +1323,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             scan_time_us=self.scan_time_us.value(),
             minimum_coherent_samples=1,
             avg_repetitions=self.avg_repetitions.value(),
+            avg_sweep_mode=str(self.avg_sweep_mode.currentData()),
+            avg_hardware_rep_delay_us=(
+                self.avg_hardware_rep_delay_us.value()
+            ),
             output_att1_db=path["output_att1_db"],
             output_att2_db=path["output_att2_db"],
             output_filter_type=self.output_filter_type.currentText(),
@@ -1332,6 +1373,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         values["minimum_coherent_samples"] = 1
         values.setdefault("acquisition_source", "fir_ddr")
         values.setdefault("avg_repetitions", 100)
+        values.setdefault("avg_sweep_mode", "hardware")
+        values.setdefault("avg_hardware_rep_delay_us", 0.0)
         database_path = str(
             values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
         ).strip()
@@ -1355,6 +1398,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             (self.power_points, config.power_points),
             (self.scan_time_us, config.scan_time_us),
             (self.avg_repetitions, config.avg_repetitions),
+            (
+                self.avg_hardware_rep_delay_us,
+                config.avg_hardware_rep_delay_us,
+            ),
             (self.output_att1_db, config.output_att1_db),
             (self.output_att2_db, config.output_att2_db),
             (self.output_filter_cutoff_ghz, config.output_filter_cutoff_ghz),
@@ -1411,6 +1458,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 f"unsupported acquisition source {config.acquisition_source!r}"
             )
         self.acquisition_source.setCurrentIndex(source_index)
+        avg_mode_index = self.avg_sweep_mode.findData(config.avg_sweep_mode)
+        if avg_mode_index < 0:
+            raise ValueError(
+                f"unsupported AVG sweep mode {config.avg_sweep_mode!r}"
+            )
+        self.avg_sweep_mode.setCurrentIndex(avg_mode_index)
         selection_index = self.input_calibration_selection.findData(
             config.input_calibration_selection
         )
@@ -1442,6 +1495,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.acquisition_source.setEnabled(not running)
         uses_fir = self.acquisition_source.currentData() == "fir_ddr"
         self.avg_repetitions.setEnabled(not running and not uses_fir)
+        self.avg_sweep_mode.setEnabled(not running and not uses_fir)
+        self.avg_hardware_rep_delay_us.setEnabled(
+            not running
+            and not uses_fir
+            and self.avg_sweep_mode.currentData() == "hardware"
+        )
         for widget in self._fir_capture_widgets:
             widget.setEnabled(not running and uses_fir)
         self.override_fpga_trigger_delay.setEnabled(

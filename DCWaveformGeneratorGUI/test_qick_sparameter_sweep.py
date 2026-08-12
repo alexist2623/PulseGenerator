@@ -654,17 +654,22 @@ def test_avg_buffer_program_works_without_fir_ddr_metadata():
             frequency_points=3,
             scan_time_us=4.0,
             avg_repetitions=7,
+            avg_sweep_mode="hardware",
+            avg_hardware_rep_delay_us=2.5,
         ),
     )
     program.compile()
 
     summary = program.summary()
     assert program.loop_dims == [3, 7]
+    assert program.rounds == 1
     assert program.ro_chs[0]["trigs"] == 1
     assert program.avg_integration_samples == 1200
     assert program.ddr_trigger_time is None
     assert summary["acquisition_source"] == "avg_buffer"
     assert summary["avg_repetitions"] == 7
+    assert summary["avg_sweep_mode"] == "hardware"
+    assert summary["avg_hardware_rep_delay_tproc_cycles"] == 750
     assert summary["avg_integration_time_us"] == pytest.approx(4.0)
     assert summary["fir_rate_profile"] is None
     assert summary["fir_output_rate_msps"] is None
@@ -675,6 +680,36 @@ def test_avg_buffer_configuration_rejects_invalid_source_and_repetitions():
         _config(acquisition_source="unknown")
     with pytest.raises(ValueError, match="avg_repetitions"):
         _config(acquisition_source="avg_buffer", avg_repetitions=0)
+    with pytest.raises(ValueError, match="avg_sweep_mode"):
+        _config(acquisition_source="avg_buffer", avg_sweep_mode="unknown")
+    with pytest.raises(ValueError, match="avg_hardware_rep_delay_us"):
+        _config(
+            acquisition_source="avg_buffer",
+            avg_hardware_rep_delay_us=-1.0,
+        )
+
+
+def test_avg_buffer_software_mode_repeats_complete_hardware_frequency_sweep():
+    program = SParameterSweepProgram(
+        _mock_soccfg(),
+        _config(
+            acquisition_source="avg_buffer",
+            frequency_points=3,
+            scan_time_us=4.0,
+            avg_repetitions=7,
+            avg_sweep_mode="software",
+            avg_hardware_rep_delay_us=2.5,
+        ),
+    )
+    program.compile()
+
+    summary = program.summary()
+    assert program.loop_dims == [3, 1]
+    assert program.rounds == 7
+    assert summary["avg_sweep_mode"] == "software"
+    assert summary["avg_repetitions"] == 7
+    assert summary["avg_hardware_rep_delay_tproc_cycles"] == 0
+    assert summary["sweep_execution"] == "tproc_hardware_register_add"
 
 
 def test_avg_buffer_acquisition_returns_one_iq_value_per_frequency(monkeypatch):
@@ -1509,6 +1544,10 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
         panel.acquisition_source.findData("avg_buffer")
     )
     panel.avg_repetitions.setValue(17)
+    panel.avg_sweep_mode.setCurrentIndex(
+        panel.avg_sweep_mode.findData("software")
+    )
+    panel.avg_hardware_rep_delay_us.setValue(12.5)
     panel.power_sweep_enabled.setChecked(True)
     panel.power_start_gain.setValue(100)
     panel.power_end_gain.setValue(10000)
@@ -1532,15 +1571,21 @@ def test_gui_has_independent_sparameter_tab_gain_limit_and_settings_round_trip(
     assert decoded["s_parameter"]["frequency_points"] == 33
     assert decoded["s_parameter"]["acquisition_source"] == "avg_buffer"
     assert decoded["s_parameter"]["avg_repetitions"] == 17
+    assert decoded["s_parameter"]["avg_sweep_mode"] == "software"
+    assert decoded["s_parameter"]["avg_hardware_rep_delay_us"] == 12.5
     assert panel.margin_input_samples.isEnabled() is False
     assert panel.address.isEnabled() is False
 
     legacy_sparameter = dict(decoded["s_parameter"])
     legacy_sparameter.pop("acquisition_source")
     legacy_sparameter.pop("avg_repetitions")
+    legacy_sparameter.pop("avg_sweep_mode")
+    legacy_sparameter.pop("avg_hardware_rep_delay_us")
     panel.load_settings(legacy_sparameter)
     assert panel.acquisition_source.currentData() == "fir_ddr"
     assert panel.avg_repetitions.value() == 100
+    assert panel.avg_sweep_mode.currentData() == "hardware"
+    assert panel.avg_hardware_rep_delay_us.value() == 0.0
     assert panel.margin_input_samples.isEnabled() is True
     assert panel.address.isEnabled() is True
     assert decoded["s_parameter"]["power_sweep_enabled"] is True

@@ -704,8 +704,10 @@ class ReadoutConfig:
     ro_ch: int
     length: int
     freq: int = 0
+    freq_mhz: Optional[float] = None
     phrst: int = 0
     at_segment: Optional[str] = None
+    timing_reference: str = "segment_end"
     measure_delay_tproc_cycles: int = 0
     trigger_width_tproc_cycles: int = 10
     wait: bool = True
@@ -713,8 +715,14 @@ class ReadoutConfig:
     def __post_init__(self):
         _require_int(self.ro_ch, "ro_ch", 0)
         _require_int(self.length, "length", 1)
+        if self.freq_mhz is not None and not isfinite(float(self.freq_mhz)):
+            raise ValueError("readout freq_mhz must be finite")
         if _require_int(self.phrst, "readout phrst", 0) != 0:
             raise ValueError("readout phrst is fixed to 0")
+        if self.timing_reference not in {"segment_start", "segment_end"}:
+            raise ValueError(
+                "readout timing_reference must be segment_start or segment_end"
+            )
         _require_int(self.measure_delay_tproc_cycles, "measure_delay_tproc_cycles", 0)
         _require_int(self.trigger_width_tproc_cycles, "trigger_width_tproc_cycles", 1)
 
@@ -863,7 +871,7 @@ class DdrFirReadoutConfig:
 
 @dataclass(frozen=True)
 class FineTuneDdrResult:
-    """Post-FIR DDR samples grouped by Cartesian point and repetition."""
+    """I/Q samples grouped by Cartesian point and repetition."""
 
     sweep_points: np.ndarray
     iq: np.ndarray
@@ -883,6 +891,8 @@ class FineTuneDdrResult:
     cross_capacitance: Optional[np.ndarray] = None
     sample_rate_hz: float = 1_000_000.0
     fir_rate_profile: str = "1_msps"
+    acquisition_source: str = "fir_ddr"
+    accumulation_repetitions: int = 1
 
     @property
     def mean_iq(self) -> np.ndarray:
@@ -2947,9 +2957,36 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         if self.readout_config is not None:
             ro = self.readout_config
             self.declare_readout(ch=ro.ro_ch, length=ro.length)
+            freq_word = int(ro.freq)
+            if ro.freq_mhz is not None:
+                ro_cfg = self.soccfg["readouts"][ro.ro_ch]
+                gen_ch = (
+                    self.rf_pulse_configs[0].gen_ch
+                    if self.rf_pulse_configs
+                    else None
+                )
+                try:
+                    freq_word = int(
+                        self.freq2reg_adc(
+                            float(ro.freq_mhz),
+                            ro_ch=ro.ro_ch,
+                            gen_ch=gen_ch,
+                        )
+                    )
+                except KeyError as exc:
+                    if exc.args != ("refclk_freq",):
+                        raise
+                    b_dds = int(ro_cfg["b_dds"])
+                    freq_word = int(
+                        round(
+                            float(ro.freq_mhz)
+                            * (1 << b_dds)
+                            / float(ro_cfg["f_dds"])
+                        )
+                    ) % (1 << b_dds)
             self.set_readout_registers(
                 ch=ro.ro_ch,
-                freq=ro.freq,
+                freq=freq_word,
                 length=ro.length,
                 phrst=0,
             )
@@ -6523,7 +6560,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 names = [segment.name for segment in self.sequence.segments]
                 if ro.at_segment not in names:
                     raise KeyError(f"unknown readout segment {ro.at_segment!r}")
-                measure_time = self.timing["segment_ends"][names.index(ro.at_segment)]
+                timing_key = (
+                    "segment_starts"
+                    if ro.timing_reference == "segment_start"
+                    else "segment_ends"
+                )
+                measure_time = self.timing[timing_key][names.index(ro.at_segment)]
             measure_time += ro.measure_delay_tproc_cycles
             schedule(measure_time, 0, "readout", ro.ro_ch)
             schedule(
@@ -7253,6 +7295,79 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             cross_capacitance=self.sequence.cross_capacitance.copy(),
             sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
             fir_rate_profile=self._fir_cfg["rate_profile"],
+            acquisition_source="fir_ddr",
+            accumulation_repetitions=repetitions,
+        )
+
+    def acquire_avg_buffer(
+        self,
+        soc,
+        *,
+        progress: bool = False,
+        counter_progress=None,
+        cancel_check: Optional[Callable[[], None]] = None,
+    ):
+        """Return one repetition-averaged AVG-buffer I/Q value per point.
+
+        Cartesian points and repetitions remain tProcessor hardware loops.
+        QICK's averager normalizes the accumulated readout by both integration
+        length and repetition count, so the returned array contains one
+        coherent mean I/Q pair for every Cartesian coordinate.
+        """
+        if self.readout_config is None:
+            raise RuntimeError(
+                "acquire_avg_buffer requires readout configuration"
+            )
+        if self.ddr_readout_config is not None:
+            raise RuntimeError(
+                "AVG-buffer acquisition cannot share the FIR DDR readout path"
+            )
+
+        n_points = self.sequence.sweep_point_count
+        repetitions = int(self.cfg["reps"])
+        total = n_points * repetitions
+        if cancel_check is not None:
+            cancel_check()
+        if counter_progress is not None:
+            counter_progress(0, total)
+        _expt_points, avg_di, avg_dq = super().acquire(
+            soc,
+            progress=progress,
+        )
+        if cancel_check is not None:
+            cancel_check()
+        if counter_progress is not None:
+            counter_progress(total, total)
+        if len(avg_di) != 1 or len(avg_dq) != 1:
+            raise RuntimeError(
+                "AVG-buffer stability acquisition expected exactly one "
+                f"readout channel, received I/Q channel counts "
+                f"{len(avg_di)}/{len(avg_dq)}"
+            )
+        mean_i = np.asarray(avg_di[0], dtype=np.float64).reshape(-1)
+        mean_q = np.asarray(avg_dq[0], dtype=np.float64).reshape(-1)
+        if mean_i.size != n_points or mean_q.size != n_points:
+            raise RuntimeError(
+                "unexpected AVG-buffer Cartesian result shape: "
+                f"I={np.asarray(avg_di[0]).shape}, "
+                f"Q={np.asarray(avg_dq[0]).shape}; expected {n_points} point(s)"
+            )
+        iq = np.stack((mean_i, mean_q), axis=-1)[:, None, None, :]
+        ro_cfg = self.soccfg["readouts"][self.readout_config.ro_ch]
+        sample_rate_hz = float(
+            ro_cfg.get("f_output", ro_cfg.get("f_fabric", 1.0))
+        ) * 1_000_000.0
+        return FineTuneDdrResult(
+            sweep_points=self.get_expt_pts(),
+            iq=iq,
+            reserved_physical_words=0,
+            sweep_axes=self.sequence.sweep_axes,
+            sweep_shape=self.sequence.sweep_shape,
+            cross_capacitance=self.sequence.cross_capacitance.copy(),
+            sample_rate_hz=sample_rate_hz,
+            fir_rate_profile="avg_buffer",
+            acquisition_source="avg_buffer",
+            accumulation_repetitions=repetitions,
         )
 
     def summary(self):
@@ -7422,6 +7537,12 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 if isinstance(axis, HoldDurationSweep)
             ),
             "fir_ddr_readout": self.ddr_readout_config is not None,
+            "avg_buffer_readout": self.readout_config is not None,
+            "acquisition_source": (
+                "fir_ddr"
+                if self.ddr_readout_config is not None
+                else ("avg_buffer" if self.readout_config is not None else None)
+            ),
             "fir_rate_profile": (
                 self._fir_cfg["rate_profile"]
                 if self.ddr_readout_config is not None

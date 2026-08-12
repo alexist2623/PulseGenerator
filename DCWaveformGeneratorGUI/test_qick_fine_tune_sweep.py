@@ -13,6 +13,7 @@ from qick.sim import QickSim  # noqa: F401
 from qick.awg_tuning import TProcV1BehaviorModel
 from qick.qick_asm import QickConfig
 
+import qick_fine_tune_sweep as sweep_module
 from qick_fine_tune_sweep import (
     COMPILE_VALIDATION_BOUNDARY,
     COMPILE_VALIDATION_FULL,
@@ -153,6 +154,34 @@ def _fir_soccfg(*, fir_rate_profile="1_msps", ddr_trigger_port=0):
         "trigger_port": int(ddr_trigger_port),
         "trigger_bit": 1,
     }
+    return QickConfig(cfg)
+
+
+def _avg_soccfg(n_outputs=2):
+    """Mock the normal accumulated-readout path used by AVG buffer tests."""
+    cfg = _mock_soccfg(n_outputs)._cfg
+    cfg["refclk_freq"] = 300.0
+    cfg["readouts"] = [{
+        "type": "axis_dyn_readout_v1",
+        "ro_type": "axis_dyn_readout_v1",
+        "tproc_ctrl": 1,
+        "tmux_ch": 0,
+        "f_fabric": 300.0,
+        "f_output": 300.0,
+        "f_dds": 300.0,
+        "fs_mult": 1,
+        "fs_div": 1,
+        "fdds_div": 1,
+        "b_dds": 32,
+        "b_phase": 32,
+        "adc": "00",
+        "buf_maxlen": 16384,
+        "has_weights": False,
+        "has_edge_counter": False,
+        "trigger_type": "dport",
+        "trigger_port": 0,
+        "trigger_bit": 0,
+    }]
     return QickConfig(cfg)
 
 
@@ -1904,6 +1933,87 @@ def test_counter_progress_tracks_hardware_sweep_and_repetition_count():
     assert program.summary()["total_acquisitions"] == 6
     assert calls.count("start") == 1
     assert calls[-1] == ("source", "internal")
+
+
+def test_avg_buffer_cartesian_sweep_and_repetitions_are_tprocessor_loops():
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("set_0", (0.0, 0.0), 300)
+    sequence.add_amplitude_sweep("set_0", "awg_0", -0.2, 0.2, 3)
+    sequence.add_amplitude_sweep("set_0", "awg_1", -0.1, 0.1, 2)
+    program = sequence.make_program(
+        _avg_soccfg(2),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=4,
+        readout=ReadoutConfig(
+            ro_ch=0,
+            length=8,
+            freq_mhz=19.0,
+            at_segment="set_0",
+            timing_reference="segment_start",
+            measure_delay_tproc_cycles=10,
+        ),
+        recovery_tproc_cycles=25,
+    )
+    program.compile()
+
+    tproc = TProcV1BehaviorModel(strict=True).run(
+        program.prog_list,
+        max_steps=1_000_000,
+    )
+    summary = program.summary()
+
+    assert sequence.sweep_shape == (3, 2)
+    assert program.loop_dims == [6, 4]
+    assert summary["total_acquisitions"] == 24
+    assert summary["avg_buffer_readout"] is True
+    assert summary["acquisition_source"] == "avg_buffer"
+    assert sum(event.tproc_ch == 0 for event in tproc.output_events) == 48
+    assert sum(event.tproc_ch == 1 for event in tproc.output_events) == 24
+    assert tproc.timing_conflicts == []
+
+
+def test_avg_buffer_acquisition_restores_cartesian_points(monkeypatch):
+    sequence = FineTuneSequence(("awg_0", "awg_1"))
+    sequence.add_set("set_0", (0.0, 0.0), 300)
+    sequence.add_amplitude_sweep("set_0", "awg_0", -0.2, 0.2, 3)
+    sequence.add_amplitude_sweep("set_0", "awg_1", -0.1, 0.1, 2)
+    program = sequence.make_program(
+        _avg_soccfg(2),
+        awg_channels=(0, 1),
+        repetitions_per_sweep=4,
+        readout=ReadoutConfig(
+            ro_ch=0,
+            length=8,
+            at_segment="set_0",
+            timing_reference="segment_start",
+        ),
+    )
+    progress_updates = []
+
+    def fake_acquire(_program, _soc, *, progress=False, **_kwargs):
+        assert progress is False
+        return (
+            sequence.sweep_points,
+            [np.asarray([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])],
+            [np.asarray([[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]])],
+        )
+
+    monkeypatch.setattr(sweep_module.RAveragerProgram, "acquire", fake_acquire)
+    result = program.acquire_avg_buffer(
+        object(),
+        counter_progress=lambda completed, total: progress_updates.append(
+            (completed, total)
+        ),
+    )
+
+    assert progress_updates == [(0, 24), (24, 24)]
+    assert result.acquisition_source == "avg_buffer"
+    assert result.accumulation_repetitions == 4
+    assert result.iq.shape == (6, 1, 1, 2)
+    assert result.sweep_shape == (3, 2)
+    np.testing.assert_allclose(result.sweep_points, sequence.sweep_points)
+    np.testing.assert_allclose(result.iq[:, 0, 0, 0], np.arange(1.0, 7.0))
+    np.testing.assert_allclose(result.iq[:, 0, 0, 1], -np.arange(1.0, 7.0))
 
 
 def test_program_compilation_observes_cancellation_between_sweep_points():

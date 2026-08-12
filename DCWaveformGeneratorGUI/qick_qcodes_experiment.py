@@ -114,6 +114,14 @@ def _runtime_types():
     return DdrFirReadoutConfig, RfPulseConfig, cycles_from_us
 
 
+def _runtime_readout_type():
+    try:
+        from .qick_fine_tune_sweep import ReadoutConfig
+    except ImportError:
+        from qick_fine_tune_sweep import ReadoutConfig
+    return ReadoutConfig
+
+
 def _resolve_tproc_mhz(soccfg, tproc_mhz: Optional[float]) -> float:
     value = (
         soccfg["tprocs"][0]["f_time"]
@@ -836,6 +844,32 @@ def build_runtime_ddr_readout(
     )
 
 
+def build_runtime_avg_readout(
+    soccfg,
+    spec: QickDdrReadoutSpec,
+    *,
+    tproc_mhz: Optional[float] = None,
+) -> Any:
+    """Convert shared GUI readout settings to an AVG-buffer trigger."""
+    readout_type = _runtime_readout_type()
+    _ddr_type, _rf_type, cycles_from_us = _runtime_types()
+    tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
+    delay_cycles = (
+        0
+        if spec.delay_us <= 0.0
+        else cycles_from_us(spec.delay_us, tproc_mhz)
+    )
+    return readout_type(
+        ro_ch=spec.ro_ch,
+        length=spec.samples_per_trigger,
+        freq_mhz=spec.readout_frequency_mhz,
+        at_segment=spec.segment_name,
+        timing_reference="segment_start",
+        measure_delay_tproc_cycles=delay_cycles,
+        phrst=0,
+    )
+
+
 def build_qick_program(
     soccfg,
     sequence,
@@ -845,11 +879,27 @@ def build_qick_program(
     tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec] = (),
     readout_spec: Optional[QickDdrReadoutSpec] = None,
+    acquisition_source: str = "fir_ddr",
+    hardware_rep_delay_us: float = 0.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     cancel_check: Optional[CancellationCheck] = None,
 ):
     """Build the tProcessor program without configuring or running hardware."""
     effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
+    acquisition_source = str(acquisition_source)
+    if acquisition_source not in {"fir_ddr", "avg_buffer"}:
+        raise ValueError(
+            "acquisition_source must be fir_ddr or avg_buffer"
+        )
+    hardware_rep_delay_us = float(hardware_rep_delay_us)
+    if not np.isfinite(hardware_rep_delay_us) or hardware_rep_delay_us < 0.0:
+        raise ValueError("hardware_rep_delay_us must be nonnegative and finite")
+    _ddr_type, _rf_type, cycles_from_us = _runtime_types()
+    recovery_tproc_cycles = 20 + (
+        0
+        if hardware_rep_delay_us == 0.0
+        else cycles_from_us(hardware_rep_delay_us, effective_tproc_mhz)
+    )
     program_kwargs = {
         "awg_channels": tuple(int(channel) for channel in awg_channels),
         "tproc_mhz": effective_tproc_mhz,
@@ -860,11 +910,17 @@ def build_qick_program(
         "rf_pulses": build_runtime_rf_pulses(
             soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
         ),
+        "recovery_tproc_cycles": recovery_tproc_cycles,
     }
     if readout_spec is not None:
-        program_kwargs["ddr_readout"] = build_runtime_ddr_readout(
-            soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
-        )
+        if acquisition_source == "fir_ddr":
+            program_kwargs["ddr_readout"] = build_runtime_ddr_readout(
+                soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
+            )
+        else:
+            program_kwargs["readout"] = build_runtime_avg_readout(
+                soccfg, readout_spec, tproc_mhz=effective_tproc_mhz
+            )
     if cancel_check is not None:
         program_kwargs["cancel_check"] = cancel_check
     _check_cancel(cancel_check)
@@ -1057,13 +1113,20 @@ def _execute_qick_sequence_once(
     tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
+    acquisition_source: str = "fir_ddr",
+    hardware_rep_delay_us: float = 0.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[ExperimentEventCallback] = None,
     cancel_check: Optional[CancellationCheck] = None,
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
-    """Configure the readout, execute the tProcessor program, and read DDR."""
+    """Configure and execute one FIR-DDR or AVG-buffer acquisition."""
+    acquisition_source = str(acquisition_source)
+    if acquisition_source not in {"fir_ddr", "avg_buffer"}:
+        raise ValueError(
+            "acquisition_source must be fir_ddr or avg_buffer"
+        )
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF readout hardware")
     _emit_experiment_event(
@@ -1107,6 +1170,8 @@ def _execute_qick_sequence_once(
         repetitions_per_sweep=int(repetitions_per_sweep),
         rf_specs=rf_specs,
         readout_spec=readout_spec,
+        acquisition_source=acquisition_source,
+        hardware_rep_delay_us=hardware_rep_delay_us,
         compile_validation_mode=compile_validation_mode,
         cancel_check=cancel_check,
     )
@@ -1171,20 +1236,25 @@ def _execute_qick_sequence_once(
             if progress_callback is not None or event_callback is not None
             else None
         ),
-        "readback_progress": (
-            readback_progress if progress_callback is not None else None
-        ),
     }
-    if event_callback is not None:
-        acquire_kwargs["phase_callback"] = event_callback
     if cancel_check is not None:
         acquire_kwargs["cancel_check"] = cancel_check
-    ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
+    if acquisition_source == "fir_ddr":
+        acquire_kwargs["readback_progress"] = (
+            readback_progress if progress_callback is not None else None
+        )
+        if event_callback is not None:
+            acquire_kwargs["phase_callback"] = event_callback
+        ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
+        completion_message = "FIR DDR acquisition and readback completed"
+    else:
+        ddr_result = program.acquire_avg_buffer(soc, **acquire_kwargs)
+        completion_message = "AVG-buffer hardware accumulation completed"
     _check_cancel(cancel_check)
     _emit_progress(
         progress_callback,
         64,
-        "FIR DDR acquisition and readback completed",
+        completion_message,
     )
     return program, ddr_result, rf_settings
 
@@ -1374,6 +1444,8 @@ def execute_qick_sequence(
     tproc_mhz: Optional[float] = None,
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
+    acquisition_source: str = "fir_ddr",
+    hardware_rep_delay_us: float = 0.0,
     sequence_fabric_mhz: float = 300.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
@@ -1394,6 +1466,8 @@ def execute_qick_sequence(
             tproc_mhz=tproc_mhz,
             rf_specs=rf_specs,
             readout_spec=readout_spec,
+            acquisition_source=acquisition_source,
+            hardware_rep_delay_us=hardware_rep_delay_us,
             compile_validation_mode=compile_validation_mode,
             progress=progress,
             progress_callback=progress_callback,
@@ -1450,6 +1524,8 @@ def execute_qick_sequence(
             tproc_mhz=tproc_mhz,
             rf_specs=concrete_specs,
             readout_spec=readout_spec,
+            acquisition_source=acquisition_source,
+            hardware_rep_delay_us=hardware_rep_delay_us,
             compile_validation_mode=compile_validation_mode,
             progress=progress,
             progress_callback=point_progress,

@@ -9,6 +9,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
@@ -107,6 +108,9 @@ DEFAULT_STABILITY_POINT_GUARD_US = 1.0
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
 DEFAULT_STABILITY_MODULATION_GAIN = 20_000
 DEFAULT_STABILITY_TARGET_POWER_DBM = -20.0
+STABILITY_ACQUISITION_SOURCES = ("fir_ddr", "avg_buffer")
+STABILITY_SWEEP_MODES = ("hardware", "software")
+DEFAULT_STABILITY_HARDWARE_REP_DELAY_US = 0.0
 DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH = str(
     Path.home() / "gain_pwr_calb.db"
 )
@@ -286,7 +290,7 @@ class StabilitySweepAxis:
 
 @dataclass(frozen=True)
 class StabilityDiagramConfig:
-    """Two-axis hardware sweep and coherent FIR reduction settings."""
+    """Two-axis sweep and coherent FIR/AVG reduction settings."""
 
     x_axis: StabilitySweepAxis
     y_axis: StabilitySweepAxis
@@ -294,6 +298,9 @@ class StabilityDiagramConfig:
     trace_samples_per_point: int = DEFAULT_STABILITY_TRACE_SAMPLES
     settle_time_us: float = DEFAULT_STABILITY_SETTLE_US
     fpga_trigger_delay_us: Optional[float] = None
+    acquisition_source: str = "fir_ddr"
+    sweep_mode: str = "hardware"
+    hardware_rep_delay_us: float = DEFAULT_STABILITY_HARDWARE_REP_DELAY_US
     modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
     modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
     modulation_power_calibration_enabled: bool = False
@@ -319,6 +326,26 @@ class StabilityDiagramConfig:
         )
         if _finite_float(self.settle_time_us, "stability settle time") < 0.0:
             raise ValueError("stability settle time must not be negative")
+        if self.acquisition_source not in STABILITY_ACQUISITION_SOURCES:
+            raise ValueError(
+                "stability acquisition source must be one of "
+                f"{STABILITY_ACQUISITION_SOURCES}"
+            )
+        if self.sweep_mode not in STABILITY_SWEEP_MODES:
+            raise ValueError(
+                "stability sweep mode must be one of "
+                f"{STABILITY_SWEEP_MODES}"
+            )
+        if (
+            _finite_float(
+                self.hardware_rep_delay_us,
+                "stability hardware repetition delay",
+            )
+            < 0.0
+        ):
+            raise ValueError(
+                "stability hardware repetition delay must not be negative"
+            )
         if (
             self.fpga_trigger_delay_us is not None
             and _finite_float(
@@ -1023,6 +1050,9 @@ def default_stability_settings(
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
         "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
         "fpga_trigger_delay_us": None,
+        "acquisition_source": "fir_ddr",
+        "sweep_mode": "hardware",
+        "hardware_rep_delay_us": DEFAULT_STABILITY_HARDWARE_REP_DELAY_US,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
         "modulation_power_calibration": {
@@ -1125,6 +1155,33 @@ def normalize_stability_settings(
     )
     if normalized["settle_time_us"] < 0.0:
         raise ValueError("stability settle time must not be negative")
+    normalized["acquisition_source"] = str(
+        settings.get("acquisition_source", defaults["acquisition_source"])
+    )
+    if normalized["acquisition_source"] not in STABILITY_ACQUISITION_SOURCES:
+        raise ValueError(
+            "stability acquisition source must be one of "
+            f"{STABILITY_ACQUISITION_SOURCES}"
+        )
+    normalized["sweep_mode"] = str(
+        settings.get("sweep_mode", defaults["sweep_mode"])
+    )
+    if normalized["sweep_mode"] not in STABILITY_SWEEP_MODES:
+        raise ValueError(
+            "stability sweep mode must be one of "
+            f"{STABILITY_SWEEP_MODES}"
+        )
+    normalized["hardware_rep_delay_us"] = _finite_float(
+        settings.get(
+            "hardware_rep_delay_us",
+            defaults["hardware_rep_delay_us"],
+        ),
+        "stability hardware repetition delay",
+    )
+    if normalized["hardware_rep_delay_us"] < 0.0:
+        raise ValueError(
+            "stability hardware repetition delay must not be negative"
+        )
     raw_fpga_delay = settings.get(
         "fpga_trigger_delay_us",
         defaults["fpga_trigger_delay_us"],
@@ -1465,6 +1522,91 @@ def build_stability_hold_sequence(
     )
 
 
+def _stability_sequence_at_point(sequence: Any, point_index: int) -> Any:
+    """Return a fixed-voltage clone for one host-software sweep point."""
+    point_index = _integer(point_index, "stability point index", 0)
+    coordinates = np.asarray(sequence.sweep_coordinates, dtype=float)
+    if point_index >= coordinates.shape[0]:
+        raise IndexError("stability point index is out of range")
+    concrete = deepcopy(sequence)
+    values = list(concrete.segments[0].amplitudes)
+    for axis, value in zip(sequence.sweep_axes, coordinates[point_index]):
+        if axis.segment_name != STABILITY_HOLD_SEGMENT:
+            raise ValueError(
+                "stability software sweep encountered an unexpected segment"
+            )
+        output_index = concrete.output_names.index(axis.output_name)
+        values[output_index] = float(value)
+    concrete.segments[0] = replace(
+        concrete.segments[0],
+        amplitudes=tuple(values),
+    )
+    concrete.sweeps = []
+    concrete._sweep_coordinate_cache = None
+    concrete._validate()
+    return concrete
+
+
+@dataclass(frozen=True)
+class StabilitySoftwareSweepProgramBundle:
+    """One compiled tProcessor program per host-controlled Cartesian point."""
+
+    programs: Tuple[Any, ...]
+    sweep_points: np.ndarray
+
+    def summary(self) -> Mapping[str, Any]:
+        base = dict(self.programs[-1].summary())
+        base.update({
+            "stability_sweep_mode": "software",
+            "software_sweep_program_count": len(self.programs),
+            "software_sweep_points": np.asarray(
+                self.sweep_points,
+                dtype=float,
+            ).tolist(),
+        })
+        return base
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.programs[-1], name)
+
+
+def _combine_stability_point_results(
+    sequence: Any,
+    results: Sequence[Any],
+) -> Any:
+    """Restore a software-point run to the normal Cartesian result shape."""
+    if not results:
+        raise RuntimeError("stability software sweep produced no results")
+    iq_parts = tuple(np.asarray(result.iq) for result in results)
+    if any(part.shape[0] != 1 for part in iq_parts):
+        raise RuntimeError(
+            "each stability software-sweep result must contain one point"
+        )
+    reference_shape = iq_parts[0].shape[1:]
+    if any(part.shape[1:] != reference_shape for part in iq_parts):
+        raise RuntimeError(
+            "stability software-sweep point results have inconsistent I/Q shapes"
+        )
+    reserved_values = tuple(
+        getattr(result, "reserved_physical_words", None)
+        for result in results
+    )
+    reserved = (
+        sum(int(value) for value in reserved_values)
+        if all(value is not None for value in reserved_values)
+        else None
+    )
+    return replace(
+        results[0],
+        sweep_points=sequence.sweep_points.copy(),
+        iq=np.concatenate(iq_parts, axis=0),
+        reserved_physical_words=reserved,
+        sweep_axes=sequence.sweep_axes,
+        sweep_shape=sequence.sweep_shape,
+        cross_capacitance=sequence.cross_capacitance.copy(),
+    )
+
+
 def reduce_fir_stability_result(
     ddr_result: Any,
     config: StabilityDiagramConfig,
@@ -1473,7 +1615,7 @@ def reduce_fir_stability_result(
     iteration: int = 1,
     readout_spec: Optional[Any] = None,
 ) -> StabilityDiagramResult:
-    """Coherently average FIR I/Q and restore the two voltage axes.
+    """Coherently average FIR/AVG I/Q and restore the two voltage axes.
 
     The arithmetic mean is taken independently on I and Q over all
     repetitions and all FIR-output samples at each Cartesian coordinate.
@@ -1483,7 +1625,7 @@ def reduce_fir_stability_result(
     iq = np.asarray(ddr_result.iq)
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError(
-            "stability FIR IQ must have shape "
+            "stability I/Q must have shape "
             "(point, repetition, sample, 2)"
         )
     if iq.shape[0] != config.point_count:
@@ -1503,7 +1645,7 @@ def reduce_fir_stability_result(
         y_column = axis_keys.index(y_key)
     except ValueError as exc:
         raise ValueError(
-            "FIR result sweep axes do not match the selected stability electrodes"
+            "acquisition sweep axes do not match the selected stability electrodes"
         ) from exc
     if x_column == y_column:
         raise ValueError("stability result requires two independent sweep axes")
@@ -1513,7 +1655,9 @@ def reduce_fir_stability_result(
         config.point_count,
         len(sweep_axes),
     ):
-        raise ValueError("stability sweep-coordinate shape does not match FIR IQ")
+        raise ValueError(
+            "stability sweep-coordinate shape does not match acquisition I/Q"
+        )
 
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
     representation = str(
@@ -1610,12 +1754,12 @@ def reduce_fir_stability_result(
         if abs(float(y_voltage_mv[y_index]) - float(y_mv)) > y_tolerance:
             raise ValueError(f"unexpected Y sweep coordinate {y_mv:g} mV")
         if populated[y_index, x_index]:
-            raise ValueError("duplicate Cartesian coordinate in FIR result")
+            raise ValueError("duplicate Cartesian coordinate in acquisition result")
         populated[y_index, x_index] = True
         i_mean[y_index, x_index] = point_iq[point_index, 0]
         q_mean[y_index, x_index] = point_iq[point_index, 1]
     if not np.all(populated):
-        raise ValueError("FIR result does not cover the full stability grid")
+        raise ValueError("acquisition result does not cover the full stability grid")
 
     i_mean, q_mean, display_scale = scale_iq_for_display(
         i_mean,
@@ -1638,7 +1782,9 @@ def reduce_fir_stability_result(
         display_scale=display_scale.factor,
         measurement_mode=measurement_mode,
         iteration=_integer(iteration, "stability iteration", 1),
-        repetition_count=int(iq.shape[1]),
+        repetition_count=int(
+            getattr(ddr_result, "accumulation_repetitions", iq.shape[1])
+        ),
         samples_per_trace=int(iq.shape[2]),
         sample_rate_hz=float(
             getattr(ddr_result, "sample_rate_hz", 1_000_000.0)
@@ -1734,14 +1880,32 @@ class StabilityDiagramWorker(QtCore.QObject):
 
         self.progress_changed.emit(1, "Connecting to QICK")
         soc, soccfg = connect_qick(connection_config, connector=connector)
-        fir_profile = resolve_fir_ddr_profile(
-            soccfg,
-            context="stability diagram",
-        )
+        acquisition_source = stability_config.acquisition_source
+        fir_profile = None
+        if acquisition_source == "fir_ddr":
+            fir_profile = resolve_fir_ddr_profile(
+                soccfg,
+                context="stability diagram",
+            )
+            sample_rate_hz = float(fir_profile.sample_rate_hz)
+            sample_period_us = float(fir_profile.sample_period_us)
+        else:
+            ro_ch = int(readout_spec.ro_ch)
+            if ro_ch >= len(soccfg["readouts"]):
+                raise IndexError("stability AVG readout channel is out of range")
+            ro_cfg = soccfg["readouts"][ro_ch]
+            sample_rate_hz = float(
+                ro_cfg.get("f_output", ro_cfg.get("f_fabric", 0.0))
+            ) * 1_000_000.0
+            if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+                raise RuntimeError(
+                    "selected AVG readout has no valid output sample rate"
+                )
+            sample_period_us = 1_000_000.0 / sample_rate_hz
         effective_run_config = (
             None
             if run_config is None
-            else replace(run_config, sample_rate_hz=fir_profile.sample_rate_hz)
+            else replace(run_config, sample_rate_hz=sample_rate_hz)
         )
         template_sequence = sequence
         if hasattr(template_sequence, "output_names") and hasattr(
@@ -1754,47 +1918,69 @@ class StabilityDiagramWorker(QtCore.QObject):
                 fabric_mhz=stability_fabric_mhz,
                 full_scale_mv=full_scale_mv,
                 cross_capacitance=template_sequence.cross_capacitance,
-                sample_period_us=fir_profile.sample_period_us,
+                sample_period_us=sample_period_us,
             )
             kwargs["sequence"] = sequence
         capture_window_us = (
             stability_config.trace_samples_per_point
-            * fir_profile.sample_period_us
+            * sample_period_us
         )
         kwargs["rf_specs"] = tuple(
             replace(
                 spec,
                 duration_us=max(
-                    fir_profile.sample_period_us,
+                    sample_period_us,
                     capture_window_us,
                 ),
             )
             for spec in kwargs.get("rf_specs", ())
         )
-        selected_delay_value = fir_profile.selected_trigger_delay_value(
-            stability_config.fpga_trigger_delay_us
-        )
-        selected_delay_us = fir_profile.trigger_delay_us_for(
-            selected_delay_value
-        )
+        if fir_profile is not None:
+            selected_delay_value = fir_profile.selected_trigger_delay_value(
+                stability_config.fpga_trigger_delay_us
+            )
+            selected_delay_us = fir_profile.trigger_delay_us_for(
+                selected_delay_value
+            )
+        else:
+            selected_delay_value = 0
+            selected_delay_us = 0.0
         if hasattr(kwargs["readout_spec"], "__dataclass_fields__"):
             kwargs["readout_spec"] = replace(
                 kwargs["readout_spec"],
                 fpga_trigger_delay_samples=None,
                 fpga_trigger_delay_us=(
                     stability_config.fpga_trigger_delay_us
+                    if fir_profile is not None
+                    else None
                 ),
             )
-        self.progress_changed.emit(
-            2,
-            (
+        kwargs["acquisition_source"] = acquisition_source
+        kwargs["hardware_rep_delay_us"] = (
+            stability_config.hardware_rep_delay_us
+            if stability_config.sweep_mode == "hardware"
+            else 0.0
+        )
+        if fir_profile is not None:
+            timing_message = (
                 f"HWH FIR DDR: "
-                f"{getattr(fir_profile, 'rate_label', format_sample_rate_hz(fir_profile.sample_rate_hz))} "
-                f"({fir_profile.sample_period_us:g} us/sample); "
+                f"{getattr(fir_profile, 'rate_label', format_sample_rate_hz(sample_rate_hz))} "
+                f"({sample_period_us:g} us/sample); "
                 f"{stability_config.trace_samples_per_point:,} samples = "
                 f"{capture_window_us:g} us; FPGA trigger-to-store delay "
                 f"{selected_delay_us:g} us"
-            ),
+            )
+        else:
+            timing_message = (
+                f"AVG buffer: {format_sample_rate_hz(sample_rate_hz)} input, "
+                f"{stability_config.trace_samples_per_point:,} integration "
+                f"samples = {capture_window_us:g} us; "
+                f"{stability_config.repetitions_per_point:,} coherent "
+                "repetition(s)"
+            )
+        self.progress_changed.emit(
+            2,
+            f"{timing_message}; {stability_config.sweep_mode} sweep",
         )
         if self._stop_event.is_set():
             self.stopped.emit()
@@ -1810,12 +1996,67 @@ class StabilityDiagramWorker(QtCore.QObject):
                     f"Scan {iteration}: {message}",
                 )
 
-            program, ddr_result, rf_settings = execute_qick_sequence(
-                soc,
-                soccfg,
-                progress_callback=scan_progress,
-                **kwargs,
-            )
+            if stability_config.sweep_mode == "hardware":
+                program, ddr_result, rf_settings = execute_qick_sequence(
+                    soc,
+                    soccfg,
+                    progress_callback=scan_progress,
+                    **kwargs,
+                )
+            else:
+                coordinates = np.asarray(sequence.sweep_coordinates, dtype=float)
+                programs = []
+                point_results = []
+                rf_settings = None
+                point_total = coordinates.shape[0]
+                for point_index in range(point_total):
+                    if self._stop_event.is_set():
+                        self.stopped.emit()
+                        return
+                    point_sequence = _stability_sequence_at_point(
+                        sequence,
+                        point_index,
+                    )
+                    point_kwargs = dict(kwargs)
+                    point_kwargs["sequence"] = point_sequence
+                    point_kwargs["hardware_rep_delay_us"] = 0.0
+
+                    def point_progress(percent: int, message: str) -> None:
+                        fraction = max(0.0, min(1.0, float(percent) / 100.0))
+                        overall = round(
+                            100.0
+                            * (point_index + fraction)
+                            / max(1, point_total)
+                        )
+                        self.progress_changed.emit(
+                            overall,
+                            (
+                                f"Scan {iteration}, software point "
+                                f"{point_index + 1:,}/{point_total:,}: {message}"
+                            ),
+                        )
+
+                    point_program, point_result, point_rf_settings = (
+                        execute_qick_sequence(
+                            soc,
+                            soccfg,
+                            progress_callback=point_progress,
+                            **point_kwargs,
+                        )
+                    )
+                    programs.append(point_program)
+                    point_results.append(point_result)
+                    if rf_settings is None:
+                        rf_settings = dict(point_rf_settings)
+                ddr_result = _combine_stability_point_results(
+                    sequence,
+                    point_results,
+                )
+                program = StabilitySoftwareSweepProgramBundle(
+                    programs=tuple(programs),
+                    sweep_points=sequence.sweep_points.copy(),
+                )
+                rf_settings = {} if rf_settings is None else rf_settings
             diagram = reduce_fir_stability_result(
                 ddr_result,
                 stability_config,
@@ -1843,20 +2084,43 @@ class StabilityDiagramWorker(QtCore.QObject):
             stored_qick = dict(stored_settings.get("qick", {}))
             stored_qick.update({
                 "iq_storage_mode": iq_storage_mode,
-                "fir_rate_profile": fir_profile.name,
-                "fir_sample_rate_hz": fir_profile.sample_rate_hz,
-                "fir_sample_period_us": fir_profile.sample_period_us,
+                "stability_acquisition_source": acquisition_source,
+                "stability_sweep_mode": stability_config.sweep_mode,
+                "stability_hardware_rep_delay_us": (
+                    stability_config.hardware_rep_delay_us
+                ),
+                "acquisition_sample_rate_hz": sample_rate_hz,
+                "acquisition_sample_period_us": sample_period_us,
+                "fir_rate_profile": (
+                    None if fir_profile is None else fir_profile.name
+                ),
+                "fir_sample_rate_hz": (
+                    None if fir_profile is None else fir_profile.sample_rate_hz
+                ),
+                "fir_sample_period_us": (
+                    None if fir_profile is None else fir_profile.sample_period_us
+                ),
                 "fir_fpga_trigger_delay_samples": selected_delay_value,
                 "fir_fpga_trigger_delay_units": (
-                    fir_profile.trigger_delay_units
+                    "none"
+                    if fir_profile is None
+                    else fir_profile.trigger_delay_units
                 ),
                 "fir_fpga_trigger_delay_us": selected_delay_us,
                 "fir_profile_default_trigger_delay_samples": (
-                    fir_profile.trigger_delay_samples
+                    0
+                    if fir_profile is None
+                    else fir_profile.trigger_delay_samples
                 ),
-                "fir_stability_capture_mode": "programmable_fpga_delay",
+                "fir_stability_capture_mode": (
+                    "not_applicable_avg_buffer"
+                    if fir_profile is None
+                    else "programmable_fpga_delay"
+                ),
                 "fir_software_warmup_compensation": (
-                    fir_profile.software_warmup_compensation
+                    False
+                    if fir_profile is None
+                    else fir_profile.software_warmup_compensation
                 ),
             })
             stored_settings["qick"] = stored_qick
@@ -2599,6 +2863,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._running = False
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
 
@@ -2646,8 +2911,43 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.trace_samples.setRange(1, 10_000_000)
         self.trace_samples.setValue(DEFAULT_STABILITY_TRACE_SAMPLES)
         self.trace_samples.setToolTip(
-            "Number of post-FIR samples stored at the HWH-selected rate for every stability "
-            "point and repetition"
+            "FIR DDR: stored samples per repetition. AVG buffer: input "
+            "samples integrated into one coherent I/Q value per repetition."
+        )
+        self.acquisition_source = QtWidgets.QComboBox(acquisition)
+        self.acquisition_source.addItem("FIR DDR traces", "fir_ddr")
+        self.acquisition_source.addItem(
+            "AVG buffer accumulated I/Q",
+            "avg_buffer",
+        )
+        self.acquisition_source.setToolTip(
+            "FIR DDR stores a trace. AVG buffer integrates the selected "
+            "readout window and returns one coherently averaged I/Q value."
+        )
+        self.sweep_mode = QtWidgets.QComboBox(acquisition)
+        self.sweep_mode.addItem(
+            "Hardware Cartesian (tProcessor)",
+            "hardware",
+        )
+        self.sweep_mode.addItem(
+            "Software Cartesian (host PC)",
+            "software",
+        )
+        self.sweep_mode.setToolTip(
+            "Hardware mode executes X, Y, and repetition loops in one "
+            "tProcessor program. Software mode runs one fixed X/Y point per "
+            "host request; repetitions remain coherently accumulated in AVG."
+        )
+        self.hardware_rep_delay_us = QtWidgets.QDoubleSpinBox(acquisition)
+        self.hardware_rep_delay_us.setRange(0.0, 1.0e9)
+        self.hardware_rep_delay_us.setDecimals(6)
+        self.hardware_rep_delay_us.setSuffix(" us")
+        self.hardware_rep_delay_us.setValue(
+            DEFAULT_STABILITY_HARDWARE_REP_DELAY_US
+        )
+        self.hardware_rep_delay_us.setToolTip(
+            "Fixed tProcessor pacing guard after every hardware repetition. "
+            "This is not a host-read handshake."
         )
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
@@ -2721,8 +3021,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.dc_measure_gain_v_per_a.setDecimals(6)
         self.dc_measure_gain_v_per_a.setValue(1.0)
         self.dc_measure_gain_v_per_a.setSuffix(" V/A")
+        acquisition_form.addRow("Source:", self.acquisition_source)
+        acquisition_form.addRow("Sweep execution:", self.sweep_mode)
         acquisition_form.addRow("Repetitions / point:", self.repetitions)
-        acquisition_form.addRow("FIR trace samples / point:", self.trace_samples)
+        acquisition_form.addRow("Samples / integration:", self.trace_samples)
+        acquisition_form.addRow(
+            "Hardware repetition guard:",
+            self.hardware_rep_delay_us,
+        )
         acquisition_form.addRow("Settle before readout:", self.settle_time_us)
         acquisition_form.addRow(
             "FPGA trigger-to-store delay:",
@@ -3087,6 +3393,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
         self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
+        self.acquisition_source.currentIndexChanged.connect(
+            self._update_acquisition_controls
+        )
+        self.sweep_mode.currentIndexChanged.connect(
+            self._update_acquisition_controls
+        )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -3099,6 +3411,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_frequency_mhz.valueChanged.connect(
             self._invalidate_modulation_power_calibration
         )
+        self._update_acquisition_controls()
         self.modulation_target_power_dbm.valueChanged.connect(
             self._invalidate_modulation_power_calibration
         )
@@ -3144,7 +3457,6 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self._targets_available = False
         self._dc_input_available = False
-        self._running = False
         self._saved_run_loading = False
         self._preferred_saved_run_id = 0
         self._resolved_modulation_power_signature = None
@@ -3647,14 +3959,33 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_fir_trace_duration()
 
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
-        supported = self._fir_uses_fpga_trigger_delay is not False
+        supported = (
+            self.acquisition_source.currentData() == "fir_ddr"
+            and self._fir_uses_fpga_trigger_delay is not False
+        )
         self.override_fpga_trigger_delay.setEnabled(supported)
         self.fpga_trigger_delay_us.setEnabled(
             supported and self.override_fpga_trigger_delay.isChecked()
         )
         self._update_fir_trace_duration()
 
+    def _update_acquisition_controls(self, *_args) -> None:
+        uses_fir = self.acquisition_source.currentData() == "fir_ddr"
+        hardware = self.sweep_mode.currentData() == "hardware"
+        self.hardware_rep_delay_us.setEnabled(
+            not self._running and hardware
+        )
+        self.override_fpga_trigger_delay.setVisible(uses_fir)
+        self.fpga_trigger_delay_us.setVisible(uses_fir)
+        self._update_fpga_trigger_delay_controls()
+
     def _update_fir_trace_duration(self, *_args) -> None:
+        if self.acquisition_source.currentData() == "avg_buffer":
+            self.fir_profile_status.setText(
+                "AVG integration rate is read from the selected readout in "
+                "the active HWH when the scan starts."
+            )
+            return
         if self._fir_sample_rate_hz is None:
             self.fir_profile_status.setText(
                 "Identify QICK to show the FIR DDR timing"
@@ -3730,6 +4061,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             repetitions_per_point=self.repetitions.value(),
             trace_samples_per_point=self.trace_samples.value(),
             settle_time_us=self.settle_time_us.value(),
+            acquisition_source=str(self.acquisition_source.currentData()),
+            sweep_mode=str(self.sweep_mode.currentData()),
+            hardware_rep_delay_us=self.hardware_rep_delay_us.value(),
             fpga_trigger_delay_us=(
                 self.fpga_trigger_delay_us.value()
                 if (
@@ -3769,6 +4103,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
             "settle_time_us": self.settle_time_us.value(),
+            "acquisition_source": str(self.acquisition_source.currentData()),
+            "sweep_mode": str(self.sweep_mode.currentData()),
+            "hardware_rep_delay_us": self.hardware_rep_delay_us.value(),
             "fpga_trigger_delay_us": (
                 self.fpga_trigger_delay_us.value()
                 if self.override_fpga_trigger_delay.isChecked()
@@ -3840,6 +4177,26 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.settle_time_us.setValue(
             float(settings.get("settle_time_us", DEFAULT_STABILITY_SETTLE_US))
+        )
+        source_index = self.acquisition_source.findData(
+            str(settings.get("acquisition_source", "fir_ddr"))
+        )
+        if source_index < 0:
+            raise ValueError("saved Stability acquisition source is invalid")
+        self.acquisition_source.setCurrentIndex(source_index)
+        sweep_mode_index = self.sweep_mode.findData(
+            str(settings.get("sweep_mode", "hardware"))
+        )
+        if sweep_mode_index < 0:
+            raise ValueError("saved Stability sweep mode is invalid")
+        self.sweep_mode.setCurrentIndex(sweep_mode_index)
+        self.hardware_rep_delay_us.setValue(
+            float(
+                settings.get(
+                    "hardware_rep_delay_us",
+                    DEFAULT_STABILITY_HARDWARE_REP_DELAY_US,
+                )
+            )
         )
         saved_fpga_delay = settings.get("fpga_trigger_delay_us")
         self.override_fpga_trigger_delay.setChecked(
@@ -4012,6 +4369,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
         self._update_fpga_trigger_delay_controls()
+        self._update_acquisition_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
@@ -4028,11 +4386,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
         self.settle_time_us.setEnabled(not running)
+        self.acquisition_source.setEnabled(not running)
+        self.sweep_mode.setEnabled(not running)
+        self.hardware_rep_delay_us.setEnabled(
+            not running and self.sweep_mode.currentData() == "hardware"
+        )
         self.override_fpga_trigger_delay.setEnabled(
-            not running and self._fir_uses_fpga_trigger_delay is not False
+            not running
+            and self.acquisition_source.currentData() == "fir_ddr"
+            and self._fir_uses_fpga_trigger_delay is not False
         )
         self.fpga_trigger_delay_us.setEnabled(
             not running
+            and self.acquisition_source.currentData() == "fir_ddr"
             and self._fir_uses_fpga_trigger_delay is not False
             and self.override_fpga_trigger_delay.isChecked()
         )
@@ -4055,6 +4421,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_dc_measure_controls()
         self._update_modulation_power_calibration_controls()
         self._update_bias_t_controls()
+        self._update_acquisition_controls()
         self.progress.setVisible(running)
         if not running:
             self.progress.setValue(0)

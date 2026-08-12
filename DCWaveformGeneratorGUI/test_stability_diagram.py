@@ -5,7 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 import sqlite3
@@ -113,6 +113,7 @@ def _ddr_result():
 
 @dataclass(frozen=True)
 class _FakeReadoutSpec:
+    ro_ch: int = 0
     fpga_trigger_delay_samples: int = 50
     fpga_trigger_delay_us: float | None = None
 
@@ -189,6 +190,9 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     legacy.pop("saved_plot_data")
     legacy.pop("iq_storage_mode")
     legacy.pop("modulation_power_calibration")
+    legacy.pop("acquisition_source")
+    legacy.pop("sweep_mode")
+    legacy.pop("hardware_rep_delay_us")
 
     normalized = stability.normalize_stability_settings(
         legacy,
@@ -205,6 +209,9 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
         "filter_tau_us": 100.0,
     }
     assert normalized["settle_time_us"] == stability.DEFAULT_STABILITY_SETTLE_US
+    assert normalized["acquisition_source"] == "fir_ddr"
+    assert normalized["sweep_mode"] == "hardware"
+    assert normalized["hardware_rep_delay_us"] == 0.0
     assert "segment_name" not in normalized["x_axis"]
     assert normalized["color_ranges"] == {
         "i": {
@@ -581,6 +588,144 @@ def test_continuous_worker_repeats_without_qcodes_storage(monkeypatch):
     assert stopped == [True]
 
 
+def test_avg_hardware_worker_keeps_cartesian_and_repetition_loops(monkeypatch):
+    calls = []
+    config = replace(
+        _config(),
+        acquisition_source="avg_buffer",
+        sweep_mode="hardware",
+        hardware_rep_delay_us=2.5,
+    )
+    kwargs = _worker_kwargs()
+    kwargs["stability_config"] = config
+    kwargs["sequence"] = SimpleNamespace(
+        output_names=("awg_0", "awg_1"),
+        cross_capacitance=np.eye(2),
+    )
+    monkeypatch.setattr(
+        stability,
+        "connect_qick",
+        lambda *_args, **_kwargs: (
+            object(),
+            {"readouts": [{"f_output": 300.0}]},
+        ),
+    )
+    monkeypatch.setattr(
+        stability,
+        "resolve_fir_ddr_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("AVG mode must not resolve the FIR DDR profile")
+        ),
+    )
+
+    class FakeProgram:
+        def summary(self):
+            return {"cartesian_point_count": 4}
+
+    def fake_execute(*_args, **runtime_kwargs):
+        calls.append(runtime_kwargs)
+        return FakeProgram(), _ddr_result(), {}
+
+    monkeypatch.setattr(stability, "execute_qick_sequence", fake_execute)
+    worker = stability.StabilityDiagramWorker(kwargs, continuous=True)
+    scans = []
+    worker.scan_ready.connect(
+        lambda result: (scans.append(result), worker.request_stop())
+    )
+    worker.run()
+
+    assert len(calls) == 1
+    assert calls[0]["sequence"].sweep_shape == (2, 2)
+    assert len(calls[0]["sequence"].sweep_axes) == 2
+    assert calls[0]["repetitions_per_sweep"] == 2
+    assert calls[0]["acquisition_source"] == "avg_buffer"
+    assert calls[0]["hardware_rep_delay_us"] == 2.5
+    assert len(scans) == 1
+    assert scans[0].magnitude.shape == (2, 2)
+
+
+def test_avg_software_worker_runs_one_fixed_program_per_cartesian_point(
+    monkeypatch,
+):
+    config = replace(
+        _config(),
+        acquisition_source="avg_buffer",
+        sweep_mode="software",
+        hardware_rep_delay_us=9.0,
+    )
+    kwargs = _worker_kwargs()
+    kwargs["stability_config"] = config
+    kwargs["sequence"] = SimpleNamespace(
+        output_names=("awg_0", "awg_1"),
+        cross_capacitance=np.eye(2),
+    )
+    monkeypatch.setattr(
+        stability,
+        "connect_qick",
+        lambda *_args, **_kwargs: (
+            object(),
+            {"readouts": [{"f_output": 300.0}]},
+        ),
+    )
+    monkeypatch.setattr(
+        stability,
+        "resolve_fir_ddr_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("AVG mode must not resolve the FIR DDR profile")
+        ),
+    )
+    raw = _ddr_result()
+    calls = []
+
+    class FakeProgram:
+        def summary(self):
+            return {"cartesian_point_count": 1}
+
+    def fake_execute(*_args, **runtime_kwargs):
+        point_index = len(calls)
+        calls.append(runtime_kwargs)
+        point_sequence = runtime_kwargs["sequence"]
+        result = FineTuneDdrResult(
+            sweep_points=np.asarray([0.0]),
+            iq=np.asarray(raw.iq[point_index : point_index + 1]),
+            sweep_shape=(1,),
+            cross_capacitance=np.eye(2),
+            sample_rate_hz=300_000_000.0,
+            fir_rate_profile="avg_buffer",
+            acquisition_source="avg_buffer",
+            accumulation_repetitions=2,
+        )
+        assert point_sequence.sweep_point_count == 1
+        assert point_sequence.sweep_axes == ()
+        return FakeProgram(), result, {}
+
+    monkeypatch.setattr(stability, "execute_qick_sequence", fake_execute)
+    worker = stability.StabilityDiagramWorker(kwargs, continuous=True)
+    scans = []
+    worker.scan_ready.connect(
+        lambda result: (scans.append(result), worker.request_stop())
+    )
+    worker.run()
+
+    expected_levels = (
+        (-1.0, -0.5),
+        (-1.0, 0.5),
+        (1.0, -0.5),
+        (1.0, 0.5),
+    )
+    assert len(calls) == 4
+    assert tuple(
+        tuple(call["sequence"].segments[0].amplitudes)
+        for call in calls
+    ) == expected_levels
+    assert all(call["repetitions_per_sweep"] == 2 for call in calls)
+    assert all(call["acquisition_source"] == "avg_buffer" for call in calls)
+    assert all(call["hardware_rep_delay_us"] == 0.0 for call in calls)
+    assert len(scans) == 1
+    assert scans[0].repetition_count == 2
+    assert scans[0].magnitude.shape == (2, 2)
+
+
 def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
     profile = _fir_profile(is_50_ksps=True)
     monkeypatch.setattr(
@@ -732,6 +877,11 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.repetitions.setValue(4)
     panel.trace_samples.setValue(321)
     panel.settle_time_us.setValue(75.5)
+    panel.acquisition_source.setCurrentIndex(
+        panel.acquisition_source.findData("avg_buffer")
+    )
+    panel.sweep_mode.setCurrentIndex(panel.sweep_mode.findData("software"))
+    panel.hardware_rep_delay_us.setValue(12.5)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
     panel.modulation_power_calibration_group.setChecked(True)
@@ -768,6 +918,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert config.point_count == 77
     assert config.trace_samples_per_point == 321
     assert config.settle_time_us == 75.5
+    assert config.acquisition_source == "avg_buffer"
+    assert config.sweep_mode == "software"
+    assert config.hardware_rep_delay_us == 12.5
     assert config.modulation_frequency_mhz == 12.5
     assert config.modulation_gain == 12345
     assert config.modulation_power_calibration_enabled is True
@@ -801,6 +954,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert restored.bias_t_mode.currentData() == "fixed_time"
     assert restored.bias_t_duration_us.value() == 2.5
     assert restored.settle_time_us.value() == 75.5
+    assert restored.acquisition_source.currentData() == "avg_buffer"
+    assert restored.sweep_mode.currentData() == "software"
+    assert restored.hardware_rep_delay_us.value() == 12.5
     assert restored.plot.color_range_settings() == {
         "i": {
             "auto": True,

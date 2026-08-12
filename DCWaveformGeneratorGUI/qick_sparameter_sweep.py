@@ -66,6 +66,7 @@ else:
 
 MAX_RF_OUTPUT_GAIN = 32766
 ACQUISITION_SOURCES = ("fir_ddr", "avg_buffer")
+AVG_SWEEP_MODES = ("hardware", "software")
 AVG_ACCUM_SAFE_MAX_SAMPLES = 1 << 16
 FILTER_TYPES = ("bypass", "lowpass", "highpass", "bandpass")
 POWER_SCALES = ("linear", "log")
@@ -286,6 +287,8 @@ class SParameterSweepConfig:
     # longer expands the requested FIR capture length.
     minimum_coherent_samples: int = 1
     avg_repetitions: int = 100
+    avg_sweep_mode: str = "hardware"
+    avg_hardware_rep_delay_us: float = 0.0
     output_att1_db: float = 10.0
     output_att2_db: float = 10.0
     output_filter_type: str = "bypass"
@@ -406,6 +409,18 @@ class SParameterSweepConfig:
             1,
         )
         _require_int(self.avg_repetitions, "avg_repetitions", 1)
+        if self.avg_sweep_mode not in AVG_SWEEP_MODES:
+            raise ValueError(
+                f"avg_sweep_mode must be one of {AVG_SWEEP_MODES}"
+            )
+        avg_hardware_rep_delay_us = _require_finite(
+            self.avg_hardware_rep_delay_us,
+            "avg_hardware_rep_delay_us",
+        )
+        if avg_hardware_rep_delay_us < 0.0:
+            raise ValueError(
+                "avg_hardware_rep_delay_us must be nonnegative"
+            )
         _require_attenuation(self.output_att1_db, "output_att1_db")
         _require_attenuation(self.output_att2_db, "output_att2_db")
         _require_attenuation(self.readout_attenuation_db, "readout_attenuation_db")
@@ -1224,7 +1239,20 @@ class SParameterSweepProgram(RAveragerProgram):
             soccfg,
             {
                 "reps": (
-                    sweep.avg_repetitions if sweep.uses_avg_buffer else 1
+                    sweep.avg_repetitions
+                    if (
+                        sweep.uses_avg_buffer
+                        and sweep.avg_sweep_mode == "hardware"
+                    )
+                    else 1
+                ),
+                "rounds": (
+                    sweep.avg_repetitions
+                    if (
+                        sweep.uses_avg_buffer
+                        and sweep.avg_sweep_mode == "software"
+                    )
+                    else 1
                 ),
                 "expts": sweep.frequency_points,
                 "start": sweep.frequency_start_mhz,
@@ -1517,8 +1545,18 @@ class SParameterSweepProgram(RAveragerProgram):
                 self.output_command_time + integration_tproc_cycles
             )
         self.rf_stop_command_time = self.capture_end_tproc_cycles
+        self.avg_hardware_rep_delay_tproc_cycles = (
+            int(ceil(self.sweep.avg_hardware_rep_delay_us * self.tproc_mhz))
+            if (
+                self.sweep.uses_avg_buffer
+                and self.sweep.avg_sweep_mode == "hardware"
+            )
+            else 0
+        )
         self.point_period_tproc_cycles = (
-            self.rf_stop_command_time + self.sweep.recovery_tproc_cycles
+            self.rf_stop_command_time
+            + self.sweep.recovery_tproc_cycles
+            + self.avg_hardware_rep_delay_tproc_cycles
         )
 
         self.default_pulse_registers(
@@ -2036,6 +2074,19 @@ class SParameterSweepProgram(RAveragerProgram):
             "avg_integration_time_us": self.avg_integration_time_us,
             "avg_repetitions": (
                 self.sweep.avg_repetitions if self.sweep.uses_avg_buffer else None
+            ),
+            "avg_sweep_mode": (
+                self.sweep.avg_sweep_mode
+                if self.sweep.uses_avg_buffer
+                else None
+            ),
+            "avg_hardware_rep_delay_us": (
+                self.sweep.avg_hardware_rep_delay_us
+                if self.sweep.uses_avg_buffer
+                else None
+            ),
+            "avg_hardware_rep_delay_tproc_cycles": (
+                self.avg_hardware_rep_delay_tproc_cycles
             ),
             "fir_output_rate_msps": self.fir_output_rate_msps,
             "fir_rate_profile": None if fir_profile is None else fir_profile.name,
@@ -3496,6 +3547,7 @@ __all__ = [
     "ACTUAL_OUTPUT_POWER_PARAMETER",
     "ADC_MAGNITUDE_DB_PARAMETER",
     "ACQUISITION_SOURCES",
+    "AVG_SWEEP_MODES",
     "FILTER_TYPES",
     "CALIBRATED_GAIN_PARAMETER",
     "FREQUENCY_PARAMETER",

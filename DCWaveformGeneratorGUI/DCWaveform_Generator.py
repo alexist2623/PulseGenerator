@@ -12446,7 +12446,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if config.uses_avg_buffer:
             sample_summary = (
                 f"AVG buffer {config.scan_time_us:g} us integration x "
-                f"{config.avg_repetitions:,} repetitions per frequency"
+                f"{config.avg_repetitions:,} repetitions per frequency "
+                f"({config.avg_sweep_mode})"
             )
         else:
             identified_rate = getattr(
@@ -12888,13 +12889,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         config = arguments["stability_config"]
         mode = "continuous" if continuous else "single shot"
+        sample_label = (
+            "AVG integration samples"
+            if config.acquisition_source == "avg_buffer"
+            else "FIR samples"
+        )
         self._stability_panel.set_running(
             True,
             (
                 f"Preparing {mode} scan: {config.x_axis.points} x "
                 f"{config.y_axis.points} points, "
                 f"{config.repetitions_per_point} repetitions / point, "
-                f"{config.trace_samples_per_point:,} FIR samples / trace"
+                f"{config.trace_samples_per_point:,} {sample_label} / point "
+                f"({config.sweep_mode} sweep)"
             ),
         )
         self.statusBar().showMessage(f"QICK stability diagram {mode} running")
