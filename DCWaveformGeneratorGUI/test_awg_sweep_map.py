@@ -1007,6 +1007,14 @@ def test_plot_widget_reprojects_axes_and_slices_without_reacquisition():
     if not hasattr(widget, "axis_x"):
         widget.close()
         pytest.skip("pyqtgraph is unavailable")
+    angle_control = widget.range_controls["angle"]
+    assert angle_control.auto_range.isChecked() is False
+    angle_control.auto_range.setChecked(True)
+    app.processEvents()
+    np.testing.assert_allclose(
+        widget.images["angle"].getLevels(),
+        widget._levels(widget._result.angle_deg),
+    )
     assert widget.axis_x.count() == 4
     assert widget.axis_y.count() == 4
     assert set(widget.slice_controls) == {

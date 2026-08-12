@@ -1656,7 +1656,7 @@ if pg is not None:
                 "i": self._symmetric_levels(result.i_mean),
                 "q": self._symmetric_levels(result.q_mean),
                 "magnitude": self._levels(result.magnitude),
-                "angle": (-180.0, 180.0),
+                "angle": self._levels(result.angle_deg),
             }
             for key, values in image_values.items():
                 self.images[key].setImage(

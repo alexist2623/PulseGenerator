@@ -353,6 +353,12 @@ def test_stability_plot_exposes_and_applies_color_ranges():
     )
     assert plot.magnitude_range_control.auto_range.isChecked() is True
     assert plot.phase_range_control.auto_range.isChecked() is False
+    plot.phase_range_control.auto_range.setChecked(True)
+    app.processEvents()
+    np.testing.assert_allclose(
+        plot.phase_image.getLevels(),
+        plot._levels(result.phase_deg),
+    )
     assert plot.magnitude_color_bar is not None
     assert plot.phase_color_bar is not None
     assert plot.magnitude_color_bar.interactive is True
