@@ -34,7 +34,10 @@ from dc_waveform_core import (
     dc_iq_to_current,
     generate_qick_program_code,
 )
-from stability_diagram import DEFAULT_STABILITY_POINT_GUARD_US
+from stability_diagram import (
+    DEFAULT_STABILITY_POINT_GUARD_US,
+    DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES,
+)
 from qick_fine_tune_sweep import FineTuneSequence
 from qick_qcodes_experiment import (
     IQ_STORAGE_FULL_TRACES,
@@ -2946,6 +2949,9 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert arguments["readout_spec"].readout_frequency_mhz == 0.0
     assert arguments["rf_specs"][0].frequency_mhz == 0.0
     assert arguments["rf_specs"][0].output_board_type == "DC_Out"
+    assert arguments["rf_specs"][0].delay_us == pytest.approx(
+        DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES / 300.0
+    )
 
     window._stability_panel.bias_t_type.setCurrentIndex(
         window._stability_panel.bias_t_type.findData("filter")
@@ -3033,7 +3039,10 @@ def test_stability_run_arguments_use_identified_50ksps_timing():
     assert arguments["sequence"].segments[0].duration_cycles == int(
         np.ceil(expected_hold_us * 300.0)
     )
-    assert arguments["rf_specs"][0].duration_us == 2000.0
+    assert arguments["rf_specs"][0].delay_us == pytest.approx(
+        DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES / 300.0
+    )
+    assert arguments["rf_specs"][0].duration_us == 2025.0
     assert arguments["readout_spec"].fpga_trigger_delay_samples is None
     assert arguments["readout_spec"].fpga_trigger_delay_us is None
     assert arguments["stability_fabric_mhz"] == 300.0

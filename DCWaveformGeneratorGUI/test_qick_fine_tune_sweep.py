@@ -1390,6 +1390,49 @@ def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
     )
 
 
+def test_shared_tmux_accepts_rf_exactly_one_clock_after_awg_set():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("set_0", (0.25,), 100)
+    rf = RfPulseConfig(
+        gen_ch=0,
+        at_segment="set_0",
+        length_cycles=30,
+        gain=10_000,
+        freq_mhz=10.0,
+        delay_tproc_cycles=1,
+    )
+    program = sequence.make_program(
+        _shared_tmux_soccfg(),
+        awg_channels=(1,),
+        rf_pulse=rf,
+    )
+    program.compile()
+
+    assert program.timing["segment_starts"][0] == 0
+    assert tuple(program.timing["command_times"].values()) == (0,)
+    assert program.aux_timing["rf_requested_start"] == 1
+    assert program.aux_timing["rf_start"] == 1
+    assert program.aux_timing["rf_command_skew_tproc_cycles"] == 0
+
+    tproc = TProcV1BehaviorModel(strict=True)
+    tproc.run(program.prog_list, max_steps=100_000)
+    port_zero_events = [
+        event for event in tproc.output_events if event.tproc_ch == 0
+    ]
+    awg_set = next(
+        event
+        for event in port_zero_events
+        if ((event.word >> 152) & 0xFF) == 1
+        and ((event.word >> 144) & 0b11) == 0b01
+    )
+    rf_start = next(
+        event
+        for event in port_zero_events
+        if ((event.word >> 152) & 0xFF) == 0
+    )
+    assert rf_start.cycle - awg_set.cycle == 1
+
+
 def test_long_rf_pulse_uses_periodic_start_and_timed_zero_stop():
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("measure", (0.25,), 400_000)

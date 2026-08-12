@@ -105,6 +105,7 @@ DEFAULT_STABILITY_REPETITIONS = 1
 DEFAULT_STABILITY_TRACE_SAMPLES = 64
 DEFAULT_STABILITY_SETTLE_US = 50.0
 DEFAULT_STABILITY_POINT_GUARD_US = 1.0
+DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES = 1
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
 DEFAULT_STABILITY_MODULATION_GAIN = 20_000
 DEFAULT_STABILITY_TARGET_POWER_DBM = -20.0
@@ -1930,7 +1931,8 @@ class StabilityDiagramWorker(QtCore.QObject):
                 spec,
                 duration_us=max(
                     sample_period_us,
-                    capture_window_us,
+                    float(stability_config.settle_time_us)
+                    + capture_window_us,
                 ),
             )
             for spec in kwargs.get("rf_specs", ())
@@ -2967,8 +2969,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.settle_time_us.setValue(DEFAULT_STABILITY_SETTLE_US)
         self.settle_time_us.setSuffix(" us")
         self.settle_time_us.setToolTip(
-            "Time to hold each new X/Y voltage before RF modulation and "
-            "FIR-DDR capture begin"
+            "Time to hold each new X/Y voltage before readout begins. RF "
+            "modulation starts one tProcessor clock after the AWG SET "
+            "dispatch and remains active through this settle interval."
         )
         self.override_fpga_trigger_delay = QtWidgets.QCheckBox(
             "Override HWH default",

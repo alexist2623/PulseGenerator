@@ -328,6 +328,7 @@ except ImportError:
 try:
     from .stability_diagram import (
         DEFAULT_STABILITY_DB_PATH,
+        DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -338,6 +339,7 @@ try:
 except ImportError:
     from stability_diagram import (
         DEFAULT_STABILITY_DB_PATH,
+        DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES,
         StabilityDiagramPanel,
         StabilityDiagramWorker,
         StabilityOverlayLoadWorker,
@@ -11815,12 +11817,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             float(stability_config.trace_samples_per_point)
             * identified_sample_period_us,
         )
+        rf_start_guard_us = (
+            DEFAULT_STABILITY_RF_START_GUARD_TPROC_CYCLES
+            / float(self._qick_tproc_mhz)
+        )
         rf_specs = (
             QickRfPulseSpec(
                 gen_ch=int(path["output_ch"]),
                 segment_name=anchor_segment,
-                delay_us=settle_time_us,
-                duration_us=modulation_duration_us,
+                # One source-clock gap is sufficient for the common-clock,
+                # full-throughput TMUX path and is explicit even when RF and
+                # AWG happen to use different tProcessor output ports.
+                delay_us=rf_start_guard_us,
+                duration_us=settle_time_us + modulation_duration_us,
                 frequency_mhz=stability_config.modulation_frequency_mhz,
                 gain=resolved_modulation_gain,
                 att1_db=float(path["output_att1_db"]),

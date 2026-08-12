@@ -749,8 +749,11 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
     @dataclass(frozen=True)
     class FakeRfSpec:
         duration_us: float
+        delay_us: float
 
-    kwargs["rf_specs"] = (FakeRfSpec(duration_us=1.0),)
+    kwargs["rf_specs"] = (
+        FakeRfSpec(duration_us=1.0, delay_us=1.0 / 300.0),
+    )
     captured = {}
 
     class FakeProgram:
@@ -783,8 +786,10 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
         np.ceil(expected_hold_us * 300.0)
     )
     assert captured["rf_specs"][0].duration_us == (
-        _config().trace_samples_per_point * profile.sample_period_us
+        _config().settle_time_us
+        + _config().trace_samples_per_point * profile.sample_period_us
     )
+    assert captured["rf_specs"][0].delay_us == pytest.approx(1.0 / 300.0)
     assert captured["readout_spec"].fpga_trigger_delay_samples is None
     assert captured["readout_spec"].fpga_trigger_delay_us is None
 
