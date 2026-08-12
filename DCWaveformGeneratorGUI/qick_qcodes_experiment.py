@@ -191,6 +191,22 @@ class StoredQickExperiment:
     program: Any
     ddr_result: Any
     rf_settings: Mapping[str, Any]
+    iq_storage_mode: str = DEFAULT_IQ_STORAGE_MODE
+
+    def detach_dataset(self) -> "StoredQickExperiment":
+        """Close and discard the QCoDeS connection before crossing threads."""
+
+        dataset = self.dataset
+        if dataset is None:
+            return self
+        try:
+            connection = getattr(dataset, "conn", None)
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self.dataset = None
+        return self
 
 
 def _json_ready(value: Any) -> Any:
@@ -2904,6 +2920,7 @@ def run_qick_qcodes_experiment(
         program=program,
         ddr_result=ddr_result,
         rf_settings=rf_settings,
+        iq_storage_mode=iq_storage_mode,
     )
 
 

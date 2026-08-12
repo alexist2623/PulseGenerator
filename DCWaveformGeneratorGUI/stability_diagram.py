@@ -2143,7 +2143,8 @@ class StabilityDiagramWorker(QtCore.QObject):
                 program=program,
                 ddr_result=ddr_result,
                 rf_settings=rf_settings,
-            )
+                iq_storage_mode=iq_storage_mode,
+            ).detach_dataset()
             self.single_finished.emit(
                 StoredStabilityDiagram(diagram=diagram, experiment=experiment)
             )

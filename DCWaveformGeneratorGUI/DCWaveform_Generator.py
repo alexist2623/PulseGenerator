@@ -8626,21 +8626,16 @@ class ExperimentPanel(QtWidgets.QWidget):
                 f"{samples_per_trace:,} samples/trace = "
                 f"{trace_time_us:g} us"
             )
+        stored_mode = normalize_iq_storage_mode(
+            getattr(
+                result,
+                "iq_storage_mode",
+                self.iq_storage_mode.currentData(),
+            )
+        )
         storage_description = f"{result.row_count} IQ samples"
-        try:
-            stored_metadata = json.loads(
-                result.dataset.get_metadata("qick_experiment_json")
-            )
-            stored_mode = normalize_iq_storage_mode(
-                stored_metadata.get("measurement_layout", {}).get(
-                    "iq_storage_mode",
-                    DEFAULT_IQ_STORAGE_MODE,
-                )
-            )
-            if stored_mode == IQ_STORAGE_MEAN_IQ:
-                storage_description = f"{result.row_count} mean I/Q points"
-        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            pass
+        if stored_mode == IQ_STORAGE_MEAN_IQ:
+            storage_description = f"{result.row_count} mean I/Q points"
         self.set_running(
             False,
             f"Run {result.run_id}, {storage_description}\n"
@@ -8678,6 +8673,7 @@ class QickExperimentWorker(QtCore.QObject):
             kwargs["event_callback"] = self.event_changed.emit
             kwargs["cancel_check"] = self._check_cancel
             result = run_qick_qcodes_experiment(**kwargs)
+            result.detach_dataset()
         except ExperimentCancelled as exc:
             self.cancelled.emit(str(exc))
             return

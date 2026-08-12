@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sqlite3
 import tracemalloc
 from types import SimpleNamespace
@@ -47,6 +48,7 @@ from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
     QcodesRunConfig,
     QickConnectionConfig,
+    StoredQickExperiment,
     _sweep_parameter_names,
     build_awg_vertex_record,
     build_awg_vertex_metadata,
@@ -64,6 +66,30 @@ from qick_qcodes_experiment import (
     store_qick_result,
     write_awg_vertex_metadata_jsonl,
 )
+
+
+def test_stored_experiment_detaches_thread_bound_dataset_connection():
+    closed = []
+    dataset = SimpleNamespace(
+        conn=SimpleNamespace(close=lambda: closed.append(True)),
+    )
+    stored = StoredQickExperiment(
+        run_id=1,
+        guid="guid",
+        database_path=Path("experiment.db"),
+        row_count=1,
+        dataset=dataset,
+        program=None,
+        ddr_result=None,
+        rf_settings={},
+        iq_storage_mode=IQ_STORAGE_MEAN_IQ,
+    )
+
+    assert stored.detach_dataset() is stored
+    assert stored.dataset is None
+    assert closed == [True]
+    stored.detach_dataset()
+    assert closed == [True]
 
 
 def test_predefined_rf_n_tau_software_sweep_executes_cartesian_programs(

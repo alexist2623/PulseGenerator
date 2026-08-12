@@ -1320,7 +1320,14 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.analyze_selected_trace()
 
     def set_experiment_result(self, stored: Any) -> None:
-        arrays = load_qick_iq_arrays(stored.dataset)
+        dataset = getattr(stored, "dataset", None)
+        if dataset is None:
+            self.set_collection(load_noise_trace_collection(
+                stored.database_path,
+                stored.run_id,
+            ))
+            return
+        arrays = load_qick_iq_arrays(dataset)
         metadata = arrays.get("metadata", {})
         layout = metadata.get("measurement_layout", {})
         sample_rate_hz = float(

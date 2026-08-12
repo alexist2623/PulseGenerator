@@ -3107,6 +3107,65 @@ def test_experiment_panel_stop_button_and_worker_cancellation(monkeypatch):
     panel.close()
 
 
+def test_experiment_panel_result_display_does_not_query_qcodes_dataset():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+
+    class ThreadBoundDataset:
+        def get_metadata(self, _name):
+            raise AssertionError("GUI must not query a worker-thread dataset")
+
+    result = SimpleNamespace(
+        run_id=7,
+        row_count=4,
+        database_path="experiment.db",
+        dataset=ThreadBoundDataset(),
+        ddr_result=None,
+        rf_settings={},
+        iq_storage_mode=IQ_STORAGE_MEAN_IQ,
+    )
+
+    panel.show_result(result)
+    app.processEvents()
+
+    assert "4 mean I/Q points" in panel.run_status.text()
+    panel.close()
+
+
+def test_experiment_worker_detaches_qcodes_dataset_before_emit(monkeypatch):
+    class FakeResult:
+        def __init__(self):
+            self.detached = False
+
+        def detach_dataset(self):
+            self.detached = True
+            return self
+
+    result = FakeResult()
+    monkeypatch.setattr(
+        gui,
+        "run_qick_qcodes_experiment",
+        lambda **_kwargs: result,
+    )
+    worker = gui.QickExperimentWorker({})
+    finished = []
+    failures = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert result.detached is True
+    assert finished == [result]
+    assert failures == []
+
+
 def test_experiment_panel_records_run_elapsed_time_and_stage_events():
     app = _application()
     panel = gui.ExperimentPanel(
