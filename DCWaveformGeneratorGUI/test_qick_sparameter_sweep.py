@@ -967,6 +967,25 @@ def test_50_ksps_uses_v2_trigger_delay_without_tproc_fir_compensation(
     assert result.iq_traces.shape == (3, 50, 2)
 
 
+def test_1_msps_delays_the_ddr_trigger_without_double_counting_capture_time():
+    program = SParameterSweepProgram(
+        _mock_soccfg(fir_rate_profile="1_msps"),
+        _config(frequency_points=3, scan_time_us=4.0),
+    )
+
+    assert program.fir_software_trigger_delay_tproc_cycles == 8397
+    assert program.ddr_trigger_time - program.output_command_time == 8397
+    assert program.fir_feed_input_samples == (
+        program.scan_samples * 300
+        + 8677
+        + program.sweep.margin_input_samples
+    )
+    summary = program.summary()
+    assert summary["fir_software_trigger_delay_output_samples"] == 28
+    assert summary["fir_software_trigger_delay_input_samples"] == 8397
+    assert summary["fir_software_trigger_delay_tproc_cycles"] == 8397
+
+
 def test_legacy_minimum_coherent_samples_does_not_expand_capture():
     program = SParameterSweepProgram(
         _mock_soccfg(fir_rate_profile="50_ksps"),

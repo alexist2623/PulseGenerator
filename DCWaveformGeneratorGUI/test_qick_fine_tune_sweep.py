@@ -1052,6 +1052,48 @@ def test_50_ksps_ddr_delay_stays_in_fpga_without_tproc_timing_shift(monkeypatch)
     assert result.fir_rate_profile == "50_ksps"
 
 
+def test_1_msps_ddr_trigger_is_delayed_to_the_fir_step_center():
+    sequence = FineTuneSequence(("awg_0",))
+    sequence.add_set("capture", (0.25,), 300)
+    ddr = DdrFirReadoutConfig(
+        ro_ch=0,
+        samples_per_trigger=8,
+        at_segment="capture",
+        trigger_delay_tproc_cycles=0,
+        margin_input_samples=0,
+    )
+    program = sequence.make_program(
+        _fir_soccfg(fir_rate_profile="1_msps", ddr_trigger_port=7),
+        awg_channels=(0,),
+        repetitions_per_sweep=1,
+        ddr_readout=ddr,
+    )
+
+    capture_start = program.timing["segment_starts"][0]
+    assert program.aux_timing["ddr_readout_start"] == 0
+    assert program.aux_timing["fir_warmup_tproc_cycles"] == 8677
+    assert program.aux_timing["fir_software_trigger_delay_tproc_cycles"] == 8397
+    assert program.aux_timing["ddr_trigger_time"] - capture_start == 8397
+    assert program.summary()["fir_software_trigger_delay_output_samples"] == 28
+    assert program.summary()["fir_software_trigger_delay_input_samples"] == 8397
+
+    program.compile()
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(program.prog_list, max_steps=500_000)
+
+    capture_command = next(
+        event for event in tproc.output_events if event.tproc_ch == 0
+    )
+    trigger_high = next(
+        event
+        for event in tproc.output_pin_events
+        if event["port"] == 7 and event["word"] == 1 << 1
+    )
+    assert trigger_high["cycle"] - capture_command.cycle == 8397
+    assert tproc.timing_conflicts == []
+
+
 def test_fir_ddr_readback_is_chunked_by_trigger_on_the_client(monkeypatch):
     sequence = FineTuneSequence(("awg_0",))
     sequence.add_set("capture", (0.0,), 300)

@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import numpy as np
 
+from qick.sim import QickSim  # noqa: F401
+from qick.qick_asm import QickConfig
+
 from noise_acquisition import (
     NoiseAcquisitionConfig,
     acquire_noise_fir_trace,
+    build_noise_fir_program,
 )
 
 
@@ -74,9 +78,37 @@ def _soccfg(*, fir_rate_profile="1_msps"):
             ),
             "trigger_delay_default_cycles": 50 if is_50_ksps else 0,
             "trigger_delay_default_samples": 0,
+            "trigger_port": 0,
+            "trigger_bit": 1,
         },
-        "readouts": [{"buf_maxlen": 4096, "b_dds": 32, "f_dds": 300.0}],
-        "tprocs": [{"f_time": 300.0}],
+        "readouts": [{
+            "type": "axis_dyn_readout_v1",
+            "ro_type": "axis_dyn_readout_v1",
+            "tproc_ctrl": 1,
+            "tmux_ch": 0,
+            "f_fabric": 300.0,
+            "buf_maxlen": 4096,
+            "b_dds": 32,
+            "b_phase": 32,
+            "f_dds": 300.0,
+            "f_output": 300.0,
+            "fs_mult": 1,
+            "fs_div": 1,
+            "fdds_div": 1,
+            "adc": "00",
+            "has_weights": False,
+            "has_edge_counter": False,
+            "trigger_port": 0,
+            "trigger_bit": 0,
+        }],
+        "gens": [],
+        "tprocs": [{
+            "type": "axis_tproc64x32_x8",
+            "f_time": 300.0,
+            "pmem_size": 65536,
+            "dmem_size": 4096,
+            "output_pins": [],
+        }],
     }
 
 
@@ -193,6 +225,20 @@ def test_direct_noise_acquisition_uses_50_ksps_hwh_and_v2_trigger_delay():
     )
     assert abs(sleeps[0] - expected_sleep) < 1.0e-12
     assert "50_ksps" in result.source
+
+
+def test_noise_program_delays_only_the_1_msps_tprocessor_trigger():
+    one_msps = build_noise_fir_program(
+        QickConfig(_soccfg(fir_rate_profile="1_msps")),
+        NoiseAcquisitionConfig(fir_samples=8),
+    )
+    fifty_ksps = build_noise_fir_program(
+        QickConfig(_soccfg(fir_rate_profile="50_ksps")),
+        NoiseAcquisitionConfig(fir_samples=8),
+    )
+
+    assert one_msps.noise_fir_software_trigger_delay_tproc_cycles == 8397
+    assert fifty_ksps.noise_fir_software_trigger_delay_tproc_cycles == 0
 
 
 def test_noise_acquisition_rejects_non_fir_hwh():

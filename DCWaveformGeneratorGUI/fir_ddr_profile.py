@@ -6,7 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
+from math import ceil, isfinite
 from typing import Any, Mapping
 
 
@@ -17,6 +17,7 @@ _KNOWN_RATES_HZ = {
 
 _DEFAULT_50_KSPS_TRIGGER_DELAY_US = 704.925
 _LEGACY_400_MHZ_TRIGGER_DELAY_CYCLES = 281_970
+_LEGACY_TRIGGER_SYNC_CYCLES = 3
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,81 @@ class FirDdrProfile:
         return self.trigger_delay_input_cycles_for(self.trigger_delay_samples)
 
     @property
+    def software_trigger_delay_output_samples(self) -> int:
+        """Stored-sample periods used to align legacy 1 MSPS capture.
+
+        The V1 DDR buffer shares its trigger with the FIR decimator.  Delaying
+        that pulse by complete output periods leaves the FIR history running
+        while placing the filter's main step response at stored sample zero.
+        """
+
+        if not self.software_warmup_compensation:
+            return 0
+        reported = self.config.get("fir_capture_skipped_outputs")
+        if reported is not None:
+            skipped_outputs = int(reported)
+            if skipped_outputs < 0:
+                raise RuntimeError(
+                    "HWH fir_capture_skipped_outputs must be nonnegative"
+                )
+            return skipped_outputs
+        first_output_phase = self.decimation - 1
+        delay_after_first = max(
+            0.0,
+            self.group_delay_input_samples - first_output_phase,
+        )
+        return int(ceil(delay_after_first / self.decimation))
+
+    @property
+    def software_trigger_delay_input_samples(self) -> int:
+        """External trigger offset in FIR input-sample periods.
+
+        The legacy BD passes the tProcessor trigger through
+        ``axis_trigger_sync_v1`` before it reaches both the FIR and DDR buffer.
+        Account for that three-cycle synchronizer so the shared pulse, rather
+        than the raw tProcessor output, lands on the requested FIR phase.
+        """
+
+        aligned_cycles = self.software_trigger_delay_output_samples * self.decimation
+        sync_cycles = int(self.config.get(
+            "fir_capture_trigger_sync_cycles",
+            _LEGACY_TRIGGER_SYNC_CYCLES,
+        ))
+        if sync_cycles < 0:
+            raise RuntimeError(
+                "HWH fir_capture_trigger_sync_cycles must be nonnegative"
+            )
+        return max(0, aligned_cycles - sync_cycles)
+
+    @property
+    def software_aligned_trigger_input_samples(self) -> int:
+        """Shared FIR/DDR trigger offset after source-clock synchronization."""
+
+        return self.software_trigger_delay_output_samples * self.decimation
+
+    @property
+    def software_trigger_delay_us(self) -> float:
+        """Legacy capture-trigger offset in microseconds."""
+
+        return self.software_trigger_delay_input_samples / self.input_rate_mhz
+
+    @property
+    def software_aligned_trigger_delay_us(self) -> float:
+        """Shared FIR/DDR trigger offset after source-clock synchronization."""
+
+        return self.software_aligned_trigger_input_samples / self.input_rate_mhz
+
+    def software_trigger_delay_tproc_cycles(self, tproc_mhz: Any) -> int:
+        """Convert the legacy capture alignment to tProcessor clock cycles."""
+
+        clock_mhz = _positive_float(tproc_mhz, "tproc_mhz")
+        return int(ceil(
+            self.software_trigger_delay_input_samples
+            * clock_mhz
+            / self.input_rate_mhz
+        ))
+
+    @property
     def rate_label(self) -> str:
         return format_sample_rate_hz(self.sample_rate_hz)
 
@@ -147,7 +223,12 @@ class FirDdrProfile:
                 f"({self.trigger_delay_us:g} us)"
             )
         else:
-            delay = ", tProcessor FIR warm-up compensation"
+            delay = (
+                ", tProcessor trigger delay "
+                f"{self.software_trigger_delay_us:g} us "
+                "(shared FIR/DDR trigger "
+                f"{self.software_aligned_trigger_delay_us:g} us after the signal edge)"
+            )
         return (
             f"{self.rate_label} ({self.sample_period_us:g} us/sample{delay})"
         )
@@ -222,7 +303,9 @@ def _rate_profile(rate_hz: float, reported_name: Any) -> str:
 def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrProfile:
     """Resolve one supported capture profile from ``soccfg['ddr4_buf']``.
 
-    The 50 kSPS firmware must expose the V2 programmable trigger-delay
+    The 1 MSPS firmware has a shared FIR/DDR trigger, so software starts the
+    readout early and delays that shared trigger by complete decimated-output
+    periods. The 50 kSPS firmware must expose the V2 programmable trigger-delay
     register. Legacy V2 firmware counts valid input samples; current V2
     firmware uses source AXIS clock cycles. Software must preserve the
     HWH-reported unit and must not move the tProcessor trigger by the FIR group

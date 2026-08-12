@@ -201,6 +201,9 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
         if profile.software_warmup_compensation
         else 0
     )
+    software_trigger_delay_cycles = profile.software_trigger_delay_tproc_cycles(
+        tproc_mhz
+    )
     monitor_length = min(
         config.fir_samples,
         int(readout_cfg.get("buf_maxlen", config.fir_samples)),
@@ -237,16 +240,19 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
             self.trigger(
                 ddr4=True,
                 adc_trig_offset=0,
-                t=warmup_cycles,
+                t=software_trigger_delay_cycles,
                 width=12,
             )
             # Queue both timed events before the program ends.  Long capture
             # completion is awaited on the host, avoiding tProcessor immediate
             # width limits for multi-second traces.
-            self.synci(max(1, warmup_cycles + 13))
+            self.synci(max(1, software_trigger_delay_cycles + 13))
 
     program = DirectNoiseFirProgram(soccfg, {"reps": 1})
     program.noise_fir_warmup_tproc_cycles = warmup_cycles
+    program.noise_fir_software_trigger_delay_tproc_cycles = (
+        software_trigger_delay_cycles
+    )
     program.noise_fir_rate_profile = profile.name
     program.noise_fir_fpga_trigger_delay_samples = trigger_delay_value
     program.noise_fir_fpga_trigger_delay_units = profile.trigger_delay_units

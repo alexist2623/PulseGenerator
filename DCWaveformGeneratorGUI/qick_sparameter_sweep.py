@@ -1453,8 +1453,14 @@ class SParameterSweepProgram(RAveragerProgram):
                 self.fir_warmup_tproc_cycles = int(
                     ceil(group_delay * self.tproc_mhz / input_fs_mhz)
                 )
+                self.fir_software_trigger_delay_tproc_cycles = (
+                    self._fir_profile.software_trigger_delay_tproc_cycles(
+                        self.tproc_mhz
+                    )
+                )
                 self.ddr_trigger_time = (
-                    self.output_command_time + self.fir_warmup_tproc_cycles
+                    self.output_command_time
+                    + self.fir_software_trigger_delay_tproc_cycles
                 )
                 self.fir_feed_input_samples = (
                     self.scan_samples * decimation
@@ -1475,6 +1481,7 @@ class SParameterSweepProgram(RAveragerProgram):
                 # The 50 kSPS HWH continuously filters and decimates. The V2
                 # DDR buffer applies the HWH-reported trigger delay.
                 self.fir_warmup_tproc_cycles = 0
+                self.fir_software_trigger_delay_tproc_cycles = 0
                 self.ddr_trigger_time = self.output_command_time
                 post_trigger_input_samples = (
                     self.scan_samples * decimation
@@ -1535,6 +1542,7 @@ class SParameterSweepProgram(RAveragerProgram):
             self.fir_group_delay_input_samples = None
             self.fir_input_fs_mhz = None
             self.fir_warmup_tproc_cycles = 0
+            self.fir_software_trigger_delay_tproc_cycles = 0
             self.fir_feed_input_samples = 0
             self.ddr_trigger_time = None
             self.avg_trigger_time = self.output_command_time
@@ -2093,6 +2101,19 @@ class SParameterSweepProgram(RAveragerProgram):
             "fir_decimation": self.fir_decimation,
             "fir_group_delay_input_samples": self.fir_group_delay_input_samples,
             "fir_warmup_tproc_cycles": self.fir_warmup_tproc_cycles,
+            "fir_software_trigger_delay_tproc_cycles": (
+                self.fir_software_trigger_delay_tproc_cycles
+            ),
+            "fir_software_trigger_delay_output_samples": (
+                None
+                if fir_profile is None
+                else fir_profile.software_trigger_delay_output_samples
+            ),
+            "fir_software_trigger_delay_input_samples": (
+                None
+                if fir_profile is None
+                else fir_profile.software_trigger_delay_input_samples
+            ),
             "fir_software_warmup_compensation": (
                 None
                 if fir_profile is None

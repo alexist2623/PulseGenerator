@@ -56,6 +56,13 @@ def test_1_msps_profile_keeps_legacy_software_warmup_compensation():
     assert profile.software_warmup_compensation is True
     assert profile.uses_fpga_trigger_delay is False
     assert profile.trigger_delay_samples == 0
+    assert profile.software_trigger_delay_output_samples == 28
+    assert profile.software_aligned_trigger_input_samples == 8400
+    assert profile.software_trigger_delay_input_samples == 8397
+    assert profile.software_trigger_delay_us == pytest.approx(27.99)
+    assert profile.software_aligned_trigger_delay_us == pytest.approx(28.0)
+    assert profile.software_trigger_delay_tproc_cycles(300.0) == 8397
+    assert "shared FIR/DDR trigger 28 us" in profile.timing_label
 
 
 def test_50_ksps_profile_uses_hwh_v2_delay_without_software_compensation():
@@ -74,6 +81,10 @@ def test_50_ksps_profile_uses_hwh_v2_delay_without_software_compensation():
     assert profile.trigger_delay_arm_kwargs() == {
         "trigger_delay_samples": 50
     }
+    assert profile.software_trigger_delay_output_samples == 0
+    assert profile.software_aligned_trigger_input_samples == 0
+    assert profile.software_trigger_delay_input_samples == 0
+    assert profile.software_trigger_delay_tproc_cycles(300.0) == 0
 
 
 def test_50_ksps_profile_supports_shift_line_clock_cycle_delay():

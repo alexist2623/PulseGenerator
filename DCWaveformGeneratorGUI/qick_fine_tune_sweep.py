@@ -5049,6 +5049,16 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             "output_fs_mhz": profile.sample_rate_msps,
             "output_sample_rate_hz": profile.sample_rate_hz,
             "software_warmup_compensation": profile.software_warmup_compensation,
+            "software_trigger_delay_output_samples": (
+                profile.software_trigger_delay_output_samples
+            ),
+            "software_trigger_delay_input_samples": (
+                profile.software_trigger_delay_input_samples
+            ),
+            "software_aligned_trigger_input_samples": (
+                profile.software_aligned_trigger_input_samples
+            ),
+            "software_trigger_delay_us": profile.software_trigger_delay_us,
             "uses_fpga_trigger_delay": profile.uses_fpga_trigger_delay,
             "trigger_delay_samples": trigger_delay_samples,
             "trigger_delay_units": profile.trigger_delay_units,
@@ -5093,9 +5103,17 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     trigger_time += shift
                     readout_start += shift
 
+                software_trigger_delay_cycles = int(ceil(
+                    self._fir_cfg["software_trigger_delay_input_samples"]
+                    * f_time
+                    / input_fs
+                ))
+                trigger_time += software_trigger_delay_cycles
+
                 feed_input_samples = (
                     ddr.samples_per_trigger * decimation
                     + group_delay
+                    + self._fir_cfg["software_trigger_delay_input_samples"]
                     + ddr.margin_input_samples
                 )
                 feed_tproc_cycles = int(
@@ -5110,6 +5128,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 # occupancy: waiting for it here would insert the same delay
                 # between every hardware-sweep point and defeat queued triggers.
                 warmup_cycles = 0
+                software_trigger_delay_cycles = 0
                 readout_start = 0
                 capture_input_samples = (
                     ddr.samples_per_trigger * decimation
@@ -5129,6 +5148,15 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 "ddr_trigger_time": int(trigger_time),
                 "ddr_capture_end": int(capture_end),
                 "fir_warmup_tproc_cycles": int(warmup_cycles),
+                "fir_software_trigger_delay_tproc_cycles": int(
+                    software_trigger_delay_cycles
+                ),
+                "fir_software_trigger_delay_output_samples": self._fir_cfg[
+                    "software_trigger_delay_output_samples"
+                ],
+                "fir_software_trigger_delay_input_samples": self._fir_cfg[
+                    "software_trigger_delay_input_samples"
+                ],
                 "fir_feed_input_samples": int(feed_input_samples),
                 "fir_rate_profile": self._fir_cfg["rate_profile"],
                 "fir_output_sample_rate_hz": self._fir_cfg["output_sample_rate_hz"],
@@ -7555,6 +7583,21 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             ),
             "fir_software_warmup_compensation": (
                 self._fir_cfg["software_warmup_compensation"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_software_trigger_delay_output_samples": (
+                self._fir_cfg["software_trigger_delay_output_samples"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_software_trigger_delay_input_samples": (
+                self._fir_cfg["software_trigger_delay_input_samples"]
+                if self.ddr_readout_config is not None
+                else None
+            ),
+            "fir_software_trigger_delay_tproc_cycles": (
+                self.aux_timing.get("fir_software_trigger_delay_tproc_cycles")
                 if self.ddr_readout_config is not None
                 else None
             ),
