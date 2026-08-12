@@ -43,7 +43,12 @@ try:
         run_input_power_calibration,
         run_output_power_calibration,
     )
-    from .qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
+    from .qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
+        FILTER_TYPES,
+        MAX_RF_OUTPUT_GAIN,
+        POWER_SCALES,
+    )
     from .sparameter_gui import RfPathCorrectionWidget
     from .fir_ddr_profile import format_sample_rate_hz
 except ImportError:
@@ -55,7 +60,12 @@ except ImportError:
         run_input_power_calibration,
         run_output_power_calibration,
     )
-    from qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
+    from qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
+        FILTER_TYPES,
+        MAX_RF_OUTPUT_GAIN,
+        POWER_SCALES,
+    )
     from sparameter_gui import RfPathCorrectionWidget
     from fir_ddr_profile import format_sample_rate_hz
 
@@ -903,6 +913,20 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_gain_end = self._gain(MAX_RF_OUTPUT_GAIN)
         self.input_gain_points = self._points(16)
         self.input_gain_scale = self._scale_combo()
+        self.input_acquisition_source = QtWidgets.QComboBox()
+        input_acquisition_labels = {
+            "fir_ddr": "FIR DDR trace mean",
+            "avg_buffer": "AVG buffer accumulated I/Q",
+        }
+        for source in ACQUISITION_SOURCES:
+            self.input_acquisition_source.addItem(
+                input_acquisition_labels[source], source
+            )
+        self.input_acquisition_source.setToolTip(
+            "FIR DDR stores a decimated trace and averages it in Python. "
+            "AVG buffer accumulates the readout window in FPGA and returns "
+            "one normalized I/Q value per frequency and gain."
+        )
         self.input_scan_time = QtWidgets.QDoubleSpinBox()
         self.input_scan_time.setRange(0.001, 1.0e6)
         self.input_scan_time.setDecimals(6)
@@ -966,7 +990,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("End gain:", self.input_gain_end),
             ("Gain points:", self.input_gain_points),
             ("Gain spacing:", self.input_gain_scale),
-            ("FIR scan time per point:", self.input_scan_time),
+            ("I/Q acquisition:", self.input_acquisition_source),
+            ("Integration time per point:", self.input_scan_time),
             ("External path loss:", self.input_path_loss),
             ("Trim low-gain points:", self.input_trim_low),
             ("Trim high-gain points:", self.input_trim_high),
@@ -981,6 +1006,12 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.input_override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
+        )
+        self.input_acquisition_source.currentIndexChanged.connect(
+            self._update_input_acquisition_source_state
+        )
+        self.input_scan_time.valueChanged.connect(
+            self._update_fir_profile_status
         )
         self.input_fpga_trigger_delay_us.valueChanged.connect(
             self._update_fir_profile_status
@@ -1317,6 +1348,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             gain_end=self.input_gain_end.value(),
             gain_points=self.input_gain_points.value(),
             gain_scale=str(self.input_gain_scale.currentData()),
+            acquisition_source=str(self.input_acquisition_source.currentData()),
             scan_time_us=self.input_scan_time.value(),
             output_att1_db=(
                 self.input_output_att1.value()
@@ -1351,6 +1383,7 @@ class CalibrationPanel(QtWidgets.QWidget):
                 self.input_fpga_trigger_delay_us.value()
                 if (
                     self.input_override_fpga_trigger_delay.isChecked()
+                    and self.input_acquisition_source.currentData() == "fir_ddr"
                     and self._fir_uses_fpga_trigger_delay is not False
                 )
                 else None
@@ -1564,24 +1597,41 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
         supported = self._fir_uses_fpga_trigger_delay is not False
-        for override, editor in (
-            (
-                self.input_override_fpga_trigger_delay,
-                self.input_fpga_trigger_delay_us,
-            ),
-            (
-                self.dc_voltage_override_fpga_trigger_delay,
-                self.dc_voltage_fpga_trigger_delay_us,
-            ),
-        ):
-            override.setEnabled(supported)
-            editor.setEnabled(supported and override.isChecked())
+        input_supported = (
+            supported
+            and self.input_acquisition_source.currentData() == "fir_ddr"
+        )
+        self.input_override_fpga_trigger_delay.setEnabled(input_supported)
+        self.input_fpga_trigger_delay_us.setEnabled(
+            input_supported and self.input_override_fpga_trigger_delay.isChecked()
+        )
+        self.dc_voltage_override_fpga_trigger_delay.setEnabled(supported)
+        self.dc_voltage_fpga_trigger_delay_us.setEnabled(
+            supported and self.dc_voltage_override_fpga_trigger_delay.isChecked()
+        )
         self._update_fir_profile_status()
 
+    def _update_input_acquisition_source_state(self, *_args) -> None:
+        uses_fir = self.input_acquisition_source.currentData() == "fir_ddr"
+        self.run_input_button.setText(
+            "Run FIR-DDR Input Calibration"
+            if uses_fir
+            else "Run AVG-Buffer Input Calibration"
+        )
+        self._update_fpga_trigger_delay_controls()
+
     def _update_fir_profile_status(self, *_args) -> None:
+        input_prefix = ""
+        if self.input_acquisition_source.currentData() == "avg_buffer":
+            input_prefix = (
+                "Input calibration AVG buffer: "
+                f"{self.input_scan_time.value():g} us integration, one "
+                "capture per frequency/gain point; DDR is unused for that "
+                "sub-tab. "
+            )
         if self._fir_sample_rate_hz is None:
             self.fir_profile_status.setText(
-                "Identify QICK to show the FIR DDR timing"
+                input_prefix + "Identify QICK to show the FIR DDR timing"
             )
             return
         sample_period_us = 1_000_000.0 / float(self._fir_sample_rate_hz)
@@ -1609,7 +1659,8 @@ class CalibrationPanel(QtWidgets.QWidget):
                 f"samples = {dc_trace_us:g} us"
             )
         self.fir_profile_status.setText(
-            f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
+            input_prefix
+            + f"{format_sample_rate_hz(self._fir_sample_rate_hz)}, "
             f"{sample_period_us:g} us/sample{delay}{dc_trace}"
         )
 
@@ -1744,6 +1795,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_gain_scale.setCurrentIndex(
             self.input_gain_scale.findData(input_config.gain_scale)
         )
+        self.input_acquisition_source.setCurrentIndex(
+            self.input_acquisition_source.findData(
+                input_config.acquisition_source
+            )
+        )
         self.input_output_filter.setCurrentText(input_config.output_filter_type)
         self.input_readout_filter.setCurrentText(input_config.readout_filter_type)
         self.input_experiment_name.setText(input_config.experiment_name)
@@ -1775,6 +1831,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
         for widget in (
+            self.input_acquisition_source,
             self.input_override_fpga_trigger_delay,
             self.input_fpga_trigger_delay_us,
             self.dc_voltage_override_fpga_trigger_delay,
@@ -1782,7 +1839,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         ):
             widget.setEnabled(not running)
         if not running:
-            self._update_fpga_trigger_delay_controls()
+            self._update_input_acquisition_source_state()
         for diagram in self._path_diagrams.values():
             diagram.setEnabled(not running)
         self.progress.setVisible(running)

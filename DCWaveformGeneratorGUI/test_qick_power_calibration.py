@@ -70,6 +70,41 @@ def test_calibration_panel_stop_button_tracks_running_state():
     panel.close()
 
 
+def test_input_calibration_avg_source_round_trip_and_disables_fir_delay(tmp_path):
+    _application()
+    panel = CalibrationPanel()
+    panel.database_path.setText(str(tmp_path / "gain_pwr_calb.db"))
+    panel.input_override_fpga_trigger_delay.setChecked(True)
+    panel.input_acquisition_source.setCurrentIndex(
+        panel.input_acquisition_source.findData("avg_buffer")
+    )
+
+    config = panel.input_config()
+    sweep = config.sweep_config(1234)
+    assert config.acquisition_source == "avg_buffer"
+    assert sweep.acquisition_source == "avg_buffer"
+    assert sweep.avg_repetitions == 1
+    assert sweep.fpga_trigger_delay_us is None
+    assert not panel.input_override_fpga_trigger_delay.isEnabled()
+    assert panel.run_input_button.text() == "Run AVG-Buffer Input Calibration"
+
+    settings = panel.settings_dict()
+    restored = CalibrationPanel()
+    restored.load_settings(settings)
+    assert restored.input_config().acquisition_source == "avg_buffer"
+    assert restored.run_input_button.text() == "Run AVG-Buffer Input Calibration"
+    panel.close()
+    restored.close()
+
+
+def test_input_calibration_rejects_unknown_acquisition_source(tmp_path):
+    with pytest.raises(ValueError, match="acquisition_source"):
+        InputPowerCalibrationConfig(
+            database_path=str(tmp_path / "gain_pwr_calb.db"),
+            acquisition_source="unknown",
+        )
+
+
 def test_calibration_worker_emits_cancelled(monkeypatch):
     def cancelled_runner(**kwargs):
         kwargs["cancel_check"]()
@@ -732,6 +767,11 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
         [-10.0, -10.2, -10.4],
         atol=1.0e-9,
     )
+    np.testing.assert_allclose(
+        output_calibration.output_power_dbm([405.0, 415.0], MAX_QICK_GAIN),
+        [-10.1, -10.3],
+        atol=1.0e-9,
+    )
 
     slopes_expected = np.asarray([1.0, 1.1, 1.2])
     intercepts_expected = np.asarray([-60.0, -61.0, -62.0])
@@ -889,4 +929,103 @@ def test_output_and_input_calibration_db_round_trip(tmp_path, monkeypatch):
     np.testing.assert_allclose(
         deembedded.magnitude_db,
         expected_input - expected_output - 5.0,
+    )
+
+
+def test_input_calibration_uses_one_avg_capture_per_gain(tmp_path, monkeypatch):
+    database_path, output_stored = _create_output_calibration(tmp_path, monkeypatch)
+    frequencies = np.asarray([400.0, 410.0, 420.0])
+    output_calibration = CalibrationDatabase(database_path).output_calibration(
+        "RF_Out",
+        frequencies,
+    )
+    acquisition_events = []
+    progress_events = []
+
+    class Program:
+        def __init__(self, config):
+            self.sweep = config
+            self.frequencies_mhz = frequencies.copy()
+
+        def acquire_avg_buffer(
+            self,
+            _soc,
+            *,
+            counter_progress=None,
+            cancel_check=None,
+        ):
+            acquisition_events.append(("avg", int(self.sweep.gain)))
+            if cancel_check is not None:
+                cancel_check()
+            if counter_progress is not None:
+                counter_progress(0, frequencies.size)
+                counter_progress(frequencies.size, frequencies.size)
+            known_input = output_calibration.output_power_dbm(
+                frequencies,
+                self.sweep.gain,
+            )
+            adc_db = known_input + 50.0
+            amplitude = np.power(10.0, adc_db / 20.0)
+            iq = np.zeros((frequencies.size, 1, 2), dtype=float)
+            iq[:, 0, 0] = amplitude
+            return SParameterSweepResult.from_iq(
+                frequencies,
+                frequencies,
+                iq,
+                acquisition_source="avg_buffer",
+                integration_time_us=125.0,
+                accumulation_repetitions=1,
+            )
+
+    def program_factory(_soccfg, config, **_kwargs):
+        acquisition_events.append(("build", int(config.gain)))
+        assert config.acquisition_source == "avg_buffer"
+        assert config.avg_repetitions == 1
+        return Program(config)
+
+    config = InputPowerCalibrationConfig(
+        database_path=str(database_path),
+        output_board_type="RF_Out",
+        input_board_type="RF_In",
+        frequency_start_mhz=400.0,
+        frequency_end_mhz=420.0,
+        frequency_points=3,
+        gain_start=1000,
+        gain_end=10_000,
+        gain_points=2,
+        acquisition_source="avg_buffer",
+        scan_time_us=123.0,
+        settle_seconds=0.0,
+    )
+    stored = run_input_power_calibration(
+        connection_config=QickConnectionConfig(host="127.0.0.1"),
+        calibration_config=config,
+        connector=lambda **_kwargs: (_FakeSoc(), object()),
+        program_factory=program_factory,
+        progress_callback=lambda percent, message: progress_events.append(
+            (percent, message)
+        ),
+    )
+
+    assert acquisition_events == [
+        ("build", 1000),
+        ("avg", 1000),
+        ("build", 10_000),
+        ("avg", 10_000),
+    ]
+    assert stored.run_id > output_stored.run_id
+    assert stored.result["acquisition_source"] == "avg_buffer"
+    assert stored.result["acquisition_details"] == {
+        "source": "avg_buffer",
+        "requested_integration_time_us": 123.0,
+        "actual_integration_time_us": 125.0,
+        "accumulation_repetitions": 1,
+    }
+    assert any(
+        "Starting AVG buffer" in message
+        for _percent, message in progress_events
+    )
+    assert any(
+        "AVG buffer acquisition complete" in message
+        for _percent, message in progress_events
     )

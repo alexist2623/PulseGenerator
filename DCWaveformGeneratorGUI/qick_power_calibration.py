@@ -1,8 +1,8 @@
 """QICK RF output and ADC input power calibration workflows.
 
 Output calibration drives a periodic QICK tone and reads a Keysight/Agilent
-oscilloscope FFT marker.  Input calibration uses the FIR-DDR readout and a
-previous output calibration to fit, at each frequency,
+oscilloscope FFT marker.  Input calibration uses either the FIR-DDR readout
+or the AVG buffer and a previous output calibration to fit, at each frequency,
 
 ``input_power_dbm = slope * 20*log10(hypot(I, Q)) + intercept``.
 
@@ -42,6 +42,7 @@ try:
         connect_qick,
     )
     from .qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
         FILTER_TYPES,
         SParameterSweepConfig,
         build_sparameter_program,
@@ -63,6 +64,7 @@ except ImportError:
         connect_qick,
     )
     from qick_sparameter_sweep import (
+        ACQUISITION_SOURCES,
         FILTER_TYPES,
         SParameterSweepConfig,
         build_sparameter_program,
@@ -315,6 +317,7 @@ class InputPowerCalibrationConfig:
     gain_end: int = MAX_QICK_GAIN
     gain_points: int = 16
     gain_scale: str = "linear"
+    acquisition_source: str = "fir_ddr"
     scan_time_us: float = 100.0
     output_att1_db: float = 0.0
     output_att2_db: float = 0.0
@@ -350,6 +353,11 @@ class InputPowerCalibrationConfig:
         _integer(self.readout_ch, "readout_ch")
         self.frequencies_mhz
         gains = self.gains
+        if self.acquisition_source not in ACQUISITION_SOURCES:
+            raise ValueError(
+                "acquisition_source must be one of "
+                f"{ACQUISITION_SOURCES}"
+            )
         _finite(self.scan_time_us, "scan_time_us", positive=True)
         _attenuation(self.output_att1_db, "output_att1_db")
         _attenuation(self.output_att2_db, "output_att2_db")
@@ -421,7 +429,12 @@ class InputPowerCalibrationConfig:
             frequency_end_mhz=self.frequency_end_mhz,
             frequency_points=self.frequency_points,
             gain=int(gain),
+            acquisition_source=self.acquisition_source,
             scan_time_us=self.scan_time_us,
+            # Input calibration already sweeps gain in software.  One AVG
+            # capture per frequency/gain point keeps that sweep cardinality
+            # unchanged; scan_time_us controls the FPGA integration length.
+            avg_repetitions=1,
             output_att1_db=self.output_att1_db,
             output_att2_db=self.output_att2_db,
             output_board_type=self.output_board_type,
@@ -921,6 +934,7 @@ def _store_input_calibration(
     *,
     output_run_id: int,
     rf_settings: Mapping[str, Any],
+    acquisition_details: Mapping[str, Any],
 ) -> StoredCalibrationRun:
     try:
         from qcodes import (
@@ -990,6 +1004,7 @@ def _store_input_calibration(
             "output_run_id": int(output_run_id),
             "out_ch": int(config.output_ch),
             "in_ch": int(config.readout_ch),
+            "acquisition_source": str(config.acquisition_source),
         }
         config_metadata = {
             "schema": "qstl-qick-adc-input-power-calibration-v2",
@@ -1006,6 +1021,8 @@ def _store_input_calibration(
             "path_loss_db": float(config.path_loss_db),
             "fit_trim_low": int(config.fit_trim_low),
             "fit_trim_high": int(config.fit_trim_high),
+            "acquisition_source": str(config.acquisition_source),
+            "acquisition_details": dict(acquisition_details),
             "formula": (
                 "input_power_dbm = slope(f) * "
                 "20*log10(hypot(mean_i,mean_q)) + intercept(f)"
@@ -1074,6 +1091,8 @@ def _store_input_calibration(
                 "slopes": slopes.tolist(),
                 "intercepts_dbm": intercepts.tolist(),
                 "output_run_id": int(output_run_id),
+                "acquisition_source": str(config.acquisition_source),
+                "acquisition_details": dict(acquisition_details),
             },
         )
     finally:
@@ -1127,6 +1146,12 @@ def run_input_power_calibration(
     ).output_calibration(
         calibration_config.output_board_type,
         frequencies,
+        nqz=calibration_config.nqz,
+        output_filter_type=calibration_config.output_filter_type,
+        output_filter_cutoff_ghz=calibration_config.output_filter_cutoff_ghz,
+        output_filter_bandwidth_ghz=(
+            calibration_config.output_filter_bandwidth_ghz
+        ),
     )
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF output and input chains")
@@ -1164,6 +1189,17 @@ def run_input_power_calibration(
     )
     measured_db = np.empty((gains.size, frequencies.size), dtype=float)
     known_input_dbm = np.empty_like(measured_db)
+    acquisition_details: dict[str, Any] = {}
+    start_action = (
+        "Arming FIR DDR"
+        if calibration_config.acquisition_source == "fir_ddr"
+        else "Starting AVG buffer"
+    )
+    point_label = (
+        "FIR"
+        if calibration_config.acquisition_source == "fir_ddr"
+        else "AVG buffer"
+    )
     for gain_index, gain in enumerate(gains):
         _check_cancel(cancel_check)
         program = first_program if gain_index == 0 else make_program(gain_index)
@@ -1176,7 +1212,7 @@ def run_input_power_calibration(
             progress_callback,
             progress_start,
             (
-                f"Arming FIR DDR for ADC calibration gain "
+                f"{start_action} for ADC calibration gain "
                 f"{gain_index + 1}/{gains.size}: "
                 f"{frequencies.size} points x "
                 f"{calibration_config.scan_time_us:.9g} us"
@@ -1191,20 +1227,24 @@ def run_input_power_calibration(
                 (progress_stop - progress_start) * fraction
             )
             if completed >= total > 0:
+                if calibration_config.acquisition_source == "fir_ddr":
+                    completion = "acquisition complete; reading FIR DDR"
+                else:
+                    completion = "AVG buffer acquisition complete"
                 message = (
                     f"ADC calibration gain {gain_index + 1}/{gains.size}: "
-                    "acquisition complete; reading FIR DDR"
+                    f"{completion}"
                 )
             else:
                 message = (
                     f"ADC calibration gain {gain_index + 1}/{gains.size}: "
-                    f"FIR point {completed}/{total}"
+                    f"{point_label} point {completed}/{total}"
                 )
             _emit_progress(progress_callback, percent, message)
 
         if acquisition_callback is not None:
             result = acquisition_callback(soc, program)
-        else:
+        elif calibration_config.acquisition_source == "fir_ddr":
             result = program.acquire_fir_ddr(
                 soc,
                 counter_progress=(
@@ -1212,7 +1252,48 @@ def run_input_power_calibration(
                 ),
                 cancel_check=cancel_check,
             )
+        else:
+            result = program.acquire_avg_buffer(
+                soc,
+                counter_progress=(
+                    counter_progress if progress_callback is not None else None
+                ),
+                cancel_check=cancel_check,
+            )
         _check_cancel(cancel_check)
+        result_source = str(
+            getattr(result, "acquisition_source", calibration_config.acquisition_source)
+        )
+        if result_source != calibration_config.acquisition_source:
+            raise RuntimeError(
+                "input calibration acquisition source changed from "
+                f"{calibration_config.acquisition_source!r} to {result_source!r}"
+            )
+        actual_integration_time_us = getattr(
+            result,
+            "integration_time_us",
+            None,
+        )
+        if actual_integration_time_us is None:
+            actual_integration_time_us = calibration_config.scan_time_us
+        current_details = {
+            "source": result_source,
+            "requested_integration_time_us": float(
+                calibration_config.scan_time_us
+            ),
+            "actual_integration_time_us": float(
+                actual_integration_time_us
+            ),
+            "accumulation_repetitions": int(
+                getattr(result, "accumulation_repetitions", 1)
+            ),
+        }
+        if not acquisition_details:
+            acquisition_details = current_details
+        elif acquisition_details != current_details:
+            raise RuntimeError(
+                "input calibration acquisition timing changed between gain points"
+            )
         if not np.array_equal(result.frequencies_mhz, frequencies):
             raise RuntimeError("acquired input-calibration frequency grid changed")
         measured_db[gain_index] = np.asarray(result.magnitude_db, dtype=float)
@@ -1266,6 +1347,7 @@ def run_input_power_calibration(
         intercepts,
         output_run_id=output_calibration.summary.run_id,
         rf_settings=rf_settings,
+        acquisition_details=acquisition_details,
     )
     _emit_progress(
         progress_callback, 100, f"Input calibration Run {stored.run_id} saved"
