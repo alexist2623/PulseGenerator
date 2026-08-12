@@ -36,9 +36,12 @@ from qick_qcodes_experiment import (
     COMPILE_VALIDATION_BOUNDARY,
     DEFAULT_COMPILE_VALIDATION_MODE,
     DEFAULT_AWG_METADATA_MODE,
+    I_MEAN_PARAMETER,
     ExperimentCancelled,
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
+    IQ_STORAGE_MEAN_IQ,
+    Q_MEAN_PARAMETER,
     Q_TRACE_PARAMETER,
     SAMPLE_INDEX_PARAMETER,
     QCODES_STAGING_ENV,
@@ -564,6 +567,69 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert not list(staging_root.glob("qick_qcodes_*"))
 
 
+def test_store_qick_result_mean_iq_mode_reduces_repetitions_and_samples(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "qick_mean_iq.db"
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+
+    dataset, row_count = store_qick_result(
+        _ddr_result(),
+        run_config=QcodesRunConfig(
+            str(database_path),
+            experiment_name="Mean IQ storage test",
+            sample_name="simulated device",
+        ),
+        connection_config=QickConnectionConfig(),
+        program_summary={"program_instructions": 4},
+        gui_settings=_gui_metadata(),
+        rf_settings={},
+        iq_storage_mode=IQ_STORAGE_MEAN_IQ,
+    )
+
+    assert row_count == 2
+    assert dataset.number_of_results == 4
+    parameter_names = {
+        parameter.strip() for parameter in dataset.parameters.split(",")
+    }
+    assert I_MEAN_PARAMETER in parameter_names
+    assert Q_MEAN_PARAMETER in parameter_names
+    assert I_TRACE_PARAMETER not in parameter_names
+    assert Q_TRACE_PARAMETER not in parameter_names
+    assert SAMPLE_INDEX_PARAMETER not in parameter_names
+    assert "repetition_index" not in parameter_names
+
+    expected = _ddr_result().iq.astype(np.float64).mean(axis=(1, 2))
+    i_data = dataset.get_parameter_data(I_MEAN_PARAMETER)[I_MEAN_PARAMETER]
+    q_data = dataset.get_parameter_data(Q_MEAN_PARAMETER)[Q_MEAN_PARAMETER]
+    np.testing.assert_allclose(i_data[I_MEAN_PARAMETER], expected[:, 0])
+    np.testing.assert_allclose(q_data[Q_MEAN_PARAMETER], expected[:, 1])
+    np.testing.assert_allclose(
+        i_data["awg_0_set_1_voltage_mv"],
+        [-50.0, 50.0],
+    )
+
+    metadata = json.loads(dataset.get_metadata("qick_experiment_json"))
+    layout = metadata["measurement_layout"]
+    assert layout["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
+    assert metadata["gui_settings"]["qick"]["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
+    assert layout["storage_format"] == "qcodes_mean_iq_per_point_v1"
+    assert layout["iq_shape"] == [2, 1, 1, 2]
+    assert layout["source_iq_shape"] == [2, 2, 3, 2]
+    assert layout["source_repetition_count"] == 2
+    assert layout["source_sample_count"] == 3
+
+    restored = load_qick_iq_arrays(dataset)
+    assert restored["storage_mode"] == IQ_STORAGE_MEAN_IQ
+    assert restored["source_repetition_count"] == 2
+    assert restored["source_sample_count"] == 3
+    assert restored["iq"].shape == (2, 1, 1, 2)
+    np.testing.assert_allclose(restored["iq"][:, 0, 0, :], expected)
+    np.testing.assert_allclose(
+        restored["sweep_coordinates"]["awg_0_set_1_voltage_mv"][:, 0],
+        [-50.0, 50.0],
+    )
 def test_store_qick_result_converts_dc_input_iq_to_current(
     tmp_path,
     monkeypatch,

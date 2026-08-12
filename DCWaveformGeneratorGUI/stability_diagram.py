@@ -1,8 +1,8 @@
 """Two-electrode QICK stability-diagram acquisition and display.
 
-Continuous acquisition intentionally bypasses QCoDeS.  A saved single shot
-uses the existing split-array FIR DDR storage path so the complete I/Q trace
-remains available in addition to the displayed coherent mean.
+Continuous acquisition intentionally bypasses QCoDeS. A saved single shot can
+retain every FIR DDR repetition trace or persist only the coherent mean I/Q pair
+for each X/Y point.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -42,13 +42,18 @@ try:
     from .dc_voltage_calibration import load_dc_voltage_calibration
     from .fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
     from .measurement_display import attach_color_bar, scale_iq_for_display
+    from .power_calibration import CalibrationDatabase
     from .qick_qcodes_experiment import (
         StoredQickExperiment,
         AWG_METADATA_MODE_EXPANDED,
         DEFAULT_AWG_METADATA_MODE,
+        DEFAULT_IQ_STORAGE_MODE,
+        IQ_STORAGE_FULL_TRACES,
+        IQ_STORAGE_MEAN_IQ,
         build_awg_vertex_metadata,
         build_awg_waveform_recipe,
         normalize_awg_metadata_mode,
+        normalize_iq_storage_mode,
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
@@ -72,13 +77,18 @@ except ImportError:
     from dc_voltage_calibration import load_dc_voltage_calibration
     from fir_ddr_profile import format_sample_rate_hz, resolve_fir_ddr_profile
     from measurement_display import attach_color_bar, scale_iq_for_display
+    from power_calibration import CalibrationDatabase
     from qick_qcodes_experiment import (
         StoredQickExperiment,
         AWG_METADATA_MODE_EXPANDED,
         DEFAULT_AWG_METADATA_MODE,
+        DEFAULT_IQ_STORAGE_MODE,
+        IQ_STORAGE_FULL_TRACES,
+        IQ_STORAGE_MEAN_IQ,
         build_awg_vertex_metadata,
         build_awg_waveform_recipe,
         normalize_awg_metadata_mode,
+        normalize_iq_storage_mode,
         connect_qick,
         execute_qick_sequence,
         load_qick_iq_arrays,
@@ -96,6 +106,10 @@ DEFAULT_STABILITY_SETTLE_US = 50.0
 DEFAULT_STABILITY_POINT_GUARD_US = 1.0
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
 DEFAULT_STABILITY_MODULATION_GAIN = 20_000
+DEFAULT_STABILITY_TARGET_POWER_DBM = -20.0
+DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH = str(
+    Path.home() / "gain_pwr_calb.db"
+)
 STABILITY_HOLD_SEGMENT = "set_0"
 DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV = (
     DEFAULT_QICK_FULL_SCALE_MV * DEFAULT_BIAS_T_COMPENSATION_FRACTION
@@ -282,6 +296,12 @@ class StabilityDiagramConfig:
     fpga_trigger_delay_us: Optional[float] = None
     modulation_frequency_mhz: float = DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ
     modulation_gain: int = DEFAULT_STABILITY_MODULATION_GAIN
+    modulation_power_calibration_enabled: bool = False
+    modulation_power_calibration_database_path: str = (
+        DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH
+    )
+    modulation_power_calibration_run_id: int = 0
+    modulation_target_power_dbm: float = DEFAULT_STABILITY_TARGET_POWER_DBM
     bias_t_compensation_enabled: bool = False
     bias_t_compensation_type: str = "dc"
     bias_t_compensation_voltage_mv: float = DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV
@@ -326,6 +346,35 @@ class StabilityDiagramConfig:
         )
         if modulation_gain > 32767:
             raise ValueError("stability modulation gain must not exceed 32767")
+        if not isinstance(
+            self.modulation_power_calibration_enabled,
+            (bool, np.bool_),
+        ):
+            raise TypeError(
+                "stability modulation power calibration enabled must be boolean"
+            )
+        calibration_run_id = _integer(
+            self.modulation_power_calibration_run_id,
+            "stability modulation power calibration Run ID",
+            0,
+        )
+        if calibration_run_id > (1 << 31) - 1:
+            raise ValueError(
+                "stability modulation power calibration Run ID is too large"
+            )
+        _finite_float(
+            self.modulation_target_power_dbm,
+            "stability modulation target output power",
+        )
+        if (
+            self.modulation_power_calibration_enabled
+            and not str(
+                self.modulation_power_calibration_database_path
+            ).strip()
+        ):
+            raise ValueError(
+                "stability modulation power calibration database path is required"
+            )
         if not isinstance(self.bias_t_compensation_enabled, (bool, np.bool_)):
             raise TypeError("stability Bias-T compensation enabled must be boolean")
         if self.bias_t_compensation_type not in BIAS_T_COMPENSATION_TYPES:
@@ -714,8 +763,10 @@ def stability_result_from_stored_arrays(
         display_scale=display_scale.factor,
         measurement_mode=str(arrays.get("measurement_mode", "raw_iq")),
         iteration=1,
-        repetition_count=int(iq.shape[1]),
-        samples_per_trace=int(iq.shape[2]),
+        repetition_count=int(
+            arrays.get("source_repetition_count", iq.shape[1])
+        ),
+        samples_per_trace=int(arrays.get("source_sample_count", iq.shape[2])),
         sample_rate_hz=sample_rate_hz,
         fir_rate_profile=str(
             qick_settings.get(
@@ -974,6 +1025,12 @@ def default_stability_settings(
         "fpga_trigger_delay_us": None,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
+        "modulation_power_calibration": {
+            "enabled": False,
+            "database_path": DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH,
+            "run_id": 0,
+            "target_power_dbm": DEFAULT_STABILITY_TARGET_POWER_DBM,
+        },
         "bias_t_compensation": {
             "enabled": False,
             "type": "dc",
@@ -989,6 +1046,7 @@ def default_stability_settings(
         },
         "visible_data": list(DEFAULT_STABILITY_VISIBLE_DATA),
         "database_path": DEFAULT_STABILITY_DB_PATH,
+        "iq_storage_mode": DEFAULT_IQ_STORAGE_MODE,
         "saved_plot_database_path": DEFAULT_STABILITY_DB_PATH,
         "saved_plot_run_id": 0,
         "saved_plot_data": "magnitude",
@@ -1100,6 +1158,59 @@ def normalize_stability_settings(
     )
     if normalized["modulation_gain"] > 32767:
         raise ValueError("stability modulation gain must not exceed 32767")
+    raw_modulation_calibration = settings.get(
+        "modulation_power_calibration",
+        defaults["modulation_power_calibration"],
+    )
+    if not isinstance(raw_modulation_calibration, Mapping):
+        raise TypeError(
+            "stability modulation power calibration must be a JSON object"
+        )
+    modulation_calibration_enabled = raw_modulation_calibration.get(
+        "enabled",
+        defaults["modulation_power_calibration"]["enabled"],
+    )
+    if not isinstance(
+        modulation_calibration_enabled,
+        (bool, np.bool_),
+    ):
+        raise TypeError(
+            "stability modulation power calibration enabled must be boolean"
+        )
+    modulation_calibration_path = str(
+        raw_modulation_calibration.get(
+            "database_path",
+            defaults["modulation_power_calibration"]["database_path"],
+        )
+    )
+    if modulation_calibration_enabled and not modulation_calibration_path.strip():
+        raise ValueError(
+            "stability modulation power calibration database path is required"
+        )
+    modulation_calibration_run_id = _integer(
+        raw_modulation_calibration.get(
+            "run_id",
+            defaults["modulation_power_calibration"]["run_id"],
+        ),
+        "stability modulation power calibration Run ID",
+        0,
+    )
+    if modulation_calibration_run_id > (1 << 31) - 1:
+        raise ValueError(
+            "stability modulation power calibration Run ID is too large"
+        )
+    normalized["modulation_power_calibration"] = {
+        "enabled": bool(modulation_calibration_enabled),
+        "database_path": modulation_calibration_path,
+        "run_id": modulation_calibration_run_id,
+        "target_power_dbm": _finite_float(
+            raw_modulation_calibration.get(
+                "target_power_dbm",
+                defaults["modulation_power_calibration"]["target_power_dbm"],
+            ),
+            "stability modulation target output power",
+        ),
+    }
     raw_bias_t = settings.get(
         "bias_t_compensation",
         defaults["bias_t_compensation"],
@@ -1194,6 +1305,9 @@ def normalize_stability_settings(
     if not database_path:
         raise ValueError("stability database path must not be empty")
     normalized["database_path"] = database_path
+    normalized["iq_storage_mode"] = normalize_iq_storage_mode(
+        settings.get("iq_storage_mode", defaults["iq_storage_mode"])
+    )
     saved_plot_database_path = str(
         settings.get("saved_plot_database_path", database_path)
     ).strip()
@@ -1607,6 +1721,9 @@ class StabilityDiagramWorker(QtCore.QObject):
         connection_config = kwargs.pop("connection_config")
         run_config = kwargs.pop("run_config", None)
         gui_settings = kwargs.pop("gui_settings", None)
+        iq_storage_mode = normalize_iq_storage_mode(
+            kwargs.pop("iq_storage_mode", DEFAULT_IQ_STORAGE_MODE)
+        )
         stability_config = kwargs.pop("stability_config")
         full_scale_mv = float(kwargs.pop("full_scale_mv"))
         sequence = kwargs["sequence"]
@@ -1725,6 +1842,7 @@ class StabilityDiagramWorker(QtCore.QObject):
             )
             stored_qick = dict(stored_settings.get("qick", {}))
             stored_qick.update({
+                "iq_storage_mode": iq_storage_mode,
                 "fir_rate_profile": fir_profile.name,
                 "fir_sample_rate_hz": fir_profile.sample_rate_hz,
                 "fir_sample_period_us": fir_profile.sample_period_us,
@@ -1749,6 +1867,7 @@ class StabilityDiagramWorker(QtCore.QObject):
                 program_summary=program.summary(),
                 gui_settings=stored_settings,
                 rf_settings=rf_settings,
+                iq_storage_mode=iq_storage_mode,
                 progress_callback=self.progress_changed.emit,
             )
             experiment = StoredQickExperiment(
@@ -2623,6 +2742,97 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         controls.addWidget(acquisition)
 
+        self.modulation_power_calibration_group = QtWidgets.QGroupBox(
+            "Use Calibrated Modulation Power",
+            controls_content,
+        )
+        self.modulation_power_calibration_group.setCheckable(True)
+        self.modulation_power_calibration_group.setChecked(False)
+        self.modulation_power_calibration_group.setToolTip(
+            "Convert the requested connector power in dBm to a DAC gain code "
+            "using an RF_Out calibration matched to modulation frequency, "
+            "Nyquist zone, output filter, and ATT1/ATT2."
+        )
+        modulation_calibration_form = QtWidgets.QFormLayout(
+            self.modulation_power_calibration_group
+        )
+        self.modulation_target_power_dbm = QtWidgets.QDoubleSpinBox(
+            self.modulation_power_calibration_group
+        )
+        self.modulation_target_power_dbm.setRange(-300.0, 100.0)
+        self.modulation_target_power_dbm.setDecimals(6)
+        self.modulation_target_power_dbm.setSuffix(" dBm")
+        self.modulation_target_power_dbm.setValue(
+            DEFAULT_STABILITY_TARGET_POWER_DBM
+        )
+        self.modulation_power_calibration_path = QtWidgets.QLineEdit(
+            DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH,
+            self.modulation_power_calibration_group,
+        )
+        self.modulation_power_calibration_path.setPlaceholderText(
+            "QCoDeS DB containing RF_Out gain/power calibration"
+        )
+        self.modulation_power_calibration_browse = QtWidgets.QToolButton(
+            self.modulation_power_calibration_group
+        )
+        self.modulation_power_calibration_browse.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.modulation_power_calibration_browse.setToolTip(
+            "Choose the RF output-power calibration database"
+        )
+        modulation_calibration_path_row = QtWidgets.QHBoxLayout()
+        modulation_calibration_path_row.setContentsMargins(0, 0, 0, 0)
+        modulation_calibration_path_row.addWidget(
+            self.modulation_power_calibration_path,
+            1,
+        )
+        modulation_calibration_path_row.addWidget(
+            self.modulation_power_calibration_browse
+        )
+        self.modulation_power_calibration_run_id = QtWidgets.QSpinBox(
+            self.modulation_power_calibration_group
+        )
+        self.modulation_power_calibration_run_id.setRange(0, (1 << 31) - 1)
+        self.modulation_power_calibration_run_id.setSpecialValueText(
+            "Best compatible Run"
+        )
+        self.resolve_modulation_gain_button = QtWidgets.QPushButton(
+            "Resolve Gain",
+            self.modulation_power_calibration_group,
+        )
+        self.resolve_modulation_gain_button.setToolTip(
+            "Find a compatible calibration and update Modulation gain"
+        )
+        self.modulation_power_calibration_status = QtWidgets.QLabel(
+            "Enable calibrated power to resolve a gain code.",
+            self.modulation_power_calibration_group,
+        )
+        self.modulation_power_calibration_status.setWordWrap(True)
+        self.modulation_power_calibration_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        modulation_calibration_form.addRow(
+            "Target connector power:",
+            self.modulation_target_power_dbm,
+        )
+        modulation_calibration_form.addRow(
+            "Calibration DB:",
+            modulation_calibration_path_row,
+        )
+        modulation_calibration_form.addRow(
+            "Calibration Run ID:",
+            self.modulation_power_calibration_run_id,
+        )
+        modulation_calibration_form.addRow(
+            self.resolve_modulation_gain_button
+        )
+        modulation_calibration_form.addRow(
+            "Resolved gain:",
+            self.modulation_power_calibration_status,
+        )
+        controls.addWidget(self.modulation_power_calibration_group)
+
         self.bias_t_group = QtWidgets.QGroupBox(
             "Bias-T compensation",
             controls_content,
@@ -2719,6 +2929,24 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(self.browse_database)
         database_form.addRow("QCoDeS DB file:", database_row)
+        self.iq_storage_mode = QtWidgets.QComboBox(database_group)
+        self.iq_storage_mode.addItem(
+            "Full traces for every repetition",
+            IQ_STORAGE_FULL_TRACES,
+        )
+        self.iq_storage_mode.addItem(
+            "Mean I/Q only for each sweep point",
+            IQ_STORAGE_MEAN_IQ,
+        )
+        self.iq_storage_mode.setCurrentIndex(
+            self.iq_storage_mode.findData(DEFAULT_IQ_STORAGE_MODE)
+        )
+        self.iq_storage_mode.setToolTip(
+            "This applies only to Single Shot & Save. Mean mode stores one "
+            "I/Q pair per X/Y point after averaging every repetition and FIR "
+            "sample; continuous scans are unchanged."
+        )
+        database_form.addRow("QCoDeS I/Q storage:", self.iq_storage_mode)
         controls.addWidget(database_group)
 
         saved_plot_group = QtWidgets.QGroupBox(
@@ -2865,6 +3093,27 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.fpga_trigger_delay_us.valueChanged.connect(
             self._update_fir_trace_duration
         )
+        self.modulation_power_calibration_group.toggled.connect(
+            self._modulation_power_calibration_changed
+        )
+        self.modulation_frequency_mhz.valueChanged.connect(
+            self._invalidate_modulation_power_calibration
+        )
+        self.modulation_target_power_dbm.valueChanged.connect(
+            self._invalidate_modulation_power_calibration
+        )
+        self.modulation_power_calibration_path.editingFinished.connect(
+            self._invalidate_modulation_power_calibration
+        )
+        self.modulation_power_calibration_run_id.valueChanged.connect(
+            self._invalidate_modulation_power_calibration
+        )
+        self.modulation_power_calibration_browse.clicked.connect(
+            self._browse_modulation_power_calibration
+        )
+        self.resolve_modulation_gain_button.clicked.connect(
+            self.resolve_modulation_gain
+        )
         self.measurement_unit.currentIndexChanged.connect(
             self._measurement_representation_changed
         )
@@ -2898,9 +3147,205 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._running = False
         self._saved_run_loading = False
         self._preferred_saved_run_id = 0
+        self._resolved_modulation_power_signature = None
+        self._resolved_modulation_power_run_id = None
         self._update_point_count()
+        self._update_modulation_power_calibration_controls()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
+
+    def _modulation_power_calibration_changed(self, *_args) -> None:
+        self._resolved_modulation_power_signature = None
+        self._resolved_modulation_power_run_id = None
+        self._update_modulation_power_calibration_controls()
+        if self.modulation_power_calibration_group.isChecked():
+            self.modulation_power_calibration_status.setText(
+                "Not resolved. Click Resolve Gain or start a scan."
+            )
+            self.modulation_power_calibration_status.setStyleSheet(
+                "color: #9a6700;"
+            )
+        else:
+            self.modulation_power_calibration_status.setText(
+                "Manual modulation gain code is active."
+            )
+            self.modulation_power_calibration_status.setStyleSheet("")
+
+    def _update_modulation_power_calibration_controls(self) -> None:
+        path = self.front_panel_values()
+        rf_output = str(path.get("output_board_type", "")) == "RF_Out"
+        editable = not self._running
+        enabled = (
+            editable
+            and rf_output
+            and self.modulation_power_calibration_group.isChecked()
+        )
+        self.modulation_power_calibration_group.setEnabled(
+            editable and rf_output
+        )
+        self.modulation_gain.setEnabled(
+            editable
+            and not self.modulation_power_calibration_group.isChecked()
+        )
+        for widget in (
+            self.modulation_target_power_dbm,
+            self.modulation_power_calibration_path,
+            self.modulation_power_calibration_browse,
+            self.modulation_power_calibration_run_id,
+            self.resolve_modulation_gain_button,
+        ):
+            widget.setEnabled(enabled)
+        if not rf_output:
+            self.modulation_power_calibration_group.setToolTip(
+                "Calibrated dBm output requires an RF_Out board."
+            )
+        else:
+            self.modulation_power_calibration_group.setToolTip(
+                "Convert target connector power to DAC gain using a matching "
+                "RF_Out calibration, including ATT1/ATT2, filter, and Nyquist."
+            )
+
+    def _modulation_power_signature(self) -> tuple:
+        path = self.front_panel_values()
+        return (
+            str(Path(
+                self.modulation_power_calibration_path.text().strip()
+            ).expanduser()),
+            int(self.modulation_power_calibration_run_id.value()),
+            float(self.modulation_frequency_mhz.value()),
+            float(self.modulation_target_power_dbm.value()),
+            int(path["output_ch"]),
+            str(path["output_board_type"]),
+            int(path["output_nqz"]),
+            float(path["output_att1_db"]),
+            float(path["output_att2_db"]),
+            str(path["output_filter_type"]),
+            float(path["output_filter_cutoff_ghz"]),
+            float(path["output_filter_bandwidth_ghz"]),
+        )
+
+    def _invalidate_modulation_power_calibration(self, *_args) -> None:
+        if not hasattr(self, "_resolved_modulation_power_signature"):
+            return
+        self._resolved_modulation_power_signature = None
+        self._resolved_modulation_power_run_id = None
+        if self.modulation_power_calibration_group.isChecked():
+            self.modulation_power_calibration_status.setText(
+                "Settings changed; resolve the gain again."
+            )
+            self.modulation_power_calibration_status.setStyleSheet(
+                "color: #9a6700;"
+            )
+
+    def _browse_modulation_power_calibration(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose RF output-power calibration database",
+            self.modulation_power_calibration_path.text().strip(),
+            "QCoDeS SQLite database (*.db)",
+        )
+        if path:
+            self.modulation_power_calibration_path.setText(path)
+            self._invalidate_modulation_power_calibration()
+
+    def resolve_modulation_gain(
+        self,
+        *_args,
+        raise_on_error: bool = False,
+    ) -> int:
+        """Resolve target connector dBm to a gain code for this RF path."""
+        if not self.modulation_power_calibration_group.isChecked():
+            return int(self.modulation_gain.value())
+        try:
+            path = self.front_panel_values()
+            if str(path["output_board_type"]) != "RF_Out":
+                raise ValueError(
+                    "calibrated modulation power requires an RF_Out board"
+                )
+            database_path = (
+                self.modulation_power_calibration_path.text().strip()
+            )
+            if not database_path:
+                raise ValueError(
+                    "modulation power calibration database path is required"
+                )
+            frequency_mhz = float(self.modulation_frequency_mhz.value())
+            target_power_dbm = float(
+                self.modulation_target_power_dbm.value()
+            )
+            requested_run_id = int(
+                self.modulation_power_calibration_run_id.value()
+            )
+            calibration = CalibrationDatabase(
+                database_path
+            ).output_calibration(
+                "RF_Out",
+                [frequency_mhz],
+                run_id=(None if requested_run_id == 0 else requested_run_id),
+                nqz=int(path["output_nqz"]),
+                output_filter_type=str(path["output_filter_type"]),
+                output_filter_cutoff_ghz=float(
+                    path["output_filter_cutoff_ghz"]
+                ),
+                output_filter_bandwidth_ghz=float(
+                    path["output_filter_bandwidth_ghz"]
+                ),
+            )
+            schedule = calibration.build_gain_schedule(
+                [frequency_mhz],
+                target_power_dbm,
+                output_att1_db=float(path["output_att1_db"]),
+                output_att2_db=float(path["output_att2_db"]),
+                max_entries=1,
+            )
+            gain = int(np.asarray(schedule.gain_codes).reshape(-1)[0])
+            if gain < 0 or gain > 32767:
+                raise ValueError(
+                    f"calibrated modulation gain {gain} is outside 0..32767"
+                )
+            predicted_power_dbm = float(
+                calibration.output_power_dbm(
+                    [frequency_mhz],
+                    [gain],
+                    output_att1_db=float(path["output_att1_db"]),
+                    output_att2_db=float(path["output_att2_db"]),
+                )[0]
+            )
+            with QtCore.QSignalBlocker(self.modulation_gain):
+                self.modulation_gain.setValue(gain)
+            self._resolved_modulation_power_signature = (
+                self._modulation_power_signature()
+            )
+            self._resolved_modulation_power_run_id = int(
+                calibration.summary.run_id
+            )
+            self.modulation_power_calibration_status.setText(
+                f"Run {calibration.summary.run_id}: {target_power_dbm:g} dBm "
+                f"-> gain {gain}; predicted {predicted_power_dbm:.6g} dBm at "
+                f"{frequency_mhz:g} MHz."
+            )
+            self.modulation_power_calibration_status.setStyleSheet(
+                "color: #1a7f37;"
+            )
+            return gain
+        except (
+            FileNotFoundError,
+            LookupError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            self._resolved_modulation_power_signature = None
+            self._resolved_modulation_power_run_id = None
+            self.modulation_power_calibration_status.setText(str(exc))
+            self.modulation_power_calibration_status.setStyleSheet(
+                "color: #cf222e;"
+            )
+            if raise_on_error:
+                raise ValueError(str(exc)) from exc
+            return int(self.modulation_gain.value())
 
     def _update_dc_measure_controls(self) -> None:
         editable = self._dc_input_available and not self._running
@@ -3086,6 +3531,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             path = path.with_suffix(".db")
         return str(path)
 
+    def iq_storage_mode_value(self) -> str:
+        return normalize_iq_storage_mode(self.iq_storage_mode.currentData())
+
     def saved_database_path_value(self) -> str:
         value = self.saved_database_path.text().strip()
         if not value:
@@ -3247,6 +3695,16 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             if key in complete:
                 self._path_aux[key] = complete[key]
         self.path_diagram.apply_external_settings(complete)
+        if (
+            str(complete["output_board_type"]) != "RF_Out"
+            and self.modulation_power_calibration_group.isChecked()
+        ):
+            with QtCore.QSignalBlocker(
+                self.modulation_power_calibration_group
+            ):
+                self.modulation_power_calibration_group.setChecked(False)
+        self._invalidate_modulation_power_calibration()
+        self._update_modulation_power_calibration_controls()
         self._dc_input_available = str(complete["input_board_type"]) == "DC_In"
         if not self._dc_input_available:
             with QtCore.QSignalBlocker(self.dc_measure_mode):
@@ -3282,6 +3740,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             ),
             modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
             modulation_gain=self.modulation_gain.value(),
+            modulation_power_calibration_enabled=(
+                self.modulation_power_calibration_group.isChecked()
+            ),
+            modulation_power_calibration_database_path=(
+                self.modulation_power_calibration_path.text().strip()
+            ),
+            modulation_power_calibration_run_id=(
+                self.modulation_power_calibration_run_id.value()
+            ),
+            modulation_target_power_dbm=(
+                self.modulation_target_power_dbm.value()
+            ),
             bias_t_compensation_enabled=self.bias_t_group.isChecked(),
             bias_t_compensation_type=str(self.bias_t_type.currentData()),
             bias_t_compensation_voltage_mv=self.bias_t_compensation_mv.value(),
@@ -3306,6 +3776,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             ),
             "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
             "modulation_gain": self.modulation_gain.value(),
+            "modulation_power_calibration": {
+                "enabled": (
+                    self.modulation_power_calibration_group.isChecked()
+                ),
+                "database_path": (
+                    self.modulation_power_calibration_path.text().strip()
+                ),
+                "run_id": self.modulation_power_calibration_run_id.value(),
+                "target_power_dbm": (
+                    self.modulation_target_power_dbm.value()
+                ),
+            },
             "bias_t_compensation": {
                 "enabled": self.bias_t_group.isChecked(),
                 "type": str(self.bias_t_type.currentData()),
@@ -3318,6 +3800,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "color_ranges": self.plot.color_range_settings(),
             "visible_data": list(self.plot.visible_data()),
             "database_path": self.database_path_value(),
+            "iq_storage_mode": self.iq_storage_mode_value(),
             "saved_plot_database_path": (
                 self.saved_database_path_value()
             ),
@@ -3379,6 +3862,33 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_gain.setValue(
             int(settings.get("modulation_gain", DEFAULT_STABILITY_MODULATION_GAIN))
         )
+        modulation_calibration = settings.get(
+            "modulation_power_calibration",
+            default_stability_settings()["modulation_power_calibration"],
+        )
+        with QtCore.QSignalBlocker(
+            self.modulation_power_calibration_group
+        ), QtCore.QSignalBlocker(
+            self.modulation_power_calibration_path
+        ), QtCore.QSignalBlocker(
+            self.modulation_power_calibration_run_id
+        ), QtCore.QSignalBlocker(
+            self.modulation_target_power_dbm
+        ):
+            self.modulation_power_calibration_group.setChecked(
+                bool(modulation_calibration["enabled"])
+            )
+            self.modulation_power_calibration_path.setText(
+                str(modulation_calibration["database_path"])
+            )
+            self.modulation_power_calibration_run_id.setValue(
+                int(modulation_calibration["run_id"])
+            )
+            self.modulation_target_power_dbm.setValue(
+                float(modulation_calibration["target_power_dbm"])
+            )
+        self._resolved_modulation_power_signature = None
+        self._resolved_modulation_power_run_id = None
         bias_t = settings.get(
             "bias_t_compensation",
             default_stability_settings()["bias_t_compensation"],
@@ -3420,6 +3930,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.database_path.setText(
             str(settings.get("database_path", DEFAULT_STABILITY_DB_PATH))
         )
+        storage_mode = normalize_iq_storage_mode(
+            settings.get("iq_storage_mode", DEFAULT_IQ_STORAGE_MODE)
+        )
+        storage_index = self.iq_storage_mode.findData(storage_mode)
+        if storage_index < 0:
+            raise ValueError(f"unsupported Stability I/Q storage mode {storage_mode!r}")
+        self.iq_storage_mode.setCurrentIndex(storage_index)
         self.saved_database_path.setText(
             str(
                 settings.get(
@@ -3490,6 +4007,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 int(settings.get("dc_voltage_calibration_run_id", 0))
             )
         self._update_point_count()
+        self._update_modulation_power_calibration_controls()
+        self._modulation_power_calibration_changed()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
         self._update_fpga_trigger_delay_controls()
@@ -3534,6 +4053,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         ):
             widget.setEnabled(database_enabled)
         self._update_dc_measure_controls()
+        self._update_modulation_power_calibration_controls()
         self._update_bias_t_controls()
         self.progress.setVisible(running)
         if not running:
@@ -3607,7 +4127,9 @@ __all__ = [
     "DEFAULT_STABILITY_REPETITIONS",
     "DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ",
     "DEFAULT_STABILITY_MODULATION_GAIN",
+    "DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH",
     "DEFAULT_STABILITY_RF_PATH",
+    "DEFAULT_STABILITY_TARGET_POWER_DBM",
     "DEFAULT_STABILITY_TRACE_SAMPLES",
     "DEFAULT_STABILITY_START_MV",
     "DEFAULT_STABILITY_STOP_MV",

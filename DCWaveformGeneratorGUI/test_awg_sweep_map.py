@@ -27,6 +27,7 @@ from qick_fine_tune_sweep import (
 )
 from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
+    IQ_STORAGE_MEAN_IQ,
     QcodesRunConfig,
     QickConnectionConfig,
     store_qick_result,
@@ -880,6 +881,7 @@ def test_saved_awg_run_loads_from_real_qcodes_database(
         program_summary={},
         gui_settings=gui_settings,
         rf_settings={},
+        iq_storage_mode=IQ_STORAGE_MEAN_IQ,
     )
 
     summaries = awg_map.list_awg_sweep_runs(database_path)
@@ -898,6 +900,8 @@ def test_saved_awg_run_loads_from_real_qcodes_database(
     )
     assert result.source_label == f"QCoDeS Run {dataset.run_id}"
     assert result.sample_rate_hz == 50_000.0
+    assert result.repetition_count == 2
+    assert result.samples_per_trace == 2
 
 
 def test_experiment_panel_axis_selection_and_result_plot():

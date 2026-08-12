@@ -36,6 +36,10 @@ from dc_waveform_core import (
 )
 from stability_diagram import DEFAULT_STABILITY_POINT_GUARD_US
 from qick_fine_tune_sweep import FineTuneSequence
+from qick_qcodes_experiment import (
+    IQ_STORAGE_FULL_TRACES,
+    IQ_STORAGE_MEAN_IQ,
+)
 
 
 def _application():
@@ -2698,6 +2702,12 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     )
     experiment.bias_t_duration_us.setValue(2.5)
     experiment.set_compile_validation_mode("full")
+    experiment.set_iq_storage_mode(IQ_STORAGE_MEAN_IQ)
+    window._stability_panel.iq_storage_mode.setCurrentIndex(
+        window._stability_panel.iq_storage_mode.findData(
+            IQ_STORAGE_MEAN_IQ
+        )
+    )
     app.processEvents()
 
     expected = window._settings_to_dict()
@@ -2708,6 +2718,7 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["version"] == gui.SETTINGS_VERSION
     assert document["qick"]["tproc_mhz"] == 275.0
     assert document["qick"]["compile_validation_mode"] == "full"
+    assert document["qick"]["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
     assert document["qick"]["bias_t_compensation"] == {
         "enabled": True,
         "type": "dc",
@@ -2756,6 +2767,10 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert "rf_outputs" not in document["stability_diagram"]
     assert "rf_readout" not in document["stability_diagram"]
     assert document["stability_diagram"]["trace_samples_per_point"] == 321
+    assert (
+        document["stability_diagram"]["iq_storage_mode"]
+        == IQ_STORAGE_MEAN_IQ
+    )
     assert document["stability_diagram"]["bias_t_compensation"] == {
         "enabled": True,
         "type": "filter",
@@ -2792,6 +2807,14 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
         restored._experiment_panel.compile_validation_mode.currentData()
         == "full"
     )
+    assert (
+        restored._experiment_panel.iq_storage_mode.currentData()
+        == IQ_STORAGE_MEAN_IQ
+    )
+    assert (
+        restored._stability_panel.iq_storage_mode_value()
+        == IQ_STORAGE_MEAN_IQ
+    )
     assert restored._control_tabs.currentWidget() is restored._awg_tuning_page
     assert restored._awg_tuning_tabs.currentWidget() is restored._rf_readout_panel
     assert restored._experiment_panel.database_path.text().endswith("experiment.db")
@@ -2809,12 +2832,14 @@ def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     window._rf_readout_panel.samples.setValue(32)
     window._experiment_panel.bias_t_group.setChecked(True)
     window._experiment_panel.bias_t_compensation_mv.setValue(200.0)
+    window._experiment_panel.set_iq_storage_mode(IQ_STORAGE_MEAN_IQ)
 
     arguments = window._experiment_run_arguments()
     assert arguments["connection_config"].host == gui.DEFAULT_QICK_HOST
     assert arguments["run_config"].resolved_database_path == (tmp_path / "run.db")
     assert arguments["awg_channels"] == (1,)
     assert arguments["compile_validation_mode"] == "boundary"
+    assert arguments["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
     assert arguments["readout_spec"].samples_per_trigger == 32
     assert arguments["gui_settings"]["qick"]["tproc_mhz"] == 300.0
     assert arguments["sequence"].bias_t_compensation.amplitude == 0.25
@@ -2873,6 +2898,11 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
         window._stability_panel.bias_t_mode.findData("fixed_time")
     )
     window._stability_panel.bias_t_duration_us.setValue(2.5)
+    window._stability_panel.iq_storage_mode.setCurrentIndex(
+        window._stability_panel.iq_storage_mode.findData(
+            IQ_STORAGE_MEAN_IQ
+        )
+    )
     app.processEvents()
 
     assert window._stability_panel.dc_measure_mode.isChecked() is True
@@ -2894,6 +2924,7 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     arguments = window._stability_run_arguments(save=False)
 
     assert arguments["run_config"] is None
+    assert arguments["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
     assert arguments["gui_settings"] is None
     assert arguments["repetitions_per_sweep"] == 4
     assert arguments["sequence"].sweep_shape == (5, 3)
@@ -2924,6 +2955,60 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     filter_compensation = filter_arguments["sequence"].bias_t_compensation
     assert filter_compensation.compensation_type == "filter"
     assert filter_compensation.tau_cycles == 7_500.0
+    window.close()
+
+
+def test_stability_run_arguments_use_calibrated_modulation_power(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    panel = window._stability_panel
+    panel.apply_path_settings({
+        "output_board_type": "RF_Out",
+        "output_ch": 0,
+        "output_nqz": 2,
+        "output_att1_db": 6.25,
+        "output_att2_db": 3.5,
+        "output_filter_type": "bandpass",
+        "output_filter_cutoff_ghz": 0.45,
+        "output_filter_bandwidth_ghz": 0.1,
+    })
+    panel.modulation_frequency_mhz.setValue(450.0)
+    panel.modulation_power_calibration_path.setText("stability_power.db")
+    panel.modulation_power_calibration_run_id.setValue(0)
+    panel.modulation_target_power_dbm.setValue(-42.5)
+    panel.modulation_power_calibration_group.setChecked(True)
+    calls = []
+
+    def resolve_gain(*, raise_on_error=False):
+        calls.append(raise_on_error)
+        panel.modulation_gain.setValue(4321)
+        panel._resolved_modulation_power_run_id = 88
+        return 4321
+
+    monkeypatch.setattr(panel, "resolve_modulation_gain", resolve_gain)
+    app.processEvents()
+
+    arguments = window._stability_run_arguments(save=False)
+    config = arguments["stability_config"]
+    spec = arguments["rf_specs"][0]
+
+    assert calls == [True]
+    assert config.modulation_power_calibration_enabled is True
+    assert config.modulation_gain == 4321
+    assert config.modulation_target_power_dbm == -42.5
+    assert spec.gain == 4321
+    assert spec.power_calibration_enabled is True
+    assert spec.power_calibration_database_path == "stability_power.db"
+    assert spec.power_calibration_run_id == 88
+    assert spec.target_output_power_dbm == -42.5
+    assert spec.frequency_mhz == 450.0
+    assert spec.nqz == 2
+    assert spec.att1_db == 6.25
+    assert spec.att2_db == 3.5
+    assert spec.filter_type == "bandpass"
+    assert spec.filter_cutoff == 0.45
+    assert spec.filter_bandwidth == 0.1
     window.close()
 
 
@@ -3068,6 +3153,8 @@ def test_experiment_panel_defaults_to_parametric_awg_metadata():
     assert panel.values(1)["awg_metadata_mode"] == "parametric"
     assert panel.compile_validation_mode.currentData() == "boundary"
     assert panel.values(1)["compile_validation_mode"] == "boundary"
+    assert panel.iq_storage_mode.currentData() == IQ_STORAGE_FULL_TRACES
+    assert panel.values(1)["iq_storage_mode"] == IQ_STORAGE_FULL_TRACES
     panel.awg_metadata_button.click()
     app.processEvents()
     assert emitted == [True]
@@ -3076,6 +3163,8 @@ def test_experiment_panel_defaults_to_parametric_awg_metadata():
     assert panel.values(1)["awg_metadata_mode"] == "expanded"
     panel.set_compile_validation_mode("full")
     assert panel.values(1)["compile_validation_mode"] == "full"
+    panel.set_iq_storage_mode(IQ_STORAGE_MEAN_IQ)
+    assert panel.values(1)["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ
     panel.close()
 
 
@@ -3367,7 +3456,9 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     document["awg"].pop("sweeps")
     document["qick"].pop("tproc_mhz")
     document["qick"].pop("repetitions_per_sweep")
+    document["qick"].pop("iq_storage_mode")
     document["qick"].pop("bias_t_compensation")
+    document["stability_diagram"].pop("iq_storage_mode")
     document["experiment"].pop("notes")
     document.pop("rf_outputs")
     document["rf_readout"] = {"enabled": False}
@@ -3383,6 +3474,14 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert window._grid_snap_enabled is False
     assert window._experiment_panel.tproc_mhz.value() == 300.0
     assert window._experiment_panel.repetitions.value() == 1
+    assert (
+        window._experiment_panel.iq_storage_mode.currentData()
+        == IQ_STORAGE_FULL_TRACES
+    )
+    assert (
+        window._stability_panel.iq_storage_mode_value()
+        == IQ_STORAGE_FULL_TRACES
+    )
     assert window._experiment_panel.bias_t_group.isChecked() is False
     assert window._experiment_panel.bias_t_compensation_mv.value() == 80.0
     assert window._control_tabs.currentWidget() is window._awg_tuning_page
@@ -3400,8 +3499,9 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 41
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 43
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
+    assert upgraded["qick"]["iq_storage_mode"] == IQ_STORAGE_FULL_TRACES
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0
     assert upgraded["display"]["selected_awg_tuning_tab"] == 2
@@ -3412,6 +3512,10 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert upgraded["stability_diagram"]["x_axis"]["output_name"] == "awg_0"
     assert upgraded["stability_diagram"]["y_axis"]["output_name"] == "awg_0"
     assert upgraded["stability_diagram"]["trace_samples_per_point"] == 64
+    assert (
+        upgraded["stability_diagram"]["iq_storage_mode"]
+        == IQ_STORAGE_FULL_TRACES
+    )
     assert upgraded["stability_diagram"]["bias_t_compensation"] == {
         "enabled": False,
         "type": "dc",

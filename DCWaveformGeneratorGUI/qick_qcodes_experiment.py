@@ -33,7 +33,16 @@ QCODES_STAGING_ENV = "QSTL_QCODES_STAGING_DIR"
 IQ_TRACE_PARAMETER = "iq_trace"
 I_TRACE_PARAMETER = "i_trace"
 Q_TRACE_PARAMETER = "q_trace"
+I_MEAN_PARAMETER = "i_mean"
+Q_MEAN_PARAMETER = "q_mean"
 SAMPLE_INDEX_PARAMETER = "sample_index"
+IQ_STORAGE_FULL_TRACES = "full_traces"
+IQ_STORAGE_MEAN_IQ = "mean_iq"
+IQ_STORAGE_MODES = (
+    IQ_STORAGE_FULL_TRACES,
+    IQ_STORAGE_MEAN_IQ,
+)
+DEFAULT_IQ_STORAGE_MODE = IQ_STORAGE_FULL_TRACES
 AWG_METADATA_MODE_PARAMETRIC = "parametric"
 AWG_METADATA_MODE_EXPANDED = "expanded"
 AWG_METADATA_MODES = (
@@ -234,6 +243,14 @@ def normalize_awg_metadata_mode(value: Any) -> str:
         raise ValueError(
             f"AWG waveform metadata mode must be one of {AWG_METADATA_MODES}"
         )
+    return mode
+
+
+def normalize_iq_storage_mode(value: Any) -> str:
+    """Return a supported QCoDeS I/Q storage mode."""
+    mode = str(value or DEFAULT_IQ_STORAGE_MODE).strip().lower()
+    if mode not in IQ_STORAGE_MODES:
+        raise ValueError(f"I/Q storage mode must be one of {IQ_STORAGE_MODES}")
     return mode
 
 
@@ -1702,7 +1719,36 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
 
     trace_count = expected_shape[0] * expected_shape[1]
     parameter_names = {parameter.name for parameter in dataset.get_parameters()}
-    if {I_TRACE_PARAMETER, Q_TRACE_PARAMETER}.issubset(parameter_names):
+    storage_mode = normalize_iq_storage_mode(
+        layout.get(
+            "iq_storage_mode",
+            (
+                IQ_STORAGE_MEAN_IQ
+                if {I_MEAN_PARAMETER, Q_MEAN_PARAMETER}.issubset(parameter_names)
+                else IQ_STORAGE_FULL_TRACES
+            ),
+        )
+    )
+    if {I_MEAN_PARAMETER, Q_MEAN_PARAMETER}.issubset(parameter_names):
+        i_parameter_data = dataset.get_parameter_data(I_MEAN_PARAMETER)
+        q_parameter_data = dataset.get_parameter_data(Q_MEAN_PARAMETER)
+        trace_data = i_parameter_data[I_MEAN_PARAMETER]
+        flat_i = np.asarray(trace_data[I_MEAN_PARAMETER]).reshape(-1)
+        flat_q = np.asarray(
+            q_parameter_data[Q_MEAN_PARAMETER][Q_MEAN_PARAMETER]
+        ).reshape(-1)
+        expected_flat_shape = (trace_count,)
+        if (
+            flat_i.shape != expected_flat_shape
+            or flat_q.shape != expected_flat_shape
+        ):
+            raise ValueError(
+                "stored mean I/Q arrays have shapes "
+                f"{flat_i.shape} and {flat_q.shape}, expected "
+                f"{expected_flat_shape}"
+            )
+        iq = np.stack((flat_i, flat_q), axis=-1).reshape(expected_shape)
+    elif {I_TRACE_PARAMETER, Q_TRACE_PARAMETER}.issubset(parameter_names):
         i_parameter_data = dataset.get_parameter_data(I_TRACE_PARAMETER)
         q_parameter_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)
         trace_data = i_parameter_data[I_TRACE_PARAMETER]
@@ -1764,10 +1810,13 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
             trace_data[parameter_name],
             trace_count,
         ).reshape(expected_shape[0], expected_shape[1])
-    repetitions = _first_value_per_trace(
-        trace_data["repetition_index"],
-        trace_count,
-    ).astype(np.int64).reshape(expected_shape[0], expected_shape[1])
+    if "repetition_index" in trace_data:
+        repetitions = _first_value_per_trace(
+            trace_data["repetition_index"],
+            trace_count,
+        ).astype(np.int64).reshape(expected_shape[0], expected_shape[1])
+    else:
+        repetitions = np.zeros(expected_shape[:2], dtype=np.int64)
 
     return {
         "iq": iq,
@@ -1784,6 +1833,13 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
         "sweep_coordinates_mv": sweep_coordinates,
         "iq_unit": str(layout.get("iq_unit", "ADC units")),
         "measurement_mode": str(layout.get("measurement_mode", "raw_iq")),
+        "storage_mode": storage_mode,
+        "source_repetition_count": int(
+            layout.get("source_repetition_count", expected_shape[1])
+        ),
+        "source_sample_count": int(
+            layout.get("source_sample_count", expected_shape[2])
+        ),
         "metadata": metadata,
     }
 
@@ -1898,9 +1954,10 @@ def store_qick_result(
     progress_start: int = 65,
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
+    iq_storage_mode: str = DEFAULT_IQ_STORAGE_MODE,
     cancel_check: Optional[CancellationCheck] = None,
 ) -> Tuple[Any, int]:
-    """Store one I array and one Q array per point/repetition acquisition."""
+    """Store full repetition traces or one mean I/Q pair per sweep point."""
     try:
         from qcodes import (
             Measurement,
@@ -1926,6 +1983,7 @@ def store_qick_result(
     if isinstance(batch_rows, bool) or int(batch_rows) < 1:
         raise ValueError("batch_rows must be a positive integer")
     batch_rows = int(batch_rows)
+    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
     progress_start = int(progress_start)
     progress_end = int(progress_end)
     if not 0 <= progress_start <= progress_end <= 100:
@@ -1936,6 +1994,12 @@ def store_qick_result(
         raise ValueError("DDR IQ result contains no samples")
 
     stored_gui_settings = dict(gui_settings)
+    qick_settings = stored_gui_settings.get("qick", {})
+    if not isinstance(qick_settings, Mapping):
+        raise TypeError("gui_settings['qick'] must be a mapping")
+    stored_qick_settings = dict(qick_settings)
+    stored_qick_settings["iq_storage_mode"] = iq_storage_mode
+    stored_gui_settings["qick"] = stored_qick_settings
     awg_vertices = stored_gui_settings.pop("awg_waveform_vertices", {})
     awg_recipe = stored_gui_settings.get("awg_waveform_recipe", {})
     vertex_data = _coerce_awg_vertex_data(
@@ -1971,12 +2035,6 @@ def store_qick_result(
     )
     measurement = Measurement(exp=experiment, station=Station())
 
-    repetition_index = Parameter("repetition_index", label="Repetition", unit="")
-    sample_index = Parameter(
-        SAMPLE_INDEX_PARAMETER,
-        label="Sample index",
-        unit="",
-    )
     setpoint_parameters = []
     sweep_parameters = []
     sweep_parameter_names = _sweep_parameter_names(sweep_axes)
@@ -1992,28 +2050,64 @@ def store_qick_result(
         )
         sweep_parameters.append(parameter)
         setpoint_parameters.append(parameter)
-    setpoint_parameters.append(repetition_index)
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
-    measurement.register_parameter(sample_index, paramtype="array")
-
-    i_trace = Parameter(
-        I_TRACE_PARAMETER,
-        label="I current trace" if iq_unit == "A" else "I trace",
-        unit=iq_unit,
-    )
-    q_trace = Parameter(
-        Q_TRACE_PARAMETER,
-        label="Q current trace" if iq_unit == "A" else "Q trace",
-        unit=iq_unit,
-    )
-    for parameter in (i_trace, q_trace):
-        measurement.register_parameter(
-            parameter,
-            # Plottr assigns the final dimension to the x-axis by default.
-            setpoints=(*setpoint_parameters, sample_index),
-            paramtype="array",
+    repetition_index = None
+    sample_index = None
+    i_trace = None
+    q_trace = None
+    i_mean = None
+    q_mean = None
+    if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+        repetition_index = Parameter(
+            "repetition_index",
+            label="Repetition",
+            unit="",
         )
+        sample_index = Parameter(
+            SAMPLE_INDEX_PARAMETER,
+            label="Sample index",
+            unit="",
+        )
+        measurement.register_parameter(repetition_index)
+        measurement.register_parameter(sample_index, paramtype="array")
+        trace_setpoints = (*setpoint_parameters, repetition_index, sample_index)
+        i_trace = Parameter(
+            I_TRACE_PARAMETER,
+            label="I current trace" if iq_unit == "A" else "I trace",
+            unit=iq_unit,
+        )
+        q_trace = Parameter(
+            Q_TRACE_PARAMETER,
+            label="Q current trace" if iq_unit == "A" else "Q trace",
+            unit=iq_unit,
+        )
+        for parameter in (i_trace, q_trace):
+            measurement.register_parameter(
+                parameter,
+                # Plottr assigns the final dimension to the x-axis by default.
+                setpoints=trace_setpoints,
+                paramtype="array",
+            )
+    else:
+        i_mean = Parameter(
+            I_MEAN_PARAMETER,
+            label="Mean I current" if iq_unit == "A" else "Mean I",
+            unit=iq_unit,
+        )
+        q_mean = Parameter(
+            Q_MEAN_PARAMETER,
+            label="Mean Q current" if iq_unit == "A" else "Mean Q",
+            unit=iq_unit,
+        )
+        for parameter in (i_mean, q_mean):
+            if setpoint_parameters:
+                measurement.register_parameter(
+                    parameter,
+                    setpoints=tuple(setpoint_parameters),
+                )
+            else:
+                measurement.register_parameter(parameter)
 
     vertex_parameters = []
     if vertex_data is not None:
@@ -2138,14 +2232,85 @@ def store_qick_result(
         parameter.name: _sweep_axis_meaning(axis)
         for axis, parameter in zip(sweep_axes, sweep_parameters)
     }
-    setpoint_meanings.update({
-        SAMPLE_INDEX_PARAMETER: (
-            "Zero-based index of each sample within the captured I/Q trace."
-        ),
-        "repetition_index": "Zero-based repetition within one sweep coordinate.",
-    })
     sample_period_us = 1_000_000.0 / run_config.sample_rate_hz
-    sample_index_values = np.arange(sample_count, dtype=np.int32)
+    mean_iq_values = None
+    if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+        setpoint_meanings.update({
+            SAMPLE_INDEX_PARAMETER: (
+                "Zero-based index of each sample within the captured I/Q trace."
+            ),
+            "repetition_index": (
+                "Zero-based repetition within one sweep coordinate."
+            ),
+        })
+        sample_index_values = np.arange(sample_count, dtype=np.int32)
+        measurement_layout = {
+            "iq_shape": list(iq.shape),
+            "iq_trace_parameters": {
+                "i": I_TRACE_PARAMETER,
+                "q": Q_TRACE_PARAMETER,
+            },
+            "iq_trace_shape": [sample_count],
+            "iq_trace_dtypes": {
+                "i": str(iq[..., 0].dtype),
+                "q": str(iq[..., 1].dtype),
+            },
+            "storage_format": "qcodes_split_array_per_trace_v3",
+            "trace_count": point_count * repetition_count,
+            "sql_rows_per_trace": 2,
+            "sample_index_parameter": SAMPLE_INDEX_PARAMETER,
+            "row_order": (
+                "sweep_axes,repetition" if sweep_axes else "repetition"
+            ),
+            "time_reconstruction": (
+                f"{SAMPLE_INDEX_PARAMETER} is stored as the array setpoint for "
+                "every I/Q trace; time_us = sample_index * sample_period_us."
+            ),
+            "derived_quantities": {
+                "magnitude": "hypot(i_trace, q_trace)",
+                "phase_deg": "degrees(arctan2(q_trace, i_trace))",
+            },
+        }
+    else:
+        mean_iq_values = np.mean(iq, axis=(1, 2), dtype=np.float64)
+        sample_index_values = None
+        measurement_layout = {
+            # Keep the common loader contract while making it explicit that
+            # repetition and sample axes were reduced before persistence.
+            "iq_shape": [point_count, 1, 1, 2],
+            "iq_mean_parameters": {
+                "i": I_MEAN_PARAMETER,
+                "q": Q_MEAN_PARAMETER,
+            },
+            "iq_mean_dtype": str(mean_iq_values.dtype),
+            "storage_format": "qcodes_mean_iq_per_point_v1",
+            "stored_point_count": point_count,
+            "sql_rows_per_point": 2,
+            "row_order": "sweep_axes" if sweep_axes else "single_point",
+            "time_reconstruction": (
+                "No time trace is stored. Each value is the arithmetic mean "
+                "over all acquired repetitions and samples for one sweep point."
+            ),
+            "derived_quantities": {
+                "magnitude": "hypot(i_mean, q_mean)",
+                "phase_deg": "degrees(arctan2(q_mean, i_mean))",
+            },
+        }
+    measurement_layout.update({
+        "iq_storage_mode": iq_storage_mode,
+        "source_iq_shape": list(iq.shape),
+        "source_repetition_count": repetition_count,
+        "source_sample_count": sample_count,
+        "raw_iq_dtype": str(raw_iq.dtype),
+        "iq_unit": iq_unit,
+        "measurement_mode": measurement_mode,
+        "measurement_conversion": dict(measurement_conversion),
+        "cartesian_point_count": point_count,
+        "sample_rate_hz": run_config.sample_rate_hz,
+        "sample_period_us": sample_period_us,
+        "sweep_axes": sweep_axis_metadata,
+        "setpoint_meanings": setpoint_meanings,
+    })
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "qick_connection": asdict(connection_config),
@@ -2171,46 +2336,7 @@ def store_qick_result(
         },
         "program_summary": program_summary,
         "rf_settings_actual": rf_settings,
-        "measurement_layout": {
-            "iq_shape": list(iq.shape),
-            "iq_trace_parameters": {
-                "i": I_TRACE_PARAMETER,
-                "q": Q_TRACE_PARAMETER,
-            },
-            "iq_trace_shape": [sample_count],
-            "iq_trace_dtypes": {
-                "i": str(iq[..., 0].dtype),
-                "q": str(iq[..., 1].dtype),
-            },
-            "raw_iq_dtype": str(raw_iq.dtype),
-            "iq_unit": iq_unit,
-            "measurement_mode": measurement_mode,
-            "measurement_conversion": dict(measurement_conversion),
-            "storage_format": "qcodes_split_array_per_trace_v3",
-            "trace_count": point_count * repetition_count,
-            "sql_rows_per_trace": 2,
-            "cartesian_point_count": point_count,
-            "sample_rate_hz": run_config.sample_rate_hz,
-            "sample_period_us": sample_period_us,
-            "sample_index_parameter": SAMPLE_INDEX_PARAMETER,
-            "row_order": (
-                "sweep_axes,repetition"
-                if sweep_axes
-                else "repetition"
-            ),
-            "sweep_axes": sweep_axis_metadata,
-            "setpoint_meanings": setpoint_meanings,
-            "time_reconstruction": (
-                f"{SAMPLE_INDEX_PARAMETER} is stored as the array setpoint for "
-                "every I/Q trace; time_us = sample_index * sample_period_us."
-            ),
-            "derived_quantities": {
-                "magnitude": "hypot(i_trace, q_trace)",
-                "phase_deg": (
-                    "degrees(arctan2(q_trace, i_trace))"
-                ),
-            },
-        },
+        "measurement_layout": measurement_layout,
     }
     if vertex_data is not None:
         output_names, vertex_time_us, virtual_mv, _physical_mv = vertex_data
@@ -2351,56 +2477,90 @@ def store_qick_result(
                     f"{point_count:,} sweep points",
                 )
 
-        trace_count = point_count * repetition_count
-        traces_per_flush = max(1, batch_rows // sample_count)
-        traces_written = 0
         data_progress_end = max(progress_start, progress_end - 4)
-        for point_index in range(point_count):
-            if cancellation_requested():
-                break
-            coordinate_results = [
-                (
-                    parameter,
-                    float(coordinates_display[point_index, axis_index]),
-                )
-                for axis_index, parameter in enumerate(sweep_parameters)
-            ]
-            for repetition in range(repetition_count):
+        if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+            trace_count = point_count * repetition_count
+            traces_per_flush = max(1, batch_rows // sample_count)
+            traces_written = 0
+            for point_index in range(point_count):
                 if cancellation_requested():
                     break
+                coordinate_results = [
+                    (
+                        parameter,
+                        float(coordinates_display[point_index, axis_index]),
+                    )
+                    for axis_index, parameter in enumerate(sweep_parameters)
+                ]
+                for repetition in range(repetition_count):
+                    if cancellation_requested():
+                        break
+                    datasaver.add_result(
+                        *coordinate_results,
+                        (repetition_index, repetition),
+                        (sample_index, sample_index_values),
+                        (
+                            i_trace,
+                            np.ascontiguousarray(
+                                iq[point_index, repetition, :, 0]
+                            ),
+                        ),
+                        (
+                            q_trace,
+                            np.ascontiguousarray(
+                                iq[point_index, repetition, :, 1]
+                            ),
+                        ),
+                    )
+                    traces_written += 1
+                    row_count += sample_count
+                    if (
+                        traces_written % traces_per_flush == 0
+                        or traces_written == trace_count
+                    ):
+                        datasaver.flush_data_to_database()
+                        fraction = traces_written / trace_count
+                        percent = progress_start + round(
+                            fraction * (data_progress_end - progress_start)
+                        )
+                        _emit_progress(
+                            progress_callback,
+                            percent,
+                            f"Saving split I/Q trace arrays {traces_written:,}/"
+                            f"{trace_count:,} "
+                            f"({row_count:,}/{total_rows:,} samples)",
+                        )
+        else:
+            points_per_flush = max(1, batch_rows // 2)
+            for point_index in range(point_count):
+                if cancellation_requested():
+                    break
+                coordinate_results = [
+                    (
+                        parameter,
+                        float(coordinates_display[point_index, axis_index]),
+                    )
+                    for axis_index, parameter in enumerate(sweep_parameters)
+                ]
                 datasaver.add_result(
                     *coordinate_results,
-                    (repetition_index, repetition),
-                    (sample_index, sample_index_values),
-                    (
-                        i_trace,
-                        np.ascontiguousarray(
-                            iq[point_index, repetition, :, 0]
-                        ),
-                    ),
-                    (
-                        q_trace,
-                        np.ascontiguousarray(
-                            iq[point_index, repetition, :, 1]
-                        ),
-                    ),
+                    (i_mean, float(mean_iq_values[point_index, 0])),
+                    (q_mean, float(mean_iq_values[point_index, 1])),
                 )
-                traces_written += 1
-                row_count += sample_count
+                row_count += 1
                 if (
-                    traces_written % traces_per_flush == 0
-                    or traces_written == trace_count
+                    row_count % points_per_flush == 0
+                    or row_count == point_count
                 ):
                     datasaver.flush_data_to_database()
-                    fraction = traces_written / trace_count
                     percent = progress_start + round(
-                        fraction * (data_progress_end - progress_start)
+                        (row_count / point_count)
+                        * (data_progress_end - progress_start)
                     )
                     _emit_progress(
                         progress_callback,
                         percent,
-                        f"Saving split I/Q trace arrays {traces_written:,}/"
-                        f"{trace_count:,} ({row_count:,}/{total_rows:,} samples)",
+                        f"Saving mean I/Q points {row_count:,}/{point_count:,}",
                     )
 
     if cancellation_error is not None:
@@ -2455,6 +2615,7 @@ def run_qick_qcodes_experiment(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     gui_settings: Mapping[str, Any],
+    iq_storage_mode: str = DEFAULT_IQ_STORAGE_MODE,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
@@ -2516,6 +2677,8 @@ def run_qick_qcodes_experiment(
     tproc_mhz = float(
         qick_settings.get("tproc_mhz", DEFAULT_QICK_TPROC_MHZ)
     )
+    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
+    stored_qick_settings["iq_storage_mode"] = iq_storage_mode
     metadata_mode = normalize_awg_metadata_mode(
         qick_settings.get("awg_metadata_mode", DEFAULT_AWG_METADATA_MODE)
     )
@@ -2645,6 +2808,7 @@ def run_qick_qcodes_experiment(
         program_summary=program.summary(),
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
+        iq_storage_mode=iq_storage_mode,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
     )
@@ -2676,13 +2840,19 @@ __all__ = [
     "COMPILE_VALIDATION_MODES",
     "DEFAULT_COMPILE_VALIDATION_MODE",
     "DEFAULT_AWG_METADATA_MODE",
+    "DEFAULT_IQ_STORAGE_MODE",
     "DEFAULT_QCODES_BATCH_ROWS",
     "CancellationCheck",
     "ExperimentCancelled",
     "ExperimentEventCallback",
     "I_TRACE_PARAMETER",
+    "I_MEAN_PARAMETER",
     "IQ_TRACE_PARAMETER",
+    "IQ_STORAGE_FULL_TRACES",
+    "IQ_STORAGE_MEAN_IQ",
+    "IQ_STORAGE_MODES",
     "Q_TRACE_PARAMETER",
+    "Q_MEAN_PARAMETER",
     "QCODES_STAGING_ENV",
     "ProgressCallback",
     "QcodesRunConfig",
@@ -2704,6 +2874,7 @@ __all__ = [
     "load_qick_iq_arrays",
     "measurement_iq_values",
     "normalize_awg_metadata_mode",
+    "normalize_iq_storage_mode",
     "normalize_compile_validation_mode",
     "run_qick_qcodes_experiment",
     "store_qick_result",

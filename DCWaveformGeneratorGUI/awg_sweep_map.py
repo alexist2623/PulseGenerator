@@ -1,10 +1,10 @@
 """Interactive two-dimensional maps from Cartesian AWG tuning sweeps.
 
-The hardware acquisition stores one I/Q trace for every Cartesian sweep point
-and repetition. This module coherently averages I and Q over repetitions and
-FIR samples, then arranges two user-selected sweep variables on X and Y. Every
-remaining sweep variable can either be fixed to one acquired value or averaged
-independently at each selected X/Y coordinate.
+Saved runs may contain every repetition trace or one already-reduced I/Q pair
+per Cartesian point. This module coherently reduces any retained repetition and
+FIR-sample axes, then arranges two user-selected sweep variables on X and Y.
+Every remaining sweep variable can either be fixed to one acquired value or
+averaged independently at each selected X/Y coordinate.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -589,6 +589,12 @@ def awg_sweep_result_from_stored_arrays(
         )
     return replace(
         result,
+        repetition_count=int(
+            arrays.get("source_repetition_count", result.repetition_count)
+        ),
+        samples_per_trace=int(
+            arrays.get("source_sample_count", result.samples_per_trace)
+        ),
         source_label=f"QCoDeS Run {int(run_id)}",
         database_path=str(path),
         run_id=int(run_id),

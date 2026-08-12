@@ -20,6 +20,7 @@ import pytest
 from qick_fine_tune_sweep import AmplitudeSweep, FineTuneDdrResult
 from qick_qcodes_experiment import (
     QCODES_STAGING_ENV,
+    IQ_STORAGE_MEAN_IQ,
     QcodesRunConfig,
     QickConnectionConfig,
     store_qick_result,
@@ -186,6 +187,8 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
     legacy.pop("saved_plot_database_path")
     legacy.pop("saved_plot_run_id")
     legacy.pop("saved_plot_data")
+    legacy.pop("iq_storage_mode")
+    legacy.pop("modulation_power_calibration")
 
     normalized = stability.normalize_stability_settings(
         legacy,
@@ -226,9 +229,18 @@ def test_stability_settings_add_backward_compatible_bias_t_defaults():
         },
     }
     assert normalized["visible_data"] == ["magnitude", "phase"]
+    assert normalized["iq_storage_mode"] == "full_traces"
     assert normalized["saved_plot_database_path"] == normalized["database_path"]
     assert normalized["saved_plot_run_id"] == 0
     assert normalized["saved_plot_data"] == "magnitude"
+    assert normalized["modulation_power_calibration"] == {
+        "enabled": False,
+        "database_path": (
+            stability.DEFAULT_STABILITY_POWER_CALIBRATION_DB_PATH
+        ),
+        "run_id": 0,
+        "target_power_dbm": stability.DEFAULT_STABILITY_TARGET_POWER_DBM,
+    }
 
     invalid = dict(normalized)
     invalid["color_ranges"] = {
@@ -633,7 +645,7 @@ def test_worker_rebuilds_50ksps_sequence_and_rf_hold(monkeypatch):
 
 
 def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
-    calls = {"store": 0}
+    calls = {"store": 0, "storage_mode": None}
 
     monkeypatch.setattr(
         stability,
@@ -660,11 +672,14 @@ def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
 
     def fake_store(*_args, **_kwargs):
         calls["store"] += 1
+        calls["storage_mode"] = _kwargs["iq_storage_mode"]
         return dataset, 24
 
     monkeypatch.setattr(stability, "store_qick_result", fake_store)
+    worker_kwargs = _worker_kwargs(tmp_path)
+    worker_kwargs["iq_storage_mode"] = IQ_STORAGE_MEAN_IQ
     worker = stability.StabilityDiagramWorker(
-        _worker_kwargs(tmp_path),
+        worker_kwargs,
         continuous=False,
     )
     finished = []
@@ -673,6 +688,7 @@ def test_single_shot_worker_saves_exactly_once(monkeypatch, tmp_path):
     worker.run()
 
     assert calls["store"] == 1
+    assert calls["storage_mode"] == IQ_STORAGE_MEAN_IQ
     assert len(finished) == 1
     assert finished[0].run_id == 23
     assert finished[0].experiment.row_count == 24
@@ -718,6 +734,12 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.settle_time_us.setValue(75.5)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
+    panel.modulation_power_calibration_group.setChecked(True)
+    panel.modulation_power_calibration_path.setText(
+        str(tmp_path / "gain_power.db")
+    )
+    panel.modulation_power_calibration_run_id.setValue(17)
+    panel.modulation_target_power_dbm.setValue(-37.25)
     panel.plot.magnitude_range_control.set_manual_levels(10.0, 100.0)
     panel.plot.phase_range_control.set_manual_levels(-90.0, 45.0)
     panel.plot.load_visible_data(["i", "q", "magnitude"])
@@ -734,6 +756,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.saved_plot_data.setCurrentIndex(
         panel.saved_plot_data.findData("q")
     )
+    panel.iq_storage_mode.setCurrentIndex(
+        panel.iq_storage_mode.findData(IQ_STORAGE_MEAN_IQ)
+    )
     app.processEvents()
 
     config = panel.config(full_scale_mv=2500.0)
@@ -745,6 +770,9 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert config.settle_time_us == 75.5
     assert config.modulation_frequency_mhz == 12.5
     assert config.modulation_gain == 12345
+    assert config.modulation_power_calibration_enabled is True
+    assert config.modulation_power_calibration_run_id == 17
+    assert config.modulation_target_power_dbm == -37.25
     assert config.bias_t_compensation_enabled is True
     assert config.bias_t_compensation_type == "dc"
     assert config.bias_t_compensation_mode == "fixed_time"
@@ -756,6 +784,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert "segment_name" not in panel.x_axis.settings_dict()
     assert not hasattr(panel, "rf_editor_tabs")
     assert panel.database_path_value() == str(database_path)
+    assert panel.iq_storage_mode_value() == IQ_STORAGE_MEAN_IQ
     assert panel.saved_database_path_value() == str(saved_plot_path)
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
 
@@ -796,8 +825,12 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     }
     assert restored.plot.visible_data() == ("i", "q", "magnitude")
     assert restored.saved_database_path.text() == str(saved_plot_path)
+    assert restored.iq_storage_mode_value() == IQ_STORAGE_MEAN_IQ
     assert restored._preferred_saved_run_id == 29
     assert restored.saved_plot_data.currentData() == "q"
+    assert restored.modulation_power_calibration_group.isChecked() is True
+    assert restored.modulation_power_calibration_run_id.value() == 17
+    assert restored.modulation_target_power_dbm.value() == -37.25
 
     dc_changes = []
     calibration_changes = []
@@ -857,6 +890,118 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.bias_t_group.isEnabled() is True
     panel.close()
     restored.close()
+
+
+def test_stability_modulation_power_calibration_resolves_gain(monkeypatch):
+    app = _application()
+    calls = []
+
+    class FakeCalibration:
+        summary = SimpleNamespace(run_id=73)
+
+        def build_gain_schedule(
+            self,
+            frequencies,
+            target_power_dbm,
+            **kwargs,
+        ):
+            calls.append(("schedule", tuple(frequencies), target_power_dbm, kwargs))
+            return SimpleNamespace(gain_codes=np.asarray([4567], dtype=np.int32))
+
+        def output_power_dbm(self, frequencies, gains, **kwargs):
+            calls.append(("power", tuple(frequencies), tuple(gains), kwargs))
+            return np.asarray([-31.125], dtype=np.float64)
+
+    class FakeCalibrationDatabase:
+        def __init__(self, path):
+            calls.append(("database", str(path)))
+
+        def output_calibration(self, board_type, frequencies, **kwargs):
+            calls.append(("calibration", board_type, tuple(frequencies), kwargs))
+            return FakeCalibration()
+
+    monkeypatch.setattr(stability, "CalibrationDatabase", FakeCalibrationDatabase)
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.apply_path_settings({
+        **stability.DEFAULT_STABILITY_RF_PATH,
+        "output_ch": 2,
+        "output_board_type": "RF_Out",
+        "output_nqz": 2,
+        "output_att1_db": 7.25,
+        "output_att2_db": 4.5,
+        "output_filter_type": "bandpass",
+        "output_filter_cutoff_ghz": 0.45,
+        "output_filter_bandwidth_ghz": 0.1,
+    })
+    panel.modulation_frequency_mhz.setValue(450.0)
+    panel.modulation_power_calibration_path.setText("gain_power.db")
+    panel.modulation_power_calibration_run_id.setValue(0)
+    panel.modulation_target_power_dbm.setValue(-31.0)
+    panel.modulation_power_calibration_group.setChecked(True)
+    app.processEvents()
+
+    assert panel.resolve_modulation_gain(raise_on_error=True) == 4567
+    assert panel.modulation_gain.value() == 4567
+    assert panel._resolved_modulation_power_run_id == 73
+    assert "Run 73" in panel.modulation_power_calibration_status.text()
+    assert "gain 4567" in panel.modulation_power_calibration_status.text()
+    assert calls[1] == (
+        "calibration",
+        "RF_Out",
+        (450.0,),
+        {
+            "run_id": None,
+            "nqz": 2,
+            "output_filter_type": "bandpass",
+            "output_filter_cutoff_ghz": 0.45,
+            "output_filter_bandwidth_ghz": 0.1,
+        },
+    )
+    assert calls[2][3] == {
+        "output_att1_db": 7.25,
+        "output_att2_db": 4.5,
+        "max_entries": 1,
+    }
+
+    panel.modulation_target_power_dbm.setValue(-30.0)
+    app.processEvents()
+    assert panel._resolved_modulation_power_run_id is None
+    assert "Settings changed" in panel.modulation_power_calibration_status.text()
+    panel.close()
+
+
+def test_stability_modulation_power_calibration_reports_lookup_failure(monkeypatch):
+    app = _application()
+
+    class MissingCalibrationDatabase:
+        def __init__(self, path):
+            self.path = path
+
+        def output_calibration(self, *_args, **_kwargs):
+            raise LookupError("no compatible RF_Out calibration run")
+
+    monkeypatch.setattr(
+        stability,
+        "CalibrationDatabase",
+        MissingCalibrationDatabase,
+    )
+    panel = stability.StabilityDiagramPanel()
+    panel.apply_path_settings({
+        **stability.DEFAULT_STABILITY_RF_PATH,
+        "output_board_type": "RF_Out",
+    })
+    panel.modulation_power_calibration_path.setText("missing.db")
+    panel.modulation_power_calibration_group.setChecked(True)
+    app.processEvents()
+
+    with pytest.raises(ValueError, match="no compatible RF_Out calibration run"):
+        panel.resolve_modulation_gain(raise_on_error=True)
+
+    assert "no compatible RF_Out calibration run" in (
+        panel.modulation_power_calibration_status.text()
+    )
+    panel.close()
 
 
 def _stored_stability_metadata():
@@ -1148,6 +1293,7 @@ def test_saved_stability_run_loads_from_real_qcodes_database(
         program_summary={},
         gui_settings=gui_settings,
         rf_settings={},
+        iq_storage_mode=IQ_STORAGE_MEAN_IQ,
     )
 
     summaries = stability.list_stability_runs(database_path)
@@ -1163,3 +1309,5 @@ def test_saved_stability_run_loads_from_real_qcodes_database(
     np.testing.assert_allclose(result.q_mean, [[-20.0, -22.0], [-21.0, -23.0]])
     assert result.source_label == f"QCoDeS Run {dataset.run_id}"
     assert result.sample_rate_hz == 50_000.0
+    assert result.repetition_count == 1
+    assert result.samples_per_trace == 2

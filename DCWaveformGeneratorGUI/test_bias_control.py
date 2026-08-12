@@ -361,7 +361,7 @@ def test_main_window_contains_bias_tab_and_persists_setpoints():
         }
     )
     document = window._settings_to_dict()
-    assert document["version"] == gui.SETTINGS_VERSION == 41
+    assert document["version"] == gui.SETTINGS_VERSION == 43
     assert document["bias"]["selected_channel"] == 3
     assert document["bias"]["voltage_limit_v"] == pytest.approx(10.0)
     assert document["bias"]["ramp_max_step_v"] == pytest.approx(0.001)
