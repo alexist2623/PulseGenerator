@@ -1416,7 +1416,7 @@ def test_swept_negative_plateau_capacity_preview_counts_hold_seed_only():
     )
 
 
-def test_duration_swept_plateau_capacity_preview_does_not_assume_hold():
+def test_duration_swept_plateau_capacity_models_fixed_outer_slice_hold():
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("zero", [0.0], 300)
@@ -1439,8 +1439,11 @@ def test_duration_swept_plateau_capacity_preview_does_not_assume_hold():
         dc_full_scale_v=2.5,
     )
 
-    assert report.exceeds_capacity is True
-    assert report.worst_channel.rendered_fabric_cycles == 36_000
+    assert report.exceeds_capacity is False
+    # The duration is fixed within each Python-loop coordinate, so the
+    # synchronized inner program renders only the ramp and retains its final
+    # value with Hold for either 100 or 110 us plateau duration.
+    assert report.worst_channel.rendered_fabric_cycles == 3_000
 
 
 def test_swept_negative_plateau_preview_reports_planned_hardware_mode():
@@ -2503,6 +2506,376 @@ def test_rf_duration_sweep_uses_one_qcs_managed_software_program():
     )
 
 
+def _mixed_amplitude_rf_duration_sequence():
+    """Two native amplitude points inside three host RF-duration points."""
+
+    return (
+        _sequence()
+        .add_amplitude_sweep("read", "gate", 0.25, 0.50, 2)
+        .add_rf_duration_sweep("read", 3, 0.10, 0.20, 3)
+    )
+
+
+def test_mixed_sweep_runs_native_amplitude_blocks_and_scatters_c_order():
+    sequence = _mixed_amplitude_rf_duration_sequence()
+    partial_results = []
+    measurement_programs = []
+
+    class Executor:
+        def execute(self, program):
+            assert program.name != "PulseGenerator emergency DC reset"
+            block_index = len(measurement_programs)
+            measurement_programs.append(program)
+
+            # Every Python-loop iteration must still be one native QCS
+            # hardware sweep, with sweep outside shots.
+            assert program.repetition_calls == ["sweep", "shots"]
+            assert len(program.sweeps) == 1
+            arrays, variables = program.sweeps[0]
+            assert len(arrays) == len(variables) == 1
+            np.testing.assert_allclose(arrays[0].value, [0.08, 0.16])
+            assert variables[0].name.startswith("awg_dc_0_interval_")
+
+            rf_entry = next(
+                entry
+                for entry in program.waveforms
+                if entry[1].name == "rf_drive"
+            )
+            assert rf_entry[0].kwargs["duration"] == pytest.approx(
+                [100e-9, 150e-9, 200e-9][block_index]
+            )
+            return np.asarray(
+                [
+                    (10 * block_index + 1) + 1j,
+                    (10 * block_index + 2) + 2j,
+                ]
+            )
+
+    result = execute_qcs_sequence(
+        connection_config=_connection(
+            rf_channel_names={3: "rf_drive"},
+        ),
+        sequence=sequence,
+        repetitions_per_sweep=1,
+        rf_pulses=(
+            QcsRfPulseConfig(
+                gen_ch=3,
+                at_segment="read",
+                duration_s=100e-9,
+                amplitude=0.2,
+                frequency_hz=50e6,
+            ),
+        ),
+        acquisition=_acquisition(),
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_gate", "rf_drive", "digitizer"),
+        executor=Executor(),
+        partial_callback=partial_results.append,
+    )
+
+    assert len(measurement_programs) == 3
+    assert len(result.programs) == 3
+    assert len(result.raw_results) == 3
+    assert result.program_summary["hardware_sweep"] is True
+    assert result.program_summary["sweep_execution_mode"] == (
+        "hybrid_hardware_software"
+    )
+    assert result.program_summary["hardware_sweep_axis_indices"] == [0]
+    assert result.program_summary["software_sweep_axis_indices"] == [1]
+    assert result.program_summary["hardware_points_per_iteration"] == 2
+    assert result.program_summary["software_iteration_count"] == 3
+    assert result.program_summary["completed_software_iterations"] == 3
+    assert result.program_summary["executor_call_count"] == 3
+
+    # The executor returns blocks in software-duration order. The public
+    # result must scatter those blocks back to the original (amplitude,
+    # duration) C-order coordinates instead of concatenating them.
+    np.testing.assert_allclose(
+        result.ddr_result.sweep_points,
+        [
+            [0.25, 0.10],
+            [0.25, 0.15],
+            [0.25, 0.20],
+            [0.50, 0.10],
+            [0.50, 0.15],
+            [0.50, 0.20],
+        ],
+    )
+    np.testing.assert_allclose(
+        result.ddr_result.iq[:, 0, 0],
+        [
+            [1.0, 1.0],
+            [11.0, 1.0],
+            [21.0, 1.0],
+            [2.0, 2.0],
+            [12.0, 2.0],
+            [22.0, 2.0],
+        ],
+    )
+
+    # A callback is emitted only after a complete native block. Each
+    # snapshot contains finite acquired rows in global C order, never NaN
+    # placeholders for points that have not run yet.
+    assert len(partial_results) == 3
+    assert [
+        item.program_summary["completed_points"]
+        for item in partial_results
+    ] == [2, 4, 6]
+    assert all(
+        item.program_summary["planned_points"] == 6
+        for item in partial_results
+    )
+    assert [
+        item.program_summary["completed_software_iterations"]
+        for item in partial_results
+    ] == [1, 2, 3]
+    np.testing.assert_allclose(
+        partial_results[1].ddr_result.sweep_points,
+        [
+            [0.25, 0.10],
+            [0.25, 0.15],
+            [0.50, 0.10],
+            [0.50, 0.15],
+        ],
+    )
+    assert np.isfinite(partial_results[1].ddr_result.iq).all()
+
+
+def test_mixed_sweep_stop_between_blocks_retains_completed_partial_result():
+    sequence = _mixed_amplitude_rf_duration_sequence()
+    controller = backend.QcsCancellationController(
+        program_name_tag="mixed-stop"
+    )
+    partial_results = []
+    measurement_programs = []
+    reset_programs = []
+
+    class Executor:
+        def execute(self, program):
+            if program.name == "PulseGenerator emergency DC reset":
+                reset_programs.append(program)
+                return None
+            measurement_programs.append(program)
+            return np.asarray([1.0 + 10.0j, 2.0 + 20.0j])
+
+    def stop_after_first_complete_block(partial_result):
+        partial_results.append(partial_result)
+        assert partial_result.program_summary["completed_points"] == 2
+        controller.request_stop()
+
+    with pytest.raises(
+        backend.QcsExperimentCancelled,
+        match="stopped by user",
+    ) as caught:
+        execute_qcs_sequence(
+            connection_config=_connection(
+                rf_channel_names={3: "rf_drive"},
+            ),
+            sequence=sequence,
+            repetitions_per_sweep=1,
+            rf_pulses=(
+                QcsRfPulseConfig(
+                    gen_ch=3,
+                    at_segment="read",
+                    duration_s=100e-9,
+                    amplitude=0.2,
+                    frequency_hz=50e6,
+                ),
+            ),
+            acquisition=_acquisition(),
+            qcs_module=_FakeQcs,
+            mapper=_Mapper("dc_gate", "rf_drive", "digitizer"),
+            executor=Executor(),
+            cancellation=controller,
+            partial_callback=stop_after_first_complete_block,
+        )
+
+    assert len(measurement_programs) == 1
+    assert len(reset_programs) == 1
+    assert len(partial_results) == 1
+    partial = caught.value.partial_result
+    assert partial is partial_results[0]
+    assert partial.program_summary["partial"] is True
+    assert partial.program_summary["completed_points"] == 2
+    assert partial.program_summary["planned_points"] == 6
+    assert partial.program_summary["completed_software_iterations"] == 1
+    assert partial.program_summary["executor_call_count"] == 1
+    assert len(partial.programs) == 1
+    assert len(partial.raw_results) == 1
+    np.testing.assert_allclose(
+        partial.ddr_result.sweep_points,
+        [[0.25, 0.10], [0.50, 0.10]],
+    )
+    np.testing.assert_allclose(
+        partial.ddr_result.iq[:, 0, 0],
+        [[1.0, 10.0], [2.0, 20.0]],
+    )
+    assert np.isfinite(partial.ddr_result.iq).all()
+
+
+def test_mixed_stop_after_completed_executor_return_retains_that_block():
+    sequence = _mixed_amplitude_rf_duration_sequence()
+    controller = backend.QcsCancellationController(
+        program_name_tag="mixed-return-race"
+    )
+    measurement_programs = []
+    reset_programs = []
+
+    class Executor:
+        def execute(self, program):
+            if program.name == "PulseGenerator emergency DC reset":
+                reset_programs.append(program)
+                return None
+            measurement_programs.append(program)
+            controller.request_stop()
+            return np.asarray([1.0 + 10.0j, 2.0 + 20.0j])
+
+    with pytest.raises(
+        backend.QcsExperimentCancelled,
+        match="stopped by user",
+    ) as caught:
+        execute_qcs_sequence(
+            connection_config=_connection(
+                rf_channel_names={3: "rf_drive"},
+            ),
+            sequence=sequence,
+            repetitions_per_sweep=1,
+            rf_pulses=(
+                QcsRfPulseConfig(
+                    gen_ch=3,
+                    at_segment="read",
+                    duration_s=100e-9,
+                    amplitude=0.2,
+                    frequency_hz=50e6,
+                ),
+            ),
+            acquisition=_acquisition(),
+            qcs_module=_FakeQcs,
+            mapper=_Mapper("dc_gate", "rf_drive", "digitizer"),
+            executor=Executor(),
+            cancellation=controller,
+        )
+
+    assert len(measurement_programs) == 1
+    assert len(reset_programs) == 1
+    partial = caught.value.partial_result
+    assert partial is not None
+    assert partial.program_summary["completed_points"] == 2
+    assert partial.program_summary["completed_software_iterations"] == 1
+    np.testing.assert_allclose(
+        partial.ddr_result.sweep_points,
+        [[0.25, 0.10], [0.50, 0.10]],
+    )
+    np.testing.assert_allclose(
+        partial.ddr_result.iq[:, 0, 0],
+        [[1.0, 10.0], [2.0, 20.0]],
+    )
+
+
+def test_long_hold_hybrid_validates_per_inner_slice_and_executes():
+    sequence = _swept_negative_plateau_sequence().add_hold_duration_sweep(
+        "swept_negative",
+        100.0,
+        110.0,
+        3,
+        sequence_fabric_mhz=300.0,
+    )
+    connection = _connection(dc_full_scale_v=2.5)
+    mapper = _PhysicalMapper("dc_gate", "digitizer")
+    preview = backend.qcs_sweep_execution_preview(
+        sequence,
+        hardware_demodulation=True,
+        source_full_scale_mv=800.0,
+        dc_full_scale_v=2.5,
+    )
+    assert preview.mode == "hybrid"
+
+    measurement_programs = []
+    reset_programs = []
+
+    class Executor:
+        def execute(self, program):
+            if program.name == "PulseGenerator emergency DC reset":
+                reset_programs.append(program)
+                return None
+            measurement_programs.append(program)
+            return np.arange(5, dtype=float) + 1.0j
+
+    result = execute_qcs_sequence(
+        connection_config=connection,
+        sequence=sequence,
+        repetitions_per_sweep=1,
+        source_full_scale_mv=800.0,
+        acquisition=_acquisition(at_segment="swept_negative"),
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=Executor(),
+    )
+
+    assert result.program_summary["sweep_execution_mode"] == (
+        "hybrid_hardware_software"
+    )
+    assert result.program_summary["hardware_points_per_iteration"] == 5
+    assert result.program_summary["software_iteration_count"] == 3
+    assert result.program_summary["completed_points"] == 15
+    assert len(measurement_programs) == 3
+    assert len(reset_programs) == 3
+    np.testing.assert_allclose(
+        result.program_summary["dc_channel_offsets_v_by_iteration"],
+        [[0.1], [0.1], [0.1]],
+    )
+    assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
+
+
+def test_mixed_capacity_preflights_every_outer_slice_before_hardware():
+    sequence = (
+        FineTuneSequence(("gate",))
+        .add_set("zero", [0.0], 300)
+        .add_ramp("ramp", 3_000)
+        .add_set("read", [0.125], 300)
+        .add_amplitude_sweep("read", "gate", 0.125, 0.25, 2)
+        .add_ramp_duration_sweep(
+            "ramp",
+            10.0,
+            50.0,
+            2,
+            sequence_fabric_mhz=300.0,
+        )
+    )
+    preview = backend.qcs_sweep_execution_preview(
+        sequence,
+        hardware_demodulation=True,
+        source_full_scale_mv=800.0,
+        dc_full_scale_v=2.5,
+    )
+    assert preview.mode == "hybrid"
+    measurement_programs = []
+
+    class Executor:
+        def execute(self, program):
+            measurement_programs.append(program)
+            return np.asarray([1.0 + 1.0j, 2.0 + 2.0j])
+
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match=r"120,000 / 98,304 samples",
+    ):
+        execute_qcs_sequence(
+            connection_config=_connection(dc_full_scale_v=2.5),
+            sequence=sequence,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=_acquisition(at_segment="read"),
+            qcs_module=_FakeQcs,
+            mapper=_PhysicalMapper("dc_gate", "digitizer"),
+            executor=Executor(),
+        )
+
+    # The legal 10 us slice must not run before the invalid 50 us slice is
+    # discovered. Mixed capacity validation is an all-slices preflight.
+    assert measurement_programs == []
+
+
 def test_same_rf_channel_uses_relative_gap_after_previous_pulse():
     sequence = (
         FineTuneSequence(("gate",))
@@ -2631,7 +3004,7 @@ def test_overlapping_pulses_on_one_rf_channel_are_rejected():
         )
 
 
-def test_hardware_array_count_budget_falls_back_to_one_software_program():
+def test_hardware_array_count_budget_partitions_into_mixed_sweep():
     sequence = FineTuneSequence(("gate",))
     for index in range(9):
         sequence.add_set(f"set_{index}", [0.0], 30)
@@ -2645,12 +3018,12 @@ def test_hardware_array_count_budget_falls_back_to_one_software_program():
     class Executor:
         def execute(self, program):
             calls["execute"] += 1
-            assert program.repetition_calls == ["shots", "sweep"]
+            assert program.repetition_calls == ["sweep", "shots"]
             assert len(program.sweeps) == 1
             arrays, variables = program.sweeps[0]
-            assert len(arrays) == len(variables) == 9
-            assert all(array.value.shape == (point_count,) for array in arrays)
-            return np.zeros((point_count, 2), dtype=complex)
+            assert len(arrays) == len(variables) == 8
+            assert all(array.value.shape == (256,) for array in arrays)
+            return np.zeros((2, 256), dtype=complex)
 
     result = execute_qcs_sequence(
         connection_config=_connection(),
@@ -2662,17 +3035,64 @@ def test_hardware_array_count_budget_falls_back_to_one_software_program():
         executor=Executor(),
     )
 
-    assert calls["execute"] == 1
+    assert calls["execute"] == 2
     assert point_count == 512
-    assert result.program_summary["hardware_sweep"] is False
+    assert result.program_summary["hardware_sweep"] is True
+    assert result.program_summary["sweep_execution_mode"] == (
+        "hybrid_hardware_software"
+    )
+    hardware_axes = set(result.program_summary["hardware_sweep_axis_indices"])
+    software_axes = set(result.program_summary["software_sweep_axis_indices"])
+    assert len(hardware_axes) == 8
+    assert len(software_axes) == 1
+    assert hardware_axes.isdisjoint(software_axes)
+    assert hardware_axes | software_axes == set(range(9))
+    assert result.program_summary["hardware_points_per_iteration"] == 256
+    assert result.program_summary["software_iteration_count"] == 2
+    assert result.program_summary["program_count"] == 2
+    assert result.program_summary["executor_call_count"] == 2
+    assert result.ddr_result.iq.shape == (point_count, 2, 1, 2)
+
+
+def test_fully_native_two_axis_sweep_stays_one_hardware_program():
+    sequence = (
+        FineTuneSequence(("gate_a", "gate_b"))
+        .add_set("read", [0.0, 0.0], 300)
+        .add_amplitude_sweep("read", "gate_a", 0.0, 0.01, 3)
+        .add_amplitude_sweep("read", "gate_b", 0.0, 0.02, 4)
+    )
+    calls = []
+    events = []
+
+    class Executor:
+        def execute(self, program):
+            calls.append(program)
+            assert program.repetition_calls == ["sweep", "shots"]
+            return np.zeros((2, 12), dtype=complex)
+
+    result = execute_qcs_sequence(
+        connection_config=_connection(
+            dc_channel_names=("dc_gate_a", "dc_gate_b")
+        ),
+        sequence=sequence,
+        repetitions_per_sweep=2,
+        acquisition=_acquisition(),
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_gate_a", "dc_gate_b", "digitizer"),
+        executor=Executor(),
+        event_callback=lambda *event: events.append(event),
+    )
+
+    assert len(calls) == 1
+    assert result.program_summary["sweep_execution_mode"] == "hardware_flattened"
     assert result.program_summary["program_count"] == 1
     assert result.program_summary["executor_call_count"] == 1
-    assert any(
-        "uses 9 swept arrays" in reason
-        and "supports at most 8" in reason
-        for reason in result.program_summary["software_sweep_reasons"]
-    )
-    assert result.ddr_result.iq.shape == (point_count, 2, 1, 2)
+    assert result.ddr_result.iq.shape == (12, 2, 1, 2)
+    assert (
+        "sweep_partition",
+        "completed",
+        "Full sweep confirmed native; no software loop needed",
+    ) in events
 
 
 def test_raw_trace_sweep_uses_one_program_and_preserves_samples():
@@ -3539,6 +3959,121 @@ def test_qcs_run_rejects_coherent_average_trace_before_execution(
             iq_repetition_policy="coherent_average",
             acquisition=_acquisition(),
         )
+
+
+def test_stopped_mixed_run_persists_partial_and_preserves_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    partial = backend.QcsExecutionResult(
+        ddr_result=backend.FineTuneDdrResult(
+            sweep_points=np.asarray([[0.1, 0.2], [0.3, 0.2]]),
+            iq=np.ones((2, 1, 1, 2)),
+            sweep_axes=tuple(
+                _mixed_amplitude_rf_duration_sequence().sweep_axes
+            ),
+            sweep_shape=(2,),
+            sample_rate_hz=backend.QCS_M5200_SAMPLE_RATE_HZ,
+            fir_rate_profile="qcs_hardware_demod",
+        ),
+        programs=("program",),
+        raw_results=("raw",),
+        program_summary={
+            "backend": "qcs",
+            "partial": True,
+            "completed_points": 2,
+            "planned_points": 6,
+        },
+        rf_settings={
+            "backend": "qcs",
+            "readout_details": {"hw_demod": True},
+        },
+    )
+
+    def cancelled_execute(**kwargs):
+        kwargs["partial_callback"](partial)
+        raise backend.QcsExperimentCancelled(
+            "stopped for test",
+            partial_result=partial,
+        )
+
+    monkeypatch.setattr(backend, "execute_qcs_sequence", cancelled_execute)
+    captured = {}
+
+    class Dataset:
+        run_id = 29
+        guid = "stopped-guid"
+
+    def fake_store(result, **kwargs):
+        captured["result"] = result
+        captured.update(kwargs)
+        return Dataset(), 2
+
+    monkeypatch.setattr(backend, "store_experiment_result", fake_store)
+    emitted = []
+    with pytest.raises(backend.QcsExperimentCancelled) as caught:
+        backend.run_qcs_qcodes_experiment(
+            connection_config=_connection(),
+            run_config=QcodesRunConfig(str(tmp_path / "stopped.db")),
+            sequence=_mixed_amplitude_rf_duration_sequence(),
+            repetitions_per_sweep=1,
+            acquisition=_acquisition(),
+            partial_callback=emitted.append,
+        )
+
+    stored = caught.value.stored_result
+    assert stored is not None
+    assert stored.run_id == 29
+    assert stored.ddr_result is partial.ddr_result
+    assert stored.program_summary["execution_status"] == "stopped"
+    assert captured["program_summary"]["completed_points"] == 2
+    assert emitted == [partial, stored]
+
+
+def test_stopped_mixed_run_keeps_cancellation_when_partial_save_fails(
+    monkeypatch,
+    tmp_path,
+):
+    partial = backend.QcsExecutionResult(
+        ddr_result=backend.FineTuneDdrResult(
+            sweep_points=np.asarray([0.1]),
+            iq=np.ones((1, 1, 1, 2)),
+            sample_rate_hz=backend.QCS_M5200_SAMPLE_RATE_HZ,
+        ),
+        programs=("program",),
+        raw_results=("raw",),
+        program_summary={"completed_points": 1, "planned_points": 2},
+        rf_settings={"backend": "qcs", "readout_details": {"hw_demod": True}},
+    )
+
+    def cancelled_execute(**_kwargs):
+        raise backend.QcsExperimentCancelled(
+            "stopped for test",
+            partial_result=partial,
+        )
+
+    monkeypatch.setattr(backend, "execute_qcs_sequence", cancelled_execute)
+    monkeypatch.setattr(
+        backend,
+        "store_experiment_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    events = []
+    with pytest.raises(backend.QcsExperimentCancelled) as caught:
+        backend.run_qcs_qcodes_experiment(
+            connection_config=_connection(),
+            run_config=QcodesRunConfig(str(tmp_path / "stopped.db")),
+            sequence=_sequence(),
+            repetitions_per_sweep=1,
+            acquisition=_acquisition(),
+            event_callback=lambda *args: events.append(args),
+        )
+
+    assert caught.value.stored_result is None
+    assert any(
+        key == "qcodes_save" and state == "failed" and "disk full" in message
+        for key, state, message in events
+    )
 
 
 def test_full_qcs_adapter_writes_real_qcodes_database(monkeypatch, tmp_path):

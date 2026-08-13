@@ -2487,6 +2487,28 @@ def test_qcs_sweep_execution_indicator_shows_mode_and_fallback_reason():
     assert "Raw trace" in panel.qcs_sweep_execution_indicator.toolTip()
     assert "#8a4b00" in panel.qcs_sweep_execution_indicator.styleSheet()
 
+    panel.set_qcs_sweep_execution_status(
+        gui.QcsSweepExecutionPreview(
+            mode="hybrid",
+            reasons=(
+                "Voltage is swept in hardware inside an RF-duration "
+                "software loop.",
+            ),
+        )
+    )
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Hardware sweep inside software loop"
+    )
+    assert "RF-duration software loop" in (
+        panel.qcs_sweep_execution_reason_label.text()
+    )
+    assert "RF-duration software loop" in (
+        panel.qcs_sweep_execution_indicator.toolTip()
+    )
+    assert "#8a4b00" not in (
+        panel.qcs_sweep_execution_indicator.styleSheet()
+    )
+
     panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
     assert panel.qcs_sweep_execution_indicator.isHidden() is True
     panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
@@ -2527,7 +2549,10 @@ def test_qcs_sweep_execution_indicator_tracks_live_voltage_sweep_and_trace_mode(
     app.processEvents()
 
 
-def test_qcs_two_output_fixed_voltage_bias_t_preview_is_m5301_safe(tmp_path):
+def test_qcs_two_output_fixed_voltage_bias_t_preview_is_m5301_safe(
+    monkeypatch,
+    tmp_path,
+):
     app = _application()
     window = gui.MainWindow()
     pulses = []
@@ -2557,17 +2582,30 @@ def test_qcs_two_output_fixed_voltage_bias_t_preview_is_m5301_safe(tmp_path):
     )
     panel.bias_t_compensation_mv.setValue(80.0)
 
+    capacity_calls = []
+    real_capacity_report = gui.qcs_m5301_waveform_capacity_report
+
+    def recording_capacity_report(sequence, **kwargs):
+        capacity_calls.append(kwargs)
+        return real_capacity_report(sequence, **kwargs)
+
+    monkeypatch.setattr(
+        gui,
+        "qcs_m5301_waveform_capacity_report",
+        recording_capacity_report,
+    )
+
     window._refresh_sweep_overlay()
     app.processEvents()
 
     assert panel.qcs_sweep_execution_mode_label.text().endswith(
-        "Software sweep"
+        "Hardware sweep inside software loop"
     )
-    assert panel.qcs_waveform_usage_progress.value() == 72_032
-    assert "72,032 / 98,304 samples" in (
+    assert "Per-slice capacity preflight at Run" in (
         panel.qcs_waveform_usage_progress.format()
     )
-    assert "Invalid" not in panel.qcs_waveform_usage_progress.format()
+    assert "Hybrid sweep" in panel.qcs_waveform_usage_summary.text()
+    assert capacity_calls == []
 
     mapper_path = tmp_path / "bias_t_mapper.qcs"
     mapper_path.write_text("{}", encoding="utf-8")
@@ -2575,7 +2613,24 @@ def test_qcs_two_output_fixed_voltage_bias_t_preview_is_m5301_safe(tmp_path):
     panel.qcs_dc_channel_names.setText("dc_0, dc_1")
     panel.qcs_acquisition_channel_name.setText("digitizer")
     window._rf_readout_panel.setChecked(True)
+
+    validation_calls = []
+    real_validate = gui.validate_qcs_m5301_waveform_capacity
+
+    def recording_validate(sequence, **kwargs):
+        validation_calls.append(kwargs)
+        return real_validate(sequence, **kwargs)
+
+    monkeypatch.setattr(
+        gui,
+        "validate_qcs_m5301_waveform_capacity",
+        recording_validate,
+    )
     arguments = window._qcs_experiment_run_arguments()
+    assert validation_calls == []
+    assert "Per-slice capacity preflight at Run" in (
+        panel.qcs_waveform_usage_progress.format()
+    )
     assert arguments["sequence"].bias_t_compensation.mode == "fixed_voltage"
     assert arguments["sequence"].sweep_shape == (3, 3)
 
@@ -2623,6 +2678,62 @@ def test_qcs_sweep_indicator_accepts_two_output_101_by_101_hardware_grid():
     assert panel.qcs_sweep_execution_mode_label.text().endswith(
         "Software sweep"
     )
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_run_preflight_samples_large_sweep_capacity(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    pulses = []
+    for initial_mv, final_mv in ((-100.0, -100.0), (-100.0, -75.0)):
+        pulse = PulseSequence(initial_mv, initial_duration_ns=10_000.0)
+        pulse.add_flat_ramp(10_000.0, 400.0, 100.0)
+        pulse.add_flat_ramp(10_000.0, 100_000.0, final_mv)
+        pulses.append(pulse)
+    window._pulse[0] = pulses[0]
+    window._plot._pulses[0] = pulses[0]
+    window._add_port()
+    window._pulse[1].v = pulses[1].v.copy()
+    window._pulse[1].segment_names = list(pulses[1].segment_names)
+    window._cross_capacitance = np.eye(2)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.125, -0.3125, 101),
+        QickSweepSpec("set_2", "awg_1", -0.09375, -0.375, 101),
+    ]
+
+    panel = window._experiment_panel
+    mapper_path = tmp_path / "large_sweep_mapper.qcs"
+    mapper_path.write_text("{}", encoding="utf-8")
+    panel.qcs_mapper_path.setText(str(mapper_path))
+    panel.qcs_dc_channel_names.setText("dc_0, dc_1")
+    panel.qcs_acquisition_channel_name.setText("digitizer")
+    window._rf_readout_panel.setChecked(True)
+
+    calls = []
+    real_validate = gui.validate_qcs_m5301_waveform_capacity
+
+    def recording_validate(sequence, **kwargs):
+        calls.append(kwargs.get("point_indices"))
+        return real_validate(sequence, **kwargs)
+
+    monkeypatch.setattr(
+        gui,
+        "validate_qcs_m5301_waveform_capacity",
+        recording_validate,
+    )
+
+    arguments = window._qcs_experiment_run_arguments()
+
+    assert arguments["sequence"].sweep_point_count == 101 * 101
+    assert calls == [
+        gui.qcs_m5301_capacity_preview_point_indices(arguments["sequence"])
+    ]
+    assert 0 < len(calls[0]) < arguments["sequence"].sweep_point_count
 
     window.close()
     app.processEvents()
@@ -3040,6 +3151,40 @@ def test_qcs_experiment_worker_forwards_progress_and_events(monkeypatch):
     assert events == [
         ("execution", "started", "Keysight executor started")
     ]
+
+
+def test_qcs_experiment_worker_forwards_partial_results(monkeypatch):
+    app = _application()
+    partials_sent = [object(), object()]
+    final_result = object()
+    received = {}
+
+    def fake_run_qcs_qcodes_experiment(**kwargs):
+        received.update(kwargs)
+        for partial in partials_sent:
+            kwargs["partial_callback"](partial)
+        return final_result
+
+    monkeypatch.setattr(
+        gui,
+        "run_qcs_qcodes_experiment",
+        fake_run_qcs_qcodes_experiment,
+    )
+    partials_received = []
+    results = []
+    failures = []
+    worker = gui.QcsExperimentWorker({"sequence": object()})
+    worker.partial_result.connect(partials_received.append)
+    worker.finished.connect(results.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+    app.processEvents()
+
+    assert failures == []
+    assert partials_received == partials_sent
+    assert results == [final_result]
+    assert callable(received["partial_callback"])
 
 
 def test_qcs_experiment_worker_reports_user_stop_without_failure(monkeypatch):

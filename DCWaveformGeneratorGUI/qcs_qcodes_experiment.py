@@ -4,11 +4,14 @@ The existing waveform editor and sweep model are vendor-neutral.  This module
 translates a complete :class:`FineTuneSequence` Cartesian sweep into QCS
 ``Program`` objects. Physical waveform parameters are precomputed in C order.
 Ordinary sweeps are paired in one ``program.sweep(...)`` call, following the
-QSTL QCS examples; QCS-supported parameters run in an instrument-side hardware
-sweep and other parameters use a single-program software sweep. Eligible
-common-baseline M5301 ramps use one fixed physical offset plus hardware-swept
-residual amplitudes. Incompatible ramps use fixed numeric per-point programs,
-avoiding a measured QCS 2.5.5 waveform-addition failure.
+QSTL QCS examples. QCS-supported parameters run in an instrument-side hardware
+sweep. When only part of a Cartesian grid is hardware-compatible, those axes
+remain in a native inner sweep while Python iterates the unsupported outer
+coordinates, exposing every completed block for live plotting and Stop-safe
+retention. Other unsupported configurations use a QCS-managed software sweep.
+Eligible common-baseline M5301 ramps use one fixed physical offset plus
+hardware-swept residual amplitudes. Incompatible ramps use fixed numeric
+per-point programs, avoiding a measured QCS 2.5.5 waveform-addition failure.
 
 Stability Diagram retains its specialized two-axis compiler because it also
 implements dedicated Bias-T compensation and scan-budget validation.
@@ -19,6 +22,7 @@ environments where the proprietary Keysight package is not installed.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass, field, replace
 import hashlib
 from itertools import product
@@ -85,6 +89,7 @@ except ImportError:
 
 ProgressCallback = Callable[[int, str], None]
 EventCallback = Callable[[str, str, str], None]
+PartialResultCallback = Callable[[Any], None]
 MAX_QCS_SOFTWARE_SWEEP_POINTS = 10_000
 MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES = 24_576
 MAX_QCS_HARDWARE_SWEEP_ARRAYS_PER_CHANNEL = 8
@@ -155,7 +160,25 @@ def _validate_qcs_software_sweep_point_count(point_count: int) -> None:
 
 
 class QcsExperimentCancelled(RuntimeError):
-    """Raised after a user-requested QCS stop reaches a safe boundary."""
+    """Raised after a user-requested QCS stop reaches a safe boundary.
+
+    ``partial_result`` contains every fully acquired mixed-sweep block.  An
+    active inner program is atomic: when it is aborted, only that incomplete
+    block is discarded. ``stored_result`` is populated by the QCoDeS wrapper
+    when at least one completed block can be persisted before returning Stop
+    to the GUI.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_result: Optional[Any] = None,
+        stored_result: Optional[Any] = None,
+    ) -> None:
+        super().__init__(str(message))
+        self.partial_result = partial_result
+        self.stored_result = stored_result
 
 
 class QcsCancellationController:
@@ -686,10 +709,11 @@ class QcsM5301CapacityReport:
 class QcsSweepExecutionPreview:
     """Host-side prediction shown by the GUI before QCS compilation.
 
-    ``mode`` is ``none``, ``hardware``, ``software``, or ``invalid``.  Mapper
-    properties such as ``absolute_phase`` and physical-offset availability are
-    confirmed when the real Program is compiled, so live GUI predictions use
-    ``exact=False`` and the completed compiler/result may promote the state.
+    ``mode`` is ``none``, ``hardware``, ``hybrid``, ``software``, or
+    ``invalid``. Mapper properties such as ``absolute_phase`` and
+    physical-offset availability are confirmed when the real Program is
+    compiled, so live GUI predictions use ``exact=False`` and the completed
+    compiler/result may refine the state.
     """
 
     mode: str
@@ -729,6 +753,27 @@ class QcsCompiledHardwareSweep:
     bias_t_compensation_peak_amplitudes: Tuple[float, ...] = ()
     dc_channel_offsets_v: Tuple[float, ...] = ()
     dc_offset_init_compensation_v: Tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class QcsMixedSweepPlan:
+    """A Python outer loop whose every item is one native hardware sweep."""
+
+    hardware_axis_indices: Tuple[int, ...]
+    software_axis_indices: Tuple[int, ...]
+    hardware_shape: Tuple[int, ...]
+    software_shape: Tuple[int, ...]
+    first_compiled: QcsCompiledHardwareSweep
+    planning_reasons: Tuple[str, ...] = ()
+    planning_wall_s: float = 0.0
+
+    @property
+    def hardware_points_per_iteration(self) -> int:
+        return int(np.prod(self.hardware_shape, dtype=np.int64))
+
+    @property
+    def software_iteration_count(self) -> int:
+        return int(np.prod(self.software_shape, dtype=np.int64))
 
 
 @dataclass(frozen=True)
@@ -1914,11 +1959,6 @@ def qcs_m5301_waveform_capacity_report(
         )
         if offset_plan is not None:
             fixed_source_offsets = offset_plan.source_offsets
-    dc_timing_is_fixed = not any(
-        str(getattr(axis, "axis_kind", ""))
-        in {"ramp_duration", "hold_duration", "rf_duration"}
-        for axis in sequence.sweep_axes
-    )
     worst_cycles = [0] * len(output_names)
     worst_points = [inspected[0]] * len(output_names)
     worst_coordinates = [tuple(sequence.sweep_coordinate(inspected[0]))] * len(
@@ -1976,8 +2016,7 @@ def qcs_m5301_waveform_capacity_report(
                 allow_continuous_ramp_holds=bool(
                     fixed_voltage_bias_t
                     or (
-                        dc_timing_is_fixed
-                        and auto_fixed_dc_offsets
+                        auto_fixed_dc_offsets
                         and offset_plan is not None
                     )
                 ),
@@ -3051,6 +3090,12 @@ def _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence: Any) -> bool:
     ):
         return False
     for axis in sequence.sweep_axes:
+        # Mixed execution fixes every Python-loop axis at one authoritative
+        # coordinate while preserving it in the sequence. Such a singleton
+        # axis cannot vary the compensation tail inside its native inner
+        # hardware sweep.
+        if int(getattr(axis, "count", 1)) <= 1:
+            continue
         axis_kind = str(getattr(axis, "axis_kind", ""))
         if axis_kind in {"amplitude", "ramp_duration", "hold_duration"}:
             return True
@@ -3060,6 +3105,122 @@ def _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence: Any) -> bool:
         ):
             return True
     return False
+
+
+def _qcs_sequence_slice(
+    sequence: Any,
+    fixed_axis_coordinates: Mapping[int, int],
+) -> Any:
+    """Return a structural sequence clone with selected axes fixed.
+
+    Axes stay in their original positions with ``count=1``. FineTuneSequence
+    waveform, duration, RF, Bias-T, and cross-capacitance calculations all
+    depend on those positional coordinates, so deleting fixed axes would
+    silently change pulse semantics. A shallow clone avoids duplicating a
+    potentially large Cartesian-coordinate cache.
+    """
+
+    axes = list(sequence.sweep_axes)
+    fixed = {int(key): int(value) for key, value in fixed_axis_coordinates.items()}
+    for axis_index, coordinate_index in fixed.items():
+        if axis_index < 0 or axis_index >= len(axes):
+            raise IndexError("QCS mixed-sweep axis index is out of range")
+        axis = axes[axis_index]
+        points = tuple(axis.points)
+        if coordinate_index < 0 or coordinate_index >= len(points):
+            raise IndexError("QCS mixed-sweep coordinate index is out of range")
+        if not all(hasattr(axis, name) for name in ("start", "stop", "count")):
+            raise TypeError(
+                "QCS mixed sweep cannot fix unsupported axis type "
+                f"{type(axis).__name__}"
+            )
+        value = float(points[coordinate_index])
+        axes[axis_index] = replace(
+            axis,
+            start=value,
+            stop=value,
+            count=1,
+        )
+    sliced = copy(sequence)
+    sliced.sweeps = axes
+    sliced.segments = list(sequence.segments)
+    sliced.cross_capacitance = np.asarray(
+        sequence.cross_capacitance,
+        dtype=float,
+    ).copy()
+    sliced._sweep_coordinate_cache = None
+    return sliced
+
+
+def _qcs_slice_global_indices(
+    original_shape: Sequence[int],
+    fixed_axis_coordinates: Mapping[int, int],
+) -> np.ndarray:
+    """Map one sequence slice's local C-order points to global C order."""
+
+    shape = tuple(int(value) for value in original_shape)
+    if not shape or any(value < 1 for value in shape):
+        raise ValueError("QCS mixed-sweep shape must contain positive axes")
+    fixed = {int(key): int(value) for key, value in fixed_axis_coordinates.items()}
+    for axis_index, coordinate_index in fixed.items():
+        if axis_index < 0 or axis_index >= len(shape):
+            raise IndexError("QCS mixed-sweep axis index is out of range")
+        if coordinate_index < 0 or coordinate_index >= shape[axis_index]:
+            raise IndexError("QCS mixed-sweep coordinate index is out of range")
+    slice_shape = tuple(
+        1 if axis_index in fixed else axis_count
+        for axis_index, axis_count in enumerate(shape)
+    )
+    result = np.empty(int(np.prod(slice_shape, dtype=np.int64)), dtype=np.int64)
+    for local_index in range(result.size):
+        coordinate = list(np.unravel_index(local_index, slice_shape, order="C"))
+        for axis_index, coordinate_index in fixed.items():
+            coordinate[axis_index] = coordinate_index
+        result[local_index] = np.ravel_multi_index(
+            tuple(coordinate),
+            shape,
+            order="C",
+        )
+    return result
+
+
+def _qcs_mixed_candidate_hardware_axes(sequence: Any) -> Tuple[int, ...]:
+    """Return axes that can plausibly remain in native QCS hardware time."""
+
+    candidates = []
+    for axis_index, axis in enumerate(sequence.sweep_axes):
+        if int(getattr(axis, "count", 1)) <= 1:
+            continue
+        axis_kind = str(getattr(axis, "axis_kind", ""))
+        # Amplitude and RF frequency are direct hardware Scalars. A SET hold
+        # duration can also be native when it renders as a legal zero Delay;
+        # the real compiler below is authoritative for that conditional case.
+        if axis_kind in {"amplitude", "rf_frequency", "hold_duration"}:
+            candidates.append(axis_index)
+    return tuple(candidates)
+
+
+def _qcs_software_coordinates(
+    shape: Sequence[int],
+    software_axis_indices: Sequence[int],
+):
+    software_axes = tuple(int(value) for value in software_axis_indices)
+    software_shape = tuple(int(shape[index]) for index in software_axes)
+    for coordinate in product(*(range(count) for count in software_shape)):
+        yield dict(zip(software_axes, coordinate))
+
+
+def _qcs_point_rf_pulses(
+    sequence: Any,
+    rf_pulses: Sequence[QcsRfPulseConfig],
+    point_index: int,
+) -> Tuple[QcsRfPulseConfig, ...]:
+    """Bake all fixed outer RF coordinates into one mixed-sweep block."""
+
+    return tuple(
+        _point_rf_pulse(sequence, pulse, point_index)
+        for pulse in rf_pulses
+    )
 
 
 def qcs_sweep_execution_preview(
@@ -3091,7 +3252,36 @@ def qcs_sweep_execution_preview(
                 "the QCS backend.",
             ),
         )
-    if _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence):
+
+    candidate_hardware_axes = _qcs_mixed_candidate_hardware_axes(sequence)
+    candidate_hardware_points = int(
+        np.prod(
+            [sequence.sweep_shape[index] for index in candidate_hardware_axes],
+            dtype=np.int64,
+        )
+    ) if candidate_hardware_axes else 1
+    candidate_software_points = (
+        point_count // candidate_hardware_points
+        if candidate_hardware_points > 1
+        else point_count
+    )
+
+    def early_software_or_hybrid(reason: str) -> QcsSweepExecutionPreview:
+        if (
+            bool(hardware_demodulation)
+            and candidate_hardware_points > 1
+            and candidate_software_points <= MAX_QCS_SOFTWARE_SWEEP_POINTS
+        ):
+            return QcsSweepExecutionPreview(
+                mode="hybrid",
+                reasons=(
+                    reason,
+                    "Compatible axes are planned as a native QCS hardware "
+                    "sweep inside a Python software loop; mapped compilation "
+                    "confirms the exact partition at Run.",
+                ),
+                exact=False,
+            )
         mode = (
             "invalid"
             if point_count > MAX_QCS_SOFTWARE_SWEEP_POINTS
@@ -3105,11 +3295,16 @@ def qcs_sweep_execution_preview(
         )
         return QcsSweepExecutionPreview(
             mode=mode,
-            reasons=(
+            reasons=(reason + limit_reason,),
+        )
+
+    if _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence):
+        return early_software_or_hybrid(
+            (
                 "Fixed-voltage Bias-T compensation changes its duration "
                 "with pulse area, so QCS uses fixed numeric point programs "
-                f"and a direct ramp-to-Hold compensation tail.{limit_reason}",
-            ),
+                "and a direct ramp-to-Hold compensation tail."
+            )
         )
     inspected = (
         tuple(range(point_count))
@@ -3123,23 +3318,11 @@ def qcs_sweep_execution_preview(
         analysis_point_indices=inspected,
     )
     if offset_plan is None:
-        mode = (
-            "invalid"
-            if point_count > MAX_QCS_SOFTWARE_SWEEP_POINTS
-            else "software"
-        )
-        limit_reason = (
-            f" This exceeds the {MAX_QCS_SOFTWARE_SWEEP_POINTS:,}-point "
-            "software-sweep limit."
-            if mode == "invalid"
-            else ""
-        )
-        return QcsSweepExecutionPreview(
-            mode=mode,
-            reasons=(
+        return early_software_or_hybrid(
+            (
                 "Voltage ramps do not share one fixed endpoint, so QCS must "
-                f"execute fixed numeric point programs.{limit_reason}",
-            ),
+                "execute fixed numeric point programs."
+            )
         )
 
     reasons = list(
@@ -3156,6 +3339,22 @@ def qcs_sweep_execution_preview(
         reasons.append("RF waveform duration requires QCS software resolution.")
     reasons = list(dict.fromkeys(reasons))
     if reasons:
+        if (
+            bool(hardware_demodulation)
+            and candidate_hardware_points > 1
+            and candidate_software_points <= MAX_QCS_SOFTWARE_SWEEP_POINTS
+        ):
+            return QcsSweepExecutionPreview(
+                mode="hybrid",
+                reasons=(
+                    *tuple(reasons),
+                    "Compatible axes will run as a native QCS hardware "
+                    "sweep inside a stoppable Python software loop; the "
+                    "mapped compiler confirms the exact partition at Run.",
+                ),
+                exact=False,
+                dc_channel_offsets_v=tuple(offset_plan.offset_volts),
+            )
         if point_count > MAX_QCS_SOFTWARE_SWEEP_POINTS:
             reasons.append(
                 f"The required software sweep exceeds the "
@@ -4155,6 +4354,791 @@ def compile_qcs_synchronized_sweep(
             )
             * (float(source_full_scale_mv) / 1000.0)
         ),
+    )
+
+
+def _plan_qcs_mixed_sweep(
+    sequence: Any,
+    *,
+    connection_config: QcsConnectionConfig,
+    mapper: Any,
+    repetitions_per_sweep: int,
+    fabric_mhz: float,
+    source_full_scale_mv: float,
+    rf_pulses: Sequence[QcsRfPulseConfig],
+    acquisition: QcsAcquisitionConfig,
+    qcs_module: Any,
+    cancellation: Optional[QcsCancellationController],
+    include_full_candidate: bool = False,
+    full_dc_offset_plan: Optional[_QcsFixedDcOffsetPlan] = None,
+) -> Tuple[Optional[QcsMixedSweepPlan], Optional[QcsCompiledHardwareSweep]]:
+    """Find the largest native inner sweep for a manual software loop.
+
+    QCS can encode nested software/hardware repetitions, but one blocking
+    ``Executor.execute`` call exposes no intermediate data. The GUI therefore
+    executes every outer coordinate separately. Candidate subsets are tried
+    from largest hardware point count to smallest; the real synchronized
+    compiler and mapped-channel settings make the final decision.
+    """
+
+    axes = tuple(sequence.sweep_axes)
+    if (
+        len(axes) < 2
+        or not connection_config.hw_demod
+        or any(isinstance(axis, RfPowerSweep) for axis in axes)
+    ):
+        return None, None
+    candidate_indices = _qcs_mixed_candidate_hardware_axes(sequence)
+    if not candidate_indices:
+        return None, None
+    original_shape = tuple(int(value) for value in sequence.sweep_shape)
+    all_axis_indices = tuple(range(len(axes)))
+    planning_failures = []
+    successful_compilations = {}
+    failed_compilations = set()
+    planning_started_s = monotonic()
+
+    def compile_candidate(hardware_axes: Sequence[int]):
+        hardware_axes = tuple(sorted(int(value) for value in hardware_axes))
+        if hardware_axes in successful_compilations:
+            return successful_compilations[hardware_axes]
+        if hardware_axes in failed_compilations:
+            return None
+        software_axes = tuple(
+            index for index in all_axis_indices if index not in hardware_axes
+        )
+        fixed = {
+            axis_index: 0
+            for axis_index in software_axes
+        }
+        sliced = _qcs_sequence_slice(sequence, fixed)
+        representative_global_index = int(
+            _qcs_slice_global_indices(original_shape, fixed)[0]
+        )
+        sliced_rf_pulses = _qcs_point_rf_pulses(
+            sequence,
+            rf_pulses,
+            representative_global_index,
+        )
+        try:
+            compiled = compile_qcs_synchronized_sweep(
+                sliced,
+                connection_config=connection_config,
+                mapper=mapper,
+                repetitions_per_sweep=repetitions_per_sweep,
+                fabric_mhz=fabric_mhz,
+                source_full_scale_mv=source_full_scale_mv,
+                rf_pulses=sliced_rf_pulses,
+                acquisition=acquisition,
+                qcs_module=qcs_module,
+                cancellation=cancellation,
+                _capacity_prevalidated=False,
+                _dc_offset_plan=(
+                    full_dc_offset_plan
+                    if hardware_axes == all_axis_indices
+                    else None
+                ),
+            )
+        except (QcsUnsupportedFeatureError, ValueError) as exc:
+            failed_compilations.add(hardware_axes)
+            planning_failures.append(
+                f"axes {hardware_axes}: {type(exc).__name__}: {exc}"
+            )
+            return None
+        finally:
+            # Compilation can set mapped physical offsets. Planning must
+            # never leave a voltage applied while Python evaluates candidates.
+            _set_qcs_dc_channel_offsets(
+                mapper,
+                channel_names=connection_config.dc_channel_names,
+                offset_volts=(0.0,) * len(connection_config.dc_channel_names),
+                require_nonzero_support=False,
+            )
+        if not compiled.hardware_sweep:
+            failed_compilations.add(hardware_axes)
+            planning_failures.extend(compiled.software_sweep_reasons)
+            return None
+        successful_compilations[hardware_axes] = compiled
+        return compiled
+
+    def build_plan(hardware_axes: Sequence[int]):
+        hardware_axes = tuple(sorted(int(value) for value in hardware_axes))
+        software_axes = tuple(
+            index for index in all_axis_indices if index not in hardware_axes
+        )
+        if not software_axes:
+            return None
+        compiled = successful_compilations.get(hardware_axes)
+        if compiled is None:
+            return None
+        return QcsMixedSweepPlan(
+            hardware_axis_indices=hardware_axes,
+            software_axis_indices=software_axes,
+            hardware_shape=tuple(original_shape[index] for index in hardware_axes),
+            software_shape=tuple(original_shape[index] for index in software_axes),
+            first_compiled=compiled,
+            planning_reasons=tuple(dict.fromkeys(planning_failures)),
+            planning_wall_s=monotonic() - planning_started_s,
+        )
+
+    # Compile the exact full sweep once when requested. This preserves every
+    # already-native multidimensional sweep as one Program/one executor call,
+    # while also detecting mapper-only reasons (for example absolute_phase)
+    # that make a true mixed partition useful.
+    if include_full_candidate:
+        full_compiled = compile_candidate(all_axis_indices)
+        if full_compiled is not None:
+            return None, full_compiled
+
+    # Keep planning bounded. Materializing the full power set makes a GUI run
+    # exponential in the number of segment sweeps (20 axes would exceed one
+    # million compilation attempts). First try the maximum set, then every
+    # one-axis removal. That resolves the common QCS eight-array budget and a
+    # single incompatible timing axis in at most N+1 attempts.
+    candidate_indices = tuple(candidate_indices)
+    compiled = compile_candidate(candidate_indices)
+    if compiled is not None:
+        if candidate_indices == all_axis_indices:
+            return None, compiled
+        plan = build_plan(candidate_indices)
+        if plan is not None:
+            return plan, None
+    ranked_removals = tuple(
+        sorted(
+            candidate_indices,
+            key=lambda index: (
+                int(original_shape[index]),
+                str(getattr(axes[index], "axis_kind", ""))
+                in {"amplitude", "rf_frequency"},
+                index,
+            ),
+        )
+    )
+    for removed_axis in ranked_removals:
+        subset = tuple(
+            index for index in candidate_indices if index != removed_axis
+        )
+        if not subset:
+            continue
+        compiled = compile_candidate(subset)
+        if compiled is not None:
+            plan = build_plan(subset)
+            if plan is not None:
+                return plan, None
+
+    # Multiple incompatible axes require refinement. Establish which axes can
+    # run natively on their own, then greedily combine them in descending
+    # point-count / hardware-confidence order. This is linear in axis count
+    # after the bounded one-axis-removal pass, never exponential.
+    individually_supported = []
+    for axis_index in sorted(
+        candidate_indices,
+        key=lambda index: (
+            str(getattr(axes[index], "axis_kind", ""))
+            in {"amplitude", "rf_frequency"},
+            int(original_shape[index]),
+            -index,
+        ),
+        reverse=True,
+    ):
+        if compile_candidate((axis_index,)) is not None:
+            individually_supported.append(axis_index)
+    selected = []
+    for axis_index in individually_supported:
+        trial = tuple(sorted((*selected, axis_index)))
+        if compile_candidate(trial) is not None:
+            selected.append(axis_index)
+    if selected:
+        return build_plan(tuple(selected)), None
+    return None, None
+
+
+def _qcs_partial_execution_result(
+    *,
+    sequence: Any,
+    full_iq: np.ndarray,
+    completed_mask: np.ndarray,
+    sample_rate_hz: float,
+    programs: Sequence[Any],
+    raw_results: Sequence[Any],
+    summary: Mapping[str, Any],
+    rf_settings: Mapping[str, Any],
+) -> QcsExecutionResult:
+    """Build a finite, completed-only live snapshot for GUI consumers."""
+
+    completed_indices = np.flatnonzero(np.asarray(completed_mask, dtype=bool))
+    points = np.asarray(sequence.sweep_points)
+    partial_points = points[completed_indices]
+    partial_iq = np.asarray(full_iq)[completed_indices].copy()
+    ddr_result = FineTuneDdrResult(
+        sweep_points=partial_points.copy(),
+        iq=partial_iq,
+        sweep_axes=tuple(sequence.sweep_axes),
+        # A partial Cartesian grid need not itself be rectangular. Consumers
+        # use the explicit point coordinates; only the final result exposes
+        # the semantic Cartesian shape through iq_grid.
+        sweep_shape=(int(completed_indices.size),),
+        cross_capacitance=np.asarray(sequence.cross_capacitance).copy(),
+        sample_rate_hz=float(sample_rate_hz),
+        fir_rate_profile="qcs_hardware_demod",
+    )
+    return QcsExecutionResult(
+        ddr_result=ddr_result,
+        programs=tuple(programs),
+        raw_results=tuple(raw_results),
+        program_summary=dict(summary),
+        rf_settings=dict(rf_settings),
+    )
+
+
+def _execute_qcs_mixed_sweep(
+    sequence: Any,
+    *,
+    plan: QcsMixedSweepPlan,
+    connection_config: QcsConnectionConfig,
+    mapper: Any,
+    executor: Any,
+    repetitions_per_sweep: int,
+    fabric_mhz: float,
+    source_full_scale_mv: float,
+    rf_pulses: Sequence[QcsRfPulseConfig],
+    acquisition: QcsAcquisitionConfig,
+    qcs_module: Any,
+    progress_callback: Optional[ProgressCallback],
+    event_callback: Optional[EventCallback],
+    partial_callback: Optional[PartialResultCallback],
+    cancellation: Optional[QcsCancellationController],
+) -> QcsExecutionResult:
+    """Execute native inner sweeps one outer Python coordinate at a time."""
+
+    qcs = qcs_module
+    original_shape = tuple(int(value) for value in sequence.sweep_shape)
+    point_count = int(sequence.sweep_point_count)
+    outer_count = int(plan.software_iteration_count)
+    inner_count = int(plan.hardware_points_per_iteration)
+    _validate_qcs_software_sweep_point_count(outer_count)
+    if outer_count * inner_count != point_count:
+        raise ValueError("QCS mixed-sweep partition does not cover every point")
+
+    hardware_axes = tuple(plan.hardware_axis_indices)
+    software_axes = tuple(plan.software_axis_indices)
+    programs = []
+    raw_results = []
+    completed_mask = np.zeros(point_count, dtype=bool)
+    full_iq = None
+    latest_partial = None
+    effective_sample_rate_hz = None
+    effective_acquisition_duration_s = None
+    sweep_variable_count = 0
+    sweep_array_value_count = 0
+    safety_reset_executor_call_count = 0
+    mixed_program_build_wall_s = float(plan.planning_wall_s)
+    mixed_executor_wall_s = 0.0
+    last_partial_publish_s = float("-inf")
+    block_offset_values = []
+    software_reasons = tuple(
+        dict.fromkeys(
+            (
+                "Unsupported sweep axes are executed by a Python outer loop; "
+                "each outer coordinate contains one native QCS hardware sweep.",
+                *plan.planning_reasons,
+            )
+        )
+    )
+
+    rf_settings = {
+        "backend": "qcs",
+        "output_details": tuple(
+            {
+                "gen_ch": pulse.gen_ch,
+                "amplitude": pulse.amplitude,
+                "frequency_hz": pulse.frequency_hz,
+                "duration_s": pulse.duration_s,
+            }
+            for pulse in rf_pulses
+        ),
+        "readout_details": {
+            "sample_rate_hz": None,
+            "hw_demod": True,
+            "reset_phase_every_shot": True,
+            "frequency_hz": acquisition.frequency_hz,
+            "duration_s": None,
+            "requested_sample_count": acquisition.sample_count,
+        },
+    }
+
+    def current_summary(*, partial: bool) -> Mapping[str, Any]:
+        completed_points = int(np.count_nonzero(completed_mask))
+        completed_iterations = len(raw_results)
+        return {
+            "backend": "qcs",
+            "hardware_sweep": True,
+            "partial": bool(partial),
+            "completed_points": completed_points,
+            "planned_points": point_count,
+            "hardware_sweep_dimensions": len(hardware_axes),
+            "hardware_sweep_axis_indices": list(hardware_axes),
+            "hardware_sweep_shape": list(plan.hardware_shape),
+            "hardware_sweep_points": point_count,
+            "hardware_points_per_iteration": inner_count,
+            "software_sweep_dimensions": len(software_axes),
+            "software_sweep_axis_indices": list(software_axes),
+            "software_sweep_shape": list(plan.software_shape),
+            "software_sweep_points": outer_count,
+            "software_iteration_count": outer_count,
+            "completed_software_iterations": completed_iterations,
+            "semantic_sweep_shape": list(original_shape),
+            "sweep_execution_mode": "hybrid_hardware_software",
+            "software_sweep_reasons": list(software_reasons),
+            "sweep_variable_count": sweep_variable_count,
+            "sweep_array_value_count": sweep_array_value_count,
+            "repetitions_per_sweep": int(repetitions_per_sweep),
+            "program_count": len(programs),
+            "executor_call_count": len(raw_results),
+            "safety_reset_executor_call_count": (
+                safety_reset_executor_call_count
+            ),
+            "total_executor_call_count": (
+                len(raw_results) + safety_reset_executor_call_count
+            ),
+            "fabric_mhz": float(fabric_mhz),
+            "source_full_scale_mv": float(source_full_scale_mv),
+            "qcs_dc_full_scale_v": connection_config.dc_full_scale_v,
+            "dc_channel_names": list(connection_config.dc_channel_names),
+            "dc_channel_offsets_v": [],
+            "dc_channel_offsets_v_by_iteration": [
+                list(values) for values in block_offset_values
+            ],
+            "fixed_dc_offset_residualization": any(
+                any(
+                    not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+                    for value in values
+                )
+                for values in block_offset_values
+            ),
+            "rf_channel_names": {
+                str(key): value
+                for key, value in connection_config.rf_channel_names.items()
+            },
+            "acquisition_channel_name": (
+                connection_config.acquisition_channel_name
+            ),
+            "hw_demod": True,
+            "reset_phase_every_shot": True,
+            "sample_rate_hz": effective_sample_rate_hz,
+            "acquisition_duration_s": effective_acquisition_duration_s,
+            "requested_sample_count": acquisition.sample_count,
+            "iq_shape": (
+                [] if full_iq is None else list(full_iq.shape)
+            ),
+            "mixed_program_build_wall_s": mixed_program_build_wall_s,
+            "mixed_partition_planning_wall_s": float(plan.planning_wall_s),
+            "mixed_executor_wall_s": mixed_executor_wall_s,
+        }
+
+    if event_callback is not None:
+        event_callback(
+            "program_build",
+            "started",
+            (
+                "Preparing a native QCS hardware sweep inside a Python "
+                f"software loop ({outer_count:,} iteration(s))"
+            ),
+        )
+    if progress_callback is not None:
+        progress_callback(
+            20,
+            (
+                f"Preflighting {outer_count:,} mixed QCS software-loop "
+                "coordinate(s)"
+            ),
+        )
+
+    # Validate the waveform capacity of every planned outer coordinate before
+    # submitting the first program. The planner's representative compilation
+    # proves the native inner partition, but an unsupported duration axis can
+    # make a later slice longer than the M5301 buffer even when slice zero is
+    # legal. This pass deliberately evaluates all inner points for every
+    # outer coordinate: an invalid configuration must not partially touch
+    # hardware before the GUI reports it.
+    capacity_scale = (
+        float(source_full_scale_mv)
+        / (float(connection_config.dc_full_scale_v) * 1000.0)
+    )
+    for preflight_index, fixed in enumerate(
+        _qcs_software_coordinates(original_shape, software_axes)
+    ):
+        if cancellation is not None:
+            cancellation.raise_if_requested(
+                "mixed QCS waveform-capacity preflight"
+            )
+        validate_qcs_m5301_waveform_capacity(
+            _qcs_sequence_slice(sequence, fixed),
+            fabric_mhz=fabric_mhz,
+            amplitude_scale=capacity_scale,
+            auto_fixed_dc_offsets=True,
+            source_full_scale_mv=source_full_scale_mv,
+            dc_full_scale_v=connection_config.dc_full_scale_v,
+        )
+        if progress_callback is not None and (
+            outer_count <= 100
+            or preflight_index == 0
+            or preflight_index + 1 == outer_count
+            or (preflight_index + 1) % max(1, outer_count // 100) == 0
+        ):
+            progress_callback(
+                20 + int(15 * (preflight_index + 1) / outer_count),
+                (
+                    "Preflighted mixed QCS coordinate "
+                    f"{preflight_index + 1:,}/{outer_count:,}"
+                ),
+            )
+
+    if event_callback is not None:
+        event_callback(
+            "program_build",
+            "completed",
+            (
+                "Preflighted and configured hardware sweep inside software "
+                f"loop: {outer_count:,} outer iteration(s) x {inner_count:,} "
+                "native hardware point(s)"
+            ),
+        )
+        event_callback(
+            "acquisition",
+            "started",
+            "Executing native QCS hardware sweeps inside the software loop",
+        )
+    if progress_callback is not None:
+        progress_callback(
+            35,
+            (
+                f"Running mixed QCS sweep: {outer_count:,} software "
+                f"iteration(s) x {inner_count:,} hardware point(s)"
+            ),
+        )
+
+    try:
+        for outer_index, fixed in enumerate(
+            _qcs_software_coordinates(original_shape, software_axes)
+        ):
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "mixed QCS software-loop compilation"
+                )
+            sliced = _qcs_sequence_slice(sequence, fixed)
+            global_indices = _qcs_slice_global_indices(original_shape, fixed)
+            representative_global_index = int(global_indices[0])
+            sliced_rf_pulses = _qcs_point_rf_pulses(
+                sequence,
+                rf_pulses,
+                representative_global_index,
+            )
+            if outer_index == 0:
+                # The planner already compiled this exact all-zero outer
+                # coordinate. Reuse it: a large native inner grid can take
+                # seconds to build. Planning reset its mapper offsets for
+                # safety, so restore only those settings immediately before
+                # the corresponding program is submitted.
+                compiled = plan.first_compiled
+                _set_qcs_dc_channel_offsets(
+                    mapper,
+                    channel_names=connection_config.dc_channel_names,
+                    offset_volts=compiled.dc_channel_offsets_v,
+                    require_nonzero_support=True,
+                )
+            else:
+                build_started_s = monotonic()
+                compiled = compile_qcs_synchronized_sweep(
+                    sliced,
+                    connection_config=connection_config,
+                    mapper=mapper,
+                    repetitions_per_sweep=repetitions_per_sweep,
+                    fabric_mhz=fabric_mhz,
+                    source_full_scale_mv=source_full_scale_mv,
+                    rf_pulses=sliced_rf_pulses,
+                    acquisition=acquisition,
+                    qcs_module=qcs,
+                    cancellation=cancellation,
+                    _capacity_prevalidated=False,
+                )
+                mixed_program_build_wall_s += monotonic() - build_started_s
+            if not compiled.hardware_sweep:
+                raise QcsUnsupportedFeatureError(
+                    "QCS mixed-sweep inner block unexpectedly downgraded to "
+                    "software execution: "
+                    + "; ".join(compiled.software_sweep_reasons)
+                )
+            if int(np.prod(compiled.sweep_shape, dtype=np.int64)) != inner_count:
+                raise ValueError(
+                    "QCS mixed-sweep inner block changed its point count"
+                )
+            block_offsets = tuple(compiled.dc_channel_offsets_v)
+            block_offset_values.append(block_offsets)
+            offset_reset_required = any(
+                not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+                for value in block_offsets
+            )
+            if cancellation is not None:
+                cancellation.tag_program(compiled.program)
+                cancellation.raise_if_requested(
+                    "mixed QCS hardware-sweep execution"
+                )
+            executor_started_s = monotonic()
+            raw_result = _executor_execute(executor, compiled.program)
+            mixed_executor_wall_s += monotonic() - executor_started_s
+            # Once execute() returns normally, its complete native block is
+            # valid even if Stop raced with that return. Normalize, scatter,
+            # and publish it before honoring cancellation at the software-
+            # loop boundary. An actual active abort raises from execute() and
+            # therefore never reaches this completed-block path.
+            values = extract_qcs_acquisition(
+                raw_result,
+                compiled.acquisition_channels,
+                prefer_trace=False,
+            )
+            block_iq = normalize_qcs_hardware_sweep_iq(
+                values,
+                repetitions_per_point=repetitions_per_sweep,
+                sweep_shape=compiled.sweep_shape,
+                hardware_sweep=True,
+            )
+            if block_iq.shape[0] != global_indices.size:
+                raise ValueError(
+                    "QCS mixed-sweep block returned an unexpected point count"
+                )
+            if full_iq is None:
+                full_iq = np.empty(
+                    (point_count, *block_iq.shape[1:]),
+                    dtype=block_iq.dtype,
+                )
+            elif block_iq.shape[1:] != full_iq.shape[1:]:
+                raise ValueError(
+                    "QCS mixed-sweep blocks returned inconsistent IQ shapes"
+                )
+            full_iq[global_indices] = block_iq
+            completed_mask[global_indices] = True
+            programs.append(compiled.program)
+            raw_results.append(raw_result)
+            sweep_variable_count = max(
+                sweep_variable_count,
+                int(compiled.sweep_variable_count),
+            )
+            sweep_array_value_count = max(
+                sweep_array_value_count,
+                int(compiled.sweep_array_value_count),
+            )
+            if effective_sample_rate_hz is None:
+                effective_sample_rate_hz = float(
+                    compiled.acquisition_sample_rate_hz
+                )
+                effective_acquisition_duration_s = float(
+                    compiled.acquisition_duration_s
+                )
+            elif not np.isclose(
+                effective_sample_rate_hz,
+                compiled.acquisition_sample_rate_hz,
+                rtol=0.0,
+                atol=1e-6,
+            ):
+                raise ValueError(
+                    "QCS mixed-sweep blocks used inconsistent sample rates"
+                )
+
+            # Physical offsets are mapper settings, not waveform operations.
+            # Remove them immediately after this complete block so Python/QCS
+            # preparation time cannot contribute uncontrolled DC area.
+            if offset_reset_required:
+                _reset_qcs_dc_outputs_to_zero(
+                    qcs,
+                    executor=executor,
+                    mapper=mapper,
+                    channel_names=connection_config.dc_channel_names,
+                    fabric_hz=float(fabric_mhz) * 1e6,
+                )
+                safety_reset_executor_call_count += 1
+            else:
+                _set_qcs_dc_channel_offsets(
+                    mapper,
+                    channel_names=connection_config.dc_channel_names,
+                    offset_volts=(0.0,)
+                    * len(connection_config.dc_channel_names),
+                    require_nonzero_support=False,
+                )
+
+            rf_settings["readout_details"]["sample_rate_hz"] = (
+                effective_sample_rate_hz
+            )
+            rf_settings["readout_details"]["duration_s"] = (
+                effective_acquisition_duration_s
+            )
+            publish_now_s = monotonic()
+            publish_partial = bool(
+                partial_callback is not None
+                and (
+                    outer_count <= 100
+                    or outer_index == 0
+                    or outer_index + 1 == outer_count
+                    or publish_now_s - last_partial_publish_s >= 0.2
+                )
+            )
+            if publish_partial:
+                latest_partial = _qcs_partial_execution_result(
+                    sequence=sequence,
+                    full_iq=full_iq,
+                    completed_mask=completed_mask,
+                    sample_rate_hz=effective_sample_rate_hz,
+                    programs=programs,
+                    raw_results=raw_results,
+                    summary=current_summary(partial=True),
+                    rf_settings=rf_settings,
+                )
+                partial_callback(latest_partial)
+                last_partial_publish_s = publish_now_s
+            if event_callback is not None:
+                event_callback(
+                    "sweep_iteration",
+                    "completed",
+                    (
+                        f"Mixed QCS iteration {outer_index + 1:,}/"
+                        f"{outer_count:,}; retained "
+                        f"{int(np.count_nonzero(completed_mask)):,}/"
+                        f"{point_count:,} point(s)"
+                    ),
+                )
+            if progress_callback is not None:
+                progress_callback(
+                    35 + int(35 * (outer_index + 1) / outer_count),
+                    (
+                        f"Acquired mixed QCS iteration {outer_index + 1:,}/"
+                        f"{outer_count:,} ({int(np.count_nonzero(completed_mask)):,}/"
+                        f"{point_count:,} points available)"
+                    ),
+                )
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "mixed QCS software-loop boundary"
+                )
+    except BaseException as execution_error:
+        cancellation_requested = bool(
+            cancellation is not None and cancellation.is_stop_requested()
+        )
+        reset_error_caught = None
+        try:
+            _reset_qcs_dc_outputs_to_zero(
+                qcs,
+                executor=executor,
+                mapper=mapper,
+                channel_names=connection_config.dc_channel_names,
+                fabric_hz=float(fabric_mhz) * 1e6,
+            )
+            safety_reset_executor_call_count += 1
+        except Exception as reset_error:
+            reset_error_caught = reset_error
+            if hasattr(execution_error, "add_note"):
+                execution_error.add_note(
+                    "Automatic QCS DC reset also failed: "
+                    f"{type(reset_error).__name__}: {reset_error}"
+                )
+        if cancellation_requested:
+            if reset_error_caught is not None:
+                raise RuntimeError(
+                    "QCS stop was requested, but the emergency DC reset "
+                    "failed; the physical output state is unknown"
+                ) from reset_error_caught
+            completed_point_count = int(np.count_nonzero(completed_mask))
+            latest_partial_point_count = (
+                0
+                if latest_partial is None
+                else int(
+                    latest_partial.program_summary.get(
+                        "completed_points",
+                        0,
+                    )
+                )
+            )
+            if (
+                full_iq is not None
+                and completed_point_count > 0
+                and latest_partial_point_count != completed_point_count
+            ):
+                latest_partial = _qcs_partial_execution_result(
+                    sequence=sequence,
+                    full_iq=full_iq,
+                    completed_mask=completed_mask,
+                    sample_rate_hz=effective_sample_rate_hz,
+                    programs=programs,
+                    raw_results=raw_results,
+                    summary=current_summary(partial=True),
+                    rf_settings=rf_settings,
+                )
+            raise QcsExperimentCancelled(
+                "QCS mixed sweep stopped by user; completed blocks remain "
+                "available and DC outputs were reset to zero",
+                partial_result=latest_partial,
+            ) from execution_error
+        raise
+
+    if full_iq is None or not np.all(completed_mask):
+        raise RuntimeError("QCS mixed sweep ended before every block completed")
+    if cancellation is not None and not cancellation.close_stop_window():
+        try:
+            _reset_qcs_dc_outputs_to_zero(
+                qcs,
+                executor=executor,
+                mapper=mapper,
+                channel_names=connection_config.dc_channel_names,
+                fabric_hz=float(fabric_mhz) * 1e6,
+            )
+        except Exception as reset_error:
+            raise RuntimeError(
+                "QCS stop was requested, but the emergency DC reset failed; "
+                "the physical output state is unknown"
+            ) from reset_error
+        if latest_partial is None:
+            latest_partial = _qcs_partial_execution_result(
+                sequence=sequence,
+                full_iq=full_iq,
+                completed_mask=completed_mask,
+                sample_rate_hz=effective_sample_rate_hz,
+                programs=programs,
+                raw_results=raw_results,
+                summary=current_summary(partial=True),
+                rf_settings=rf_settings,
+            )
+        raise QcsExperimentCancelled(
+            "QCS mixed sweep stopped by user after its final hardware block; "
+            "all acquired points remain available",
+            partial_result=latest_partial,
+        )
+
+    final_ddr = FineTuneDdrResult(
+        sweep_points=np.asarray(sequence.sweep_points).copy(),
+        iq=full_iq,
+        sweep_axes=tuple(sequence.sweep_axes),
+        sweep_shape=tuple(sequence.sweep_shape),
+        cross_capacitance=np.asarray(sequence.cross_capacitance).copy(),
+        sample_rate_hz=float(effective_sample_rate_hz),
+        fir_rate_profile="qcs_hardware_demod",
+    )
+    final_summary = current_summary(partial=False)
+    final_summary["completed_points"] = point_count
+    if event_callback is not None:
+        event_callback(
+            "acquisition",
+            "completed",
+            (
+                f"Acquired {point_count:,} QCS point(s) with "
+                f"{outer_count:,} native hardware-sweep execution(s) "
+                "through one persistent executor"
+            ),
+        )
+    return QcsExecutionResult(
+        ddr_result=final_ddr,
+        programs=tuple(programs),
+        raw_results=tuple(raw_results),
+        program_summary=final_summary,
+        rf_settings=rf_settings,
     )
 
 
@@ -5596,6 +6580,7 @@ def execute_qcs_sequence(
     acquisition: Optional[QcsAcquisitionConfig] = None,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[EventCallback] = None,
+    partial_callback: Optional[PartialResultCallback] = None,
     qcs_module=None,
     mapper=None,
     executor=None,
@@ -5641,28 +6626,37 @@ def execute_qcs_sequence(
             for value in dc_offset_plan.offset_volts
         )
     )
-    host_preview = None
-    if nonzero_dc_offset:
-        host_preview = qcs_sweep_execution_preview(
-            sequence,
-            hardware_demodulation=connection_config.hw_demod,
-            source_full_scale_mv=source_full_scale_mv,
-            dc_full_scale_v=connection_config.dc_full_scale_v,
-            fabric_mhz=fabric_mhz,
-            init_time_s=connection_config.init_time_s,
-        )
+    host_preview = qcs_sweep_execution_preview(
+        sequence,
+        hardware_demodulation=connection_config.hw_demod,
+        source_full_scale_mv=source_full_scale_mv,
+        dc_full_scale_v=connection_config.dc_full_scale_v,
+        fabric_mhz=fabric_mhz,
+        init_time_s=connection_config.init_time_s,
+    )
     use_fixed_offset_plan = bool(
         dc_offset_plan is not None
         and not fixed_voltage_bias_t_sweep
         and (
             not nonzero_dc_offset
-            or (
-                host_preview is not None
-                and host_preview.mode == "hardware"
-            )
+            or host_preview.mode == "hardware"
         )
     )
-    if not use_fixed_offset_plan:
+    defer_capacity_to_mixed_planner = bool(
+        host_preview.mode == "hybrid"
+        and connection_config.hw_demod
+        and len(tuple(sequence.sweep_axes)) >= 2
+        and _qcs_mixed_candidate_hardware_axes(sequence)
+    )
+    if defer_capacity_to_mixed_planner:
+        # An outer timing/RF coordinate can turn a long plateau into a valid
+        # short M5301 seed plus Hold. The exact synchronized compiler checks
+        # every selected inner slice; validating the unsliced grid with the
+        # fixed-numeric model here would reject that valid mixed graph before
+        # partitioning. If planning fails, the fallback validates itself.
+        synchronized_capacity_prevalidated = False
+        fixed_numeric_capacity_prevalidated = False
+    elif not use_fixed_offset_plan:
         validate_qcs_m5301_waveform_capacity(
             sequence,
             fabric_mhz=fabric_mhz,
@@ -5671,6 +6665,8 @@ def execute_qcs_sequence(
                 / (float(connection_config.dc_full_scale_v) * 1000.0)
             ),
         )
+        synchronized_capacity_prevalidated = False
+        fixed_numeric_capacity_prevalidated = True
     else:
         point_indices = (
             None
@@ -5689,8 +6685,8 @@ def execute_qcs_sequence(
             source_full_scale_mv=source_full_scale_mv,
             dc_full_scale_v=connection_config.dc_full_scale_v,
         )
-    synchronized_capacity_prevalidated = use_fixed_offset_plan
-    fixed_numeric_capacity_prevalidated = not use_fixed_offset_plan
+        synchronized_capacity_prevalidated = True
+        fixed_numeric_capacity_prevalidated = False
     if cancellation is not None:
         cancellation.raise_if_requested("QCS waveform-capacity validation")
     if event_callback is not None:
@@ -5725,6 +6721,95 @@ def execute_qcs_sequence(
         progress_callback(8, "QCS ChannelMapper loaded")
 
     point_count = int(sequence.sweep_point_count)
+    full_sweep_preview = host_preview
+    has_multiple_sweep_axes = len(tuple(sequence.sweep_axes)) >= 2
+    has_native_candidate_axis = bool(
+        _qcs_mixed_candidate_hardware_axes(sequence)
+    )
+    attempt_mixed_partition = bool(
+        has_multiple_sweep_axes
+        and connection_config.hw_demod
+        and has_native_candidate_axis
+        and full_sweep_preview.mode != "invalid"
+    )
+    # An oversized full grid can still be legal when only the Python outer
+    # coordinate count is <=10k. Allow the exact planner to determine that
+    # partition instead of applying the all-software total-point limit.
+    if (
+        has_multiple_sweep_axes
+        and connection_config.hw_demod
+        and has_native_candidate_axis
+        and full_sweep_preview.mode == "invalid"
+        and not any(isinstance(axis, RfPowerSweep) for axis in sequence.sweep_axes)
+    ):
+        attempt_mixed_partition = True
+    if attempt_mixed_partition:
+        if event_callback is not None:
+            event_callback(
+                "sweep_partition",
+                "started",
+                "Checking for a native hardware sweep inside a software loop",
+            )
+        if progress_callback is not None:
+            progress_callback(10, "Analyzing QCS mixed-sweep partition")
+    mixed_plan, precompiled_full_sweep = (
+        _plan_qcs_mixed_sweep(
+            sequence,
+            connection_config=connection_config,
+            mapper=mapper,
+            repetitions_per_sweep=repetitions_per_sweep,
+            fabric_mhz=fabric_mhz,
+            source_full_scale_mv=source_full_scale_mv,
+            rf_pulses=rf_pulses,
+            acquisition=acquisition,
+            qcs_module=qcs,
+            cancellation=cancellation,
+            include_full_candidate=(
+                full_sweep_preview.mode == "hardware"
+            ),
+            full_dc_offset_plan=dc_offset_plan,
+        )
+        if attempt_mixed_partition
+        else (None, None)
+    )
+    if attempt_mixed_partition and event_callback is not None:
+        if mixed_plan is not None:
+            partition_message = "Mixed hardware/software partition selected"
+        elif precompiled_full_sweep is not None:
+            partition_message = "Full sweep confirmed native; no software loop needed"
+        else:
+            partition_message = "No native inner hardware-sweep partition is available"
+        event_callback(
+            "sweep_partition",
+            "completed",
+            partition_message,
+        )
+    if mixed_plan is not None:
+        if executor is None:
+            executor = build_qcs_executor(
+                connection_config,
+                mapper,
+                qcs_module=qcs,
+            )
+        if cancellation is not None:
+            cancellation.raise_if_requested("QCS mixed-sweep executor setup")
+        return _execute_qcs_mixed_sweep(
+            sequence,
+            plan=mixed_plan,
+            connection_config=connection_config,
+            mapper=mapper,
+            executor=executor,
+            repetitions_per_sweep=repetitions_per_sweep,
+            fabric_mhz=fabric_mhz,
+            source_full_scale_mv=source_full_scale_mv,
+            rf_pulses=rf_pulses,
+            acquisition=acquisition,
+            qcs_module=qcs,
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+            partial_callback=partial_callback,
+            cancellation=cancellation,
+        )
     fixed_numeric_dc_ramp = bool(
         dc_offset_plan is None or fixed_voltage_bias_t_sweep
     )
@@ -5829,20 +6914,29 @@ def execute_qcs_sequence(
                 ),
             )
     else:
-        compiled = compile_qcs_synchronized_sweep(
-            sequence,
-            connection_config=connection_config,
-            mapper=mapper,
-            repetitions_per_sweep=repetitions_per_sweep,
-            fabric_mhz=fabric_mhz,
-            source_full_scale_mv=source_full_scale_mv,
-            rf_pulses=rf_pulses,
-            acquisition=acquisition,
-            qcs_module=qcs,
-            cancellation=cancellation,
-            _capacity_prevalidated=synchronized_capacity_prevalidated,
-            _dc_offset_plan=dc_offset_plan,
-        )
+        compiled = precompiled_full_sweep
+        if compiled is not None:
+            _set_qcs_dc_channel_offsets(
+                mapper,
+                channel_names=connection_config.dc_channel_names,
+                offset_volts=compiled.dc_channel_offsets_v,
+                require_nonzero_support=True,
+            )
+        else:
+            compiled = compile_qcs_synchronized_sweep(
+                sequence,
+                connection_config=connection_config,
+                mapper=mapper,
+                repetitions_per_sweep=repetitions_per_sweep,
+                fabric_mhz=fabric_mhz,
+                source_full_scale_mv=source_full_scale_mv,
+                rf_pulses=rf_pulses,
+                acquisition=acquisition,
+                qcs_module=qcs,
+                cancellation=cancellation,
+                _capacity_prevalidated=synchronized_capacity_prevalidated,
+                _dc_offset_plan=dc_offset_plan,
+            )
         if nonzero_dc_offset and not compiled.hardware_sweep:
             _set_qcs_dc_channel_offsets(
                 mapper,
@@ -6326,6 +7420,7 @@ def run_qcs_qcodes_experiment(
     gui_settings: Optional[Mapping[str, Any]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     event_callback: Optional[EventCallback] = None,
+    partial_callback: Optional[PartialResultCallback] = None,
     qcs_module=None,
     mapper=None,
     executor=None,
@@ -6347,6 +7442,14 @@ def run_qcs_qcodes_experiment(
         event_callback(
             "experiment", "started", "Starting Keysight QCS experiment"
         )
+    latest_partial_execution = None
+
+    def publish_partial_execution(partial: QcsExecutionResult) -> None:
+        nonlocal latest_partial_execution
+        latest_partial_execution = partial
+        if partial_callback is not None:
+            partial_callback(partial)
+
     try:
         execution = execute_qcs_sequence(
             connection_config=connection_config,
@@ -6358,6 +7461,7 @@ def run_qcs_qcodes_experiment(
             acquisition=acquisition,
             progress_callback=progress_callback,
             event_callback=event_callback,
+            partial_callback=publish_partial_execution,
             qcs_module=qcs_module,
             mapper=mapper,
             executor=executor,
@@ -6448,6 +7552,102 @@ def run_qcs_qcodes_experiment(
             program_summary=execution.program_summary,
         )
     except QcsExperimentCancelled as exc:
+        # Persist every fully completed mixed block after Stop. This is not a
+        # live per-iteration database transaction (the GUI receives those
+        # blocks in memory immediately), but it guarantees that cancellation
+        # does not discard measured data or leave it available only through a
+        # Python object.
+        partial = exc.partial_result or latest_partial_execution
+        if partial is not None and int(
+            partial.program_summary.get("completed_points", 0)
+        ) > 0:
+            try:
+                effective_run_config = replace(
+                    run_config,
+                    sample_rate_hz=float(partial.ddr_result.sample_rate_hz),
+                )
+                stored_gui_settings = dict(gui_settings or {})
+                qick_settings = stored_gui_settings.get("qick", {})
+                if not isinstance(qick_settings, Mapping):
+                    qick_settings = {}
+                qick_settings = dict(qick_settings)
+                full_scale_mv = _positive_finite(
+                    source_full_scale_mv,
+                    "source waveform full scale",
+                )
+                qick_settings["full_scale_mv"] = full_scale_mv
+                stored_gui_settings["qick"] = qick_settings
+                stored_gui_settings["awg_waveform_recipe"] = (
+                    build_awg_waveform_recipe(
+                        sequence,
+                        fabric_mhz=fabric_mhz,
+                        full_scale_mv=full_scale_mv,
+                    )
+                )
+                stopped_summary = dict(partial.program_summary)
+                stopped_summary.update({
+                    "partial": True,
+                    "execution_status": "stopped",
+                    "stop_message": str(exc),
+                })
+                if event_callback is not None:
+                    event_callback(
+                        "qcodes_save",
+                        "started",
+                        "Saving completed mixed-sweep blocks after Stop",
+                    )
+                dataset, row_count = store_experiment_result(
+                    partial.ddr_result,
+                    run_config=effective_run_config,
+                    connection_config=connection_config,
+                    program_summary=stopped_summary,
+                    gui_settings=stored_gui_settings,
+                    rf_settings=partial.rf_settings,
+                    backend_name="qcs",
+                    iq_repetition_policy=iq_repetition_policy,
+                    progress_callback=progress_callback,
+                    progress_start=70,
+                    progress_end=99,
+                )
+                stored_partial = StoredQcsExperiment(
+                    run_id=int(dataset.run_id),
+                    guid=str(dataset.guid),
+                    database_path=effective_run_config.resolved_database_path,
+                    row_count=int(row_count),
+                    dataset=dataset,
+                    program=partial.programs,
+                    ddr_result=partial.ddr_result,
+                    rf_settings=partial.rf_settings,
+                    programs=partial.programs,
+                    raw_results=partial.raw_results,
+                    program_summary=stopped_summary,
+                )
+                exc.stored_result = stored_partial
+                if partial_callback is not None:
+                    partial_callback(stored_partial)
+                if event_callback is not None:
+                    event_callback(
+                        "qcodes_save",
+                        "completed",
+                        f"Saved stopped QCoDeS Run {int(dataset.run_id)}",
+                    )
+            except Exception as storage_error:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "Completed QCS data remains available in memory, but "
+                        "the stopped-run database save failed: "
+                        f"{type(storage_error).__name__}: {storage_error}"
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "qcodes_save",
+                        "failed",
+                        (
+                            "Could not save completed blocks after Stop; "
+                            "in-memory data is retained: "
+                            f"{storage_error}"
+                        ),
+                    )
         if event_callback is not None:
             event_callback("experiment", "stopped", str(exc))
         raise

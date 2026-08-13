@@ -7402,6 +7402,26 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.qcs_waveform_usage_detail.setText(str(message))
         self._set_qcs_waveform_usage_style("error")
 
+    def set_qcs_mixed_waveform_capacity_pending(self) -> None:
+        """Explain that hybrid capacity is authoritative only per slice."""
+
+        maximum = QCS_M5301_MAX_RENDERED_SAMPLES
+        self.qcs_waveform_usage_progress.setRange(0, maximum)
+        self.qcs_waveform_usage_progress.setValue(0)
+        self.qcs_waveform_usage_progress.setFormat(
+            "Per-slice capacity preflight at Run"
+        )
+        self.qcs_waveform_usage_summary.setText(
+            "Hybrid sweep: M5301 capacity depends on the software-loop "
+            "coordinate."
+        )
+        self.qcs_waveform_usage_detail.setText(
+            "Before the first hardware program is submitted, every planned "
+            "software-loop coordinate is checked using its exact fixed "
+            "timing and M5301 offset/Hold representation."
+        )
+        self._set_qcs_waveform_usage_style("normal")
+
     def set_qcs_sweep_execution_status(
         self,
         preview: QcsSweepExecutionPreview,
@@ -7409,7 +7429,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         """Show the predicted or compiled QCS repetition mode."""
 
         mode = str(preview.mode).strip().lower()
-        if mode not in {"none", "hardware", "software", "invalid"}:
+        if mode not in {"none", "hardware", "hybrid", "software", "invalid"}:
             raise ValueError(f"unsupported QCS sweep execution mode {mode!r}")
         reasons = tuple(
             str(reason).strip() for reason in preview.reasons if str(reason).strip()
@@ -7421,12 +7441,14 @@ class ExperimentPanel(QtWidgets.QWidget):
                 if preview.exact
                 else "Hardware sweep (planned)"
             ),
+            "hybrid": "Hardware sweep inside software loop",
             "software": "Software sweep",
             "invalid": "Invalid sweep",
         }
         colors = {
             "none": ("#455a64", "#eceff1"),
             "hardware": ("#1b5e20", "#e8f5e9"),
+            "hybrid": ("#0d4775", "#e3f2fd"),
             "software": ("#8a4b00", "#fff3e0"),
             "invalid": ("#b71c1c", "#ffebee"),
         }
@@ -9045,6 +9067,17 @@ class ExperimentPanel(QtWidgets.QWidget):
                     mode="none",
                     reasons=("The completed QCS Program contained one point.",),
                 )
+            elif qcs_sweep_mode == "hybrid_hardware_software":
+                preview = QcsSweepExecutionPreview(
+                    mode="hybrid",
+                    reasons=(
+                        "Confirmed by the completed QCS run: "
+                        f"{int(program_summary.get('software_iteration_count', 0)):,} "
+                        "Python iteration(s), each containing "
+                        f"{int(program_summary.get('hardware_points_per_iteration', 0)):,} "
+                        "native hardware-sweep point(s).",
+                    ),
+                )
             elif bool(program_summary.get("hardware_sweep", False)):
                 offsets = tuple(
                     float(value)
@@ -9164,6 +9197,7 @@ class QcsExperimentWorker(QtCore.QObject):
     """Run blocking Keysight QCS/QCoDeS work outside the GUI thread."""
 
     finished = QtCore.pyqtSignal(object)
+    partial_result = QtCore.pyqtSignal(object)
     stopped = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
@@ -9190,14 +9224,24 @@ class QcsExperimentWorker(QtCore.QObject):
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
             kwargs["event_callback"] = self.event_changed.emit
+            kwargs["partial_callback"] = self.partial_result.emit
             kwargs["cancellation"] = self._cancellation
             result = run_qcs_qcodes_experiment(**kwargs)
-        except QcsExperimentCancelled:
+        except QcsExperimentCancelled as exc:
             self._cancellation.mark_finished()
-            self.stopped.emit(
-                "Stopped by user; QCS execution ended and DC safety cleanup "
-                "completed"
-            )
+            stored = getattr(exc, "stored_result", None)
+            if stored is not None:
+                message = (
+                    "Stopped by user; completed QCS data was saved as "
+                    f"QCoDeS Run {int(stored.run_id)} at "
+                    f"{stored.database_path}"
+                )
+            else:
+                message = (
+                    "Stopped by user; QCS execution ended and DC safety "
+                    "cleanup completed"
+                )
+            self.stopped.emit(message)
             return
         except Exception:
             self._cancellation.mark_finished()
@@ -10287,6 +10331,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_worker: Optional[QtCore.QObject] = None
         self._active_experiment_backend = DEFAULT_EXECUTION_BACKEND
         self._last_experiment_result = None
+        self._active_qcs_partial_result = None
         self._last_stability_result = None
         self._trace_overlay_result = None
         self._trace_overlay_pinned = False
@@ -12887,6 +12932,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._experiment_panel.set_qcs_sweep_execution_status(
                 sweep_preview
             )
+            if sweep_preview.mode == "hybrid":
+                # A mixed sweep can choose a different safe fixed offset and
+                # Hold graph for each Python-loop coordinate. A full-grid
+                # host estimate can therefore reject a valid partition. The
+                # worker performs an exhaustive all-slices capacity preflight
+                # before its first hardware submission.
+                self._experiment_panel.set_qcs_mixed_waveform_capacity_pending()
+                return
             point_indices = (
                 None
                 if int(sequence.sweep_point_count) <= 256
@@ -14166,31 +14219,48 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
         )
         self._experiment_panel.set_qcs_sweep_execution_status(sweep_preview)
-        capacity_report = validate_qcs_m5301_waveform_capacity(
-            qick_arguments["sequence"],
-            fabric_mhz=self._qick_fabric_mhz,
-            amplitude_scale=(
-                self._qick_full_scale_mv
-                / (
+        sequence = qick_arguments["sequence"]
+        # Run-button preflight executes on the Qt thread.  Keep large-grid
+        # capacity feedback bounded here; QCS compilation still validates the
+        # complete sweep before submitting anything to hardware.
+        if sweep_preview.mode == "hybrid":
+            # Do not apply one full-grid offset model here: the exact mixed
+            # partition can use a different legal offset/Hold graph in each
+            # outer coordinate. The worker validates every coordinate before
+            # executing any of them.
+            self._experiment_panel.set_qcs_mixed_waveform_capacity_pending()
+        else:
+            capacity_point_indices = (
+                None
+                if int(sequence.sweep_point_count) <= 256
+                else qcs_m5301_capacity_preview_point_indices(sequence)
+            )
+            capacity_report = validate_qcs_m5301_waveform_capacity(
+                sequence,
+                point_indices=capacity_point_indices,
+                fabric_mhz=self._qick_fabric_mhz,
+                amplitude_scale=(
+                    self._qick_full_scale_mv
+                    / (
+                        self._experiment_panel.qcs_dc_full_scale_v.value()
+                        * 1000.0
+                    )
+                ),
+                auto_fixed_dc_offsets=(sweep_preview.mode == "hardware"),
+                source_full_scale_mv=self._qick_full_scale_mv,
+                dc_full_scale_v=(
                     self._experiment_panel.qcs_dc_full_scale_v.value()
-                    * 1000.0
-                )
-            ),
-            auto_fixed_dc_offsets=(sweep_preview.mode == "hardware"),
-            source_full_scale_mv=self._qick_full_scale_mv,
-            dc_full_scale_v=(
-                self._experiment_panel.qcs_dc_full_scale_v.value()
-            ),
-        )
-        physical_names = tuple(
-            name.strip()
-            for name in self._experiment_panel.qcs_dc_channel_names.text().split(",")
-            if name.strip()
-        )
-        self._experiment_panel.set_qcs_waveform_capacity(
-            capacity_report,
-            physical_names,
-        )
+                ),
+            )
+            physical_names = tuple(
+                name.strip()
+                for name in self._experiment_panel.qcs_dc_channel_names.text().split(",")
+                if name.strip()
+            )
+            self._experiment_panel.set_qcs_waveform_capacity(
+                capacity_report,
+                physical_names,
+            )
         if qick_arguments["readout_spec"] is None:
             raise ValueError(
                 "enable QCS Acquisition before running so acquisition "
@@ -15800,6 +15870,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         if isinstance(worker, QcsExperimentWorker):
+            self._active_qcs_partial_result = None
+            worker.partial_result.connect(self._on_experiment_partial)
             worker.stopped.connect(self._on_experiment_stopped)
             worker.stop_status_changed.connect(
                 self._on_experiment_stop_status
@@ -15974,6 +16046,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         reasons=(str(message),),
                     )
                 )
+            elif "hardware sweep inside software loop" in lowered_message:
+                self._experiment_panel.set_qcs_sweep_execution_status(
+                    QcsSweepExecutionPreview(
+                        mode="hybrid",
+                        reasons=(str(message),),
+                    )
+                )
             elif (
                 lowered_state == "completed"
                 and (
@@ -16084,8 +16163,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             f"Displaying {result.source_label or 'latest AWG experiment'}"
         )
 
-    def _refresh_awg_sweep_map_from_last_result(self) -> Optional[str]:
-        result = self._last_experiment_result
+    def _refresh_awg_sweep_map_from_last_result(
+        self,
+        result=None,
+        *,
+        source_label: Optional[str] = None,
+        report_error: bool = True,
+        raise_dock: bool = True,
+    ) -> Optional[str]:
+        if result is None:
+            result = self._last_experiment_result
         if result is None:
             return None
         selected = self._experiment_panel.selected_sweep_axis_keys()
@@ -16105,36 +16192,75 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 value_unit=unit,
                 measurement_mode=mode,
             )
+            run_id = int(getattr(result, "run_id", 0) or 0)
+            database_path = str(getattr(result, "database_path", "") or "")
+            if source_label is None:
+                source_label = (
+                    f"QCoDeS Run {run_id}"
+                    if run_id > 0
+                    else "Live QCS mixed sweep"
+                )
             map_result = replace(
                 map_result,
-                source_label=f"QCoDeS Run {int(result.run_id)}",
-                database_path=str(result.database_path),
-                run_id=int(result.run_id),
+                source_label=source_label,
+                database_path=database_path,
+                run_id=run_id,
                 source=(
                     None
                     if map_result.source is None
                     else replace(
                         map_result.source,
-                        source_label=f"QCoDeS Run {int(result.run_id)}",
-                        database_path=str(result.database_path),
-                        run_id=int(result.run_id),
+                        source_label=source_label,
+                        database_path=database_path,
+                        run_id=run_id,
                     )
                 ),
             )
         except Exception as exc:
-            self.statusBar().showMessage(
-                f"QCoDeS run {result.run_id} saved; "
-                f"AWG 2D map unavailable: {exc}"
-            )
+            if report_error:
+                run_id = int(getattr(result, "run_id", 0) or 0)
+                prefix = (
+                    f"QCoDeS run {run_id} saved"
+                    if run_id > 0
+                    else "Live QCS partial result"
+                )
+                self.statusBar().showMessage(
+                    f"{prefix}; AWG 2D map unavailable: {exc}"
+                )
             return str(exc)
         self._last_awg_sweep_map_result = map_result
         self._awg_sweep_plot.set_result(map_result)
         self._awg_sweep_run_selector.show_latest_result(map_result)
         self._dock_awg_sweep.show()
-        self._dock_awg_sweep.raise_()
+        if raise_dock:
+            self._dock_awg_sweep.raise_()
         return None
 
+    def _on_experiment_partial(self, result) -> None:
+        """Expose every completed mixed-sweep block without ending the run."""
+
+        self._active_qcs_partial_result = result
+        self._last_experiment_result = result
+        summary = getattr(result, "program_summary", {}) or {}
+        completed = int(summary.get("completed_points", 0))
+        planned = int(summary.get("planned_points", completed))
+        label = f"Live QCS mixed sweep ({completed:,}/{planned:,} points)"
+        self._refresh_awg_sweep_map_from_last_result(
+            result,
+            source_label=label,
+            report_error=False,
+            raise_dock=False,
+        )
+        self._experiment_panel.run_status.setText(
+            f"Mixed QCS sweep: {completed:,}/{planned:,} acquired point(s) "
+            "available; Stop remains active"
+        )
+        self.statusBar().showMessage(
+            f"{label}; completed data retained in memory"
+        )
+
     def _on_experiment_finished(self, result) -> None:
+        self._active_qcs_partial_result = None
         self._last_experiment_result = result
         self._experiment_panel.show_result(result)
         map_error = self._refresh_awg_sweep_map_from_last_result()
@@ -16166,6 +16292,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_experiment_stopped(self, message: str) -> None:
         message = str(message).strip() or "Stopped by user"
+        partial = self._active_qcs_partial_result
+        if partial is not None:
+            summary = getattr(partial, "program_summary", {}) or {}
+            completed = int(summary.get("completed_points", 0))
+            planned = int(summary.get("planned_points", completed))
+            run_id = int(getattr(partial, "run_id", 0) or 0)
+            database_path = str(
+                getattr(partial, "database_path", "") or ""
+            )
+            if run_id > 0:
+                message += (
+                    f"; retained {completed:,}/{planned:,} completed point(s) "
+                    f"in QCoDeS Run {run_id} at {database_path}"
+                )
+            else:
+                message += (
+                    f"; retained {completed:,}/{planned:,} completed point(s) "
+                    "in memory"
+                )
         self._experiment_panel.set_running(False, message)
         self._experiment_panel.finish_run_timeline(
             message,
