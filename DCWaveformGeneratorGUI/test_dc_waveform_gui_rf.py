@@ -480,13 +480,17 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert panel.ro_ch.isHidden() is True
     assert panel.segment.isHidden() is False
     assert panel.delay.isHidden() is False
-    assert panel.samples.isHidden() is False
+    assert panel.samples.isHidden() is True
+    assert panel.qcs_acquisition_duration.isHidden() is False
     assert panel.frequency_mhz.isHidden() is False
+    assert panel.qcs_acquisition_mode_widget.isHidden() is False
+    assert panel.qcs_single_iq_radio.isChecked() is True
+    assert panel.qcs_trace_radio.isChecked() is False
+    assert experiment.qcs_hw_demod.isHidden() is True
     assert panel.segment_label.text() == "Acquisition segment:"
     assert panel._delay_label.text() == "Acquisition pre-delay [us]:"
-    assert (
-        panel.samples_label.text()
-        == "Integration length (M5200 samples):"
+    assert panel.qcs_acquisition_duration_label.text() == (
+        "Acquisition time [us]:"
     )
     assert (
         panel.frequency_label.text()
@@ -494,16 +498,20 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     )
     acquisition_note = panel.qcs_acquisition_note.text()
     assert "IntegrationFilter" in acquisition_note
-    assert "64 M5200 ADC samples at 4.8 GSPS" in acquisition_note
-    assert "13.3333 ns integration duration" in acquisition_note
+    assert "64 M5200 samples at 4.8 GSPS" in acquisition_note
+    assert "programmed time 0.0133333333333 us" in acquisition_note
     assert experiment.qcs_sample_rate_hz.text() == "4.8 GSPS"
     assert experiment.qcs_sample_rate_hz.isReadOnly() is True
-    assert panel.samples.singleStep() == 16
-    panel.samples.setValue(65)
+    assert experiment.qcs_sample_rate_hz.isHidden() is True
+    panel.qcs_acquisition_duration.setValue(1.0)
     app.processEvents()
-    assert "invalid" in panel.qcs_acquisition_note.text()
-    assert "multiple of 16" in panel.qcs_acquisition_note.text()
-    panel.samples.setValue(64)
+    assert panel.configured_spec().samples_per_trigger == 4_800
+    assert "4,800 M5200 samples" in panel.qcs_acquisition_note.text()
+    panel.setChecked(True)
+    app.processEvents()
+    assert "one I/Q value/shot from 4,800 integration samples" in (
+        window.statusBar().currentMessage()
+    )
     visible_text = "\n".join(
         label.text()
         for label in panel.findChildren(QtWidgets.QLabel)
@@ -521,13 +529,37 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     panel.measurement_unit.setCurrentIndex(
         panel.measurement_unit.findData("current")
     )
-    experiment.qcs_hw_demod.setChecked(False)
+    panel.qcs_trace_radio.click()
     app.processEvents()
 
+    assert panel.qcs_trace_radio.isChecked() is True
+    assert panel.qcs_single_iq_radio.isChecked() is False
+    assert experiment.qcs_hw_demod.isChecked() is False
     assert panel.frequency_mhz.isHidden() is True
     assert panel.frequency_label.isHidden() is True
-    assert panel.samples_label.text() == "Raw acquisition samples:"
     assert "Raw acquisition" in panel.qcs_acquisition_note.text()
+    assert "4,800 trace samples/shot" in window.statusBar().currentMessage()
+
+    panel.qcs_single_iq_radio.click()
+    app.processEvents()
+    assert panel.qcs_single_iq_radio.isChecked() is True
+    assert panel.qcs_trace_radio.isChecked() is False
+    assert experiment.qcs_hw_demod.isChecked() is True
+    assert panel.frequency_mhz.isHidden() is False
+    assert "one I/Q value/shot from 4,800 integration samples" in (
+        window.statusBar().currentMessage()
+    )
+
+    experiment.set_running(True, "Test run active")
+    app.processEvents()
+    assert panel.qcs_acquisition_mode_widget.isEnabled() is False
+    assert panel.qcs_acquisition_duration.isEnabled() is False
+    panel.qcs_trace_radio.click()
+    assert panel.qcs_single_iq_radio.isChecked() is True
+    experiment.set_running(False, "Test run complete")
+    app.processEvents()
+    assert panel.qcs_acquisition_mode_widget.isEnabled() is True
+    assert panel.qcs_acquisition_duration.isEnabled() is True
 
     experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
     app.processEvents()
@@ -542,14 +574,70 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert all(not field.isHidden() for field in qick_only_fields)
     assert panel.ro_ch.isHidden() is False
     assert panel.qcs_acquisition_note.isHidden() is True
+    assert panel.qcs_acquisition_mode_widget.isHidden() is True
+    assert panel.qcs_acquisition_duration.isHidden() is True
+    assert panel.samples.isHidden() is False
     assert panel.segment_label.text() == "Anchor SET:"
     assert panel._delay_label.text() == "Trigger delay [us]:"
     assert panel.samples_label.text() == "Stored FIR samples:"
+    assert panel.samples.value() == 64
     assert panel.frequency_label.text() == "Readout/DDC frequency:"
     assert panel.margin_samples.value() == 4321
     assert panel.override_fpga_trigger_delay.isChecked() is True
     assert panel.fpga_trigger_delay_us.value() == pytest.approx(17.5)
     assert panel.measurement_unit.currentData() == "current"
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_acquisition_time_rounds_up_and_preserves_qick_samples():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_readout_panel
+    experiment = window._experiment_panel
+    panel.samples.setValue(321)
+
+    panel.qcs_acquisition_duration.setValue(0.0101)  # 10.1 ns
+    app.processEvents()
+    assert panel.qcs_acquisition_duration.value() == pytest.approx(0.0101)
+    assert panel.configured_spec().samples_per_trigger == 64
+    assert "64 M5200 samples" in panel.qcs_acquisition_note.text()
+    assert "programmed time 0.0133333333333 us" in (
+        panel.qcs_acquisition_note.text()
+    )
+
+    panel.qcs_trace_radio.click()
+    app.processEvents()
+    assert panel.qcs_acquisition_duration.value() == pytest.approx(0.0101)
+    assert panel.configured_spec().samples_per_trigger == 49
+    assert "49 M5200 samples" in panel.qcs_acquisition_note.text()
+    assert "programmed time 0.0102083333333 us" in (
+        panel.qcs_acquisition_note.text()
+    )
+
+    panel.qcs_acquisition_duration.setValue(0.001)  # 1 ns
+    assert panel.configured_spec().samples_per_trigger == 5
+    panel.qcs_single_iq_radio.click()
+    app.processEvents()
+    assert panel.qcs_acquisition_duration.value() == pytest.approx(0.001)
+    assert panel.configured_spec().samples_per_trigger == 16
+
+    panel.qcs_trace_radio.click()
+    panel.qcs_acquisition_duration.setValue(0.0101)
+
+    panel.set_time_unit("ns")
+    assert panel.qcs_acquisition_duration.value() == pytest.approx(10.1)
+    assert panel.qcs_acquisition_duration_label.text() == (
+        "Acquisition time [ns]:"
+    )
+    assert panel.configured_spec().samples_per_trigger == 49
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    app.processEvents()
+    assert panel.samples.value() == 321
+    assert panel.samples.isHidden() is False
+    assert panel.qcs_acquisition_duration.isHidden() is True
 
     window.close()
     app.processEvents()
@@ -1248,6 +1336,9 @@ def test_generated_qick_module_preserves_hold_duration_sweep():
 def test_rf_readout_panel_builds_analog_input_and_ddr_settings():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     panel = window._rf_readout_panel
     panel.setChecked(True)
     panel.ro_ch.setValue(2)
@@ -1665,6 +1756,9 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
 def test_experiment_panel_builds_hardware_run_snapshot(tmp_path):
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     window._experiment_panel.database_path.setText(str(tmp_path / "run.db"))
     window._experiment_panel.experiment_name.setText("GUI run")
     window._experiment_panel.sample_name.setText("sample 1")
@@ -1891,7 +1985,11 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
         arguments["sequence"].sweep_axes[0].points,
         [-0.4, 0.0, 0.4],
     )
-    assert arguments["sequence"].bias_t_compensation is None
+    compensation = arguments["sequence"].bias_t_compensation
+    assert compensation is not None
+    assert compensation.compensation_type == "dc"
+    assert compensation.mode == "fixed_time"
+    assert compensation.fixed_duration_cycles == 300
     assert window._stability_panel.bias_t_group.isChecked() is True
     assert arguments["rf_pulses"][0].gen_ch == 7
     assert arguments["rf_pulses"][0].amplitude == pytest.approx(
@@ -1932,6 +2030,61 @@ def test_experiment_panel_exposes_show_program_action():
     panel.close()
 
 
+def test_experiment_panel_qcs_stop_button_lifecycle():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+    stopped = []
+    panel.stop_requested.connect(lambda: stopped.append(True))
+
+    assert panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert panel.stop_button.isHidden() is False
+    assert panel.stop_button.isEnabled() is False
+
+    panel.set_running(True, "Running QCS", allow_stop=True)
+    assert panel.run_button.isEnabled() is False
+    assert panel.stop_button.isEnabled() is True
+    panel.stop_button.click()
+    app.processEvents()
+    assert stopped == [True]
+
+    panel.set_stopping()
+    assert panel.stop_button.isEnabled() is False
+    assert "Stopping" in panel.run_status.text()
+    panel.set_running(False, "Stopped")
+    assert panel.run_button.isEnabled() is True
+    assert panel.stop_button.isEnabled() is False
+
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    assert panel.stop_button.isHidden() is True
+    panel.close()
+
+
+def test_qcs_stop_button_disables_when_hardware_acquisition_finishes():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    panel.set_running(True, "Running QCS", allow_stop=True)
+    assert panel.stop_button.isEnabled() is True
+
+    window._on_experiment_event(
+        "acquisition",
+        "completed",
+        "QCS hardware execution completed",
+    )
+    app.processEvents()
+
+    assert panel.stop_button.isEnabled() is False
+    window.close()
+    app.processEvents()
+
+
 def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     app = _application()
     panel = gui.ExperimentPanel(
@@ -1948,6 +2101,15 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     assert panel.execution_system_label.text() == "Keysight QCS / M5000"
     assert panel.show_program_button.isHidden() is True
     assert panel.ddr_usage_group.isHidden() is True
+    assert panel.qcs_waveform_usage_group.isHidden() is False
+    assert panel.qcs_waveform_usage_group.isEnabled() is True
+    assert panel.full_scale_mv_label.isHidden() is True
+    assert panel.full_scale_mv.isHidden() is True
+    assert panel.qcs_sample_rate_hz.isHidden() is True
+    assert "M5200 ADC sample rate:" not in {
+        label.text()
+        for label in panel.qcs_connection_group.findChildren(QtWidgets.QLabel)
+    }
     assert panel.compile_validation_mode.isHidden() is True
     assert panel.qcs_mapper_path.isReadOnly() is True
     assert panel.qcs_dc_channel_names.isReadOnly() is True
@@ -1985,7 +2147,184 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     # HCL stores whole nanoseconds, and 300 MHz timing is exactly representable
     # every 10 ns. Inter-shot initialization rounds upward, never shorter.
     assert qcs_connection.init_time_s == pytest.approx(0.130e-6)
+
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    assert panel.full_scale_mv_label.isHidden() is False
+    assert panel.full_scale_mv.isHidden() is False
+    assert panel.qcs_sample_rate_hz.isHidden() is True
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    assert panel.full_scale_mv_label.isHidden() is True
+    assert panel.full_scale_mv.isHidden() is True
     panel.close()
+
+
+def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._experiment_panel
+    app.processEvents()
+
+    assert panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert panel.qcs_waveform_usage_group.isHidden() is False
+    assert panel.qcs_waveform_usage_progress.maximum() == 98_304
+    assert panel.qcs_waveform_usage_progress.value() == 2_400
+    assert "2,400 / 98,304 samples" in (
+        panel.qcs_waveform_usage_progress.format()
+    )
+
+    window._pulse[0].t = np.asarray([0.0, 1_001.0])
+    window._pulse[0].v = np.asarray([100.0, 100.0])
+    window._refresh_qcs_waveform_capacity()
+    assert panel.qcs_waveform_usage_progress.format() == "Invalid waveform setup"
+    assert "16-sample waveform granularity" in (
+        panel.qcs_waveform_usage_detail.text()
+    )
+
+    window._pulse[0].t = np.asarray([0.0, 40_960.0])
+    window._pulse[0].v = np.asarray([100.0, 100.0])
+    window._refresh_qcs_waveform_capacity()
+    assert panel.qcs_waveform_usage_progress.value() == 98_304
+    assert "100.00%" in panel.qcs_waveform_usage_progress.format()
+    assert "#c58a1c" in panel.qcs_waveform_usage_progress.styleSheet()
+
+    window._pulse[0].t = np.asarray([0.0, 40_966.0])
+    window._refresh_qcs_waveform_capacity()
+    assert panel.qcs_waveform_usage_progress.value() == 98_304
+    assert "98,320 / 98,304 samples (100.02%)" == (
+        panel.qcs_waveform_usage_progress.format()
+    )
+    assert "#b33a3a" in panel.qcs_waveform_usage_progress.styleSheet()
+    assert "run is blocked" in panel.qcs_waveform_usage_detail.text()
+    with pytest.raises(ValueError, match=r"98,320 / 98,304 samples"):
+        window._qcs_experiment_run_arguments()
+
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    assert panel.qcs_waveform_usage_group.isHidden() is True
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    assert panel.qcs_waveform_usage_group.isHidden() is False
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_sweep_execution_indicator_shows_mode_and_fallback_reason():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+
+    panel.set_qcs_sweep_execution_status(
+        gui.QcsSweepExecutionPreview(
+            mode="hardware",
+            reasons=("The mapped offset is checked during compilation.",),
+            exact=False,
+        )
+    )
+    assert "Hardware sweep (planned)" in (
+        panel.qcs_sweep_execution_mode_label.text()
+    )
+    assert "mapped offset" in panel.qcs_sweep_execution_reason_label.text()
+    assert "#1b5e20" in panel.qcs_sweep_execution_indicator.styleSheet()
+
+    panel.set_qcs_sweep_execution_status(
+        gui.QcsSweepExecutionPreview(
+            mode="software",
+            reasons=("Raw trace acquisition requires software resolution.",),
+        )
+    )
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Software sweep"
+    )
+    assert "Raw trace" in panel.qcs_sweep_execution_indicator.toolTip()
+    assert "#8a4b00" in panel.qcs_sweep_execution_indicator.styleSheet()
+
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    assert panel.qcs_sweep_execution_indicator.isHidden() is True
+    panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    assert panel.qcs_sweep_execution_indicator.isHidden() is False
+    panel.close()
+    app.processEvents()
+
+
+def test_qcs_sweep_execution_indicator_tracks_live_voltage_sweep_and_trace_mode():
+    app = _application()
+    window = gui.MainWindow()
+    pulse = PulseSequence(-100.0, initial_duration_ns=10_000.0)
+    pulse.add_flat_ramp(10_000.0, 400.0, 100.0)
+    pulse.add_flat_ramp(10_000.0, 100_000.0, -100.0)
+    window._pulse = [pulse]
+    window._cross_capacitance = np.eye(1)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.125, -0.3125, 20)
+    ]
+
+    window._refresh_sweep_overlay()
+    app.processEvents()
+    panel = window._experiment_panel
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Hardware sweep (planned)"
+    )
+    assert "M5301 offset" in panel.qcs_sweep_execution_reason_label.text()
+    assert panel.qcs_waveform_usage_progress.value() == 72_000
+
+    panel.qcs_hw_demod.setChecked(False)
+    app.processEvents()
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Software sweep"
+    )
+    assert "Raw trace" in panel.qcs_sweep_execution_reason_label.text()
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_sweep_indicator_accepts_two_output_101_by_101_hardware_grid():
+    app = _application()
+    window = gui.MainWindow()
+    pulses = []
+    for initial_mv, final_mv in ((-100.0, -100.0), (-100.0, -75.0)):
+        pulse = PulseSequence(initial_mv, initial_duration_ns=10_000.0)
+        pulse.add_flat_ramp(10_000.0, 400.0, 100.0)
+        pulse.add_flat_ramp(10_000.0, 100_000.0, final_mv)
+        pulses.append(pulse)
+    window._pulse[0] = pulses[0]
+    window._plot._pulses[0] = pulses[0]
+    window._add_port()
+    window._pulse[1].v = pulses[1].v.copy()
+    window._pulse[1].segment_names = list(pulses[1].segment_names)
+    window._cross_capacitance = np.eye(2)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.125, -0.3125, 101),
+        QickSweepSpec("set_2", "awg_1", -0.09375, -0.375, 101),
+    ]
+
+    window._refresh_sweep_overlay()
+    app.processEvents()
+
+    panel = window._experiment_panel
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Hardware sweep (planned)"
+    )
+    reason = panel.qcs_sweep_execution_reason_label.text()
+    assert "100 us inter-shot initialization gap" in reason
+    assert panel.qcs_waveform_usage_progress.value() == 72_000
+
+    window._active_experiment_backend = gui.EXECUTION_BACKEND_QCS
+    window._on_experiment_event(
+        "program_build",
+        "started",
+        "Compiling fixed numeric QCS DC-ramp programs",
+    )
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Software sweep"
+    )
+
+    window.close()
+    app.processEvents()
 
 
 def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
@@ -2014,7 +2353,7 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     readout = window._rf_readout_panel
     readout.setChecked(True)
     readout.delay.setValue(0.5)
-    readout.samples.setValue(32)
+    readout.qcs_acquisition_duration.setValue(32 / 4.8e9 * 1.0e6)
     readout.frequency_mhz.setValue(42.0)
     readout.margin_samples.setValue(9876)
     readout.override_fpga_trigger_delay.setChecked(True)
@@ -2042,6 +2381,8 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     assert qcs_rf.phase_rad == pytest.approx(np.pi / 2)
     assert qcs_rf.require_within_segment is True
     acquisition = arguments["acquisition"]
+    assert readout.qcs_single_iq_radio.isChecked() is True
+    assert arguments["connection_config"].hw_demod is True
     assert acquisition.at_segment == "set_0"
     assert acquisition.pre_delay_s == pytest.approx(0.5e-6)
     assert acquisition.sample_rate_hz == pytest.approx(4.8e9)
@@ -2050,9 +2391,11 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     assert acquisition.frequency_hz == pytest.approx(42.0e6)
     assert arguments["gui_settings"]["experiment"]["execution_backend"] == "qcs"
 
-    experiment.qcs_hw_demod.setChecked(False)
+    readout.qcs_trace_radio.click()
     app.processEvents()
     raw_arguments = window._qcs_experiment_run_arguments()
+    assert readout.qcs_trace_radio.isChecked() is True
+    assert experiment.qcs_hw_demod.isChecked() is False
     assert raw_arguments["connection_config"].hw_demod is False
     assert raw_arguments["acquisition"].sample_count == 32
     assert raw_arguments["acquisition"].frequency_hz == 0.0
@@ -2378,10 +2721,42 @@ def test_qcs_experiment_worker_forwards_progress_and_events(monkeypatch):
     assert failures == []
     assert results == [sentinel]
     assert received["sequence"] is not None
+    assert isinstance(
+        received["cancellation"],
+        gui.QcsCancellationController,
+    )
     assert progress == [(42, "Executing QCS")]
     assert events == [
         ("execution", "started", "Keysight executor started")
     ]
+
+
+def test_qcs_experiment_worker_reports_user_stop_without_failure(monkeypatch):
+    app = _application()
+
+    def fake_run_qcs_qcodes_experiment(**kwargs):
+        assert kwargs["cancellation"].is_stop_requested() is True
+        raise gui.QcsExperimentCancelled("stopped by user")
+
+    monkeypatch.setattr(
+        gui,
+        "run_qcs_qcodes_experiment",
+        fake_run_qcs_qcodes_experiment,
+    )
+    stopped = []
+    failures = []
+    worker = gui.QcsExperimentWorker({"sequence": object()})
+    worker.stopped.connect(stopped.append)
+    worker.failed.connect(failures.append)
+
+    assert worker.request_stop() is True
+    assert worker.request_stop() is False
+    worker.run()
+    app.processEvents()
+
+    assert failures == []
+    assert len(stopped) == 1
+    assert "Stopped by user" in stopped[0]
 
 
 def test_qick_assembly_dialog_is_read_only_and_copyable():
@@ -2496,13 +2871,16 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_dc_full_scale_v.setValue(2.5)
     panel.qcs_rf_channel_names.setText("0=rf_drive")
     panel.qcs_acquisition_channel_name.setText("digitizer")
-    panel.qcs_hw_demod.setChecked(False)
+    source._rf_readout_panel.samples.setValue(777)
+    source._rf_readout_panel.qcs_acquisition_duration.setValue(0.0101)
+    source._rf_readout_panel.qcs_trace_radio.click()
+    assert panel.qcs_hw_demod.isChecked() is False
     panel.qcs_sample_rate_hz.setValue(2.4e9)
     assert panel.qcs_sample_rate_hz.value() == pytest.approx(4.8e9)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 36
+    assert document["version"] == 37
     assert document["experiment"]["execution_backend"] == "qcs"
     assert document["qcs"] == {
         "mapper_path": str(tmp_path / "mapper.json"),
@@ -2518,6 +2896,10 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
         "hardware_configuration_state": "external",
         "hardware_mapper_sha256": None,
     }
+    assert document["rf_readout"]["samples_per_trigger"] == 777
+    assert document["rf_readout"][
+        "qcs_acquisition_duration_s"
+    ] == pytest.approx(10.1e-9)
 
     restored = gui.MainWindow()
     restored._apply_decoded_settings(restored._decode_settings(document))
@@ -2529,6 +2911,12 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert restored_panel.qcs_rf_channel_names.text() == "0=rf_drive"
     assert restored_panel.qcs_acquisition_channel_name.text() == "digitizer"
     assert restored_panel.qcs_hw_demod.isChecked() is False
+    assert restored._rf_readout_panel.qcs_trace_radio.isChecked() is True
+    assert restored._rf_readout_panel.qcs_single_iq_radio.isChecked() is False
+    assert restored._rf_readout_panel.samples.value() == 777
+    assert restored._rf_readout_panel.qcs_acquisition_duration.value() == (
+        pytest.approx(0.0101)
+    )
     assert restored_panel.qcs_sample_rate_hz.value() == pytest.approx(4.8e9)
     assert restored_panel.qcs_init_time_us.value() == pytest.approx(0.25)
 
@@ -2537,6 +2925,36 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     decoded_legacy_rate = source._decode_settings(legacy_rate_document)
     assert decoded_legacy_rate["qcs_settings"]["sample_rate_hz"] == (
         pytest.approx(4.8e9)
+    )
+
+    document_without_mode = json.loads(json.dumps(document))
+    document_without_mode["qcs"].pop("hw_demod")
+    restored_without_mode = gui.MainWindow()
+    restored_without_mode._apply_decoded_settings(
+        restored_without_mode._decode_settings(document_without_mode)
+    )
+    assert (
+        restored_without_mode._rf_readout_panel
+        .qcs_single_iq_radio.isChecked()
+        is True
+    )
+    assert (
+        restored_without_mode._rf_readout_panel.qcs_trace_radio.isChecked()
+        is False
+    )
+
+    version_36 = json.loads(json.dumps(document))
+    version_36["version"] = 36
+    version_36["rf_readout"].pop("qcs_acquisition_duration_s")
+    restored_version_36 = gui.MainWindow()
+    restored_version_36._apply_decoded_settings(
+        restored_version_36._decode_settings(version_36)
+    )
+    assert restored_version_36._rf_readout_panel.samples.value() == 777
+    assert (
+        restored_version_36._rf_readout_panel
+        .qcs_acquisition_duration.value()
+        == pytest.approx(777 / 4.8e9 * 1.0e6)
     )
 
     version_35 = json.loads(json.dumps(document))
@@ -2574,6 +2992,8 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     )
     for window in (
         restored_version_35,
+        restored_version_36,
+        restored_without_mode,
         restored,
         source,
     ):
@@ -3104,7 +3524,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 36
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 37
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

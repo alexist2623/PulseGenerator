@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -28,6 +29,111 @@ def _application():
             or QtWidgets.QApplication([])
         )
     return _APP
+
+
+def _wait_for_qcs_mapper_commit(window, *, timeout_ms: int = 5000) -> None:
+    """Drain Qt events until the latest background mapper request is idle."""
+
+    app = _application()
+    elapsed = QtCore.QElapsedTimer()
+    elapsed.start()
+    while elapsed.elapsed() < timeout_ms:
+        # The connector signal first queues request capture with singleShot(0),
+        # then the worker's result returns through queued cross-thread signals.
+        app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        thread = window._qcs_mapper_commit_thread
+        if (
+            thread is None
+            and window._qcs_mapper_commit_active is None
+            and window._qcs_mapper_commit_queued is None
+        ):
+            # Give a pending singleShot(0) one additional opportunity to start.
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            if (
+                window._qcs_mapper_commit_thread is None
+                and window._qcs_mapper_commit_active is None
+                and window._qcs_mapper_commit_queued is None
+            ):
+                return
+        QtTest.QTest.qWait(5)
+
+    thread = window._qcs_mapper_commit_thread
+    pytest.fail(
+        "QCS mapper commit did not finish within "
+        f"{timeout_ms} ms (thread_running="
+        f"{thread is not None and thread.isRunning()}, "
+        f"active={window._qcs_mapper_commit_active is not None}, "
+        f"queued={window._qcs_mapper_commit_queued is not None})"
+    )
+
+
+def _open_saved_qcs_output_window(tmp_path, *, acquisition_name=None):
+    """Open one run-ready QCS output picker for mapper race tests."""
+
+    app = _application()
+    original_mapper = tmp_path / "race_original.qcs"
+    original_mapper.write_bytes(b"original mapper")
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_only",),
+        {},
+        acquisition_name,
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "mapper_path": str(original_mapper),
+            "dc_channel_names": ["dc_only"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": acquisition_name,
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_SAVED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(original_mapper)
+            ),
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    window._show_active_front_panel("output", window._multi_ctrl)
+    app.processEvents()
+    assert window._qcs_front_panel._focused_mapping == ("dc", 0)
+    return app, window, experiment, original_mapper
+
+
+def _wait_for_event(event, *, timeout_ms: int = 2000) -> None:
+    """Wait for a worker-side threading.Event while keeping Qt responsive."""
+
+    app = _application()
+    elapsed = QtCore.QElapsedTimer()
+    elapsed.start()
+    while not event.is_set() and elapsed.elapsed() < timeout_ms:
+        app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        QtTest.QTest.qWait(5)
+    assert event.is_set() is True
+
+
+def _close_qcs_race_window(window, *release_events) -> None:
+    """Release test workers, drain them, and safely destroy their window."""
+
+    app = _application()
+    for event in release_events:
+        event.set()
+    _wait_for_qcs_mapper_commit(window)
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
 
 
 def _example_configuration(name: str) -> dict:
@@ -404,6 +510,110 @@ def test_compact_preview_highlights_selected_physical_sma():
     assert preview._selected_address() == (7, 2)
     assert second_png != first_png
     assert "M5301A slot 7 ch2" in preview.binding_label.text()
+    preview.close()
+
+
+def test_compact_preview_skips_unchanged_configuration_and_selection(
+    monkeypatch,
+):
+    _application()
+    configuration = _example_configuration("lab_baseline")
+    preview = front_panel.QcsFrontPanelPreview()
+    preview.set_configuration(configuration)
+    refreshes = []
+    monkeypatch.setattr(
+        preview,
+        "_refresh_pixmap",
+        lambda: refreshes.append("pixmap"),
+    )
+
+    preview.set_configuration(json.loads(json.dumps(configuration)))
+    preview.set_selection("dc", 0)
+
+    assert refreshes == []
+    preview.set_selection("dc", 1)
+    assert refreshes == ["pixmap"]
+    preview.close()
+
+
+def test_hidden_parented_preview_defers_render_until_shown(monkeypatch):
+    app = _application()
+    parent = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(parent)
+    preview = front_panel.QcsFrontPanelPreview(parent)
+    layout.addWidget(preview)
+    configuration = _example_configuration("lab_baseline")
+    original_pixmap = front_panel._qcs_front_panel_pixmap
+    rendered_addresses = []
+
+    def tracked_pixmap(
+        candidate,
+        highlighted_address=None,
+        **kwargs,
+    ):
+        rendered_addresses.append(highlighted_address)
+        return original_pixmap(
+            candidate,
+            highlighted_address,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        front_panel,
+        "_qcs_front_panel_pixmap",
+        tracked_pixmap,
+    )
+    preview.set_configuration(configuration)
+    preview.set_selection("dc", 1)
+
+    assert rendered_addresses == []
+    assert preview._configuration is not None
+    assert preview._selected_address() == (7, 2)
+    assert "M5301A slot 7 ch2" in preview.binding_label.text()
+    assert preview._pixmap_refresh_pending is True
+
+    parent.show()
+    app.processEvents()
+
+    assert rendered_addresses == [(7, 2)]
+    assert preview._pixmap_refresh_pending is False
+    assert preview._pixmap.size() == QtCore.QSize(1914, 652)
+    parent.close()
+
+
+def test_compact_preview_reuses_decoded_chassis_image():
+    _application()
+    configuration = _example_configuration("lab_baseline")
+    front_panel._cached_qcs_front_panel_png.cache_clear()
+    front_panel._cached_qcs_front_panel_image.cache_clear()
+
+    first = front_panel._qcs_front_panel_pixmap(configuration, (7, 1))
+    second = front_panel._qcs_front_panel_pixmap(configuration, (7, 1))
+
+    assert first.isNull() is False
+    assert _pixmap_png(second) == _pixmap_png(first)
+    image_cache = front_panel._cached_qcs_front_panel_image.cache_info()
+    assert image_cache.misses == 1
+    assert image_cache.hits == 1
+
+
+def test_hardware_preview_skips_unchanged_backend(monkeypatch):
+    _application()
+    preview = gui.HardwareFrontPanelPreview()
+    assert preview.currentWidget() is preview.qcs_preview
+    synchronizations = []
+    monkeypatch.setattr(
+        preview,
+        "_sync_current_size_constraints",
+        lambda: synchronizations.append("size"),
+    )
+
+    preview.set_backend(gui.EXECUTION_BACKEND_QCS)
+    assert synchronizations == []
+
+    preview.set_backend(gui.EXECUTION_BACKEND_QICK)
+    assert synchronizations == ["size"]
+    assert preview.currentWidget() is preview.qick_preview
     preview.close()
 
 
@@ -897,8 +1107,20 @@ def test_stability_path_focus_routes_sma_click_by_module(tmp_path):
     )
 
     assert control.focus_rf_acquisition_path(0, 0) is True
+    initial_configuration = control._preview_configuration_from_widgets()
+    initial_acquisition = next(
+        (
+            int(mapping["slot"]),
+            int(mapping["channel"]),
+        )
+        for mapping in initial_configuration["channel_mappings"]
+        if mapping["role"] == "acquisition"
+    )
     assert control.select_connector(2, 2) is True
     assert control._focused_mapping == ("rf", 0)
+    assert control._focused_mapping_addresses(
+        control._preview_configuration_from_widgets()
+    ) == ((2, 2), initial_acquisition)
     rf_mapping = next(
         mapping
         for mapping in control._mappings_from_widgets()
@@ -917,9 +1139,20 @@ def test_stability_path_focus_routes_sma_click_by_module(tmp_path):
         acquisition_mapping["slot"],
         acquisition_mapping["channel"],
     ) == (5, 2)
+    assert control._focused_mapping_addresses(
+        control._preview_configuration_from_widgets()
+    ) == ((2, 2), (5, 2))
+
+    # Selecting the RF endpoint again must retain the acquisition highlight.
+    assert control.select_connector(2, 3) is True
+    assert control._focused_mapping == ("rf", 0)
+    assert control._focused_mapping_addresses(
+        control._preview_configuration_from_widgets()
+    ) == ((2, 3), (5, 2))
     assert [item[:4] for item in selected] == [
         ("rf", 0, 2, 2),
         ("acquisition", 0, 5, 2),
+        ("rf", 0, 2, 3),
     ]
 
     # Leaving the Stability path restores the strict single-role picker.
@@ -1998,7 +2231,7 @@ def test_main_window_identifies_qcs_hardware_off_gui_thread(monkeypatch):
     monkeypatch.setattr(
         window._qcs_front_panel,
         "apply_discovered_hardware_configuration",
-        lambda inventory: received.append(inventory) or True,
+        lambda inventory, **_kwargs: received.append(inventory) or True,
     )
     window._qcs_front_panel_source_snapshot = (
         window._current_qcs_front_panel_source_snapshot()
@@ -2256,10 +2489,6 @@ def test_awg_edit_opens_focused_qcs_sma_picker_and_applies_selection(
     assert window._multi_ctrl._selected_index == 1
     assert compact_preview._selected_address() == (2, 2)
     assert _pixmap_png(compact_preview._pixmap) != first_output_png
-
-    QtTest.QTest.mouseClick(compact_preview, QtCore.Qt.LeftButton)
-    app.processEvents()
-
     assert window._qcs_front_panel_dialog.isVisible() is True
     assert window._qcs_front_panel._focused_mapping == ("dc", 1)
     assert (
@@ -2270,7 +2499,7 @@ def test_awg_edit_opens_focused_qcs_sma_picker_and_applies_selection(
     )
 
     assert window._qcs_front_panel.select_connector(2, 3) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     applied_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
@@ -2305,6 +2534,584 @@ def test_awg_edit_opens_focused_qcs_sma_picker_and_applies_selection(
         QtCore.QEvent.DeferredDelete,
     )
     app.processEvents()
+
+
+def test_qcs_sma_selection_stays_responsive_and_blocks_run_until_mapper_saved(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    original_mapper = tmp_path / "original_mapper.qcs"
+    original_mapper.write_bytes(b"original mapper")
+    automatic_mapper = tmp_path / "background_mapper.qcs"
+    save_started = threading.Event()
+    release_save = threading.Event()
+    worker_thread_ids = []
+    warnings = []
+
+    def blocking_save(_configuration, path):
+        worker_thread_ids.append(int(QtCore.QThread.currentThreadId()))
+        save_started.set()
+        if not release_save.wait(5.0):
+            raise TimeoutError("test did not release background mapper save")
+        output_path = Path(path)
+        output_path.write_bytes(b"background mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", blocking_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda _parent, title, message, *_args, **_kwargs: (
+            warnings.append((str(title), str(message)))
+            or QtWidgets.QMessageBox.Ok
+        ),
+    )
+
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_only",),
+        {},
+        None,
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "mapper_path": str(original_mapper),
+            "dc_channel_names": ["dc_only"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_SAVED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(original_mapper)
+            ),
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    window._show_active_front_panel("output", window._multi_ctrl)
+    app.processEvents()
+
+    gui_thread_id = int(QtCore.QThread.currentThreadId())
+    watchdog = threading.Timer(3.0, release_save.set)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        # The save is still unreleased, so returning here proves that the SMA
+        # click did not execute native mapper work synchronously.
+        assert release_save.is_set() is False
+        assert experiment._qcs_front_panel_draft_pending is True
+        assert window._qcs_front_panel._focused_mapping_address(
+            window._qcs_front_panel.working_configuration()
+        ) == (2, 2)
+
+        elapsed = QtCore.QElapsedTimer()
+        elapsed.start()
+        while not save_started.is_set() and elapsed.elapsed() < 2000:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            QtTest.QTest.qWait(5)
+        assert save_started.is_set() is True
+        assert release_save.is_set() is False
+        assert worker_thread_ids and worker_thread_ids[0] != gui_thread_id
+
+        heartbeat = []
+        QtCore.QTimer.singleShot(0, lambda: heartbeat.append(True))
+        app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        assert heartbeat == [True]
+        assert release_save.is_set() is False
+
+        assert experiment._qcs_front_panel_draft_pending is True
+        with pytest.raises(ValueError, match="assignment is incomplete"):
+            experiment.qcs_connection_values(1)
+
+        # Exercise the actual Run entrypoint while avoiding unrelated waveform
+        # and acquisition validation. It must stop at the pending-mapper guard.
+        monkeypatch.setattr(
+            window,
+            "_qcs_experiment_run_arguments",
+            lambda: experiment.qcs_connection_values(1),
+        )
+        window._run_experiment()
+        assert window._experiment_thread is None
+        assert warnings
+        assert "assignment is incomplete" in warnings[-1][1]
+
+        canonical_before_save = experiment.qcs_settings_dict()[
+            "hardware_configuration"
+        ]
+        assert canonical_before_save["channel_mappings"][0]["channel"] == 1
+
+        release_save.set()
+        _wait_for_qcs_mapper_commit(window)
+        saved = experiment.qcs_settings_dict()
+        assert saved["hardware_configuration_state"] == (
+            front_panel.QCS_HARDWARE_STATE_SAVED
+        )
+        assert saved["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 2
+        assert experiment._qcs_front_panel_draft_pending is False
+        assert automatic_mapper.is_file()
+    finally:
+        release_save.set()
+        watchdog.cancel()
+        _wait_for_qcs_mapper_commit(window)
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
+        )
+        app.processEvents()
+
+
+def test_rapid_qcs_sma_selection_ignores_stale_success_and_latest_wins(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    original_mapper = tmp_path / "rapid_original.qcs"
+    original_mapper.write_bytes(b"original mapper")
+    automatic_mapper = tmp_path / "rapid_background.qcs"
+    first_started = threading.Event()
+    release_first = threading.Event()
+    latest_started = threading.Event()
+    release_latest = threading.Event()
+    saved_channels = []
+
+    def controlled_save(configuration, path):
+        dc_mapping = next(
+            mapping
+            for mapping in configuration["channel_mappings"]
+            if mapping["role"] == "dc" and mapping["logical_index"] == 0
+        )
+        channel = int(dc_mapping["channel"])
+        saved_channels.append(channel)
+        if channel == 2:
+            first_started.set()
+            if not release_first.wait(5.0):
+                raise TimeoutError("test did not release stale mapper save")
+        elif channel == 3:
+            latest_started.set()
+            if not release_latest.wait(5.0):
+                raise TimeoutError("test did not release latest mapper save")
+        else:
+            raise AssertionError(f"unexpected saved channel {channel}")
+        output_path = Path(path)
+        output_path.write_bytes(f"mapper channel {channel}".encode("ascii"))
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", controlled_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_only",),
+        {},
+        None,
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "mapper_path": str(original_mapper),
+            "dc_channel_names": ["dc_only"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_SAVED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(original_mapper)
+            ),
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    window._show_active_front_panel("output", window._multi_ctrl)
+    app.processEvents()
+
+    watchdog = threading.Timer(
+        5.0,
+        lambda: (release_first.set(), release_latest.set()),
+    )
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        elapsed = QtCore.QElapsedTimer()
+        elapsed.start()
+        while not first_started.is_set() and elapsed.elapsed() < 2000:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            QtTest.QTest.qWait(5)
+        assert first_started.is_set() is True
+        assert release_first.is_set() is False
+
+        # This later click updates the visible draft immediately while the CH2
+        # native mapper is still being written by the serialized worker.
+        assert window._qcs_front_panel.select_connector(2, 3) is True
+        assert window._qcs_front_panel._focused_mapping_address(
+            window._qcs_front_panel.working_configuration()
+        ) == (2, 3)
+        elapsed.restart()
+        while (
+            window._qcs_mapper_commit_queued is None
+            and elapsed.elapsed() < 2000
+        ):
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            QtTest.QTest.qWait(5)
+        assert window._qcs_mapper_commit_queued is not None
+        assert window._qcs_mapper_commit_queued["address"] == (2, 3)
+        assert experiment._qcs_front_panel_draft_pending is True
+
+        release_first.set()
+        elapsed.restart()
+        while not latest_started.is_set() and elapsed.elapsed() < 3000:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            QtTest.QTest.qWait(5)
+        assert latest_started.is_set() is True
+        assert release_latest.is_set() is False
+
+        # CH2 completed successfully, including writing a native file, but its
+        # stale revision must not reach canonical Experiment settings.
+        canonical = experiment.qcs_settings_dict()["hardware_configuration"]
+        assert canonical["channel_mappings"][0]["channel"] == 1
+        assert experiment._qcs_front_panel_draft_pending is True
+        assert window._qcs_front_panel_dialog.isVisible() is True
+        assert window._qcs_front_panel._focused_mapping_address(
+            window._qcs_front_panel.working_configuration()
+        ) == (2, 3)
+
+        release_latest.set()
+        _wait_for_qcs_mapper_commit(window)
+        final_settings = experiment.qcs_settings_dict()
+        assert saved_channels == [2, 3]
+        assert final_settings["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 3
+        assert final_settings["hardware_configuration_state"] == (
+            front_panel.QCS_HARDWARE_STATE_SAVED
+        )
+        assert experiment._qcs_front_panel_draft_pending is False
+        assert window._qcs_front_panel_dialog.isVisible() is False
+    finally:
+        release_first.set()
+        release_latest.set()
+        watchdog.cancel()
+        _wait_for_qcs_mapper_commit(window)
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None,
+            QtCore.QEvent.DeferredDelete,
+        )
+        app.processEvents()
+
+
+def test_qcs_mapper_completion_is_stale_after_switching_to_qick(
+    monkeypatch,
+    tmp_path,
+):
+    automatic_mapper = tmp_path / "backend_switch_mapper.qcs"
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def blocking_save(_configuration, path):
+        save_started.set()
+        if not release_save.wait(5.0):
+            raise TimeoutError("test did not release backend-switch save")
+        output_path = Path(path)
+        output_path.write_bytes(b"backend-switch mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", blocking_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    _app, window, experiment, original_mapper = (
+        _open_saved_qcs_output_window(tmp_path)
+    )
+    watchdog = threading.Timer(4.0, release_save.set)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        _wait_for_event(save_started)
+        assert release_save.is_set() is False
+        assert experiment._qcs_front_panel_draft_pending is True
+
+        experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+        assert experiment.execution_backend() == gui.EXECUTION_BACKEND_QICK
+        release_save.set()
+        _wait_for_qcs_mapper_commit(window)
+
+        # The stale worker may finish its atomic local file, but it cannot
+        # restore QCS or replace the last run-ready canonical mapper.
+        assert experiment.execution_backend() == gui.EXECUTION_BACKEND_QICK
+        settings = experiment.qcs_settings_dict()
+        assert Path(settings["mapper_path"]) == original_mapper
+        assert settings["hardware_configuration_state"] == (
+            front_panel.QCS_HARDWARE_STATE_SAVED
+        )
+        assert settings["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 1
+        pending = window._pending_qcs_front_panel_state()
+        assert pending is not None
+        assert pending[0]["channel_mappings"][0]["channel"] == 2
+        assert experiment._qcs_front_panel_draft_pending is True
+        with pytest.raises(ValueError, match="background mapper update"):
+            experiment.qcs_connection_values(1)
+    finally:
+        watchdog.cancel()
+        _close_qcs_race_window(window, release_save)
+
+
+def test_qcs_mapper_completion_is_stale_after_source_binding_edit(
+    monkeypatch,
+    tmp_path,
+):
+    automatic_mapper = tmp_path / "binding_edit_mapper.qcs"
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def blocking_save(_configuration, path):
+        save_started.set()
+        if not release_save.wait(5.0):
+            raise TimeoutError("test did not release binding-edit save")
+        output_path = Path(path)
+        output_path.write_bytes(b"binding-edit mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", blocking_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    _app, window, experiment, original_mapper = (
+        _open_saved_qcs_output_window(tmp_path)
+    )
+    watchdog = threading.Timer(4.0, release_save.set)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        _wait_for_event(save_started)
+        assert release_save.is_set() is False
+
+        # This is a source-binding-only edit: the physical configuration and
+        # mapper fingerprint stay unchanged, but the in-editor role name no
+        # longer belongs to the request being validated.
+        window._qcs_front_panel.update_source_dc_channels(
+            ("renamed_dc",),
+            output_count=1,
+        )
+        assert window._stage_qcs_front_panel_pending_configuration(
+            window._qcs_front_panel.working_configuration(),
+            propagate=False,
+        ) is True
+        assert window._qcs_front_panel.working_source_bindings()[0] == [
+            "renamed_dc"
+        ]
+
+        release_save.set()
+        _wait_for_qcs_mapper_commit(window)
+
+        settings = experiment.qcs_settings_dict()
+        assert Path(settings["mapper_path"]) == original_mapper
+        assert settings["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 1
+        pending = window._pending_qcs_front_panel_state()
+        assert pending is not None
+        assert pending[1] == ("renamed_dc",)
+        assert pending[0]["channel_mappings"][0]["channel"] == 2
+        assert experiment._qcs_front_panel_draft_pending is True
+        with pytest.raises(ValueError, match="background mapper update"):
+            experiment.qcs_connection_values(1)
+    finally:
+        watchdog.cancel()
+        _close_qcs_race_window(window, release_save)
+
+
+def test_settings_loads_are_rejected_while_qcs_mapper_save_is_active(
+    monkeypatch,
+    tmp_path,
+):
+    automatic_mapper = tmp_path / "settings_load_guard_mapper.qcs"
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def blocking_save(_configuration, path):
+        save_started.set()
+        if not release_save.wait(5.0):
+            raise TimeoutError("test did not release settings-load save")
+        output_path = Path(path)
+        output_path.write_bytes(b"settings-load mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", blocking_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    _app, window, experiment, original_mapper = (
+        _open_saved_qcs_output_window(tmp_path)
+    )
+    decoded_settings = window._decode_settings(window._settings_to_dict())
+    legacy_settings = {
+        "initial_voltage": 123.0,
+        "voltage_bounds": [-800.0, 800.0],
+    }
+    watchdog = threading.Timer(4.0, release_save.set)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        _wait_for_event(save_started)
+        assert release_save.is_set() is False
+        assert experiment._qcs_front_panel_draft_pending is True
+
+        with pytest.raises(RuntimeError, match="background QCS mapper update"):
+            window._apply_decoded_settings(decoded_settings)
+        with pytest.raises(RuntimeError, match="background QCS mapper update"):
+            window._apply_legacy_settings(legacy_settings)
+
+        # Neither rejected load may discard the selected physical draft or
+        # expose the previous run-ready mapper to hardware execution.
+        assert experiment._qcs_front_panel_draft_pending is True
+        pending = window._pending_qcs_front_panel_state()
+        assert pending is not None
+        assert pending[0]["channel_mappings"][0]["channel"] == 2
+        canonical = experiment.qcs_settings_dict()
+        assert Path(canonical["mapper_path"]) == original_mapper
+        assert canonical["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 1
+        with pytest.raises(ValueError, match="background mapper update"):
+            experiment.qcs_connection_values(1)
+
+        release_save.set()
+        _wait_for_qcs_mapper_commit(window)
+
+        # Once the same request finishes normally, its selected mapper becomes
+        # canonical and the standard QCS connection path is run-ready again.
+        settings = experiment.qcs_settings_dict()
+        assert Path(settings["mapper_path"]) == automatic_mapper
+        assert settings["hardware_configuration"]["channel_mappings"][0][
+            "channel"
+        ] == 2
+        assert settings["hardware_configuration_state"] == (
+            front_panel.QCS_HARDWARE_STATE_SAVED
+        )
+        assert experiment._qcs_front_panel_draft_pending is False
+        connection = experiment.qcs_connection_values(1)
+        assert Path(connection.mapper_path) == automatic_mapper
+        assert connection.dc_channel_names == ("dc_only",)
+    finally:
+        watchdog.cancel()
+        _close_qcs_race_window(window, release_save)
+
+
+def test_old_qcs_mapper_completion_does_not_close_reopened_input_context(
+    monkeypatch,
+    tmp_path,
+):
+    automatic_mapper = tmp_path / "reopened_context_mapper.qcs"
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def blocking_save(_configuration, path):
+        save_started.set()
+        if not release_save.wait(5.0):
+            raise TimeoutError("test did not release reopened-context save")
+        output_path = Path(path)
+        output_path.write_bytes(b"reopened-context mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", blocking_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    app, window, experiment, _original_mapper = (
+        _open_saved_qcs_output_window(
+            tmp_path,
+            acquisition_name="digitizer",
+        )
+    )
+    watchdog = threading.Timer(4.0, release_save.set)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert window._qcs_front_panel.select_connector(2, 2) is True
+        _wait_for_event(save_started)
+        original_session = window._qcs_front_panel_session_revision
+
+        window._qcs_front_panel_dialog.close()
+        app.processEvents()
+        window._show_active_front_panel("input", window._rf_readout_panel)
+        app.processEvents()
+        assert window._qcs_front_panel_dialog.isVisible() is True
+        assert window._qcs_front_panel_session_revision > original_session
+        assert window._qcs_front_panel._focused_mapping == ("acquisition", 0)
+        assert window._qcs_front_panel_auto_apply_selection == (
+            "acquisition",
+            0,
+        )
+
+        release_save.set()
+        _wait_for_qcs_mapper_commit(window)
+
+        # The output request remains valid and may commit, but it no longer
+        # owns the dialog session that is now selecting an acquisition input.
+        settings = experiment.qcs_settings_dict()
+        dc_mapping = next(
+            mapping
+            for mapping in settings["hardware_configuration"][
+                "channel_mappings"
+            ]
+            if mapping["role"] == "dc"
+        )
+        assert (dc_mapping["slot"], dc_mapping["channel"]) == (2, 2)
+        assert experiment._qcs_front_panel_draft_pending is False
+        assert window._qcs_front_panel_dialog.isVisible() is True
+        assert window._qcs_front_panel._focused_mapping == ("acquisition", 0)
+        assert window._qcs_front_panel_auto_apply_selection == (
+            "acquisition",
+            0,
+        )
+    finally:
+        watchdog.cancel()
+        _close_qcs_race_window(window, release_save)
 
 
 def test_unchecked_rf_output_preview_remains_clickable():
@@ -2405,7 +3212,7 @@ def test_rf_output_front_panel_sma_selection_auto_applies(
     assert window._qcs_front_panel_auto_apply_selection == ("rf", 0)
 
     assert window._qcs_front_panel.select_connector(2, 2) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
     applied_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
     ]
@@ -2497,7 +3304,7 @@ def test_stability_same_sma_draft_retries_automatic_mapper_save(
     # The SMA is unchanged in the editor, but the draft still needs to become
     # an executable native mapper without exposing the Channel mappings tab.
     assert window._qcs_front_panel.select_connector(2, 1) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
     assert save_attempts == [automatic_mapper]
     assert automatic_mapper.is_file() is False
     assert window._qcs_front_panel_dialog.isVisible() is True
@@ -2507,7 +3314,7 @@ def test_stability_same_sma_draft_retries_automatic_mapper_save(
     # Retrying the same SMA also reports changed=False. It must retry the
     # failed commit instead of treating the editor-only address as applied.
     assert window._qcs_front_panel.select_connector(2, 1) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     assert save_attempts == [automatic_mapper, automatic_mapper]
     assert automatic_mapper.is_file()
@@ -2635,7 +3442,7 @@ def test_acquisition_preview_picture_click_creates_and_applies_mapping(
         QtCore.Qt.LeftButton,
         pos=click_position,
     )
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     settings = experiment.qcs_settings_dict()
     mapping = next(
@@ -2744,7 +3551,7 @@ def test_same_acquisition_sma_commits_pending_graphical_topology(
     # still commit the pending module/IP topology instead of taking the
     # canonical-address no-op shortcut.
     assert window._qcs_front_panel.select_connector(5, 1) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     settings = experiment.qcs_settings_dict()
     assert save_calls == [updated_mapper]
@@ -2874,7 +3681,7 @@ def test_m5201_dialog_automatically_saves_applies_and_persists(
     dialog.digitizer_combo.setCurrentIndex(address_index)
     dialog.lo_frequency_ghz.setValue(8.125)
     QtTest.QTest.mouseClick(dialog.save_button, QtCore.Qt.LeftButton)
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     # A failed mapper write leaves the route editor open so the user can fix
     # the cause and retry without reselecting the module, pair, SMA, or LO.
@@ -2885,7 +3692,7 @@ def test_m5201_dialog_automatically_saves_applies_and_persists(
     assert "could not be generated" in window._qcs_front_panel.status.text()
 
     QtTest.QTest.mouseClick(dialog.save_button, QtCore.Qt.LeftButton)
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     assert len(saved_configurations) == 2
     settings = experiment.qcs_settings_dict()
@@ -3120,6 +3927,62 @@ def test_stability_front_panel_enables_rf_and_acquisition_path_focus(
     app.processEvents()
 
 
+def test_sparameter_front_panel_enables_rf_and_acquisition_path_focus(
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {7: "rf_drive"},
+        "digitizer",
+    )
+    window._propagate_qcs_hardware_configuration(
+        configuration,
+        ("dc_gate",),
+        {7: "rf_drive"},
+        "digitizer",
+    )
+    path = window._sparameter_panel.path_diagram
+    path.qcs_mapping_selector.setCurrentIndex(
+        path.qcs_mapping_selector.findData(7)
+    )
+    assert (
+        window._sparameter_panel.qcs_rf_acquisition_front_panel_selections()
+        == (
+            ("rf", 7),
+            ("acquisition", 0),
+        )
+    )
+    focused = []
+    monkeypatch.setattr(
+        window,
+        "_show_qcs_front_panel",
+        lambda role=None, logical_index=0: True,
+    )
+    monkeypatch.setattr(
+        window._qcs_front_panel,
+        "focus_rf_acquisition_path",
+        lambda rf_index, acquisition_index=0: focused.append(
+            (rf_index, acquisition_index)
+        ),
+    )
+
+    window._show_active_front_panel("path", window._sparameter_panel)
+
+    assert focused == [(7, 0)]
+    assert window._qcs_front_panel_keep_open_after_selection is True
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 7), ("acquisition", 0)}
+    )
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_stability_path_sma_clicks_auto_apply_both_endpoints(
     monkeypatch,
     tmp_path,
@@ -3192,7 +4055,7 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
     ) == (3, 2)
     expected_rf_highlight = front_panel._qcs_front_panel_pixmap(
         window._qcs_front_panel.working_configuration(),
-        (3, 2),
+        highlighted_addresses=((3, 2), (5, 1)),
     )
     assert _pixmap_png(window._qcs_front_panel._image_pixmap) == (
         _pixmap_png(expected_rf_highlight)
@@ -3203,7 +4066,7 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
     assert experiment.qcs_settings_dict()["hardware_configuration"] != (
         window._qcs_front_panel.working_configuration()
     )
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
     first_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
     ]
@@ -3227,12 +4090,12 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
     assert len(saved_configurations) == 1
     expected_acquisition_highlight = front_panel._qcs_front_panel_pixmap(
         window._qcs_front_panel.working_configuration(),
-        (5, 2),
+        highlighted_addresses=((3, 2), (5, 2)),
     )
     assert _pixmap_png(window._qcs_front_panel._image_pixmap) == (
         _pixmap_png(expected_acquisition_highlight)
     )
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
     second_configuration = experiment.qcs_settings_dict()[
         "hardware_configuration"
     ]
@@ -3261,6 +4124,245 @@ def test_stability_path_sma_clicks_auto_apply_both_endpoints(
         QtCore.QEvent.DeferredDelete,
     )
     app.processEvents()
+
+
+def test_edit_awg_output_reopens_current_identified_qcs_front_panel(
+    monkeypatch,
+):
+    app = _application()
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *_args: QtWidgets.QMessageBox.Yes,
+    )
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+
+    assert window._show_qcs_front_panel() is True
+    assert window._qcs_front_panel.apply_discovered_hardware_configuration(
+        {
+            "ip_address": "192.168.2.105",
+            "inventories": [
+                {
+                    "chassis_model": "M9046A",
+                    "chassis": 1,
+                    "host_controller": 1,
+                    "modules": [
+                        {"slot": 4, "model": "M5300A"},
+                        {"slot": 7, "model": "M5301A"},
+                        {"slot": 17, "model": "M5201A"},
+                        {"slot": 18, "model": "M5200A"},
+                    ],
+                }
+            ],
+        }
+    )
+    identified = window._qcs_front_panel.working_configuration()
+    assert window._qcs_front_panel_pending_configuration == identified
+    window._qcs_front_panel_dialog.close()
+    app.processEvents()
+
+    # This was the real stale-state failure: changing the AWG output count
+    # used to discard the identified draft, so Edit rebuilt slots 1/2/3/5.
+    window._add_port()
+    app.processEvents()
+    assert len(window._pulse) == 2
+    assert window._qcs_front_panel_pending_configuration == identified
+
+    control = window._multi_ctrl._ctrl_pannels[1]
+    edit_button = next(
+        button
+        for button in control.findChildren(QtWidgets.QPushButton)
+        if button.text() == "Edit this AWG output"
+    )
+    QtTest.QTest.mouseClick(edit_button, QtCore.Qt.LeftButton)
+    app.processEvents()
+
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel._focused_mapping == ("dc", 1)
+    assert window._qcs_front_panel.working_configuration() == identified
+    assert {
+        (int(module["slot"]), str(module["model"]))
+        for module in identified["modules"]
+    } == {
+        (4, "M5300A"),
+        (7, "M5301A"),
+        (17, "M5201A"),
+        (18, "M5200A"),
+    }
+    assert window._qcs_front_panel_pending_configuration == identified
+    pending = window._pending_qcs_front_panel_state()
+    assert pending is not None
+    assert pending[1] == ("dc_ch_1", "dc_ch_2")
+
+    window._qcs_front_panel_dialog.close()
+    window._delete_port(1)
+    app.processEvents()
+    assert len(window._pulse) == 1
+    assert window._qcs_front_panel_pending_configuration == identified
+    first_edit_button = next(
+        button
+        for button in window._multi_ctrl._ctrl_pannels[0].findChildren(
+            QtWidgets.QPushButton
+        )
+        if button.text() == "Edit this AWG output"
+    )
+    QtTest.QTest.mouseClick(first_edit_button, QtCore.Qt.LeftButton)
+    app.processEvents()
+    assert window._qcs_front_panel._focused_mapping == ("dc", 0)
+    assert window._qcs_front_panel.working_configuration() == identified
+
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
+def test_compatible_identification_commits_and_edit_rehydrates_canonical_state():
+    app = _application()
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+
+    initial = _example_configuration("lab_baseline")
+    initial["channel_mappings"] = [
+        mapping
+        for mapping in initial["channel_mappings"]
+        if mapping["role"] == "dc" and mapping["logical_index"] == 0
+    ]
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "dc_channel_names": ["gate_left"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": None,
+            "hardware_configuration": initial,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+            "hardware_mapper_sha256": None,
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    assert window._show_qcs_front_panel() is True
+
+    assert window._qcs_front_panel.apply_discovered_hardware_configuration(
+        {
+            "ip_address": "192.168.2.105",
+            "inventories": [
+                {
+                    "chassis_model": "M9046A",
+                    "chassis": 1,
+                    "host_controller": 1,
+                    "modules": [
+                        {"slot": 4, "model": "M5300A"},
+                        {"slot": 7, "model": "M5301A"},
+                        {"slot": 17, "model": "M5201A"},
+                        {"slot": 18, "model": "M5200A"},
+                    ],
+                }
+            ],
+        },
+        commit_callback=window._apply_qcs_front_panel_settings,
+    )
+    identified = window._qcs_front_panel.working_configuration()
+    assert experiment.qcs_settings_dict()["hardware_configuration"] == identified
+    assert window._qcs_front_panel_pending_configuration is None
+    assert {module["slot"] for module in identified["modules"]} == {
+        4,
+        7,
+        17,
+        18,
+    }
+
+    # Simulate an initialized but stale widget tree.  The closed editor must
+    # treat the canonical Experiment configuration as authoritative on Edit.
+    window._qcs_front_panel_dialog.close()
+    window._qcs_front_panel._set_configuration_widgets(initial)
+    assert 17 not in {
+        module["slot"]
+        for module in window._qcs_front_panel.working_configuration()["modules"]
+    }
+    edit_button = next(
+        button
+        for button in window._multi_ctrl._ctrl_pannels[0].findChildren(
+            QtWidgets.QPushButton
+        )
+        if button.text() == "Edit this AWG output"
+    )
+    QtTest.QTest.mouseClick(edit_button, QtCore.Qt.LeftButton)
+    app.processEvents()
+
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel.working_configuration() == identified
+    assert window._qcs_front_panel._focused_mapping == ("dc", 0)
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
+def test_rejected_compatible_identification_is_retained_as_pending_draft(
+    tmp_path,
+):
+    _application()
+    control = front_panel.QcsFrontPanelControl()
+    configuration = _example_configuration("lab_baseline")
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+        },
+        output_count=2,
+    )
+    staged = []
+    control.draft_staged.connect(staged.append)
+
+    assert control.apply_discovered_hardware_configuration(
+        {
+            "ip_address": "192.168.2.105",
+            "inventories": [
+                {
+                    "chassis_model": "M9046A",
+                    "chassis": 1,
+                    "host_controller": 1,
+                    "modules": [
+                        {"slot": 4, "model": "M5300A"},
+                        {"slot": 7, "model": "M5301A"},
+                        {"slot": 17, "model": "M5201A"},
+                        {"slot": 18, "model": "M5200A"},
+                    ],
+                }
+            ],
+        },
+        commit_callback=lambda _settings: False,
+    )
+    assert len(staged) == 1
+    assert staged[0] == control.working_configuration()
+    assert control._configuration_state == front_panel.QCS_HARDWARE_STATE_DRAFT
+    assert "retained as a pending front-panel draft" in control.status.text()
+    control.close()
 
 
 def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
@@ -3319,6 +4421,7 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
     )
     assert window._qcs_front_panel._mappings_from_widgets() == []
     assert experiment.qcs_settings_dict()["hardware_configuration"] is None
+    assert window._qcs_front_panel_pending_configuration is not None
     with pytest.raises(ValueError, match="assignment is incomplete"):
         experiment.qcs_connection_values(2)
 
@@ -3341,6 +4444,41 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
     assert len(window._pulse) == 2
     assert window._stability_panel.x_axis.current_gen_ch() == 0
     assert window._stability_panel.y_axis.current_gen_ch() == 1
+    expected_slots = {4, 7, 18}
+    calibration_previews = tuple(
+        window._calibration_panel.path_diagram_for(mode).front_panel_preview
+        for mode in ("output", "input", "dc_voltage")
+    )
+    shared_previews = (
+        window._multi_ctrl.front_panel_preview,
+        window._rf_ports_panel._panels[0].front_panel_preview,
+        window._rf_readout_panel.front_panel_preview,
+        window._stability_panel.front_panel_preview,
+        window._stability_panel.x_axis.front_panel_preview,
+        window._stability_panel.y_axis.front_panel_preview,
+        window._sparameter_panel.path_diagram.front_panel_preview,
+        window._noise_panel.front_panel_preview,
+        *calibration_previews,
+    )
+    for tab_index in range(window._control_tabs.count()):
+        window._control_tabs.setCurrentIndex(tab_index)
+        app.processEvents()
+        for preview in shared_previews:
+            configuration = preview.qcs_preview._configuration
+            assert configuration is not None
+            assert {
+                int(module["slot"])
+                for module in configuration["modules"]
+            } == expected_slots
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    app.processEvents()
+    assert window._qcs_front_panel_pending_configuration is not None
+    for preview in shared_previews:
+        assert {
+            int(module["slot"])
+            for module in preview.qcs_preview._configuration["modules"]
+        } == expected_slots
     assert window._qcs_front_panel._focused_mapping == ("dc", 0)
     assert window._qcs_front_panel.select_connector(7, 3) is True
     app.processEvents()
@@ -3372,7 +4510,7 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
         if mapping["role"] == "dc"
     } == {(7, 3)}
     assert window._qcs_front_panel.select_connector(7, 4) is True
-    app.processEvents()
+    _wait_for_qcs_mapper_commit(window)
 
     configuration = experiment.qcs_settings_dict()["hardware_configuration"]
     dc_mappings = {
@@ -3401,6 +4539,7 @@ def test_identified_draft_survives_reopen_and_stability_sma_auto_applies(
         experiment.qcs_settings_dict()["hardware_configuration_state"]
         == front_panel.QCS_HARDWARE_STATE_SAVED
     )
+    assert window._qcs_front_panel_pending_configuration is None
     assert len(experiment.qcs_connection_values(2).dc_channel_names) == 2
 
     QtTest.QTest.mouseClick(
@@ -3569,6 +4708,13 @@ def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
     assert path.output_ch.value() == legacy_output_channel
     assert path.qcs_mapping_selector.currentData() == 7
     assert path.qcs_front_panel_selection() == ("rf", 7)
+    assert (
+        window._sparameter_panel.qcs_rf_acquisition_front_panel_selections()
+        == (
+            ("rf", 7),
+            ("acquisition", 0),
+        )
+    )
     assert "rf_drive" in (
         path.front_panel_preview.qcs_preview.binding_label.text()
     )
@@ -3576,6 +4722,14 @@ def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
     window._sparameter_panel.front_panel_requested.emit()
     app.processEvents()
     assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel._rf_acquisition_path_focus == (
+        ("rf", 7),
+        ("acquisition", 0),
+    )
+    assert window._qcs_front_panel_keep_open_after_selection is True
+    assert window._qcs_front_panel_auto_apply_selection == frozenset(
+        {("rf", 7), ("acquisition", 0)}
+    )
     selected_rows = (
         window._qcs_front_panel.mapping_table.selectionModel().selectedRows()
     )
@@ -3599,6 +4753,7 @@ def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
 
     assert window._stability_panel.backend_warning.isHidden() is False
     assert window._sparameter_panel.backend_warning.isHidden() is False
+    assert window._sparameter_panel.fir_ddr_capture_group.isHidden() is True
     assert window._calibration_panel.backend_warning.isHidden() is False
     assert window._noise_panel.backend_warning.isHidden() is False
     # This fixture has only one AWG output, so Stability remains unavailable
@@ -3734,6 +4889,93 @@ def test_loaded_path_settings_reset_transient_qcs_mapping_selection():
 
     assert path.qcs_front_panel_selection() == ("rf", 0)
     assert path.qcs_mapping_selector.currentData() == 0
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_sparameter_qcs_hides_qick_only_controls_and_restores_them():
+    app = _application()
+    panel = gui.SParameterSweepPanel()
+    panel.gain.setValue(12_345)
+    panel.output_power_dbm.setValue(-12.5)
+    panel.margin_input_samples.setValue(2_048)
+    panel.address.setValue(37)
+    panel.stride_bytes.setValue(256)
+    panel.force_overwrite.setChecked(True)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {7: "rf_drive"},
+        "digitizer",
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    panel.set_hardware_backend(gui.EXECUTION_BACKEND_QCS)
+    panel.resize(1100, 1000)
+    panel.show()
+    app.processEvents()
+
+    path = panel.path_diagram
+    output_nodes, input_nodes = path._active_arrow_nodes()
+    assert output_nodes[0] is path.qcs_output_endpoint
+    assert input_nodes[-1] is path.qcs_input_endpoint
+    assert path.output_endpoint not in output_nodes
+    assert path.input_endpoint not in input_nodes
+    assert path.title() == "QCS RF Path and DUT De-embedding"
+    assert path.qcs_output_endpoint.isVisible() is True
+    assert path.qcs_input_endpoint.isVisible() is True
+    assert path.output_endpoint.isVisible() is False
+    assert path.input_endpoint.isVisible() is False
+    assert path.output_att1_component.isVisible() is False
+    assert path.output_att2_component.isVisible() is False
+    assert path.input_condition.isVisible() is False
+    assert path.qcs_mapping_widget.isVisible() is False
+    assert panel.fir_ddr_capture_group.isVisible() is False
+    assert panel.power_calibration_enabled.isVisible() is False
+    assert panel.power_sweep_enabled.isVisible() is False
+    assert panel.gain.isVisible() is False
+    assert panel.gain_label.isVisible() is False
+    assert panel.output_power_dbm.isVisible() is False
+    assert panel.output_power_label.isVisible() is False
+    assert panel.override_fpga_trigger_delay.isEnabled() is False
+    assert panel.run_button.isEnabled() is False
+    assert panel.scan_time_label.text() == "Requested integration duration:"
+    assert all(
+        term not in panel.path_hint.text()
+        for term in ("HWH", "Nyquist", "board selection")
+    )
+    qcs_settings = panel.settings_dict()
+    assert qcs_settings["gain"] == 12_345
+    assert qcs_settings["output_power_dbm"] == pytest.approx(-12.5)
+    assert qcs_settings["margin_input_samples"] == 2_048
+    assert qcs_settings["address"] == 37
+    assert qcs_settings["stride_bytes"] == 256
+    assert qcs_settings["force_overwrite"] is True
+
+    panel.set_hardware_backend(gui.EXECUTION_BACKEND_QICK)
+    app.processEvents()
+
+    assert path.output_endpoint.isVisible() is True
+    assert path.input_endpoint.isVisible() is True
+    assert path.qcs_output_endpoint.isVisible() is False
+    assert path.qcs_input_endpoint.isVisible() is False
+    assert path.output_att1_component.isVisible() is True
+    assert path.output_att2_component.isVisible() is True
+    assert path.input_condition.isVisible() is True
+    assert panel.fir_ddr_capture_group.isVisible() is True
+    assert panel.power_calibration_enabled.isVisible() is True
+    assert panel.power_sweep_enabled.isVisible() is True
+    assert panel.gain.isVisible() is True
+    assert panel.gain_label.isVisible() is True
+    assert panel.output_power_dbm.isVisible() is True
+    assert panel.output_power_label.isVisible() is True
+    assert panel.override_fpga_trigger_delay.isEnabled() is True
+    assert panel.scan_time_label.text() == "Scan time per point:"
+    assert panel.gain.value() == 12_345
+    assert panel.output_power_dbm.value() == pytest.approx(-12.5)
+    assert panel.margin_input_samples.value() == 2_048
+    assert panel.address.value() == 37
+    assert panel.stride_bytes.value() == 256
+    assert panel.force_overwrite.isChecked() is True
     panel.close()
     panel.deleteLater()
     app.processEvents()
@@ -4027,6 +5269,33 @@ def test_qcs_dc_mapping_tracks_added_and_removed_outputs():
     assert dc_names == ["dc_right"]
     assert contracted["channel_mappings"][0]["logical_index"] == 0
     assert contracted["channel_mappings"][0]["channel"] == 2
+
+    incomplete_expanded = front_panel.resize_incomplete_qcs_dc_mappings(
+        configuration,
+        ("dc_left", "dc_right"),
+    )
+    assert [
+        (mapping["logical_index"], mapping["slot"], mapping["channel"])
+        for mapping in incomplete_expanded["channel_mappings"]
+        if mapping["role"] == "dc"
+    ] == [(0, 2, 1)]
+
+    incomplete_contracted = front_panel.resize_incomplete_qcs_dc_mappings(
+        expanded,
+        ("dc_right",),
+        removed_index=0,
+    )
+    assert [
+        (mapping["logical_index"], mapping["slot"], mapping["channel"])
+        for mapping in incomplete_contracted["channel_mappings"]
+        if mapping["role"] == "dc"
+    ] == [(0, 2, 2)]
+    assert any(
+        mapping["role"] == "unassigned"
+        and mapping["slot"] == 2
+        and mapping["channel"] == 1
+        for mapping in incomplete_contracted["channel_mappings"]
+    )
 
 
 def test_qcs_dc_resize_matches_existing_names_before_allocating_new_output():

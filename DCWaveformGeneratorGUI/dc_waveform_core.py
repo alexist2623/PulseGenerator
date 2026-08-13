@@ -26,6 +26,9 @@ DEFAULT_INSERT_RAMP_NS = 50.0
 DEFAULT_INSERT_FLAT_NS = 100.0
 DEFAULT_MIN_DURATION_NS = 1.0e-6
 DEFAULT_QCS_FULL_SCALE_V = 2.5
+# The connected HCL sandbox gives all rendered DCWaveforms on one M5301
+# channel one aggregate 98,304-sample buffer (40.960 us at 2.4 GSa/s).
+_QCS_DC_RENDERED_BUFFER_MAX_NS = 40_960.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 800.0
@@ -1232,10 +1235,43 @@ def _qcs_channel_samples_code(
     if np.any(np.diff(time_values) <= 0.0):
         raise ValueError("QCS waveform times must be strictly increasing")
 
-    lines = []
+    interval_plans = []
     for index in range(time_values.size - 1):
-        duration_name = f"{channel_name}_dc_segment_duration_{index}"
         duration_ns = float(time_values[index + 1] - time_values[index])
+        start_mv = float(voltage_values[index])
+        end_mv = float(voltage_values[index + 1])
+        is_flat = bool(
+            np.isclose(start_mv, end_mv, rtol=0.0, atol=1.0e-12)
+        )
+        kind = (
+            "zero_delay"
+            if is_flat
+            and np.isclose(start_mv, 0.0, rtol=0.0, atol=1.0e-12)
+            else "waveform"
+        )
+        interval_plans.append(
+            (kind, duration_ns, start_mv, end_mv)
+        )
+
+    rendered_duration_ns = sum(
+        0.0 if kind == "zero_delay" else duration_ns
+        for kind, duration_ns, _start, _end in interval_plans
+    )
+    if rendered_duration_ns > _QCS_DC_RENDERED_BUFFER_MAX_NS + 1e-9:
+        rendered_samples = int(round(rendered_duration_ns * 2.4))
+        raise ValueError(
+            f"QCS output {channel_name!r} requires "
+            f"{rendered_samples:,} rendered M5301 samples, exceeding the "
+            "connected HCL sandbox's aggregate 98,304-sample (40.960 us) "
+            "buffer. QCS Hold was hardware-tested and did not preserve the "
+            "M5301 voltage, while concatenating DCWaveforms did not extend "
+            "the aggregate buffer on the current QCS host."
+        )
+
+    lines = []
+    for index, plan in enumerate(interval_plans):
+        _kind, duration_ns, _start_mv, _end_mv = plan
+        duration_name = f"{channel_name}_dc_segment_duration_{index}"
         lines.extend(
             [
                 f"    {duration_name} = qcs.Scalar(",
@@ -1245,12 +1281,20 @@ def _qcs_channel_samples_code(
                 "    )",
             ]
         )
-    for index in range(time_values.size - 1):
+    for index, plan in enumerate(interval_plans):
+        kind, _duration_ns, start_mv, end_mv = plan
         duration_name = f"{channel_name}_dc_segment_duration_{index}"
         waveform_name = f"{channel_name}_dc_segment_{index}"
-        start_mv = float(voltage_values[index])
-        end_mv = float(voltage_values[index + 1])
-        if np.isclose(start_mv, end_mv, rtol=0.0, atol=1.0e-12):
+        if kind == "zero_delay":
+            lines.extend(
+                [
+                    f"    {waveform_name} = qcs.Delay(",
+                    f"        duration={duration_name},",
+                    "    )",
+                    "",
+                ]
+            )
+        elif np.isclose(start_mv, end_mv, rtol=0.0, atol=1.0e-12):
             lines.extend(
                 [
                     f"    {waveform_name} = qcs.DCWaveform(",

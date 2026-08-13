@@ -5,7 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 import sqlite3
@@ -817,7 +817,13 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
     tmp_path,
     monkeypatch,
 ):
-    config = _config()
+    config = replace(
+        _config(),
+        bias_t_compensation_enabled=True,
+        bias_t_compensation_type="dc",
+        bias_t_compensation_mode="fixed_time",
+        bias_t_compensation_duration_us=2.5,
+    )
     full_scale_mv = 2500.0
     sequence = stability.build_stability_hold_sequence(
         config,
@@ -941,7 +947,16 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
     )
     assert (
         stored["stability_diagram"]["bias_t_compensation_applied"]
-        is False
+        is True
+    )
+    assert stored["stability_diagram"]["bias_t_compensation_type"] == "dc"
+    assert (
+        stored["stability_diagram"]["bias_t_compensation_mode"]
+        == "fixed_time"
+    )
+    assert (
+        stored["stability_diagram"]["bias_t_compensation_duration_us"]
+        == pytest.approx(2.5)
     )
     assert stored["stability_diagram"]["hardware_sweep_shape"] == [4]
     assert stored["stability_diagram"]["stability_grid_shape"] == [2, 2]
@@ -1215,6 +1230,17 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
         ).text()
         == "Relative amplitude:"
     )
+    for label in (
+        panel.repetitions_label,
+        panel.trace_samples_label,
+        panel.settle_time_label,
+        panel.modulation_frequency_label,
+        panel.qcs_modulation_amplitude_label,
+        panel.point_count_label,
+    ):
+        assert label.isVisible() is True
+        assert label.width() > 0
+    assert panel.dc_measure_mode.isVisible() is False
     visible_labels = " ".join(
         label.text()
         for label in panel.findChildren(QtWidgets.QLabel)
@@ -1224,7 +1250,18 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
         assert qick_term not in visible_labels
     assert panel.start_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is True
-    assert panel.bias_t_group.isVisible() is False
+    assert panel.bias_t_group.isVisible() is True
+    assert "QCS fixed-time" in panel.bias_t_group.title()
+    assert panel.bias_t_type.isVisible() is False
+    assert panel.bias_t_mode.isVisible() is False
+    assert panel.bias_t_compensation_mv.isVisible() is False
+    assert panel.bias_t_filter_tau_us.isVisible() is False
+    assert panel.bias_t_duration_us.isVisible() is True
+    assert panel.bias_t_duration_us.isEnabled() is False
+    assert (
+        panel._bias_t_form.labelForField(panel.bias_t_duration_us).text()
+        == "Compensation duration:"
+    )
     assert "native M5301 X/Y hardware-sweep" in panel.backend_warning.text()
     assert "4.8 GSPS" in panel.backend_warning.text()
     assert "multiples of 16 samples" in panel.backend_warning.text()
@@ -1316,6 +1353,56 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.start_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is True
 
+    panel.close()
+
+
+def test_stability_qcs_bias_t_exposes_only_fixed_time_dc_compensation():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.bias_t_group.setChecked(True)
+    panel.bias_t_type.setCurrentIndex(panel.bias_t_type.findData("filter"))
+    panel.bias_t_mode.setCurrentIndex(
+        panel.bias_t_mode.findData("fixed_voltage")
+    )
+    panel.bias_t_duration_us.setValue(4.25)
+    panel.show()
+
+    panel.set_hardware_backend("qcs")
+    app.processEvents()
+
+    assert panel.bias_t_group.isVisible() is True
+    assert panel.bias_t_duration_us.isVisible() is True
+    assert panel.bias_t_duration_us.isEnabled() is True
+    for unsupported_control in (
+        panel.bias_t_type,
+        panel.bias_t_mode,
+        panel.bias_t_compensation_mv,
+        panel.bias_t_filter_tau_us,
+    ):
+        assert unsupported_control.isVisible() is False
+        assert unsupported_control.isEnabled() is False
+
+    config = panel.config(full_scale_mv=2500.0)
+    assert config.bias_t_compensation_enabled is True
+    assert config.bias_t_compensation_type == "dc"
+    assert config.bias_t_compensation_mode == "fixed_time"
+    assert config.bias_t_compensation_duration_us == pytest.approx(4.25)
+    assert panel.settings_dict()["bias_t_compensation"] == {
+        "enabled": True,
+        "type": "filter",
+        "mode": "fixed_voltage",
+        "voltage_mv": panel.bias_t_compensation_mv.value(),
+        "duration_us": 4.25,
+        "filter_tau_us": panel.bias_t_filter_tau_us.value(),
+    }
+
+    panel.set_hardware_backend("qick")
+    app.processEvents()
+    assert panel.bias_t_type.isVisible() is True
+    assert panel.bias_t_mode.isVisible() is True
+    assert panel.bias_t_type.currentData() == "filter"
+    assert panel.bias_t_mode.currentData() == "fixed_voltage"
     panel.close()
 
 

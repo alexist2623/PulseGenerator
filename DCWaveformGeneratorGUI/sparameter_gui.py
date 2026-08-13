@@ -149,7 +149,7 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             # Mapping labels include virtual name, module, slot, and SMA.  A
             # combo box normally contributes that entire string to the
             # layout's minimum width, which can push the right QCS endpoint
-            # (and its arrows) outside compact Stability/Calibration views.
+            # (and its arrows) outside compact measurement views.
             for combo in (
                 self.qcs_output_mapping_selector,
                 self.qcs_acquisition_mapping_selector,
@@ -968,8 +968,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         self.backend_warning = QtWidgets.QLabel(
             "QCS front-panel mapping is available, but RF S-parameter "
-            "execution is still QICK-only. Run is disabled while QCS is "
-            "selected.",
+            "execution is not implemented for QCS yet. Run is disabled while "
+            "QCS is selected.",
             self,
         )
         self.backend_warning.setWordWrap(True)
@@ -986,7 +986,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        self.path_diagram = RfPathCorrectionWidget(content)
+        self.path_diagram = RfPathCorrectionWidget(content, compact=True)
         self.output_ch = self.path_diagram.output_ch
         self.readout_ch = self.path_diagram.readout_ch
         self.output_nqz = self.path_diagram.output_nqz
@@ -1005,13 +1005,15 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.front_panel_requested.emit
         )
         content_layout.addWidget(self.path_diagram)
-        path_hint = QtWidgets.QLabel(
+        self.path_hint = QtWidgets.QLabel(
             "ATT, RF filters, board selection, and Nyquist zones belong to "
             "this S-parameter tab and its HWH-backed front-panel editor."
         )
-        path_hint.setWordWrap(True)
-        path_hint.setStyleSheet("QLabel { color: #4f5b66; padding: 2px 6px; }")
-        content_layout.addWidget(path_hint)
+        self.path_hint.setWordWrap(True)
+        self.path_hint.setStyleSheet(
+            "QLabel { color: #4f5b66; padding: 2px 6px; }"
+        )
+        content_layout.addWidget(self.path_hint)
 
         sweep_group = QtWidgets.QGroupBox("Frequency Sweep")
         sweep_form = QtWidgets.QFormLayout(sweep_group)
@@ -1036,6 +1038,11 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         sweep_form.addRow("Single output gain:", self.gain)
         sweep_form.addRow("Single target power:", self.output_power_dbm)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
+        self.gain_label = sweep_form.labelForField(self.gain)
+        self.output_power_label = sweep_form.labelForField(
+            self.output_power_dbm
+        )
+        self.scan_time_label = sweep_form.labelForField(self.scan_time_us)
         content_layout.addWidget(sweep_group)
 
         self.power_calibration_enabled = QtWidgets.QGroupBox(
@@ -1153,8 +1160,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         self._update_filter_control_state()
 
-        capture_group = QtWidgets.QGroupBox("FIR DDR Capture")
-        capture_form = QtWidgets.QFormLayout(capture_group)
+        self.fir_ddr_capture_group = QtWidgets.QGroupBox("FIR DDR Capture")
+        capture_form = QtWidgets.QFormLayout(self.fir_ddr_capture_group)
         self.margin_input_samples = QtWidgets.QSpinBox()
         self.margin_input_samples.setRange(0, 10_000_000)
         self.margin_input_samples.setValue(1024)
@@ -1194,7 +1201,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         capture_form.addRow("Trigger stride (bytes):", self.stride_bytes)
         capture_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         capture_form.addRow(self.force_overwrite)
-        content_layout.addWidget(capture_group)
+        content_layout.addWidget(self.fir_ddr_capture_group)
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -1473,6 +1480,33 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.path_diagram.set_hardware_backend(backend)
         is_qcs = self._hardware_backend == "qcs"
         self.backend_warning.setVisible(is_qcs)
+        self.path_hint.setText(
+            (
+                "RF output and acquisition modules, virtual channels, slots, "
+                "and SMA ports come from the QCS front panel. Path loss and "
+                "amplifier gain remain local de-embedding corrections."
+            )
+            if is_qcs
+            else (
+                "ATT, RF filters, board selection, and Nyquist zones belong "
+                "to this S-parameter tab and its HWH-backed front-panel editor."
+            )
+        )
+        for label, field in (
+            (self.gain_label, self.gain),
+            (self.output_power_label, self.output_power_dbm),
+        ):
+            label.setVisible(not is_qcs)
+            field.setVisible(not is_qcs)
+        self.scan_time_label.setText(
+            "Requested integration duration:"
+            if is_qcs
+            else "Scan time per point:"
+        )
+        self.power_calibration_enabled.setVisible(not is_qcs)
+        self.power_sweep_enabled.setVisible(not is_qcs)
+        self.fir_ddr_capture_group.setVisible(not is_qcs)
+        self._update_fpga_trigger_delay_controls()
         self.run_button.setEnabled(not self._running and not is_qcs)
 
     def set_qcs_front_panel_configuration(
@@ -1484,8 +1518,18 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def qcs_front_panel_selection(self) -> tuple[str, int]:
         return self.path_diagram.qcs_front_panel_selection()
 
+    def qcs_rf_acquisition_front_panel_selections(
+        self,
+    ) -> tuple[tuple[str, int], tuple[str, int]]:
+        """Return both QCS endpoints selectable from the S-parameter chassis."""
+
+        return self.path_diagram.qcs_rf_acquisition_front_panel_selections()
+
     def _update_fpga_trigger_delay_controls(self, *_args) -> None:
-        supported = self._fir_uses_fpga_trigger_delay is not False
+        supported = (
+            self._hardware_backend == "qick"
+            and self._fir_uses_fpga_trigger_delay is not False
+        )
         self.override_fpga_trigger_delay.setEnabled(supported)
         self.fpga_trigger_delay_us.setEnabled(
             supported and self.override_fpga_trigger_delay.isChecked()
@@ -1698,10 +1742,13 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.power_calibration_enabled.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
         self.override_fpga_trigger_delay.setEnabled(
-            not running and self._fir_uses_fpga_trigger_delay is not False
+            not running
+            and self._hardware_backend == "qick"
+            and self._fir_uses_fpga_trigger_delay is not False
         )
         self.fpga_trigger_delay_us.setEnabled(
             not running
+            and self._hardware_backend == "qick"
             and self._fir_uses_fpga_trigger_delay is not False
             and self.override_fpga_trigger_delay.isChecked()
         )

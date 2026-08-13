@@ -7,6 +7,7 @@ from io import BytesIO
 from PIL import Image
 import pytest
 
+import qcs_chassis_renderer as renderer
 from qcs_chassis_renderer import (
     ASSET_DIRECTORY,
     DEFAULT_CHASSIS_HEADER_HEIGHT,
@@ -135,6 +136,52 @@ def test_generated_slot_composites_preserve_module_spans(tmp_path):
     assert (tmp_path / "slot_03_M5300A.png").is_file()
     assert (tmp_path / "slot_05_M5200A.png").is_file()
     assert (tmp_path / "slot_06_M5201A.png").is_file()
+
+
+def test_module_composite_cache_tracks_asset_bytes_and_still_writes_files(
+    tmp_path,
+):
+    source_assets = load_qcs_panel_png_assets()
+    asset_directory = tmp_path / "assets"
+    asset_directory.mkdir()
+    for model, png_bytes in source_assets.items():
+        (asset_directory / f"{model}_python_front_panel.png").write_bytes(
+            png_bytes
+        )
+
+    renderer._cached_qcs_module_panel_png.cache_clear()
+    first = generate_qcs_panel_png_assets(
+        _configuration(),
+        asset_directory=asset_directory,
+    )
+    output_directory = tmp_path / "cached-output"
+    second = generate_qcs_panel_png_assets(
+        _configuration(),
+        asset_directory=asset_directory,
+        output_directory=output_directory,
+    )
+
+    assert second == first
+    assert renderer._cached_qcs_module_panel_png.cache_info().misses == 5
+    assert renderer._cached_qcs_module_panel_png.cache_info().hits == 5
+    assert (output_directory / "slot_02_M5301A.png").read_bytes() == first[2]
+
+    # A changed source PNG must invalidate only that module composite even
+    # when its path and the rest of the chassis topology remain unchanged.
+    (asset_directory / "M5301A_python_front_panel.png").write_bytes(
+        source_assets["M5200A"]
+    )
+    changed = generate_qcs_panel_png_assets(
+        _configuration(),
+        asset_directory=asset_directory,
+    )
+
+    assert changed[2] != first[2]
+    assert all(changed[slot] == first[slot] for slot in (1, 3, 5, 6))
+    cache_info = renderer._cached_qcs_module_panel_png.cache_info()
+    assert cache_info.misses == 6
+    assert cache_info.hits == 9
+    renderer._cached_qcs_module_panel_png.cache_clear()
 
 
 def test_chassis_render_is_deterministic_and_savable(tmp_path):
@@ -290,6 +337,29 @@ def test_highlighted_channel_sma_changes_only_transient_rendering():
     with Image.open(BytesIO(highlighted)) as rendered:
         rendered.load()
         assert rendered.size == (1914, 652)
+
+
+def test_multiple_channel_smas_are_highlighted_in_one_render():
+    configuration = _configuration()
+    plain = render_qcs_chassis_png(configuration)
+    rf_only = render_qcs_chassis_png(
+        configuration,
+        highlighted_address=(3, 1),
+    )
+    acquisition_only = render_qcs_chassis_png(
+        configuration,
+        highlighted_address=(5, 1),
+    )
+    both = render_qcs_chassis_png(
+        configuration,
+        highlighted_addresses=((3, 1), (5, 1)),
+    )
+
+    assert both not in {plain, rf_only, acquisition_only}
+    assert render_qcs_chassis_png(
+        configuration,
+        highlighted_addresses=((3, 1), (5, 1), (3, 1)),
+    ) == both
 
 
 def test_downconverter_link_is_rendered_in_the_address_footer():

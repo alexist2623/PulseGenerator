@@ -27,7 +27,9 @@ class HardwareFrontPanelPreview(QtWidgets.QStackedWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scope = "path"
-        self._backend = EXECUTION_BACKEND_QCS
+        # ``None`` ensures the initial QCS selection configures the stacked
+        # widget; subsequent identical requests can remain true no-ops.
+        self._backend: Optional[str] = None
         self._width_reference: Optional[QtWidgets.QWidget] = None
         self._visible_width_margin = 36
         self.setSizePolicy(
@@ -42,7 +44,7 @@ class HardwareFrontPanelPreview(QtWidgets.QStackedWidget):
         self.addWidget(self.qcs_preview)
         self.qick_preview.activated.connect(self.activated.emit)
         self.qcs_preview.activated.connect(self.activated.emit)
-        self.set_backend(self._backend)
+        self.set_backend(EXECUTION_BACKEND_QCS)
 
     def sizeHint(self) -> QtCore.QSize:
         current = self.currentWidget()
@@ -65,12 +67,15 @@ class HardwareFrontPanelPreview(QtWidgets.QStackedWidget):
         backend = str(backend).strip().lower()
         if backend not in EXECUTION_BACKENDS:
             raise ValueError(f"unsupported execution backend {backend!r}")
-        self._backend = backend
-        self.setCurrentWidget(
+        target = (
             self.qcs_preview
             if backend == EXECUTION_BACKEND_QCS
             else self.qick_preview
         )
+        if backend == self._backend and self.currentWidget() is target:
+            return
+        self._backend = backend
+        self.setCurrentWidget(target)
         self._sync_current_size_constraints()
         QtCore.QTimer.singleShot(0, self._sync_current_size_constraints)
         QtCore.QTimer.singleShot(0, self._fit_visible_width)

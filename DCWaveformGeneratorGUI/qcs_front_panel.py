@@ -1428,6 +1428,76 @@ def resize_qcs_dc_mappings(
     return normalize_qcs_hardware_configuration(updated)
 
 
+def resize_incomplete_qcs_dc_mappings(
+    configuration: Mapping[str, Any],
+    dc_channel_names: Sequence[str],
+    *,
+    removed_index: Optional[int] = None,
+) -> dict:
+    """Resize GUI DC roles without inventing physical SMA assignments.
+
+    Hardware identification can intentionally leave a topology incomplete
+    after obsolete mappings are removed.  Changing the number of waveform
+    outputs must preserve that discovered chassis: a newly added output stays
+    unmapped until the user selects an SMA, while a deleted output is demoted
+    to an unassigned virtual channel instead of disappearing from the mapper.
+    """
+
+    normalized = normalize_qcs_hardware_configuration(configuration)
+    target_names = [_virtual_name(name) for name in dc_channel_names]
+    if len(set(target_names)) != len(target_names):
+        raise ValueError("QCS DC virtual-channel names must be unique")
+
+    if removed_index is not None:
+        removed_index = _nonnegative_integer(
+            removed_index,
+            "removed QCS DC output index",
+        )
+
+    used_unassigned_indices = {
+        int(mapping["logical_index"])
+        for mapping in normalized["channel_mappings"]
+        if mapping["role"] == "unassigned"
+    }
+    next_unassigned_index = 0
+
+    def allocate_unassigned_index() -> int:
+        nonlocal next_unassigned_index
+        while next_unassigned_index in used_unassigned_indices:
+            next_unassigned_index += 1
+        result = next_unassigned_index
+        used_unassigned_indices.add(result)
+        next_unassigned_index += 1
+        return result
+
+    mappings = []
+    for original in normalized["channel_mappings"]:
+        mapping = dict(original)
+        if mapping["role"] != "dc":
+            mappings.append(mapping)
+            continue
+
+        logical_index = int(mapping["logical_index"])
+        if removed_index is not None and logical_index == removed_index:
+            mapping["role"] = "unassigned"
+            mapping["logical_index"] = allocate_unassigned_index()
+            mappings.append(mapping)
+            continue
+        if removed_index is not None and logical_index > removed_index:
+            logical_index -= 1
+            mapping["logical_index"] = logical_index
+        if logical_index >= len(target_names):
+            mapping["role"] = "unassigned"
+            mapping["logical_index"] = allocate_unassigned_index()
+        else:
+            mapping["virtual_name"] = target_names[logical_index]
+        mappings.append(mapping)
+
+    updated = dict(normalized)
+    updated["channel_mappings"] = mappings
+    return normalize_qcs_hardware_configuration(updated)
+
+
 def _import_qcs():
     try:
         import keysight.qcs as qcs  # pylint: disable=import-outside-toplevel
@@ -1972,19 +2042,31 @@ def configuration_from_qcs_mapper(
 @lru_cache(maxsize=64)
 def _cached_qcs_front_panel_png(
     serialized_configuration: str,
-    highlighted_address: Optional[tuple[int, int]] = None,
+    highlighted_addresses: tuple[tuple[int, int], ...] = (),
 ) -> bytes:
     if _render_qcs_chassis_png is None:
         return b""
     return _render_qcs_chassis_png(
         json.loads(serialized_configuration),
-        highlighted_address=highlighted_address,
+        highlighted_addresses=highlighted_addresses,
     )
+
+
+@lru_cache(maxsize=8)
+def _cached_qcs_front_panel_image(png_bytes: bytes) -> QtGui.QImage:
+    """Decode one rendered chassis PNG once for all compact previews."""
+
+    image = QtGui.QImage()
+    if png_bytes:
+        image.loadFromData(png_bytes, "PNG")
+    return image
 
 
 def _qcs_front_panel_pixmap(
     configuration: Mapping[str, Any],
     highlighted_address: Optional[tuple[int, int]] = None,
+    *,
+    highlighted_addresses: Optional[Sequence[tuple[int, int]]] = None,
 ) -> QtGui.QPixmap:
     """Render a normalized configuration into a GUI-thread QPixmap."""
 
@@ -1993,13 +2075,18 @@ def _qcs_front_panel_pixmap(
         sort_keys=True,
         separators=(",", ":"),
     )
-    png_bytes = _cached_qcs_front_panel_png(
-        serialized,
-        highlighted_address,
-    )
-    pixmap = QtGui.QPixmap()
-    if png_bytes and pixmap.loadFromData(png_bytes, "PNG"):
-        return pixmap
+    requested_highlights = []
+    if highlighted_address is not None:
+        requested_highlights.append(tuple(highlighted_address))
+    if highlighted_addresses is not None:
+        requested_highlights.extend(
+            tuple(address) for address in highlighted_addresses
+        )
+    normalized_highlights = tuple(dict.fromkeys(requested_highlights))
+    png_bytes = _cached_qcs_front_panel_png(serialized, normalized_highlights)
+    image = _cached_qcs_front_panel_image(png_bytes)
+    if not image.isNull():
+        return QtGui.QPixmap.fromImage(image)
     return QtGui.QPixmap()
 
 
@@ -2014,6 +2101,7 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         self._role = "dc"
         self._logical_index: Optional[int] = 0
         self._render_error = None
+        self._pixmap_refresh_pending = False
         self._fallback_pixmap = QtGui.QPixmap(
             str(
                 Path(image_path)
@@ -2088,6 +2176,13 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         super().resizeEvent(event)
         self._refresh_image()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._pixmap_refresh_pending:
+            self._pixmap_refresh_pending = False
+            self._refresh_pixmap()
+            self.updateGeometry()
+
     def mousePressEvent(self, event) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             self.activated.emit()
@@ -2099,12 +2194,15 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         self,
         configuration: Optional[Mapping[str, Any]],
     ) -> None:
-        self._configuration = (
+        normalized = (
             None
             if configuration is None
             else normalize_qcs_hardware_configuration(configuration)
         )
-        self._refresh_pixmap()
+        if normalized == self._configuration:
+            return
+        self._configuration = normalized
+        self._request_pixmap_refresh()
         self._refresh_binding()
         self.updateGeometry()
 
@@ -2145,6 +2243,15 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
         self._pixmap = pixmap
         self._refresh_image()
 
+    def _request_pixmap_refresh(self) -> None:
+        """Render now unless this preview is hidden inside another widget."""
+
+        if self.parentWidget() is not None and not self.isVisible():
+            self._pixmap_refresh_pending = True
+            return
+        self._pixmap_refresh_pending = False
+        self._refresh_pixmap()
+
     def set_selection(
         self,
         role: str,
@@ -2158,9 +2265,11 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
                 logical_index,
                 "QCS preview logical index",
             )
+        if role == self._role and logical_index == self._logical_index:
+            return
         self._role = role
         self._logical_index = logical_index
-        self._refresh_pixmap()
+        self._request_pixmap_refresh()
         self._refresh_binding()
         self.updateGeometry()
 
@@ -2459,8 +2568,9 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._identifying_hardware = False
         self._syncing_downconverter_lo = False
         self._focused_mapping: Optional[tuple[str, int]] = None
-        # Stability's RF-path preview selects either endpoint from one full
-        # chassis view.  Other callers retain a strict single-role focus.
+        # RF-path previews such as Stability and S-Parameter select either
+        # endpoint from one full chassis view. Other callers retain a strict
+        # single-role focus.
         self._rf_acquisition_path_focus: Optional[
             tuple[tuple[str, int], tuple[str, int]]
         ] = None
@@ -3012,6 +3122,8 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     def apply_discovered_hardware_configuration(
         self,
         discovery: Mapping[str, Any],
+        *,
+        commit_callback=None,
     ) -> bool:
         """Make one discovered chassis the active front-panel configuration."""
 
@@ -3170,7 +3282,37 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         ]
         self._mapper_file_sha256 = settings["hardware_mapper_sha256"]
         self._source_settings = dict(settings)
-        self.settings_applied.emit(settings)
+        if commit_callback is not None:
+            try:
+                committed = commit_callback(settings)
+            except (OSError, TypeError, ValueError) as exc:
+                committed = False
+                rejection_detail = f": {exc}"
+            else:
+                rejection_detail = ""
+            if committed is False:
+                # Signal delivery cannot return the receiver's result.  Keep
+                # the newly identified topology as the shared pending draft
+                # when the owning experiment rejects a synchronous commit.
+                self._configuration_state = QCS_HARDWARE_STATE_DRAFT
+                self._mapper_file_sha256 = None
+                pending_settings = dict(settings)
+                pending_settings["hardware_configuration_state"] = (
+                    QCS_HARDWARE_STATE_DRAFT
+                )
+                pending_settings["hardware_mapper_sha256"] = None
+                self._source_settings = pending_settings
+                self.draft_staged.emit(merged)
+                self._set_status(
+                    f"Identified {address_summary}: {module_summary}, but the "
+                    "experiment could not apply it"
+                    f"{rejection_detail}. The identified chassis is retained "
+                    "as a pending front-panel draft.",
+                    error=True,
+                )
+                return True
+        else:
+            self.settings_applied.emit(settings)
         state_suffix = (
             " The mapper is now an unsaved draft."
             if self._configuration_state == QCS_HARDWARE_STATE_DRAFT
@@ -3752,7 +3894,9 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         try:
             pixmap = _qcs_front_panel_pixmap(
                 configuration,
-                self._focused_mapping_address(configuration),
+                highlighted_addresses=(
+                    self._focused_mapping_addresses(configuration)
+                ),
             )
         except (OSError, TypeError, ValueError):
             self._show_reference_preview_unavailable()
@@ -3791,6 +3935,36 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         if mapping is None:
             return None
         return int(mapping["slot"]), int(mapping["channel"])
+
+    def _focused_mapping_addresses(
+        self,
+        configuration: Mapping[str, Any],
+    ) -> tuple[tuple[int, int], ...]:
+        """Return every endpoint highlighted by the active selection mode."""
+
+        if self._rf_acquisition_path_focus is None:
+            address = self._focused_mapping_address(configuration)
+            return () if address is None else (address,)
+
+        addresses = []
+        mappings = configuration.get("channel_mappings", ())
+        for role, logical_index in self._rf_acquisition_path_focus:
+            mapping = next(
+                (
+                    candidate
+                    for candidate in mappings
+                    if str(candidate.get("role", "")).strip().lower() == role
+                    and int(candidate.get("logical_index", -1))
+                    == logical_index
+                ),
+                None,
+            )
+            if mapping is None:
+                continue
+            address = int(mapping["slot"]), int(mapping["channel"])
+            if address not in addresses:
+                addresses.append(address)
+        return tuple(addresses)
 
     def _focused_mapping_row(self) -> Optional[int]:
         if self._focused_mapping is None:
@@ -4695,7 +4869,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 self._focused_mapping = ("rf", path_mappings["rf"])
             else:
                 self._set_status(
-                    "Stability RF-path selection requires an RF output SMA "
+                    "RF-path selection requires an RF output SMA "
                     "on M5300A/M5301A or an acquisition input SMA on "
                     "M5200A.",
                     error=True,
@@ -5819,83 +5993,118 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         fingerprint = qcs_hardware_mapper_fingerprint(configuration)
         return mapper_directory / f"front_panel_{fingerprint[:24]}.qcs"
 
-    def apply_connector_selection(self, commit_callback=None) -> bool:
-        """Generate and apply a run-ready mapper after a contextual SMA click."""
+    def prepare_connector_selection(self) -> Optional[dict]:
+        """Capture a validated connector edit without importing QCS.
+
+        Native ``ChannelMapper`` construction, save, and reload can take
+        several seconds on the first QCS import.  The main window uses this
+        lightweight preparation step on the GUI thread, then performs the
+        native work in a dedicated worker thread.  ``apply_connector_selection``
+        remains as the synchronous API for standalone users of this widget.
+        """
 
         if not self._apply_preflight_passes():
-            return False
-        if not self._mapper_write_allowed:
-            settings = self.validate_settings(verify_mapper_identity=True)
-            if (
-                settings is not None
-                and settings["hardware_configuration_state"]
-                == QCS_HARDWARE_STATE_IMPORTED
-            ):
-                if commit_callback is not None:
-                    try:
-                        committed = commit_callback(settings)
-                    except (OSError, TypeError, ValueError) as exc:
-                        self._set_status(
-                            "The imported mapper was preserved, but the "
-                            f"experiment rejected the role assignment: {exc}",
-                            error=True,
-                        )
-                        return False
-                    if committed is False:
-                        self._set_status(
-                            "The imported mapper was preserved, but the "
-                            "experiment rejected the role assignment.",
-                            error=True,
-                        )
-                        return False
-                else:
-                    self.settings_applied.emit(settings)
-                self._configuration_state = QCS_HARDWARE_STATE_IMPORTED
-                self._source_settings = dict(settings)
-                self._set_status(
-                    "Applied the selected role to an existing imported "
-                    "virtual channel. The native QCS mapper file was not "
-                    "rewritten.",
-                    error=False,
-                )
-                return True
-            self._set_status(
-                "This selection changed an imported mapper. Automatic saving "
-                "is disabled because the editor cannot preserve every "
-                "third-party mapper setting; open Advanced Hardware Settings "
-                "to restore the diagram layout or load an app-owned mapper.",
-                error=True,
-            )
-            return False
-        settings = self.validate_settings(verify_mapper_identity=False)
-        if settings is None:
-            return False
+            return None
         try:
-            automatic_path = self._automatic_mapper_output_path(
-                settings["hardware_configuration"]
-            )
-            saved_path = save_qcs_channel_mapper(
-                settings["hardware_configuration"],
-                automatic_path,
-            )
-            mapper_sha256 = qcs_mapper_file_sha256(saved_path)
-        except (ImportError, OSError, TypeError, ValueError) as exc:
+            settings = self.settings_dict()
+            if self._mapper_write_allowed:
+                mapper_path = self._automatic_mapper_output_path(
+                    settings["hardware_configuration"]
+                )
+                write_mapper = True
+            else:
+                if (
+                    settings["hardware_configuration_state"]
+                    != QCS_HARDWARE_STATE_IMPORTED
+                ):
+                    raise ValueError(
+                        "This selection changed an imported mapper. "
+                        "Automatic saving is disabled because the editor "
+                        "cannot preserve every third-party mapper setting; "
+                        "open Advanced Hardware Settings to restore the "
+                        "diagram layout or load an app-owned mapper."
+                    )
+                mapper_path = Path(settings["mapper_path"]).expanduser()
+                write_mapper = False
+        except (OSError, TypeError, ValueError) as exc:
+            self._set_status(str(exc), error=True)
+            return None
+
+        self._set_status(
+            (
+                "SMA selected. Generating and validating the native QCS "
+                "mapper in the background..."
+                if write_mapper
+                else (
+                    "SMA selected. Validating the imported QCS mapper in "
+                    "the background..."
+                )
+            ),
+            error=False,
+        )
+        return {
+            "settings": settings,
+            "mapper_path": str(mapper_path),
+            "write_mapper": write_mapper,
+        }
+
+    def complete_connector_selection(
+        self,
+        settings: Mapping[str, Any],
+        *,
+        commit_callback=None,
+    ) -> bool:
+        """Finalize a connector edit after native mapper work succeeds."""
+
+        settings = dict(settings)
+        configuration = normalize_qcs_hardware_configuration(
+            settings.get("hardware_configuration"),
+            required_dc_count=self._output_count,
+        )
+        try:
+            current = self._configuration_from_widgets()
+        except (TypeError, ValueError) as exc:
             self._set_status(
-                f"The SMA was selected, but its automatic QCS mapper could "
-                f"not be generated: {exc}",
+                f"The native mapper finished, but the current front panel "
+                f"is invalid: {exc}",
                 error=True,
+            )
+            return False
+        if current != configuration:
+            self._set_status(
+                "A newer front-panel selection replaced this mapper result; "
+                "the current selection is still being processed.",
+                error=False,
             )
             return False
 
-        settings["mapper_path"] = str(saved_path)
-        settings["hardware_configuration_state"] = QCS_HARDWARE_STATE_SAVED
-        settings["hardware_mapper_sha256"] = mapper_sha256
+        settings["hardware_configuration"] = configuration
+        state = str(settings.get("hardware_configuration_state", ""))
+        if state not in {
+            QCS_HARDWARE_STATE_SAVED,
+            QCS_HARDWARE_STATE_IMPORTED,
+        }:
+            self._set_status(
+                "The completed QCS mapper does not have a runnable state.",
+                error=True,
+            )
+            return False
+        mapper_path = str(settings["mapper_path"])
+        mapper_sha256 = normalize_qcs_mapper_sha256(
+            settings.get("hardware_mapper_sha256")
+        )
+        if mapper_sha256 is None:
+            self._set_status(
+                "The completed QCS mapper has no file identity digest.",
+                error=True,
+            )
+            return False
         if commit_callback is not None:
             try:
                 committed = commit_callback(settings)
             except (OSError, TypeError, ValueError) as exc:
                 self._set_status(
-                    f"The native mapper was generated, but the experiment "
+                    "The native mapper was generated, but the experiment "
                     f"rejected the assignment: {exc}",
                     error=True,
                 )
@@ -5910,24 +6119,77 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         else:
             self.settings_applied.emit(settings)
 
-        self.mapper_path.setText(str(saved_path))
-        self._configuration_state = QCS_HARDWARE_STATE_SAVED
+        self.mapper_path.setText(mapper_path)
+        self._configuration_state = state
         self._mapper_file_sha256 = mapper_sha256
         self._authoritative_fingerprint = qcs_hardware_mapper_fingerprint(
-            settings["hardware_configuration"]
+            configuration
         )
         self._authoritative_mapper_path = self._normalized_mapper_path(
-            str(saved_path)
+            mapper_path
         )
         self._source_settings = dict(settings)
-        self._set_mapper_write_allowed(True)
-        self.mapper_saved.emit(str(saved_path))
-        self._set_status(
-            "Mapped the selected SMA and generated the native QCS mapper "
-            "automatically.",
-            error=False,
+        self._set_mapper_write_allowed(
+            state != QCS_HARDWARE_STATE_IMPORTED
         )
+        if state == QCS_HARDWARE_STATE_SAVED:
+            self.mapper_saved.emit(mapper_path)
+            message = (
+                "Mapped the selected SMA and generated the native QCS "
+                "mapper automatically."
+            )
+        else:
+            message = (
+                "Applied the selected role to the existing imported virtual "
+                "channel. The native QCS mapper file was not rewritten."
+            )
+        self._set_status(message, error=False)
         return True
+
+    def fail_connector_selection(self, details: str) -> None:
+        """Keep a failed background selection visible and editable."""
+
+        lines = [line for line in str(details).splitlines() if line.strip()]
+        summary = lines[-1] if lines else "Unknown QCS mapper error"
+        self._set_status(
+            "The SMA remains selected, but its automatic QCS mapper could "
+            f"not be generated: {summary}",
+            error=True,
+        )
+
+    def apply_connector_selection(self, commit_callback=None) -> bool:
+        """Generate and apply a run-ready mapper after a contextual SMA click."""
+
+        prepared = self.prepare_connector_selection()
+        if prepared is None:
+            return False
+        settings = dict(prepared["settings"])
+        try:
+            if prepared["write_mapper"]:
+                saved_path = save_qcs_channel_mapper(
+                    settings["hardware_configuration"],
+                    prepared["mapper_path"],
+                )
+                state = QCS_HARDWARE_STATE_SAVED
+            else:
+                validate_imported_qcs_role_configuration(
+                    settings["hardware_configuration"],
+                    prepared["mapper_path"],
+                )
+                saved_path = Path(prepared["mapper_path"]).resolve()
+                state = QCS_HARDWARE_STATE_IMPORTED
+            mapper_sha256 = qcs_mapper_file_sha256(saved_path)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.fail_connector_selection(str(exc))
+            return False
+
+        settings["mapper_path"] = str(saved_path)
+        settings["hardware_configuration_state"] = state
+        settings["hardware_mapper_sha256"] = mapper_sha256
+        return self.complete_connector_selection(
+            settings,
+            commit_callback=commit_callback,
+        )
 
     def write_mapper(self) -> None:
         if not self._apply_preflight_passes():
@@ -5987,6 +6249,8 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         )
 
     def load_mapper(self, path=None) -> None:
+        if not self._apply_preflight_passes():
+            return
         if isinstance(path, bool) or path is None:
             path = self._choose_mapper_input()
         if not path:
@@ -6111,10 +6375,11 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     ) -> bool:
         """Select an RF output or acquisition input by the clicked module.
 
-        This scoped mode is used by the Stability RF-path preview. M5300A or
-        M5301A SMA clicks target the selected RF virtual channel, while M5200A
-        SMA clicks target the acquisition virtual channel. M5201A clicks keep
-        using the existing graphical downconverter-route editor.
+        This scoped mode is used by RF-path previews such as Stability and
+        S-Parameter. M5300A or M5301A SMA clicks target the selected RF virtual
+        channel, while M5200A SMA clicks target the acquisition virtual
+        channel. M5201A clicks keep using the existing graphical
+        downconverter-route editor.
         """
 
         rf_logical_index = _nonnegative_integer(
@@ -6132,13 +6397,15 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             ("rf", rf_logical_index),
             ("acquisition", acquisition_logical_index),
         )
+        self._preview_refresh_timer.stop()
+        self._refresh_reference_preview()
         self.reference_label.setToolTip(
-            "Click an M5300A/M5301A SMA to select the Stability RF output, "
-            "or an M5200A SMA to select the Stability acquisition input. "
+            "Click an M5300A/M5301A SMA to select the RF-path output, "
+            "or an M5200A SMA to select the RF-path acquisition input. "
             "Click an M5201A pair to configure its acquisition route."
         )
         self._set_status(
-            "Select a Stability RF-path endpoint: click an RF output SMA on "
+            "Select an RF-path endpoint: click an RF output SMA on "
             "M5300A/M5301A, or an acquisition input SMA on M5200A.",
             error=False,
         )

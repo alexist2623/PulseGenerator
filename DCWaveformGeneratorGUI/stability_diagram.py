@@ -2078,6 +2078,12 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
             stored_stability = dict(
                 stored_settings.get("stability_diagram", {})
             )
+            bias_t_compensation = getattr(
+                sequence,
+                "bias_t_compensation",
+                None,
+            )
+            bias_t_compensation_applied = bias_t_compensation is not None
             stored_stability.update({
                 "capture_mode": "qcs_hardware_sweep",
                 "hardware_sweep_shape": [
@@ -2087,7 +2093,24 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 "hardware_sweep_program_count": 1,
                 "hardware_demodulation": True,
                 "acquisition_result_type": "integrated_iq",
-                "bias_t_compensation_applied": False,
+                "bias_t_compensation_applied": (
+                    bias_t_compensation_applied
+                ),
+                "bias_t_compensation_type": (
+                    getattr(bias_t_compensation, "compensation_type", None)
+                    if bias_t_compensation_applied
+                    else None
+                ),
+                "bias_t_compensation_mode": (
+                    getattr(bias_t_compensation, "mode", None)
+                    if bias_t_compensation_applied
+                    else None
+                ),
+                "bias_t_compensation_duration_us": (
+                    float(stability_config.bias_t_compensation_duration_us)
+                    if bias_t_compensation_applied
+                    else None
+                ),
                 "measurement_representation_applied": "adc",
                 "qick_only_settings_dormant": True,
                 "coordinate_full_scale_mv": full_scale_mv,
@@ -2957,8 +2980,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             f"{format_sample_rate_hz(QCS_M5200_SAMPLE_RATE_HZ)}. Integration "
             f"lengths must be multiples of "
             f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples. Raw trace "
-            "capture is unavailable; saved QICK Bias-T settings remain "
-            "dormant and are not applied in this mode.",
+            "capture is unavailable. QCS Bias-T compensation uses a fixed "
+            "duration and adjusts each M5301 compensation voltage; "
+            "fixed-voltage and filter compensation remain QICK-only.",
             self,
         )
         self.backend_warning.setWordWrap(True)
@@ -3111,6 +3135,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "DC measure mode",
             self.acquisition_group,
         )
+        # Retain this checkbox as an internal compatibility mirror for older
+        # settings/signals.  The Display unit selector is the user-facing
+        # control; leaving this parented but outside the form places it at
+        # (0, 0), where it overlaps the group-box title.
+        self.dc_measure_mode.hide()
         self.dc_measure_mode.setToolTip(
             "DC_In only: convert FIR I/Q to current using voltage / gain"
         )
@@ -3198,7 +3227,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         ):
             label.setWordWrap(True)
             label.setSizePolicy(
-                QtWidgets.QSizePolicy.Ignored,
+                QtWidgets.QSizePolicy.Preferred,
                 QtWidgets.QSizePolicy.Preferred,
             )
         controls.addWidget(self.acquisition_group)
@@ -3214,6 +3243,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "sweep shot"
         )
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
+        self._bias_t_form = bias_t_form
         self.bias_t_type = QtWidgets.QComboBox(self.bias_t_group)
         self.bias_t_type.addItem("DC compensation", "dc")
         self.bias_t_type.addItem("Filter compensation", "filter")
@@ -3509,6 +3539,16 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             label.setVisible(bool(visible))
         field.setVisible(bool(visible))
 
+    def _set_bias_t_row_visible(
+        self,
+        field: QtWidgets.QWidget,
+        visible: bool,
+    ) -> None:
+        label = self._bias_t_form.labelForField(field)
+        if label is not None:
+            label.setVisible(bool(visible))
+        field.setVisible(bool(visible))
+
     def _sync_qcs_modulation_amplitude(self, *_args) -> None:
         with QtCore.QSignalBlocker(self.qcs_modulation_amplitude):
             self.qcs_modulation_amplitude.setValue(
@@ -3548,7 +3588,38 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             not is_qcs,
         )
         self.dc_calibration_group.setVisible(not is_qcs)
-        self.bias_t_group.setVisible(not is_qcs)
+        self.bias_t_group.setVisible(True)
+        self.bias_t_group.setTitle(
+            "Bias-T DC compensation (QCS fixed-time)"
+            if is_qcs
+            else "Bias-T compensation"
+        )
+        self.bias_t_group.setToolTip(
+            "Append one fixed-duration, opposite-area compensation pulse to "
+            "every physical M5301 output after each Stability acquisition. "
+            "QCS calculates the required voltage independently at every X/Y "
+            "point."
+            if is_qcs
+            else (
+                "Apply Stability Diagram-specific compensation to every "
+                "hardware sweep shot"
+            )
+        )
+        for field in (
+            self.bias_t_type,
+            self.bias_t_mode,
+            self.bias_t_compensation_mv,
+            self.bias_t_filter_tau_us,
+        ):
+            self._set_bias_t_row_visible(field, not is_qcs)
+        self._set_bias_t_row_visible(self.bias_t_duration_us, True)
+        duration_label = self._bias_t_form.labelForField(
+            self.bias_t_duration_us
+        )
+        if duration_label is not None:
+            duration_label.setText(
+                "Compensation duration:" if is_qcs else "DC time:"
+            )
         self.trace_samples_label.setText(
             "Integration length (M5200 samples):"
             if is_qcs
@@ -3595,6 +3666,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             )
         )
         self._sync_qcs_modulation_amplitude()
+        self._update_bias_t_controls()
 
     def _update_dc_measure_controls(self) -> None:
         editable = self._dc_input_available and not self._running
@@ -3607,6 +3679,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def _update_bias_t_controls(self, *_args) -> None:
         editable = not self._running and self.bias_t_group.isChecked()
+        if self._hardware_backend == "qcs":
+            self.bias_t_type.setEnabled(False)
+            self.bias_t_mode.setEnabled(False)
+            self.bias_t_compensation_mv.setEnabled(False)
+            self.bias_t_duration_us.setEnabled(editable)
+            self.bias_t_filter_tau_us.setEnabled(False)
+            return
         filter_mode = self.bias_t_type.currentData() == "filter"
         fixed_time = self.bias_t_mode.currentData() == "fixed_time"
         self.bias_t_type.setEnabled(editable)
@@ -4055,6 +4134,16 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.apply_path_settings(values)
         self.path_settings_applied.emit(dict(self.front_panel_values()))
 
+    def _effective_bias_t_type(self) -> str:
+        if self._hardware_backend == "qcs":
+            return "dc"
+        return str(self.bias_t_type.currentData())
+
+    def _effective_bias_t_mode(self) -> str:
+        if self._hardware_backend == "qcs":
+            return "fixed_time"
+        return str(self.bias_t_mode.currentData())
+
     def config(self, *, full_scale_mv: float) -> StabilityDiagramConfig:
         if not self._targets_available:
             raise ValueError("stability diagram requires at least two AWG outputs")
@@ -4075,9 +4164,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             modulation_frequency_mhz=self.modulation_frequency_mhz.value(),
             modulation_gain=self.modulation_gain.value(),
             bias_t_compensation_enabled=self.bias_t_group.isChecked(),
-            bias_t_compensation_type=str(self.bias_t_type.currentData()),
+            bias_t_compensation_type=self._effective_bias_t_type(),
             bias_t_compensation_voltage_mv=self.bias_t_compensation_mv.value(),
-            bias_t_compensation_mode=str(self.bias_t_mode.currentData()),
+            bias_t_compensation_mode=self._effective_bias_t_mode(),
             bias_t_compensation_duration_us=self.bias_t_duration_us.value(),
             bias_t_filter_tau_us=self.bias_t_filter_tau_us.value(),
         )
@@ -4100,6 +4189,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "modulation_gain": self.modulation_gain.value(),
             "bias_t_compensation": {
                 "enabled": self.bias_t_group.isChecked(),
+                # Preserve the complete QICK selection across backend changes.
+                # QCS config() independently constrains execution to fixed-time
+                # DC compensation, and saved run metadata records that effective
+                # method explicitly.
                 "type": str(self.bias_t_type.currentData()),
                 "mode": str(self.bias_t_mode.currentData()),
                 "voltage_mv": self.bias_t_compensation_mv.value(),

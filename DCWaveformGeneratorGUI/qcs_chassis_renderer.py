@@ -527,7 +527,9 @@ def _encode_png(image: Image.Image) -> bytes:
     image.save(
         stream,
         format="PNG",
-        compress_level=9,
+        # Level 3 remains deterministic and visually lossless while avoiding
+        # the large CPU cost of maximum compression on every GUI highlight.
+        compress_level=3,
         optimize=False,
     )
     return stream.getvalue()
@@ -659,6 +661,34 @@ def _system_sync_panel(
     return image
 
 
+@lru_cache(maxsize=64)
+def _cached_qcs_module_panel_png(
+    model: str,
+    span: int,
+    source_png: bytes,
+    slot_width: int,
+    panel_height: int,
+    scale: int,
+) -> bytes:
+    """Return one resized module composite keyed by its exact source bytes."""
+
+    if model == "M9032A":
+        panel = _system_sync_panel(
+            slot_width=slot_width,
+            panel_height=panel_height,
+            scale=scale,
+        )
+    else:
+        panel = _panel_canvas_from_asset(
+            source_png,
+            span=span,
+            slot_width=slot_width,
+            panel_height=panel_height,
+            scale=scale,
+        )
+    return _encode_png(panel)
+
+
 @lru_cache(maxsize=16)
 def _filler_panel(
     slot_width: int,
@@ -724,21 +754,14 @@ def generate_qcs_panel_png_assets(
         slot = int(module["slot"])
         model = str(module["model"])
         span = int(module["span"])
-        if model == "M9032A":
-            panel = _system_sync_panel(
-                slot_width=slot_width,
-                panel_height=panel_height,
-                scale=scale,
-            )
-        else:
-            panel = _panel_canvas_from_asset(
-                source_assets[model],
-                span=span,
-                slot_width=slot_width,
-                panel_height=panel_height,
-                scale=scale,
-            )
-        assets[slot] = _encode_png(panel)
+        assets[slot] = _cached_qcs_module_panel_png(
+            model,
+            span,
+            b"" if model == "M9032A" else source_assets[model],
+            slot_width,
+            panel_height,
+            scale,
+        )
 
     if output_directory is not None:
         directory = Path(output_directory).expanduser()
@@ -819,6 +842,7 @@ def render_qcs_chassis(
     output_path: Optional[PathLike] = None,
     asset_directory: Optional[PathLike] = None,
     highlighted_address: Optional[tuple[int, int]] = None,
+    highlighted_addresses: Optional[Sequence[tuple[int, int]]] = None,
     slot_width: int = DEFAULT_SLOT_WIDTH,
     panel_height: int = DEFAULT_PANEL_HEIGHT,
     scale: int = DEFAULT_SCALE,
@@ -970,26 +994,43 @@ def render_qcs_chassis(
             rgba_panel = panel.convert("RGBA")
             image.paste(rgba_panel, (paste_x, paste_y), rgba_panel)
 
+    requested_highlights = []
     if highlighted_address is not None:
+        requested_highlights.append(highlighted_address)
+    if highlighted_addresses is not None:
         if (
-            not isinstance(highlighted_address, Sequence)
+            not isinstance(highlighted_addresses, Sequence)
+            or isinstance(highlighted_addresses, (str, bytes, bytearray))
+        ):
+            raise TypeError("QCS highlighted addresses must be a sequence")
+        requested_highlights.extend(highlighted_addresses)
+
+    normalized_highlights = []
+    for address in requested_highlights:
+        if (
+            not isinstance(address, Sequence)
             or isinstance(
-                highlighted_address,
+                address,
                 (str, bytes, bytearray),
             )
-            or len(highlighted_address) != 2
+            or len(address) != 2
         ):
             raise TypeError(
                 "QCS highlighted address must contain slot and channel"
             )
         highlight_slot = _strict_positive_int(
-            highlighted_address[0],
+            address[0],
             "QCS highlighted slot",
         )
         highlight_channel = _strict_positive_int(
-            highlighted_address[1],
+            address[1],
             "QCS highlighted channel",
         )
+        normalized_address = (highlight_slot, highlight_channel)
+        if normalized_address not in normalized_highlights:
+            normalized_highlights.append(normalized_address)
+
+    for highlight_slot, highlight_channel in normalized_highlights:
         highlighted_module = next(
             (
                 module
@@ -1091,6 +1132,7 @@ def render_qcs_chassis_png(
     *,
     asset_directory: Optional[PathLike] = None,
     highlighted_address: Optional[tuple[int, int]] = None,
+    highlighted_addresses: Optional[Sequence[tuple[int, int]]] = None,
     slot_width: int = DEFAULT_SLOT_WIDTH,
     panel_height: int = DEFAULT_PANEL_HEIGHT,
     scale: int = DEFAULT_SCALE,
@@ -1101,6 +1143,7 @@ def render_qcs_chassis_png(
         configuration,
         asset_directory=asset_directory,
         highlighted_address=highlighted_address,
+        highlighted_addresses=highlighted_addresses,
         slot_width=slot_width,
         panel_height=panel_height,
         scale=scale,
