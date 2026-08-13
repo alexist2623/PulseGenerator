@@ -845,6 +845,7 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
         program=object(),
         sweep_shape=(2, 2),
         acquisition_duration_s=1.5e-6,
+        bias_t_compensation_duration_s=2.5e-6,
     )
     execution = SimpleNamespace(
         ddr_result=ddr_result,
@@ -1217,12 +1218,21 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.measurement_unit.isVisible() is False
     assert panel.dc_measure_gain_v_per_a.isVisible() is False
     assert panel.dc_calibration_group.isVisible() is False
-    assert panel.trace_samples.isVisible() is True
+    assert panel.trace_samples.isVisible() is False
+    assert panel.qcs_integration_duration_us.isVisible() is True
     assert (
-        panel.trace_samples_label.text()
-        == "Integration length (M5200 samples):"
+        panel.qcs_integration_duration_label.text()
+        == "Integration / sampling time:"
     )
-    assert panel.trace_samples.singleStep() == 16
+    assert "calculates the sample count automatically" in (
+        panel.qcs_integration_duration_us.toolTip()
+    )
+    assert panel.qcs_integration_duration_us.suffix() == " us"
+    assert panel.qcs_integration_duration_us.singleStep() == pytest.approx(
+        2.0 / 300.0
+    )
+    assert "6.666667 ns" in panel.qcs_integration_note.text()
+    assert "64 M5200 samples" in panel.qcs_integration_note.text()
     assert panel.modulation_frequency_label.text() == "RF frequency:"
     assert (
         panel._acquisition_form.labelForField(
@@ -1232,7 +1242,7 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     )
     for label in (
         panel.repetitions_label,
-        panel.trace_samples_label,
+        panel.qcs_integration_duration_label,
         panel.settle_time_label,
         panel.modulation_frequency_label,
         panel.qcs_modulation_amplitude_label,
@@ -1262,9 +1272,7 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
         panel._bias_t_form.labelForField(panel.bias_t_duration_us).text()
         == "Compensation duration:"
     )
-    assert "native M5301 X/Y hardware-sweep" in panel.backend_warning.text()
-    assert "4.8 GSPS" in panel.backend_warning.text()
-    assert "multiples of 16 samples" in panel.backend_warning.text()
+    assert not hasattr(panel, "backend_warning")
     panel.set_running(True, "Running QCS hardware sweep")
     assert panel.start_button.isEnabled() is False
     assert panel.single_shot_button.isEnabled() is False
@@ -1341,6 +1349,9 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.fpga_trigger_delay_us.value() == pytest.approx(17.5)
     assert panel.fir_profile_status.isVisible() is True
     assert panel.fir_profile_label.text() == "HWH FIR DDR:"
+    assert panel.trace_samples.isVisible() is True
+    assert panel.qcs_integration_duration_us.isVisible() is False
+    assert panel.qcs_integration_note.isVisible() is False
     assert panel.trace_samples_label.text() == "FIR trace samples / point:"
     assert panel.modulation_frequency_label.text() == "Modulation frequency:"
     assert panel.measurement_unit.isVisible() is True
@@ -1353,6 +1364,118 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.start_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is True
 
+    panel.close()
+
+
+def test_stability_qcs_integration_time_rounds_up_and_reports_effective_time():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.set_hardware_backend("qcs")
+    panel.show()
+    app.processEvents()
+
+    panel.qcs_integration_duration_us.setValue(0.0101)
+    assert "Requested 0.0101 us" in panel.qcs_integration_note.text()
+    assert "adjusted upward to 0.0133333333333 us" in (
+        panel.qcs_integration_note.text()
+    )
+    panel.qcs_integration_duration_us.editingFinished.emit()
+
+    assert panel.qcs_integration_duration_us.value() == pytest.approx(
+        0.013333333333,
+        abs=0.5e-12,
+    )
+    assert panel.config(full_scale_mv=2500.0).trace_samples_per_point == 64
+    settings = panel.settings_dict()
+    assert settings["qcs_integration_duration_s"] == pytest.approx(
+        64 / stability.QCS_M5200_SAMPLE_RATE_HZ
+    )
+
+    panel.qcs_integration_duration_us.setValue(0.020)
+    panel.qcs_integration_duration_us.editingFinished.emit()
+    assert panel.qcs_integration_duration_us.value() == pytest.approx(0.020)
+    assert panel.config(full_scale_mv=2500.0).trace_samples_per_point == 96
+    assert "Programmed 0.02 us" in panel.qcs_integration_note.text()
+
+    panel.close()
+
+
+def test_stability_qcs_timeline_reports_complete_target_and_compensation():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    panel.set_hardware_backend("qcs")
+    panel.settle_time_us.setValue(10.0)
+    panel.qcs_integration_duration_us.setValue(
+        10_000 / stability.QCS_M5200_SAMPLE_RATE_HZ * 1.0e6
+    )
+    panel.qcs_integration_duration_us.editingFinished.emit()
+    panel.bias_t_group.setChecked(True)
+    panel.bias_t_duration_us.setValue(50.0)
+    panel.x_axis.points.setValue(101)
+    panel.y_axis.points.setValue(101)
+    panel.set_qcs_init_time_us(100.0)
+    app.processEvents()
+
+    note = panel.qcs_point_timing_note.text()
+    assert "10,016 M5200 samples" in panel.qcs_integration_note.text()
+    assert "target DC interval 0-13.1266666667 us" in note
+    assert "10.0133333333 to 12.1 us" in note
+    assert "after 10 us at the full target voltage" in note
+    assert "post-readout full-level guard is 1 us" in note
+    assert "Compensation: 13.1266666667-63.1266666667 us" in note
+    assert "HCL inter-iteration delay: 100 us" in note
+    assert "10,201 scheduled point/repetition iterations" in note
+    assert "0.643955 s active program" in note
+    assert "1.02 s inter-iteration delay" in note
+    assert "dominates scan time" in note
+    assert "explicit terminal zero" in note
+
+    panel.set_qcs_init_time_us(0.07)
+    assert "HCL inter-iteration delay: 0.07 us" in (
+        panel.qcs_point_timing_note.text()
+    )
+
+    # RF/acquisition delay rounds to the nearest fabric cycle, whereas the
+    # complete target and compensation intervals round upward.  The displayed
+    # contract must use those independently programmed values.
+    panel.settle_time_us.setValue(10.001)
+    panel.qcs_integration_duration_us.setValue(0.020)
+    panel.qcs_integration_duration_us.editingFinished.emit()
+    panel.bias_t_duration_us.setValue(50.000001)
+    note = panel.qcs_point_timing_note.text()
+    assert "target DC interval 0-11.0633333333 us" in note
+    assert "10.0133333333 to 10.0333333333 us" in note
+    assert "1.00333333333 us" in note
+    assert "Compensation: 11.0633333333-61.0666666667 us" in note
+    panel.close()
+
+
+def test_stability_legacy_sample_setting_derives_qcs_time_then_aligns_it():
+    app = _application()
+    panel = stability.StabilityDiagramPanel()
+    panel.refresh_targets(("awg_0", "awg_1"), (1, 3))
+    legacy = stability.default_stability_settings(("awg_0", "awg_1"))
+    legacy.pop("qcs_integration_duration_s")
+    legacy["trace_samples_per_point"] = 80
+    normalized = stability.normalize_stability_settings(
+        legacy,
+        output_names=("awg_0", "awg_1"),
+    )
+
+    assert normalized["qcs_integration_duration_s"] == pytest.approx(
+        80 / stability.QCS_M5200_SAMPLE_RATE_HZ
+    )
+    panel.load_settings(normalized)
+    panel.set_hardware_backend("qcs")
+
+    assert panel.trace_samples.value() == 80
+    assert panel.qcs_integration_duration_us.value() == pytest.approx(0.020)
+    assert panel.config(full_scale_mv=2500.0).trace_samples_per_point == 96
+    assert "80" not in panel.qcs_integration_note.text()
+    assert "96 M5200 samples" in panel.qcs_integration_note.text()
+    app.processEvents()
     panel.close()
 
 
@@ -1586,6 +1709,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.stop_button.isEnabled() is True
     assert panel.single_shot_button.isEnabled() is False
     assert panel.trace_samples.isEnabled() is False
+    assert panel.qcs_integration_duration_us.isEnabled() is False
     assert panel.settle_time_us.isEnabled() is False
     assert panel.modulation_frequency_mhz.isEnabled() is False
     assert panel.bias_t_group.isEnabled() is False
@@ -1597,6 +1721,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.set_running(False, "ready")
     assert panel.start_button.isEnabled() is True
     assert panel.trace_samples.isEnabled() is True
+    assert panel.qcs_integration_duration_us.isEnabled() is True
     assert panel.settle_time_us.isEnabled() is True
     assert panel.modulation_frequency_mhz.isEnabled() is True
     assert panel.bias_t_group.isEnabled() is True

@@ -10,12 +10,14 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 from PyQt5 import QtCore, QtTest, QtWidgets
 import pytest
 
 import DCWaveform_Generator as gui
 import qcs_chassis_renderer as chassis_renderer
 import qcs_front_panel as front_panel
+from noise_analysis import NoiseAcquisitionRequest, NoiseTraceCollection
 
 
 _APP = None
@@ -1479,6 +1481,7 @@ def test_acquisition_m5201_picture_click_opens_route_dialog(
     assert tuple(dialog.digitizer_combo.currentData()) == (5, 1)
     assert dialog.lo_frequency_ghz.value() == pytest.approx(7.25)
     dialog.close()
+    app.processEvents()
 
     # A neutral faceplate click opens the same route dialog and selects the
     # currently linked pair rather than the generic replace/remove menu.
@@ -1491,6 +1494,7 @@ def test_acquisition_m5201_picture_click_opens_route_dialog(
         + chassis_renderer.DEFAULT_CHASSIS_SLOT_LABEL_HEIGHT
         + 20
     )
+    displayed = control.reference_label.pixmap()
     click_position = QtCore.QPoint(
         round(source_x * displayed.width() / control._image_pixmap.width()),
         round(source_y * displayed.height() / control._image_pixmap.height()),
@@ -3996,6 +4000,192 @@ def test_m5201_dialog_automatically_saves_applies_and_persists(
     app.processEvents()
 
 
+def test_awg_front_panel_click_maps_m5201_to_m5200_and_shares_route(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    monkeypatch.setattr(
+        front_panel,
+        "build_qcs_channel_mapper",
+        lambda configuration: object(),
+    )
+    automatic_mapper = tmp_path / "awg_m5201_route.qcs"
+    save_calls = []
+
+    def fake_save(configuration, path):
+        save_calls.append(
+            front_panel.normalize_qcs_hardware_configuration(configuration)
+        )
+        output_path = Path(path)
+        output_path.write_bytes(b"shared M5201 route mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", fake_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    original_mapper = tmp_path / "original_m5201_route.qcs"
+    original_mapper.write_bytes(b"original route mapper")
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.normalize_qcs_hardware_configuration(
+        _m5201_configuration()
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "mapper_path": str(original_mapper),
+            "dc_channel_names": ["dc_left"],
+            "rf_channel_names": {},
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_SAVED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(original_mapper)
+            ),
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+
+    window._edit_awg_output_hardware(0)
+    app.processEvents()
+    control = window._qcs_front_panel
+    assert control._focused_mapping == ("dc", 0)
+    original_dc_address = control._focused_mapping_address(
+        control.working_configuration()
+    )
+
+    def click_chassis(x, y):
+        displayed = control.reference_label.pixmap()
+        position = QtCore.QPoint(
+            round(x * displayed.width() / control._image_pixmap.width()),
+            round(y * displayed.height() / control._image_pixmap.height()),
+        )
+        QtTest.QTest.mouseClick(
+            control.reference_label,
+            QtCore.Qt.LeftButton,
+            pos=position,
+        )
+        app.processEvents()
+
+    bay_top = (
+        chassis_renderer.DEFAULT_CHASSIS_HEADER_HEIGHT
+        + chassis_renderer.DEFAULT_CHASSIS_SLOT_LABEL_HEIGHT
+    )
+    click_chassis(
+        chassis_renderer.DEFAULT_CHASSIS_LEFT_MARGIN
+        + 5 * chassis_renderer.DEFAULT_SLOT_WIDTH
+        + 92 * chassis_renderer.DEFAULT_SLOT_WIDTH / 300,
+        bay_top
+        + 540 * chassis_renderer.DEFAULT_PANEL_HEIGHT / 1300,
+    )
+    assert control.m5201_route_selection_active() is True
+    assert control._pending_m5201_route == (6, 2)
+    assert control._focused_mapping == ("dc", 0)
+
+    click_chassis(
+        chassis_renderer.DEFAULT_CHASSIS_LEFT_MARGIN
+        + 4 * chassis_renderer.DEFAULT_SLOT_WIDTH
+        + 95 * chassis_renderer.DEFAULT_SLOT_WIDTH / 300,
+        bay_top
+        + 820 * chassis_renderer.DEFAULT_PANEL_HEIGHT / 1300,
+    )
+    _wait_for_qcs_mapper_commit(window)
+
+    settings = experiment.qcs_settings_dict()
+    canonical = settings["hardware_configuration"]
+    acquisition = next(
+        mapping
+        for mapping in canonical["channel_mappings"]
+        if mapping["role"] == "acquisition"
+    )
+    assert (acquisition["slot"], acquisition["channel"]) == (5, 3)
+    assert canonical["downconverter_links"] == [
+        {
+            "digitizer_slot": 5,
+            "digitizer_channel": 3,
+            "downconverter_slot": 6,
+            "downconverter_channel": 2,
+            "lo_frequency_hz": 7.25e9,
+        }
+    ]
+    assert control.m5201_route_selection_active() is False
+    assert control._m5201_route_dialog.isVisible() is False
+    assert control._focused_mapping == ("dc", 0)
+    assert control._focused_mapping_address(control.working_configuration()) == (
+        original_dc_address
+    )
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == ("dc", 0)
+    assert len(save_calls) == 1
+
+    # Repeating the already-applied cable gesture is a true no-op: it closes
+    # only the route dialog, retains the AWG picker/focus, and does not write
+    # another native mapper.
+    click_chassis(
+        chassis_renderer.DEFAULT_CHASSIS_LEFT_MARGIN
+        + 5 * chassis_renderer.DEFAULT_SLOT_WIDTH
+        + 92 * chassis_renderer.DEFAULT_SLOT_WIDTH / 300,
+        bay_top
+        + 540 * chassis_renderer.DEFAULT_PANEL_HEIGHT / 1300,
+    )
+    click_chassis(
+        chassis_renderer.DEFAULT_CHASSIS_LEFT_MARGIN
+        + 4 * chassis_renderer.DEFAULT_SLOT_WIDTH
+        + 95 * chassis_renderer.DEFAULT_SLOT_WIDTH / 300,
+        bay_top
+        + 820 * chassis_renderer.DEFAULT_PANEL_HEIGHT / 1300,
+    )
+    app.processEvents()
+    assert len(save_calls) == 1
+    assert control.m5201_route_selection_active() is False
+    assert control._m5201_route_dialog.isVisible() is False
+    assert control._focused_mapping == ("dc", 0)
+    assert window._qcs_front_panel_dialog.isVisible() is True
+    assert window._qcs_front_panel_auto_apply_selection == ("dc", 0)
+
+    previews = [
+        window._multi_ctrl.front_panel_preview,
+        window._rf_readout_panel.front_panel_preview,
+        window._stability_panel.front_panel_preview,
+        window._stability_panel.x_axis.front_panel_preview,
+        window._stability_panel.y_axis.front_panel_preview,
+        window._sparameter_panel.path_diagram.front_panel_preview,
+        window._noise_panel.front_panel_preview,
+    ]
+    previews.extend(
+        panel.front_panel_preview
+        for panel in window._rf_ports_panel._panels
+    )
+    previews.extend(
+        window._calibration_panel.path_diagram_for(mode).front_panel_preview
+        for mode in ("output", "input", "dc_voltage")
+    )
+    assert all(
+        preview.qcs_preview._configuration == canonical
+        for preview in previews
+    )
+
+    window._qcs_front_panel_dialog.close()
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
 def test_qcs_front_panel_is_shared_by_auxiliary_measurement_tabs(monkeypatch):
     app = _application()
     window = gui.MainWindow()
@@ -5009,11 +5199,11 @@ def test_auxiliary_qcs_panels_follow_settings_and_enable_qcs_sparameter(
     )
     window._qcs_front_panel_dialog.close()
 
-    assert window._stability_panel.backend_warning.isHidden() is False
-    assert window._sparameter_panel.backend_warning.isHidden() is False
+    assert not hasattr(window._stability_panel, "backend_warning")
+    assert not hasattr(window._sparameter_panel, "backend_warning")
     assert window._sparameter_panel.fir_ddr_capture_group.isHidden() is True
-    assert window._calibration_panel.backend_warning.isHidden() is False
-    assert window._noise_panel.backend_warning.isHidden() is False
+    assert not hasattr(window._calibration_panel, "backend_warning")
+    assert not hasattr(window._noise_panel, "backend_warning")
     # This fixture has only one AWG output, so Stability remains unavailable
     # for the backend-independent two-electrode requirement.
     assert window._stability_panel.start_button.isEnabled() is False
@@ -5025,7 +5215,12 @@ def test_auxiliary_qcs_panels_follow_settings_and_enable_qcs_sparameter(
     assert (
         window._calibration_panel.run_dc_voltage_button.isEnabled() is False
     )
-    assert window._noise_panel.acquire_button.isEnabled() is False
+    assert window._calibration_panel.run_qcs_rf_button.isEnabled() is True
+    assert window._calibration_panel.run_qcs_dc_button.isEnabled() is True
+    assert window._noise_panel.acquire_button.isEnabled() is True
+    assert window._noise_panel.fir_samples.isHidden() is True
+    assert window._noise_panel.input_filter.isHidden() is True
+    assert window._noise_panel.input_margin.isHidden() is True
 
     notices = []
     warnings = []
@@ -5040,14 +5235,95 @@ def test_auxiliary_qcs_panels_follow_settings_and_enable_qcs_sparameter(
         lambda _parent, title, message: warnings.append((title, message)),
     )
     window._run_sparameter_sweep()
-    window._run_noise_acquisition(None)
+    noise_request = window._noise_panel.acquisition_request()
+    assert isinstance(noise_request, NoiseAcquisitionRequest)
+    assert noise_request.backend == "qcs"
+    window._run_noise_acquisition(noise_request)
     window._run_power_calibration("output")
-    assert len(notices) == 2
-    assert all("still uses QICK" in message for _title, message in notices)
-    assert warnings
+    assert notices == []
+    assert len(warnings) >= 2
     assert warnings[0][0] == "Cannot run RF sweep"
     assert "incomplete" in warnings[0][1]
+    assert warnings[1][0] == "Cannot acquire QCS noise trace"
+    assert "incomplete" in warnings[1][1]
     assert window._experiment_thread is None
+
+    window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
+
+
+def test_main_window_qcs_noise_request_forces_raw_trace_worker(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._noise_panel
+    panel.set_hardware_backend(gui.EXECUTION_BACKEND_QCS)
+    panel.qcs_duration_us.setValue(10.0001)
+    experiment = window._experiment_panel
+    connection = gui.QcsConnectionConfig(
+        mapper_path=str(tmp_path / "noise_mapper.qcs"),
+        dc_channel_names=("dc_gate",),
+        acquisition_channel_name="digitizer",
+        hw_demod=True,
+        blocking=False,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "execution_backend",
+        lambda: gui.EXECUTION_BACKEND_QCS,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "qcs_connection_values",
+        lambda output_count: connection,
+    )
+    captured = []
+
+    class FakeQcsNoiseWorker(QtCore.QObject):
+        finished = QtCore.pyqtSignal(object)
+        failed = QtCore.pyqtSignal(str)
+        progress_changed = QtCore.pyqtSignal(int, str)
+
+        def __init__(self, config):
+            super().__init__()
+            captured.append(config)
+
+        @QtCore.pyqtSlot()
+        def run(self):
+            self.progress_changed.emit(50, "Reading raw M5200 trace")
+            self.finished.emit(NoiseTraceCollection(
+                i_traces=np.arange(32, dtype=float).reshape(1, 1, 32),
+                sample_rate_hz=gui.QCS_M5200_SAMPLE_RATE_HZ,
+                unit="V",
+                source="Direct QCS raw trace",
+            ))
+
+    monkeypatch.setattr(gui, "QcsNoiseAcquisitionWorker", FakeQcsNoiseWorker)
+    request = panel.acquisition_request()
+    window._run_noise_acquisition(request)
+
+    timer = QtCore.QElapsedTimer()
+    timer.start()
+    while window._experiment_thread is not None and timer.elapsed() < 5000:
+        app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        QtTest.QTest.qWait(5)
+
+    assert window._experiment_thread is None
+    assert len(captured) == 1
+    config = captured[0]
+    assert config.duration_s == pytest.approx(10.0001e-6)
+    assert config.connection_config.hw_demod is False
+    assert config.connection_config.blocking is True
+    assert panel._collection is not None
+    assert panel._collection.sample_count == 32
+    assert panel._collection.source == "Direct QCS raw trace"
 
     window.close()
     window.deleteLater()
@@ -5198,12 +5474,13 @@ def test_sparameter_qcs_hides_qick_only_controls_and_restores_them():
     assert path.input_condition.isVisible() is False
     assert path.qcs_mapping_widget.isVisible() is False
     assert panel.fir_ddr_capture_group.isVisible() is False
-    assert panel.power_calibration_enabled.isVisible() is False
+    assert panel.power_calibration_enabled.isVisible() is True
     assert panel.power_sweep_enabled.isVisible() is False
     assert panel.gain.isVisible() is False
     assert panel.gain_label.isVisible() is False
-    assert panel.output_power_dbm.isVisible() is False
-    assert panel.output_power_label.isVisible() is False
+    assert panel.output_power_dbm.isVisible() is True
+    assert panel.output_power_label.isVisible() is True
+    assert panel.output_power_label.text() == "Target M5300 connector power:"
     assert panel.qcs_amplitude.isVisible() is True
     assert panel.override_fpga_trigger_delay.isEnabled() is False
     assert panel.run_button.isEnabled() is True

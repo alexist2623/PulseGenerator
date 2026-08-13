@@ -285,7 +285,9 @@ def _acquisition(**changes):
 def _stability_sequence():
     return (
         FineTuneSequence(("x_gate", "y_gate"))
-        .add_set("set_0", [0.0, 0.0], 30_000)
+        # A fully rendered 40 us plateau remains below the connected HCL
+        # M5301 limit and avoids the hardware-invalid constant-seed + Hold.
+        .add_set("set_0", [0.0, 0.0], 12_000)
         .add_amplitude_sweep("set_0", "x_gate", -0.25, 0.25, 3)
         .add_amplitude_sweep("set_0", "y_gate", -0.5, 0.5, 2)
         .set_cross_capacitance([[1.0, 0.1], [-0.2, 1.0]])
@@ -295,6 +297,27 @@ def _stability_sequence():
 def _program_waveform_operations(entry):
     pulse = entry[0]
     return pulse if isinstance(pulse, list) else [pulse]
+
+
+@pytest.mark.parametrize(
+    ("requested_s", "expected_s", "expected_samples"),
+    (
+        (6.666667e-9, 2.0 / 300.0e6, 32),
+        (10.1e-9, 4.0 / 300.0e6, 64),
+        (20.0e-9, 6.0 / 300.0e6, 96),
+    ),
+)
+def test_qcs_stability_integration_time_quantizes_upward(
+    requested_s,
+    expected_s,
+    expected_samples,
+):
+    effective_s, sample_count = (
+        backend.quantize_qcs_stability_integration_duration(requested_s)
+    )
+
+    assert effective_s == pytest.approx(expected_s)
+    assert sample_count == expected_samples
 
 
 def test_qcs_cancellation_aborts_only_owned_pending_programs():
@@ -475,7 +498,9 @@ def test_connection_config_is_qcodes_metadata_serializable():
     assert payload["dc_channel_names"] == ("dc_gate",)
     assert payload["dc_full_scale_v"] == 2.5
     assert payload["rf_channel_names"] == {3: "readout_rf"}
-    assert payload["init_time_s"] == pytest.approx(100e-6)
+    assert payload["init_time_s"] == pytest.approx(
+        backend.DEFAULT_QCS_INIT_TIME_S
+    )
 
 
 def test_connection_config_prevents_hcl_init_time_nanosecond_truncation():
@@ -522,7 +547,9 @@ def test_stability_executor_resets_phase_for_hardware_iq():
     assert captured["channel_mapper"] is mapper
     assert captured["hw_demod"] is True
     assert captured["reset_phase_every_shot"] is True
-    assert captured["init_time"] == pytest.approx(100e-6)
+    assert captured["init_time"] == pytest.approx(
+        backend.DEFAULT_QCS_INIT_TIME_S
+    )
 
 
 def test_compile_converts_gui_millivolts_to_qcs_relative_amplitude():
@@ -572,7 +599,7 @@ def test_compile_lowers_awg_set_ramp_set_to_real_dc_waveforms():
     assert [type(operation) for operation in operations] == [
         _Delay,
         _Waveform,
-        _Waveform,
+        _Hold,
     ]
     durations = [operation.kwargs["duration"] for operation in operations]
     np.testing.assert_allclose(
@@ -585,12 +612,12 @@ def test_compile_lowers_awg_set_ramp_set_to_real_dc_waveforms():
     assert compiled.duration_s == pytest.approx(120e-6)
 
     # 0.0 -> 0.4 of the GUI's 800 mV scale becomes 0.0 -> 0.128
-    # relative to the configured 2.5 V QCS full scale. The following SET uses
-    # a real constant DCWaveform; HCL Hold does not preserve M5301 voltage.
+    # relative to the configured 2.5 V QCS full scale. The following SET is
+    # continuous with that ramp endpoint, so it retains the voltage with Hold.
     ramp_vertices = operations[1].kwargs["envelope"].args[1]
     assert ramp_vertices[0] == pytest.approx(0.0)
     assert ramp_vertices[-1] == pytest.approx(0.128)
-    assert operations[2].kwargs["amplitude"] == pytest.approx(0.128)
+    assert operations[2].kwargs["duration"] == pytest.approx(10e-6)
 
 
 @pytest.mark.parametrize(
@@ -719,9 +746,9 @@ def test_m5301_ramp_rejects_unrepresentable_odd_fabric_cycle_duration():
 def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
     exact_limit = (
         FineTuneSequence(("gate",))
-        .add_set("initial", [0.0], 30_000)
+        .add_set("initial", [0.001], 6_288)
         .add_ramp("ramp", 6_000)
-        .add_set("final", [0.001], 6_288)
+        .add_set("final", [0.002], 30_000)
     )
     compiled = compile_qcs_point(
         exact_limit,
@@ -747,9 +774,9 @@ def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
 
     over_limit = (
         FineTuneSequence(("gate",))
-        .add_set("initial", [0.0], 30_000)
+        .add_set("initial", [0.001], 6_290)
         .add_ramp("ramp", 6_000)
-        .add_set("final", [0.001], 6_290)
+        .add_set("final", [0.002], 30_000)
     )
     with pytest.raises(
         QcsUnsupportedFeatureError,
@@ -777,16 +804,18 @@ def test_m5301_capacity_is_per_output_and_zero_delays_use_no_samples():
     two_outputs = (
         FineTuneSequence(("gate_x", "gate_y"))
         .add_set("initial", [0.0, 0.0], 30_000)
-        .add_ramp("ramp", 6_000)
-        .add_set("final", [0.001, 0.002], 6_288)
+        .add_ramp("x_ramp", 6_000)
+        .add_set("x_level", [0.001, None], 30_000)
+        .add_ramp("y_ramp", 3_000)
+        .add_set("y_level", [None, 0.002], 30_000)
     )
     report = backend.qcs_m5301_waveform_capacity_report(two_outputs)
 
     assert [channel.rendered_samples for channel in report.channels] == [
-        98_304,
-        98_304,
+        48_000,
+        24_000,
     ]
-    assert report.usage_fraction == pytest.approx(1.0)
+    assert report.usage_fraction == pytest.approx(48_000 / 98_304)
     assert report.exceeds_capacity is False
 
     long_zero_delay = FineTuneSequence(("gate",)).add_set(
@@ -796,6 +825,90 @@ def test_m5301_capacity_is_per_output_and_zero_delays_use_no_samples():
     )
     zero_report = backend.qcs_m5301_waveform_capacity_report(long_zero_delay)
     assert zero_report.worst_channel.rendered_samples == 0
+
+
+def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
+    sequence = (
+        FineTuneSequence(("awg_0", "awg_1"))
+        .add_set("initial", [0.0, 0.0], 3_000)
+        .add_ramp("ramp_to_control", 4_500)
+        .add_set("control", [0.1875, -0.25], 120)
+        .add_ramp("ramp_to_measure", 4_500)
+        .add_set("measure", [0.125, 0.125], 30_000)
+    )
+
+    report = backend.qcs_m5301_waveform_capacity_report(sequence)
+    assert [channel.rendered_fabric_cycles for channel in report.channels] == [
+        9_000,
+        9_000,
+    ]
+    assert [channel.rendered_samples for channel in report.channels] == [
+        72_000,
+        72_000,
+    ]
+    assert report.usage_fraction == pytest.approx(72_000 / 98_304)
+    assert report.exceeds_capacity is False
+
+    compiled = compile_qcs_point(
+        sequence,
+        0,
+        connection_config=_connection(
+            dc_channel_names=("dc_0", "dc_1"),
+        ),
+        mapper=_Mapper("dc_0", "dc_1", "digitizer"),
+        repetitions_per_sweep=1,
+        qcs_module=_FakeQcs,
+    )
+    for output_index, entry in enumerate(compiled.program.waveforms):
+        operations = _program_waveform_operations(entry)
+        assert type(operations[0]) is _Delay
+        holds = [
+            operation for operation in operations if type(operation) is _Hold
+        ]
+        np.testing.assert_allclose(
+            [operation.kwargs["duration"] for operation in holds],
+            [0.4e-6, 100e-6],
+            rtol=0.0,
+            atol=1e-15,
+        )
+        rendered = [
+            operation
+            for operation in operations
+            if type(operation) is _Waveform
+        ]
+        # awg_1's second ramp crosses zero and is safely split into two
+        # waveforms, but their combined rendered duration is still 15 us.
+        assert len(rendered) == (2 if output_index == 0 else 3)
+        assert sum(
+            operation.kwargs["duration"] for operation in rendered
+        ) == pytest.approx(30e-6)
+        assert sum(
+            operation.kwargs["duration"] for operation in operations
+        ) == pytest.approx(140.4e-6)
+    assert compiled.duration_s == pytest.approx(140.4e-6)
+
+
+def test_independent_nonzero_plateau_still_consumes_rendered_capacity():
+    sequence = FineTuneSequence(("gate",)).add_set(
+        "independent_level",
+        [0.1],
+        6_000,
+    )
+
+    report = backend.qcs_m5301_waveform_capacity_report(sequence)
+    assert report.worst_channel.rendered_fabric_cycles == 6_000
+    assert report.worst_channel.rendered_samples == 48_000
+
+    compiled = compile_qcs_point(
+        sequence,
+        0,
+        connection_config=_connection(),
+        mapper=_Mapper("dc_gate", "digitizer"),
+        repetitions_per_sweep=1,
+        qcs_module=_FakeQcs,
+    )
+    operations = _program_waveform_operations(compiled.program.waveforms[0])
+    assert [type(operation) for operation in operations] == [_Waveform]
 
 
 def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
@@ -1115,6 +1228,180 @@ def test_compile_raw_trace_uses_duration_instead_of_integration_filter():
         acquisition.duration_s
     )
     assert request["new_layer"] is False
+
+
+def test_qcs_noise_raw_duration_quantizes_to_one_sample_and_enforces_app_cap():
+    rate_hz = backend.QCS_M5200_SAMPLE_RATE_HZ
+
+    exact_s, exact_count = backend.quantize_qcs_raw_trace_duration(
+        17 / rate_hz
+    )
+    rounded_s, rounded_count = backend.quantize_qcs_raw_trace_duration(
+        17.25 / rate_hz
+    )
+
+    assert exact_count == 17
+    assert exact_s == pytest.approx(17 / rate_hz)
+    assert rounded_count == 18
+    assert rounded_s == pytest.approx(18 / rate_hz)
+    with pytest.raises(ValueError, match="application limit"):
+        backend.quantize_qcs_raw_trace_duration(
+            (backend.QCS_NOISE_MAX_RAW_TRACE_SAMPLES + 0.25) / rate_hz
+        )
+
+
+def test_qcs_noise_config_forces_raw_trace_and_requires_acquisition_mapping():
+    config = backend.QcsNoiseTraceConfig(
+        connection_config=_connection(hw_demod=True, blocking=False),
+        duration_s=100e-9,
+        repetitions=3,
+    )
+
+    assert config.connection_config.hw_demod is False
+    assert config.connection_config.blocking is True
+    assert config.repetitions == 3
+    with pytest.raises(ValueError, match="mapped M5200"):
+        backend.QcsNoiseTraceConfig(
+            connection_config=_connection(acquisition_channel_name=None),
+            duration_s=100e-9,
+        )
+
+
+def test_qcs_noise_acquires_one_raw_program_and_preserves_repetitions():
+    rate_hz = backend.QCS_M5200_SAMPLE_RATE_HZ
+    config = backend.QcsNoiseTraceConfig(
+        connection_config=_connection(hw_demod=True),
+        duration_s=5.25 / rate_hz,
+        repetitions=2,
+    )
+    mapper = _PhysicalMapper("digitizer")
+    # QCS trace frames are sample-first with the shot axis last.
+    trace = np.asarray(
+        [[1.0, 11.0], [2.0, 12.0], [3.0, 13.0],
+         [4.0, 14.0], [5.0, 15.0], [6.0, 16.0]]
+    )
+    trace_calls = []
+
+    class Results:
+        def get_trace(self, channels, avg=False):
+            trace_calls.append((channels, avg))
+            return {channels: trace}
+
+    class ExecutedProgram:
+        results = Results()
+
+        @staticmethod
+        def get_sample_rates(channels):
+            return {channels: rate_hz}
+
+    class Executor:
+        def __init__(self):
+            self.programs = []
+
+        def execute(self, program):
+            self.programs.append(program)
+            return ExecutedProgram()
+
+    executor = Executor()
+    progress = []
+    result = backend.acquire_qcs_noise_trace(
+        config,
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=executor,
+        progress_callback=lambda percent, message: progress.append(
+            (percent, message)
+        ),
+    )
+
+    assert len(executor.programs) == 1
+    program = executor.programs[0]
+    assert program.shots == 2
+    assert len(program.acquisitions) == 1
+    request = program.acquisitions[0]
+    assert request["integration_filter"] == pytest.approx(6 / rate_hz)
+    assert isinstance(request["integration_filter"], float)
+    assert request["new_layer"] is True
+    assert trace_calls == [(request["channels"], False)]
+    assert result.i_traces.shape == (2, 6)
+    np.testing.assert_array_equal(result.i_traces, trace.T)
+    assert result.requested_duration_s == pytest.approx(5.25 / rate_hz)
+    assert result.duration_s == pytest.approx(6 / rate_hz)
+    assert result.sample_rate_hz == rate_hz
+    assert result.sample_count == 6
+    assert result.program is program
+    assert result.raw_result.__class__ is ExecutedProgram
+    assert progress[-1] == (100, "QCS raw noise trace acquired")
+
+
+def test_qcs_noise_builds_hcl_backend_with_hardware_demodulation_disabled():
+    rate_hz = backend.QCS_M5200_SAMPLE_RATE_HZ
+    config = backend.QcsNoiseTraceConfig(
+        connection_config=_connection(hw_demod=True),
+        duration_s=4 / rate_hz,
+    )
+    mapper = _PhysicalMapper("digitizer")
+    backend_kwargs = []
+    execute_calls = []
+
+    class Results:
+        @staticmethod
+        def get_trace(channels, avg=False):
+            assert avg is False
+            return {channels: np.arange(4, dtype=float)}
+
+    class ExecutedProgram:
+        results = Results()
+
+    class HclBackend:
+        def __init__(self, **kwargs):
+            backend_kwargs.append(kwargs)
+
+    class Executor:
+        def __init__(self, hcl_backend):
+            self.hcl_backend = hcl_backend
+
+        def execute(self, program):
+            execute_calls.append(program)
+            return ExecutedProgram()
+
+    class QcsWithExecutor(_FakeQcs):
+        pass
+
+    QcsWithExecutor.HclBackend = HclBackend
+    QcsWithExecutor.Executor = Executor
+
+    result = backend.acquire_qcs_noise_trace(
+        config,
+        qcs_module=QcsWithExecutor,
+        mapper=mapper,
+    )
+
+    assert len(backend_kwargs) == 1
+    assert backend_kwargs[0]["hw_demod"] is False
+    assert backend_kwargs[0]["reset_phase_every_shot"] is False
+    assert backend_kwargs[0]["channel_mapper"] is mapper
+    assert len(execute_calls) == 1
+    assert result.i_traces.shape == (1, 4)
+
+
+def test_qcs_noise_rejects_non_m5200_acquisition_role_before_execution():
+    config = backend.QcsNoiseTraceConfig(
+        connection_config=_connection(),
+        duration_s=100e-9,
+    )
+    mapper = _PhysicalMapper("digitizer")
+    mapper._physical[mapper.channels[0]].instrument = "M5300AWG"
+
+    with pytest.raises(ValueError, match="M5200Digitizer"):
+        backend.acquire_qcs_noise_trace(
+            config,
+            qcs_module=_FakeQcs,
+            mapper=mapper,
+            executor=lambda _program: (_ for _ in ()).throw(
+                AssertionError("invalid acquisition must not execute")
+            ),
+        )
 
 
 def test_raw_trace_can_cross_segment_while_single_iq_remains_scoped():
@@ -1500,7 +1787,7 @@ def test_101_by_101_voltage_grid_uses_hardware_limit_not_software_limit():
     assert sequence.sweep_point_count == 10_201
     assert preview.mode == "hardware"
     assert preview.exact is False
-    assert "100 us inter-shot" in " ".join(preview.reasons)
+    assert "100 us inter-iteration" in " ".join(preview.reasons)
     assert compiled.hardware_sweep is True
     assert compiled.sweep_shape == (101, 101)
     assert compiled.sweep_variable_count == 2
@@ -1654,9 +1941,15 @@ def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
     assert result.program_summary["dc_channel_offsets_v"] == pytest.approx(
         [0.100]
     )
+    expected_init_compensation_v = -0.100 * (
+        backend.DEFAULT_QCS_INIT_TIME_S
+        * (sequence.sweep_point_count - 1)
+        / sequence.sweep_point_count
+        / (3_000 / 300e6)
+    )
     assert result.program_summary[
         "dc_offset_init_compensation_v"
-    ] == pytest.approx([-0.800])
+    ] == pytest.approx([expected_init_compensation_v])
 
     arrays, variables = calls[0].sweeps[0]
     values_by_name = {
@@ -1670,7 +1963,11 @@ def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
         0
     ].target_amplitude
     expected_first = (
-        (original_target - 0.800 / 0.800) * (800.0 / 2_500.0)
+        (
+            original_target
+            + expected_init_compensation_v / 0.800
+        )
+        * (800.0 / 2_500.0)
         - 0.100 / 2.5
     )
     assert compensation_values[0] == pytest.approx(expected_first)
@@ -3294,13 +3591,15 @@ def test_qcs_stability_fixed_time_compensation_is_in_same_hardware_sweep():
         mode="fixed_time",
         fixed_duration_cycles=60_000,
     )
+    connection = _connection(
+        dc_channel_names=("dc_x", "dc_y"),
+        dc_full_scale_v=1.0,
+    )
+    mapper = _Mapper("dc_x", "dc_y", "digitizer")
     compiled = backend.compile_qcs_stability_hardware_sweep(
         sequence,
-        connection_config=_connection(
-            dc_channel_names=("dc_x", "dc_y"),
-            dc_full_scale_v=1.0,
-        ),
-        mapper=_Mapper("dc_x", "dc_y", "digitizer"),
+        connection_config=connection,
+        mapper=mapper,
         repetitions_per_point=4,
         fabric_mhz=300.0,
         source_full_scale_mv=800.0,
@@ -3334,8 +3633,12 @@ def test_qcs_stability_fixed_time_compensation_is_in_same_hardware_sweep():
         assert [type(operation) for operation in operations] == [
             _Waveform,
             _Hold,
+            _Waveform,
+            _Delay,
         ]
-        assert operations[0].kwargs["duration"] == pytest.approx(1e-6)
+        assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+        assert operations[-2].kwargs["duration"] == pytest.approx(4 / 300e6)
+        assert operations[-1].kwargs["duration"] == pytest.approx(4 / 300e6)
 
     compensation_duration_s = sum(
         operation.kwargs["duration"]
@@ -3375,15 +3678,55 @@ def test_qcs_stability_fixed_time_compensation_is_in_same_hardware_sweep():
         hold_y_values,
         [-0.36, 0.44, -0.4, 0.4, -0.44, 0.36],
     )
+    ramp_s = 4 / 300e6
+    edge_area_s = (3 - 64 / 63) * ramp_s
+    effective_measurement_s = 40e-6 - edge_area_s
+    effective_compensation_s = 200e-6 - edge_area_s
     np.testing.assert_allclose(
         compensation_x_values,
-        [0.12, 0.08, 0.02, -0.02, -0.08, -0.12],
+        np.asarray([0.24, 0.16, 0.04, -0.04, -0.16, -0.24])
+        * effective_measurement_s
+        / effective_compensation_s,
     )
     np.testing.assert_allclose(
         compensation_y_values,
-        [0.18, -0.22, 0.2, -0.2, 0.22, -0.18],
+        np.asarray([0.36, -0.44, 0.4, -0.4, 0.44, -0.36])
+        * effective_measurement_s
+        / effective_compensation_s,
     )
     assert not np.array_equal(compensation_x_values, compensation_y_values)
+    assert compiled.duration_s == pytest.approx(240e-6)
+    assert compiled.bias_t_compensation_duration_s == pytest.approx(200e-6)
+
+    class Executor:
+        @staticmethod
+        def execute(_program):
+            return np.zeros((4, 6), dtype=complex)
+
+    result = backend.execute_qcs_stability_hardware_sweep(
+        connection_config=connection,
+        sequence=sequence,
+        repetitions_per_point=4,
+        fabric_mhz=300.0,
+        source_full_scale_mv=800.0,
+        acquisition=_acquisition(at_segment="set_0"),
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=Executor(),
+        compiled=compiled,
+    )
+    assert result.program_summary["measurement_hold_duration_s"] == (
+        pytest.approx(40e-6)
+    )
+    assert result.program_summary["point_program_duration_s"] == (
+        pytest.approx(240e-6)
+    )
+    assert result.program_summary["inter_iteration_delay_s"] == (
+        pytest.approx(backend.DEFAULT_QCS_INIT_TIME_S)
+    )
+    assert result.program_summary["nominal_point_period_s"] == (
+        pytest.approx(240e-6 + backend.DEFAULT_QCS_INIT_TIME_S)
+    )
 
 
 def test_qcs_stability_fixed_time_compensation_rejects_overrange_voltage():
@@ -3437,10 +3780,12 @@ def test_qcs_stability_without_compensation_keeps_original_single_layer_sweep():
         assert [type(operation) for operation in operations] == [
             _Waveform,
             _Hold,
+            _Waveform,
+            _Delay,
         ]
         assert sum(
             operation.kwargs["duration"] for operation in operations
-        ) == pytest.approx(100e-6)
+        ) == pytest.approx(40e-6)
     arrays, variables = compiled.program.sweeps[0]
     assert len(arrays) == len(variables) == 2
 
@@ -3534,6 +3879,89 @@ def test_qcs_stability_hardware_sweep_requires_hardware_demodulation():
         )
 
 
+def test_qcs_stability_rejects_integration_above_measured_m5200_limit():
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match=r"at most 32,768 samples",
+    ):
+        backend.compile_qcs_stability_hardware_sweep(
+            _stability_sequence(),
+            connection_config=_connection(
+                dc_channel_names=("dc_x", "dc_y"),
+                dc_full_scale_v=1.0,
+            ),
+            mapper=_Mapper("dc_x", "dc_y", "digitizer"),
+            repetitions_per_point=1,
+            fabric_mhz=300.0,
+            source_full_scale_mv=800.0,
+            acquisition=_acquisition(
+                at_segment="set_0",
+                duration_s=32_800 / backend.QCS_M5200_SAMPLE_RATE_HZ,
+                sample_count=32_800,
+            ),
+            qcs_module=_FakeQcs,
+        )
+
+
+def test_qcs_stability_summary_reports_programmed_quantized_timing():
+    acquisition = _acquisition(
+        at_segment="set_0",
+        duration_s=20e-9,
+        pre_delay_s=10.001e-6,
+        sample_count=96,
+    )
+    rf_pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="set_0",
+        duration_s=20.001e-9,
+        amplitude=0.2,
+        frequency_hz=50e6,
+        delay_s=10.001e-6,
+        require_within_segment=False,
+    )
+    connection = _connection(
+        dc_channel_names=("dc_x", "dc_y"),
+        dc_full_scale_v=1.0,
+        rf_channel_names={0: "rf_out"},
+    )
+    mapper = _Mapper("dc_x", "dc_y", "rf_out", "digitizer")
+    compiled = backend.compile_qcs_stability_hardware_sweep(
+        _stability_sequence(),
+        connection_config=connection,
+        mapper=mapper,
+        repetitions_per_point=1,
+        acquisition=acquisition,
+        rf_pulses=(rf_pulse,),
+        qcs_module=_FakeQcs,
+    )
+
+    class Executor:
+        @staticmethod
+        def execute(_program):
+            return np.zeros((1, 6), dtype=complex)
+
+    result = backend.execute_qcs_stability_hardware_sweep(
+        connection_config=connection,
+        sequence=_stability_sequence(),
+        repetitions_per_point=1,
+        acquisition=acquisition,
+        rf_pulses=(rf_pulse,),
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=Executor(),
+        compiled=compiled,
+    )
+    assert result.program_summary["acquisition_pre_delay_s"] == (
+        pytest.approx(10e-6)
+    )
+    (output_details,) = result.rf_settings["output_details"]
+    assert output_details["delay_s"] == pytest.approx(10e-6)
+    assert output_details["duration_s"] == pytest.approx(20e-9)
+    assert result.rf_settings["readout_details"]["pre_delay_s"] == (
+        pytest.approx(10e-6)
+    )
+
+
 def test_qcs_stability_hardware_sweep_requires_300_mhz_fabric():
     with pytest.raises(ValueError, match="300 MHz synchronization fabric"):
         backend.compile_qcs_stability_hardware_sweep(
@@ -3545,6 +3973,26 @@ def test_qcs_stability_hardware_sweep_requires_300_mhz_fabric():
             repetitions_per_point=1,
             fabric_mhz=250.0,
             acquisition=_acquisition(at_segment="set_0"),
+            qcs_module=_FakeQcs,
+        )
+
+
+def test_qcs_stability_compiler_rejects_one_cycle_integration_length():
+    with pytest.raises(
+        ValueError,
+        match=r"6\.666666667 ns \(32 M5200 samples",
+    ):
+        backend.compile_qcs_stability_hardware_sweep(
+            _stability_sequence(),
+            connection_config=_connection(
+                dc_channel_names=("dc_x", "dc_y"),
+            ),
+            mapper=_Mapper("dc_x", "dc_y", "digitizer"),
+            repetitions_per_point=1,
+            acquisition=_acquisition(
+                at_segment="set_0",
+                sample_count=16,
+            ),
             qcs_module=_FakeQcs,
         )
 
@@ -4232,6 +4680,7 @@ def test_real_qcs_255_builds_program_offline():
 
 def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
     qcs = pytest.importorskip("keysight.qcs")
+    from keysight.qcs.channels.render import render as render_qcs_channel
     dc_x = qcs.Channels(0, "dc_x", absolute_phase=False)
     dc_y = qcs.Channels(0, "dc_y", absolute_phase=False)
     rf_out = qcs.Channels(0, "rf_out", absolute_phase=True)
@@ -4315,16 +4764,22 @@ def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
     assert len(compiled.program.layers[0].operations) == 4
     for channel in (dc_x, dc_y):
         operations = compiled.program.layers[0].operations[channel]
-        assert len(operations) == 2
-        waveform, hold = operations
-        assert isinstance(waveform, qcs.DCWaveform)
+        assert len(operations) == 4
+        ramp_up, hold, ramp_down, terminal_zero = operations
+        assert isinstance(ramp_up, qcs.DCWaveform)
         assert isinstance(hold, qcs.Hold)
-        assert len(waveform.amplitudes) == 1
-        assert isinstance(waveform.amplitudes[0], qcs.Scalar)
-        assert waveform.duration.value == pytest.approx(1e-6)
-        assert waveform.duration.value + hold.duration.value == pytest.approx(
-            100e-6
+        assert isinstance(ramp_down, qcs.DCWaveform)
+        assert isinstance(terminal_zero, qcs.Delay)
+        assert isinstance(ramp_up.amplitudes[0], qcs.Scalar)
+        assert ramp_down.amplitudes[0].name == ramp_up.amplitudes[0].name
+        assert sum(
+            operation.duration.value for operation in operations
+        ) == pytest.approx(40e-6)
+        rendered, _phasor = render_qcs_channel(operations, 2.4e9)
+        assert rendered[31].real == pytest.approx(
+            ramp_up.amplitudes[0].value
         )
+        np.testing.assert_array_equal(rendered[-32:], 0.0)
 
     def assert_300_mhz_aligned(seconds):
         ticks = seconds * 300e6
@@ -4341,6 +4796,7 @@ def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
 
 def test_real_qcs_255_builds_fixed_time_stability_compensation_layer():
     qcs = pytest.importorskip("keysight.qcs")
+    from keysight.qcs.channels.render import render as render_qcs_channel
     dc_x = qcs.Channels(0, "dc_x", absolute_phase=False)
     dc_y = qcs.Channels(0, "dc_y", absolute_phase=False)
     digitizer = qcs.Channels(0, "digitizer", absolute_phase=True)
@@ -4384,15 +4840,26 @@ def test_real_qcs_255_builds_fixed_time_stability_compensation_layer():
         for channel in (dc_x, dc_y)
     ]
     for operations in compensation_operations:
-        assert len(operations) == 2
-        waveform, hold = operations
-        assert isinstance(waveform, qcs.DCWaveform)
+        assert len(operations) == 4
+        ramp_up, hold, ramp_down, terminal_zero = operations
+        assert isinstance(ramp_up, qcs.DCWaveform)
         assert isinstance(hold, qcs.Hold)
-        assert isinstance(waveform.amplitudes[0], qcs.Scalar)
-        assert waveform.duration.value == pytest.approx(1e-6)
-        total_duration_s = waveform.duration.value + hold.duration.value
+        assert isinstance(ramp_down, qcs.DCWaveform)
+        assert isinstance(terminal_zero, qcs.Delay)
+        assert isinstance(ramp_up.amplitudes[0], qcs.Scalar)
+        assert ramp_down.amplitudes[0].name == ramp_up.amplitudes[0].name
+        assert ramp_up.duration.value == pytest.approx(4 / 300e6)
+        assert ramp_down.duration.value == pytest.approx(4 / 300e6)
+        total_duration_s = sum(
+            operation.duration.value for operation in operations
+        )
         assert total_duration_s == pytest.approx(60_000 / 300.0e6)
         assert total_duration_s * 300.0e6 == pytest.approx(60_000)
+        rendered, _phasor = render_qcs_channel(operations, 2.4e9)
+        assert rendered[31].real == pytest.approx(
+            ramp_up.amplitudes[0].value
+        )
+        np.testing.assert_array_equal(rendered[-32:], 0.0)
 
     sweep = compiled.program.repetitions.items[1]
     association_by_name = {
@@ -4403,13 +4870,21 @@ def test_real_qcs_255_builds_fixed_time_stability_compensation_layer():
         association_by_name[operations[0].amplitudes[0].name]
         for operations in compensation_operations
     ]
+    ramp_s = 4 / 300e6
+    edge_area_s = (3 - 64 / 63) * ramp_s
+    effective_measurement_s = 40e-6 - edge_area_s
+    effective_compensation_s = 200e-6 - edge_area_s
     np.testing.assert_allclose(
         compensation_values[0],
-        [0.12, 0.08, 0.02, -0.02, -0.08, -0.12],
+        np.asarray([0.24, 0.16, 0.04, -0.04, -0.16, -0.24])
+        * effective_measurement_s
+        / effective_compensation_s,
     )
     np.testing.assert_allclose(
         compensation_values[1],
-        [0.18, -0.22, 0.2, -0.2, 0.22, -0.18],
+        np.asarray([0.36, -0.44, 0.4, -0.4, 0.44, -0.36])
+        * effective_measurement_s
+        / effective_compensation_s,
     )
     assert len(sweep.associations) == 4
 

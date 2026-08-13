@@ -318,6 +318,20 @@ def test_channel_sma_hit_test_resolves_role_compatible_connectors():
         "model": "M5201A",
         "center": pytest.approx(downconverter_ch3),
     }
+    downconverter_if3 = (
+        m5201_left + 208 * DEFAULT_SLOT_WIDTH / 300,
+        bay_top + 665 * DEFAULT_PANEL_HEIGHT / 1300,
+    )
+    downconverter_if_hit = qcs_chassis_connector_at_point(
+        configuration,
+        *downconverter_if3,
+        role="downconverter",
+    )
+    assert (
+        downconverter_if_hit["slot"],
+        downconverter_if_hit["channel"],
+        downconverter_if_hit["model"],
+    ) == (6, 3, "M5201A")
     assert (
         qcs_chassis_connector_at_point(
             configuration,
@@ -425,6 +439,46 @@ def test_downconverter_link_is_rendered_in_the_address_footer():
             )
         }
         assert link_color not in footer_colors
+
+
+def test_downconverter_link_is_drawn_between_module_face_connectors():
+    configuration = _configuration()
+    linked = render_qcs_chassis(configuration)
+    without_link = dict(configuration)
+    without_link["downconverter_links"] = []
+    unlinked = render_qcs_chassis(without_link)
+    bay_top = (
+        DEFAULT_CHASSIS_HEADER_HEIGHT
+        + DEFAULT_CHASSIS_SLOT_LABEL_HEIGHT
+    )
+    source = (
+        round(
+            DEFAULT_CHASSIS_LEFT_MARGIN
+            + 5 * DEFAULT_SLOT_WIDTH
+            + 208 * DEFAULT_SLOT_WIDTH / 300
+        ),
+        round(bay_top + 455 * DEFAULT_PANEL_HEIGHT / 1300),
+    )
+    destination = (
+        round(
+            DEFAULT_CHASSIS_LEFT_MARGIN
+            + 4 * DEFAULT_SLOT_WIDTH
+            + 95 * DEFAULT_SLOT_WIDTH / 300
+        ),
+        round(bay_top + 300 * DEFAULT_PANEL_HEIGHT / 1300),
+    )
+    midpoint = (
+        round((source[0] + destination[0]) / 2),
+        round((source[1] + destination[1]) / 2),
+    )
+    link_color = tuple(
+        int(ROLE_COLORS["downconverter"][offset : offset + 2], 16)
+        for offset in (1, 3, 5)
+    )
+
+    for point in (source, midpoint, destination):
+        assert linked.getpixel(point) == link_color
+    assert unlinked.getpixel(midpoint) != link_color
 
 
 def test_chassis_render_rejects_overlapping_two_slot_module():

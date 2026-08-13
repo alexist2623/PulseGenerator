@@ -38,7 +38,7 @@ try:
     from .hardware_front_panel import HardwareFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
     from .qcs_qcodes_experiment import (
-        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S,
         run_qcs_sparameter_sweep,
     )
 except ImportError:
@@ -55,7 +55,7 @@ except ImportError:
     from hardware_front_panel import HardwareFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
     from qcs_qcodes_experiment import (
-        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S,
         run_qcs_sparameter_sweep,
     )
 
@@ -974,21 +974,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._hardware_backend = "qick"
         self._running = False
         outer = QtWidgets.QVBoxLayout(self)
-        self.backend_warning = QtWidgets.QLabel(
-            "QCS runs one submitted frequency-sweep Program and one "
-            "Executor call. The same frequency scalar drives the M5300 "
-            "waveform and M5200 integration filter; QCS 2.5.5 resolves the "
-            "frequencies in software because the M5200 filter frequency "
-            "cannot change in hardware time.",
-            self,
-        )
-        self.backend_warning.setWordWrap(True)
-        self.backend_warning.setStyleSheet(
-            "QLabel { color: #8a4b08; background: #fff4d6; "
-            "border: 1px solid #e0b96a; padding: 6px; }"
-        )
-        self.backend_warning.hide()
-        outer.addWidget(self.backend_warning)
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         content = QtWidgets.QWidget(scroll)
@@ -1121,6 +1106,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         calibration_form.addRow(
             "Input calibration Run ID:",
             self.requested_input_calibration_run_id,
+        )
+        self.input_calibration_label = calibration_form.labelForField(
+            self.input_calibration_selection
+        )
+        self.input_calibration_run_label = calibration_form.labelForField(
+            self.requested_input_calibration_run_id
         )
         calibration_form.addRow(self.calibration_hint)
         content_layout.addWidget(self.power_calibration_enabled)
@@ -1337,7 +1328,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def _update_power_control_state(self, _enabled: bool) -> None:
         sweep_enabled = self.power_sweep_enabled.isChecked()
         calibrated = self.power_calibration_enabled.isChecked()
-        self.gain.setEnabled(not sweep_enabled and not calibrated)
+        is_qcs = self._hardware_backend == "qcs"
+        self.gain.setEnabled(not is_qcs and not sweep_enabled and not calibrated)
+        self.qcs_amplitude.setEnabled(is_qcs and not calibrated)
         self.output_power_dbm.setEnabled(not sweep_enabled and calibrated)
         for widget in (
             self.power_start_gain,
@@ -1351,14 +1344,14 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         for widget in (
             self.calibration_database_path,
             self.browse_calibration_database,
-            self.input_calibration_selection,
         ):
             widget.setEnabled(calibrated)
+        self.input_calibration_selection.setEnabled(calibrated and not is_qcs)
         manual_input_run = (
             self.input_calibration_selection.currentData() == "manual_run_id"
         )
         self.requested_input_calibration_run_id.setEnabled(
-            calibrated and manual_input_run
+            calibrated and (is_qcs or manual_input_run)
         )
 
     def _update_filter_control_state(self, *_args) -> None:
@@ -1503,25 +1496,21 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.path_diagram.set_hardware_backend(backend)
         is_qcs = self._hardware_backend == "qcs"
         if is_qcs:
-            # Six displayed decimals must never round above the measured
-            # 32,768-sample one-filter limit.
             qcs_max_us = float(
-                np.floor(
-                    QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S
-                    * 1.0e12
-                )
-                / 1.0e6
+                QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S * 1.0e6
             )
             self.scan_time_us.setMaximum(qcs_max_us)
             self.scan_time_us.setToolTip(
-                "One flat M5200 IntegrationFilter per frequency. QCS 2.5.5 "
-                f"hardware-tested maximum: {qcs_max_us:g} us "
-                "(32,768 samples)."
+                "QCS uses flat M5200 hardware-demodulation filters. Above "
+                "the single-filter limit, the measurement is split into "
+                "equal repeated integrations separated by a hardware-safe "
+                "20 ns guard; their "
+                "complex I/Q values are combined with sample-count "
+                f"weights. Hardware-tested maximum: {qcs_max_us:g} us."
             )
         else:
             self.scan_time_us.setMaximum(1.0e6)
             self.scan_time_us.setToolTip("")
-        self.backend_warning.setVisible(is_qcs)
         self.path_hint.setText(
             (
                 "RF output and acquisition modules, virtual channels, slots, "
@@ -1534,12 +1523,15 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 "to this S-parameter tab and its HWH-backed front-panel editor."
             )
         )
-        for label, field in (
-            (self.gain_label, self.gain),
-            (self.output_power_label, self.output_power_dbm),
-        ):
-            label.setVisible(not is_qcs)
-            field.setVisible(not is_qcs)
+        self.gain_label.setVisible(not is_qcs)
+        self.gain.setVisible(not is_qcs)
+        self.output_power_label.setVisible(True)
+        self.output_power_label.setText(
+            "Target M5300 connector power:"
+            if is_qcs
+            else "Single target power:"
+        )
+        self.output_power_dbm.setVisible(True)
         self.qcs_amplitude_label.setVisible(is_qcs)
         self.qcs_amplitude.setVisible(is_qcs)
         self.scan_time_label.setText(
@@ -1547,10 +1539,35 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             if is_qcs
             else "Scan time per point:"
         )
-        self.power_calibration_enabled.setVisible(not is_qcs)
+        self.power_calibration_enabled.setVisible(True)
+        self.power_calibration_enabled.setTitle(
+            "M5300A 50 Ohm Output Power Calibration"
+            if is_qcs
+            else "Frequency Response Compensation"
+        )
+        self.calibration_hint.setText(
+            (
+                "Select the dedicated M5300A/M5200A calibration database. "
+                "Run ID 0 uses the newest exact mapper, LO, connector, and "
+                "frequency-covering calibration."
+            )
+            if is_qcs
+            else (
+                "Same-board response; normalized to the weakest frequency "
+                "in the sweep."
+            )
+        )
+        self.input_calibration_label.setVisible(not is_qcs)
+        self.input_calibration_selection.setVisible(not is_qcs)
+        self.input_calibration_run_label.setText(
+            "QCS calibration Run ID:"
+            if is_qcs
+            else "Input calibration Run ID:"
+        )
         self.power_sweep_enabled.setVisible(not is_qcs)
         self.fir_ddr_capture_group.setVisible(not is_qcs)
         self._update_fpga_trigger_delay_controls()
+        self._update_power_control_state(False)
         self.run_button.setEnabled(not self._running)
 
     def set_qcs_front_panel_configuration(

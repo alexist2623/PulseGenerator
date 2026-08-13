@@ -7,8 +7,9 @@ finalized Python front-panel PNGs from ``assets/``, and places them into an
 M5201A each occupy one.  Every other unoccupied slot receives a generated
 filler panel.
 
-Channel mappings are shown as an address legend below the chassis.  The
-renderer deliberately draws no cables or signal-routing lines.
+Channel mappings are shown as an address legend below the chassis. Explicit
+M5201A-to-M5200A down-converter cables are drawn on the module faces; no cable
+is inferred from the installed-module inventory.
 
 Typical use::
 
@@ -119,6 +120,19 @@ CHANNEL_CONNECTOR_LAYOUT = {
             3: (92, 750),
             4: (92, 960),
         },
+    },
+}
+
+# M5201A routing is selected by its RF input, but the declared external cable
+# leaves the corresponding IF output on the other side of the pair. Keep that
+# physical cable endpoint separate from the clickable RF-input geometry.
+M5201_LINK_OUTPUT_LAYOUT = {
+    "source_size": (300, 1300),
+    "channels": {
+        1: (208, 245),
+        2: (208, 455),
+        3: (208, 665),
+        4: (208, 875),
     },
 }
 
@@ -429,6 +443,46 @@ def _module_channel_geometry(
     return center_x, center_y, hit_radius
 
 
+def _m5201_link_output_geometry(
+    module: Mapping[str, Any],
+    channel: int,
+    *,
+    slot_width: int,
+    panel_height: int,
+    scale: int,
+) -> Optional[tuple[float, float, float]]:
+    """Return the physical M5201A IF-output geometry for one pair."""
+
+    if str(module["model"]) != "M5201A":
+        return None
+    source_point = M5201_LINK_OUTPUT_LAYOUT["channels"].get(int(channel))
+    if source_point is None:
+        return None
+    source_width, source_height = M5201_LINK_OUTPUT_LAYOUT["source_size"]
+    target_width = slot_width * int(module["span"]) * scale
+    target_height = panel_height * scale
+    module_left = (
+        DEFAULT_CHASSIS_LEFT_MARGIN * scale
+        + (int(module["slot"]) - 1) * slot_width * scale
+    )
+    bay_top = (
+        DEFAULT_CHASSIS_HEADER_HEIGHT
+        + DEFAULT_CHASSIS_SLOT_LABEL_HEIGHT
+    ) * scale
+    center_x = (
+        module_left + float(source_point[0]) * target_width / source_width
+    )
+    center_y = (
+        bay_top + float(source_point[1]) * target_height / source_height
+    )
+    source_radius = 52.0
+    hit_radius = source_radius * min(
+        target_width / source_width,
+        target_height / source_height,
+    )
+    return center_x, center_y, hit_radius
+
+
 def qcs_chassis_connector_at_point(
     configuration: Mapping[str, Any],
     x: float,
@@ -443,8 +497,9 @@ def qcs_chassis_connector_at_point(
 
     ``role`` limits selection to compatible module types.  For example, DC
     output selection accepts only M5301A channel SMAs, while acquisition
-    selection accepts only M5200A channel SMAs.  SMP connectors are never
-    returned.
+    selection accepts only M5200A channel SMAs. Both connectors in an M5201A
+    RF/IF pair resolve to the same down-converter channel. SMP connectors are
+    never returned.
     """
 
     slot_width = _strict_positive_int(slot_width, "QCS render slot width")
@@ -469,30 +524,46 @@ def qcs_chassis_connector_at_point(
             continue
         channel_count = int(MODULE_SPECS[model]["channels"])
         for channel in range(1, channel_count + 1):
-            geometry = _module_channel_geometry(
-                module,
-                channel,
-                slot_width=slot_width,
-                panel_height=panel_height,
-                scale=scale,
-            )
-            if geometry is None:
-                continue
-            center_x, center_y, hit_radius = geometry
-            distance = (float(x) - center_x) ** 2 + (
-                float(y) - center_y
-            ) ** 2
-            if distance > hit_radius**2:
-                continue
-            if nearest_distance is not None and distance >= nearest_distance:
-                continue
-            nearest_distance = distance
-            nearest = {
-                "slot": int(module["slot"]),
-                "channel": channel,
-                "model": model,
-                "center": (center_x, center_y),
-            }
+            geometries = [
+                _module_channel_geometry(
+                    module,
+                    channel,
+                    slot_width=slot_width,
+                    panel_height=panel_height,
+                    scale=scale,
+                )
+            ]
+            if model == "M5201A" and role in (None, "downconverter"):
+                geometries.append(
+                    _m5201_link_output_geometry(
+                        module,
+                        channel,
+                        slot_width=slot_width,
+                        panel_height=panel_height,
+                        scale=scale,
+                    )
+                )
+            for geometry in geometries:
+                if geometry is None:
+                    continue
+                center_x, center_y, hit_radius = geometry
+                distance = (float(x) - center_x) ** 2 + (
+                    float(y) - center_y
+                ) ** 2
+                if distance > hit_radius**2:
+                    continue
+                if (
+                    nearest_distance is not None
+                    and distance >= nearest_distance
+                ):
+                    continue
+                nearest_distance = distance
+                nearest = {
+                    "slot": int(module["slot"]),
+                    "channel": channel,
+                    "model": model,
+                    "center": (center_x, center_y),
+                }
     return nearest
 
 
@@ -1008,6 +1079,61 @@ def render_qcs_chassis(
             rgba_panel = panel.convert("RGBA")
             image.paste(rgba_panel, (paste_x, paste_y), rgba_panel)
 
+    # Draw only user-declared external down-converter cables. The source is
+    # the physical M5201A IF output; the destination is the chosen M5200A SMA.
+    modules_by_slot = {
+        int(module["slot"]): module for module in plan["modules"]
+    }
+    cable_color = ROLE_COLORS["downconverter"]
+    for link in plan["downconverter_links"]:
+        source_module = modules_by_slot[int(link["downconverter_slot"])]
+        destination_module = modules_by_slot[int(link["digitizer_slot"])]
+        source_geometry = _m5201_link_output_geometry(
+            source_module,
+            int(link["downconverter_channel"]),
+            slot_width=slot_width,
+            panel_height=panel_height,
+            scale=scale,
+        )
+        destination_geometry = _module_channel_geometry(
+            destination_module,
+            int(link["digitizer_channel"]),
+            slot_width=slot_width,
+            panel_height=panel_height,
+            scale=scale,
+        )
+        if source_geometry is None or destination_geometry is None:
+            continue
+        source = tuple(round(value) for value in source_geometry[:2])
+        destination = tuple(
+            round(value) for value in destination_geometry[:2]
+        )
+        # A pale outline keeps the explicit cable legible over dark and light
+        # module artwork while the violet core matches the route legend.
+        draw.line(
+            (source, destination),
+            fill="#F4F0FF",
+            width=max(4, _scaled(9, scale)),
+        )
+        draw.line(
+            (source, destination),
+            fill=cable_color,
+            width=max(2, _scaled(5, scale)),
+        )
+        endpoint_radius = max(3, _scaled(6, scale))
+        for center in (source, destination):
+            draw.ellipse(
+                (
+                    center[0] - endpoint_radius,
+                    center[1] - endpoint_radius,
+                    center[0] + endpoint_radius,
+                    center[1] + endpoint_radius,
+                ),
+                fill=cable_color,
+                outline="#FFFFFF",
+                width=max(1, _scaled(2, scale)),
+            )
+
     requested_highlights = []
     if highlighted_address is not None:
         requested_highlights.append(highlighted_address)
@@ -1078,6 +1204,8 @@ def render_qcs_chassis(
             ),
             "unassigned",
         )
+        if str(highlighted_module["model"]) == "M5201A":
+            role = "downconverter"
         ring_radius = max(_scaled(9, scale), round(connector_radius * 1.35))
         outer_width = max(2, _scaled(7, scale))
         inner_width = max(2, _scaled(4, scale))

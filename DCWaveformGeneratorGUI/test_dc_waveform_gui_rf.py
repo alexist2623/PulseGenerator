@@ -2198,7 +2198,7 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     window._stability_panel.y_axis.points.setValue(2)
     window._stability_panel.x_axis.start_mv.setValue(-1000.0)
     window._stability_panel.x_axis.stop_mv.setValue(1000.0)
-    window._stability_panel.trace_samples.setValue(80)
+    window._stability_panel.qcs_integration_duration_us.setValue(0.020)
     window._stability_panel.settle_time_us.setValue(25.0)
     window._stability_panel.modulation_frequency_mhz.setValue(125.0)
     window._stability_panel.qcs_modulation_amplitude.setValue(0.25)
@@ -2241,10 +2241,25 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
         window._stability_panel.qcs_modulation_amplitude.value()
     )
     assert arguments["rf_pulses"][0].frequency_hz == pytest.approx(125e6)
-    assert arguments["acquisition"].duration_s == pytest.approx(80 / 4.8e9)
+    assert arguments["acquisition"].duration_s == pytest.approx(20e-9)
     assert arguments["acquisition"].sample_rate_hz == pytest.approx(4.8e9)
-    assert arguments["acquisition"].pre_delay_s == pytest.approx(25e-6)
-    assert arguments["acquisition"].sample_count == 80
+    expected_readout_delay_s = 25e-6 + gui.QCS_STABILITY_DC_RAMP_S
+    assert arguments["acquisition"].pre_delay_s == pytest.approx(
+        expected_readout_delay_s
+    )
+    assert arguments["rf_pulses"][0].delay_s == pytest.approx(
+        expected_readout_delay_s
+    )
+    expected_target_us = (
+        25.0
+        + 0.020
+        + DEFAULT_STABILITY_POINT_GUARD_US
+        + gui.QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
+    )
+    assert arguments["sequence"].segments[0].duration_cycles == int(
+        np.ceil(expected_target_us * 300.0)
+    )
+    assert arguments["acquisition"].sample_count == 96
     assert arguments["readout_spec"] is None
     app.processEvents()
     window.close()
@@ -2360,6 +2375,12 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     assert panel.qcs_dc_channel_names.isReadOnly() is True
     assert panel.qcs_rf_channel_names.isReadOnly() is True
     assert panel.qcs_acquisition_channel_name.isReadOnly() is True
+    assert panel.qcs_init_time_us.value() == pytest.approx(0.07)
+    assert panel.qcs_init_time_us.singleStep() == pytest.approx(0.01)
+    assert "Inter-point / repetition delay:" in {
+        label.text()
+        for label in panel.qcs_connection_group.findChildren(QtWidgets.QLabel)
+    }
 
     panel.qcs_mapper_path.setText(str(tmp_path / "mapper.json"))
     panel.qcs_dc_channel_names.setText("gate_a")
@@ -2390,8 +2411,9 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     assert qcs_connection.acquisition_channel_name == "digitizer"
     assert qcs_connection.hw_demod is False
     # HCL stores whole nanoseconds, and 300 MHz timing is exactly representable
-    # every 10 ns. Inter-shot initialization rounds upward, never shorter.
+    # every 10 ns. The inter-iteration delay rounds upward, never shorter.
     assert qcs_connection.init_time_s == pytest.approx(0.130e-6)
+    assert panel.qcs_init_time_us.value() == pytest.approx(0.130)
 
     panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
     assert panel.full_scale_mv_label.isHidden() is False
@@ -2447,6 +2469,49 @@ def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
     assert panel.qcs_waveform_usage_group.isHidden() is True
     panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
     assert panel.qcs_waveform_usage_group.isHidden() is False
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_no_sweep_capacity_bar_counts_each_outputs_ramps_only():
+    app = _application()
+    window = gui.MainWindow()
+    pulses = []
+    for control_mv in (150.0, -200.0):
+        pulse = PulseSequence(0.0, initial_duration_ns=10_000.0)
+        pulse.add_flat_ramp(15_000.0, 400.0, control_mv)
+        pulse.add_flat_ramp(15_000.0, 100_000.0, 100.0)
+        pulses.append(pulse)
+    window._pulse[0] = pulses[0]
+    window._plot._pulses[0] = pulses[0]
+    window._add_port()
+    window._pulse[1].t = pulses[1].t.copy()
+    window._pulse[1].v = pulses[1].v.copy()
+    window._pulse[1].segment_names = list(pulses[1].segment_names)
+    window._cross_capacitance = np.eye(2)
+    window._sweep_specs = []
+
+    window._refresh_sweep_overlay()
+    app.processEvents()
+
+    panel = window._experiment_panel
+    assert panel.qcs_waveform_usage_progress.value() == 72_000
+    assert panel.qcs_waveform_usage_progress.format() == (
+        "72,000 / 98,304 samples (73.24%)"
+    )
+    assert "30.000000 / 40.960000 us" in (
+        panel.qcs_waveform_usage_summary.text()
+    )
+    assert "awg_0 -> dc_ch_1: 72,000 samples (30.000000 us)" in (
+        panel.qcs_waveform_usage_detail.text()
+    )
+    assert "awg_1 -> dc_ch_2: 72,000 samples (30.000000 us)" in (
+        panel.qcs_waveform_usage_detail.text()
+    )
+    assert "outputs are not added together" in (
+        panel.qcs_waveform_usage_detail.text()
+    )
 
     window.close()
     app.processEvents()
@@ -2666,7 +2731,7 @@ def test_qcs_sweep_indicator_accepts_two_output_101_by_101_hardware_grid():
         "Hardware sweep (planned)"
     )
     reason = panel.qcs_sweep_execution_reason_label.text()
-    assert "100 us inter-shot initialization gap" in reason
+    assert "0.07 us inter-iteration delay" in reason
     assert panel.qcs_waveform_usage_progress.value() == 72_000
 
     window._active_experiment_backend = gui.EXECUTION_BACKEND_QCS
@@ -3339,7 +3404,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 38
+    assert document["version"] == 39
     assert document["experiment"]["execution_backend"] == "qcs"
     assert document["experiment"]["iq_repetition_policy"] == (
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
@@ -3395,6 +3460,22 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert decoded_legacy_rate["qcs_settings"]["sample_rate_hz"] == (
         pytest.approx(4.8e9)
     )
+
+    version_38_default_delay = json.loads(json.dumps(document))
+    version_38_default_delay["version"] = 38
+    version_38_default_delay["qcs"]["init_time_s"] = 100.0e-6
+    decoded_version_38_default_delay = source._decode_settings(
+        version_38_default_delay
+    )
+    assert decoded_version_38_default_delay["qcs_settings"][
+        "init_time_s"
+    ] == pytest.approx(gui.DEFAULT_QCS_INIT_TIME_US * 1.0e-6)
+
+    current_explicit_delay = json.loads(json.dumps(document))
+    current_explicit_delay["qcs"]["init_time_s"] = 100.0e-6
+    assert source._decode_settings(current_explicit_delay)["qcs_settings"][
+        "init_time_s"
+    ] == pytest.approx(100.0e-6)
 
     document_without_mode = json.loads(json.dumps(document))
     document_without_mode["qcs"].pop("hw_demod")
@@ -3468,7 +3549,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
         gui.DEFAULT_QCS_FULL_SCALE_V
     )
     assert decoded_legacy["qcs_settings"]["init_time_s"] == pytest.approx(
-        100e-6
+        gui.DEFAULT_QCS_INIT_TIME_US * 1.0e-6
     )
     for window in (
         restored_version_35,
@@ -3526,6 +3607,47 @@ def test_qcs_unsaved_front_panel_configuration_blocks_run(tmp_path):
     panel.qcs_mapper_path.setText(str(tmp_path / "different_mapper.qcs"))
     with pytest.raises(ValueError, match="unsaved physical changes"):
         panel.qcs_connection_values(1)
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_dc_calibration_reuses_existing_full_scale_control(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    experiment.qcs_dc_full_scale_v.setValue(2.5)
+
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_ch_1",),
+        {},
+        None,
+    )
+    calibration_panel = window._calibration_panel
+    calibration_panel.set_qcs_front_panel_configuration(configuration)
+    calibration_panel.qcs_dc_scope_resource.setText("USB::MOCK_SCOPE")
+    config = calibration_panel.qcs_dc_output_config(
+        nominal_full_scale_v=experiment.qcs_dc_full_scale_v.value(),
+    )
+    assert config.nominal_full_scale_v == pytest.approx(2.5)
+
+    monkeypatch.setattr(calibration_panel, "show_result", lambda _stored: None)
+    monkeypatch.setattr(window, "_refresh_qcs_waveform_capacity", lambda: None)
+    stored = SimpleNamespace(
+        run_id=31,
+        database_path="calibration.db",
+        calibration=SimpleNamespace(
+            gain_a=0.98,
+            corrected_maximum_abs_voltage_v=2.45,
+        ),
+    )
+    window._on_calibration_finished(stored)
+
+    assert experiment.qcs_dc_full_scale_v.value() == pytest.approx(2.45)
+    assert experiment.qcs_settings_dict()["dc_full_scale_v"] == pytest.approx(
+        2.45
+    )
+    assert not hasattr(calibration_panel, "qcs_dc_full_scale_v")
     window.close()
     app.processEvents()
 
@@ -4005,7 +4127,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 38
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 39
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

@@ -44,7 +44,19 @@ try:
     )
     from .qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
     from .sparameter_gui import RfPathCorrectionWidget
+    from .hardware_front_panel import HardwareFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
+    from .qcs_dc_output_calibration import (
+        QcsDcOscilloscopeConfig,
+        QcsM5301DcCalibrationConfig,
+        run_qcs_m5301_dc_output_calibration,
+    )
+    from .qcs_qcodes_experiment import load_qcs_channel_mapper
+    from .qcs_rf_power_calibration import (
+        M5200PowerReference,
+        M5300PowerCalibrationConfig,
+        run_m5300_power_calibration,
+    )
 except ImportError:
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from qick_power_calibration import (
@@ -56,7 +68,19 @@ except ImportError:
     )
     from qick_sparameter_sweep import FILTER_TYPES, MAX_RF_OUTPUT_GAIN, POWER_SCALES
     from sparameter_gui import RfPathCorrectionWidget
+    from hardware_front_panel import HardwareFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
+    from qcs_dc_output_calibration import (
+        QcsDcOscilloscopeConfig,
+        QcsM5301DcCalibrationConfig,
+        run_qcs_m5301_dc_output_calibration,
+    )
+    from qcs_qcodes_experiment import load_qcs_channel_mapper
+    from qcs_rf_power_calibration import (
+        M5200PowerReference,
+        M5300PowerCalibrationConfig,
+        run_m5300_power_calibration,
+    )
 
 
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
@@ -206,6 +230,110 @@ class _CalibrationPathWidget(RfPathCorrectionWidget):
             values,
             mode=self._calibration_mode,
         )
+
+
+class _QcsCalibrationPreview(QtWidgets.QGroupBox):
+    """Small shared-chassis preview selecting one QCS calibration endpoint."""
+
+    front_panel_requested = QtCore.pyqtSignal()
+
+    def __init__(self, role: str, title: str, parent=None):
+        super().__init__(title, parent)
+        self._role = str(role).strip().lower()
+        self._configuration = None
+        self._preferred_logical_index = 0
+        layout = QtWidgets.QVBoxLayout(self)
+        self.preview = HardwareFrontPanelPreview(self)
+        self.preview.set_backend("qcs")
+        self.preview.set_scope("path")
+        self.preview.activated.connect(self.front_panel_requested.emit)
+        layout.addWidget(self.preview)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Mapped connector:"))
+        self.mapping = QtWidgets.QComboBox(self)
+        self.mapping.currentIndexChanged.connect(self._selection_changed)
+        row.addWidget(self.mapping, 1)
+        layout.addLayout(row)
+
+    def set_hardware_backend(self, backend: str) -> None:
+        self.preview.set_backend(str(backend).strip().lower())
+
+    def set_qcs_front_panel_configuration(
+        self,
+        configuration: Mapping[str, object] | None,
+    ) -> None:
+        self._configuration = configuration
+        self.preview.set_qcs_configuration(configuration)
+        current = self.mapping.currentData()
+        if current is None:
+            current = self._preferred_logical_index
+        modules = (
+            {}
+            if configuration is None
+            else {
+                int(module["slot"]): str(module["model"])
+                for module in configuration["modules"]
+            }
+        )
+        mappings = (
+            []
+            if configuration is None
+            else sorted(
+                (
+                    item
+                    for item in configuration["channel_mappings"]
+                    if str(item["role"]) == self._role
+                ),
+                key=lambda item: int(item["logical_index"]),
+            )
+        )
+        with QtCore.QSignalBlocker(self.mapping):
+            self.mapping.clear()
+            for item in mappings:
+                logical = int(item["logical_index"])
+                model = modules.get(int(item["slot"]), "Unknown")
+                self.mapping.addItem(
+                    f"{logical}: {item['virtual_name']} | {model}, "
+                    f"slot {int(item['slot'])}, SMA CH {int(item['channel'])}",
+                    logical,
+                )
+            selected = self.mapping.findData(current)
+            self.mapping.setCurrentIndex(selected if selected >= 0 else 0)
+        self.mapping.setEnabled(bool(mappings))
+        self._selection_changed()
+
+    def set_logical_index(self, logical_index: int) -> None:
+        self._preferred_logical_index = int(logical_index)
+        selected = self.mapping.findData(self._preferred_logical_index)
+        if selected >= 0:
+            self.mapping.setCurrentIndex(selected)
+
+    def qcs_front_panel_selection(self) -> tuple[str, int]:
+        logical = self.mapping.currentData()
+        return self._role, int(
+            self._preferred_logical_index if logical is None else logical
+        )
+
+    def selected_mapping(self) -> Mapping[str, object]:
+        if self._configuration is None:
+            raise ValueError("Identify or configure QCS hardware first")
+        role, logical = self.qcs_front_panel_selection()
+        try:
+            return next(
+                item
+                for item in self._configuration["channel_mappings"]
+                if str(item["role"]) == role
+                and int(item["logical_index"]) == logical
+            )
+        except StopIteration as exc:
+            raise ValueError(
+                f"QCS {role} logical channel {logical} is not mapped"
+            ) from exc
+
+    def _selection_changed(self, *_args) -> None:
+        role, logical = self.qcs_front_panel_selection()
+        self._preferred_logical_index = logical
+        self.preview.set_qcs_selection(role, logical)
 
 
 def input_calibration_plot_data(
@@ -601,6 +729,8 @@ class CalibrationPanel(QtWidgets.QWidget):
     output_requested = QtCore.pyqtSignal()
     input_requested = QtCore.pyqtSignal()
     dc_voltage_requested = QtCore.pyqtSignal()
+    qcs_dc_output_requested = QtCore.pyqtSignal()
+    qcs_rf_output_requested = QtCore.pyqtSignal()
     dc_application_changed = QtCore.pyqtSignal(bool, str, int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
@@ -612,23 +742,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._fir_uses_fpga_trigger_delay = None
         self._hardware_backend = "qick"
         self._running = False
+        self._qcs_front_panel_configuration = None
         layout = QtWidgets.QVBoxLayout(self)
         self._path_diagrams: dict[str, RfPathCorrectionWidget] = {}
         self._front_panel_mode = "output"
-        self.backend_warning = QtWidgets.QLabel(
-            "QCS front-panel mapping is available, but calibration execution "
-            "is still QICK-only. Calibration runs are disabled while QCS is "
-            "selected.",
-            self,
-        )
-        self.backend_warning.setWordWrap(True)
-        self.backend_warning.setStyleSheet(
-            "QLabel { color: #8a4b08; background: #fff4d6; "
-            "border: 1px solid #e0b96a; padding: 6px; }"
-        )
-        self.backend_warning.hide()
-        layout.addWidget(self.backend_warning)
-
         database_group = QtWidgets.QGroupBox("Calibration Database")
         database_form = QtWidgets.QFormLayout(database_group)
         self.database_path = QtWidgets.QLineEdit(DEFAULT_CALIBRATION_DB_PATH)
@@ -649,13 +766,23 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.fir_profile_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        database_form.addRow("HWH FIR DDR:", self.fir_profile_status)
+        self.fir_profile_label = QtWidgets.QLabel("HWH FIR DDR:")
+        database_form.addRow(self.fir_profile_label, self.fir_profile_status)
         layout.addWidget(database_group)
 
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.addTab(self._build_output_tab(), "Output / Oscilloscope")
         self.tabs.addTab(self._build_input_tab(), "Input / ADC")
         self.tabs.addTab(self._build_dc_voltage_tab(), "DC Voltage")
+        self._qick_tab_indices = (0, 1, 2)
+        self._qcs_rf_tab_index = self.tabs.addTab(
+            self._build_qcs_rf_output_tab(),
+            "M5300 RF / M5200",
+        )
+        self._qcs_dc_tab_index = self.tabs.addTab(
+            self._build_qcs_dc_output_tab(),
+            "M5301 DC / Oscilloscope",
+        )
         initial_paths = _legacy_calibration_paths(
             OutputPowerCalibrationConfig(
                 database_path=DEFAULT_CALIBRATION_DB_PATH
@@ -680,6 +807,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
+        self.set_hardware_backend("qick")
 
     @staticmethod
     def _scroll_form(title: str):
@@ -1194,6 +1322,403 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._update_dc_voltage_path_note()
         return scroll
 
+    def _build_qcs_rf_output_tab(self) -> QtWidgets.QWidget:
+        scroll, form, vertical = self._scroll_form(
+            "M5300A 50 Ohm Output Power Calibration with M5200A"
+        )
+        endpoint_row = QtWidgets.QWidget(self)
+        endpoint_layout = QtWidgets.QHBoxLayout(endpoint_row)
+        endpoint_layout.setContentsMargins(0, 0, 0, 0)
+        self.qcs_rf_output_preview = _QcsCalibrationPreview(
+            "rf",
+            "M5300A Output",
+            endpoint_row,
+        )
+        self.qcs_rf_input_preview = _QcsCalibrationPreview(
+            "acquisition",
+            "M5200A Input",
+            endpoint_row,
+        )
+        self.qcs_rf_output_preview.front_panel_requested.connect(
+            lambda: self.front_panel_requested.emit(
+                self.qcs_rf_output_preview
+            )
+        )
+        self.qcs_rf_input_preview.front_panel_requested.connect(
+            lambda: self.front_panel_requested.emit(
+                self.qcs_rf_input_preview
+            )
+        )
+        endpoint_layout.addWidget(self.qcs_rf_output_preview, 1)
+        endpoint_layout.addWidget(self.qcs_rf_input_preview, 1)
+        vertical.insertWidget(0, endpoint_row)
+
+        self.qcs_rf_frequency_start = self._frequency(10.0)
+        self.qcs_rf_frequency_end = self._frequency(100.0)
+        self.qcs_rf_frequency_points = self._points(11)
+        self.qcs_rf_amplitude_start = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_amplitude_start.setRange(0.000001, 1.0)
+        self.qcs_rf_amplitude_start.setDecimals(9)
+        self.qcs_rf_amplitude_start.setValue(0.05)
+        self.qcs_rf_amplitude_end = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_amplitude_end.setRange(0.000001, 1.0)
+        self.qcs_rf_amplitude_end.setDecimals(9)
+        self.qcs_rf_amplitude_end.setValue(1.0)
+        self.qcs_rf_amplitude_points = self._points(10)
+        self.qcs_rf_integration_us = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_integration_us.setRange(0.003333333, 6.826666666)
+        self.qcs_rf_integration_us.setDecimals(9)
+        self.qcs_rf_integration_us.setValue(1.0)
+        self.qcs_rf_integration_us.setSuffix(" us")
+        self.qcs_rf_repetitions = QtWidgets.QSpinBox()
+        self.qcs_rf_repetitions.setRange(1, 1_000_000)
+        self.qcs_rf_repetitions.setValue(100)
+        for label, widget in (
+            ("Start RF waveform frequency:", self.qcs_rf_frequency_start),
+            ("Stop RF waveform frequency:", self.qcs_rf_frequency_end),
+            ("Frequency points:", self.qcs_rf_frequency_points),
+            ("Start relative amplitude:", self.qcs_rf_amplitude_start),
+            ("Stop relative amplitude:", self.qcs_rf_amplitude_end),
+            ("Amplitude points:", self.qcs_rf_amplitude_points),
+            ("Flat I/Q integration duration:", self.qcs_rf_integration_us),
+            ("Repetitions / grid point:", self.qcs_rf_repetitions),
+        ):
+            form.addRow(label, widget)
+
+        reference_group = QtWidgets.QGroupBox(
+            "M5200A 50 Ohm Power Reference"
+        )
+        reference_form = QtWidgets.QFormLayout(reference_group)
+        self.qcs_rf_reference_mode = QtWidgets.QComboBox()
+        self.qcs_rf_reference_mode.addItem(
+            "Calibrated I/Q-to-dBm reference",
+            "reference_calibrated",
+        )
+        self.qcs_rf_reference_mode.addItem(
+            "Nominal M5200 50 Ohm conversion (not traceable)",
+            "nominal_m5200_50ohm",
+        )
+        self.qcs_rf_reference_mode.setCurrentIndex(1)
+        self.qcs_rf_reference_slope = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_reference_slope.setRange(0.000001, 1000.0)
+        self.qcs_rf_reference_slope.setDecimals(9)
+        self.qcs_rf_reference_slope.setValue(1.0)
+        self.qcs_rf_reference_intercept_dbm = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_reference_intercept_dbm.setRange(-500.0, 500.0)
+        self.qcs_rf_reference_intercept_dbm.setDecimals(9)
+        self.qcs_rf_reference_intercept_dbm.setSuffix(" dBm")
+        self.qcs_rf_nominal_volts_per_iq = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_nominal_volts_per_iq.setRange(1.0e-12, 100.0)
+        self.qcs_rf_nominal_volts_per_iq.setDecimals(12)
+        self.qcs_rf_nominal_volts_per_iq.setValue(0.9)
+        self.qcs_rf_nominal_volts_per_iq.setSuffix(" V / I-Q unit")
+        self.qcs_rf_path_loss_db = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_path_loss_db.setRange(-200.0, 200.0)
+        self.qcs_rf_path_loss_db.setDecimals(9)
+        self.qcs_rf_path_loss_db.setSuffix(" dB")
+        self.qcs_rf_reference_uncertainty_db = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_reference_uncertainty_db.setRange(0.0, 200.0)
+        self.qcs_rf_reference_uncertainty_db.setDecimals(6)
+        self.qcs_rf_reference_uncertainty_db.setSuffix(" dB")
+        self.qcs_rf_reference_source = QtWidgets.QLineEdit()
+        self.qcs_rf_reference_source.setPlaceholderText(
+            "Reference instrument/run or nominal range assumption"
+        )
+        self.qcs_rf_acknowledge_nominal = QtWidgets.QCheckBox(
+            "I acknowledge that nominal M5200 scaling is not a traceable "
+            "absolute-power calibration"
+        )
+        reference_form.addRow("Conversion mode:", self.qcs_rf_reference_mode)
+        reference_form.addRow("Calibrated log slope:", self.qcs_rf_reference_slope)
+        reference_form.addRow(
+            "Calibrated intercept:",
+            self.qcs_rf_reference_intercept_dbm,
+        )
+        reference_form.addRow(
+            "Nominal M5200 voltage scale:",
+            self.qcs_rf_nominal_volts_per_iq,
+        )
+        reference_form.addRow("Cable/path loss:", self.qcs_rf_path_loss_db)
+        reference_form.addRow(
+            "Reference uncertainty:",
+            self.qcs_rf_reference_uncertainty_db,
+        )
+        reference_form.addRow("Reference source:", self.qcs_rf_reference_source)
+        reference_form.addRow(self.qcs_rf_acknowledge_nominal)
+        vertical.insertWidget(2, reference_group)
+        self.qcs_rf_reference_mode.currentIndexChanged.connect(
+            self._update_qcs_rf_reference_controls
+        )
+
+        self.run_qcs_rf_button = QtWidgets.QPushButton(
+            "Run M5300A / M5200A Power Calibration"
+        )
+        self.run_qcs_rf_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        )
+        self.run_qcs_rf_button.clicked.connect(
+            self.qcs_rf_output_requested.emit
+        )
+        vertical.insertWidget(3, self.run_qcs_rf_button)
+        self.qcs_rf_result = QtWidgets.QLabel(
+            "No M5300A calibration has been run in this session."
+        )
+        self.qcs_rf_result.setWordWrap(True)
+        self.qcs_rf_result.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        vertical.insertWidget(4, self.qcs_rf_result)
+        self._update_qcs_rf_reference_controls()
+        return scroll
+
+    def _update_qcs_rf_reference_controls(self, *_args) -> None:
+        calibrated = (
+            self.qcs_rf_reference_mode.currentData()
+            == "reference_calibrated"
+        )
+        self.qcs_rf_reference_slope.setEnabled(calibrated)
+        self.qcs_rf_reference_intercept_dbm.setEnabled(calibrated)
+        self.qcs_rf_reference_uncertainty_db.setEnabled(calibrated)
+        self.qcs_rf_nominal_volts_per_iq.setEnabled(not calibrated)
+        self.qcs_rf_acknowledge_nominal.setEnabled(not calibrated)
+
+    def qcs_rf_output_config(
+        self,
+        connection_config,
+    ) -> M5300PowerCalibrationConfig:
+        if self._qcs_front_panel_configuration is None:
+            raise ValueError("Identify or configure the QCS front panel first")
+        output = self.qcs_rf_output_preview.selected_mapping()
+        acquisition = self.qcs_rf_input_preview.selected_mapping()
+        modules = {
+            int(module["slot"]): str(module["model"])
+            for module in self._qcs_front_panel_configuration["modules"]
+        }
+        output_model = modules.get(int(output["slot"]))
+        input_model = modules.get(int(acquisition["slot"]))
+        if output_model != "M5300A":
+            raise ValueError(
+                "QCS RF power calibration requires an M5300A output; "
+                f"selected {output_model or 'unknown module'}"
+            )
+        if input_model != "M5200A":
+            raise ValueError(
+                "QCS RF power calibration requires an M5200A input; "
+                f"selected {input_model or 'unknown module'}"
+            )
+        start = self.qcs_rf_frequency_start.value() * 1.0e6
+        stop = self.qcs_rf_frequency_end.value() * 1.0e6
+        amplitudes = np.linspace(
+            self.qcs_rf_amplitude_start.value(),
+            self.qcs_rf_amplitude_end.value(),
+            self.qcs_rf_amplitude_points.value(),
+        )
+        mode = str(self.qcs_rf_reference_mode.currentData())
+        if mode == "reference_calibrated":
+            reference = M5200PowerReference.calibrated(
+                slope=self.qcs_rf_reference_slope.value(),
+                intercept_dbm=self.qcs_rf_reference_intercept_dbm.value(),
+                path_loss_db=self.qcs_rf_path_loss_db.value(),
+                source=self.qcs_rf_reference_source.text().strip(),
+                uncertainty_db=self.qcs_rf_reference_uncertainty_db.value(),
+            )
+        else:
+            reference = M5200PowerReference.nominal_50ohm(
+                volts_per_iq_unit=self.qcs_rf_nominal_volts_per_iq.value(),
+                path_loss_db=self.qcs_rf_path_loss_db.value(),
+                acknowledge_nominal_scaling=(
+                    self.qcs_rf_acknowledge_nominal.isChecked()
+                ),
+                source=self.qcs_rf_reference_source.text().strip(),
+            )
+        lo_frequency_hz = output.get("lo_frequency_hz")
+        if lo_frequency_hz is None:
+            raise ValueError(
+                "Set the selected M5300A LO frequency in the front panel "
+                "before calibration"
+            )
+        return M5300PowerCalibrationConfig(
+            database_path=self.database_path_value(),
+            mapper_path=str(connection_config.mapper_path),
+            rf_channel_name=str(output["virtual_name"]),
+            acquisition_channel_name=str(acquisition["virtual_name"]),
+            frequencies_hz=tuple(
+                np.linspace(start, stop, self.qcs_rf_frequency_points.value())
+            ),
+            relative_amplitudes=tuple(amplitudes),
+            input_reference=reference,
+            integration_duration_s=(
+                self.qcs_rf_integration_us.value() * 1.0e-6
+            ),
+            repetitions=self.qcs_rf_repetitions.value(),
+            init_time_s=float(connection_config.init_time_s),
+            expected_lo_frequency_hz=float(lo_frequency_hz),
+        )
+
+    def _build_qcs_dc_output_tab(self) -> QtWidgets.QWidget:
+        scroll, form, vertical = self._scroll_form(
+            "M5301A Linear DC Output Calibration"
+        )
+        self.qcs_dc_preview = _QcsCalibrationPreview(
+            "dc",
+            "Mapped M5301A Output",
+            self,
+        )
+        self.qcs_dc_preview.front_panel_requested.connect(
+            lambda: self.front_panel_requested.emit(self.qcs_dc_preview)
+        )
+        vertical.insertWidget(0, self.qcs_dc_preview)
+
+        model_note = QtWidgets.QLabel(
+            "The oscilloscope input is forced to 1 Mohm and queried back. "
+            "The fit is constrained to Vmeasured = A x Vcommanded (zero "
+            "intercept). The existing Experiment > DC full scale value is "
+            "used as the command scale, then replaced by A times that value. "
+            "Future QCS amplitudes therefore use Vcommanded = Vtarget / A."
+        )
+        model_note.setWordWrap(True)
+        form.addRow(model_note)
+
+        self.qcs_dc_start_v = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_start_v.setRange(-10.0, 10.0)
+        self.qcs_dc_start_v.setDecimals(9)
+        self.qcs_dc_start_v.setValue(-2.0)
+        self.qcs_dc_start_v.setSuffix(" V")
+        self.qcs_dc_stop_v = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_stop_v.setRange(-10.0, 10.0)
+        self.qcs_dc_stop_v.setDecimals(9)
+        self.qcs_dc_stop_v.setValue(2.0)
+        self.qcs_dc_stop_v.setSuffix(" V")
+        self.qcs_dc_points = self._points(9)
+        self.qcs_dc_duration_us = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_duration_us.setRange(0.013333333, 40.96)
+        self.qcs_dc_duration_us.setDecimals(9)
+        self.qcs_dc_duration_us.setValue(1.0)
+        self.qcs_dc_duration_us.setSuffix(" us")
+        self.qcs_dc_min_r_squared = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_min_r_squared.setRange(0.0, 1.0)
+        self.qcs_dc_min_r_squared.setDecimals(9)
+        self.qcs_dc_min_r_squared.setValue(0.99)
+        self.qcs_dc_experiment_name = QtWidgets.QLineEdit(
+            "QCS M5301A DC output calibration"
+        )
+        self.qcs_dc_sample_name = QtWidgets.QLineEdit()
+        self.qcs_dc_sample_name.setPlaceholderText(
+            "Auto: M5301A_<chassis>_<slot>_<channel>"
+        )
+        for label, widget in (
+            ("Start commanded voltage:", self.qcs_dc_start_v),
+            ("Stop commanded voltage:", self.qcs_dc_stop_v),
+            ("Voltage points:", self.qcs_dc_points),
+            ("Level waveform duration:", self.qcs_dc_duration_us),
+            ("Minimum origin-fit R^2:", self.qcs_dc_min_r_squared),
+            ("Experiment name:", self.qcs_dc_experiment_name),
+            ("Sample name:", self.qcs_dc_sample_name),
+        ):
+            form.addRow(label, widget)
+
+        scope_group = QtWidgets.QGroupBox(
+            "Oscilloscope DC Voltage (required 1 Mohm input)"
+        )
+        scope_form = QtWidgets.QFormLayout(scope_group)
+        self.qcs_dc_scope_resource = QtWidgets.QLineEdit()
+        self.qcs_dc_scope_resource.setPlaceholderText(
+            "USB0::0x0957::...::INSTR or TCPIP0::...::INSTR"
+        )
+        self.qcs_dc_scope_channel = QtWidgets.QSpinBox()
+        self.qcs_dc_scope_channel.setRange(1, 8)
+        self.qcs_dc_scope_channel.setValue(1)
+        self.qcs_dc_scope_averages = QtWidgets.QSpinBox()
+        self.qcs_dc_scope_averages.setRange(1, 100_000)
+        self.qcs_dc_scope_averages.setValue(8)
+        self.qcs_dc_scope_settle_s = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_scope_settle_s.setRange(0.0, 3600.0)
+        self.qcs_dc_scope_settle_s.setDecimals(6)
+        self.qcs_dc_scope_settle_s.setValue(0.05)
+        self.qcs_dc_scope_settle_s.setSuffix(" s")
+        self.qcs_dc_scope_interval_s = QtWidgets.QDoubleSpinBox()
+        self.qcs_dc_scope_interval_s.setRange(0.0, 60.0)
+        self.qcs_dc_scope_interval_s.setDecimals(6)
+        self.qcs_dc_scope_interval_s.setValue(0.01)
+        self.qcs_dc_scope_interval_s.setSuffix(" s")
+        self.qcs_dc_scope_impedance = QtWidgets.QLineEdit("1 Mohm (forced and verified)")
+        self.qcs_dc_scope_impedance.setReadOnly(True)
+        for label, widget in (
+            ("VISA resource:", self.qcs_dc_scope_resource),
+            ("Scope channel:", self.qcs_dc_scope_channel),
+            ("Input impedance:", self.qcs_dc_scope_impedance),
+            ("Readings / point:", self.qcs_dc_scope_averages),
+            ("Settle after level:", self.qcs_dc_scope_settle_s),
+            ("Reading interval:", self.qcs_dc_scope_interval_s),
+        ):
+            scope_form.addRow(label, widget)
+        vertical.insertWidget(2, scope_group)
+
+        self.run_qcs_dc_button = QtWidgets.QPushButton(
+            "Run M5301A / 1 Mohm Scope Calibration"
+        )
+        self.run_qcs_dc_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        )
+        self.run_qcs_dc_button.clicked.connect(
+            self.qcs_dc_output_requested.emit
+        )
+        vertical.insertWidget(3, self.run_qcs_dc_button)
+        self.qcs_dc_result = QtWidgets.QLabel(
+            "No M5301A calibration has been run in this session."
+        )
+        self.qcs_dc_result.setWordWrap(True)
+        self.qcs_dc_result.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        vertical.insertWidget(4, self.qcs_dc_result)
+        return scroll
+
+    def qcs_dc_output_config(
+        self,
+        *,
+        nominal_full_scale_v: float,
+    ) -> QcsM5301DcCalibrationConfig:
+        if self._qcs_front_panel_configuration is None:
+            raise ValueError("Identify or configure the QCS front panel first")
+        mapping = self.qcs_dc_preview.selected_mapping()
+        modules = {
+            int(module["slot"]): str(module["model"])
+            for module in self._qcs_front_panel_configuration["modules"]
+        }
+        model = modules.get(int(mapping["slot"]))
+        if model != "M5301A":
+            raise ValueError(
+                "QCS DC calibration requires an M5301A mapping; selected "
+                f"{model or 'unknown module'}"
+            )
+        resource = self.qcs_dc_scope_resource.text().strip()
+        if not resource:
+            raise ValueError("Oscilloscope VISA resource must not be empty")
+        return QcsM5301DcCalibrationConfig(
+            database_path=self.database_path_value(),
+            chassis=int(self._qcs_front_panel_configuration["chassis"]),
+            slot=int(mapping["slot"]),
+            channel=int(mapping["channel"]),
+            virtual_channel_name=str(mapping["virtual_name"]),
+            voltage_start_v=self.qcs_dc_start_v.value(),
+            voltage_stop_v=self.qcs_dc_stop_v.value(),
+            voltage_points=self.qcs_dc_points.value(),
+            nominal_full_scale_v=float(nominal_full_scale_v),
+            waveform_duration_s=self.qcs_dc_duration_us.value() * 1.0e-6,
+            minimum_r_squared=self.qcs_dc_min_r_squared.value(),
+            experiment_name=self.qcs_dc_experiment_name.text().strip(),
+            sample_name=self.qcs_dc_sample_name.text().strip(),
+            oscilloscope=QcsDcOscilloscopeConfig(
+                visa_resource=resource,
+                channel=self.qcs_dc_scope_channel.value(),
+                input_impedance_ohm=1.0e6,
+                average_count=self.qcs_dc_scope_averages.value(),
+                settle_seconds=self.qcs_dc_scope_settle_s.value(),
+                sample_interval_seconds=self.qcs_dc_scope_interval_s.value(),
+            ),
+        )
+
     def _browse_dc_application(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -1575,18 +2100,44 @@ class CalibrationPanel(QtWidgets.QWidget):
         for diagram in self._path_diagrams.values():
             diagram.set_hardware_backend(backend)
         is_qcs = self._hardware_backend == "qcs"
-        self.backend_warning.setVisible(is_qcs)
-        enabled = not self._running and not is_qcs
-        self.run_output_button.setEnabled(enabled)
-        self.run_input_button.setEnabled(enabled)
-        self.run_dc_voltage_button.setEnabled(enabled)
+        self.fir_profile_label.setVisible(not is_qcs)
+        self.fir_profile_status.setVisible(not is_qcs)
+        current_tab_index = self.tabs.currentIndex()
+        for index in self._qick_tab_indices:
+            self.tabs.tabBar().setTabVisible(index, not is_qcs)
+        self.tabs.tabBar().setTabVisible(self._qcs_rf_tab_index, is_qcs)
+        self.tabs.tabBar().setTabVisible(self._qcs_dc_tab_index, is_qcs)
+        if is_qcs and current_tab_index in self._qick_tab_indices:
+            self.tabs.setCurrentIndex(self._qcs_dc_tab_index)
+        elif not is_qcs and current_tab_index in {
+            self._qcs_rf_tab_index,
+            self._qcs_dc_tab_index,
+        }:
+            self.tabs.setCurrentIndex(0)
+        qick_enabled = not self._running and not is_qcs
+        self.run_output_button.setEnabled(qick_enabled)
+        self.run_input_button.setEnabled(qick_enabled)
+        self.run_dc_voltage_button.setEnabled(qick_enabled)
+        self.run_qcs_rf_button.setEnabled(not self._running and is_qcs)
+        self.run_qcs_dc_button.setEnabled(not self._running and is_qcs)
+        self.qcs_rf_output_preview.set_hardware_backend(backend)
+        self.qcs_rf_input_preview.set_hardware_backend(backend)
+        self.qcs_dc_preview.set_hardware_backend(backend)
 
     def set_qcs_front_panel_configuration(
         self,
         configuration: Mapping[str, object] | None,
     ) -> None:
+        self._qcs_front_panel_configuration = configuration
         for diagram in self._path_diagrams.values():
             diagram.set_qcs_front_panel_configuration(configuration)
+        self.qcs_rf_output_preview.set_qcs_front_panel_configuration(
+            configuration
+        )
+        self.qcs_rf_input_preview.set_qcs_front_panel_configuration(
+            configuration
+        )
+        self.qcs_dc_preview.set_qcs_front_panel_configuration(configuration)
 
     def qcs_front_panel_selection(self) -> tuple[str, int]:
         return self.path_diagram.qcs_front_panel_selection()
@@ -1661,6 +2212,55 @@ class CalibrationPanel(QtWidgets.QWidget):
                 for mode in CALIBRATION_PATH_MODES
             },
             "dc_voltage_application": dict(dc_application),
+            "qcs_rf_output": {
+                "output_logical_index": (
+                    self.qcs_rf_output_preview.qcs_front_panel_selection()[1]
+                ),
+                "input_logical_index": (
+                    self.qcs_rf_input_preview.qcs_front_panel_selection()[1]
+                ),
+                "frequency_start_mhz": self.qcs_rf_frequency_start.value(),
+                "frequency_end_mhz": self.qcs_rf_frequency_end.value(),
+                "frequency_points": self.qcs_rf_frequency_points.value(),
+                "amplitude_start": self.qcs_rf_amplitude_start.value(),
+                "amplitude_end": self.qcs_rf_amplitude_end.value(),
+                "amplitude_points": self.qcs_rf_amplitude_points.value(),
+                "integration_duration_us": self.qcs_rf_integration_us.value(),
+                "repetitions": self.qcs_rf_repetitions.value(),
+                "reference_mode": str(
+                    self.qcs_rf_reference_mode.currentData()
+                ),
+                "reference_slope": self.qcs_rf_reference_slope.value(),
+                "reference_intercept_dbm": (
+                    self.qcs_rf_reference_intercept_dbm.value()
+                ),
+                "nominal_volts_per_iq_unit": (
+                    self.qcs_rf_nominal_volts_per_iq.value()
+                ),
+                "path_loss_db": self.qcs_rf_path_loss_db.value(),
+                "reference_uncertainty_db": (
+                    self.qcs_rf_reference_uncertainty_db.value()
+                ),
+                "reference_source": self.qcs_rf_reference_source.text(),
+                "acknowledge_nominal_scaling": (
+                    self.qcs_rf_acknowledge_nominal.isChecked()
+                ),
+            },
+            "qcs_dc_output": {
+                "logical_index": self.qcs_dc_preview.qcs_front_panel_selection()[1],
+                "voltage_start_v": self.qcs_dc_start_v.value(),
+                "voltage_stop_v": self.qcs_dc_stop_v.value(),
+                "voltage_points": self.qcs_dc_points.value(),
+                "waveform_duration_us": self.qcs_dc_duration_us.value(),
+                "minimum_r_squared": self.qcs_dc_min_r_squared.value(),
+                "experiment_name": self.qcs_dc_experiment_name.text(),
+                "sample_name": self.qcs_dc_sample_name.text(),
+                "scope_resource": self.qcs_dc_scope_resource.text(),
+                "scope_channel": self.qcs_dc_scope_channel.value(),
+                "scope_averages": self.qcs_dc_scope_averages.value(),
+                "scope_settle_s": self.qcs_dc_scope_settle_s.value(),
+                "scope_interval_s": self.qcs_dc_scope_interval_s.value(),
+            },
             "input_plot": {
                 "x_scale": self.input_response_plot.x_scale_mode,
                 "y_scale": self.input_response_plot.y_scale_mode,
@@ -1674,6 +2274,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         input_values = dict(settings.get("input", {}))
         dc_voltage_values = dict(settings.get("dc_voltage", {}))
         dc_application = dict(settings.get("dc_voltage_application", {}))
+        qcs_rf = dict(settings.get("qcs_rf_output", {}))
+        qcs_dc = dict(settings.get("qcs_dc_output", {}))
         scope_values = dict(output_values.pop("oscilloscope", {}))
         output = OutputPowerCalibrationConfig(
             database_path=database_path,
@@ -1780,6 +2382,82 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_force_overwrite.setChecked(dc_voltage.force_overwrite)
         self.dc_voltage_experiment_name.setText(dc_voltage.experiment_name)
         self.dc_voltage_sample_name.setText(dc_voltage.sample_name)
+        qcs_rf_assignments = (
+            (self.qcs_rf_frequency_start, "frequency_start_mhz", 10.0),
+            (self.qcs_rf_frequency_end, "frequency_end_mhz", 100.0),
+            (self.qcs_rf_frequency_points, "frequency_points", 11),
+            (self.qcs_rf_amplitude_start, "amplitude_start", 0.05),
+            (self.qcs_rf_amplitude_end, "amplitude_end", 1.0),
+            (self.qcs_rf_amplitude_points, "amplitude_points", 10),
+            (self.qcs_rf_integration_us, "integration_duration_us", 1.0),
+            (self.qcs_rf_repetitions, "repetitions", 100),
+            (self.qcs_rf_reference_slope, "reference_slope", 1.0),
+            (
+                self.qcs_rf_reference_intercept_dbm,
+                "reference_intercept_dbm",
+                0.0,
+            ),
+            (
+                self.qcs_rf_nominal_volts_per_iq,
+                "nominal_volts_per_iq_unit",
+                0.9,
+            ),
+            (self.qcs_rf_path_loss_db, "path_loss_db", 0.0),
+            (
+                self.qcs_rf_reference_uncertainty_db,
+                "reference_uncertainty_db",
+                0.0,
+            ),
+        )
+        for widget, key, default in qcs_rf_assignments:
+            widget.setValue(qcs_rf.get(key, default))
+        self.qcs_rf_output_preview.set_logical_index(
+            int(qcs_rf.get("output_logical_index", 0))
+        )
+        self.qcs_rf_input_preview.set_logical_index(
+            int(qcs_rf.get("input_logical_index", 0))
+        )
+        reference_index = self.qcs_rf_reference_mode.findData(
+            str(qcs_rf.get("reference_mode", "nominal_m5200_50ohm"))
+        )
+        self.qcs_rf_reference_mode.setCurrentIndex(
+            max(0, reference_index)
+        )
+        self.qcs_rf_reference_source.setText(
+            str(qcs_rf.get("reference_source", ""))
+        )
+        self.qcs_rf_acknowledge_nominal.setChecked(
+            bool(qcs_rf.get("acknowledge_nominal_scaling", False))
+        )
+        self._update_qcs_rf_reference_controls()
+        qcs_dc_assignments = (
+            (self.qcs_dc_start_v, "voltage_start_v", -2.0),
+            (self.qcs_dc_stop_v, "voltage_stop_v", 2.0),
+            (self.qcs_dc_points, "voltage_points", 9),
+            (self.qcs_dc_duration_us, "waveform_duration_us", 1.0),
+            (self.qcs_dc_min_r_squared, "minimum_r_squared", 0.99),
+            (self.qcs_dc_scope_channel, "scope_channel", 1),
+            (self.qcs_dc_scope_averages, "scope_averages", 8),
+            (self.qcs_dc_scope_settle_s, "scope_settle_s", 0.05),
+            (self.qcs_dc_scope_interval_s, "scope_interval_s", 0.01),
+        )
+        for widget, key, default in qcs_dc_assignments:
+            widget.setValue(qcs_dc.get(key, default))
+        self.qcs_dc_preview.set_logical_index(
+            int(qcs_dc.get("logical_index", 0))
+        )
+        self.qcs_dc_experiment_name.setText(
+            str(
+                qcs_dc.get(
+                    "experiment_name",
+                    "QCS M5301A DC output calibration",
+                )
+            )
+        )
+        self.qcs_dc_sample_name.setText(str(qcs_dc.get("sample_name", "")))
+        self.qcs_dc_scope_resource.setText(
+            str(qcs_dc.get("scope_resource", ""))
+        )
         self.set_dc_application_selection(
             bool(dc_application.get("enabled", False)),
             str(dc_application.get("database_path", database_path)),
@@ -1793,15 +2471,26 @@ class CalibrationPanel(QtWidgets.QWidget):
         for mode, values in path_values.items():
             self.apply_path_settings(values, mode=mode)
         self._update_board_controls()
-        self.tabs.setCurrentIndex(max(0, min(2, int(settings.get("selected_tab", 0)))))
+        self.tabs.setCurrentIndex(
+            max(
+                0,
+                min(
+                    self.tabs.count() - 1,
+                    int(settings.get("selected_tab", 0)),
+                ),
+            )
+        )
         self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
-        run_enabled = not running and self._hardware_backend == "qick"
-        self.run_output_button.setEnabled(run_enabled)
-        self.run_input_button.setEnabled(run_enabled)
-        self.run_dc_voltage_button.setEnabled(run_enabled)
+        qick_enabled = not running and self._hardware_backend == "qick"
+        qcs_enabled = not running and self._hardware_backend == "qcs"
+        self.run_output_button.setEnabled(qick_enabled)
+        self.run_input_button.setEnabled(qick_enabled)
+        self.run_dc_voltage_button.setEnabled(qick_enabled)
+        self.run_qcs_rf_button.setEnabled(qcs_enabled)
+        self.run_qcs_dc_button.setEnabled(qcs_enabled)
         self.dc_application_group.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
@@ -1816,6 +2505,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             self._update_fpga_trigger_delay_controls()
         for diagram in self._path_diagrams.values():
             diagram.setEnabled(not running)
+        self.qcs_rf_output_preview.setEnabled(not running)
+        self.qcs_rf_input_preview.setEnabled(not running)
+        self.qcs_dc_preview.setEnabled(not running)
         self.progress.setVisible(running)
         if running:
             self.progress.setValue(0)
@@ -1829,6 +2521,61 @@ class CalibrationPanel(QtWidgets.QWidget):
     def show_result(self, stored) -> None:
         plot_message = ""
         result = getattr(stored, "result", None)
+        qcs_calibration = getattr(stored, "calibration", None)
+        is_qcs_rf_calibration = qcs_calibration is not None and hasattr(
+            qcs_calibration,
+            "full_scale_power_dbm",
+        )
+        is_qcs_dc_calibration = qcs_calibration is not None and hasattr(
+            qcs_calibration,
+            "gain_a",
+        )
+        is_qcs_calibration = (
+            is_qcs_rf_calibration or is_qcs_dc_calibration
+        )
+        if is_qcs_rf_calibration:
+            frequencies_hz = np.asarray(
+                qcs_calibration.frequencies_hz,
+                dtype=float,
+            )
+            full_scale_dbm = np.asarray(
+                qcs_calibration.full_scale_power_dbm(frequencies_hz),
+                dtype=float,
+            )
+            self.qcs_rf_result.setText(
+                f"M5300A 50 Ohm full-scale map stored for "
+                f"{frequencies_hz.size:,} frequency grid rows. "
+                f"Full-scale power spans {np.min(full_scale_dbm):.6g} to "
+                f"{np.max(full_scale_dbm):.6g} dBm. "
+                f"Reference quality: "
+                f"{qcs_calibration.calibration_quality}; "
+                f"output {qcs_calibration.output_identity.describe()}; "
+                f"input {qcs_calibration.input_identity.describe()}."
+            )
+            self.tabs.setCurrentIndex(self._qcs_rf_tab_index)
+        elif is_qcs_dc_calibration:
+            gain_a = float(qcs_calibration.gain_a)
+            corrected_max = float(
+                qcs_calibration.corrected_maximum_abs_voltage_v
+            )
+            zero_value = getattr(qcs_calibration, "measured_zero_v", None)
+            zero_text = (
+                "not sampled"
+                if zero_value is None
+                else f"{float(zero_value):.9g} V"
+            )
+            self.qcs_dc_result.setText(
+                f"Origin-constrained fit: Vmeasured = {gain_a:.12g} x "
+                "Vcommanded (intercept fixed to 0 V).\n"
+                f"Compensation: Vcommanded = Vtarget / {gain_a:.12g}.\n"
+                f"Corrected reachable maximum: +/-{corrected_max:.9g} V; "
+                f"R^2 {float(qcs_calibration.r_squared):.9g}; "
+                f"RMSE {float(qcs_calibration.rmse_v):.9g} V; "
+                f"maximum residual "
+                f"{float(qcs_calibration.max_abs_residual_v):.9g} V; "
+                f"zero-reading diagnostic {zero_text}."
+            )
+            self.tabs.setCurrentIndex(self._qcs_dc_tab_index)
         if isinstance(result, Mapping):
             excluded_count = int(result.get("excluded_point_count", 0) or 0)
             if excluded_count:
@@ -1836,7 +2583,7 @@ class CalibrationPanel(QtWidgets.QWidget):
                     f"\nExcluded {excluded_count:,} invalid oscilloscope "
                     "power point(s)."
                 )
-        if isinstance(result, Mapping) and {
+        if not is_qcs_calibration and isinstance(result, Mapping) and {
             "frequencies_mhz",
             "gains",
             "input_power_dbm",
@@ -1848,7 +2595,11 @@ class CalibrationPanel(QtWidgets.QWidget):
                 plot_message += f"\nPlot unavailable: {exc}"
             else:
                 self.tabs.setCurrentIndex(1)
-        elif isinstance(result, Mapping) and "calibration" in result:
+        elif (
+            not is_qcs_calibration
+            and isinstance(result, Mapping)
+            and "calibration" in result
+        ):
             calibration = result.get("calibration", {})
             try:
                 self.dc_voltage_response_plot.set_result(result)
@@ -1867,11 +2618,33 @@ class CalibrationPanel(QtWidgets.QWidget):
                 str(stored.database_path),
                 int(stored.run_id),
             )
+        board_type = str(
+            getattr(
+                stored,
+                "board_type",
+                (
+                    "M5301A"
+                    if is_qcs_dc_calibration
+                    else (
+                        "M5300A"
+                        if is_qcs_rf_calibration
+                        else "QCS"
+                    )
+                ),
+            )
+        )
+        row_count = int(
+            getattr(
+                stored,
+                "row_count",
+                getattr(stored, "point_count", 0),
+            )
+        )
         self.set_running(
             False,
             (
-                f"{stored.board_type} calibration Run {stored.run_id}: "
-                f"{stored.row_count:,} rows\n{stored.database_path}{plot_message}"
+                f"{board_type} calibration Run {stored.run_id}: "
+                f"{row_count:,} rows\n{stored.database_path}{plot_message}"
             ),
         )
 
@@ -1885,8 +2658,17 @@ class CalibrationWorker(QtCore.QObject):
 
     def __init__(self, mode: str, kwargs: Mapping[str, Any], parent=None):
         super().__init__(parent)
-        if mode not in ("output", "input", "dc_voltage"):
-            raise ValueError("calibration mode must be output, input, or dc_voltage")
+        if mode not in (
+            "output",
+            "input",
+            "dc_voltage",
+            "qcs_rf_output",
+            "qcs_dc_output",
+        ):
+            raise ValueError(
+                "calibration mode must be output, input, dc_voltage, or "
+                "qcs_rf_output, or qcs_dc_output"
+            )
         self.mode = mode
         self.kwargs = dict(kwargs)
 
@@ -1895,10 +2677,19 @@ class CalibrationWorker(QtCore.QObject):
         try:
             kwargs = dict(self.kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
+            if self.mode in {"qcs_rf_output", "qcs_dc_output"}:
+                connection_config = kwargs.pop("connection_config")
+                kwargs["mapper"] = load_qcs_channel_mapper(
+                    connection_config
+                )
+            if self.mode == "qcs_rf_output":
+                kwargs["config"] = kwargs.pop("calibration_config")
             runners = {
                 "output": run_output_power_calibration,
                 "input": run_input_power_calibration,
                 "dc_voltage": run_dc_voltage_calibration,
+                "qcs_rf_output": run_m5300_power_calibration,
+                "qcs_dc_output": run_qcs_m5301_dc_output_calibration,
             }
             stored = runners[self.mode](**kwargs)
         except Exception:
@@ -1937,6 +2728,41 @@ def default_calibration_settings() -> Mapping[str, Any]:
             "enabled": False,
             "database_path": DEFAULT_CALIBRATION_DB_PATH,
             "run_id": 0,
+        },
+        "qcs_rf_output": {
+            "output_logical_index": 0,
+            "input_logical_index": 0,
+            "frequency_start_mhz": 10.0,
+            "frequency_end_mhz": 100.0,
+            "frequency_points": 11,
+            "amplitude_start": 0.05,
+            "amplitude_end": 1.0,
+            "amplitude_points": 10,
+            "integration_duration_us": 1.0,
+            "repetitions": 100,
+            "reference_mode": "nominal_m5200_50ohm",
+            "reference_slope": 1.0,
+            "reference_intercept_dbm": 0.0,
+            "nominal_volts_per_iq_unit": 0.9,
+            "path_loss_db": 0.0,
+            "reference_uncertainty_db": 0.0,
+            "reference_source": "",
+            "acknowledge_nominal_scaling": False,
+        },
+        "qcs_dc_output": {
+            "logical_index": 0,
+            "voltage_start_v": -2.0,
+            "voltage_stop_v": 2.0,
+            "voltage_points": 9,
+            "waveform_duration_us": 1.0,
+            "minimum_r_squared": 0.99,
+            "experiment_name": "QCS M5301A DC output calibration",
+            "sample_name": "",
+            "scope_resource": "",
+            "scope_channel": 1,
+            "scope_averages": 8,
+            "scope_settle_s": 0.05,
+            "scope_interval_s": 0.01,
         },
         "input_plot": {
             "x_scale": "log",

@@ -1,12 +1,12 @@
-"""Current-noise analysis for QICK I traces.
+"""Current-noise analysis for QICK and QCS I traces.
 
 The panel mirrors the common laboratory workflow::
 
     current = input_trace * input_scale / transimpedance_gain
     ASD = sqrt(periodogram(current, scaling="density"))
 
-It can acquire an independent FIR-DDR trace directly from QICK or load a
-previously saved QCoDeS run.
+It can acquire an independent FIR-DDR trace directly from QICK, acquire a raw
+M5200 trace directly from QCS, or load a previously saved QCoDeS run.
 
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
@@ -36,6 +36,13 @@ try:
         acquire_noise_fir_trace,
     )
     from .hardware_front_panel import HardwareFrontPanelPreview
+    from .qcs_qcodes_experiment import (
+        QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_NOISE_MAX_RAW_TRACE_SAMPLES,
+        QcsNoiseTraceConfig,
+        acquire_qcs_noise_trace,
+        quantize_qcs_raw_trace_duration,
+    )
 except ImportError:
     from qick_qcodes_experiment import load_qick_iq_arrays
     from dc_voltage_calibration import load_dc_voltage_calibration
@@ -44,11 +51,19 @@ except ImportError:
         acquire_noise_fir_trace,
     )
     from hardware_front_panel import HardwareFrontPanelPreview
+    from qcs_qcodes_experiment import (
+        QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_NOISE_MAX_RAW_TRACE_SAMPLES,
+        QcsNoiseTraceConfig,
+        acquire_qcs_noise_trace,
+        quantize_qcs_raw_trace_duration,
+    )
 
 
 INPUT_MODES = ("voltage", "adc", "current")
 WINDOWS = ("flattop", "hann", "blackmanharris", "boxcar")
 DETREND_MODES = ("constant", "linear", "none")
+DEFAULT_QCS_NOISE_DURATION_US = 10.0
 DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "acquisition_host": "192.168.2.99",
     "acquisition_ns_port": 8888,
@@ -67,6 +82,7 @@ DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "acquisition_fpga_trigger_delay_us": None,
     "acquisition_force_overwrite": True,
     "acquisition_post_run_read_delay_seconds": 0.1,
+    "qcs_acquisition_duration_us": DEFAULT_QCS_NOISE_DURATION_US,
     "database_path": str(Path.home() / "qick_experiments.db"),
     "run_id": 0,
     "point_index": 0,
@@ -84,6 +100,30 @@ DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "dc_voltage_calibration_readout_ch": 0,
     "dc_voltage_calibration_input_gain_db": 0.0,
 }
+
+
+@dataclass(frozen=True)
+class NoiseAcquisitionRequest:
+    """Backend-neutral request emitted by the Noise Analysis panel."""
+
+    backend: str
+    qick_config: Optional[NoiseAcquisitionConfig] = None
+    duration_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        backend = str(self.backend).strip().lower()
+        if backend not in {"qick", "qcs"}:
+            raise ValueError("noise acquisition backend must be 'qick' or 'qcs'")
+        if backend == "qick":
+            if not isinstance(self.qick_config, NoiseAcquisitionConfig):
+                raise TypeError("QICK noise acquisition requires a QICK config")
+            if self.duration_s is not None:
+                raise ValueError("QICK noise acquisition must not set QCS duration")
+        else:
+            if self.qick_config is not None:
+                raise ValueError("QCS noise acquisition must not set a QICK config")
+            _finite_positive(self.duration_s, "QCS noise acquisition duration")
+        object.__setattr__(self, "backend", backend)
 
 
 def _finite_positive(value: Any, name: str) -> float:
@@ -175,6 +215,20 @@ def normalize_noise_analysis_settings(
         "acquisition_post_run_read_delay_seconds",
     ):
         settings[name] = _finite(settings[name], name)
+    settings["qcs_acquisition_duration_us"] = _finite_positive(
+        settings["qcs_acquisition_duration_us"],
+        "qcs_acquisition_duration_us",
+    )
+    _effective_duration_s, qcs_sample_count = (
+        quantize_qcs_raw_trace_duration(
+            settings["qcs_acquisition_duration_us"] * 1.0e-6
+        )
+    )
+    if qcs_sample_count > QCS_NOISE_MAX_RAW_TRACE_SAMPLES:
+        raise ValueError(
+            "QCS noise acquisition duration exceeds the application limit of "
+            f"{QCS_NOISE_MAX_RAW_TRACE_SAMPLES:,} raw M5200 samples"
+        )
     raw_fpga_delay = settings["acquisition_fpga_trigger_delay_us"]
     settings["acquisition_fpga_trigger_delay_us"] = (
         None
@@ -503,8 +557,16 @@ class NoiseAcquisitionWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, config: NoiseAcquisitionConfig, parent=None):
+    def __init__(
+        self,
+        config: NoiseAcquisitionConfig | NoiseAcquisitionRequest,
+        parent=None,
+    ):
         super().__init__(parent)
+        if isinstance(config, NoiseAcquisitionRequest):
+            if config.backend != "qick" or config.qick_config is None:
+                raise ValueError("NoiseAcquisitionWorker requires a QICK request")
+            config = config.qick_config
         self._config = config
 
     @QtCore.pyqtSlot()
@@ -521,6 +583,41 @@ class NoiseAcquisitionWorker(QtCore.QObject):
                 sample_rate_hz=result.sample_rate_hz,
                 unit="ADC units",
                 source=result.source,
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(collection)
+
+
+class QcsNoiseAcquisitionWorker(QtCore.QObject):
+    """Run one duration-based QCS M5200 raw-trace acquisition."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
+
+    def __init__(self, config: QcsNoiseTraceConfig, parent=None):
+        super().__init__(parent)
+        self._config = config
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = acquire_qcs_noise_trace(
+                self._config,
+                progress_callback=self.progress_changed.emit,
+            )
+            traces = np.asarray(result.i_traces, dtype=np.float64)
+            if traces.ndim != 2:
+                raise ValueError(
+                    "QCS noise traces must have shape (repetition, sample)"
+                )
+            collection = NoiseTraceCollection(
+                i_traces=traces[np.newaxis, ...],
+                sample_rate_hz=float(result.sample_rate_hz),
+                unit="V",
+                source="Direct QCS raw trace",
             )
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -624,8 +721,38 @@ else:
             return
 
 
+def _set_layout_children_visible(layout, visible: bool) -> None:
+    """Hide a layout row completely on Qt versions without setRowVisible()."""
+
+    for index in range(layout.count()):
+        item = layout.itemAt(index)
+        widget = item.widget()
+        if widget is not None:
+            widget.setVisible(bool(visible))
+            continue
+        child_layout = item.layout()
+        if child_layout is not None:
+            _set_layout_children_visible(child_layout, visible)
+
+
+def _set_form_row_visible(
+    form: QtWidgets.QFormLayout,
+    field,
+    visible: bool,
+) -> None:
+    """Show or hide both the label and field belonging to one form row."""
+
+    label = form.labelForField(field)
+    if label is not None:
+        label.setVisible(bool(visible))
+    if isinstance(field, QtWidgets.QWidget):
+        field.setVisible(bool(visible))
+    else:
+        _set_layout_children_visible(field, visible)
+
+
 class NoiseAnalysisPanel(QtWidgets.QWidget):
-    """Independent FIR acquisition and current-noise analysis controls."""
+    """Independent QICK/QCS trace acquisition and noise-analysis controls."""
 
     load_requested = QtCore.pyqtSignal(str, int)
     acquire_requested = QtCore.pyqtSignal(object)
@@ -643,19 +770,6 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self._acquiring = False
         page_layout = QtWidgets.QVBoxLayout(self)
         page_layout.setContentsMargins(0, 0, 0, 0)
-        self.backend_warning = QtWidgets.QLabel(
-            "QCS front-panel mapping is available, but direct FIR-DDR "
-            "acquisition is still QICK-only. Acquisition is disabled while "
-            "QCS is selected; saved-trace analysis remains available.",
-            self,
-        )
-        self.backend_warning.setWordWrap(True)
-        self.backend_warning.setStyleSheet(
-            "QLabel { color: #8a4b08; background: #fff4d6; "
-            "border: 1px solid #e0b96a; padding: 6px; }"
-        )
-        self.backend_warning.hide()
-        page_layout.addWidget(self.backend_warning)
         control_scroll = QtWidgets.QScrollArea(self)
         control_scroll.setWidgetResizable(True)
         control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -669,7 +783,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             "Direct FIR-DDR Acquisition",
             self,
         )
+        self.acquisition_group = acquisition_group
         acquisition_form = QtWidgets.QFormLayout(acquisition_group)
+        self._acquisition_form = acquisition_form
         self.acquisition_status = QtWidgets.QLabel(
             "Independent capture is ready",
             acquisition_group,
@@ -725,6 +841,30 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         samples_row = QtWidgets.QHBoxLayout()
         samples_row.addWidget(self.fir_samples)
         samples_row.addWidget(self.capture_duration, 1)
+        self.qcs_duration_us = QtWidgets.QDoubleSpinBox(acquisition_group)
+        self.qcs_duration_us.setRange(
+            1.0e6 / QCS_M5200_SAMPLE_RATE_HZ,
+            QCS_NOISE_MAX_RAW_TRACE_SAMPLES
+            * 1.0e6
+            / QCS_M5200_SAMPLE_RATE_HZ,
+        )
+        self.qcs_duration_us.setDecimals(9)
+        self.qcs_duration_us.setSingleStep(1.0)
+        self.qcs_duration_us.setValue(DEFAULT_QCS_NOISE_DURATION_US)
+        self.qcs_duration_us.setSuffix(" us")
+        self.qcs_duration_us.setKeyboardTracking(False)
+        self.qcs_duration_us.setToolTip(
+            "Raw M5200 capture duration. The value is rounded upward to one "
+            "4.8 GSa/s sample. The 10,000,000-sample maximum is a GUI payload "
+            "limit, not a stated M5200 hardware limit."
+        )
+        self.qcs_duration_note = QtWidgets.QLabel(acquisition_group)
+        self.qcs_duration_note.setWordWrap(True)
+        qcs_duration_row = QtWidgets.QVBoxLayout()
+        qcs_duration_row.setContentsMargins(0, 0, 0, 0)
+        qcs_duration_row.setSpacing(2)
+        qcs_duration_row.addWidget(self.qcs_duration_us)
+        qcs_duration_row.addWidget(self.qcs_duration_note)
         self.readout_frequency = QtWidgets.QDoubleSpinBox(acquisition_group)
         self.readout_frequency.setRange(-100_000.0, 100_000.0)
         self.readout_frequency.setDecimals(9)
@@ -824,6 +964,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         acquisition_form.addRow(front_panel_row)
         acquisition_form.addRow("Input:", input_row)
         acquisition_form.addRow("Stored FIR samples:", samples_row)
+        acquisition_form.addRow("Measurement duration:", qcs_duration_row)
         acquisition_form.addRow("Readout/DDC frequency:", self.readout_frequency)
         acquisition_form.addRow("Input board setting:", board_setting_row)
         acquisition_form.addRow("Input filter:", filter_row)
@@ -835,6 +976,17 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         acquisition_form.addRow("HWH FIR DDR:", self.fir_profile_status)
         acquisition_form.addRow(self.acquire_button)
         acquisition_form.addRow("Status:", self.acquisition_status)
+        self._qick_acquisition_rows = (
+            input_row,
+            samples_row,
+            self.readout_frequency,
+            board_setting_row,
+            filter_row,
+            advanced_row,
+            fpga_delay_row,
+            self.fir_profile_status,
+        )
+        self._qcs_acquisition_rows = (qcs_duration_row,)
         outer.addWidget(acquisition_group)
 
         source_group = QtWidgets.QGroupBox("Saved I Trace (Optional)", self)
@@ -999,6 +1151,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         )
         self.acquire_button.clicked.connect(self._request_acquisition)
         self.fir_samples.valueChanged.connect(self._update_capture_duration)
+        self.qcs_duration_us.valueChanged.connect(
+            self._update_qcs_capture_duration
+        )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -1037,9 +1192,11 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             self._browse_dc_calibration
         )
         self._update_capture_duration()
+        self._update_qcs_capture_duration()
         self._update_input_board_controls()
         self._update_mode_controls()
         self._update_fpga_trigger_delay_controls()
+        self._update_backend_controls()
 
     def connection_config(self):
         """Return the QICK connection mirrored from the shared Setup menu."""
@@ -1077,6 +1234,21 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             ),
             force_overwrite=self.force_overwrite.isChecked(),
             post_run_read_delay_seconds=self.post_read_delay.value(),
+        )
+
+    def acquisition_request(self) -> NoiseAcquisitionRequest:
+        """Return the backend-specific acquisition selected in this tab."""
+
+        if self._hardware_backend == "qcs":
+            return NoiseAcquisitionRequest(
+                backend="qcs",
+                # Keep the requested duration intact. The backend records it
+                # separately and performs the authoritative upward rounding.
+                duration_s=self.qcs_duration_us.value() * 1.0e-6,
+            )
+        return NoiseAcquisitionRequest(
+            backend="qick",
+            qick_config=self.acquisition_config(),
         )
 
     def configured_spec(self):
@@ -1152,9 +1324,34 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
 
     def set_hardware_backend(self, backend: str) -> None:
         self._hardware_backend = str(backend).strip().lower()
+        if self._hardware_backend not in {"qick", "qcs"}:
+            raise ValueError(f"unsupported Noise Analysis backend {backend!r}")
         self.front_panel_preview.set_backend(self._hardware_backend)
-        self.backend_warning.setVisible(self._hardware_backend == "qcs")
+        self._update_backend_controls()
         self._refresh_acquire_button()
+
+    def _update_backend_controls(self) -> None:
+        is_qcs = self._hardware_backend == "qcs"
+        for row in self._qick_acquisition_rows:
+            _set_form_row_visible(self._acquisition_form, row, not is_qcs)
+        for row in self._qcs_acquisition_rows:
+            _set_form_row_visible(self._acquisition_form, row, is_qcs)
+        self.acquisition_group.setTitle(
+            "Direct QCS Raw-Trace Acquisition"
+            if is_qcs
+            else "Direct FIR-DDR Acquisition"
+        )
+        self.acquire_button.setText(
+            "Acquire Raw Trace and Analyze"
+            if is_qcs
+            else "Acquire FIR Trace and Analyze"
+        )
+        if not self._acquiring:
+            self.acquisition_status.setText(
+                "QCS raw-trace acquisition is ready"
+                if is_qcs
+                else "Independent capture is ready"
+            )
 
     def set_qcs_front_panel_configuration(
         self,
@@ -1195,6 +1392,24 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             f"{seconds:g} s at {rate_label}{delay}"
         )
 
+    def _update_qcs_capture_duration(self, _value: float = 0.0) -> None:
+        duration_s, sample_count = quantize_qcs_raw_trace_duration(
+            self.qcs_duration_us.value() * 1.0e-6
+        )
+        payload_bytes = sample_count * np.dtype(np.float64).itemsize
+        if payload_bytes < 1024:
+            payload_label = f"{payload_bytes:,} B"
+        elif payload_bytes < 1024**2:
+            payload_label = f"{payload_bytes / 1024:.3g} KiB"
+        else:
+            payload_label = f"{payload_bytes / 1024**2:.3g} MiB"
+        self.qcs_duration_note.setText(
+            f"{sample_count:,} M5200 samples at "
+            f"{QCS_M5200_SAMPLE_RATE_HZ / 1.0e9:g} GSa/s; "
+            f"effective {duration_s * 1.0e6:.9g} us; "
+            f"approximately {payload_label} stored as float64."
+        )
+
     def _update_input_board_controls(self, _board: str = "") -> None:
         is_rf = self.input_board.currentText() == "RF_In"
         self.input_attenuation.setEnabled(is_rf)
@@ -1205,7 +1420,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
 
     def _request_acquisition(self) -> None:
         try:
-            config = self.acquisition_config()
+            request = self.acquisition_request()
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -1213,7 +1428,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
                 str(exc),
             )
             return
-        self.acquire_requested.emit(config)
+        self.acquire_requested.emit(request)
 
     def _browse_database(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -1354,6 +1569,11 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
                 f"Completed: {collection.sample_count:,} FIR samples from "
                 f"readout {self.readout_channel.value()}"
             )
+        elif collection.source.startswith("Direct QCS raw trace"):
+            self.acquisition_status.setText(
+                f"Completed: {collection.sample_count:,} raw M5200 samples "
+                f"per repetition"
+            )
         self.set_loading(False)
         self.analyze_selected_trace()
 
@@ -1445,8 +1665,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
 
     def _refresh_acquire_button(self) -> None:
         self.acquire_button.setEnabled(
-            self._hardware_backend == "qick"
-            and not self._loading
+            not self._loading
             and not self._acquiring
         )
 
@@ -1487,6 +1706,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             ),
             "acquisition_force_overwrite": self.force_overwrite.isChecked(),
             "acquisition_post_run_read_delay_seconds": self.post_read_delay.value(),
+            "qcs_acquisition_duration_us": self.qcs_duration_us.value(),
             "database_path": self.database_path.text().strip(),
             "run_id": self.run_id.value(),
             "point_index": self.point_index.value(),
@@ -1559,6 +1779,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.post_read_delay.setValue(
             settings["acquisition_post_run_read_delay_seconds"]
         )
+        self.qcs_duration_us.setValue(
+            settings["qcs_acquisition_duration_us"]
+        )
         self.database_path.setText(settings["database_path"])
         self.run_id.setValue(settings["run_id"])
         self.point_index.setValue(settings["point_index"])
@@ -1595,19 +1818,23 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             )
         self._calibration_controls_changed()
         self._update_capture_duration()
+        self._update_qcs_capture_duration()
         self._update_input_board_controls()
         self._update_mode_controls()
         self._update_fpga_trigger_delay_controls()
+        self._update_backend_controls()
 
 
 __all__ = [
     "DEFAULT_NOISE_ANALYSIS_SETTINGS",
+    "NoiseAcquisitionRequest",
+    "NoiseAcquisitionWorker",
     "NoiseAnalysisConfig",
     "NoiseAnalysisPanel",
     "NoiseAnalysisPlotWidget",
     "NoiseAnalysisResult",
     "NoiseTraceCollection",
-    "NoiseAcquisitionWorker",
+    "QcsNoiseAcquisitionWorker",
     "NoiseTraceLoadWorker",
     "analyze_i_trace",
     "load_noise_trace_collection",

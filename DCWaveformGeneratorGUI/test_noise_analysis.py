@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,6 +21,8 @@ from noise_analysis import (
     DEFAULT_NOISE_ANALYSIS_SETTINGS,
     NoiseAnalysisConfig,
     NoiseAnalysisPanel,
+    NoiseAcquisitionRequest,
+    QcsNoiseAcquisitionWorker,
     NoiseTraceCollection,
     analyze_i_trace,
     normalize_noise_analysis_settings,
@@ -194,7 +197,11 @@ def test_noise_panel_direct_acquisition_settings_are_self_contained():
     panel.acquire_button.click()
 
     assert len(emitted) == 1
-    config = emitted[0]
+    request = emitted[0]
+    assert isinstance(request, NoiseAcquisitionRequest)
+    assert request.backend == "qick"
+    config = request.qick_config
+    assert config is not None
     assert config.connection_config.host == "noise-only-host"
     assert config.connection_config.ns_port == 9444
     assert config.connection_config.proxy_name == "noise-only-proxy"
@@ -210,6 +217,110 @@ def test_noise_panel_direct_acquisition_settings_are_self_contained():
     assert panel.database_path.text() == "noise.db"
     app.processEvents()
     panel.close()
+
+
+def test_noise_panel_qcs_uses_duration_and_hides_qick_only_rows():
+    app = _application()
+    panel = NoiseAnalysisPanel(default_database_path="noise.db")
+    panel.resize(720, 1100)
+    panel.show()
+    panel.set_hardware_backend("qcs")
+    app.processEvents()
+
+    assert panel.acquisition_group.title() == "Direct QCS Raw-Trace Acquisition"
+    assert panel.acquire_button.text() == "Acquire Raw Trace and Analyze"
+    assert panel.acquire_button.isEnabled() is True
+    assert panel.qcs_duration_us.isHidden() is False
+    assert panel.qcs_duration_us.value() == pytest.approx(10.0)
+    assert "48,000 M5200 samples" in panel.qcs_duration_note.text()
+    assert "4.8 GSa/s" in panel.qcs_duration_note.text()
+    assert "375 KiB" in panel.qcs_duration_note.text()
+
+    for qick_only in (
+        panel.readout_channel,
+        panel.input_board,
+        panel.input_nqz,
+        panel.fir_samples,
+        panel.readout_frequency,
+        panel.input_attenuation,
+        panel.input_dc_gain,
+        panel.input_filter,
+        panel.filter_cutoff,
+        panel.filter_bandwidth,
+        panel.input_margin,
+        panel.post_read_delay,
+        panel.force_overwrite,
+        panel.override_fpga_trigger_delay,
+        panel.fpga_trigger_delay_us,
+        panel.fir_profile_status,
+    ):
+        assert qick_only.isHidden() is True
+
+    panel.qcs_duration_us.setValue(10.0001)
+    app.processEvents()
+    assert "48,001 M5200 samples" in panel.qcs_duration_note.text()
+    emitted = []
+    panel.acquire_requested.connect(emitted.append)
+    panel.acquire_button.click()
+    assert len(emitted) == 1
+    request = emitted[0]
+    assert isinstance(request, NoiseAcquisitionRequest)
+    assert request.backend == "qcs"
+    assert request.qick_config is None
+    assert request.duration_s == pytest.approx(10.0001e-6)
+
+    settings = panel.settings_dict()
+    assert settings["qcs_acquisition_duration_us"] == pytest.approx(10.0001)
+    restored = NoiseAnalysisPanel(default_database_path="other.db")
+    restored.load_settings(settings)
+    restored.set_hardware_backend("qcs")
+    assert restored.qcs_duration_us.value() == pytest.approx(10.0001)
+    assert restored.settings_dict() == settings
+
+    panel.fir_samples.setValue(12345)
+    panel.set_hardware_backend("qick")
+    app.processEvents()
+    assert panel.acquisition_group.title() == "Direct FIR-DDR Acquisition"
+    assert panel.acquire_button.text() == "Acquire FIR Trace and Analyze"
+    assert panel.fir_samples.isHidden() is False
+    assert panel.fir_samples.value() == 12345
+    assert panel.qcs_duration_us.isHidden() is True
+    panel.close()
+    restored.close()
+
+
+def test_qcs_noise_worker_converts_result_to_voltage_trace_collection(monkeypatch):
+    app = _application()
+    raw_traces = np.arange(2 * 8, dtype=float).reshape(2, 8)
+
+    def fake_acquire(config, *, progress_callback):
+        assert config == "qcs config"
+        progress_callback(50, "Reading raw trace")
+        return SimpleNamespace(
+            i_traces=raw_traces,
+            sample_rate_hz=4.8e9,
+        )
+
+    monkeypatch.setattr(noise_module, "acquire_qcs_noise_trace", fake_acquire)
+    worker = QcsNoiseAcquisitionWorker("qcs config")
+    completed = []
+    failed = []
+    progress = []
+    worker.finished.connect(completed.append)
+    worker.failed.connect(failed.append)
+    worker.progress_changed.connect(lambda value, text: progress.append((value, text)))
+    worker.run()
+    app.processEvents()
+
+    assert failed == []
+    assert progress == [(50, "Reading raw trace")]
+    assert len(completed) == 1
+    collection = completed[0]
+    assert collection.i_traces.shape == (1, 2, 8)
+    np.testing.assert_array_equal(collection.i_traces[0], raw_traces)
+    assert collection.sample_rate_hz == pytest.approx(4.8e9)
+    assert collection.unit == "V"
+    assert collection.source == "Direct QCS raw trace"
 
 
 def test_noise_panel_front_panel_preview_uses_control_panel_width():

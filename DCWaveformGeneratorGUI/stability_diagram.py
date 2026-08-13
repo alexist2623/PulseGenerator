@@ -35,6 +35,7 @@ try:
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
         QickSweepSpec,
+        _cycles_from_ns,
         adc_iq_to_voltage,
         build_qick_sequence,
         dc_iq_to_current,
@@ -56,13 +57,21 @@ try:
         store_qick_result,
     )
     from .qcs_qcodes_experiment import (
-        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        DEFAULT_QCS_INIT_TIME_S,
+        QCS_FABRIC_CLOCK_HZ,
+        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_STABILITY_INTEGRATION_QUANTUM_S,
+        QCS_STABILITY_DC_EDGE_PADDING_S,
+        QCS_STABILITY_DC_RAMP_S,
         StoredQcsExperiment,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        quantize_qcs_inter_iteration_delay,
+        quantize_qcs_stability_integration_duration,
     )
     from .hardware_front_panel import HardwareFrontPanelPreview
     from .sparameter_gui import RfPathCorrectionWidget
@@ -76,6 +85,7 @@ except ImportError:
         DEFAULT_QICK_FULL_SCALE_MV,
         PulseSequence,
         QickSweepSpec,
+        _cycles_from_ns,
         adc_iq_to_voltage,
         build_qick_sequence,
         dc_iq_to_current,
@@ -97,13 +107,21 @@ except ImportError:
         store_qick_result,
     )
     from qcs_qcodes_experiment import (
-        QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+        DEFAULT_QCS_INIT_TIME_S,
+        QCS_FABRIC_CLOCK_HZ,
+        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_STABILITY_INTEGRATION_QUANTUM_S,
+        QCS_STABILITY_DC_EDGE_PADDING_S,
+        QCS_STABILITY_DC_RAMP_S,
         StoredQcsExperiment,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        quantize_qcs_inter_iteration_delay,
+        quantize_qcs_stability_integration_duration,
     )
     from hardware_front_panel import HardwareFrontPanelPreview
     from sparameter_gui import RfPathCorrectionWidget
@@ -114,6 +132,9 @@ DEFAULT_STABILITY_STOP_MV = 100.0
 DEFAULT_STABILITY_POINTS = 51
 DEFAULT_STABILITY_REPETITIONS = 1
 DEFAULT_STABILITY_TRACE_SAMPLES = 64
+DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S = (
+    DEFAULT_STABILITY_TRACE_SAMPLES / QCS_M5200_SAMPLE_RATE_HZ
+)
 DEFAULT_STABILITY_SETTLE_US = 50.0
 DEFAULT_STABILITY_POINT_GUARD_US = 1.0
 DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ = 50.0
@@ -1093,6 +1114,9 @@ def default_stability_settings(
         },
         "repetitions_per_point": DEFAULT_STABILITY_REPETITIONS,
         "trace_samples_per_point": DEFAULT_STABILITY_TRACE_SAMPLES,
+        "qcs_integration_duration_s": (
+            DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S
+        ),
         "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
         "fpga_trigger_delay_us": None,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
@@ -1198,6 +1222,20 @@ def normalize_stability_settings(
         "stability FIR trace samples per point",
         1,
     )
+    raw_qcs_integration_duration_s = settings.get(
+        "qcs_integration_duration_s"
+    )
+    if raw_qcs_integration_duration_s is None:
+        raw_qcs_integration_duration_s = (
+            normalized["trace_samples_per_point"]
+            / QCS_M5200_SAMPLE_RATE_HZ
+        )
+    normalized["qcs_integration_duration_s"] = _finite_float(
+        raw_qcs_integration_duration_s,
+        "stability QCS integration time",
+    )
+    if normalized["qcs_integration_duration_s"] <= 0.0:
+        raise ValueError("stability QCS integration time must be positive")
     normalized["settle_time_us"] = _finite_float(
         settings.get("settle_time_us", defaults["settle_time_us"]),
         "stability settle time",
@@ -1427,6 +1465,7 @@ def build_stability_hold_sequence(
     full_scale_mv: float,
     cross_capacitance=None,
     sample_period_us: float = 1.0,
+    target_edge_padding_us: float = 0.0,
 ):
     """Build the dedicated SET-and-hold sequence for one Cartesian scan.
 
@@ -1452,10 +1491,17 @@ def build_stability_hold_sequence(
     )
     if sample_period_us <= 0.0:
         raise ValueError("stability FIR sample period must be positive")
+    target_edge_padding_us = _finite_float(
+        target_edge_padding_us,
+        "stability target edge padding",
+    )
+    if target_edge_padding_us < 0.0:
+        raise ValueError("stability target edge padding must be nonnegative")
     hold_duration_us = (
         float(config.settle_time_us)
         + float(config.trace_samples_per_point) * sample_period_us
         + DEFAULT_STABILITY_POINT_GUARD_US
+        + target_edge_padding_us
     )
     pulses = tuple(
         PulseSequence(
@@ -2107,8 +2153,11 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                     else None
                 ),
                 "bias_t_compensation_duration_us": (
-                    float(stability_config.bias_t_compensation_duration_us)
+                    float(
+                        compiled.bias_t_compensation_duration_s * 1.0e6
+                    )
                     if bias_t_compensation_applied
+                    and compiled.bias_t_compensation_duration_s is not None
                     else None
                 ),
                 "measurement_representation_applied": "adc",
@@ -2974,25 +3023,6 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._hardware_backend = "qick"
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
-        self.backend_warning = QtWidgets.QLabel(
-            "QCS Stability uses one native M5301 X/Y hardware-sweep program "
-            f"with M5200 hardware-demodulated acquisition at "
-            f"{format_sample_rate_hz(QCS_M5200_SAMPLE_RATE_HZ)}. Integration "
-            f"lengths must be multiples of "
-            f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples. Raw trace "
-            "capture is unavailable. QCS Bias-T compensation uses a fixed "
-            "duration and adjusts each M5301 compensation voltage; "
-            "fixed-voltage and filter compensation remain QICK-only.",
-            self,
-        )
-        self.backend_warning.setWordWrap(True)
-        self.backend_warning.setStyleSheet(
-            "QLabel { color: #8a4b08; background: #fff4d6; "
-            "border: 1px solid #e0b96a; padding: 6px; }"
-        )
-        self.backend_warning.hide()
-        outer.addWidget(self.backend_warning)
-
         self.controls_scroll = QtWidgets.QScrollArea(self)
         self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -3052,6 +3082,58 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.trace_samples.setToolTip(
             "Number of post-FIR samples stored at the HWH-selected rate for every stability "
             "point and repetition"
+        )
+        self.qcs_integration_duration_us = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
+        qcs_integration_quantum_us = (
+            QCS_STABILITY_INTEGRATION_QUANTUM_S * 1.0e6
+        )
+        self.qcs_integration_duration_us.setRange(
+            qcs_integration_quantum_us,
+            QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6,
+        )
+        self.qcs_integration_duration_us.setDecimals(12)
+        self.qcs_integration_duration_us.setSingleStep(
+            qcs_integration_quantum_us
+        )
+        self.qcs_integration_duration_us.setKeyboardTracking(False)
+        self.qcs_integration_duration_us.setSuffix(" us")
+        self.qcs_integration_duration_us.setValue(
+            DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S * 1.0e6
+        )
+        self.qcs_integration_duration_us.setToolTip(
+            "Enter the desired M5200 integration (sampling-window) time in "
+            "microseconds; the GUI calculates the sample count automatically. "
+            "Stability synchronizes the RF waveform and acquisition, so the "
+            "requested time is rounded upward to a "
+            "6.666667 ns (32-sample) timing quantum. The connected QCS "
+            f"2.5.5 ceiling is "
+            f"{QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:,} samples "
+            f"({QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6:.9g} "
+            "us)."
+        )
+        self._qcs_integration_requested_us = (
+            self.qcs_integration_duration_us.value()
+        )
+        self._qcs_init_time_us = DEFAULT_QCS_INIT_TIME_S * 1.0e6
+        self.qcs_integration_note = QtWidgets.QLabel(
+            self.acquisition_group
+        )
+        self.qcs_integration_note.setWordWrap(True)
+        self.qcs_integration_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.qcs_point_timing_note = QtWidgets.QLabel(
+            self.acquisition_group
+        )
+        self.qcs_point_timing_note.setWordWrap(True)
+        self.qcs_point_timing_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.qcs_point_timing_note.setStyleSheet(
+            "QLabel { color: #3f4f5f; background: #edf5fb; "
+            "border: 1px solid #b8cfdf; padding: 5px; }"
         )
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
@@ -3163,9 +3245,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.trace_samples_label = QtWidgets.QLabel(
             "FIR trace samples / point:"
         )
+        self.qcs_integration_duration_label = QtWidgets.QLabel(
+            "Integration / sampling time:"
+        )
         self.settle_time_label = QtWidgets.QLabel("Settle before readout:")
         acquisition_form.addRow(self.repetitions_label, self.repetitions)
         acquisition_form.addRow(self.trace_samples_label, self.trace_samples)
+        acquisition_form.addRow(
+            self.qcs_integration_duration_label,
+            self.qcs_integration_duration_us,
+        )
+        acquisition_form.addRow(self.qcs_integration_note)
+        acquisition_form.addRow(self.qcs_point_timing_note)
         acquisition_form.addRow(self.settle_time_label, self.settle_time_us)
         self.fpga_delay_label = QtWidgets.QLabel(
             "FPGA trigger-to-store delay:"
@@ -3215,6 +3306,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         for label in (
             self.repetitions_label,
             self.trace_samples_label,
+            self.qcs_integration_duration_label,
             self.settle_time_label,
             self.fpga_delay_label,
             self.modulation_frequency_label,
@@ -3472,6 +3564,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.fit_button.clicked.connect(self.plot.fit_view)
         self.x_axis.points.valueChanged.connect(self._update_point_count)
         self.y_axis.points.valueChanged.connect(self._update_point_count)
+        self.repetitions.valueChanged.connect(
+            lambda _value: self._update_qcs_point_timing_note()
+        )
         self.x_axis.output.currentIndexChanged.connect(
             lambda _index: self._enforce_independent_axis_outputs(self.x_axis)
         )
@@ -3479,6 +3574,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             lambda _index: self._enforce_independent_axis_outputs(self.y_axis)
         )
         self.trace_samples.valueChanged.connect(self._update_fir_trace_duration)
+        self.settle_time_us.valueChanged.connect(
+            lambda _value: self._update_qcs_point_timing_note()
+        )
+        self.qcs_integration_duration_us.valueChanged.connect(
+            self._qcs_integration_duration_changed
+        )
+        self.qcs_integration_duration_us.editingFinished.connect(
+            self._commit_qcs_integration_duration
+        )
         self.override_fpga_trigger_delay.toggled.connect(
             self._update_fpga_trigger_delay_controls
         )
@@ -3518,6 +3622,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.bias_t_mode.currentIndexChanged.connect(
             self._update_bias_t_controls
+        )
+        self.bias_t_duration_us.valueChanged.connect(
+            lambda _value: self._update_qcs_point_timing_note()
         )
         self._targets_available = False
         self._dc_input_available = False
@@ -3568,6 +3675,171 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(self.qcs_modulation_amplitude):
             self.qcs_modulation_amplitude.setValue(gain / 32767.0)
 
+    def _qcs_integration_timing(
+        self,
+        requested_us: Optional[float] = None,
+    ) -> tuple[float, int]:
+        if requested_us is None:
+            requested_us = self.qcs_integration_duration_us.value()
+        return quantize_qcs_stability_integration_duration(
+            float(requested_us) * 1.0e-6
+        )
+
+    def _update_qcs_integration_note(
+        self,
+        requested_us: Optional[float] = None,
+    ) -> None:
+        if requested_us is None:
+            requested_us = self._qcs_integration_requested_us
+        effective_s, sample_count = self._qcs_integration_timing(requested_us)
+        effective_us = effective_s * 1.0e6
+        if effective_us - float(requested_us) > 1.0e-12:
+            self.qcs_integration_note.setText(
+                f"Requested {float(requested_us):.12g} us was adjusted "
+                f"upward to {effective_us:.12g} us "
+                f"({sample_count:,} M5200 samples) to satisfy the "
+                f"{QCS_STABILITY_INTEGRATION_QUANTUM_S * 1.0e9:.6f} ns "
+                "QCS timing quantum."
+            )
+            self._update_qcs_point_timing_note(effective_s)
+            return
+        self.qcs_integration_note.setText(
+            f"Programmed {effective_us:.12g} us "
+            f"({sample_count:,} M5200 samples); this satisfies the "
+            f"{QCS_STABILITY_INTEGRATION_QUANTUM_S * 1.0e9:.6f} ns "
+            "QCS timing quantum."
+        )
+        self._update_qcs_point_timing_note(effective_s)
+
+    def _update_qcs_point_timing_note(
+        self,
+        integration_duration_s: Optional[float] = None,
+    ) -> None:
+        """Show the complete per-point QCS Stability timing contract."""
+
+        if integration_duration_s is None or not isinstance(
+            integration_duration_s,
+            (int, float, np.floating),
+        ):
+            integration_duration_s, _samples = self._qcs_integration_timing(
+                self._qcs_integration_requested_us
+            )
+        integration_us = float(integration_duration_s) * 1.0e6
+        requested_settle_us = float(self.settle_time_us.value())
+        ramp_edge_us = QCS_STABILITY_DC_RAMP_S * 1.0e6
+        edge_padding_us = QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
+        readout_start_us = (
+            round(
+                (requested_settle_us + ramp_edge_us)
+                * 1.0e-6
+                * QCS_FABRIC_CLOCK_HZ
+            )
+            / QCS_FABRIC_CLOCK_HZ
+            * 1.0e6
+        )
+        effective_settle_us = readout_start_us - ramp_edge_us
+        readout_end_us = readout_start_us + integration_us
+        # Use the exact duration-to-cycle conversion used by
+        # build_qick_sequence.  This intentionally has no near-integer
+        # tolerance: the sequence builder always ceilings the raw float.
+        fabric_mhz = QCS_FABRIC_CLOCK_HZ / 1.0e6
+        measurement_cycles = _cycles_from_ns(
+            (
+                requested_settle_us
+                + integration_us
+                + DEFAULT_STABILITY_POINT_GUARD_US
+                + edge_padding_us
+            )
+            * 1000.0,
+            fabric_mhz,
+        )
+        measurement_hold_us = measurement_cycles / fabric_mhz
+        plateau_end_us = measurement_hold_us - 2.0 * ramp_edge_us
+        post_readout_guard_us = plateau_end_us - readout_end_us
+        compensation_us = (
+            _cycles_from_ns(
+                float(self.bias_t_duration_us.value()) * 1000.0,
+                fabric_mhz,
+            )
+            / fabric_mhz
+            if self.bias_t_group.isChecked()
+            else 0.0
+        )
+        program_end_us = measurement_hold_us + compensation_us
+        next_point_us = program_end_us + float(self._qcs_init_time_us)
+        scheduled_iterations = (
+            int(self.x_axis.points.value())
+            * int(self.y_axis.points.value())
+            * int(self.repetitions.value())
+        )
+        active_scan_s = scheduled_iterations * program_end_us * 1.0e-6
+        gap_scan_s = (
+            max(0, scheduled_iterations - 1)
+            * float(self._qcs_init_time_us)
+            * 1.0e-6
+        )
+        compensation_text = (
+            f" Compensation: {measurement_hold_us:.12g}-"
+            f"{program_end_us:.12g} us ({compensation_us:.12g} us, "
+            f"including {ramp_edge_us:.12g} us ramp-up and ramp-down to "
+            f"0 V plus {ramp_edge_us:.12g} us explicit terminal zero)."
+            if compensation_us > 0.0
+            else " Compensation disabled."
+        )
+        delay_warning = (
+            " Warning: the inter-iteration delay is longer than the active "
+            "point program and dominates scan time."
+            if self._qcs_init_time_us > program_end_us
+            else ""
+        )
+        self.qcs_point_timing_note.setText(
+            f"Per point: target DC interval 0-{measurement_hold_us:.12g} us "
+            f"(including safe edges). The M5301 ramps from 0 V to the target "
+            f"during 0-"
+            f"{ramp_edge_us:.12g} us, then keeps the full target voltage "
+            f"through {plateau_end_us:.12g} us. RF output and acquisition "
+            f"run together from {readout_start_us:.12g} to "
+            f"{readout_end_us:.12g} us, after {effective_settle_us:.12g} us "
+            f"at the full target voltage; the post-readout full-level guard "
+            f"is {post_readout_guard_us:.12g} us (requested "
+            f"{DEFAULT_STABILITY_POINT_GUARD_US:.12g} us). The target then "
+            f"ramps to 0 V and ends with an explicit terminal-zero interval."
+            f"{compensation_text} HCL inter-iteration delay: "
+            f"{self._qcs_init_time_us:.12g} us; next point starts at "
+            f"approximately {next_point_us:.12g} us. Both M5301 intervals "
+            "use the hardware-tested direct ramp-to-Hold form and return to "
+            f"0 V before the next layer or point. For {scheduled_iterations:,} "
+            f"scheduled point/repetition iterations: {active_scan_s:.6g} s "
+            f"active program + {gap_scan_s:.6g} s inter-iteration delay "
+            "(excluding compile, network, and result-transfer time)."
+            f"{delay_warning}"
+        )
+
+    def set_qcs_init_time_us(self, value: float) -> None:
+        """Update the displayed HCL delay shared with Experiment settings."""
+
+        self._qcs_init_time_us = (
+            quantize_qcs_inter_iteration_delay(
+                max(0.0, float(value)) * 1.0e-6
+            )
+            * 1.0e6
+        )
+        self._update_qcs_point_timing_note()
+
+    def _qcs_integration_duration_changed(self, *_args) -> None:
+        self._qcs_integration_requested_us = (
+            self.qcs_integration_duration_us.value()
+        )
+        self._update_qcs_integration_note()
+
+    def _commit_qcs_integration_duration(self) -> tuple[float, int]:
+        requested_us = float(self._qcs_integration_requested_us)
+        effective_s, sample_count = self._qcs_integration_timing(requested_us)
+        with QtCore.QSignalBlocker(self.qcs_integration_duration_us):
+            self.qcs_integration_duration_us.setValue(effective_s * 1.0e6)
+        self._update_qcs_integration_note(requested_us)
+        return effective_s, sample_count
+
     def _update_backend_presentation(self) -> None:
         is_qcs = self._hardware_backend == "qcs"
         self.acquisition_group.setTitle(
@@ -3576,6 +3848,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             else "Acquisition"
         )
         self._set_acquisition_row_visible(self.modulation_gain, not is_qcs)
+        self._set_acquisition_row_visible(self.trace_samples, not is_qcs)
+        self._set_acquisition_row_visible(
+            self.qcs_integration_duration_us,
+            is_qcs,
+        )
+        self.qcs_integration_note.setVisible(is_qcs)
+        self.qcs_point_timing_note.setVisible(is_qcs)
         self._set_acquisition_row_visible(
             self.qcs_modulation_amplitude,
             is_qcs,
@@ -3620,14 +3899,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             duration_label.setText(
                 "Compensation duration:" if is_qcs else "DC time:"
             )
-        self.trace_samples_label.setText(
-            "Integration length (M5200 samples):"
-            if is_qcs
-            else "FIR trace samples / point:"
-        )
-        self.trace_samples.setSingleStep(
-            QCS_M5200_INTEGRATION_BLOCK_SAMPLES if is_qcs else 1
-        )
+        self.trace_samples_label.setText("FIR trace samples / point:")
+        self.trace_samples.setSingleStep(1)
         self.settle_time_label.setText(
             "Settle before acquisition:"
             if is_qcs
@@ -3639,14 +3912,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             else "Modulation frequency:"
         )
         self.trace_samples.setToolTip(
-            "M5200 ADC samples integrated at every Stability point and "
-            "repetition. QCS requires a multiple of "
-            f"{QCS_M5200_INTEGRATION_BLOCK_SAMPLES} samples."
-            if is_qcs
-            else (
-                "Number of post-FIR samples stored at the HWH-selected rate "
-                "for every stability point and repetition"
-            )
+            "Number of post-FIR samples stored at the HWH-selected rate "
+            "for every stability point and repetition"
         )
         self.settle_time_us.setToolTip(
             "Time to hold each new X/Y voltage before the RF waveform and "
@@ -3666,6 +3933,10 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             )
         )
         self._sync_qcs_modulation_amplitude()
+        if is_qcs:
+            self._commit_qcs_integration_duration()
+        else:
+            self._update_qcs_integration_note()
         self._update_bias_t_controls()
 
     def _update_dc_measure_controls(self) -> None:
@@ -3685,6 +3956,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.bias_t_compensation_mv.setEnabled(False)
             self.bias_t_duration_us.setEnabled(editable)
             self.bias_t_filter_tau_us.setEnabled(False)
+            self._update_qcs_point_timing_note()
             return
         filter_mode = self.bias_t_type.currentData() == "filter"
         fixed_time = self.bias_t_mode.currentData() == "fixed_time"
@@ -3697,6 +3969,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             editable and not filter_mode and fixed_time
         )
         self.bias_t_filter_tau_us.setEnabled(editable and filter_mode)
+        self._update_qcs_point_timing_note()
 
     def _emit_dc_measure_changed(self, *_args) -> None:
         self._update_dc_measure_controls()
@@ -4042,7 +4315,6 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.y_axis.set_hardware_backend(backend)
         is_qcs = self._hardware_backend == "qcs"
         self._update_backend_presentation()
-        self.backend_warning.setVisible(is_qcs)
         idle_enabled = (
             not self._running
             and not self._saved_run_loading
@@ -4147,11 +4419,17 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def config(self, *, full_scale_mv: float) -> StabilityDiagramConfig:
         if not self._targets_available:
             raise ValueError("stability diagram requires at least two AWG outputs")
+        if self._hardware_backend == "qcs":
+            _integration_duration_s, trace_samples_per_point = (
+                self._commit_qcs_integration_duration()
+            )
+        else:
+            trace_samples_per_point = self.trace_samples.value()
         config = StabilityDiagramConfig(
             x_axis=self.x_axis.value(),
             y_axis=self.y_axis.value(),
             repetitions_per_point=self.repetitions.value(),
-            trace_samples_per_point=self.trace_samples.value(),
+            trace_samples_per_point=trace_samples_per_point,
             settle_time_us=self.settle_time_us.value(),
             fpga_trigger_delay_us=(
                 self.fpga_trigger_delay_us.value()
@@ -4174,11 +4452,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         return config
 
     def settings_dict(self) -> dict:
+        qcs_integration_duration_s, _sample_count = (
+            self._commit_qcs_integration_duration()
+        )
         return {
             "x_axis": self.x_axis.settings_dict(),
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
+            "qcs_integration_duration_s": qcs_integration_duration_s,
             "settle_time_us": self.settle_time_us.value(),
             "fpga_trigger_delay_us": (
                 self.fpga_trigger_delay_us.value()
@@ -4254,6 +4536,21 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 )
             )
         )
+        raw_qcs_integration_duration_s = settings.get(
+            "qcs_integration_duration_s"
+        )
+        if raw_qcs_integration_duration_s is None:
+            raw_qcs_integration_duration_s = (
+                self.trace_samples.value() / QCS_M5200_SAMPLE_RATE_HZ
+            )
+        with QtCore.QSignalBlocker(self.qcs_integration_duration_us):
+            self.qcs_integration_duration_us.setValue(
+                float(raw_qcs_integration_duration_s) * 1.0e6
+            )
+        self._qcs_integration_requested_us = (
+            self.qcs_integration_duration_us.value()
+        )
+        self._commit_qcs_integration_duration()
         self.settle_time_us.setValue(
             float(settings.get("settle_time_us", DEFAULT_STABILITY_SETTLE_US))
         )
@@ -4411,6 +4708,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             editor.setEnabled(not running)
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
+        self.qcs_integration_duration_us.setEnabled(not running)
         self.settle_time_us.setEnabled(not running)
         self.override_fpga_trigger_delay.setEnabled(
             not running and self._fir_uses_fpga_trigger_delay is not False
@@ -4520,9 +4818,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.point_count.setText(
             f"{self.x_axis.points.value() * self.y_axis.points.value():,}"
         )
+        if hasattr(self, "qcs_point_timing_note"):
+            self._update_qcs_point_timing_note()
 
 
 __all__ = [
+    "DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S",
     "DEFAULT_STABILITY_BIAS_T_COMPENSATION_MV",
     "DEFAULT_STABILITY_COLOR_RANGES",
     "DEFAULT_STABILITY_VISIBLE_DATA",

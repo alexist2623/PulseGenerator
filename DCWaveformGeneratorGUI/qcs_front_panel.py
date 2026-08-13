@@ -2385,9 +2385,9 @@ class QcsM5201RouteDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         note = QtWidgets.QLabel(
-            "Declare the physical cable from an M5201A RF/IF pair to an "
-            "M5200A digitizer SMA. This explicit route and the shared M5201A "
-            "LO are written to the QCS mapper automatically."
+            "Choose the M5201A RF/IF pair, then click the connected M5200A "
+            "SMA in the front-panel picture. This physical route and the "
+            "shared M5201A LO are written to the QCS mapper automatically."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -2398,6 +2398,9 @@ class QcsM5201RouteDialog(QtWidgets.QDialog):
         for pair in range(1, 5):
             self.pair_combo.addItem(f"RF/IF pair {pair}", pair)
         self.digitizer_combo = QtWidgets.QComboBox()
+        self.digitizer_combo.setToolTip(
+            "This value follows the M5200A SMA clicked in the front panel"
+        )
         self.lo_frequency_ghz = QtWidgets.QDoubleSpinBox()
         self.lo_frequency_ghz.setRange(0.0, 18.0)
         self.lo_frequency_ghz.setDecimals(9)
@@ -2513,7 +2516,8 @@ class QcsM5201RouteDialog(QtWidgets.QDialog):
         self.lo_frequency_ghz.setValue(self._module_lo_ghz)
         if link is None:
             self.route_note.setText(
-                f"M5201A pair {pair} has no declared physical cable."
+                f"M5201A pair {pair} has no declared physical cable. Click "
+                "the connected M5200A SMA in the chassis picture."
             )
         else:
             self.route_note.setText(
@@ -2521,6 +2525,40 @@ class QcsM5201RouteDialog(QtWidgets.QDialog):
                 f"{int(link['digitizer_slot'])} CH"
                 f"{int(link['digitizer_channel'])}."
             )
+
+    def select_digitizer_address(self, slot: int, channel: int) -> bool:
+        """Select an M5200A endpoint from a chassis-picture click."""
+
+        address = int(slot), int(channel)
+        index = self._combo_index_for_address(
+            self.digitizer_combo,
+            address,
+        )
+        if index < 0:
+            return False
+        self.digitizer_combo.setCurrentIndex(index)
+        pair = int(self.pair_combo.currentData() or 1)
+        self.route_note.setText(
+            f"Selected cable: M5201A pair {pair} -> M5200A slot "
+            f"{address[0]} CH{address[1]}."
+        )
+        return True
+
+    def selected_route(self) -> Optional[tuple[int, int, int, int, float]]:
+        """Return the currently selected route, or ``None`` if incomplete."""
+
+        raw_address = self.digitizer_combo.currentData()
+        lo_ghz = float(self.lo_frequency_ghz.value())
+        if raw_address is None or not 1.0 <= lo_ghz <= 18.0:
+            return None
+        digitizer_slot, digitizer_channel = tuple(raw_address)
+        return (
+            int(self._downconverter_slot),
+            int(self.pair_combo.currentData() or 1),
+            int(digitizer_slot),
+            int(digitizer_channel),
+            lo_ghz * 1.0e9,
+        )
 
     def _submit(self) -> None:
         raw_address = self.digitizer_combo.currentData()
@@ -2555,6 +2593,8 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
 
     identify_requested = QtCore.pyqtSignal(str)
     connector_selected = QtCore.pyqtSignal(str, int, int, int, bool)
+    m5201_route_selection_started = QtCore.pyqtSignal()
+    m5201_route_selection_finished = QtCore.pyqtSignal()
     m5300_lo_frequency_changed = QtCore.pyqtSignal(
         str,
         int,
@@ -2582,6 +2622,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._editing_enabled = True
         self._identifying_hardware = False
         self._syncing_downconverter_lo = False
+        self._pending_m5201_route: Optional[tuple[int, int]] = None
         self._focused_mapping: Optional[tuple[str, int]] = None
         # RF-path previews such as Stability and S-Parameter select either
         # endpoint from one full chassis view. Other callers retain a strict
@@ -2663,6 +2704,12 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._m5201_route_dialog = QcsM5201RouteDialog(self)
         self._m5201_route_dialog.save_requested.connect(
             self._commit_m5201_route_dialog
+        )
+        self._m5201_route_dialog.pair_combo.currentIndexChanged.connect(
+            self._on_m5201_route_pair_changed
+        )
+        self._m5201_route_dialog.finished.connect(
+            self._on_m5201_route_dialog_finished
         )
 
         self.validate_button.clicked.connect(self.validate_settings)
@@ -3036,6 +3083,46 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         route_dialog = getattr(self, "_m5201_route_dialog", None)
         if route_dialog is not None and route_dialog.isVisible():
             route_dialog.reject()
+        elif self._pending_m5201_route is not None:
+            self._on_m5201_route_dialog_finished(
+                QtWidgets.QDialog.Rejected
+            )
+
+    def _on_m5201_route_pair_changed(self, *_args) -> None:
+        """Keep the selected M5201A pair highlighted while routing."""
+
+        if self._pending_m5201_route is None:
+            return
+        slot = int(self._pending_m5201_route[0])
+        pair = int(self._m5201_route_dialog.pair_combo.currentData() or 1)
+        self._pending_m5201_route = slot, pair
+        self._preview_refresh_timer.stop()
+        self._refresh_reference_preview()
+
+    def _on_m5201_route_dialog_finished(self, _result: int) -> None:
+        """Leave temporary cable-selection mode without changing focus."""
+
+        if self._pending_m5201_route is None:
+            return
+        self._pending_m5201_route = None
+        self.m5201_route_selection_finished.emit()
+
+    def m5201_route_selection_active(self) -> bool:
+        """Return whether the next M5200A SMA click completes a route."""
+
+        return self._pending_m5201_route is not None
+
+    def complete_m5201_route_selection(self) -> None:
+        """Close a route picker after its native mapper commit succeeds."""
+
+        if self._pending_m5201_route is None:
+            return
+        if self._m5201_route_dialog.isVisible():
+            self._m5201_route_dialog.accept()
+        else:
+            self._on_m5201_route_dialog_finished(
+                QtWidgets.QDialog.Accepted
+            )
 
     def hideEvent(self, event) -> None:
         advanced_dialog = getattr(self, "_advanced_hardware_dialog", None)
@@ -3352,10 +3439,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     ) -> bool:
         """Open the graphical M5201 cable/LO editor for acquisition."""
 
-        if (
-            not self.tabs.isEnabled()
-            or self._focused_mapping != ("acquisition", 0)
-        ):
+        if not self.tabs.isEnabled():
             return False
         downconverter_slot = _positive_integer(
             downconverter_slot,
@@ -3393,7 +3477,23 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 error=True,
             )
             return False
-        current_address = self._focused_mapping_address(configuration)
+        current_mapping = next(
+            (
+                mapping
+                for mapping in configuration["channel_mappings"]
+                if str(mapping["role"]) == "acquisition"
+                and int(mapping["logical_index"]) == 0
+            ),
+            None,
+        )
+        current_address = (
+            None
+            if current_mapping is None
+            else (
+                int(current_mapping["slot"]),
+                int(current_mapping["channel"]),
+            )
+        )
         mappings_by_address = {
             (int(mapping["slot"]), int(mapping["channel"])): mapping
             for mapping in configuration["channel_mappings"]
@@ -3465,6 +3565,13 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             current_acquisition_address=current_address,
             links=links,
         )
+        self._pending_m5201_route = (
+            downconverter_slot,
+            int(downconverter_pair),
+        )
+        self.m5201_route_selection_started.emit()
+        self._preview_refresh_timer.stop()
+        self._refresh_reference_preview()
         self._m5201_route_dialog.show()
         self._m5201_route_dialog.raise_()
         self._m5201_route_dialog.activateWindow()
@@ -3487,6 +3594,53 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         )
         if configured and self._m5201_route_is_applied():
             self._m5201_route_dialog.accept()
+
+    def _select_pending_m5201_digitizer(
+        self,
+        slot: int,
+        channel: int,
+    ) -> bool:
+        """Complete the active cable gesture from an M5200A SMA click."""
+
+        if self._pending_m5201_route is None:
+            return False
+        if not self._m5201_route_dialog.select_digitizer_address(
+            slot,
+            channel,
+        ):
+            self._set_status(
+                f"M5200A slot {int(slot)} CH{int(channel)} is not available "
+                "for this M5201A route.",
+                error=True,
+            )
+            return True
+        route = self._m5201_route_dialog.selected_route()
+        if route is None:
+            self._set_status(
+                f"Selected M5200A slot {int(slot)} CH{int(channel)}. Set the "
+                "shared M5201A LO between 1 and 18 GHz, then click Apply "
+                "Route Automatically.",
+                error=False,
+            )
+            self._m5201_route_dialog.show()
+            self._m5201_route_dialog.raise_()
+            self._m5201_route_dialog.activateWindow()
+            return True
+        (
+            downconverter_slot,
+            downconverter_pair,
+            digitizer_slot,
+            digitizer_channel,
+            lo_frequency_hz,
+        ) = route
+        self.configure_m5201_route(
+            downconverter_slot=downconverter_slot,
+            downconverter_pair=downconverter_pair,
+            digitizer_slot=digitizer_slot,
+            digitizer_channel=digitizer_channel,
+            lo_frequency_hz=lo_frequency_hz,
+        )
+        return True
 
     def _m5201_route_is_applied(self) -> bool:
         """Return whether the synchronous auto-apply committed this draft."""
@@ -3689,10 +3843,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
     ) -> bool:
         """Atomically declare a physical M5201-to-M5200 acquisition route."""
 
-        if (
-            not self.tabs.isEnabled()
-            or self._focused_mapping != ("acquisition", 0)
-        ):
+        if not self.tabs.isEnabled():
             return False
         downconverter_slot = _positive_integer(
             downconverter_slot,
@@ -3984,85 +4135,73 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                         )
                         return True
                     return super().eventFilter(watched, event)
-                if self._focused_mapping is not None:
-                    configuration = (
-                        self._preview_configuration_from_widgets()
+                configuration = self._preview_configuration_from_widgets()
+                if configuration is None:
+                    return super().eventFilter(watched, event)
+
+                # M5201A routing is a chassis-level gesture, independent of
+                # which experiment channel opened this shared front panel.
+                # Selecting either connector of a pair arms the next M5200A
+                # SMA click while preserving the original DC/RF focus.
+                downconverter = qcs_chassis_connector_at_point(
+                    configuration,
+                    source_x,
+                    source_y,
+                    role="downconverter",
+                )
+                if downconverter is not None:
+                    self.show_m5201_route_dialog(
+                        int(downconverter["slot"]),
+                        int(downconverter["channel"]),
                     )
-                    if configuration is not None:
-                        role, _logical_index = self._focused_mapping
-                        if (
-                            role == "acquisition"
-                            or self._rf_acquisition_path_focus is not None
-                        ):
-                            downconverter = (
-                                qcs_chassis_connector_at_point(
-                                    configuration,
-                                    source_x,
-                                    source_y,
-                                    role="downconverter",
-                                )
-                            )
-                            if downconverter is not None:
-                                if self._rf_acquisition_path_focus is not None:
-                                    self._focused_mapping = (
-                                        "acquisition",
-                                        dict(
-                                            self._rf_acquisition_path_focus
-                                        )["acquisition"],
-                                    )
-                                self.show_m5201_route_dialog(
-                                    int(downconverter["slot"]),
-                                    int(downconverter["channel"]),
-                                )
-                                return True
-                        connector = qcs_chassis_connector_at_point(
-                            configuration,
-                            source_x,
-                            source_y,
+                    return True
+                if self._pending_m5201_route is not None:
+                    digitizer = qcs_chassis_connector_at_point(
+                        configuration,
+                        source_x,
+                        source_y,
+                        role="acquisition",
+                    )
+                    if digitizer is not None:
+                        return self._select_pending_m5201_digitizer(
+                            int(digitizer["slot"]),
+                            int(digitizer["channel"]),
                         )
-                        if connector is not None:
-                            compatible_connector = (
-                                qcs_chassis_connector_at_point(
-                                    configuration,
-                                    source_x,
-                                    source_y,
-                                    role=role,
-                                )
+                if self._focused_mapping is not None:
+                    role, _logical_index = self._focused_mapping
+                    connector = qcs_chassis_connector_at_point(
+                        configuration,
+                        source_x,
+                        source_y,
+                    )
+                    if connector is not None:
+                        compatible_connector = (
+                            qcs_chassis_connector_at_point(
+                                configuration,
+                                source_x,
+                                source_y,
+                                role=role,
                             )
-                            if compatible_connector is None:
-                                self.select_connector(
-                                    int(connector["slot"]),
-                                    int(connector["channel"]),
-                                )
-                            else:
-                                self.select_connector(
-                                    int(
-                                        compatible_connector["slot"]
-                                    ),
-                                    int(
-                                        compatible_connector["channel"]
-                                    ),
-                                )
-                            return True
+                        )
+                        if compatible_connector is None:
+                            self.select_connector(
+                                int(connector["slot"]),
+                                int(connector["channel"]),
+                            )
+                        else:
+                            self.select_connector(
+                                int(compatible_connector["slot"]),
+                                int(compatible_connector["channel"]),
+                            )
+                        return True
                 slot = qcs_chassis_slot_at_point(source_x, source_y)
                 if slot is not None:
-                    if (
-                        self._focused_mapping == ("acquisition", 0)
-                        or self._rf_acquisition_path_focus is not None
-                    ):
-                        module_slot, module_model = (
-                            self._module_covering_slot(slot)
-                        )
-                        if module_model == "M5201A":
-                            if self._rf_acquisition_path_focus is not None:
-                                self._focused_mapping = (
-                                    "acquisition",
-                                    dict(
-                                        self._rf_acquisition_path_focus
-                                    )["acquisition"],
-                                )
-                            self.show_m5201_route_dialog(module_slot)
-                            return True
+                    module_slot, module_model = self._module_covering_slot(
+                        slot
+                    )
+                    if module_model == "M5201A":
+                        self.show_m5201_route_dialog(module_slot)
+                        return True
                     self._show_module_menu_for_slot(
                         slot,
                         event.globalPos(),
@@ -4156,7 +4295,13 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
 
         if self._rf_acquisition_path_focus is None:
             address = self._focused_mapping_address(configuration)
-            return () if address is None else (address,)
+            addresses = [] if address is None else [address]
+            if (
+                self._pending_m5201_route is not None
+                and self._pending_m5201_route not in addresses
+            ):
+                addresses.append(self._pending_m5201_route)
+            return tuple(addresses)
 
         addresses = []
         mappings = configuration.get("channel_mappings", ())
@@ -4176,6 +4321,11 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             address = int(mapping["slot"]), int(mapping["channel"])
             if address not in addresses:
                 addresses.append(address)
+        if (
+            self._pending_m5201_route is not None
+            and self._pending_m5201_route not in addresses
+        ):
+            addresses.append(self._pending_m5201_route)
         return tuple(addresses)
 
     def _focused_mapping_row(self) -> Optional[int]:

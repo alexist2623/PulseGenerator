@@ -219,37 +219,47 @@ except ImportError:
 
 try:
     from .qcs_qcodes_experiment import (
+        DEFAULT_QCS_INIT_TIME_S,
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
+        QCS_STABILITY_DC_EDGE_PADDING_S,
+        QCS_STABILITY_DC_RAMP_S,
         QcsAcquisitionConfig,
         QcsCancellationController,
         QcsConnectionConfig,
         QcsExperimentCancelled,
         QcsM5301CapacityReport,
+        QcsNoiseTraceConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
+        quantize_qcs_inter_iteration_delay,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
     )
 except ImportError:
     from qcs_qcodes_experiment import (
+        DEFAULT_QCS_INIT_TIME_S,
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
+        QCS_STABILITY_DC_EDGE_PADDING_S,
+        QCS_STABILITY_DC_RAMP_S,
         QcsAcquisitionConfig,
         QcsCancellationController,
         QcsConnectionConfig,
         QcsExperimentCancelled,
         QcsM5301CapacityReport,
+        QcsNoiseTraceConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
+        quantize_qcs_inter_iteration_delay,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
     )
@@ -321,6 +331,7 @@ try:
     from .noise_analysis import (
         NoiseAcquisitionWorker,
         NoiseAnalysisPanel,
+        QcsNoiseAcquisitionWorker,
         NoiseTraceLoadWorker,
         normalize_noise_analysis_settings,
     )
@@ -328,6 +339,7 @@ except ImportError:
     from noise_analysis import (
         NoiseAcquisitionWorker,
         NoiseAnalysisPanel,
+        QcsNoiseAcquisitionWorker,
         NoiseTraceLoadWorker,
         normalize_noise_analysis_settings,
     )
@@ -445,7 +457,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 38
+SETTINGS_VERSION = 39
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 EXECUTION_BACKEND_QICK = "qick"
@@ -456,7 +468,7 @@ DEFAULT_QICK_HOST = "192.168.2.99"
 DEFAULT_QICK_NS_PORT = 8888
 DEFAULT_QICK_PROXY_NAME = "myqick"
 DEFAULT_QCS_MAPPER_PATH = "qcs_channel_mapper.qcs"
-DEFAULT_QCS_INIT_TIME_US = 100.0
+DEFAULT_QCS_INIT_TIME_US = DEFAULT_QCS_INIT_TIME_S * 1.0e6
 DEFAULT_QCS_SAMPLE_RATE_HZ = QCS_M5200_SAMPLE_RATE_HZ
 DEFAULT_QCODES_DB_PATH = str(Path.home() / "qick_experiments.db")
 DEFAULT_POWER_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
@@ -6469,8 +6481,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.qcs_dc_full_scale_v.setSuffix(" V")
         self.qcs_dc_full_scale_v.setValue(DEFAULT_QCS_FULL_SCALE_V)
         self.qcs_dc_full_scale_v.setToolTip(
-            "Physical voltage represented by QCS DC amplitude +1.0. "
-            "Match this to the configured AWG output range."
+            "Effective M5301A connector voltage represented by QCS DC "
+            "amplitude +1.0. Enter the present AWG full scale here; a "
+            "successful M5301A / 1 Mohm-scope calibration updates this same "
+            "value using the fitted origin gain."
         )
         self.qcs_rf_channel_names = QtWidgets.QLineEdit()
         self.qcs_rf_channel_names.setPlaceholderText(
@@ -6534,8 +6548,20 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.qcs_init_time_us = QtWidgets.QDoubleSpinBox()
         self.qcs_init_time_us.setRange(0.0, 1.0e9)
         self.qcs_init_time_us.setDecimals(9)
+        self.qcs_init_time_us.setSingleStep(0.01)
+        self.qcs_init_time_us.setKeyboardTracking(False)
         self.qcs_init_time_us.setSuffix(" us")
         self.qcs_init_time_us.setValue(DEFAULT_QCS_INIT_TIME_US)
+        self.qcs_init_time_us.setToolTip(
+            "Delay from the end of one QCS program iteration to the start "
+            "of the next. This is not connection or compilation time. The "
+            "70 ns default follows QTTVideoMode/QCSVideoProcessor.py; larger "
+            "values directly slow every hardware-sweep point. Values are "
+            "rounded upward to a 10 ns HCL/fabric-safe quantum."
+        )
+        self.qcs_init_time_us.editingFinished.connect(
+            self._commit_qcs_inter_iteration_delay
+        )
         self._qcs_blocking = True
         self._qcs_front_panel_draft_pending = False
         self._qcs_hardware_configuration = None
@@ -6563,7 +6589,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             "Acquisition virtual channel:",
             self.qcs_acquisition_channel_name,
         )
-        qcs_form.addRow("Backend initialization time:", self.qcs_init_time_us)
+        qcs_form.addRow(
+            "Inter-point / repetition delay:",
+            self.qcs_init_time_us,
+        )
 
         self.database_path = QtWidgets.QLineEdit(DEFAULT_QCODES_DB_PATH)
         browse_database = QtWidgets.QToolButton()
@@ -6706,8 +6735,9 @@ class ExperimentPanel(QtWidgets.QWidget):
             "The tested QCS 2.5.5 HCL backend accepts 98,304 rendered M5301 "
             "samples (40.960 us) per physical DC output and program. This is "
             "the QCS/HCL program budget, not the module's onboard-memory "
-            "specification. Ramps and nonzero holds consume capacity; "
-            "zero-voltage delays do not."
+            "specification. Ramps and independently rendered nonzero levels "
+            "consume capacity. A plateau directly following its ramp can use "
+            "QCS Hold; zero-voltage delays consume no waveform samples."
         )
         self.awg_metadata_mode = QtWidgets.QComboBox()
         self.awg_metadata_mode.addItem(
@@ -7648,7 +7678,20 @@ class ExperimentPanel(QtWidgets.QWidget):
             return QCS_HARDWARE_STATE_IMPORTED_DIRTY
         return QCS_HARDWARE_STATE_DRAFT
 
+    def _commit_qcs_inter_iteration_delay(self) -> float:
+        """Round the displayed delay to the exact value HCL will receive."""
+
+        effective_us = (
+            quantize_qcs_inter_iteration_delay(
+                self.qcs_init_time_us.value() * 1.0e-6
+            )
+            * 1.0e6
+        )
+        self.qcs_init_time_us.setValue(effective_us)
+        return effective_us
+
     def qcs_settings_dict(self) -> dict:
+        self._commit_qcs_inter_iteration_delay()
         strict = self.execution_backend() == EXECUTION_BACKEND_QCS
         acquisition_name = self.qcs_acquisition_channel_name.text().strip()
         raw_dc_names_text = self.qcs_dc_channel_names.text()
@@ -8221,6 +8264,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             float(settings.get("init_time_s", DEFAULT_QCS_INIT_TIME_US * 1.0e-6))
             * 1.0e6
         )
+        self._commit_qcs_inter_iteration_delay()
         self._qcs_blocking = bool(settings.get("blocking", True))
         self._qcs_hardware_configuration = normalized_hardware_configuration
         self._qcs_hardware_configuration_state = state
@@ -10400,6 +10444,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qcs_front_panel_editor_initialized = False
         self._qcs_front_panel_auto_apply_selection = None
         self._qcs_front_panel_keep_open_after_selection = False
+        self._qcs_m5201_route_context_active = False
+        self._qcs_m5201_route_previous_auto_selection = None
+        self._qcs_m5201_route_temporary_auto_selection = None
+        self._qcs_m5201_route_previous_keep_open = False
         self._preserve_qcs_front_panel_draft_on_output_count_change = False
         # Hardware discovery can remove mappings which no longer exist on the
         # installed chassis.  Such a topology is intentionally not runnable,
@@ -10486,6 +10534,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._experiment_panel.qcs_init_time_us.valueChanged.connect(
             lambda _value: self._refresh_qcs_waveform_capacity()
+        )
+        self._experiment_panel.qcs_init_time_us.valueChanged.connect(
+            self._stability_panel.set_qcs_init_time_us
+        )
+        self._stability_panel.set_qcs_init_time_us(
+            self._experiment_panel.qcs_init_time_us.value()
         )
         self._experiment_panel.qcs_mapper_path.textChanged.connect(
             lambda _text: self._refresh_qcs_waveform_capacity()
@@ -10599,6 +10653,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.dc_voltage_requested.connect(
             lambda: self._run_power_calibration("dc_voltage")
         )
+        self._calibration_panel.qcs_dc_output_requested.connect(
+            lambda: self._run_power_calibration("qcs_dc_output")
+        )
+        self._calibration_panel.qcs_rf_output_requested.connect(
+            lambda: self._run_power_calibration("qcs_rf_output")
+        )
         self._calibration_panel.front_panel_requested.connect(
             lambda target: self._show_active_front_panel("path", target)
         )
@@ -10621,6 +10681,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._qcs_front_panel.connector_selected.connect(
             self._on_qcs_front_panel_connector_selected
+        )
+        self._qcs_front_panel.m5201_route_selection_started.connect(
+            self._on_qcs_m5201_route_selection_started
+        )
+        self._qcs_front_panel.m5201_route_selection_finished.connect(
+            self._on_qcs_m5201_route_selection_finished
         )
         self._qcs_front_panel.m5300_lo_frequency_changed.connect(
             self._on_qcs_m5300_lo_frequency_changed
@@ -11363,9 +11429,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         ""
                         if is_qick
                         else (
-                            "The front panel shows the shared QCS hardware "
-                            "mapping, but measurement execution in this tab "
-                            "still uses the legacy QICK path."
+                            "QCS Noise Analysis records the mapped M5200 "
+                            "raw time trace for the requested measurement "
+                            "duration; it does not use an IntegrationFilter."
+                            if index == 4
+                            else (
+                                "The front panel shows the shared QCS hardware "
+                                "mapping, but measurement execution in this tab "
+                                "still uses the legacy QICK path."
+                            )
                         )
                     ),
                 )
@@ -11722,6 +11794,53 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 str(exc),
             )
 
+    def _on_qcs_m5201_route_selection_started(self) -> None:
+        """Temporarily accept the acquisition endpoint of a cable gesture."""
+
+        if not self._qcs_m5201_route_context_active:
+            self._qcs_m5201_route_previous_auto_selection = (
+                self._qcs_front_panel_auto_apply_selection
+            )
+            self._qcs_m5201_route_previous_keep_open = (
+                self._qcs_front_panel_keep_open_after_selection
+            )
+            self._qcs_m5201_route_context_active = True
+        automatic = self._qcs_front_panel_auto_apply_selection
+        acquisition = ("acquisition", 0)
+        if isinstance(automatic, frozenset):
+            self._qcs_front_panel_auto_apply_selection = (
+                automatic | {acquisition}
+            )
+        elif automatic is None or automatic == acquisition:
+            self._qcs_front_panel_auto_apply_selection = acquisition
+        else:
+            self._qcs_front_panel_auto_apply_selection = frozenset(
+                (automatic, acquisition)
+            )
+        self._qcs_m5201_route_temporary_auto_selection = (
+            self._qcs_front_panel_auto_apply_selection
+        )
+
+    def _on_qcs_m5201_route_selection_finished(self) -> None:
+        """Restore the channel-selection context that opened the chassis."""
+
+        if not self._qcs_m5201_route_context_active:
+            return
+        if (
+            self._qcs_front_panel_auto_apply_selection
+            == self._qcs_m5201_route_temporary_auto_selection
+        ):
+            self._qcs_front_panel_auto_apply_selection = (
+                self._qcs_m5201_route_previous_auto_selection
+            )
+            self._qcs_front_panel_keep_open_after_selection = (
+                self._qcs_m5201_route_previous_keep_open
+            )
+        self._qcs_m5201_route_context_active = False
+        self._qcs_m5201_route_previous_auto_selection = None
+        self._qcs_m5201_route_temporary_auto_selection = None
+        self._qcs_m5201_route_previous_keep_open = False
+
     def _on_qcs_m5300_lo_frequency_changed(
         self,
         role: str,
@@ -11886,7 +12005,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._experiment_panel.set_qcs_front_panel_draft_pending(
                     False
                 )
-                if not keep_open:
+                route_selection = (
+                    selection == ("acquisition", 0)
+                    and self._qcs_front_panel.m5201_route_selection_active()
+                )
+                route_from_other_focus = route_selection and (
+                    self._qcs_front_panel._focused_mapping != selection
+                )
+                if route_selection:
+                    self._qcs_front_panel.complete_m5201_route_selection()
+                if not keep_open and not route_from_other_focus:
                     self._qcs_front_panel_auto_apply_selection = None
                     self._qcs_front_panel_dialog.close()
                 self.statusBar().showMessage(
@@ -11944,6 +12072,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "selection_name": selection_name,
             "physical_name": physical_name,
             "keep_open": bool(keep_open),
+            "m5201_route_selection": (
+                selection == ("acquisition", 0)
+                and self._qcs_front_panel.m5201_route_selection_active()
+            ),
             "source_snapshot": (
                 self._current_qcs_front_panel_source_snapshot()
             ),
@@ -12197,6 +12329,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     self._experiment_panel.set_qcs_front_panel_draft_pending(
                         False
                     )
+                    if bool(request.get("m5201_route_selection")):
+                        self._qcs_front_panel.complete_m5201_route_selection()
                     if (
                         not bool(request["keep_open"])
                         and self._qcs_mapper_request_owns_dialog(request)
@@ -14568,6 +14702,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             / sample_rate_hz
         )
         settle_s = float(stability_config.settle_time_us) * 1.0e-6
+        # The M5301 needs a minimum direct ramp before Hold can retain a swept
+        # Scalar.  Put that ramp before the user-requested settle interval, and
+        # reserve a falling ramp plus explicit zero after the full-level guard.
+        # Thus "settle" continues to mean time spent at the requested voltage.
+        readout_delay_s = settle_s + QCS_STABILITY_DC_RAMP_S
         sequence = build_stability_hold_sequence(
             stability_config,
             output_names=self._qick_output_names(),
@@ -14575,6 +14714,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=qcs_full_scale_mv,
             cross_capacitance=self._cross_capacitance.copy(),
             sample_period_us=1.0e6 / sample_rate_hz,
+            target_edge_padding_us=(
+                QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
+            ),
         )
         rf_pulses = (
             QcsRfPulseConfig(
@@ -14590,7 +14732,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     * 1.0e6
                 ),
                 phase_rad=0.0,
-                delay_s=settle_s,
+                delay_s=readout_delay_s,
                 envelope="constant",
                 require_within_segment=False,
             ),
@@ -14598,7 +14740,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         acquisition = QcsAcquisitionConfig(
             at_segment=stability_config.x_axis.segment_name,
             duration_s=acquisition_duration_s,
-            pre_delay_s=settle_s,
+            pre_delay_s=readout_delay_s,
             sample_rate_hz=sample_rate_hz,
             sample_count=int(
                 stability_config.trace_samples_per_point
@@ -15200,24 +15342,62 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
-    def _run_noise_acquisition(self, config) -> None:
-        """Run the Noise tab's self-contained FIR-DDR acquisition."""
-        if not self._legacy_qick_workflow_available("Noise Analysis"):
-            return
+    def _run_noise_acquisition(self, request) -> None:
+        """Run one independent QICK FIR trace or QCS M5200 raw trace."""
+        backend = self._experiment_panel.execution_backend()
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
-                "QICK task running",
-                "Wait for the current QICK task to finish.",
+                "Hardware task running",
+                "Wait for the current hardware task to finish.",
             )
             return
+
+        if backend == EXECUTION_BACKEND_QCS:
+            try:
+                duration_s = float(request.duration_s)
+                connection = replace(
+                    self._experiment_panel.qcs_connection_values(
+                        len(self._pulse)
+                    ),
+                    # Noise Analysis always returns a time trace. QCS cannot
+                    # expose get_trace() from a hardware-demodulated backend.
+                    hw_demod=False,
+                    blocking=True,
+                )
+                config = QcsNoiseTraceConfig(
+                    connection_config=connection,
+                    duration_s=duration_s,
+                )
+            except (AttributeError, OSError, TypeError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Cannot acquire QCS noise trace",
+                    str(exc),
+                )
+                return
+            worker = QcsNoiseAcquisitionWorker(config)
+            starting_message = "Loading QCS mapper for M5200 raw trace..."
+        else:
+            config = getattr(request, "qick_config", request)
+            if config is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Cannot acquire QICK noise trace",
+                    "The QICK noise-acquisition settings are missing.",
+                )
+                return
+            worker = NoiseAcquisitionWorker(config)
+            starting_message = (
+                "Connecting for independent QICK FIR-DDR acquisition..."
+            )
+
         self._noise_panel.set_acquiring(
             True,
-            "Connecting for independent FIR-DDR acquisition...",
+            starting_message,
         )
         self.statusBar().showMessage("Starting independent noise acquisition")
         thread = QtCore.QThread(self)
-        worker = NoiseAcquisitionWorker(config)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress_changed.connect(
@@ -15252,16 +15432,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_noise.raise_()
         self.statusBar().showMessage(
             f"Noise acquisition completed: {collection.sample_count:,} "
-            "FIR samples analyzed"
+            "time-trace samples analyzed"
         )
 
     def _on_noise_acquisition_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown noise-acquisition error"
         self._noise_panel.show_acquisition_error(summary)
-        self.statusBar().showMessage("Noise FIR-DDR acquisition failed")
+        self.statusBar().showMessage("Noise trace acquisition failed")
         dialog = DetailedErrorMessageBox(
-            "Noise FIR-DDR acquisition failed",
+            "Noise trace acquisition failed",
             summary,
             details,
             self,
@@ -15321,28 +15501,59 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         dialog.exec_()
 
     def _run_power_calibration(self, mode: str) -> None:
-        if not self._legacy_qick_workflow_available("Calibration"):
+        is_qcs = (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        )
+        if is_qcs and mode not in {"qcs_rf_output", "qcs_dc_output"}:
+            return
+        if not is_qcs and mode in {"qcs_rf_output", "qcs_dc_output"}:
+            return
+        if not is_qcs and not self._legacy_qick_workflow_available(
+            "Calibration"
+        ):
             return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
-                "QICK task running",
-                "Wait for the current QICK task to finish.",
+                "Hardware task running",
+                "Wait for the current hardware task to finish.",
             )
             return
         try:
-            connection, _run = self._experiment_panel.connection_values(
-                database_path=self._calibration_panel.database_path_value()
-            )
-            calibration_config = (
-                self._calibration_panel.output_config()
-                if mode == "output"
-                else (
-                    self._calibration_panel.input_config()
-                    if mode == "input"
-                    else self._calibration_panel.dc_voltage_config()
+            if is_qcs:
+                connection = self._experiment_panel.qcs_connection_values(
+                    len(self._pulse)
                 )
-            )
+                if mode == "qcs_rf_output":
+                    calibration_config = (
+                        self._calibration_panel.qcs_rf_output_config(
+                            connection
+                        )
+                    )
+                else:
+                    calibration_config = (
+                        self._calibration_panel.qcs_dc_output_config(
+                            nominal_full_scale_v=(
+                                self._experiment_panel.qcs_dc_full_scale_v.value()
+                            )
+                        )
+                    )
+            else:
+                connection, _run = self._experiment_panel.connection_values(
+                    database_path=(
+                        self._calibration_panel.database_path_value()
+                    )
+                )
+                calibration_config = (
+                    self._calibration_panel.output_config()
+                    if mode == "output"
+                    else (
+                        self._calibration_panel.input_config()
+                        if mode == "input"
+                        else self._calibration_panel.dc_voltage_config()
+                    )
+                )
             if mode == "output" and not (
                 calibration_config.oscilloscope.visa_resource.strip()
             ):
@@ -15364,12 +15575,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "output": "oscilloscope output",
             "input": "FIR-DDR input",
             "dc_voltage": "0 MHz DC voltage",
+            "qcs_rf_output": "M5300A / M5200A RF power",
+            "qcs_dc_output": "M5301A / 1 Mohm scope DC output",
         }[mode]
         self._calibration_panel.set_running(
             True,
             f"0% - Preparing {label} calibration",
         )
-        self.statusBar().showMessage(f"QICK {label} calibration running")
+        system_name = "QCS" if is_qcs else "QICK"
+        self.statusBar().showMessage(
+            f"{system_name} {label} calibration running"
+        )
         thread = QtCore.QThread(self)
         worker = CalibrationWorker(mode, arguments)
         worker.moveToThread(thread)
@@ -15393,17 +15609,44 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_calibration_finished(self, stored) -> None:
         self._calibration_panel.show_result(stored)
+        calibration = getattr(stored, "calibration", None)
+        if calibration is not None and hasattr(
+            calibration,
+            "corrected_maximum_abs_voltage_v",
+        ):
+            corrected_maximum = float(
+                calibration.corrected_maximum_abs_voltage_v
+            )
+            self._experiment_panel.qcs_dc_full_scale_v.setValue(
+                corrected_maximum
+            )
+            self._refresh_qcs_waveform_capacity()
         self.statusBar().showMessage(
             f"Calibration Run {stored.run_id} saved to {stored.database_path}"
+            + (
+                f"; QCS DC full scale set to +/-{corrected_maximum:.9g} V"
+                if calibration is not None
+                and hasattr(
+                    calibration,
+                    "corrected_maximum_abs_voltage_v",
+                )
+                else ""
+            )
         )
 
     def _on_calibration_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown calibration error"
         self._calibration_panel.set_running(False, f"Failed: {summary}")
-        self.statusBar().showMessage("QICK calibration failed")
+        system_name = (
+            "QCS"
+            if self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+            else "QICK"
+        )
+        self.statusBar().showMessage(f"{system_name} calibration failed")
         dialog = DetailedErrorMessageBox(
-            "QICK calibration failed", summary, details, self
+            f"{system_name} calibration failed", summary, details, self
         )
         dialog.exec_()
 
@@ -15497,7 +15740,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         config = arguments["stability_config"]
         mode = "continuous" if continuous else "single shot"
         acquisition_summary = (
-            f"{config.trace_samples_per_point:,} QCS integration samples"
+            f"{config.trace_samples_per_point / QCS_M5200_SAMPLE_RATE_HZ * 1.0e6:.12g} "
+            "us QCS integration time"
             if backend == EXECUTION_BACKEND_QCS
             else (
                 f"{config.trace_samples_per_point:,} FIR samples / trace"
@@ -17577,6 +17821,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if qcs_init_time_s < 0.0:
             raise ValueError("QCS init_time_s must be nonnegative")
+        if settings_version < 39 and np.isclose(
+            qcs_init_time_s,
+            100.0e-6,
+            rtol=0.0,
+            atol=1.0e-15,
+        ):
+            # This was the old QCS library default, exposed under the
+            # misleading label "Backend initialization time". It is really
+            # paid between every sweep point/repetition, so migrate only that
+            # exact inherited value to the validated video-mode default.
+            qcs_init_time_s = DEFAULT_QCS_INIT_TIME_US * 1.0e-6
         qcs_sample_rate_hz = self._json_finite_float(
             qcs.get("sample_rate_hz", DEFAULT_QCS_SAMPLE_RATE_HZ),
             "QCS sample_rate_hz",
@@ -17947,8 +18202,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
             "calibration selected tab",
         )
-        if calibration_selected_tab > 2:
-            raise ValueError("calibration selected tab must be 0, 1, or 2")
+        if calibration_selected_tab > 4:
+            raise ValueError(
+                "calibration selected tab must be 0, 1, 2, 3, or 4"
+            )
         raw_input_calibration_plot = raw_calibration.get("input_plot", {})
         if not isinstance(raw_input_calibration_plot, dict):
             raise TypeError("calibration input_plot must be a JSON object")
@@ -17981,6 +18238,128 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raw_dc_application.get("run_id", 0),
             "DC voltage calibration application Run ID",
         )
+        raw_qcs_rf_calibration = raw_calibration.get("qcs_rf_output", {})
+        if not isinstance(raw_qcs_rf_calibration, dict):
+            raise TypeError(
+                "calibration qcs_rf_output must be a JSON object"
+            )
+        qcs_rf_calibration = {
+            **calibration_defaults["qcs_rf_output"],
+            **raw_qcs_rf_calibration,
+        }
+        for key in ("output_logical_index", "input_logical_index"):
+            qcs_rf_calibration[key] = self._json_int(
+                qcs_rf_calibration[key],
+                f"QCS RF calibration {key}",
+            )
+        for key in (
+            "frequency_points",
+            "amplitude_points",
+            "repetitions",
+        ):
+            qcs_rf_calibration[key] = self._json_int(
+                qcs_rf_calibration[key],
+                f"QCS RF calibration {key}",
+                minimum=2 if key != "repetitions" else 1,
+            )
+        for key in (
+            "frequency_start_mhz",
+            "frequency_end_mhz",
+            "amplitude_start",
+            "amplitude_end",
+            "integration_duration_us",
+            "reference_slope",
+            "reference_intercept_dbm",
+            "nominal_volts_per_iq_unit",
+            "path_loss_db",
+            "reference_uncertainty_db",
+        ):
+            qcs_rf_calibration[key] = self._json_finite_float(
+                qcs_rf_calibration[key],
+                f"QCS RF calibration {key}",
+            )
+        if not (
+            0.0 < qcs_rf_calibration["amplitude_start"]
+            <= qcs_rf_calibration["amplitude_end"]
+            <= 1.0
+        ):
+            raise ValueError(
+                "QCS RF calibration amplitudes must satisfy "
+                "0 < start <= stop <= 1"
+            )
+        if qcs_rf_calibration["integration_duration_us"] <= 0.0:
+            raise ValueError(
+                "QCS RF calibration integration_duration_us must be positive"
+            )
+        reference_mode = str(qcs_rf_calibration["reference_mode"])
+        if reference_mode not in {
+            "reference_calibrated",
+            "nominal_m5200_50ohm",
+        }:
+            raise ValueError(
+                "QCS RF calibration reference_mode is unsupported"
+            )
+        qcs_rf_calibration["reference_mode"] = reference_mode
+        qcs_rf_calibration["reference_source"] = str(
+            qcs_rf_calibration["reference_source"]
+        )
+        qcs_rf_calibration["acknowledge_nominal_scaling"] = (
+            self._json_bool(
+                qcs_rf_calibration["acknowledge_nominal_scaling"],
+                "QCS RF nominal-scaling acknowledgement",
+            )
+        )
+        raw_qcs_dc_calibration = raw_calibration.get("qcs_dc_output", {})
+        if not isinstance(raw_qcs_dc_calibration, dict):
+            raise TypeError(
+                "calibration qcs_dc_output must be a JSON object"
+            )
+        qcs_dc_defaults = calibration_defaults["qcs_dc_output"]
+        qcs_dc_calibration = {
+            **qcs_dc_defaults,
+            **raw_qcs_dc_calibration,
+        }
+        qcs_dc_calibration["logical_index"] = self._json_int(
+            qcs_dc_calibration["logical_index"],
+            "QCS DC calibration logical index",
+        )
+        for key in (
+            "voltage_start_v",
+            "voltage_stop_v",
+            "waveform_duration_us",
+            "minimum_r_squared",
+            "scope_settle_s",
+            "scope_interval_s",
+        ):
+            qcs_dc_calibration[key] = self._json_finite_float(
+                qcs_dc_calibration[key],
+                f"QCS DC calibration {key}",
+            )
+        qcs_dc_calibration["voltage_points"] = self._json_int(
+            qcs_dc_calibration["voltage_points"],
+            "QCS DC calibration voltage points",
+            minimum=3,
+        )
+        qcs_dc_calibration["scope_channel"] = self._json_int(
+            qcs_dc_calibration["scope_channel"],
+            "QCS DC calibration scope channel",
+            minimum=1,
+        )
+        qcs_dc_calibration["scope_averages"] = self._json_int(
+            qcs_dc_calibration["scope_averages"],
+            "QCS DC calibration scope averages",
+            minimum=1,
+        )
+        if qcs_dc_calibration["waveform_duration_us"] <= 0.0:
+            raise ValueError(
+                "QCS DC calibration waveform_duration_us must be positive"
+            )
+        if not 0.0 <= qcs_dc_calibration["minimum_r_squared"] <= 1.0:
+            raise ValueError(
+                "QCS DC calibration minimum_r_squared must be in [0, 1]"
+            )
+        for key in ("experiment_name", "sample_name", "scope_resource"):
+            qcs_dc_calibration[key] = str(qcs_dc_calibration[key])
         output_calibration_settings = asdict(output_calibration)
         input_calibration_settings = asdict(input_calibration)
         dc_voltage_calibration_settings = asdict(dc_voltage_calibration)
@@ -17999,6 +18378,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "database_path": dc_application_database_path,
                 "run_id": dc_application_run_id,
             },
+            "qcs_rf_output": qcs_rf_calibration,
+            "qcs_dc_output": qcs_dc_calibration,
             "input_plot": input_calibration_plot,
         }
 
