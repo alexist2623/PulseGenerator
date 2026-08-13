@@ -37,6 +37,10 @@ try:
     from .power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from .hardware_front_panel import HardwareFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
+    from .qcs_qcodes_experiment import (
+        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        run_qcs_sparameter_sweep,
+    )
 except ImportError:
     from qick_sparameter_sweep import (
         FILTER_TYPES,
@@ -50,6 +54,10 @@ except ImportError:
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from hardware_front_panel import HardwareFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
+    from qcs_qcodes_experiment import (
+        QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
+        run_qcs_sparameter_sweep,
+    )
 
 
 DEFAULT_SPARAMETER_DB_PATH = str(Path.home() / "qick_sparameter_experiments.db")
@@ -967,9 +975,11 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._running = False
         outer = QtWidgets.QVBoxLayout(self)
         self.backend_warning = QtWidgets.QLabel(
-            "QCS front-panel mapping is available, but RF S-parameter "
-            "execution is not implemented for QCS yet. Run is disabled while "
-            "QCS is selected.",
+            "QCS runs one submitted frequency-sweep Program and one "
+            "Executor call. The same frequency scalar drives the M5300 "
+            "waveform and M5200 integration filter; QCS 2.5.5 resolves the "
+            "frequencies in software because the M5200 filter frequency "
+            "cannot change in hardware time.",
             self,
         )
         self.backend_warning.setWordWrap(True)
@@ -1026,19 +1036,32 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.gain.setRange(0, MAX_RF_OUTPUT_GAIN)
         self.gain.setValue(20000)
         self.gain.setSuffix(f" / {MAX_RF_OUTPUT_GAIN}")
+        self.qcs_amplitude = QtWidgets.QDoubleSpinBox()
+        self.qcs_amplitude.setRange(-1.0, 1.0)
+        self.qcs_amplitude.setDecimals(9)
+        self.qcs_amplitude.setSingleStep(0.001)
+        self.qcs_amplitude.setValue(0.005)
+        self.qcs_amplitude.setToolTip(
+            "M5300 RF waveform amplitude relative to the configured output "
+            "range"
+        )
         self.output_power_dbm = self._power_spin(-20.0)
         self.scan_time_us = QtWidgets.QDoubleSpinBox()
         self.scan_time_us.setRange(0.001, 1.0e6)
         self.scan_time_us.setDecimals(6)
-        self.scan_time_us.setValue(10.0)
+        self.scan_time_us.setValue(1.0)
         self.scan_time_us.setSuffix(" us")
         sweep_form.addRow("Start frequency:", self.frequency_start_mhz)
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
         sweep_form.addRow("Single output gain:", self.gain)
+        sweep_form.addRow("QCS relative amplitude:", self.qcs_amplitude)
         sweep_form.addRow("Single target power:", self.output_power_dbm)
         sweep_form.addRow("Scan time per point:", self.scan_time_us)
         self.gain_label = sweep_form.labelForField(self.gain)
+        self.qcs_amplitude_label = sweep_form.labelForField(
+            self.qcs_amplitude
+        )
         self.output_power_label = sweep_form.labelForField(
             self.output_power_dbm
         )
@@ -1479,6 +1502,25 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._hardware_backend = str(backend).strip().lower()
         self.path_diagram.set_hardware_backend(backend)
         is_qcs = self._hardware_backend == "qcs"
+        if is_qcs:
+            # Six displayed decimals must never round above the measured
+            # 32,768-sample one-filter limit.
+            qcs_max_us = float(
+                np.floor(
+                    QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S
+                    * 1.0e12
+                )
+                / 1.0e6
+            )
+            self.scan_time_us.setMaximum(qcs_max_us)
+            self.scan_time_us.setToolTip(
+                "One flat M5200 IntegrationFilter per frequency. QCS 2.5.5 "
+                f"hardware-tested maximum: {qcs_max_us:g} us "
+                "(32,768 samples)."
+            )
+        else:
+            self.scan_time_us.setMaximum(1.0e6)
+            self.scan_time_us.setToolTip("")
         self.backend_warning.setVisible(is_qcs)
         self.path_hint.setText(
             (
@@ -1498,6 +1540,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         ):
             label.setVisible(not is_qcs)
             field.setVisible(not is_qcs)
+        self.qcs_amplitude_label.setVisible(is_qcs)
+        self.qcs_amplitude.setVisible(is_qcs)
         self.scan_time_label.setText(
             "Requested integration duration:"
             if is_qcs
@@ -1507,7 +1551,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.power_sweep_enabled.setVisible(not is_qcs)
         self.fir_ddr_capture_group.setVisible(not is_qcs)
         self._update_fpga_trigger_delay_controls()
-        self.run_button.setEnabled(not self._running and not is_qcs)
+        self.run_button.setEnabled(not self._running)
 
     def set_qcs_front_panel_configuration(
         self,
@@ -1634,17 +1678,22 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def settings_dict(self) -> Mapping[str, Any]:
         return {
             "database_path": self.database_path_value(),
+            "qcs_amplitude": self.qcs_amplitude.value(),
             **asdict(self.config()),
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         values = dict(settings)
+        qcs_amplitude = float(values.pop("qcs_amplitude", 0.005))
+        if not np.isfinite(qcs_amplitude) or not -1.0 <= qcs_amplitude <= 1.0:
+            raise ValueError("QCS S-parameter amplitude must be in [-1, 1]")
         database_path = str(
             values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
         ).strip()
         if not database_path:
             raise ValueError("RF S-parameter database path must not be empty")
         config = SParameterSweepConfig(**values)
+        self.qcs_amplitude.setValue(qcs_amplitude)
         widgets = (
             (self.output_ch, config.output_ch),
             (self.readout_ch, config.readout_ch),
@@ -1734,7 +1783,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     def set_running(self, running: bool, message: str) -> None:
         self._running = bool(running)
         self.run_button.setEnabled(
-            not running and self._hardware_backend == "qick"
+            not running
         )
         self.load_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
@@ -1766,6 +1815,34 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         result = stored.result
         self.run_id.setValue(stored.run_id)
         power_count = int(getattr(result, "power_count", 1))
+        rf_settings = getattr(stored, "rf_settings", None)
+        is_qcs = bool(
+            isinstance(rf_settings, Mapping)
+            and str(rf_settings.get("backend", "")).strip().lower() == "qcs"
+        )
+        if is_qcs:
+            readout = rf_settings.get("readout", {})
+            integration_duration_s = (
+                float(readout.get("integration_duration_s", 0.0))
+                if isinstance(readout, Mapping)
+                else 0.0
+            )
+            integration_text = (
+                f", {integration_duration_s * 1.0e6:g} us integration"
+                if integration_duration_s > 0.0
+                else ""
+            )
+            self.set_running(
+                False,
+                (
+                    f"Run {stored.run_id}: "
+                    f"{result.frequencies_mhz.size} frequency points, "
+                    f"{result.sample_count} integrated I/Q shot(s) per point"
+                    f"{integration_text}\n"
+                    f"{stored.database_path}"
+                ),
+            )
+            return
         sample_rate_hz = float(
             getattr(result, "sample_rate_hz", 1_000_000.0)
         )
@@ -2617,6 +2694,29 @@ class SParameterSweepWorker(QtCore.QObject):
         self.finished.emit(stored)
 
 
+class QcsSParameterSweepWorker(QtCore.QObject):
+    """Run one QCS-resolved RF frequency sweep off the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    progress_changed = QtCore.pyqtSignal(int, str)
+
+    def __init__(self, kwargs: Mapping[str, Any], parent=None):
+        super().__init__(parent)
+        self._kwargs = dict(kwargs)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            kwargs = dict(self._kwargs)
+            kwargs["progress_callback"] = self.progress_changed.emit
+            stored = run_qcs_sparameter_sweep(**kwargs)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(stored)
+
+
 class SParameterLoadWorker(QtCore.QObject):
     """Load a saved RF S-parameter run off the GUI thread."""
 
@@ -2640,6 +2740,7 @@ class SParameterLoadWorker(QtCore.QObject):
 
 __all__ = [
     "DEFAULT_SPARAMETER_DB_PATH",
+    "QcsSParameterSweepWorker",
     "SParameterLoadWorker",
     "SParameterPlotWidget",
     "SParameterSweepPanel",

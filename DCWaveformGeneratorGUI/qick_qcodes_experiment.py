@@ -45,6 +45,29 @@ COMPILE_VALIDATION_MODES = (
     COMPILE_VALIDATION_FULL,
 )
 DEFAULT_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_FULL
+IQ_REPETITION_POLICY_PRESERVE = "preserve"
+IQ_REPETITION_POLICY_COHERENT_AVERAGE = "coherent_average"
+IQ_REPETITION_POLICIES = (
+    IQ_REPETITION_POLICY_PRESERVE,
+    IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+)
+
+
+def normalize_iq_repetition_policy(value: Any) -> str:
+    """Validate how acquired repetitions are represented in QCoDeS.
+
+    ``coherent_average`` averages I and Q independently.  It is intentionally
+    restricted to integrated single-I/Q acquisitions so selecting it cannot
+    silently turn a sampled trace into a one-sample result.
+    """
+
+    policy = str(value).strip().lower()
+    if policy not in IQ_REPETITION_POLICIES:
+        raise ValueError(
+            "IQ repetition policy must be one of "
+            f"{IQ_REPETITION_POLICIES}; received {value!r}"
+        )
+    return policy
 
 try:
     from .dc_waveform_core import (
@@ -1512,6 +1535,7 @@ def store_qick_result(
     progress_start: int = 65,
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
+    iq_repetition_policy: str = IQ_REPETITION_POLICY_PRESERVE,
 ) -> Tuple[Any, int]:
     """Store one I/Q array pair per point/repetition for any backend."""
     try:
@@ -1534,6 +1558,21 @@ def store_qick_result(
     )
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError("DDR IQ must have shape (point, repetition, sample, 2)")
+    acquired_iq_shape = tuple(int(value) for value in iq.shape)
+    iq_repetition_policy = normalize_iq_repetition_policy(
+        iq_repetition_policy
+    )
+    if iq_repetition_policy == IQ_REPETITION_POLICY_COHERENT_AVERAGE:
+        if iq.shape[2] != 1:
+            raise ValueError(
+                "coherent-average IQ repetition storage requires exactly "
+                "one integrated I/Q value per repetition; trace acquisitions "
+                f"contain {iq.shape[2]:,} samples"
+            )
+        # Average the Cartesian I and Q components, not magnitude and phase.
+        # Keep singleton repetition/sample axes so the established QCoDeS
+        # layout and load_qick_iq_arrays() contract remain unchanged.
+        iq = iq.astype(np.float64, copy=False).mean(axis=1, keepdims=True)
     if isinstance(batch_rows, bool) or int(batch_rows) < 1:
         raise ValueError("batch_rows must be a positive integer")
     batch_rows = int(batch_rows)
@@ -1778,6 +1817,13 @@ def store_qick_result(
         "rf_settings_actual": rf_settings,
         "measurement_layout": {
             "iq_shape": list(iq.shape),
+            "acquired_iq_shape": list(acquired_iq_shape),
+            "stored_iq_shape": list(iq.shape),
+            "iq_repetition_policy": iq_repetition_policy,
+            "acquired_repetition_count": acquired_iq_shape[1],
+            "stored_repetition_count": repetition_count,
+            "acquired_iq_value_count": int(np.prod(acquired_iq_shape[:-1])),
+            "stored_iq_value_count": int(np.prod(iq.shape[:-1])),
             "iq_trace_parameters": {
                 "i": I_TRACE_PARAMETER,
                 "q": Q_TRACE_PARAMETER,
@@ -2026,6 +2072,7 @@ def store_experiment_result(
     progress_start: int = 65,
     progress_end: int = 99,
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
+    iq_repetition_policy: str = IQ_REPETITION_POLICY_PRESERVE,
 ) -> Tuple[Any, int]:
     """Backend-neutral entry point for persisting an acquisition result."""
     return store_qick_result(
@@ -2040,6 +2087,7 @@ def store_experiment_result(
         progress_start=progress_start,
         progress_end=progress_end,
         batch_rows=batch_rows,
+        iq_repetition_policy=iq_repetition_policy,
     )
 
 
@@ -2053,6 +2101,7 @@ def run_qick_qcodes_experiment(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     gui_settings: Mapping[str, Any],
+    iq_repetition_policy: str = IQ_REPETITION_POLICY_PRESERVE,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
@@ -2060,6 +2109,17 @@ def run_qick_qcodes_experiment(
     event_callback: Optional[ExperimentEventCallback] = None,
 ) -> StoredQickExperiment:
     """Connect, execute, acquire FIR DDR IQ, and commit one QCoDeS run."""
+    iq_repetition_policy = normalize_iq_repetition_policy(
+        iq_repetition_policy
+    )
+    if (
+        iq_repetition_policy == IQ_REPETITION_POLICY_COHERENT_AVERAGE
+        and int(readout_spec.samples_per_trigger) != 1
+    ):
+        raise ValueError(
+            "coherent-average IQ repetition storage requires a single-I/Q "
+            "acquisition with exactly one sample per repetition"
+        )
     _emit_progress(progress_callback, 0, "Starting QICK experiment")
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
     _emit_experiment_event(
@@ -2192,6 +2252,7 @@ def run_qick_qcodes_experiment(
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
         progress_callback=progress_callback,
+        iq_repetition_policy=iq_repetition_policy,
     )
     _emit_experiment_event(
         event_callback,
@@ -2224,6 +2285,9 @@ __all__ = [
     "DEFAULT_QCODES_BATCH_ROWS",
     "ExperimentEventCallback",
     "I_TRACE_PARAMETER",
+    "IQ_REPETITION_POLICIES",
+    "IQ_REPETITION_POLICY_COHERENT_AVERAGE",
+    "IQ_REPETITION_POLICY_PRESERVE",
     "IQ_TRACE_PARAMETER",
     "Q_TRACE_PARAMETER",
     "QCODES_STAGING_ENV",
@@ -2247,6 +2311,7 @@ __all__ = [
     "measurement_iq_values",
     "normalize_awg_metadata_mode",
     "normalize_compile_validation_mode",
+    "normalize_iq_repetition_policy",
     "run_qick_qcodes_experiment",
     "store_experiment_result",
     "store_qick_result",

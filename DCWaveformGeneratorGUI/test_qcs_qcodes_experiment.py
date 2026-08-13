@@ -240,6 +240,27 @@ def _two_output_swept_negative_plateau_sequence(*, levels=101):
     )
 
 
+def _two_output_bias_t_screenshot_sequence():
+    """Two-output waveform matching the reported 10/15/0.4/15/100 us rows."""
+
+    return (
+        FineTuneSequence(("awg_0", "awg_1"))
+        .add_set("set_0", [0.0, 0.0], 3_000)
+        .add_ramp("ramp_0", 4_500)
+        .add_set("set_1", [0.1875, -0.25], 120)
+        .add_ramp("ramp_1", 4_500)
+        .add_set("set_2", [0.125, 0.125], 30_000)
+        .add_amplitude_sweep(
+            "set_2", "awg_0", -0.375, 0.375, 3
+        )
+        .add_amplitude_sweep(
+            "set_2", "awg_1", -0.625, 0.625, 3
+        )
+        # 80 mV on the GUI's 800 mV source scale.
+        .set_bias_t_compensation(0.1, mode="fixed_voltage")
+    )
+
+
 def _connection(**changes):
     values = {
         "mapper_path": "unused.json",
@@ -805,6 +826,216 @@ def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
     # only the two 1,000-cycle ramps consume rendered waveform memory.
     assert optimized.worst_channel.rendered_fabric_cycles == 2_000
     assert optimized.worst_channel.rendered_samples == 16_000
+
+
+def test_two_output_bias_t_guard_and_tail_are_qcs_aligned_and_fit_capacity():
+    sequence = _two_output_bias_t_screenshot_sequence()
+
+    legacy_times, _legacy_waveforms, _legacy_boundaries = (
+        sequence.compensated_waveform_vertices(0)
+    )
+    assert 42_185 in np.asarray(legacy_times, dtype=int)
+
+    qcs_times, qcs_waveforms, boundaries, force_terminal = (
+        backend._qcs_synchronized_waveform_vertices(sequence, 0)
+    )
+    assert force_terminal is False
+    assert 42_185 not in np.asarray(qcs_times, dtype=int)
+    assert 42_186 in np.asarray(qcs_times, dtype=int)
+
+    boundary_map = {
+        name: (start, stop) for name, start, stop in boundaries
+    }
+    for preview in sequence.bias_t_compensation_preview(0):
+        start, stop = boundary_map[
+            f"bias_t_comp_{preview.output_name}"
+        ]
+        selected = (qcs_times >= start) & (qcs_times <= stop)
+        times = qcs_times[selected]
+        values = np.asarray(qcs_waveforms[preview.output_name])[selected]
+        qcs_area = float(
+            np.sum((values[:-1] + values[1:]) * np.diff(times) / 2.0)
+        )
+        assert qcs_area == pytest.approx(
+            preview.target_amplitude * preview.duration_cycles,
+            abs=1e-9,
+        )
+
+    for auto_fixed_offsets in (False, True):
+        report = backend.qcs_m5301_waveform_capacity_report(
+            sequence,
+            amplitude_scale=800.0 / 2_500.0,
+            auto_fixed_dc_offsets=auto_fixed_offsets,
+            source_full_scale_mv=800.0,
+            dc_full_scale_v=2.5,
+        )
+        assert report.exceeds_capacity is False
+        assert [
+            channel.rendered_fabric_cycles for channel in report.channels
+        ] == [9_004, 9_004]
+
+
+def test_two_output_fixed_voltage_bias_t_compiles_with_ramp_to_hold():
+    sequence = _two_output_bias_t_screenshot_sequence()
+    compiled = compile_qcs_point(
+        sequence,
+        0,
+        connection_config=_connection(
+            dc_channel_names=("dc_0", "dc_1"),
+        ),
+        mapper=_Mapper("dc_0", "dc_1", "digitizer"),
+        repetitions_per_sweep=1,
+        acquisition=_acquisition(at_segment="set_2"),
+        qcs_module=_FakeQcs,
+    )
+
+    for entry in compiled.program.waveforms:
+        operations = _program_waveform_operations(entry)
+        by_name = {
+            operation.kwargs.get("name"): operation
+            for operation in operations
+        }
+        assert by_name[
+            next(name for name in by_name if name.endswith("interval_5"))
+        ].kwargs["duration"] == pytest.approx(66 / 300e6)
+        compensation_ramp = next(
+            operation
+            for name, operation in by_name.items()
+            if name.endswith("interval_6")
+        )
+        assert type(compensation_ramp) is _Waveform
+        assert compensation_ramp.kwargs["duration"] == pytest.approx(
+            4 / 300e6
+        )
+        assert any(
+            isinstance(operation, _Hold)
+            and "interval_7_hold" in operation.kwargs.get("name", "")
+            for operation in operations
+        )
+        for operation in operations:
+            if type(operation) is _Waveform:
+                duration_cycles = round(
+                    operation.kwargs["duration"] * 300e6
+                )
+                assert duration_cycles >= 4
+                assert duration_cycles % 2 == 0
+
+
+def test_short_fixed_voltage_bias_t_tail_uses_legal_minimum_hold():
+    sequence = (
+        FineTuneSequence(("gate",))
+        .add_set("read", [0.1], 4)
+        .set_bias_t_compensation(0.1, mode="fixed_voltage")
+    )
+    (preview,) = sequence.bias_t_compensation_preview(0)
+    assert preview.duration_cycles == 4
+
+    qcs_times, qcs_waveforms, boundaries, _force_terminal = (
+        backend._qcs_synchronized_waveform_vertices(sequence, 0)
+    )
+    boundary_map = {
+        name: (start, stop) for name, start, stop in boundaries
+    }
+    start, stop = boundary_map["bias_t_comp_gate"]
+    assert stop - start == 8
+    selected = (qcs_times >= start) & (qcs_times <= stop)
+    times = qcs_times[selected]
+    values = np.asarray(qcs_waveforms["gate"])[selected]
+    qcs_area = float(
+        np.sum((values[:-1] + values[1:]) * np.diff(times) / 2.0)
+    )
+    assert qcs_area == pytest.approx(
+        preview.target_amplitude * preview.duration_cycles,
+        abs=1e-12,
+    )
+
+    compiled = compile_qcs_point(
+        sequence,
+        0,
+        connection_config=_connection(),
+        mapper=_Mapper("dc_gate", "digitizer"),
+        repetitions_per_sweep=1,
+        acquisition=_acquisition(
+            duration_s=1 / 300e6,
+            sample_count=16,
+        ),
+        qcs_module=_FakeQcs,
+    )
+    operations = _program_waveform_operations(compiled.program.waveforms[0])
+    generated_durations = [
+        round(operation.kwargs["duration"] * 300e6)
+        for operation in operations
+        if type(operation) in {_Waveform, _Hold}
+        and "interval" in operation.kwargs.get("name", "")
+    ]
+    assert generated_durations[-2:] == [4, 4]
+    assert all(duration >= 4 for duration in generated_durations)
+
+
+def test_fixed_voltage_bias_t_duration_sweep_capacity_matches_point_compile():
+    sequence = (
+        FineTuneSequence(("gate",))
+        .add_set("read", [0.1], 3_000)
+        .set_bias_t_compensation(0.01, mode="fixed_voltage")
+        .add_hold_duration_sweep("read", 10.0, 20.0, 2)
+    )
+
+    report = backend.qcs_m5301_waveform_capacity_report(sequence)
+    assert report.exceeds_capacity is False
+    # The longest user plateau consumes 6,000 cycles; the long Bias-T tail
+    # consumes only its four-cycle ramp seed because its plateau is a Hold.
+    assert report.worst_channel.rendered_fabric_cycles == 6_004
+
+    for point_index in range(sequence.sweep_point_count):
+        compiled = compile_qcs_point(
+            sequence,
+            point_index,
+            connection_config=_connection(),
+            mapper=_Mapper("dc_gate", "digitizer"),
+            repetitions_per_sweep=1,
+            acquisition=_acquisition(at_segment="read"),
+            qcs_module=_FakeQcs,
+        )
+        operations = _program_waveform_operations(
+            compiled.program.waveforms[0]
+        )
+        assert any(type(operation) is _Hold for operation in operations)
+
+
+def test_fixed_voltage_bias_t_sweep_uses_safe_fixed_numeric_points():
+    sequence = _two_output_bias_t_screenshot_sequence()
+    calls = []
+
+    class Executor:
+        def execute(self, program):
+            calls.append(program)
+            return np.asarray([1.0 + 2.0j])
+
+    result = execute_qcs_sequence(
+        connection_config=_connection(
+            dc_channel_names=("dc_0", "dc_1"),
+        ),
+        sequence=sequence,
+        repetitions_per_sweep=1,
+        source_full_scale_mv=800.0,
+        acquisition=_acquisition(at_segment="set_2"),
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_0", "dc_1", "digitizer"),
+        executor=Executor(),
+    )
+
+    assert len(calls) == 9
+    assert result.program_summary["hardware_sweep"] is False
+    assert result.program_summary["sweep_execution_mode"] == (
+        "software_fixed_numeric_dc_ramp"
+    )
+    assert result.program_summary["program_count"] == 9
+    assert result.program_summary["executor_call_count"] == 9
+    assert result.program_summary["dc_channel_offsets_v"] == [0.0, 0.0]
+    assert "Fixed-voltage Bias-T" in result.program_summary[
+        "software_sweep_reasons"
+    ][0]
+    assert result.ddr_result.iq.shape == (9, 1, 1, 2)
 
 
 def test_m5301_capacity_counts_only_nonzero_terminal_waveform():
@@ -1953,7 +2184,7 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
         .set_bias_t_compensation(
             0.1,
             mode="fixed_time",
-            fixed_duration_cycles=300,
+            fixed_duration_cycles=301,
         )
     )
 
@@ -1977,7 +2208,8 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
         _Waveform,
         _Delay,
     ]
-    assert operations[1].kwargs["duration"] == pytest.approx(33 / 300e6)
+    assert operations[1].kwargs["duration"] == pytest.approx(34 / 300e6)
+    assert operations[2].kwargs["duration"] == pytest.approx(302 / 300e6)
     assert operations[3].kwargs["duration"] == pytest.approx(4 / 300e6)
     arrays, variables = compiled.program.sweeps[0]
     by_name = {
@@ -1986,6 +2218,7 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
     }
     expected_compensation = [
         sequence.bias_t_compensation_preview(point_index)[0].target_amplitude
+        * (301.0 / 302.0)
         * (800.0 / 2500.0)
         for point_index in range(3)
     ]
@@ -1994,6 +2227,59 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
         expected_compensation,
         atol=1e-12,
     )
+
+
+def test_odd_fixed_time_bias_t_duration_preserves_compensation_area():
+    sequence = (
+        FineTuneSequence(("gate",))
+        .add_set("read", [0.1], 300)
+        .set_bias_t_compensation(
+            0.1,
+            mode="fixed_time",
+            fixed_duration_cycles=301,
+        )
+    )
+    preview = sequence.bias_t_compensation_preview(0)[0]
+    times, waveforms, boundaries, force_terminal = (
+        backend._qcs_synchronized_waveform_vertices(sequence, 0)
+    )
+    assert force_terminal is True
+    boundary_map = {
+        name: (start, stop) for name, start, stop in boundaries
+    }
+    start, stop = boundary_map["bias_t_comp_gate"]
+    assert stop - start == 302
+    selected = (times >= start) & (times <= stop)
+    values = np.asarray(waveforms["gate"])[selected]
+    selected_times = times[selected]
+    qcs_area = float(
+        np.sum(
+            (values[:-1] + values[1:])
+            * np.diff(selected_times)
+            / 2.0
+        )
+    )
+    assert qcs_area == pytest.approx(
+        preview.target_amplitude * 301,
+        abs=1e-12,
+    )
+
+    compiled = compile_qcs_point(
+        sequence,
+        0,
+        connection_config=_connection(),
+        mapper=_Mapper("dc_gate", "digitizer"),
+        repetitions_per_sweep=1,
+        acquisition=_acquisition(),
+        qcs_module=_FakeQcs,
+    )
+    for operation in _program_waveform_operations(
+        compiled.program.waveforms[0]
+    ):
+        if type(operation) is _Waveform:
+            duration_cycles = round(operation.kwargs["duration"] * 300e6)
+            assert duration_cycles >= 4
+            assert duration_cycles % 2 == 0
 
 
 @pytest.mark.parametrize(
@@ -2085,7 +2371,10 @@ def test_short_constant_zero_delay_compiles_but_short_waveform_does_not():
 
 
 def test_rf_frequency_sweep_uses_one_native_hardware_program():
-    sequence = _sequence().add_rf_frequency_sweep(
+    sequence = _sequence().set_bias_t_compensation(
+        0.1,
+        mode="fixed_voltage",
+    ).add_rf_frequency_sweep(
         "read", 3, 25.0, 75.0, 3
     )
     returned = np.asarray(
@@ -3217,6 +3506,7 @@ def test_run_qcs_qcodes_experiment_uses_qcs_storage(monkeypatch, tmp_path):
         run_config=run_config,
         sequence=_sequence(),
         repetitions_per_sweep=1,
+        iq_repetition_policy="coherent_average",
         source_full_scale_mv=1000.0,
         acquisition=_acquisition(),
     )
@@ -3224,8 +3514,31 @@ def test_run_qcs_qcodes_experiment_uses_qcs_storage(monkeypatch, tmp_path):
     assert stored.run_id == 17
     assert stored.programs == ("program",)
     assert captured["backend_name"] == "qcs"
+    assert captured["iq_repetition_policy"] == "coherent_average"
     assert captured["connection_config"] == _connection()
     assert captured["gui_settings"]["qick"]["full_scale_mv"] == 1000.0
+
+
+def test_qcs_run_rejects_coherent_average_trace_before_execution(
+    monkeypatch,
+    tmp_path,
+):
+    def unexpected_execute(**_kwargs):
+        raise AssertionError("QCS execution must not start for invalid storage")
+
+    monkeypatch.setattr(backend, "execute_qcs_sequence", unexpected_execute)
+    with pytest.raises(
+        ValueError,
+        match="requires QCS Single I/Q acquisition",
+    ):
+        backend.run_qcs_qcodes_experiment(
+            connection_config=_connection(hw_demod=False),
+            run_config=QcodesRunConfig(str(tmp_path / "unused.db")),
+            sequence=_sequence(),
+            repetitions_per_sweep=2,
+            iq_repetition_policy="coherent_average",
+            acquisition=_acquisition(),
+        )
 
 
 def test_full_qcs_adapter_writes_real_qcodes_database(monkeypatch, tmp_path):
@@ -3355,6 +3668,31 @@ def test_real_qcs_255_builds_program_offline():
     assert dc in layer_operations
     assert dc_second in layer_operations
     assert digitizer in layer_operations
+
+    bias_t_compiled = compile_qcs_point(
+        _two_output_bias_t_screenshot_sequence(),
+        0,
+        connection_config=_connection(
+            dc_channel_names=("dc_gate", "dc_second")
+        ),
+        mapper=mapper,
+        repetitions_per_sweep=1,
+        source_full_scale_mv=800.0,
+        acquisition=_acquisition(at_segment="set_2"),
+        qcs_module=qcs,
+    )
+    bias_t_operations = bias_t_compiled.program.layers[0].operations[dc]
+    assert any(isinstance(operation, qcs.Hold) for operation in bias_t_operations)
+    assert any(
+        isinstance(operation, qcs.Delay)
+        and operation.name.endswith("interval_5")
+        and operation.duration.value == pytest.approx(66 / 300e6)
+        for operation in bias_t_operations
+    )
+    rendered_bias_t_program, _layer_map = qcs.SequenceBuilder(
+        channel_map=mapper
+    ).build(bias_t_compiled.program)
+    assert len(rendered_bias_t_program.layers) == 1
 
 
 def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():

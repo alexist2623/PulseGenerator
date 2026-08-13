@@ -779,6 +779,7 @@ def generate_qcs_panel_png_assets(
 
 def _mapping_rows(
     draw: ImageDraw.ImageDraw,
+    modules: Sequence[Mapping[str, Any]],
     mappings: Sequence[Mapping[str, Any]],
     downconverter_links: Sequence[Mapping[str, Any]],
     *,
@@ -793,11 +794,23 @@ def _mapping_rows(
     gap = _scaled(10, scale)
     rows: list[list[tuple[str, str, int]]] = [[]]
     used_width = 0
+    modules_by_slot = {
+        int(module["slot"]): str(module["model"])
+        for module in modules
+    }
     for mapping in mappings:
         label = (
             f"S{int(mapping['slot']):02d} CH{int(mapping['channel'])} · "
             f"{mapping['virtual_name']} · {str(mapping['role']).upper()}"
         )
+        if modules_by_slot.get(int(mapping["slot"])) == "M5300A":
+            lo_frequency_hz = mapping.get("lo_frequency_hz")
+            lo_text = (
+                "LO unset"
+                if lo_frequency_hz is None
+                else f"LO {float(lo_frequency_hz) / 1.0e9:.6g} GHz"
+            )
+            label += f" · {lo_text}"
         chip_width = min(
             content_width,
             _text_width(draw, label, font) + horizontal_padding,
@@ -880,6 +893,7 @@ def render_qcs_chassis(
     sizing_draw = ImageDraw.Draw(sizing_image)
     mapping_rows = _mapping_rows(
         sizing_draw,
+        plan["modules"],
         plan["mappings"],
         plan["downconverter_links"],
         content_width=content_width,

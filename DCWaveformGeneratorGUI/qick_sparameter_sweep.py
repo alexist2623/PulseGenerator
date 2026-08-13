@@ -2405,9 +2405,14 @@ def store_sparameter_result(
         label="RF frequency",
         unit="MHz",
     )
+    is_qcs = str(program_summary.get("backend", "")).strip().lower() == "qcs"
     sample_index = Parameter(
         SAMPLE_INDEX_PARAMETER,
-        label="FIR sample index",
+        label=(
+            "Integrated I/Q shot index"
+            if is_qcs
+            else "FIR sample index"
+        ),
         unit="",
     )
     mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit="ADC units")
@@ -2510,8 +2515,12 @@ def store_sparameter_result(
             "physical_power_calibrated": result.physical_power_calibrated,
         },
         "formulas": {
-            "mean_i": "mean(i_trace)",
-            "mean_q": "mean(q_trace)",
+            "mean_i": (
+                "mean(integrated_i_shots)" if is_qcs else "mean(i_trace)"
+            ),
+            "mean_q": (
+                "mean(integrated_q_shots)" if is_qcs else "mean(q_trace)"
+            ),
             "adc_magnitude_db": "20*log10(hypot(mean_i, mean_q))",
             "magnitude_db": (
                 "P_DUT_OUT - P_DUT_IN"
@@ -2525,6 +2534,11 @@ def store_sparameter_result(
             ),
         },
         "storage": "one split I/Q array row and scalar response per frequency",
+        "sample_axis": (
+            "hardware-demodulated repetition"
+            if is_qcs
+            else "FIR DDR time sample"
+        ),
     }
 
     _emit_progress(progress_callback, 65, "Preparing S-parameter QCoDeS run")
@@ -2971,6 +2985,20 @@ def load_sparameter_run(
     if not payload_text:
         raise ValueError(f"run {run_id} is not an RF S-parameter run")
     payload = json.loads(payload_text)
+    rf_settings = None
+    try:
+        experiment_text = dataset.get_metadata("sparameter_experiment_json")
+    except (AttributeError, KeyError):
+        experiment_text = dataset.metadata.get("sparameter_experiment_json")
+    if experiment_text:
+        try:
+            experiment_payload = json.loads(experiment_text)
+        except (TypeError, ValueError):
+            experiment_payload = None
+        if isinstance(experiment_payload, Mapping):
+            candidate = experiment_payload.get("rf_settings_actual")
+            if isinstance(candidate, Mapping):
+                rf_settings = dict(candidate)
     frequencies = np.asarray(payload["frequencies_mhz"], dtype=float)
     requested = np.asarray(
         payload.get("requested_frequencies_mhz", frequencies), dtype=float
@@ -3028,6 +3056,7 @@ def load_sparameter_run(
         row_count=int(iq.shape[0] * iq.shape[1]),
         result=result,
         dataset=dataset,
+        rf_settings=rf_settings,
     )
 
 

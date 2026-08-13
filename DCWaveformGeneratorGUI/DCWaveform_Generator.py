@@ -175,6 +175,8 @@ try:
         COMPILE_VALIDATION_BOUNDARY,
         COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
+        IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+        IQ_REPETITION_POLICY_PRESERVE,
         QcodesRunConfig,
         QickConnectionConfig,
         build_awg_vertex_record,
@@ -186,6 +188,7 @@ try:
         measurement_iq_values,
         normalize_awg_metadata_mode,
         normalize_compile_validation_mode,
+        normalize_iq_repetition_policy,
         run_qick_qcodes_experiment,
         write_awg_vertex_metadata_jsonl,
     )
@@ -196,6 +199,8 @@ except ImportError:
         COMPILE_VALIDATION_BOUNDARY,
         COMPILE_VALIDATION_FULL,
         DEFAULT_AWG_METADATA_MODE,
+        IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+        IQ_REPETITION_POLICY_PRESERVE,
         QcodesRunConfig,
         QickConnectionConfig,
         build_awg_vertex_record,
@@ -207,6 +212,7 @@ except ImportError:
         measurement_iq_values,
         normalize_awg_metadata_mode,
         normalize_compile_validation_mode,
+        normalize_iq_repetition_policy,
         run_qick_qcodes_experiment,
         write_awg_vertex_metadata_jsonl,
     )
@@ -271,6 +277,7 @@ try:
     from .qick_sparameter_sweep import SParameterSweepConfig
     from .sparameter_gui import (
         DEFAULT_SPARAMETER_DB_PATH,
+        QcsSParameterSweepWorker,
         SParameterLoadWorker,
         SParameterPlotWidget,
         SParameterSweepPanel,
@@ -280,6 +287,7 @@ except ImportError:
     from qick_sparameter_sweep import SParameterSweepConfig
     from sparameter_gui import (
         DEFAULT_SPARAMETER_DB_PATH,
+        QcsSParameterSweepWorker,
         SParameterLoadWorker,
         SParameterPlotWidget,
         SParameterSweepPanel,
@@ -437,7 +445,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 37
+SETTINGS_VERSION = 38
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 EXECUTION_BACKEND_QICK = "qick"
@@ -522,6 +530,11 @@ DEFAULT_RF_READOUT_SETTINGS = {
 DEFAULT_SPARAMETER_SETTINGS = {
     "database_path": DEFAULT_SPARAMETER_DB_PATH,
     **asdict(SParameterSweepConfig()),
+    "qcs_amplitude": 0.005,
+    # The connected QCS/M5200 path is live-tested with a 1 us flat filter.
+    # Keep this GUI default safe while retaining the standalone QICK config
+    # dataclass's historical 10 us default for non-GUI callers.
+    "scan_time_us": 1.0,
 }
 DEFAULT_CALIBRATION_SETTINGS = default_calibration_settings()
 
@@ -1797,6 +1810,11 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         act_remove_hold_sweep.setEnabled(row in self._hold_sweep_rows)
         menu.addSeparator()
         act_del       = menu.addAction("Delete segment")
+        act_del.setEnabled(row > 0)
+        act_del.setToolTip(
+            "The initial SET defines the waveform baseline and cannot be "
+            "deleted."
+        )
 
         chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
         if chosen == act_sweep:
@@ -3039,6 +3057,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     changed = QtCore.pyqtSignal()
     remove_requested = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
+    lo_frequency_change_requested = QtCore.pyqtSignal(object, float)
 
     def __init__(
         self,
@@ -3075,6 +3094,34 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "The QCS module is determined by the front-panel mapping. Click "
             "the front-panel preview to select a different module or SMA output."
         )
+        self.qcs_lo_frequency_ghz = QtWidgets.QDoubleSpinBox()
+        self.qcs_lo_frequency_ghz.setRange(0.0, 18.0)
+        self.qcs_lo_frequency_ghz.setDecimals(9)
+        self.qcs_lo_frequency_ghz.setSingleStep(0.01)
+        self.qcs_lo_frequency_ghz.setSuffix(" GHz")
+        self.qcs_lo_frequency_ghz.setToolTip(
+            "Physical M5300 local-oscillator frequency. This is separate "
+            "from the RF waveform frequency below."
+        )
+        self.apply_qcs_lo_frequency = QtWidgets.QPushButton("Apply LO")
+        self.apply_qcs_lo_frequency.setToolTip(
+            "Save this LO frequency to the shared QCS ChannelMapper"
+        )
+        self.qcs_lo_frequency_status = QtWidgets.QLabel("LO not configured")
+        self.qcs_lo_frequency_status.setStyleSheet(
+            "QLabel { color: #6a737d; }"
+        )
+        self.qcs_lo_frequency_status.setWordWrap(True)
+        self.qcs_lo_frequency_row = QtWidgets.QWidget()
+        qcs_lo_layout = QtWidgets.QVBoxLayout(self.qcs_lo_frequency_row)
+        qcs_lo_layout.setContentsMargins(0, 0, 0, 0)
+        qcs_lo_layout.setSpacing(2)
+        qcs_lo_editor_layout = QtWidgets.QHBoxLayout()
+        qcs_lo_editor_layout.setContentsMargins(0, 0, 0, 0)
+        qcs_lo_editor_layout.addWidget(self.qcs_lo_frequency_ghz, 1)
+        qcs_lo_editor_layout.addWidget(self.apply_qcs_lo_frequency)
+        qcs_lo_layout.addLayout(qcs_lo_editor_layout)
+        qcs_lo_layout.addWidget(self.qcs_lo_frequency_status)
         self.segment = QtWidgets.QComboBox()
         self.delay = QtWidgets.QDoubleSpinBox()
         self.duration = QtWidgets.QDoubleSpinBox()
@@ -3320,6 +3367,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.qcs_module_label = QtWidgets.QLabel("Module:")
         form.addRow(self.output_board_label, self.output_board_type)
         form.addRow(self.qcs_module_label, self.qcs_module_model)
+        form.addRow("M5300 LO frequency:", self.qcs_lo_frequency_row)
         self.segment_label = QtWidgets.QLabel("Anchor SET:")
         form.addRow(self.segment_label, self.segment)
         self._delay_label = QtWidgets.QLabel()
@@ -3445,6 +3493,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self._update_board_controls
         )
         self.gen_ch.valueChanged.connect(self._sync_front_panel_selection)
+        self.apply_qcs_lo_frequency.clicked.connect(
+            self._request_qcs_lo_frequency_change
+        )
         self.duration_sweep_enabled.toggled.connect(
             self._update_duration_sweep_controls
         )
@@ -3506,6 +3557,19 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_power_sweep_controls()
         self.set_hardware_backend(self._hardware_backend)
         self.set_index(index)
+
+    def _request_qcs_lo_frequency_change(self) -> None:
+        """Request one persisted physical M5300 LO update from MainWindow."""
+
+        if (
+            self._hardware_backend != EXECUTION_BACKEND_QCS
+            or self.qcs_module_model.currentData() != "M5300A"
+        ):
+            return
+        self.lo_frequency_change_requested.emit(
+            self,
+            float(self.qcs_lo_frequency_ghz.value()) * 1.0e9,
+        )
 
     @staticmethod
     def _gain_to_qcs_amplitude(gain: int) -> float:
@@ -3585,6 +3649,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.gen_ch.setEnabled(not is_qcs)
         self._set_form_row_visible(self.output_board_type, not is_qcs)
         self._set_form_row_visible(self.qcs_module_model, is_qcs)
+        self._set_form_row_visible(self.qcs_lo_frequency_row, False)
         self._set_form_row_visible(self.gain, not is_qcs)
         self._set_form_row_visible(self.qcs_amplitude, is_qcs)
         self._set_form_row_visible(self.power_calibration_group, not is_qcs)
@@ -4160,10 +4225,18 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_backend_presentation()
 
     def _keep_front_panel_preview_enabled(self, *_args) -> None:
-        """Allow physical RF-output selection before the output is enabled."""
+        """Allow physical RF configuration before the waveform is enabled."""
 
         self.front_panel_preview.setEnabled(True)
         self.front_panel_preview.currentWidget().setEnabled(True)
+        if hasattr(self, "qcs_lo_frequency_row"):
+            is_m5300 = (
+                self._hardware_backend == EXECUTION_BACKEND_QCS
+                and self.qcs_module_model.currentData() == "M5300A"
+            )
+            self.qcs_lo_frequency_row.setEnabled(is_m5300)
+            self.qcs_lo_frequency_ghz.setEnabled(is_m5300)
+            self.apply_qcs_lo_frequency.setEnabled(is_m5300)
 
     def set_qcs_front_panel_configuration(
         self,
@@ -4181,6 +4254,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         """Reflect the module bound by the QCS front-panel configuration."""
 
         selected_model = None
+        selected_lo_frequency_hz = None
         binding_tooltip = (
             "No QCS RF module is mapped to this virtual channel. Click the "
             "front-panel preview to configure its module and SMA output."
@@ -4216,6 +4290,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     )
                     if module is not None:
                         selected_model = str(module["model"])
+                        selected_lo_frequency_hz = mapping.get(
+                            "lo_frequency_hz"
+                        )
                         binding_tooltip = (
                             f"{selected_model}, chassis "
                             f"{configuration['chassis']}, slot "
@@ -4228,6 +4305,36 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             model_index = self.qcs_module_model.findData(selected_model)
             self.qcs_module_model.setCurrentIndex(model_index)
         self.qcs_module_model.setToolTip(binding_tooltip)
+        is_m5300 = (
+            self._hardware_backend == EXECUTION_BACKEND_QCS
+            and selected_model == "M5300A"
+        )
+        self._set_form_row_visible(self.qcs_lo_frequency_row, is_m5300)
+        if is_m5300:
+            if selected_lo_frequency_hz is None:
+                self.qcs_lo_frequency_status.setText(
+                    "LO is not configured; choose a frequency before running."
+                )
+                self.qcs_lo_frequency_status.setStyleSheet(
+                    "QLabel { color: #cf222e; }"
+                )
+            else:
+                with QtCore.QSignalBlocker(self.qcs_lo_frequency_ghz):
+                    self.qcs_lo_frequency_ghz.setValue(
+                        float(selected_lo_frequency_hz) / 1.0e9
+                    )
+                self.qcs_lo_frequency_status.setText(
+                    "Current ChannelMapper LO: "
+                    f"{float(selected_lo_frequency_hz) / 1.0e9:.9g} GHz"
+                )
+                self.qcs_lo_frequency_status.setStyleSheet(
+                    "QLabel { color: #1a7f37; }"
+                )
+        self.apply_qcs_lo_frequency.setEnabled(is_m5300)
+        # An unchecked QGroupBox disables its child editors.  Re-evaluate the
+        # explicit exceptions after a mapping change so an M5301 -> M5300
+        # reassignment does not leave the newly visible LO editor disabled.
+        self._keep_front_panel_preview_enabled()
 
     def _sync_front_panel_selection(self, *_args) -> None:
         self.front_panel_preview.set_qcs_selection(
@@ -4628,6 +4735,7 @@ class RfPortsPanel(QtWidgets.QWidget):
 
     specs_changed = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal(object)
+    lo_frequency_change_requested = QtCore.pyqtSignal(int, float)
     MAX_PORTS = 8
 
     def __init__(self, pulse: PulseSequence, *, time_unit: str, parent=None):
@@ -4671,6 +4779,9 @@ class RfPortsPanel(QtWidgets.QWidget):
         panel.changed.connect(self._emit_specs)
         panel.remove_requested.connect(self.remove_port)
         panel.front_panel_requested.connect(self.front_panel_requested.emit)
+        panel.lo_frequency_change_requested.connect(
+            self._forward_lo_frequency_change_request
+        )
         if self._front_panel_configuration is not None:
             panel.set_front_panel_configuration(self._front_panel_configuration)
         panel.set_hardware_backend(self._hardware_backend)
@@ -4843,6 +4954,18 @@ class RfPortsPanel(QtWidgets.QWidget):
                     panel.gen_ch.setValue(logical_index)
             self.set_qcs_front_panel_preview_configuration(configuration)
         self._emit_specs()
+
+    def _forward_lo_frequency_change_request(
+        self,
+        panel: RfPulsePortPanel,
+        frequency_hz: float,
+    ) -> None:
+        if panel not in self._panels:
+            return
+        self.lo_frequency_change_requested.emit(
+            int(panel.gen_ch.value()),
+            float(frequency_hz),
+        )
 
     def specs(
         self,
@@ -5834,6 +5957,48 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             if match >= 0:
                 self.segment.setCurrentIndex(match)
 
+    def remap_segment_reference(
+        self,
+        pulse: PulseSequence,
+        operation: str,
+        segment_index: int,
+    ) -> Tuple[str, Optional[str]]:
+        """Keep acquisition attached to its logical SET after an edit.
+
+        If its target SET is deleted, acquisition is disabled and a nearby
+        remaining SET is selected only as an explicit future-edit fallback.
+        This prevents Qt from silently acquiring the first SET while a stale
+        readout specification still points at the deleted segment.
+        """
+
+        self._pulse = pulse
+        old_name = str(self.segment.currentData())
+        new_name = _remap_set_segment_name(
+            old_name,
+            operation,
+            segment_index,
+        )
+        fallback_index = min(
+            max(0, int(segment_index)),
+            max(0, pulse.set_count - 1),
+        )
+        with QtCore.QSignalBlocker(self):
+            self.refresh_segments(pulse)
+            if new_name is None:
+                self.setChecked(False)
+                target_name = f"set_{fallback_index}"
+            else:
+                target_name = new_name
+            match = self.segment.findData(target_name)
+            if match < 0:
+                raise RuntimeError(
+                    f"cannot remap acquisition anchor {old_name!r} after "
+                    f"{operation} at SET {segment_index}"
+                )
+            self.segment.setCurrentIndex(match)
+        self._emit_spec()
+        return old_name, new_name
+
     def configured_spec(self) -> QickDdrReadoutSpec:
         """Return the editor values even when capture is disabled."""
         return QickDdrReadoutSpec(
@@ -6231,6 +6396,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         full_scale_mv: float,
         awg_channels: Sequence[int],
         repetitions: int,
+        iq_repetition_policy: str = IQ_REPETITION_POLICY_PRESERVE,
         bias_t_enabled: bool = False,
         bias_t_compensation_type: str = "dc",
         bias_t_compensation_mv: Optional[float] = None,
@@ -6431,6 +6597,35 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
+        self.iq_repetition_policy = QtWidgets.QComboBox()
+        self.iq_repetition_policy.addItem(
+            "Preserve every repetition",
+            IQ_REPETITION_POLICY_PRESERVE,
+        )
+        self.iq_repetition_policy.addItem(
+            "Coherently average; save one I/Q per point",
+            IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+        )
+        self.iq_repetition_policy.setToolTip(
+            "For a single-I/Q acquisition, preserve one complex value from "
+            "every repetition or coherently average I and Q and save one "
+            "complex value per sweep point. Hardware still executes every "
+            "configured repetition. Raw traces always preserve repetitions."
+        )
+        self.iq_repetition_policy_note = QtWidgets.QLabel()
+        self.iq_repetition_policy_note.setWordWrap(True)
+        self.iq_repetition_policy_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        iq_repetition_policy_layout = QtWidgets.QVBoxLayout()
+        iq_repetition_policy_layout.setContentsMargins(0, 0, 0, 0)
+        iq_repetition_policy_layout.setSpacing(2)
+        iq_repetition_policy_layout.addWidget(self.iq_repetition_policy)
+        iq_repetition_policy_layout.addWidget(self.iq_repetition_policy_note)
+        self.iq_repetition_policy_widget = QtWidgets.QWidget()
+        self.iq_repetition_policy_widget.setLayout(
+            iq_repetition_policy_layout
+        )
         self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
         self._ddr_capacity_words_32b: Optional[int] = None
         self._ddr_samples_per_axi_word = 8
@@ -6760,6 +6955,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             awg_channels=awg_channels,
             repetitions=repetitions,
         )
+        self.set_iq_repetition_policy(iq_repetition_policy)
 
         form.addRow("Execution system:", self.execution_system_label)
         form.addRow(self.qcs_connection_group)
@@ -6769,6 +6965,10 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv_label = QtWidgets.QLabel("AWG full scale (+/-):")
         form.addRow(self.full_scale_mv_label, self.full_scale_mv)
         form.addRow("Repetitions per sweep point:", self.repetitions)
+        form.addRow(
+            "Single-I/Q repetition save:",
+            self.iq_repetition_policy_widget,
+        )
         form.addRow(self.ddr_usage_group)
         form.addRow(self.qcs_waveform_usage_group)
         self.compile_validation_label = QtWidgets.QLabel(
@@ -6791,6 +6991,9 @@ class ExperimentPanel(QtWidgets.QWidget):
             lambda _value: self.set_sweep_specs(self._map_sweep_specs)
         )
         self.repetitions.valueChanged.connect(self._refresh_ddr_usage)
+        self.repetitions.valueChanged.connect(
+            self._refresh_iq_repetition_policy_controls
+        )
         self.bias_t_group.toggled.connect(self._emit_bias_t_changed)
         self.bias_t_compensation_mv.valueChanged.connect(self._emit_bias_t_changed)
         self.bias_t_duration_us.valueChanged.connect(self._emit_bias_t_changed)
@@ -6897,6 +7100,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.backend_selector.currentIndexChanged.connect(
             self._update_execution_backend_controls
         )
+        self.qcs_hw_demod.toggled.connect(
+            self._refresh_iq_repetition_policy_controls
+        )
         self._update_execution_backend_controls()
 
     def set_ddr_readout_spec(
@@ -6906,6 +7112,64 @@ class ExperimentPanel(QtWidgets.QWidget):
         """Update the capture estimate from the Experiment RF-readout editor."""
         self._ddr_readout_spec = spec
         self._refresh_ddr_usage()
+        self._refresh_iq_repetition_policy_controls()
+
+    def iq_repetition_policy_value(self, *, effective: bool = False) -> str:
+        """Return the configured or currently applicable save policy."""
+
+        policy = normalize_iq_repetition_policy(
+            self.iq_repetition_policy.currentData()
+        )
+        if effective and not self._single_iq_repetition_policy_available():
+            return IQ_REPETITION_POLICY_PRESERVE
+        return policy
+
+    def set_iq_repetition_policy(self, policy: str) -> None:
+        """Restore a validated repetition-save policy from application settings."""
+
+        policy = normalize_iq_repetition_policy(policy)
+        index = self.iq_repetition_policy.findData(policy)
+        if index < 0:
+            raise ValueError(f"I/Q repetition policy {policy!r} is unavailable")
+        self.iq_repetition_policy.setCurrentIndex(index)
+        self._refresh_iq_repetition_policy_controls()
+
+    def _single_iq_repetition_policy_available(self) -> bool:
+        spec = self._ddr_readout_spec
+        if spec is None:
+            return False
+        if self.execution_backend() == EXECUTION_BACKEND_QCS:
+            return self.qcs_hw_demod.isChecked()
+        return int(spec.samples_per_trigger) == 1
+
+    def _refresh_iq_repetition_policy_controls(self, *_args) -> None:
+        """Enable averaging only when one I/Q value is acquired per shot."""
+
+        available = self._single_iq_repetition_policy_available()
+        self.iq_repetition_policy.setEnabled(
+            available and not getattr(self, "_running", False)
+        )
+        if self._ddr_readout_spec is None:
+            note = (
+                "Enable acquisition to select how repeated single-I/Q "
+                "values are saved."
+            )
+        elif not available:
+            note = (
+                "Trace acquisition always preserves every repetition; this "
+                "selection is retained and becomes active in Single I/Q mode."
+            )
+        elif self.repetitions.value() == 1:
+            note = (
+                "Only one repetition is configured, so both choices save the "
+                "same value."
+            )
+        else:
+            note = (
+                "Preserve keeps every shot. Coherent average computes mean I "
+                "and mean Q and saves one complex value per sweep point."
+            )
+        self.iq_repetition_policy_note.setText(note)
 
     def set_ddr_memory_configuration(self, configuration) -> None:
         """Use the live HWH/runtime DDR capacity reported by QICK."""
@@ -7282,6 +7546,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         if hasattr(self, "sweep_map_status"):
             self._update_sweep_map_status()
+        if hasattr(self, "iq_repetition_policy"):
+            self._refresh_iq_repetition_policy_controls()
         if backend != self._last_execution_backend:
             self._last_execution_backend = backend
             self.execution_backend_changed.emit(backend)
@@ -8221,10 +8487,14 @@ class ExperimentPanel(QtWidgets.QWidget):
         selected_keys: Optional[
             Tuple[Tuple[str, str], Tuple[str, str]]
         ] = None,
+        selected_parameter_key: Optional[
+            Tuple[str, str, str]
+        ] = None,
     ) -> None:
         """Refresh selectable AWG sweep axes while preserving valid choices."""
         previous = self.selected_sweep_axis_keys()
-        selected_parameter_key = self._selected_sweep_parameter_key()
+        if selected_parameter_key is None:
+            selected_parameter_key = self._selected_sweep_parameter_key()
         self._map_sweep_specs = tuple(specs)
         available = tuple(
             (str(spec.output_name), str(spec.segment_name))
@@ -8384,6 +8654,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             "full_scale_mv": self.full_scale_mv.value(),
             "awg_channels": awg_channels,
             "repetitions_per_sweep": self.repetitions.value(),
+            "iq_repetition_policy": self.iq_repetition_policy_value(),
             "awg_metadata_mode": normalize_awg_metadata_mode(
                 self.awg_metadata_mode.currentData()
             ),
@@ -8538,6 +8809,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         full_scale_mv: float,
         awg_channels: Sequence[int],
         repetitions: int,
+        iq_repetition_policy: str = IQ_REPETITION_POLICY_PRESERVE,
         bias_t_enabled: bool = False,
         bias_t_compensation_type: str = "dc",
         bias_t_compensation_mv: float = DEFAULT_BIAS_T_COMPENSATION_MV,
@@ -8563,6 +8835,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             awg_channels=awg_channels,
             repetitions=repetitions,
         )
+        self.set_iq_repetition_policy(iq_repetition_policy)
         self.set_awg_metadata_mode(awg_metadata_mode)
         self.set_compile_validation_mode(compile_validation_mode)
         self.set_qcs_settings(qcs_settings or {}, len(awg_channels))
@@ -10260,6 +10533,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_ports_panel.front_panel_requested.connect(
             lambda panel: self._show_active_front_panel("output", panel)
         )
+        self._rf_ports_panel.lo_frequency_change_requested.connect(
+            self._set_qcs_m5300_lo_from_rf_output
+        )
         self._multi_ctrl.front_panel_requested.connect(
             lambda target: self._show_active_front_panel("output", target)
         )
@@ -10300,6 +10576,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._qcs_front_panel.connector_selected.connect(
             self._on_qcs_front_panel_connector_selected
+        )
+        self._qcs_front_panel.m5300_lo_frequency_changed.connect(
+            self._on_qcs_m5300_lo_frequency_changed
         )
         self._qcs_front_panel.draft_staged.connect(
             self._on_qcs_front_panel_draft_staged
@@ -11308,6 +11587,121 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qcs_front_panel_dialog.raise_()
         self._qcs_front_panel_dialog.activateWindow()
         return True
+
+    def _hydrate_qcs_front_panel_editor(self) -> None:
+        """Load shared QCS state for a non-dialog hardware edit."""
+
+        if (
+            self._experiment_thread is not None
+            and self._experiment_thread.isRunning()
+        ) or self._experiment_panel._running:
+            raise ValueError(
+                "Wait for the current hardware task before changing the "
+                "M5300 LO frequency."
+            )
+        source_snapshot = self._current_qcs_front_panel_source_snapshot()
+        if (
+            self._qcs_front_panel_editor_initialized
+            and self._qcs_front_panel_dialog.isVisible()
+            and self._qcs_front_panel_source_snapshot == source_snapshot
+        ):
+            # The modeless editor may contain a just-entered value whose
+            # editingFinished/draft-staging signal has not run yet.  Reusing
+            # that live widget tree preserves the draft when Apply LO is
+            # clicked from the RF Outputs tab.
+            return
+        settings = self._experiment_panel.qcs_settings_dict()
+        pending = self._pending_qcs_front_panel_state()
+        if pending is not None:
+            configuration, dc_names, rf_names, acquisition_name = pending
+            settings = dict(settings)
+            settings.update(
+                {
+                    "dc_channel_names": list(dc_names),
+                    "rf_channel_names": {
+                        str(index): name
+                        for index, name in rf_names.items()
+                    },
+                    "acquisition_channel_name": acquisition_name,
+                    "hardware_configuration": configuration,
+                    "hardware_configuration_state": QCS_HARDWARE_STATE_DRAFT,
+                    "hardware_mapper_sha256": None,
+                }
+            )
+        self._qcs_front_panel.set_settings(
+            settings,
+            output_count=len(self._pulse),
+        )
+        self._qcs_front_panel_editor_initialized = True
+        self._qcs_front_panel_source_snapshot = source_snapshot
+
+    def _set_qcs_m5300_lo_from_rf_output(
+        self,
+        logical_index: int,
+        lo_frequency_hz: float,
+    ) -> None:
+        """Apply the RF Outputs LO editor without opening the full panel."""
+
+        try:
+            self._hydrate_qcs_front_panel_editor()
+            configuration = self._qcs_front_panel.working_configuration()
+            mapping = next(
+                candidate
+                for candidate in configuration["channel_mappings"]
+                if (
+                    str(candidate["role"]) == "rf"
+                    and int(candidate["logical_index"]) == int(logical_index)
+                )
+            )
+            module = next(
+                candidate
+                for candidate in configuration["modules"]
+                if int(candidate["slot"]) == int(mapping["slot"])
+            )
+            if str(module["model"]) != "M5300A":
+                raise ValueError(
+                    f"QCS RF output {int(logical_index)} is mapped to "
+                    f"{module['model']}, not an M5300A."
+                )
+            changed = self._qcs_front_panel.set_m5300_lo_frequency(
+                int(mapping["slot"]),
+                int(mapping["channel"]),
+                float(lo_frequency_hz),
+            )
+            if not changed:
+                raise ValueError(self._qcs_front_panel.status.text())
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "M5300 LO was not changed",
+                str(exc),
+            )
+
+    def _on_qcs_m5300_lo_frequency_changed(
+        self,
+        role: str,
+        logical_index: int,
+        slot: int,
+        channel: int,
+        lo_frequency_hz: float,
+    ) -> None:
+        """Persist a front-panel or RF-tab LO edit through one mapper job."""
+
+        del lo_frequency_hz
+        self._qcs_front_panel_auto_apply_selection = (
+            str(role),
+            int(logical_index),
+        )
+        self._qcs_front_panel_keep_open_after_selection = (
+            self._qcs_front_panel_dialog.isVisible()
+        )
+        self._on_qcs_front_panel_connector_selected(
+            str(role),
+            int(logical_index),
+            int(slot),
+            int(channel),
+            True,
+        )
 
     def _on_qcs_front_panel_connector_selected(
         self,
@@ -12655,6 +13049,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         selected_map_keys: Optional[
             Tuple[Tuple[str, str], Tuple[str, str]]
         ] = None,
+        selected_parameter_key: Optional[
+            Tuple[str, str, str]
+        ] = None,
         waveform_changed: bool = False,
         trace_changed: bool = False,
         rf_changed: bool = False,
@@ -12664,6 +13061,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             {
                 "fit_view": bool(fit_view),
                 "selected_map_keys": selected_map_keys,
+                "selected_parameter_key": selected_parameter_key,
                 "waveform_changed": bool(waveform_changed),
                 "trace_changed": bool(trace_changed),
                 "rf_changed": bool(rf_changed),
@@ -12681,6 +13079,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             fit_view=bool(options.get("fit_view", False)),
             sync_rows=True,
             selected_map_keys=options.get("selected_map_keys"),
+            selected_parameter_key=options.get(
+                "selected_parameter_key"
+            ),
         )
         if options.get("trace_changed", False):
             self._refresh_trace_if_needed(force=True)
@@ -12695,11 +13096,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         selected_map_keys: Optional[
             Tuple[Tuple[str, str], Tuple[str, str]]
         ] = None,
+        selected_parameter_key: Optional[
+            Tuple[str, str, str]
+        ] = None,
     ) -> None:
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_sweep_specs(
                 self._active_map_sweep_specs(),
                 selected_keys=selected_map_keys,
+                selected_parameter_key=selected_parameter_key,
             )
         self._refresh_physical_waveforms()
         envelopes = []
@@ -13105,6 +13510,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if hasattr(self, "_experiment_panel")
             else None
         )
+        previous_parameter_key = (
+            self._experiment_panel._selected_sweep_parameter_key()
+            if hasattr(self, "_experiment_panel")
+            else None
+        )
         sweep_key_remap = {}
         updated_sweeps = []
         remapped_count = 0
@@ -13202,6 +13612,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 new_key is None for new_key in rf_key_remap.values()
             )
 
+        acquisition_was_enabled = self._rf_readout_panel.isChecked()
+        acquisition_old_name, acquisition_new_name = (
+            self._rf_readout_panel.remap_segment_reference(
+                self._pulse[0],
+                operation,
+                segment_index,
+            )
+        )
+        if acquisition_new_name is None and acquisition_was_enabled:
+            removed_count += 1
+        elif acquisition_new_name != acquisition_old_name:
+            remapped_count += 1
+
         selected_map_keys = None
         if previous_map_keys is not None:
             remapped_keys = []
@@ -13222,9 +13645,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ):
                 selected_map_keys = tuple(remapped_keys)
 
+        selected_parameter_key = None
+        if previous_parameter_key is not None:
+            axis_kind, output_name, segment_name = previous_parameter_key
+            remapped_target = sweep_key_remap.get(
+                (output_name, segment_name),
+                (output_name, segment_name),
+            )
+            if remapped_target is not None:
+                selected_parameter_key = (
+                    axis_kind,
+                    str(remapped_target[0]),
+                    str(remapped_target[1]),
+                )
+
         self._notify_sweep_state_changed(
             fit_view=True,
             selected_map_keys=selected_map_keys,
+            selected_parameter_key=selected_parameter_key,
             waveform_changed=True,
             trace_changed=True,
             rf_changed=True,
@@ -13694,6 +14132,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sequence": sequence,
             "awg_channels": self._qick_awg_channels,
             "repetitions_per_sweep": self._qick_repetitions_per_sweep,
+            "iq_repetition_policy": (
+                self._experiment_panel.iq_repetition_policy_value(
+                    effective=True
+                )
+            ),
             "compile_validation_mode": values["compile_validation_mode"],
             "rf_specs": rf_specs,
             "readout_spec": readout_spec,
@@ -13708,6 +14151,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             validate_qcs_hardware=False,
             for_qcs=True,
         )
+        sweep_preview = qcs_sweep_execution_preview(
+            qick_arguments["sequence"],
+            hardware_demodulation=(
+                self._experiment_panel.qcs_hw_demod.isChecked()
+            ),
+            source_full_scale_mv=self._qick_full_scale_mv,
+            dc_full_scale_v=(
+                self._experiment_panel.qcs_dc_full_scale_v.value()
+            ),
+            fabric_mhz=self._qick_fabric_mhz,
+            init_time_s=(
+                self._experiment_panel.qcs_init_time_us.value() * 1.0e-6
+            ),
+        )
+        self._experiment_panel.set_qcs_sweep_execution_status(sweep_preview)
         capacity_report = validate_qcs_m5301_waveform_capacity(
             qick_arguments["sequence"],
             fabric_mhz=self._qick_fabric_mhz,
@@ -13718,7 +14176,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     * 1000.0
                 )
             ),
-            auto_fixed_dc_offsets=True,
+            auto_fixed_dc_offsets=(sweep_preview.mode == "hardware"),
             source_full_scale_mv=self._qick_full_scale_mv,
             dc_full_scale_v=(
                 self._experiment_panel.qcs_dc_full_scale_v.value()
@@ -13820,6 +14278,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sequence": qick_arguments["sequence"],
             "repetitions_per_sweep": qick_arguments[
                 "repetitions_per_sweep"
+            ],
+            "iq_repetition_policy": qick_arguments[
+                "iq_repetition_policy"
             ],
             "fabric_mhz": self._qick_fabric_mhz,
             "source_full_scale_mv": self._qick_full_scale_mv,
@@ -14097,6 +14558,53 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         }
 
     def _sparameter_run_arguments(self) -> dict:
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        ):
+            connection = self._experiment_panel.qcs_connection_values(
+                len(self._pulse)
+            )
+            if not connection.hw_demod:
+                raise ValueError(
+                    "QCS RF S-parameter requires Single I/Q value "
+                    "(hardware demodulation)."
+                )
+            config = self._sparameter_panel.config()
+            rf_gen_ch = (
+                self._sparameter_panel.path_diagram
+                .qcs_output_mapping_selector.currentData()
+            )
+            if rf_gen_ch is None:
+                raise ValueError(
+                    "Select a mapped M5300 RF output for S-parameter."
+                )
+            rf_gen_ch = int(rf_gen_ch)
+            if rf_gen_ch not in connection.rf_channel_names:
+                raise ValueError(
+                    f"QCS RF channel map has no logical output {rf_gen_ch}."
+                )
+            if connection.acquisition_channel_name is None:
+                raise ValueError(
+                    "Select a mapped M5200 acquisition input for S-parameter."
+                )
+            return {
+                "connection_config": connection,
+                "run_config": self._experiment_panel.run_config_values(
+                    require_run_config=True,
+                    database_path=(
+                        self._sparameter_panel.database_path_value()
+                    ),
+                ),
+                "sweep_config": config,
+                "rf_gen_ch": rf_gen_ch,
+                "rf_amplitude": float(
+                    self._sparameter_panel.qcs_amplitude.value()
+                ),
+                "repetitions_per_point": int(
+                    self._experiment_panel.repetitions.value()
+                ),
+            }
         connection, run = self._experiment_panel.connection_values(
             database_path=self._sparameter_panel.database_path_value()
         )
@@ -14462,8 +14970,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         return False
 
     def _run_sparameter_sweep(self) -> None:
-        if not self._legacy_qick_workflow_available("RF S-parameter"):
-            return
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
@@ -14480,28 +14986,40 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
 
         config = arguments["sweep_config"]
-        identified_rate = getattr(
-            self._qick_configuration,
-            "fir_sample_rate_hz",
-            None,
+        is_qcs = (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
         )
-        if identified_rate is None:
+        if is_qcs:
+            repetitions = int(arguments["repetitions_per_point"])
             sample_summary = (
-                f"{config.scan_time_us:g} us requested; HWH selects the "
-                "stored FIR sample count"
+                f"{config.scan_time_us:g} us requested integration, "
+                f"{repetitions:,} repetition(s) per frequency"
             )
+            power_count = 1
         else:
-            sample_count = max(
-                1,
-                int(np.ceil(config.scan_time_us * identified_rate / 1_000_000.0)),
+            identified_rate = getattr(
+                self._qick_configuration,
+                "fir_sample_rate_hz",
+                None,
             )
-            actual_time_us = sample_count * 1_000_000.0 / identified_rate
-            sample_summary = (
-                f"{sample_count:,} samples at "
-                f"{format_sample_rate_hz(identified_rate)} "
-                f"({actual_time_us:g} us actual)"
-            )
-        power_count = int(config.power_gains.size)
+            if identified_rate is None:
+                sample_summary = (
+                    f"{config.scan_time_us:g} us requested; HWH selects the "
+                    "stored FIR sample count"
+                )
+            else:
+                sample_count = max(
+                    1,
+                    int(np.ceil(config.scan_time_us * identified_rate / 1_000_000.0)),
+                )
+                actual_time_us = sample_count * 1_000_000.0 / identified_rate
+                sample_summary = (
+                    f"{sample_count:,} samples at "
+                    f"{format_sample_rate_hz(identified_rate)} "
+                    f"({actual_time_us:g} us actual)"
+                )
+            power_count = int(config.power_gains.size)
         self._sparameter_panel.set_running(
             True,
             (
@@ -14512,14 +15030,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self.statusBar().showMessage("RF S-parameter sweep running")
         thread = QtCore.QThread(self)
-        worker = SParameterSweepWorker(arguments)
+        worker = (
+            QcsSParameterSweepWorker(arguments)
+            if is_qcs
+            else SParameterSweepWorker(arguments)
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_sparameter_finished)
         worker.failed.connect(self._on_sparameter_failed)
         worker.progress_changed.connect(self._on_sparameter_progress)
-        worker.partial_result.connect(self._on_sparameter_partial)
-        worker.warning_raised.connect(self._on_sparameter_warning)
+        if not is_qcs:
+            worker.partial_result.connect(self._on_sparameter_partial)
+            worker.warning_raised.connect(self._on_sparameter_warning)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -15231,8 +15754,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
             )
             worker_class = QcsExperimentWorker
+        iq_repetition_policy = normalize_iq_repetition_policy(
+            arguments["iq_repetition_policy"]
+        )
+        stored_repetitions = (
+            1
+            if (
+                iq_repetition_policy
+                == IQ_REPETITION_POLICY_COHERENT_AVERAGE
+            )
+            else repetitions
+        )
         expected_rows = (
-            sweep_points * repetitions * samples_per_acquisition
+            sweep_points * stored_repetitions * samples_per_acquisition
+        )
+        storage_summary = (
+            "; coherent average saves one I/Q value per sweep point"
+            if (
+                iq_repetition_policy
+                == IQ_REPETITION_POLICY_COHERENT_AVERAGE
+            )
+            else "; every repetition is saved"
         )
         self._experiment_panel.set_running(
             True,
@@ -15240,7 +15782,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"0% - Preparing {sweep_points:,} sweep points x "
                 f"{repetitions:,} repetitions "
                 f"({sweep_points * repetitions:,} acquisitions, "
-                f"{expected_rows:,} IQ sample rows)"
+                f"{expected_rows:,} IQ sample rows{storage_summary})"
             ),
             allow_stop=backend == EXECUTION_BACKEND_QCS,
         )
@@ -16131,6 +16673,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "experiment_name": run.experiment_name,
                 "sample_name": run.sample_name,
                 "notes": run.notes,
+                "iq_repetition_policy": experiment_values[
+                    "iq_repetition_policy"
+                ],
                 "sweep_map": sweep_map_settings,
             },
             "rf_outputs": list(self._rf_ports_panel.settings()),
@@ -17155,6 +17700,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             sample_name=str(experiment.get("sample_name", "PulseGenerator")),
             notes=str(experiment.get("notes", "")),
         )
+        iq_repetition_policy = normalize_iq_repetition_policy(
+            experiment.get(
+                "iq_repetition_policy",
+                IQ_REPETITION_POLICY_PRESERVE,
+            )
+        )
 
         raw_sparameter = data.get("s_parameter", {})
         if raw_sparameter is None:
@@ -17170,6 +17721,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ).strip()
         if not sparameter_database_path:
             raise ValueError("RF S-parameter database path must not be empty")
+        sparameter_qcs_amplitude = self._json_finite_float(
+            sparameter_settings.pop("qcs_amplitude", 0.005),
+            "QCS S-parameter amplitude",
+        )
+        if not -1.0 <= sparameter_qcs_amplitude <= 1.0:
+            raise ValueError("QCS S-parameter amplitude must be in [-1, 1]")
         sparameter_config = SParameterSweepConfig(**sparameter_settings)
 
         raw_calibration = data.get("calibration", {})
@@ -17722,6 +18279,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "full_scale_mv": full_scale_mv,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
+            "iq_repetition_policy": iq_repetition_policy,
             "awg_metadata_mode": awg_metadata_mode,
             "compile_validation_mode": compile_validation_mode,
             "bias_t_enabled": bias_t_enabled,
@@ -17743,6 +18301,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "stability_diagram": stability_settings,
             "s_parameter": {
                 "database_path": sparameter_database_path,
+                "qcs_amplitude": sparameter_qcs_amplitude,
                 **asdict(sparameter_config),
             },
             "calibration": calibration_settings,
@@ -17802,6 +18361,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=self._qick_full_scale_mv,
             awg_channels=self._qick_awg_channels,
             repetitions=self._qick_repetitions_per_sweep,
+            iq_repetition_policy=settings["iq_repetition_policy"],
             awg_metadata_mode=settings["awg_metadata_mode"],
             compile_validation_mode=settings["compile_validation_mode"],
             bias_t_enabled=self._bias_t_compensation_enabled,

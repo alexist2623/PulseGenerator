@@ -643,6 +643,98 @@ def test_qcs_acquisition_time_rounds_up_and_preserves_qick_samples():
     app.processEvents()
 
 
+def test_single_iq_repetition_save_policy_tracks_acquisition_mode():
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    readout = window._rf_readout_panel
+
+    assert experiment.iq_repetition_policy_value() == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
+    assert experiment.iq_repetition_policy.isEnabled() is False
+    assert "Enable acquisition" in experiment.iq_repetition_policy_note.text()
+
+    readout.setChecked(True)
+    experiment.repetitions.setValue(4)
+    app.processEvents()
+    assert readout.qcs_single_iq_radio.isChecked() is True
+    assert experiment.iq_repetition_policy.isEnabled() is True
+    experiment.set_iq_repetition_policy(
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    assert experiment.iq_repetition_policy_value(effective=True) == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    assert "mean I" in experiment.iq_repetition_policy_note.text()
+
+    readout.qcs_trace_radio.click()
+    app.processEvents()
+    assert experiment.iq_repetition_policy.isEnabled() is False
+    assert experiment.iq_repetition_policy_value() == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    assert experiment.iq_repetition_policy_value(effective=True) == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
+    assert "Trace acquisition always preserves" in (
+        experiment.iq_repetition_policy_note.text()
+    )
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    readout.samples.setValue(1)
+    app.processEvents()
+    assert experiment.iq_repetition_policy.isEnabled() is True
+    assert experiment.iq_repetition_policy_value(effective=True) == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    readout.samples.setValue(2)
+    app.processEvents()
+    assert experiment.iq_repetition_policy.isEnabled() is False
+    assert experiment.iq_repetition_policy_value(effective=True) == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
+
+    window.close()
+    app.processEvents()
+
+
+def test_qick_run_arguments_forward_only_effective_repetition_policy(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    readout = window._rf_readout_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    experiment.database_path.setText(str(tmp_path / "qick_single_iq.db"))
+    experiment.repetitions.setValue(5)
+    experiment.set_iq_repetition_policy(
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    readout.setChecked(True)
+    readout.samples.setValue(1)
+    app.processEvents()
+
+    arguments = window._experiment_run_arguments(
+        validate_qick_hardware=False,
+    )
+    assert arguments["repetitions_per_sweep"] == 5
+    assert arguments["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+
+    readout.samples.setValue(2)
+    app.processEvents()
+    trace_arguments = window._experiment_run_arguments(
+        validate_qick_hardware=False,
+    )
+    assert trace_arguments["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
+
+    window.close()
+    app.processEvents()
+
+
 def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
     app = _application()
     window = gui.MainWindow()
@@ -781,6 +873,159 @@ def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
     )
     assert "HWH-backed Front Panel" in visible_text
 
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_rf_output_shows_and_requests_m5300_lo_without_front_panel():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    logical_index = panel.gen_ch.value()
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("gate",),
+        {logical_index: "rf_drive"},
+        "digitizer",
+    )
+    for mapping in configuration["channel_mappings"]:
+        if mapping["role"] == "rf":
+            mapping["lo_frequency_hz"] = 6.25e9
+    configuration = qcs_front_panel.normalize_qcs_hardware_configuration(
+        configuration
+    )
+    window._rf_ports_panel.set_hardware_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    window._rf_ports_panel.set_qcs_front_panel_configuration(
+        configuration,
+        {logical_index: "rf_drive"},
+    )
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+    window.show()
+    app.processEvents()
+
+    assert panel.qcs_lo_frequency_row.isVisible() is True
+    assert panel.qcs_lo_frequency_ghz.value() == pytest.approx(6.25)
+    assert "6.25 GHz" in panel.qcs_lo_frequency_status.text()
+    requests = []
+    window._rf_ports_panel.lo_frequency_change_requested.disconnect()
+    window._rf_ports_panel.lo_frequency_change_requested.connect(
+        lambda channel, frequency: requests.append((channel, frequency))
+    )
+    panel.qcs_lo_frequency_ghz.setValue(6.5)
+    panel.apply_qcs_lo_frequency.click()
+    app.processEvents()
+
+    assert requests == [(logical_index, pytest.approx(6.5e9))]
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_rf_output_enables_lo_after_m5301_to_m5300_remap():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_ports_panel._panels[0]
+    logical_index = panel.gen_ch.value()
+    m5300_configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("gate",),
+        {logical_index: "rf_drive"},
+        "digitizer",
+    )
+    m5301_configuration = {
+        **m5300_configuration,
+        "modules": [
+            dict(module)
+            for module in m5300_configuration["modules"]
+            if module["model"] != "M5300A"
+        ],
+        "channel_mappings": [
+            dict(mapping)
+            for mapping in m5300_configuration["channel_mappings"]
+        ],
+    }
+    for mapping in m5301_configuration["channel_mappings"]:
+        if mapping["role"] == "rf":
+            mapping.update(slot=2, channel=2, lo_frequency_hz=None)
+    m5301_configuration = (
+        qcs_front_panel.normalize_qcs_hardware_configuration(
+            m5301_configuration
+        )
+    )
+    for mapping in m5300_configuration["channel_mappings"]:
+        if mapping["role"] == "rf":
+            mapping["lo_frequency_hz"] = 6.25e9
+    m5300_configuration = (
+        qcs_front_panel.normalize_qcs_hardware_configuration(
+            m5300_configuration
+        )
+    )
+
+    window._rf_ports_panel.set_hardware_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    window._rf_ports_panel.set_qcs_front_panel_configuration(
+        m5301_configuration,
+        {logical_index: "rf_drive"},
+    )
+    panel._keep_front_panel_preview_enabled()
+    assert panel.isChecked() is False
+    assert panel.qcs_lo_frequency_row.isEnabled() is False
+
+    window._rf_ports_panel.set_qcs_front_panel_configuration(
+        m5300_configuration,
+        {logical_index: "rf_drive"},
+    )
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+    window.show()
+    app.processEvents()
+
+    assert panel.qcs_lo_frequency_row.isVisible() is True
+    assert panel.qcs_lo_frequency_row.isEnabled() is True
+    assert panel.qcs_lo_frequency_ghz.isEnabled() is True
+    assert panel.apply_qcs_lo_frequency.isEnabled() is True
+    window.close()
+    app.processEvents()
+
+
+def test_main_window_routes_m5300_lo_change_through_mapper_commit(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    routed = []
+    monkeypatch.setattr(
+        window,
+        "_on_qcs_front_panel_connector_selected",
+        lambda *args: routed.append(args),
+    )
+
+    window._on_qcs_m5300_lo_frequency_changed(
+        "rf", 2, 4, 1, 1.2e9
+    )
+
+    assert window._qcs_front_panel_auto_apply_selection == ("rf", 2)
+    assert routed == [("rf", 2, 4, 1, True)]
+    window.close()
+    app.processEvents()
+
+
+def test_direct_lo_hydration_preserves_live_front_panel_draft():
+    app = _application()
+    window = gui.MainWindow()
+    window._qcs_front_panel_editor_initialized = True
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    window._qcs_front_panel_dialog.show()
+    app.processEvents()
+
+    # Model a value typed into the modeless editor immediately before Apply
+    # LO is clicked in the RF Outputs tab.  Hydration must not replace the
+    # live widget tree before editingFinished has staged this value.
+    window._qcs_front_panel.ip_address.setText("10.20.30.40")
+    window._hydrate_qcs_front_panel_editor()
+
+    assert window._qcs_front_panel.ip_address.text() == "10.20.30.40"
     window.close()
     app.processEvents()
 
@@ -2282,6 +2527,62 @@ def test_qcs_sweep_execution_indicator_tracks_live_voltage_sweep_and_trace_mode(
     app.processEvents()
 
 
+def test_qcs_two_output_fixed_voltage_bias_t_preview_is_m5301_safe(tmp_path):
+    app = _application()
+    window = gui.MainWindow()
+    pulses = []
+    for first_mv in (150.0, -200.0):
+        pulse = PulseSequence(0.0, initial_duration_ns=10_000.0)
+        pulse.add_flat_ramp(15_000.0, 400.0, first_mv)
+        pulse.add_flat_ramp(15_000.0, 100_000.0, 100.0)
+        pulses.append(pulse)
+    window._pulse[0] = pulses[0]
+    window._plot._pulses[0] = pulses[0]
+    window._add_port()
+    window._pulse[1].t = pulses[1].t.copy()
+    window._pulse[1].v = pulses[1].v.copy()
+    window._pulse[1].segment_names = list(pulses[1].segment_names)
+    window._cross_capacitance = np.eye(2)
+    window._sweep_specs = [
+        QickSweepSpec("set_2", "awg_0", -0.375, 0.375, 3),
+        QickSweepSpec("set_2", "awg_1", -0.625, 0.625, 3),
+    ]
+    panel = window._experiment_panel
+    panel.bias_t_group.setChecked(True)
+    panel.bias_t_type.setCurrentIndex(
+        panel.bias_t_type.findData("dc")
+    )
+    panel.bias_t_mode.setCurrentIndex(
+        panel.bias_t_mode.findData("fixed_voltage")
+    )
+    panel.bias_t_compensation_mv.setValue(80.0)
+
+    window._refresh_sweep_overlay()
+    app.processEvents()
+
+    assert panel.qcs_sweep_execution_mode_label.text().endswith(
+        "Software sweep"
+    )
+    assert panel.qcs_waveform_usage_progress.value() == 72_032
+    assert "72,032 / 98,304 samples" in (
+        panel.qcs_waveform_usage_progress.format()
+    )
+    assert "Invalid" not in panel.qcs_waveform_usage_progress.format()
+
+    mapper_path = tmp_path / "bias_t_mapper.qcs"
+    mapper_path.write_text("{}", encoding="utf-8")
+    panel.qcs_mapper_path.setText(str(mapper_path))
+    panel.qcs_dc_channel_names.setText("dc_0, dc_1")
+    panel.qcs_acquisition_channel_name.setText("digitizer")
+    window._rf_readout_panel.setChecked(True)
+    arguments = window._qcs_experiment_run_arguments()
+    assert arguments["sequence"].bias_t_compensation.mode == "fixed_voltage"
+    assert arguments["sequence"].sweep_shape == (3, 3)
+
+    window.close()
+    app.processEvents()
+
+
 def test_qcs_sweep_indicator_accepts_two_output_101_by_101_hardware_grid():
     app = _application()
     window = gui.MainWindow()
@@ -2339,6 +2640,10 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     experiment.qcs_rf_channel_names.setText("1=rf_drive")
     experiment.qcs_acquisition_channel_name.setText("digitizer")
     experiment.database_path.setText(str(tmp_path / "qcs_run.db"))
+    experiment.repetitions.setValue(3)
+    experiment.set_iq_repetition_policy(
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
 
     rf_panel = window._rf_ports_panel._panels[0]
     rf_panel.setChecked(True)
@@ -2367,7 +2672,10 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     arguments = window._qcs_experiment_run_arguments()
     assert isinstance(arguments["connection_config"], gui.QcsConnectionConfig)
     assert arguments["connection_config"].acquisition_channel_name == "digitizer"
-    assert arguments["repetitions_per_sweep"] == 1
+    assert arguments["repetitions_per_sweep"] == 3
+    assert arguments["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
     assert arguments["fabric_mhz"] == 300.0
     assert arguments["source_full_scale_mv"] == pytest.approx(800.0)
     assert len(arguments["rf_pulses"]) == 1
@@ -2397,6 +2705,9 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     assert readout.qcs_trace_radio.isChecked() is True
     assert experiment.qcs_hw_demod.isChecked() is False
     assert raw_arguments["connection_config"].hw_demod is False
+    assert raw_arguments["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
     assert raw_arguments["acquisition"].sample_count == 32
     assert raw_arguments["acquisition"].frequency_hz == 0.0
     assert readout.frequency_mhz.isHidden() is True
@@ -2873,6 +3184,9 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_acquisition_channel_name.setText("digitizer")
     source._rf_readout_panel.samples.setValue(777)
     source._rf_readout_panel.qcs_acquisition_duration.setValue(0.0101)
+    panel.set_iq_repetition_policy(
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
     source._rf_readout_panel.qcs_trace_radio.click()
     assert panel.qcs_hw_demod.isChecked() is False
     panel.qcs_sample_rate_hz.setValue(2.4e9)
@@ -2880,8 +3194,11 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 37
+    assert document["version"] == 38
     assert document["experiment"]["execution_backend"] == "qcs"
+    assert document["experiment"]["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
     assert document["qcs"] == {
         "mapper_path": str(tmp_path / "mapper.json"),
         "dc_channel_names": ["gate_a"],
@@ -2911,6 +3228,13 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert restored_panel.qcs_rf_channel_names.text() == "0=rf_drive"
     assert restored_panel.qcs_acquisition_channel_name.text() == "digitizer"
     assert restored_panel.qcs_hw_demod.isChecked() is False
+    assert restored_panel.iq_repetition_policy_value() == (
+        gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    assert restored_panel.iq_repetition_policy_value(effective=True) == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
+    assert restored_panel.iq_repetition_policy.isEnabled() is False
     assert restored._rf_readout_panel.qcs_trace_radio.isChecked() is True
     assert restored._rf_readout_panel.qcs_single_iq_radio.isChecked() is False
     assert restored._rf_readout_panel.samples.value() == 777
@@ -2941,6 +3265,17 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert (
         restored_without_mode._rf_readout_panel.qcs_trace_radio.isChecked()
         is False
+    )
+
+    version_37 = json.loads(json.dumps(document))
+    version_37["version"] = 37
+    version_37["experiment"].pop("iq_repetition_policy")
+    restored_version_37 = gui.MainWindow()
+    restored_version_37._apply_decoded_settings(
+        restored_version_37._decode_settings(version_37)
+    )
+    assert restored_version_37._experiment_panel.iq_repetition_policy_value() == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
     )
 
     version_36 = json.loads(json.dumps(document))
@@ -2993,6 +3328,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     for window in (
         restored_version_35,
         restored_version_36,
+        restored_version_37,
         restored_without_mode,
         restored,
         source,
@@ -3524,7 +3860,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 37
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 38
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0
@@ -3557,6 +3893,9 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
         "filter_tau_us": 100.0,
     }
     assert upgraded["experiment"]["notes"] == ""
+    assert upgraded["experiment"]["iq_repetition_policy"] == (
+        gui.IQ_REPETITION_POLICY_PRESERVE
+    )
     assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
     assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
     assert upgraded["rf_readout"]["dc_measure_mode"] is False

@@ -486,12 +486,14 @@ def test_compact_preview_renders_the_applied_qcs_chassis_configuration():
 
     assert preview._pixmap.size() == QtCore.QSize(1914, 652)
     assert "M5300A slot 4 ch1" in preview.binding_label.text()
+    assert "LO 6 GHz" in preview.binding_label.text()
 
     preview.set_configuration(_example_configuration("dc_expanded"))
     assert preview._pixmap.width() == 1914
     assert preview._pixmap.height() >= 652
     assert _pixmap_png(preview._pixmap) != baseline_png
     assert "M5300A slot 8 ch1" in preview.binding_label.text()
+    assert "LO 5.8 GHz" in preview.binding_label.text()
     preview.close()
 
 
@@ -1010,6 +1012,185 @@ def test_focused_m5300_sma_requests_required_lo(monkeypatch, tmp_path):
     assert mapping["virtual_name"] == "rf_drive"
     assert mapping["lo_frequency_hz"] == pytest.approx(6.25e9)
     assert (mapping["slot"], mapping["channel"]) == (3, 1)
+    control.close()
+
+
+def test_m5300_lo_setter_emits_one_canonical_mapper_change(tmp_path):
+    _application()
+    mapper_path = tmp_path / "saved_mapper.qcs"
+    mapper_path.write_bytes(b"saved M5300 mapper")
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": _example_configuration(
+                "lab_baseline"
+            ),
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_SAVED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        },
+        output_count=2,
+    )
+    changes = []
+    control.m5300_lo_frequency_changed.connect(
+        lambda *args: changes.append(args)
+    )
+
+    assert control.set_m5300_lo_frequency(4, 1, 6.5e9) is True
+    assert changes == [("rf", 0, 4, 1, 6.5e9)]
+    mapping = next(
+        mapping
+        for mapping in control.working_configuration()["channel_mappings"]
+        if mapping["role"] == "rf" and mapping["logical_index"] == 0
+    )
+    assert mapping["lo_frequency_hz"] == pytest.approx(6.5e9)
+    assert (
+        control._configuration_state
+        == front_panel.QCS_HARDWARE_STATE_DRAFT
+    )
+    assert control._mapper_file_sha256 is None
+
+    # Reapplying the canonical value is a successful no-op and must not
+    # schedule a second native mapper write.
+    assert control.set_m5300_lo_frequency(4, 1, 6.5e9) is True
+    assert changes == [("rf", 0, 4, 1, 6.5e9)]
+    control.close()
+
+
+def test_right_click_m5300_sma_prompts_with_current_lo(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    configuration = _example_configuration("lab_baseline")
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(tmp_path / "mapper.qcs"),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+        },
+        output_count=2,
+    )
+    control.resize(1200, 720)
+    control.show()
+    control.show_front_panel()
+    app.processEvents()
+    prompts = []
+    changes = []
+
+    def fake_get_double(*args):
+        prompts.append(args)
+        return 6.75, True
+
+    monkeypatch.setattr(
+        QtWidgets.QInputDialog,
+        "getDouble",
+        fake_get_double,
+    )
+    control.m5300_lo_frequency_changed.connect(
+        lambda *args: changes.append(args)
+    )
+    source_x = (
+        chassis_renderer.DEFAULT_CHASSIS_LEFT_MARGIN
+        + 3 * chassis_renderer.DEFAULT_SLOT_WIDTH
+        + 185 * 2 * chassis_renderer.DEFAULT_SLOT_WIDTH / 600
+    )
+    source_y = (
+        chassis_renderer.DEFAULT_CHASSIS_HEADER_HEIGHT
+        + chassis_renderer.DEFAULT_CHASSIS_SLOT_LABEL_HEIGHT
+        + 285 * chassis_renderer.DEFAULT_PANEL_HEIGHT / 1300
+    )
+    connector = chassis_renderer.qcs_chassis_connector_at_point(
+        configuration,
+        source_x,
+        source_y,
+        role="rf",
+    )
+    assert (connector["slot"], connector["channel"]) == (4, 1)
+    displayed = control.reference_label.pixmap()
+    click_position = QtCore.QPoint(
+        round(source_x * displayed.width() / control._image_pixmap.width()),
+        round(source_y * displayed.height() / control._image_pixmap.height()),
+    )
+
+    QtTest.QTest.mouseClick(
+        control.reference_label,
+        QtCore.Qt.RightButton,
+        pos=click_position,
+    )
+    app.processEvents()
+
+    assert len(prompts) == 1
+    assert prompts[0][3] == pytest.approx(6.0)
+    assert changes == [("rf", 0, 4, 1, 6.75e9)]
+    assert "6.75 GHz" in control.status.text()
+    control.close()
+    app.processEvents()
+
+
+def test_imported_mapper_rejects_m5300_lo_change_without_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    _application()
+    mapper_path = tmp_path / "imported.qcs"
+    mapper_path.write_bytes(b"third-party mapper")
+    configuration = _example_configuration("lab_baseline")
+    control = front_panel.QcsFrontPanelControl()
+    control.set_settings(
+        {
+            "mapper_path": str(mapper_path),
+            "dc_channel_names": ["gate_left", "gate_right"],
+            "rf_channel_names": {
+                "0": "qubit_drive",
+                "1": "readout_drive",
+            },
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_IMPORTED
+            ),
+            "hardware_mapper_sha256": (
+                front_panel.qcs_mapper_file_sha256(mapper_path)
+            ),
+        },
+        output_count=2,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QInputDialog,
+        "getDouble",
+        lambda *_args: pytest.fail(
+            "read-only imported mapper must not open an LO editor"
+        ),
+    )
+    changes = []
+    control.m5300_lo_frequency_changed.connect(
+        lambda *args: changes.append(args)
+    )
+
+    assert control._prompt_m5300_lo_frequency(4, 1) is False
+    assert control.set_m5300_lo_frequency(4, 1, 6.5e9) is False
+    assert changes == []
+    assert "imported" in control.status.text().lower()
+    assert control.working_configuration() == (
+        front_panel.normalize_qcs_hardware_configuration(configuration)
+    )
     control.close()
 
 
@@ -3236,6 +3417,83 @@ def test_rf_output_front_panel_sma_selection_auto_applies(
     window.close()
 
 
+def test_rf_output_lo_editor_persists_mapper_and_updates_shared_preview(
+    monkeypatch,
+    tmp_path,
+):
+    app = _application()
+    monkeypatch.setattr(
+        front_panel,
+        "build_qcs_channel_mapper",
+        lambda configuration: object(),
+    )
+    automatic_mapper = tmp_path / "automatic_rf_lo_mapper.qcs"
+
+    def fake_save(_configuration, path):
+        output_path = Path(path)
+        output_path.write_bytes(b"automatic RF LO mapper")
+        return output_path.resolve()
+
+    monkeypatch.setattr(front_panel, "save_qcs_channel_mapper", fake_save)
+    monkeypatch.setattr(
+        front_panel.QcsFrontPanelControl,
+        "_automatic_mapper_output_path",
+        lambda _self, _configuration: automatic_mapper,
+    )
+    window = gui.MainWindow()
+    window.show()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_only",),
+        {0: "rf_drive"},
+        None,
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "dc_channel_names": ["dc_only"],
+            "rf_channel_names": {"0": "rf_drive"},
+            "acquisition_channel_name": None,
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+            "hardware_mapper_sha256": None,
+        }
+    )
+    window._qcs_front_panel_source_snapshot = (
+        window._current_qcs_front_panel_source_snapshot()
+    )
+    assert window._apply_qcs_front_panel_settings(payload) is True
+    rf_output = window._rf_ports_panel._panels[0]
+    window._control_tabs.setCurrentWidget(window._awg_tuning_page)
+    window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+    app.processEvents()
+
+    rf_output.qcs_lo_frequency_ghz.setValue(6.5)
+    rf_output.apply_qcs_lo_frequency.click()
+    _wait_for_qcs_mapper_commit(window)
+
+    saved = experiment.qcs_settings_dict()
+    rf_mapping = next(
+        mapping
+        for mapping in saved["hardware_configuration"]["channel_mappings"]
+        if mapping["role"] == "rf" and mapping["logical_index"] == 0
+    )
+    assert rf_mapping["lo_frequency_hz"] == pytest.approx(6.5e9)
+    assert saved["hardware_configuration_state"] == (
+        front_panel.QCS_HARDWARE_STATE_SAVED
+    )
+    assert saved["hardware_mapper_sha256"] == (
+        front_panel.qcs_mapper_file_sha256(automatic_mapper)
+    )
+    assert automatic_mapper.is_file()
+    assert rf_output.qcs_lo_frequency_ghz.value() == pytest.approx(6.5)
+    assert "6.5 GHz" in rf_output.qcs_lo_frequency_status.text()
+    window.close()
+
+
 def test_stability_same_sma_draft_retries_automatic_mapper_save(
     monkeypatch,
     tmp_path,
@@ -4671,7 +4929,7 @@ def test_external_qcs_source_change_discards_pending_identified_draft(
     app.processEvents()
 
 
-def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
+def test_auxiliary_qcs_panels_follow_settings_and_enable_qcs_sparameter(
     monkeypatch,
 ):
     app = _application()
@@ -4760,7 +5018,8 @@ def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
     # for the backend-independent two-electrode requirement.
     assert window._stability_panel.start_button.isEnabled() is False
     assert window._stability_panel.single_shot_button.isEnabled() is False
-    assert window._sparameter_panel.run_button.isEnabled() is False
+    assert window._sparameter_panel.run_button.isEnabled() is True
+    assert window._sparameter_panel.qcs_amplitude.isHidden() is False
     assert window._calibration_panel.run_output_button.isEnabled() is False
     assert window._calibration_panel.run_input_button.isEnabled() is False
     assert (
@@ -4769,16 +5028,25 @@ def test_auxiliary_qcs_panels_follow_experiment_settings_and_guard_qick_runs(
     assert window._noise_panel.acquire_button.isEnabled() is False
 
     notices = []
+    warnings = []
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "information",
         lambda _parent, title, message: notices.append((title, message)),
     )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
     window._run_sparameter_sweep()
     window._run_noise_acquisition(None)
     window._run_power_calibration("output")
-    assert len(notices) == 3
+    assert len(notices) == 2
     assert all("still uses QICK" in message for _title, message in notices)
+    assert warnings
+    assert warnings[0][0] == "Cannot run RF sweep"
+    assert "incomplete" in warnings[0][1]
     assert window._experiment_thread is None
 
     window.close()
@@ -4936,14 +5204,16 @@ def test_sparameter_qcs_hides_qick_only_controls_and_restores_them():
     assert panel.gain_label.isVisible() is False
     assert panel.output_power_dbm.isVisible() is False
     assert panel.output_power_label.isVisible() is False
+    assert panel.qcs_amplitude.isVisible() is True
     assert panel.override_fpga_trigger_delay.isEnabled() is False
-    assert panel.run_button.isEnabled() is False
+    assert panel.run_button.isEnabled() is True
     assert panel.scan_time_label.text() == "Requested integration duration:"
     assert all(
         term not in panel.path_hint.text()
         for term in ("HWH", "Nyquist", "board selection")
     )
     qcs_settings = panel.settings_dict()
+    assert qcs_settings["qcs_amplitude"] == pytest.approx(0.005)
     assert qcs_settings["gain"] == 12_345
     assert qcs_settings["output_power_dbm"] == pytest.approx(-12.5)
     assert qcs_settings["margin_input_samples"] == 2_048
@@ -4968,6 +5238,7 @@ def test_sparameter_qcs_hides_qick_only_controls_and_restores_them():
     assert panel.gain_label.isVisible() is True
     assert panel.output_power_dbm.isVisible() is True
     assert panel.output_power_label.isVisible() is True
+    assert panel.qcs_amplitude.isVisible() is False
     assert panel.override_fpga_trigger_delay.isEnabled() is True
     assert panel.scan_time_label.text() == "Scan time per point:"
     assert panel.gain.value() == 12_345

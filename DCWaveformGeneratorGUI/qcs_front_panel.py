@@ -2332,6 +2332,14 @@ class QcsFrontPanelPreview(QtWidgets.QFrame):
             f"{mapping['virtual_name']}  |  {model} slot "
             f"{int(mapping['slot'])} ch{int(mapping['channel'])}"
         )
+        if self._role == "rf" and model == "M5300A":
+            lo_frequency_hz = mapping.get("lo_frequency_hz")
+            lo_text = (
+                "LO unset"
+                if lo_frequency_hz is None
+                else f"LO {float(lo_frequency_hz) / 1.0e9:.6g} GHz"
+            )
+            binding_text += f"  |  {lo_text}"
         if self._role == "acquisition":
             link = next(
                 (
@@ -2547,6 +2555,13 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
 
     identify_requested = QtCore.pyqtSignal(str)
     connector_selected = QtCore.pyqtSignal(str, int, int, int, bool)
+    m5300_lo_frequency_changed = QtCore.pyqtSignal(
+        str,
+        int,
+        int,
+        int,
+        float,
+    )
     draft_staged = QtCore.pyqtSignal(object)
     settings_applied = QtCore.pyqtSignal(object)
     mapper_saved = QtCore.pyqtSignal(str)
@@ -3493,6 +3508,176 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         except (TypeError, ValueError):
             return False
 
+    def _mapping_row_for_address(
+        self,
+        slot: int,
+        channel: int,
+    ) -> Optional[int]:
+        """Return the unique virtual mapping bound to one physical address."""
+
+        expected = int(slot), int(channel)
+        for row in range(self.mapping_table.rowCount()):
+            address = (
+                int(self.mapping_table.cellWidget(row, 6).value()),
+                int(self.mapping_table.cellWidget(row, 7).value()),
+            )
+            if address == expected:
+                return row
+        return None
+
+    def set_m5300_lo_frequency(
+        self,
+        slot: int,
+        channel: int,
+        lo_frequency_hz: float,
+    ) -> bool:
+        """Set one mapped M5300 SMA LO and request native mapper persistence.
+
+        m5300_lo_frequency_changed is emitted exactly once after a real value
+        change. Its arguments are role, logical index, slot, channel, and
+        frequency in Hz, allowing the owning window to reuse the same
+        asynchronous mapper-save path as a connector selection.
+        """
+
+        if not self.tabs.isEnabled():
+            return False
+        slot = _positive_integer(slot, "QCS M5300 slot")
+        channel = _positive_integer(channel, "QCS M5300 channel")
+        lo_frequency_hz = float(lo_frequency_hz)
+        if (
+            not isfinite(lo_frequency_hz)
+            or not 0.0 <= lo_frequency_hz <= 18.0e9
+        ):
+            raise ValueError("M5300 LO frequency must be in [0, 18] GHz")
+        if self._module_models_by_slot.get(slot) != "M5300A":
+            self._set_status(
+                f"Slot {slot} does not contain an M5300A RF AWG.",
+                error=True,
+            )
+            return False
+        row = self._mapping_row_for_address(slot, channel)
+        if row is None:
+            self._set_status(
+                f"M5300A slot {slot} CH{channel} has no virtual-channel "
+                "mapping. Map this SMA to an RF output before setting its "
+                "LO frequency.",
+                error=True,
+            )
+            return False
+        if not self._mapper_write_allowed:
+            self._set_status(
+                "The M5300 LO cannot be changed in an imported third-party "
+                "mapper because the editor cannot safely preserve all of "
+                "its native settings. Restore the diagram layout and save "
+                "an app-owned mapper first.",
+                error=True,
+            )
+            return False
+
+        lo_widget = self.mapping_table.cellWidget(row, 5)
+        old_text = lo_widget.text().strip()
+        old_frequency_hz = (
+            None if not old_text else float(old_text) * 1.0e9
+        )
+        if (
+            old_frequency_hz is not None
+            and abs(old_frequency_hz - lo_frequency_hz) <= 0.5
+        ):
+            self._set_status(
+                f"M5300A slot {slot} CH{channel} already uses "
+                f"{lo_frequency_hz / 1.0e9:.12g} GHz LO.",
+                error=False,
+            )
+            self._refresh_reference_preview()
+            return True
+
+        with QtCore.QSignalBlocker(lo_widget):
+            lo_widget.setText(f"{lo_frequency_hz / 1.0e9:.12g}")
+        configuration = self.working_configuration()
+        self._configuration_state = self._effective_configuration_state(
+            configuration,
+            self.mapper_path.text().strip(),
+        )
+        if self._configuration_state not in {
+            QCS_HARDWARE_STATE_SAVED,
+            QCS_HARDWARE_STATE_IMPORTED,
+        }:
+            self._mapper_file_sha256 = None
+        self.mapping_table.selectRow(row)
+        self._preview_refresh_timer.stop()
+        self._refresh_reference_preview()
+        role = str(self.mapping_table.cellWidget(row, 0).currentData())
+        logical_index = int(
+            self.mapping_table.cellWidget(row, 1).value()
+        )
+        self._set_status(
+            f"Set M5300A slot {slot} CH{channel} LO to "
+            f"{lo_frequency_hz / 1.0e9:.12g} GHz. Regenerating the native "
+            "QCS mapper automatically...",
+            error=False,
+        )
+        self.m5300_lo_frequency_changed.emit(
+            role,
+            logical_index,
+            slot,
+            channel,
+            lo_frequency_hz,
+        )
+        return True
+
+    def _prompt_m5300_lo_frequency(
+        self,
+        slot: int,
+        channel: int,
+    ) -> bool:
+        """Prompt once for the LO of a mapped M5300 front-panel SMA."""
+
+        if self._module_models_by_slot.get(int(slot)) != "M5300A":
+            return False
+        row = self._mapping_row_for_address(slot, channel)
+        if row is None:
+            self._set_status(
+                f"M5300A slot {int(slot)} CH{int(channel)} has no "
+                "virtual-channel mapping. Map this SMA to an RF output "
+                "before setting its LO frequency.",
+                error=True,
+            )
+            return False
+        if not self._mapper_write_allowed:
+            self._set_status(
+                "The M5300 LO cannot be changed in an imported third-party "
+                "mapper. Restore the diagram layout and save an app-owned "
+                "mapper first.",
+                error=True,
+            )
+            return False
+        lo_text = self.mapping_table.cellWidget(row, 5).text().strip()
+        current_ghz = 5.0 if not lo_text else float(lo_text)
+        lo_frequency_ghz, accepted = QtWidgets.QInputDialog.getDouble(
+            self,
+            "M5300 RF Output LO",
+            (
+                f"M5300A slot {int(slot)} CH{int(channel)} local-oscillator "
+                "frequency [GHz]:"
+            ),
+            current_ghz,
+            0.0,
+            18.0,
+            9,
+        )
+        if not accepted:
+            self._set_status(
+                f"M5300A slot {int(slot)} CH{int(channel)} LO change was "
+                "cancelled.",
+                error=False,
+            )
+            return False
+        return self.set_m5300_lo_frequency(
+            slot,
+            channel,
+            float(lo_frequency_ghz) * 1.0e9,
+        )
+
     def configure_m5201_route(
         self,
         *,
@@ -3751,7 +3936,10 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             reference_label is not None
             and watched is reference_label
             and event.type() == QtCore.QEvent.MouseButtonRelease
-            and event.button() == QtCore.Qt.LeftButton
+            and event.button() in (
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.RightButton,
+            )
             and self.tabs.isEnabled()
             and not self._image_pixmap.isNull()
         ):
@@ -3772,6 +3960,30 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                     * self._image_pixmap.height()
                     / displayed.height()
                 )
+                if event.button() == QtCore.Qt.RightButton:
+                    configuration = (
+                        self._preview_configuration_from_widgets()
+                    )
+                    connector = (
+                        None
+                        if configuration is None
+                        else qcs_chassis_connector_at_point(
+                            configuration,
+                            source_x,
+                            source_y,
+                            role="rf",
+                        )
+                    )
+                    if (
+                        connector is not None
+                        and connector.get("model") == "M5300A"
+                    ):
+                        self._prompt_m5300_lo_frequency(
+                            int(connector["slot"]),
+                            int(connector["channel"]),
+                        )
+                        return True
+                    return super().eventFilter(watched, event)
                 if self._focused_mapping is not None:
                     configuration = (
                         self._preview_configuration_from_widgets()

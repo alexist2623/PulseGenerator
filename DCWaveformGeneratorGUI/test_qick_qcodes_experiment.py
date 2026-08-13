@@ -33,6 +33,8 @@ from qick_qcodes_experiment import (
     DEFAULT_AWG_METADATA_MODE,
     I_TRACE_PARAMETER,
     IQ_TRACE_PARAMETER,
+    IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+    IQ_REPETITION_POLICY_PRESERVE,
     Q_TRACE_PARAMETER,
     SAMPLE_INDEX_PARAMETER,
     QCODES_STAGING_ENV,
@@ -50,6 +52,7 @@ from qick_qcodes_experiment import (
     connect_qick,
     load_qick_iq_arrays,
     normalize_compile_validation_mode,
+    normalize_iq_repetition_policy,
     run_qick_qcodes_experiment,
     store_experiment_result,
     store_qick_result,
@@ -76,6 +79,41 @@ def test_compile_validation_mode_normalization():
     )
     with pytest.raises(ValueError, match="compile validation mode"):
         normalize_compile_validation_mode("sampled")
+
+
+def test_iq_repetition_policy_normalization():
+    assert normalize_iq_repetition_policy(" PRESERVE ") == (
+        IQ_REPETITION_POLICY_PRESERVE
+    )
+    assert normalize_iq_repetition_policy("COHERENT_AVERAGE") == (
+        IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    with pytest.raises(ValueError, match="IQ repetition policy"):
+        normalize_iq_repetition_policy("magnitude_average")
+
+
+def test_qick_run_rejects_coherent_average_trace_before_connecting(tmp_path):
+    sequence = FineTuneSequence(("awg_0",)).add_set("gate", (0.0,), 10)
+
+    def unexpected_connector(*_args, **_kwargs):
+        raise AssertionError("QICK connection must not start for invalid storage")
+
+    with pytest.raises(
+        ValueError,
+        match="requires a single-I/Q acquisition",
+    ):
+        run_qick_qcodes_experiment(
+            connection_config=QickConnectionConfig("host", 8888, "proxy"),
+            run_config=QcodesRunConfig(str(tmp_path / "unused.db")),
+            sequence=sequence,
+            awg_channels=(0,),
+            repetitions_per_sweep=2,
+            rf_specs=(),
+            readout_spec=QickDdrReadoutSpec(0, "gate", 0.0, 2),
+            gui_settings={},
+            iq_repetition_policy=IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+            connector=unexpected_connector,
+        )
 
 
 def test_sweep_parameter_names_preserve_rf_duration_units():
@@ -374,6 +412,13 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert metadata["measurement_layout"]["awg_vertex_shape"] == [2, 2, 2]
     assert "awg_waveform_vertices" not in metadata["gui_settings"]
     layout = metadata["measurement_layout"]
+    assert layout["iq_repetition_policy"] == IQ_REPETITION_POLICY_PRESERVE
+    assert layout["acquired_iq_shape"] == [2, 2, 3, 2]
+    assert layout["stored_iq_shape"] == [2, 2, 3, 2]
+    assert layout["acquired_repetition_count"] == 2
+    assert layout["stored_repetition_count"] == 2
+    assert layout["acquired_iq_value_count"] == 12
+    assert layout["stored_iq_value_count"] == 12
     assert layout["sample_period_us"] == 1.0
     assert layout["storage_format"] == "qcodes_split_array_per_trace_v3"
     assert layout["iq_trace_parameters"] == {
@@ -454,6 +499,96 @@ def test_store_experiment_result_uses_qcs_metadata_names(
     }
     assert "qick_connection" not in metadata
     assert metadata["program_summary"] == {"program_layers": 4}
+
+
+def test_store_experiment_result_coherently_averages_integrated_iq_repetitions(
+    tmp_path,
+    monkeypatch,
+):
+    """One saved I/Q scalar per point retains the established loader shape."""
+
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
+    axis = AmplitudeSweep("set_1", "awg_0", -0.5, 0.5, 2)
+    acquired_iq = np.asarray(
+        [
+            [[[1.0, 10.0]], [[3.0, 14.0]], [[8.0, 18.0]]],
+            [[[-9.0, 4.0]], [[0.0, -2.0]], [[3.0, 1.0]]],
+        ]
+    )
+    acquired = FineTuneDdrResult(
+        sweep_points=np.asarray([-0.5, 0.5]),
+        iq=acquired_iq,
+        sweep_axes=(axis,),
+        sweep_shape=(2,),
+        cross_capacitance=np.eye(1),
+    )
+
+    dataset, row_count = store_experiment_result(
+        acquired,
+        run_config=QcodesRunConfig(
+            str(tmp_path / "qcs_averaged_iq.db"),
+            experiment_name="QCS integrated IQ averaging",
+            sample_name="simulated QCS",
+        ),
+        connection_config={"mapper_path": "simulated.qcs"},
+        program_summary={"repetitions_per_sweep": 3},
+        gui_settings=_gui_metadata(),
+        rf_settings={},
+        backend_name="qcs",
+        iq_repetition_policy=IQ_REPETITION_POLICY_COHERENT_AVERAGE,
+    )
+
+    expected = acquired_iq.mean(axis=1, keepdims=True)
+    loaded = load_qick_iq_arrays(dataset, backend_name="qcs")
+    assert row_count == 2
+    assert loaded["iq"].shape == (2, 1, 1, 2)
+    np.testing.assert_allclose(loaded["iq"], expected)
+    np.testing.assert_array_equal(loaded["repetition_index"], [[0], [0]])
+
+    i_data = dataset.get_parameter_data(I_TRACE_PARAMETER)[I_TRACE_PARAMETER]
+    q_data = dataset.get_parameter_data(Q_TRACE_PARAMETER)[Q_TRACE_PARAMETER]
+    assert i_data[I_TRACE_PARAMETER].shape == (2, 1)
+    assert q_data[Q_TRACE_PARAMETER].shape == (2, 1)
+    np.testing.assert_allclose(
+        i_data[I_TRACE_PARAMETER][:, 0], expected[:, 0, 0, 0]
+    )
+    np.testing.assert_allclose(
+        q_data[Q_TRACE_PARAMETER][:, 0], expected[:, 0, 0, 1]
+    )
+
+    metadata = json.loads(dataset.get_metadata("qcs_experiment_json"))
+    layout = metadata["measurement_layout"]
+    assert layout["iq_repetition_policy"] == (
+        IQ_REPETITION_POLICY_COHERENT_AVERAGE
+    )
+    assert layout["acquired_iq_shape"] == [2, 3, 1, 2]
+    assert layout["stored_iq_shape"] == [2, 1, 1, 2]
+    assert layout["iq_shape"] == layout["stored_iq_shape"]
+    assert layout["acquired_repetition_count"] == 3
+    assert layout["stored_repetition_count"] == 1
+    assert layout["acquired_iq_value_count"] == 6
+    assert layout["stored_iq_value_count"] == 2
+
+
+def test_coherent_average_repetition_storage_rejects_sampled_traces(
+    tmp_path,
+):
+    with pytest.raises(
+        ValueError,
+        match="requires exactly one integrated I/Q value per repetition",
+    ):
+        store_qick_result(
+            _ddr_result(),
+            run_config=QcodesRunConfig(str(tmp_path / "must_not_exist.db")),
+            connection_config=QickConnectionConfig(),
+            program_summary={},
+            gui_settings=_gui_metadata(),
+            rf_settings={},
+            iq_repetition_policy=(
+                IQ_REPETITION_POLICY_COHERENT_AVERAGE
+            ),
+        )
+    assert not (tmp_path / "must_not_exist.db").exists()
 
 
 def test_store_qick_result_converts_dc_input_iq_to_current(

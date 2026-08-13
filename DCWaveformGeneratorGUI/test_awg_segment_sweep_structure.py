@@ -650,6 +650,58 @@ def test_deleting_preceding_segment_keeps_sweep_visible_and_in_experiment():
     window.close()
 
 
+def test_selected_sweep_editor_follows_target_through_insert_delete():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.1, 0.1, 3),
+        QickSweepSpec("set_3", "awg_0", -0.2, 0.2, 5),
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+    experiment = window._experiment_panel
+    experiment.sweep_parameter_table.selectRow(1)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_3"
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._edit_segment_structure("insert_above", 2)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_4"
+    assert experiment.sweep_parameter_table.currentRow() == 1
+
+    assert control._edit_segment_structure("delete", 2)
+    app.processEvents()
+    assert experiment.sweep_parameter_target.text() == "awg_0 / set_3"
+    assert experiment.sweep_parameter_table.currentRow() == 1
+    window.close()
+
+
+def test_acquisition_anchor_remaps_and_target_deletion_disables_capture():
+    app = _application()
+    window = gui.MainWindow()
+    _add_segments(window, 3)
+    readout = window._rf_readout_panel
+    readout.segment.setCurrentIndex(readout.segment.findData("set_3"))
+    readout.setChecked(True)
+    readout._emit_spec()
+    assert window._ddr_readout_spec.segment_name == "set_3"
+
+    control = window._multi_ctrl._ctrl_pannels[0]
+    assert control._edit_segment_structure("insert_above", 2)
+    app.processEvents()
+    assert readout.isChecked()
+    assert readout.segment.currentData() == "set_4"
+    assert window._ddr_readout_spec.segment_name == "set_4"
+
+    assert control._edit_segment_structure("delete", 4)
+    app.processEvents()
+    assert not readout.isChecked()
+    assert readout.segment.currentData() == "set_3"
+    assert window._ddr_readout_spec is None
+    window.close()
+
+
 def test_insert_below_preceding_row_keeps_sweep_on_original_segment():
     app = _application()
     window = gui.MainWindow()

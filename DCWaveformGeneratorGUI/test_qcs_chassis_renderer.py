@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import pytest
 
 import qcs_chassis_renderer as renderer
@@ -82,6 +82,31 @@ def _configuration() -> dict:
             }
         ],
     }
+
+
+def test_mapping_footer_reports_m5300_lo_frequency():
+    configuration = _configuration()
+    image = Image.new("RGB", (1, 1))
+    rows = renderer._mapping_rows(
+        ImageDraw.Draw(image),
+        configuration["modules"],
+        configuration["channel_mappings"],
+        configuration["downconverter_links"],
+        content_width=10000,
+        font=ImageFont.load_default(),
+        scale=1,
+    )
+    labels = [label for row in rows for label, _role, _width in row]
+
+    assert any(
+        "rf_drive" in label and "LO 6.25 GHz" in label
+        for label in labels
+    )
+    assert all(
+        "LO" not in label
+        for label in labels
+        if "dc_left" in label
+    )
 
 
 def test_finalized_physical_panel_assets_are_loaded_as_exact_png_bytes():
