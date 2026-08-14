@@ -81,6 +81,11 @@ try:
         quantize_qcs_stability_integration_duration,
     )
     from .hardware_front_panel import HardwareFrontPanelPreview
+    from .qcs_front_panel import (
+        qcs_mapper_file_sha256,
+        save_qcs_channel_mapper,
+        scoped_qcs_hardware_configuration,
+    )
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
     import qcs_qcodes_experiment as _qcs_qcodes_backend
@@ -137,6 +142,11 @@ except ImportError:
         quantize_qcs_stability_integration_duration,
     )
     from hardware_front_panel import HardwareFrontPanelPreview
+    from qcs_front_panel import (
+        qcs_mapper_file_sha256,
+        save_qcs_channel_mapper,
+        scoped_qcs_hardware_configuration,
+    )
     from sparameter_gui import RfPathCorrectionWidget
 
 
@@ -149,6 +159,9 @@ QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_SAMPLES = int(
 )
 QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_DURATION_S = float(
     QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S
+)
+DEFAULT_QCS_RF_POWER_CALIBRATION_DB_PATH = str(
+    Path.home() / "gain_pwr_calb.db"
 )
 QCS_STABILITY_INTER_SEGMENT_DELAY_S = float(
     getattr(
@@ -1202,6 +1215,12 @@ def default_stability_settings(
         "fpga_trigger_delay_us": None,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
         "modulation_gain": DEFAULT_STABILITY_MODULATION_GAIN,
+        "qcs_power_calibration_enabled": False,
+        "qcs_power_calibration_database_path": (
+            DEFAULT_QCS_RF_POWER_CALIBRATION_DB_PATH
+        ),
+        "qcs_power_calibration_run_id": 0,
+        "qcs_target_output_power_dbm": -20.0,
         "bias_t_compensation": {
             "enabled": False,
             "type": "dc",
@@ -1356,6 +1375,49 @@ def normalize_stability_settings(
     )
     if normalized["modulation_gain"] > 32767:
         raise ValueError("stability modulation gain must not exceed 32767")
+    qcs_power_calibration_enabled = settings.get(
+        "qcs_power_calibration_enabled",
+        defaults["qcs_power_calibration_enabled"],
+    )
+    if not isinstance(qcs_power_calibration_enabled, (bool, np.bool_)):
+        raise TypeError(
+            "stability QCS RF power calibration enabled must be boolean"
+        )
+    qcs_power_calibration_database_path = str(
+        settings.get(
+            "qcs_power_calibration_database_path",
+            defaults["qcs_power_calibration_database_path"],
+        )
+    ).strip()
+    if (
+        qcs_power_calibration_enabled
+        and not qcs_power_calibration_database_path
+    ):
+        raise ValueError(
+            "stability QCS RF power calibration database path must not be "
+            "empty"
+        )
+    normalized["qcs_power_calibration_enabled"] = bool(
+        qcs_power_calibration_enabled
+    )
+    normalized["qcs_power_calibration_database_path"] = (
+        qcs_power_calibration_database_path
+    )
+    normalized["qcs_power_calibration_run_id"] = _integer(
+        settings.get(
+            "qcs_power_calibration_run_id",
+            defaults["qcs_power_calibration_run_id"],
+        ),
+        "stability QCS RF power calibration record ID",
+        0,
+    )
+    normalized["qcs_target_output_power_dbm"] = _finite_float(
+        settings.get(
+            "qcs_target_output_power_dbm",
+            defaults["qcs_target_output_power_dbm"],
+        ),
+        "stability QCS target RF output power",
+    )
     raw_bias_t = settings.get(
         "bias_t_compensation",
         defaults["bias_t_compensation"],
@@ -2109,18 +2171,50 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
         mapper = kwargs.pop("mapper", None)
         executor = kwargs.pop("executor", None)
         compiled = kwargs.pop("compiled", None)
+        mapper_configuration = kwargs.pop("mapper_configuration", None)
         if kwargs:
             raise TypeError(
                 "unexpected QCS Stability worker argument(s): "
                 + ", ".join(sorted(kwargs))
             )
 
-        self.progress_changed.emit(1, "Loading QCS ChannelMapper")
+        self.progress_changed.emit(1, "Preparing Stability QCS ChannelMapper")
         if mapper is None:
+            mapper_path = Path(connection_config.mapper_path).expanduser()
+            if mapper_configuration is not None:
+                mapper_created = False
+                if not mapper_path.is_file():
+                    saved_mapper_path = save_qcs_channel_mapper(
+                        mapper_configuration,
+                        mapper_path,
+                        qcs_module=qcs_module,
+                    )
+                    mapper_path = Path(saved_mapper_path)
+                    mapper_created = True
+                if mapper_created or connection_config.mapper_sha256 is None:
+                    connection_config = replace(
+                        connection_config,
+                        mapper_path=str(mapper_path.resolve()),
+                        mapper_sha256=qcs_mapper_file_sha256(mapper_path),
+                    )
+            self.progress_changed.emit(2, "Loading Stability QCS ChannelMapper")
             mapper = load_qcs_channel_mapper(
                 connection_config,
                 qcs_module=qcs_module,
             )
+        if gui_settings is not None and connection_config.mapper_sha256:
+            gui_settings = dict(gui_settings)
+            stored_qcs_settings = dict(gui_settings.get("qcs", {}))
+            stored_qcs_settings.update(
+                {
+                    "mapper_path": connection_config.mapper_path,
+                    "hardware_configuration_state": "saved",
+                    "hardware_mapper_sha256": (
+                        connection_config.mapper_sha256
+                    ),
+                }
+            )
+            gui_settings["qcs"] = stored_qcs_settings
         if compiled is None:
             averaging_plan = plan_qcs_total_iq_averaging(
                 acquisition.duration_s,
@@ -3186,6 +3280,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._hardware_backend = "qick"
+        self._qcs_front_panel_configuration = None
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         self.controls_scroll = QtWidgets.QScrollArea(self)
@@ -3380,6 +3475,80 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "QCS RF waveform amplitude relative to the configured "
             "signal-generator output range"
         )
+        self.qcs_power_calibration_group = QtWidgets.QGroupBox(
+            "M5300A 50 Ohm output-power calibration",
+            controls_content,
+        )
+        self.qcs_power_calibration_group.setCheckable(True)
+        self.qcs_power_calibration_group.setChecked(False)
+        qcs_power_calibration_form = QtWidgets.QFormLayout(
+            self.qcs_power_calibration_group
+        )
+        self.qcs_power_calibration_database_path = QtWidgets.QLineEdit(
+            DEFAULT_QCS_RF_POWER_CALIBRATION_DB_PATH,
+            self.qcs_power_calibration_group,
+        )
+        self.qcs_power_calibration_database_path.setPlaceholderText(
+            "Select the M5300A/M5200A RF-power calibration database"
+        )
+        self.browse_qcs_power_calibration = QtWidgets.QToolButton(
+            self.qcs_power_calibration_group
+        )
+        self.browse_qcs_power_calibration.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_qcs_power_calibration.setToolTip(
+            "Choose the QCS M5300A/M5200A RF-power calibration database"
+        )
+        qcs_power_database_row = QtWidgets.QHBoxLayout()
+        qcs_power_database_row.setContentsMargins(0, 0, 0, 0)
+        qcs_power_database_row.addWidget(
+            self.qcs_power_calibration_database_path,
+            1,
+        )
+        qcs_power_database_row.addWidget(self.browse_qcs_power_calibration)
+        self.qcs_power_calibration_run_id = QtWidgets.QSpinBox(
+            self.qcs_power_calibration_group
+        )
+        self.qcs_power_calibration_run_id.setRange(0, 2_147_483_647)
+        self.qcs_power_calibration_run_id.setSpecialValueText(
+            "Latest compatible"
+        )
+        self.qcs_power_calibration_run_id.setToolTip(
+            "Record ID 0 selects the newest calibration matching the exact "
+            "Stability M5300 SMA, LO frequency, and RF frequency."
+        )
+        self.qcs_target_output_power_dbm = QtWidgets.QDoubleSpinBox(
+            self.qcs_power_calibration_group
+        )
+        self.qcs_target_output_power_dbm.setRange(-200.0, 100.0)
+        self.qcs_target_output_power_dbm.setDecimals(6)
+        self.qcs_target_output_power_dbm.setSuffix(" dBm")
+        self.qcs_target_output_power_dbm.setValue(-20.0)
+        self.qcs_power_calibration_status = QtWidgets.QLabel(
+            "Enable calibration to request M5300 connector power in dBm.",
+            self.qcs_power_calibration_group,
+        )
+        self.qcs_power_calibration_status.setWordWrap(True)
+        self.qcs_power_calibration_status.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        qcs_power_calibration_form.addRow(
+            "Calibration DB:",
+            qcs_power_database_row,
+        )
+        qcs_power_calibration_form.addRow(
+            "Calibration record ID:",
+            self.qcs_power_calibration_run_id,
+        )
+        qcs_power_calibration_form.addRow(
+            "Target M5300 connector power:",
+            self.qcs_target_output_power_dbm,
+        )
+        qcs_power_calibration_form.addRow(
+            "Status:",
+            self.qcs_power_calibration_status,
+        )
         self.point_count = QtWidgets.QLabel(
             "2,601",
             self.acquisition_group,
@@ -3494,6 +3663,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Preferred,
             )
         controls.addWidget(self.acquisition_group)
+        controls.addWidget(self.qcs_power_calibration_group)
 
         self.bias_t_group = QtWidgets.QGroupBox(
             "Bias-T compensation",
@@ -3766,6 +3936,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.qcs_modulation_amplitude.valueChanged.connect(
             self._apply_qcs_modulation_amplitude
         )
+        self.qcs_power_calibration_group.toggled.connect(
+            self._update_qcs_power_calibration_controls
+        )
+        self.browse_qcs_power_calibration.clicked.connect(
+            self._browse_qcs_power_calibration_database
+        )
         self.measurement_unit.currentIndexChanged.connect(
             self._measurement_representation_changed
         )
@@ -3805,6 +3981,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
+        self._update_qcs_power_calibration_controls()
         self._update_backend_presentation()
 
     def _set_acquisition_row_visible(
@@ -3845,6 +4022,103 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.modulation_gain.setValue(gain)
         with QtCore.QSignalBlocker(self.qcs_modulation_amplitude):
             self.qcs_modulation_amplitude.setValue(gain / 32767.0)
+
+    def _browse_qcs_power_calibration_database(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose QCS M5300A output-power calibration database",
+            self.qcs_power_calibration_database_path.text().strip()
+            or DEFAULT_QCS_RF_POWER_CALIBRATION_DB_PATH,
+            "SQLite calibration database (*.db)",
+        )
+        if path:
+            self.qcs_power_calibration_database_path.setText(path)
+
+    def adopt_qcs_power_calibration(
+        self,
+        database_path: str,
+        *,
+        run_id: int = 0,
+        enable: bool = True,
+    ) -> None:
+        """Use a newly stored M5300 calibration for subsequent Stability runs."""
+
+        path = str(database_path).strip()
+        if not path:
+            raise ValueError("QCS RF power-calibration path must not be empty")
+        self.qcs_power_calibration_database_path.setText(path)
+        self.qcs_power_calibration_run_id.setValue(int(run_id))
+        self.qcs_power_calibration_group.setChecked(bool(enable))
+        self._update_qcs_power_calibration_controls()
+
+    def _update_qcs_power_calibration_controls(self, *_args) -> None:
+        enabled = bool(
+            self._hardware_backend == "qcs"
+            and self.qcs_power_calibration_group.isChecked()
+        )
+        editable = enabled and not self._running
+        for widget in (
+            self.qcs_power_calibration_database_path,
+            self.browse_qcs_power_calibration,
+            self.qcs_power_calibration_run_id,
+            self.qcs_target_output_power_dbm,
+        ):
+            widget.setEnabled(editable)
+        self.qcs_modulation_amplitude.setEnabled(
+            self._hardware_backend == "qcs"
+            and not self._running
+            and not enabled
+        )
+        if enabled:
+            self.qcs_power_calibration_status.setText(
+                "Run resolves the requested dBm to a relative amplitude "
+                "using the exact selected M5300 SMA, its LO frequency, and "
+                "the RF frequency. Frequency and power extrapolation are "
+                "rejected."
+            )
+            self.qcs_power_calibration_status.setStyleSheet(
+                "QLabel { color: #1a7f37; }"
+            )
+        else:
+            self.qcs_power_calibration_status.setText(
+                "Enable calibration to request M5300 connector power in "
+                "dBm; otherwise Relative amplitude is used directly."
+            )
+            self.qcs_power_calibration_status.setStyleSheet(
+                "QLabel { color: #4f5b66; }"
+            )
+
+    def qcs_power_calibration_values(self) -> Optional[Mapping[str, Any]]:
+        """Return one Stability-specific calibrated connector-power request."""
+
+        if not self.qcs_power_calibration_group.isChecked():
+            return None
+        selected_model = self.path_diagram.qcs_output_module_model.currentData()
+        if selected_model != "M5300A":
+            raise ValueError(
+                "Stability calibrated RF power requires an M5300A output; "
+                f"selected {selected_model or 'no mapped RF module'}"
+            )
+        database_path = (
+            self.qcs_power_calibration_database_path.text().strip()
+        )
+        if not database_path:
+            raise ValueError(
+                "Stability QCS RF power-calibration database is missing"
+            )
+        resolved_path = Path(database_path).expanduser()
+        if not resolved_path.is_file():
+            raise ValueError(
+                "Stability QCS RF power-calibration database was not found: "
+                f"{database_path}"
+            )
+        return {
+            "database_path": str(resolved_path),
+            "run_id": int(self.qcs_power_calibration_run_id.value()),
+            "target_power_dbm": float(
+                self.qcs_target_output_power_dbm.value()
+            ),
+        }
 
     def _qcs_integration_timing(
         self,
@@ -4139,6 +4413,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.qcs_modulation_amplitude,
             is_qcs,
         )
+        self.qcs_power_calibration_group.setVisible(is_qcs)
         self._set_acquisition_row_visible(self.fpga_delay_widget, not is_qcs)
         self._set_acquisition_row_visible(self.fir_profile_status, not is_qcs)
         self._set_acquisition_row_visible(self.measurement_unit, not is_qcs)
@@ -4217,6 +4492,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self._commit_qcs_integration_duration()
         else:
             self._update_qcs_integration_note()
+        self._update_qcs_power_calibration_controls()
         self._update_bias_t_controls()
 
     def _update_dc_measure_controls(self) -> None:
@@ -4607,9 +4883,89 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self,
         configuration: Mapping[str, object] | None,
     ) -> None:
+        self._qcs_front_panel_configuration = configuration
         self.path_diagram.set_qcs_front_panel_configuration(configuration)
         self.x_axis.set_qcs_front_panel_configuration(configuration)
         self.y_axis.set_qcs_front_panel_configuration(configuration)
+
+    def qcs_mapper_configuration(self) -> Mapping[str, object]:
+        """Build the native mapper recipe owned by Stability Diagram."""
+
+        configuration = self._qcs_front_panel_configuration
+        if configuration is None:
+            raise ValueError(
+                "Identify or configure the shared QCS front panel first"
+            )
+        mappings = tuple(configuration.get("channel_mappings", ()))
+        dc_mappings = sorted(
+            (
+                dict(mapping)
+                for mapping in mappings
+                if str(mapping.get("role")) == "dc"
+            ),
+            key=lambda mapping: int(mapping["logical_index"]),
+        )
+        expected_dc_indices = list(range(self.x_axis.output.count()))
+        actual_dc_indices = [
+            int(mapping["logical_index"]) for mapping in dc_mappings
+        ]
+        if actual_dc_indices != expected_dc_indices:
+            raise ValueError(
+                "Stability requires one mapped M5301 SMA for every waveform "
+                f"output; expected GUI indices {expected_dc_indices}, got "
+                f"{actual_dc_indices}"
+            )
+
+        rf_index = self.path_diagram.qcs_output_mapping_selector.currentData()
+        if rf_index is None:
+            raise ValueError("Select an M5300 RF output SMA for Stability")
+        acquisition_index = (
+            self.path_diagram.qcs_acquisition_mapping_selector.currentData()
+        )
+        if acquisition_index is None:
+            raise ValueError("Select an M5200 acquisition SMA for Stability")
+
+        def selected_mapping(role: str, logical_index: int) -> dict:
+            mapping = next(
+                (
+                    dict(candidate)
+                    for candidate in mappings
+                    if str(candidate.get("role")) == role
+                    and int(candidate.get("logical_index", -1))
+                    == int(logical_index)
+                ),
+                None,
+            )
+            if mapping is None:
+                raise ValueError(
+                    f"Stability QCS {role} channel {int(logical_index)} is "
+                    "not mapped on the shared front panel"
+                )
+            return mapping
+
+        rf_mapping = selected_mapping("rf", int(rf_index))
+        acquisition_mapping = selected_mapping(
+            "acquisition",
+            int(acquisition_index),
+        )
+        selected_digitizer_address = (
+            int(acquisition_mapping["slot"]),
+            int(acquisition_mapping["channel"]),
+        )
+        downconverter_links = tuple(
+            dict(link)
+            for link in configuration.get("downconverter_links", ())
+            if (
+                int(link["digitizer_slot"]),
+                int(link["digitizer_channel"]),
+            )
+            == selected_digitizer_address
+        )
+        return scoped_qcs_hardware_configuration(
+            configuration,
+            (*dc_mappings, rf_mapping, acquisition_mapping),
+            downconverter_links=downconverter_links,
+        )
 
     def qcs_front_panel_selection(self) -> tuple[str, int]:
         return self.path_diagram.qcs_front_panel_selection()
@@ -4749,6 +5105,18 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             ),
             "modulation_frequency_mhz": self.modulation_frequency_mhz.value(),
             "modulation_gain": self.modulation_gain.value(),
+            "qcs_power_calibration_enabled": (
+                self.qcs_power_calibration_group.isChecked()
+            ),
+            "qcs_power_calibration_database_path": (
+                self.qcs_power_calibration_database_path.text().strip()
+            ),
+            "qcs_power_calibration_run_id": (
+                self.qcs_power_calibration_run_id.value()
+            ),
+            "qcs_target_output_power_dbm": (
+                self.qcs_target_output_power_dbm.value()
+            ),
             "bias_t_compensation": {
                 "enabled": self.bias_t_group.isChecked(),
                 # Preserve the complete QICK selection across backend changes.
@@ -4855,6 +5223,29 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_gain.setValue(
             int(settings.get("modulation_gain", DEFAULT_STABILITY_MODULATION_GAIN))
         )
+        with QtCore.QSignalBlocker(self.qcs_power_calibration_group):
+            self.qcs_power_calibration_group.setChecked(
+                bool(settings.get("qcs_power_calibration_enabled", False))
+            )
+        with QtCore.QSignalBlocker(
+            self.qcs_power_calibration_database_path
+        ):
+            self.qcs_power_calibration_database_path.setText(
+                str(
+                    settings.get(
+                        "qcs_power_calibration_database_path",
+                        DEFAULT_QCS_RF_POWER_CALIBRATION_DB_PATH,
+                    )
+                )
+            )
+        with QtCore.QSignalBlocker(self.qcs_power_calibration_run_id):
+            self.qcs_power_calibration_run_id.setValue(
+                int(settings.get("qcs_power_calibration_run_id", 0))
+            )
+        with QtCore.QSignalBlocker(self.qcs_target_output_power_dbm):
+            self.qcs_target_output_power_dbm.setValue(
+                float(settings.get("qcs_target_output_power_dbm", -20.0))
+            )
         bias_t = settings.get(
             "bias_t_compensation",
             default_stability_settings()["bias_t_compensation"],
@@ -4972,6 +5363,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self._update_point_count()
         self._update_dc_measure_controls()
         self._update_bias_t_controls()
+        self._update_qcs_power_calibration_controls()
         self._update_fpga_trigger_delay_controls()
 
     def set_running(self, running: bool, message: str) -> None:
@@ -5001,6 +5393,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.modulation_frequency_mhz.setEnabled(not running)
         self.modulation_gain.setEnabled(not running)
         self.qcs_modulation_amplitude.setEnabled(not running)
+        self.qcs_power_calibration_group.setEnabled(not running)
         self.bias_t_group.setEnabled(not running)
         self.path_diagram.setEnabled(not running)
         database_enabled = not running and not self._saved_run_loading
@@ -5016,6 +5409,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         ):
             widget.setEnabled(database_enabled)
         self._update_dc_measure_controls()
+        self._update_qcs_power_calibration_controls()
         self._update_bias_t_controls()
         self.progress.setVisible(running)
         if not running:

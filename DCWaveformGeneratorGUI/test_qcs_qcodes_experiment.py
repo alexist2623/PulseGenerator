@@ -4025,6 +4025,84 @@ def test_qcs_stability_without_compensation_keeps_original_single_layer_sweep():
     assert len(arrays) == len(variables) == 2
 
 
+def test_qcs_stability_resolves_calibrated_rf_power_before_compile(
+    monkeypatch,
+):
+    request = QcsRfPowerCalibrationConfig(
+        database_path="m5300_power.db",
+        run_id=17,
+        target_power_dbm=-26.0,
+    )
+    requested_pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="set_0",
+        duration_s=100e-9,
+        amplitude=0.01,
+        frequency_hz=50e6,
+        power_calibration=request,
+    )
+    provenance = {
+        "schema": "pulse-generator-qcs-m5300-m5200-power-calibration-v1",
+        "run_id": 17,
+        "target_power_dbm": -26.0,
+        "relative_amplitude": 0.125,
+    }
+    resolved_pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="set_0",
+        duration_s=100e-9,
+        amplitude=0.125,
+        frequency_hz=50e6,
+        power_calibration=request,
+        power_calibration_provenance=provenance,
+    )
+    calls = []
+
+    def resolve_calibration(*, connection_config, mapper, rf_pulses):
+        calls.append((connection_config, mapper, tuple(rf_pulses)))
+        return (resolved_pulse,)
+
+    monkeypatch.setattr(
+        backend,
+        "resolve_qcs_rf_power_calibrations",
+        resolve_calibration,
+    )
+    connection = _connection(
+        dc_channel_names=("dc_x", "dc_y"),
+        dc_full_scale_v=1.0,
+        rf_channel_names={0: "rf_out"},
+    )
+    mapper = _Mapper("dc_x", "dc_y", "rf_out", "digitizer")
+
+    compiled = backend.compile_qcs_stability_hardware_sweep(
+        _stability_sequence(),
+        connection_config=connection,
+        mapper=mapper,
+        repetitions_per_point=1,
+        fabric_mhz=300.0,
+        source_full_scale_mv=800.0,
+        rf_pulses=(requested_pulse,),
+        acquisition=_acquisition(at_segment="set_0"),
+        qcs_module=_FakeQcs,
+    )
+
+    assert calls == [(connection, mapper, (requested_pulse,))]
+    rf_waveform = compiled.program.waveforms[2][0]
+    assert rf_waveform.kwargs["amplitude"] == pytest.approx(0.125)
+    assert compiled.programmed_rf_pulses == (
+        {
+            "gen_ch": 0,
+            "amplitude": 0.125,
+            "frequency_hz": 50e6,
+            "duration_s": pytest.approx(100e-9),
+            "delay_s": pytest.approx(0.0),
+            "elapsed_duration_s": pytest.approx(100e-9),
+            "segment_count": 1,
+            "power_calibration": provenance,
+        },
+    )
+
+
 def test_qcs_stability_hold_avoids_the_measured_direct_waveform_limit():
     # The connected QCS 2.5.5 sandbox accepts 98,304 M5301 samples but
     # rejects the next valid 16-sample increment (98,320 samples). Verify

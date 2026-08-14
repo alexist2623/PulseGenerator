@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2081,6 +2082,12 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     )
     window._stability_panel.modulation_frequency_mhz.setValue(211.0)
     window._stability_panel.trace_samples.setValue(321)
+    window._stability_panel.qcs_power_calibration_group.setChecked(True)
+    window._stability_panel.qcs_power_calibration_database_path.setText(
+        str(tmp_path / "stability_m5300_power.db")
+    )
+    window._stability_panel.qcs_power_calibration_run_id.setValue(31)
+    window._stability_panel.qcs_target_output_power_dbm.setValue(-22.75)
     window._stability_panel.bias_t_group.setChecked(True)
     window._stability_panel.bias_t_type.setCurrentIndex(
         window._stability_panel.bias_t_type.findData("filter")
@@ -2169,6 +2176,15 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert "rf_outputs" not in document["stability_diagram"]
     assert "rf_readout" not in document["stability_diagram"]
     assert document["stability_diagram"]["trace_samples_per_point"] == 321
+    assert document["stability_diagram"][
+        "qcs_power_calibration_enabled"
+    ] is True
+    assert document["stability_diagram"][
+        "qcs_power_calibration_run_id"
+    ] == 31
+    assert document["stability_diagram"][
+        "qcs_target_output_power_dbm"
+    ] == pytest.approx(-22.75)
     assert document["stability_diagram"]["bias_t_compensation"] == {
         "enabled": True,
         "type": "filter",
@@ -2191,6 +2207,18 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert restored_stability_path["readout_attenuation_db"] == 9.5
     assert restored._stability_panel.modulation_frequency_mhz.value() == 211.0
     assert restored._stability_panel.trace_samples.value() == 321
+    assert (
+        restored._stability_panel.qcs_power_calibration_group.isChecked()
+        is True
+    )
+    assert (
+        restored._stability_panel.qcs_power_calibration_run_id.value()
+        == 31
+    )
+    assert (
+        restored._stability_panel.qcs_target_output_power_dbm.value()
+        == pytest.approx(-22.75)
+    )
     assert restored._stability_panel.bias_t_group.isChecked() is True
     assert restored._stability_panel.bias_t_type.currentData() == "filter"
     assert restored._stability_panel.bias_t_filter_tau_us.value() == 42.0
@@ -2416,6 +2444,14 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     window._stability_panel.settle_time_us.setValue(25.0)
     window._stability_panel.modulation_frequency_mhz.setValue(125.0)
     window._stability_panel.qcs_modulation_amplitude.setValue(0.25)
+    calibration_path = tmp_path / "m5300_power_calibration.db"
+    calibration_path.write_bytes(b"offline calibration placeholder")
+    window._stability_panel.qcs_power_calibration_database_path.setText(
+        str(calibration_path)
+    )
+    window._stability_panel.qcs_power_calibration_run_id.setValue(29)
+    window._stability_panel.qcs_target_output_power_dbm.setValue(-18.25)
+    window._stability_panel.qcs_power_calibration_group.setChecked(True)
     window._stability_panel.bias_t_group.setChecked(True)
     window._experiment_panel.qcs_sample_rate_hz.setValue(2.0e6)
     assert window._experiment_panel.qcs_sample_rate_hz.value() == pytest.approx(
@@ -2424,15 +2460,14 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     window._experiment_panel.qick_host.clear()
     window._experiment_panel.proxy_name.clear()
     window._experiment_panel.awg_channels.setText("invalid dormant value")
-    monkeypatch.setattr(
-        window._experiment_panel,
-        "qcs_connection_values",
-        lambda _output_count: connection,
+    window._experiment_panel.qcs_dc_channel_names.setText(
+        "duplicate, duplicate"
     )
+    window._experiment_panel.qcs_rf_channel_names.setText("invalid mapping")
     monkeypatch.setattr(
-        window._experiment_panel,
-        "run_config_values",
-        lambda **_kwargs: None,
+        gui,
+        "qcs_workflow_mapper_output_path",
+        lambda _configuration, _workflow: mapper_path,
     )
     window._rf_readout_panel.qcs_trace_radio.click()
     app.processEvents()
@@ -2443,6 +2478,16 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     assert connection.hw_demod is False
     assert arguments["connection_config"].hw_demod is True
     assert arguments["connection_config"].mapper_path == connection.mapper_path
+    assert arguments["connection_config"].dc_channel_names == (
+        "dc_x",
+        "dc_y",
+    )
+    assert arguments["connection_config"].rf_channel_names == {
+        7: "rf_drive"
+    }
+    assert arguments["mapper_configuration"] == (
+        window._stability_panel.qcs_mapper_configuration()
+    )
     assert window._rf_readout_panel.qcs_trace_radio.isChecked() is True
     assert window._experiment_panel.qcs_hw_demod.isChecked() is False
     assert arguments["repetitions_per_point"] == 4
@@ -2462,6 +2507,14 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     assert arguments["rf_pulses"][0].amplitude == pytest.approx(
         window._stability_panel.qcs_modulation_amplitude.value()
     )
+    assert arguments["rf_pulses"][0].power_calibration == (
+        gui.QcsRfPowerCalibrationConfig(
+            database_path=str(calibration_path),
+            run_id=29,
+            target_power_dbm=-18.25,
+        )
+    )
+    assert window._stability_panel.qcs_modulation_amplitude.isEnabled() is False
     assert arguments["rf_pulses"][0].frequency_hz == pytest.approx(125e6)
     assert arguments["acquisition"].duration_s == pytest.approx(20e-9)
     assert arguments["acquisition"].sample_rate_hz == pytest.approx(4.8e9)
@@ -2521,8 +2574,21 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     aggregate_note = window._stability_panel.qcs_integration_note.text()
     assert "1,000 bounded QCS passes" in aggregate_note
     assert "100000 us total I/Q averaging time" in aggregate_note
-    app.processEvents()
+
+    saved_arguments = window._stability_run_arguments(save=True)
+    assert saved_arguments["gui_settings"]["qcs"][
+        "dc_channel_names"
+    ] == ["dc_x", "dc_y"]
+    assert saved_arguments["gui_settings"]["qcs"][
+        "rf_channel_names"
+    ] == {"7": "rf_drive"}
     window.close()
+    window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(
+        None,
+        QtCore.QEvent.DeferredDelete,
+    )
+    app.processEvents()
 
 
 def test_qcs_sparameter_uses_single_iq_without_changing_awg_tuning_mode(
@@ -3847,7 +3913,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 41
+    assert document["version"] == 42
     assert document["experiment"]["execution_backend"] == "qcs"
     assert document["experiment"]["iq_repetition_policy"] == (
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
@@ -4008,6 +4074,47 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
         None,
         QtCore.QEvent.DeferredDelete,
     )
+    app.processEvents()
+
+
+def test_legacy_stability_settings_adopt_existing_qcs_rf_calibration(
+    tmp_path,
+):
+    app = _application()
+    database_path = tmp_path / "m5300_calibration.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE qcs_rf_power_calibration_runs (id INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO qcs_rf_power_calibration_runs VALUES (1)"
+        )
+
+    window = gui.MainWindow()
+    document = window._settings_to_dict()
+    document["version"] = 41
+    for key in (
+        "qcs_power_calibration_enabled",
+        "qcs_power_calibration_database_path",
+        "qcs_power_calibration_run_id",
+        "qcs_target_output_power_dbm",
+    ):
+        document["stability_diagram"].pop(key, None)
+    document["calibration"]["database_path"] = str(database_path)
+
+    decoded = window._decode_settings(document)
+    migrated = decoded["stability_diagram"]
+
+    assert migrated["qcs_power_calibration_enabled"] is True
+    assert migrated["qcs_power_calibration_database_path"] == str(
+        database_path
+    )
+    assert migrated["qcs_power_calibration_run_id"] == 0
+    assert migrated["qcs_target_output_power_dbm"] == pytest.approx(-20.0)
+    window._apply_decoded_settings(decoded)
+    assert window._stability_panel.qcs_power_calibration_group.isChecked()
+    window.close()
+    window.deleteLater()
     app.processEvents()
 
 
@@ -4570,7 +4677,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 41
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 42
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

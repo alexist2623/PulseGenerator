@@ -40,6 +40,7 @@ import hashlib
 import json
 from math import isfinite
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
@@ -51,6 +52,15 @@ QCS_RF_POWER_CALIBRATION_SCHEMA = (
 )
 QCS_RF_CALIBRATION_RUN_TABLE = "qcs_rf_power_calibration_runs"
 QCS_RF_CALIBRATION_POINT_TABLE = "qcs_rf_power_calibration_points"
+QCS_RF_CALIBRATION_EXPERIMENT_NAME = (
+    "QCS M5300A RF output power calibration"
+)
+QCS_RF_CALIBRATION_CONFIG_METADATA = (
+    "QCS_M5300_RF_Power_Calibration_Config"
+)
+QCS_RF_CALIBRATION_RESULT_METADATA = (
+    "QCS_M5300_RF_Power_Calibration_Result"
+)
 REFERENCE_CALIBRATED = "reference_calibrated"
 NOMINAL_M5200_50OHM = "nominal_m5200_50ohm"
 QCS_M5200_VOLTAGE_50OHM = "qcs_m5200_voltage_50ohm"
@@ -641,9 +651,15 @@ class M5300PowerCalibration:
 @dataclass(frozen=True)
 class StoredM5300PowerCalibration:
     database_path: Path
+    # ``run_id`` intentionally remains the application-owned calibration
+    # record ID.  It is consumed by ``load_m5300_power_calibration`` and is
+    # independent of the QCoDeS run ID shown by Plottr Inspectr.
     run_id: int
+    qcodes_run_id: int
+    guid: str
     point_count: int
     calibration: M5300PowerCalibration
+    dataset: Any
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
@@ -675,7 +691,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             amplitude_min REAL NOT NULL,
             amplitude_max REAL NOT NULL,
             point_count INTEGER NOT NULL,
-            notes TEXT NOT NULL
+            notes TEXT NOT NULL,
+            qcodes_run_id INTEGER,
+            qcodes_guid TEXT
         )
         """
     )
@@ -695,6 +713,34 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (run_id) REFERENCES
                 {QCS_RF_CALIBRATION_RUN_TABLE}(run_id) ON DELETE CASCADE
         )
+        """
+    )
+    # Databases written by the original custom-table-only implementation do
+    # not have QCoDeS association columns.  SQLite supports adding nullable
+    # columns without rebuilding the table, so this migration is safe and
+    # idempotent for existing calibration files.
+    run_columns = {
+        str(row[1])
+        for row in connection.execute(
+            f"PRAGMA table_info({QCS_RF_CALIBRATION_RUN_TABLE})"
+        )
+    }
+    if "qcodes_run_id" not in run_columns:
+        connection.execute(
+            f"ALTER TABLE {QCS_RF_CALIBRATION_RUN_TABLE} "
+            "ADD COLUMN qcodes_run_id INTEGER"
+        )
+    if "qcodes_guid" not in run_columns:
+        connection.execute(
+            f"ALTER TABLE {QCS_RF_CALIBRATION_RUN_TABLE} "
+            "ADD COLUMN qcodes_guid TEXT"
+        )
+    connection.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            qcs_rf_power_calibration_qcodes_guid
+        ON {QCS_RF_CALIBRATION_RUN_TABLE}(qcodes_guid)
+        WHERE qcodes_guid IS NOT NULL
         """
     )
 
@@ -769,6 +815,237 @@ def _grid_columns(
     )
 
 
+def _storage_helpers() -> Tuple[Callable[..., Any], ...]:
+    """Load the shared crash-safe SQLite publication helpers lazily."""
+
+    try:
+        from .qick_qcodes_experiment import (
+            _checkpoint_sqlite_database,
+            _prepare_local_database,
+            _publish_local_database,
+        )
+    except ImportError:
+        from qick_qcodes_experiment import (
+            _checkpoint_sqlite_database,
+            _prepare_local_database,
+            _publish_local_database,
+        )
+    return (
+        _checkpoint_sqlite_database,
+        _prepare_local_database,
+        _publish_local_database,
+    )
+
+
+def _qcodes_storage_api() -> Tuple[Any, ...]:
+    try:
+        from qcodes import (
+            Measurement,
+            Parameter,
+            Station,
+            initialise_or_create_database_at,
+            load_by_guid,
+            load_or_create_experiment,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "QCoDeS==0.58.0 is required for QCS RF calibration storage"
+        ) from exc
+    return (
+        Measurement,
+        Parameter,
+        Station,
+        initialise_or_create_database_at,
+        load_by_guid,
+        load_or_create_experiment,
+    )
+
+
+def _qcodes_calibration_sample_name(
+    output_identity: QcsPhysicalChannelIdentity,
+    input_identity: QcsPhysicalChannelIdentity,
+) -> str:
+    output = output_identity
+    input_channel = input_identity
+    return (
+        f"M5300A_H{output.host_controller}_C{output.chassis}_"
+        f"S{output.slot}_CH{output.channel}_to_"
+        f"M5200A_H{input_channel.host_controller}_C{input_channel.chassis}_"
+        f"S{input_channel.slot}_CH{input_channel.channel}"
+    )
+
+
+def _write_qcodes_calibration_dataset(
+    *,
+    calibration_run_id: int,
+    created_utc: str,
+    output_identity: QcsPhysicalChannelIdentity,
+    input_identity: QcsPhysicalChannelIdentity,
+    mapper_sha256: str,
+    lo_frequency_hz: float,
+    termination_ohm: float,
+    input_reference: M5200PowerReference,
+    integration_duration_s: float,
+    repetitions: int,
+    columns: Tuple[np.ndarray, ...],
+    notes: str,
+) -> Tuple[int, str]:
+    """Write one Plottr-compatible QCoDeS mirror of a custom calibration."""
+
+    (
+        Measurement,
+        Parameter,
+        Station,
+        _initialise_or_create_database_at,
+        _load_by_guid,
+        load_or_create_experiment,
+    ) = _qcodes_storage_api()
+    frequency_column, amplitude_column, mean_i, mean_q, magnitude, power = (
+        columns
+    )
+    sample_name = _qcodes_calibration_sample_name(
+        output_identity,
+        input_identity,
+    )
+    experiment = load_or_create_experiment(
+        QCS_RF_CALIBRATION_EXPERIMENT_NAME,
+        sample_name,
+    )
+    measurement = Measurement(
+        exp=experiment,
+        station=Station(),
+        name="M5300A RF output power calibration",
+    )
+    frequency_parameter = Parameter(
+        "m5300_frequency_hz",
+        label="M5300A RF frequency",
+        unit="Hz",
+    )
+    amplitude_parameter = Parameter(
+        "m5300_relative_amplitude",
+        label="M5300A relative amplitude",
+        unit="",
+    )
+    mean_i_parameter = Parameter(
+        "m5200_mean_i_v",
+        label="M5200A mean I",
+        unit="V",
+    )
+    mean_q_parameter = Parameter(
+        "m5200_mean_q_v",
+        label="M5200A mean Q",
+        unit="V",
+    )
+    magnitude_parameter = Parameter(
+        "m5200_iq_magnitude_v",
+        label="M5200A I/Q magnitude",
+        unit="V",
+    )
+    power_parameter = Parameter(
+        "m5300_output_power_dbm",
+        label="M5300A output power",
+        unit="dBm",
+    )
+    measurement.register_parameter(frequency_parameter)
+    measurement.register_parameter(amplitude_parameter)
+    for parameter in (
+        mean_i_parameter,
+        mean_q_parameter,
+        magnitude_parameter,
+        power_parameter,
+    ):
+        measurement.register_parameter(
+            parameter,
+            setpoints=(frequency_parameter, amplitude_parameter),
+        )
+
+    unique_frequencies = np.unique(frequency_column)
+    unique_amplitudes = np.unique(amplitude_column)
+    config_metadata = {
+        "schema": QCS_RF_POWER_CALIBRATION_SCHEMA,
+        "created_at_utc": str(created_utc),
+        "purpose": "m5300a_rf_output_power_calibration",
+        "calibration_record_id": int(calibration_run_id),
+        "output_identity": asdict(output_identity),
+        "input_identity": asdict(input_identity),
+        "mapper_sha256": str(mapper_sha256),
+        "lo_frequency_hz": float(lo_frequency_hz),
+        "termination_ohm": float(termination_ohm),
+        "calibration_quality": input_reference.mode,
+        "input_reference": asdict(input_reference),
+        "integration_duration_s": float(integration_duration_s),
+        "repetitions": int(repetitions),
+        "grid": {
+            "shape": [
+                int(unique_frequencies.size),
+                int(unique_amplitudes.size),
+            ],
+            "flatten_order": "frequency-major C order",
+            "frequency_min_hz": float(np.min(frequency_column)),
+            "frequency_max_hz": float(np.max(frequency_column)),
+            "relative_amplitude_min": float(np.min(amplitude_column)),
+            "relative_amplitude_max": float(np.max(amplitude_column)),
+            "point_count": int(frequency_column.size),
+        },
+        "formulae": {
+            "iq_magnitude_v": "hypot(m5200_mean_i_v, m5200_mean_q_v)",
+            "output_power_dbm": (
+                "M5200PowerReference.output_power_dbm(iq_magnitude_v)"
+            ),
+        },
+        "notes": str(notes),
+    }
+
+    dataset = None
+    with measurement.run(
+        write_in_background=False,
+        in_memory_cache=False,
+    ) as datasaver:
+        dataset = datasaver.dataset
+        qcodes_run_id = int(dataset.run_id)
+        guid = str(dataset.guid)
+        result_metadata = {
+            "schema": QCS_RF_POWER_CALIBRATION_SCHEMA,
+            "calibration_record_id": int(calibration_run_id),
+            "qcodes_run_id": qcodes_run_id,
+            "qcodes_guid": guid,
+            "point_count": int(frequency_column.size),
+        }
+        config_metadata_text = json.dumps(config_metadata, sort_keys=True)
+        result_metadata_text = json.dumps(result_metadata, sort_keys=True)
+        dataset.add_metadata(
+            QCS_RF_CALIBRATION_CONFIG_METADATA,
+            config_metadata_text,
+        )
+        dataset.add_metadata(
+            QCS_RF_CALIBRATION_RESULT_METADATA,
+            result_metadata_text,
+        )
+        # Keep the metadata aliases used by the established QICK 50 kSPS
+        # calibration datasets so existing inspection/export tooling can read
+        # QICK and QCS calibrations through the same entry points.
+        dataset.add_metadata("Calibration_Config", config_metadata_text)
+        dataset.add_metadata("Calibration_Result", result_metadata_text)
+        if notes:
+            dataset.add_metadata("calibration_notes", str(notes))
+        for index in range(frequency_column.size):
+            datasaver.add_result(
+                (frequency_parameter, float(frequency_column[index])),
+                (amplitude_parameter, float(amplitude_column[index])),
+                (mean_i_parameter, float(mean_i[index])),
+                (mean_q_parameter, float(mean_q[index])),
+                (magnitude_parameter, float(magnitude[index])),
+                (power_parameter, float(power[index])),
+            )
+        datasaver.flush_data_to_database()
+    if dataset is None:  # pragma: no cover - Measurement always yields a dataset
+        raise RuntimeError("QCoDeS did not create an RF calibration dataset")
+    qcodes_run_id = int(dataset.run_id)
+    guid = str(dataset.guid)
+    dataset.conn.close()
+    return qcodes_run_id, guid
+
+
 def store_m5300_power_calibration(
     database_path: str | Path,
     *,
@@ -826,73 +1103,125 @@ def store_m5300_power_calibration(
     created = datetime.now(timezone.utc).isoformat()
     output = output_identity
     input_channel = input_identity
-    with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA foreign_keys=ON")
-        _create_schema(connection)
-        cursor = connection.execute(
-            f"""
-            INSERT INTO {QCS_RF_CALIBRATION_RUN_TABLE} (
-                schema_tag, created_utc,
-                output_model, output_host_controller, output_chassis,
-                output_slot, output_channel,
-                input_model, input_host_controller, input_chassis,
-                input_slot, input_channel,
-                mapper_sha256, lo_frequency_hz, termination_ohm,
-                calibration_quality, input_reference_json,
-                integration_duration_s, repetitions,
-                frequency_min_hz, frequency_max_hz,
-                amplitude_min, amplitude_max, point_count, notes
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                QCS_RF_POWER_CALIBRATION_SCHEMA,
-                created,
-                output.module_model,
-                *output.address_tuple,
-                input_channel.module_model,
-                *input_channel.address_tuple,
-                mapper_digest,
-                lo_frequency,
-                termination,
-                input_reference.mode,
-                json.dumps(asdict(input_reference), sort_keys=True),
-                integration,
-                repetitions,
-                float(np.min(frequency_column)),
-                float(np.max(frequency_column)),
-                float(np.min(amplitude_column)),
-                float(np.max(amplitude_column)),
-                int(frequency_column.size),
-                str(notes).strip(),
-            ),
-        )
-        run_id = int(cursor.lastrowid)
-        connection.executemany(
-            f"""
-            INSERT INTO {QCS_RF_CALIBRATION_POINT_TABLE} (
-                run_id, point_index, frequency_hz, relative_amplitude,
-                mean_i, mean_q, iq_magnitude, power_dbm
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    run_id,
-                    index,
-                    *(float(column[index]) for column in columns),
-                )
-                for index in range(frequency_column.size)
-            ],
-        )
-    calibration = load_m5300_power_calibration(database, run_id=run_id)
-    return StoredM5300PowerCalibration(
-        database_path=database,
-        run_id=run_id,
-        point_count=int(frequency_column.size),
-        calibration=calibration,
+    checkpoint_database, prepare_local_database, publish_local_database = (
+        _storage_helpers()
     )
+    (
+        _Measurement,
+        _Parameter,
+        _Station,
+        initialise_or_create_database_at,
+        load_by_guid,
+        _load_or_create_experiment,
+    ) = _qcodes_storage_api()
+    staging, local_path = prepare_local_database(database)
+    try:
+        initialise_or_create_database_at(str(local_path))
+        with sqlite3.connect(local_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            _create_schema(connection)
+            cursor = connection.execute(
+                f"""
+                INSERT INTO {QCS_RF_CALIBRATION_RUN_TABLE} (
+                    schema_tag, created_utc,
+                    output_model, output_host_controller, output_chassis,
+                    output_slot, output_channel,
+                    input_model, input_host_controller, input_chassis,
+                    input_slot, input_channel,
+                    mapper_sha256, lo_frequency_hz, termination_ohm,
+                    calibration_quality, input_reference_json,
+                    integration_duration_s, repetitions,
+                    frequency_min_hz, frequency_max_hz,
+                    amplitude_min, amplitude_max, point_count, notes
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    QCS_RF_POWER_CALIBRATION_SCHEMA,
+                    created,
+                    output.module_model,
+                    *output.address_tuple,
+                    input_channel.module_model,
+                    *input_channel.address_tuple,
+                    mapper_digest,
+                    lo_frequency,
+                    termination,
+                    input_reference.mode,
+                    json.dumps(asdict(input_reference), sort_keys=True),
+                    integration,
+                    repetitions,
+                    float(np.min(frequency_column)),
+                    float(np.max(frequency_column)),
+                    float(np.min(amplitude_column)),
+                    float(np.max(amplitude_column)),
+                    int(frequency_column.size),
+                    str(notes).strip(),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.executemany(
+                f"""
+                INSERT INTO {QCS_RF_CALIBRATION_POINT_TABLE} (
+                    run_id, point_index, frequency_hz, relative_amplitude,
+                    mean_i, mean_q, iq_magnitude, power_dbm
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        index,
+                        *(float(column[index]) for column in columns),
+                    )
+                    for index in range(frequency_column.size)
+                ],
+            )
+
+        qcodes_run_id, guid = _write_qcodes_calibration_dataset(
+            calibration_run_id=run_id,
+            created_utc=created,
+            output_identity=output,
+            input_identity=input_channel,
+            mapper_sha256=mapper_digest,
+            lo_frequency_hz=lo_frequency,
+            termination_ohm=termination,
+            input_reference=input_reference,
+            integration_duration_s=integration,
+            repetitions=repetitions,
+            columns=columns,
+            notes=str(notes).strip(),
+        )
+        with sqlite3.connect(local_path) as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE {QCS_RF_CALIBRATION_RUN_TABLE}
+                SET qcodes_run_id=?, qcodes_guid=?
+                WHERE run_id=?
+                """,
+                (qcodes_run_id, guid, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "failed to associate QCoDeS RF calibration dataset"
+                )
+
+        checkpoint_database(local_path)
+        publish_local_database(local_path, database)
+        initialise_or_create_database_at(str(database))
+        final_dataset = load_by_guid(guid)
+        calibration = load_m5300_power_calibration(database, run_id=run_id)
+        return StoredM5300PowerCalibration(
+            database_path=database,
+            run_id=run_id,
+            qcodes_run_id=qcodes_run_id,
+            guid=guid,
+            point_count=int(frequency_column.size),
+            calibration=calibration,
+            dataset=final_dataset,
+        )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -1092,6 +1421,140 @@ def load_m5300_power_calibration(
             "no QCS M5300 calibration run matches the requested hardware: "
             + "; ".join(failures[:5])
         )
+
+
+def migrate_m5300_power_calibrations_to_qcodes(
+    database_path: str | Path,
+) -> Tuple[StoredM5300PowerCalibration, ...]:
+    """Add QCoDeS/Plottr datasets for legacy unlinked custom records.
+
+    The original QCS RF calibration backend stored only application-owned
+    SQLite rows.  This migration preserves those rows and their ``run_id``
+    values, creates one QCoDeS dataset for each record with no association,
+    and links the two namespaces through nullable ``qcodes_run_id`` and
+    ``qcodes_guid`` columns.  A second call performs no duplicate work.
+    """
+
+    database = Path(database_path).expanduser().resolve()
+    if not database.is_file():
+        raise FileNotFoundError(
+            f"QCS RF calibration database not found: {database}"
+        )
+    checkpoint_database, prepare_local_database, publish_local_database = (
+        _storage_helpers()
+    )
+    (
+        _Measurement,
+        _Parameter,
+        _Station,
+        initialise_or_create_database_at,
+        load_by_guid,
+        _load_or_create_experiment,
+    ) = _qcodes_storage_api()
+    staging, local_path = prepare_local_database(database)
+    migrated_links = []
+    try:
+        initialise_or_create_database_at(str(local_path))
+        with sqlite3.connect(local_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            existing_tables = _table_names(connection)
+            required_tables = {
+                QCS_RF_CALIBRATION_RUN_TABLE,
+                QCS_RF_CALIBRATION_POINT_TABLE,
+            }
+            if not required_tables.issubset(existing_tables):
+                raise ValueError(
+                    "database does not contain the tagged QCS M5300/M5200 "
+                    "RF calibration schema"
+                )
+            _create_schema(connection)
+            run_ids = [
+                int(row[0])
+                for row in connection.execute(
+                    f"""
+                    SELECT run_id
+                    FROM {QCS_RF_CALIBRATION_RUN_TABLE}
+                    WHERE schema_tag=?
+                      AND qcodes_run_id IS NULL
+                      AND (qcodes_guid IS NULL OR TRIM(qcodes_guid)='')
+                    ORDER BY run_id
+                    """,
+                    (QCS_RF_POWER_CALIBRATION_SCHEMA,),
+                )
+            ]
+
+        for calibration_run_id in run_ids:
+            with sqlite3.connect(local_path) as connection:
+                calibration = _calibration_from_connection(
+                    connection,
+                    local_path,
+                    calibration_run_id,
+                )
+            columns = (
+                np.asarray(calibration.frequencies_hz, dtype=float),
+                np.asarray(calibration.relative_amplitudes, dtype=float),
+                np.asarray(calibration.mean_i, dtype=float),
+                np.asarray(calibration.mean_q, dtype=float),
+                np.asarray(calibration.iq_magnitude, dtype=float),
+                np.asarray(calibration.power_dbm, dtype=float),
+            )
+            qcodes_run_id, guid = _write_qcodes_calibration_dataset(
+                calibration_run_id=calibration_run_id,
+                created_utc=calibration.created_utc,
+                output_identity=calibration.output_identity,
+                input_identity=calibration.input_identity,
+                mapper_sha256=calibration.mapper_sha256,
+                lo_frequency_hz=calibration.lo_frequency_hz,
+                termination_ohm=calibration.termination_ohm,
+                input_reference=calibration.input_reference,
+                integration_duration_s=calibration.integration_duration_s,
+                repetitions=calibration.repetitions,
+                columns=columns,
+                notes=calibration.notes,
+            )
+            with sqlite3.connect(local_path) as connection:
+                cursor = connection.execute(
+                    f"""
+                    UPDATE {QCS_RF_CALIBRATION_RUN_TABLE}
+                    SET qcodes_run_id=?, qcodes_guid=?
+                    WHERE run_id=?
+                      AND qcodes_run_id IS NULL
+                      AND (qcodes_guid IS NULL OR TRIM(qcodes_guid)='')
+                    """,
+                    (qcodes_run_id, guid, calibration_run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "QCS RF calibration record changed during migration"
+                    )
+            migrated_links.append(
+                (calibration_run_id, qcodes_run_id, guid, len(columns[0]))
+            )
+
+        checkpoint_database(local_path)
+        publish_local_database(local_path, database)
+        initialise_or_create_database_at(str(database))
+        migrated = []
+        for calibration_run_id, qcodes_run_id, guid, point_count in (
+            migrated_links
+        ):
+            migrated.append(
+                StoredM5300PowerCalibration(
+                    database_path=database,
+                    run_id=calibration_run_id,
+                    qcodes_run_id=qcodes_run_id,
+                    guid=guid,
+                    point_count=point_count,
+                    calibration=load_m5300_power_calibration(
+                        database,
+                        run_id=calibration_run_id,
+                    ),
+                    dataset=load_by_guid(guid),
+                )
+            )
+        return tuple(migrated)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _resolve_mapper_channel(mapper: Any, name: str) -> Any:
@@ -1680,7 +2143,13 @@ def run_m5300_power_calibration(
         input_reference=config.input_reference,
         notes=config.notes,
     )
-    progress(100, f"Stored QCS RF calibration Run {stored.run_id}")
+    progress(
+        100,
+        (
+            f"Stored QCoDeS Run {stored.qcodes_run_id} "
+            f"(calibration record {stored.run_id})"
+        ),
+    )
     return stored
 
 
@@ -1695,11 +2164,15 @@ __all__ = [
     "QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES",
     "QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S",
     "QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_SAMPLES",
+    "QCS_RF_CALIBRATION_CONFIG_METADATA",
+    "QCS_RF_CALIBRATION_EXPERIMENT_NAME",
+    "QCS_RF_CALIBRATION_RESULT_METADATA",
     "QCS_RF_POWER_CALIBRATION_SCHEMA",
     "QcsPhysicalChannelIdentity",
     "REFERENCE_CALIBRATED",
     "StoredM5300PowerCalibration",
     "load_m5300_power_calibration",
+    "migrate_m5300_power_calibrations_to_qcodes",
     "resolve_m5300_m5200_identities",
     "run_m5300_power_calibration",
     "store_m5300_power_calibration",

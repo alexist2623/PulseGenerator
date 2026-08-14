@@ -6,8 +6,10 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
+from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
@@ -818,6 +820,66 @@ def test_qcs_continuous_worker_runs_one_native_grid_without_storage(
     assert stopped == [True]
 
 
+def test_qcs_stability_worker_rejects_mapper_changed_after_run_snapshot(
+    tmp_path,
+):
+    mapper_path = tmp_path / "stability_mapper.qcs"
+    mapper_path.write_bytes(b"original Stability mapper")
+    expected_digest = hashlib.sha256(mapper_path.read_bytes()).hexdigest()
+    connection = QcsConnectionConfig(
+        mapper_path=str(mapper_path),
+        mapper_sha256=expected_digest,
+        dc_channel_names=("dc_x", "dc_y"),
+        acquisition_channel_name="digitizer",
+    )
+    mapper_path.write_bytes(b"changed after Run was clicked")
+    config = _config()
+    sequence = stability.build_stability_hold_sequence(
+        config,
+        output_names=("awg_0", "awg_1"),
+        fabric_mhz=300.0,
+        full_scale_mv=100.0,
+    )
+    worker = stability.QcsStabilityDiagramWorker(
+        {
+            "connection_config": connection,
+            "run_config": None,
+            "gui_settings": None,
+            "stability_config": config,
+            "full_scale_mv": 100.0,
+            "sequence": sequence,
+            "repetitions_per_point": 1,
+            "fabric_mhz": 300.0,
+            "rf_pulses": (),
+            "acquisition": QcsAcquisitionConfig(
+                at_segment="set_0",
+                duration_s=32 / 4.8e9,
+                sample_rate_hz=4.8e9,
+                sample_count=32,
+            ),
+            "readout_spec": None,
+            "mapper_configuration": {},
+            "qcs_module": SimpleNamespace(
+                load=lambda _path: object(),
+                ChannelMapper=object,
+            ),
+            "compiled": SimpleNamespace(
+                program=object(),
+                sweep_shape=(2, 2),
+            ),
+            "executor": object(),
+        },
+        continuous=False,
+    )
+    failures = []
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert len(failures) == 1
+    assert "does not match the hardware configuration" in failures[0]
+
+
 def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
     tmp_path,
     monkeypatch,
@@ -864,11 +926,29 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
         rf_settings={"backend": "qcs"},
     )
     captured = {}
+    mapper_path = tmp_path / "scoped_stability_mapper.qcs"
+    mapper_configuration = {"workflow": "stability"}
+
+    def fake_save_mapper(configuration, path, *, qcs_module=None):
+        assert configuration == mapper_configuration
+        assert qcs_module is None
+        output_path = Path(path)
+        output_path.write_bytes(b"generated scoped Stability mapper")
+        return output_path.resolve()
+
+    def fake_load_mapper(connection_config, **_kwargs):
+        captured["loaded_connection"] = connection_config
+        return object()
 
     monkeypatch.setattr(
         stability,
         "load_qcs_channel_mapper",
-        lambda *_args, **_kwargs: object(),
+        fake_load_mapper,
+    )
+    monkeypatch.setattr(
+        stability,
+        "save_qcs_channel_mapper",
+        fake_save_mapper,
     )
     monkeypatch.setattr(
         stability,
@@ -905,7 +985,7 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
     worker = stability.QcsStabilityDiagramWorker(
         {
             "connection_config": QcsConnectionConfig(
-                mapper_path="unused.qcs",
+                mapper_path=str(mapper_path),
                 dc_channel_names=("dc_x", "dc_y"),
                 acquisition_channel_name="digitizer",
             ),
@@ -919,6 +999,11 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
                 },
                 "stability_diagram": {},
                 "awg": {"outputs": []},
+                "qcs": {
+                    "mapper_path": str(mapper_path),
+                    "hardware_configuration_state": "draft",
+                    "hardware_mapper_sha256": None,
+                },
             },
             "stability_config": config,
             "full_scale_mv": full_scale_mv,
@@ -933,6 +1018,7 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
                 sample_count=32,
             ),
             "readout_spec": None,
+            "mapper_configuration": mapper_configuration,
         },
         continuous=False,
     )
@@ -951,6 +1037,15 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
     assert captured["progress_start"] == 65
     assert captured["progress_end"] == 100
     stored = captured["gui_settings"]
+    expected_mapper_digest = hashlib.sha256(
+        mapper_path.read_bytes()
+    ).hexdigest()
+    assert captured["loaded_connection"].mapper_sha256 == (
+        expected_mapper_digest
+    )
+    assert stored["qcs"]["hardware_configuration_state"] == "saved"
+    assert stored["qcs"]["hardware_mapper_sha256"] == expected_mapper_digest
+    assert stored["qcs"]["mapper_path"] == str(mapper_path.resolve())
     assert stored["qick"]["full_scale_mv"] == 800.0
     assert (
         stored["stability_diagram"]["coordinate_full_scale_mv"]

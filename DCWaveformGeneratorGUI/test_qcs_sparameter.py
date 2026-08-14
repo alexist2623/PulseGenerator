@@ -40,21 +40,29 @@ except ImportError:
 
 try:
     from .qick_sparameter_sweep import (
+        ACTUAL_INPUT_POWER_PARAMETER,
+        ACTUAL_OUTPUT_POWER_PARAMETER,
+        ADC_MAGNITUDE_DB_PARAMETER,
+        MAGNITUDE_DB_PARAMETER,
         SAMPLE_INDEX_PARAMETER,
         SParameterSweepConfig,
         load_sparameter_run,
     )
 except ImportError:
     from qick_sparameter_sweep import (
+        ACTUAL_INPUT_POWER_PARAMETER,
+        ACTUAL_OUTPUT_POWER_PARAMETER,
+        ADC_MAGNITUDE_DB_PARAMETER,
+        MAGNITUDE_DB_PARAMETER,
         SAMPLE_INDEX_PARAMETER,
         SParameterSweepConfig,
         load_sparameter_run,
     )
 
 try:
-    from .sparameter_gui import SParameterSweepPanel
+    from .sparameter_gui import SParameterPlotWidget, SParameterSweepPanel
 except ImportError:
-    from sparameter_gui import SParameterSweepPanel
+    from sparameter_gui import SParameterPlotWidget, SParameterSweepPanel
 
 try:
     from .qcs_rf_power_calibration import (
@@ -544,6 +552,8 @@ def test_qcs_panel_uses_segmented_integration_default_and_maximum():
     assert panel.scan_time_us.maximum() == pytest.approx(100_000.0)
     assert panel.scan_time_label.text() == "Total I/Q averaging time:"
     assert "bounded QCS passes" in panel.scan_time_us.toolTip()
+    assert "Power and Through Calibration" in panel.power_calibration_enabled.title()
+    assert "normalized |S21|" in panel.calibration_hint.text()
     assert panel.stop_button.isHidden() is False
     panel.show()
     application.processEvents()
@@ -600,6 +610,7 @@ def test_qcs_result_status_describes_integrated_shots_not_fir_samples():
     assert panel.run_id.value == 17
     assert panel.running_update is not None
     _running, message = panel.running_update
+    assert "uncalibrated receiver magnitude" in message
     assert "4 integrated I/Q shot(s) per point" in message
     assert "10 us total I/Q averaging" in message
     assert "FIR" not in message
@@ -650,6 +661,12 @@ def test_qcs_sparameter_database_round_trip_preserves_backend_and_shot_axis(
     )
 
     assert stored.result.iq_traces.shape == (3, 2, 2)
+    assert not stored.result.physical_power_calibrated
+    assert stored.result.s21_reference is None
+    np.testing.assert_allclose(
+        stored.result.magnitude_db,
+        stored.result.adc_magnitude_db,
+    )
     assert stored.rf_settings["backend"] == "qcs"
     metadata = json.loads(
         stored.dataset.get_metadata("sparameter_experiment_json")
@@ -749,3 +766,152 @@ def test_qcs_sparameter_applies_distinct_m5300_power_calibration(tmp_path):
         "sparameter_frequency_hz",
         "sparameter_relative_amplitude",
     }
+
+
+def test_qcs_calibrated_plot_stores_power_invariant_loopback_s21(tmp_path):
+    qcs = pytest.importorskip("keysight.qcs")
+    mapper, _rf, _digitizer = _real_qcs_mapper(qcs)
+    frequencies = np.asarray([1.24e9, 1.25e9, 1.26e9])
+    amplitudes = np.asarray([0.001, 1.0])
+    calibration_powers_dbm = np.tile(np.asarray([-60.0, 0.0]), (3, 1))
+
+    def voltage_peak(power_dbm):
+        return np.sqrt(2.0 * 50.0 * 10.0 ** ((power_dbm - 30.0) / 10.0))
+
+    calibration_volts = voltage_peak(calibration_powers_dbm)
+    calibration_path = tmp_path / "qcs_loopback_power.db"
+    store_m5300_power_calibration(
+        calibration_path,
+        frequencies_hz=frequencies,
+        relative_amplitudes=amplitudes,
+        mean_i=calibration_volts,
+        mean_q=np.zeros_like(calibration_volts),
+        power_dbm=calibration_powers_dbm,
+        output_identity=QcsPhysicalChannelIdentity(1, 1, 4, 1, "M5300A"),
+        input_identity=QcsPhysicalChannelIdentity(1, 1, 18, 1, "M5200A"),
+        mapper_sha256="0" * 64,
+        lo_frequency_hz=1.2e9,
+        integration_duration_s=1e-6,
+        repetitions=2,
+        input_reference=M5200PowerReference.qcs_voltage_50ohm(),
+    )
+
+    class Executor:
+        def __init__(self, receiver_power_dbm):
+            self.receiver_voltage = float(voltage_peak(receiver_power_dbm))
+
+        def execute(self, _program):
+            values = np.full((3, 2), self.receiver_voltage, dtype=complex)
+
+            class RawResult:
+                def __getitem__(self, _channels):
+                    return values
+
+            return RawResult()
+
+    stored_results = []
+    partial_results = []
+    for target_power_dbm in (-30.0, -10.0):
+        stored_results.append(
+            run_qcs_sparameter_sweep(
+                connection_config=_connection(),
+                run_config=QcodesRunConfig(
+                    database_path=tmp_path / "qcs_s21.db",
+                    experiment_name="QCS normalized S21 test",
+                    sample_name="loopback",
+                ),
+                sweep_config=SParameterSweepConfig(
+                    frequency_start_mhz=1240.0,
+                    frequency_end_mhz=1260.0,
+                    frequency_points=3,
+                    scan_time_us=1.0,
+                    power_calibration_enabled=True,
+                    calibration_database_path=str(calibration_path),
+                    output_power_dbm=target_power_dbm,
+                ),
+                rf_gen_ch=0,
+                rf_amplitude=0.005,
+                repetitions_per_point=2,
+                partial_callback=partial_results.append,
+                qcs_module=qcs,
+                mapper=mapper,
+                executor=Executor(target_power_dbm - 3.0),
+            )
+        )
+
+    low_power, high_power = (stored.result for stored in stored_results)
+    for result, target_power_dbm in zip(
+        (low_power, high_power),
+        (-30.0, -10.0),
+    ):
+        assert result.physical_power_calibrated
+        assert result.s21_reference == "qcs_m5300_m5200_calibration_thru"
+        np.testing.assert_allclose(result.magnitude_db, -3.0, atol=1e-10)
+        np.testing.assert_allclose(
+            result.dut_input_powers_dbm,
+            target_power_dbm,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            result.dut_output_powers_dbm,
+            target_power_dbm - 3.0,
+            atol=1e-10,
+        )
+    np.testing.assert_allclose(
+        high_power.adc_magnitude_db - low_power.adc_magnitude_db,
+        20.0,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        high_power.magnitude_db,
+        low_power.magnitude_db,
+        atol=1e-10,
+    )
+
+    assert partial_results
+    assert all(
+        partial.dut_input_powers_dbm is not None
+        and partial.dut_output_powers_dbm is not None
+        for partial in partial_results
+    )
+    latest = stored_results[-1]
+    assert ACTUAL_OUTPUT_POWER_PARAMETER in latest.dataset.paramspecs
+    assert ACTUAL_INPUT_POWER_PARAMETER in latest.dataset.paramspecs
+    assert latest.dataset.paramspecs[ADC_MAGNITUDE_DB_PARAMETER].unit == "dBV"
+    assert latest.dataset.paramspecs[MAGNITUDE_DB_PARAMETER].unit == "dB"
+    stored_pin = latest.dataset.get_parameter_data(
+        ACTUAL_OUTPUT_POWER_PARAMETER
+    )[ACTUAL_OUTPUT_POWER_PARAMETER][ACTUAL_OUTPUT_POWER_PARAMETER]
+    stored_pout = latest.dataset.get_parameter_data(
+        ACTUAL_INPUT_POWER_PARAMETER
+    )[ACTUAL_INPUT_POWER_PARAMETER][ACTUAL_INPUT_POWER_PARAMETER]
+    np.testing.assert_allclose(np.asarray(stored_pin).reshape(-1), -10.0)
+    np.testing.assert_allclose(np.asarray(stored_pout).reshape(-1), -13.0)
+    metadata = json.loads(
+        latest.dataset.get_metadata("sparameter_experiment_json")
+    )
+    assert metadata["formulas"]["magnitude_db"] == (
+        "P_DUT_OUT - P_DUT_IN"
+    )
+    assert metadata["result"]["s21_reference"] == (
+        "qcs_m5300_m5200_calibration_thru"
+    )
+    loaded = load_sparameter_run(latest.database_path, latest.run_id)
+    assert loaded.result.physical_power_calibrated
+    assert loaded.result.s21_reference == "qcs_m5300_m5200_calibration_thru"
+    np.testing.assert_allclose(loaded.result.magnitude_db, -3.0, atol=1e-10)
+
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    plot = SParameterPlotWidget()
+    plot.set_result(high_power)
+    marker = plot._marker_text("Magnitude", 0, 1250.0, -3.0)
+    assert "Normalized |S21|" in marker
+    assert plot._curve_labels == ["Pin -10 dBm"]
+    if hasattr(plot.magnitude_plot, "getAxis"):
+        axis_label = plot.magnitude_plot.getAxis("left").labelText
+    else:
+        axis_label = plot.magnitude_plot.get_ylabel()
+    assert "Normalized |S21|" in axis_label
+    plot.close()
+    plot.deleteLater()
+    application.processEvents()

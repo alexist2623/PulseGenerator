@@ -1559,15 +1559,18 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         )
         self.power_calibration_enabled.setVisible(True)
         self.power_calibration_enabled.setTitle(
-            "M5300A 50 Ohm Output Power Calibration"
+            "M5300A/M5200A Power and Through Calibration"
             if is_qcs
             else "Frequency Response Compensation"
         )
         self.calibration_hint.setText(
             (
                 "Select the dedicated M5300A/M5200A calibration database. "
-                "Run ID 0 uses the newest exact mapper, LO, connector, and "
-                "frequency-covering calibration."
+                "Calibration record ID 0 uses the newest exact mapper, LO, "
+                "connector, and frequency-covering calibration. This ID is "
+                "separate from its Plottr/QCoDeS Run ID. Enable this group to "
+                "plot loopback-normalized |S21|; when disabled, the plot shows "
+                "only uncalibrated receiver magnitude."
             )
             if is_qcs
             else (
@@ -1578,7 +1581,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.input_calibration_label.setVisible(not is_qcs)
         self.input_calibration_selection.setVisible(not is_qcs)
         self.input_calibration_run_label.setText(
-            "QCS calibration Run ID:"
+            "QCS calibration record ID:"
             if is_qcs
             else "Input calibration Run ID:"
         )
@@ -1867,6 +1870,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             and str(rf_settings.get("backend", "")).strip().lower() == "qcs"
         )
         if is_qcs:
+            result_quantity = (
+                "loopback-normalized |S21|"
+                if getattr(result, "s21_reference", None)
+                == "qcs_m5300_m5200_calibration_thru"
+                else "uncalibrated receiver magnitude"
+            )
             readout = rf_settings.get("readout", {})
             integration_duration_s = (
                 float(
@@ -1888,6 +1897,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 (
                     f"Run {stored.run_id}: "
                     f"{result.frequencies_mhz.size} frequency points, "
+                    f"{result_quantity}, "
                     f"{result.sample_count} integrated I/Q shot(s) per point"
                     f"{integration_text}\n"
                     f"{stored.database_path}"
@@ -2001,6 +2011,7 @@ class _SParameterPlotMixin:
         self._curve_labels = []
         self._visible_curve_indices = np.empty(0, dtype=np.int64)
         self._physical_power_calibrated = False
+        self._s21_reference = None
         self._phase_fit_region = None
         self._phase_fit_applied = False
         self._markers_enabled = True
@@ -2078,13 +2089,27 @@ class _SParameterPlotMixin:
         frequency = np.asarray(result.frequencies_mhz, dtype=float).reshape(-1)
         magnitude = np.asarray(result.magnitude_db, dtype=float)
         phase = np.asarray(result.phase_unwrapped_deg, dtype=float)
+        self._s21_reference = getattr(result, "s21_reference", None)
         if magnitude.ndim == 1:
             magnitude = magnitude.reshape(1, -1)
             phase = phase.reshape(1, -1)
             output_power = getattr(result, "output_power_dbm", None)
-            labels = [
-                None if output_power is None else f"{float(output_power):.6g} dBm"
-            ]
+            if output_power is not None:
+                label = f"{float(output_power):.6g} dBm"
+            else:
+                dut_input = getattr(result, "dut_input_powers_dbm", None)
+                if dut_input is None:
+                    label = None
+                else:
+                    powers = np.asarray(dut_input, dtype=float).reshape(-1)
+                    label = (
+                        f"Pin {float(np.mean(powers)):.6g} dBm"
+                        if powers.size
+                        and np.all(np.isfinite(powers))
+                        and np.ptp(powers) <= 1.0e-6
+                        else "calibrated S21"
+                    )
+            labels = [label]
         elif magnitude.ndim == 2:
             output_powers = getattr(result, "output_powers_dbm", None)
             if output_powers is None:
@@ -2184,10 +2209,18 @@ class _SParameterPlotMixin:
         frequency: float,
         value: float,
     ) -> str:
+        if plot_name == "Magnitude" and self._physical_power_calibrated:
+            quantity = (
+                "Normalized |S21|"
+                if self._s21_reference == "qcs_m5300_m5200_calibration_thru"
+                else "|S21|"
+            )
+        else:
+            quantity = plot_name
         unit = "dB" if plot_name == "Magnitude" else "deg"
         return (
             f"{self._curve_name(curve_index)} | {frequency:.9g} MHz | "
-            f"{plot_name} {value:.9g} {unit}"
+            f"{quantity} {value:.9g} {unit}"
         )
 
     def _set_markers_enabled(self, enabled: bool) -> None:
@@ -2427,11 +2460,21 @@ if _USE_PYQTGRAPH:
             self.magnitude_plot.setLabel(
                 "left",
                 (
-                    "S21 (P input / P output)"
+                    (
+                        "Normalized |S21|"
+                        if self._s21_reference
+                        == "qcs_m5300_m5200_calibration_thru"
+                        else "|S21| = Pout - Pin"
+                    )
                     if self._physical_power_calibrated
-                    else "ADC magnitude"
+                    else "Uncalibrated receiver magnitude"
                 ),
                 units="dB",
+            )
+            self.phase_plot.setLabel(
+                "left",
+                "Unwrapped response phase",
+                units="deg",
             )
             for curve in self._magnitude_curves:
                 self.magnitude_plot.removeItem(curve)
@@ -2679,12 +2722,17 @@ else:
                 self.phase_plot.legend()
             self.magnitude_plot.set_ylabel(
                 (
-                    "S21, P input - P output [dB]"
+                    (
+                        "Normalized |S21| [dB]"
+                        if self._s21_reference
+                        == "qcs_m5300_m5200_calibration_thru"
+                        else "|S21| = Pout - Pin [dB]"
+                    )
                     if self._physical_power_calibrated
-                    else "ADC magnitude [dB]"
+                    else "Uncalibrated receiver magnitude [dB]"
                 )
             )
-            self.phase_plot.set_ylabel("Unwrapped phase [deg]")
+            self.phase_plot.set_ylabel("Unwrapped response phase [deg]")
             self.phase_plot.set_xlabel("RF frequency [MHz]")
             self._hover_artists = {
                 "Magnitude": (

@@ -528,6 +528,7 @@ class SParameterSweepResult:
     frequency_gain_codes: Optional[np.ndarray] = None
     actual_output_powers_dbm: Optional[np.ndarray] = None
     input_powers_dbm: Optional[np.ndarray] = None
+    s21_reference: Optional[str] = None
 
     @classmethod
     def from_iq(
@@ -543,6 +544,7 @@ class SParameterSweepResult:
         frequency_gain_codes: Optional[Any] = None,
         actual_output_powers_dbm: Optional[Any] = None,
         input_powers_dbm: Optional[Any] = None,
+        s21_reference: Optional[str] = None,
     ) -> "SParameterSweepResult":
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
@@ -612,6 +614,13 @@ class SParameterSweepResult:
             if actual_input is not None
             else adc_magnitude_db
         )
+        reference = None
+        if s21_reference is not None:
+            reference = str(s21_reference).strip() or None
+            if reference is not None and actual_input is None:
+                raise ValueError(
+                    "s21_reference requires calibrated input and output powers"
+                )
         return cls(
             requested_frequencies_mhz=requested,
             frequencies_mhz=frequencies,
@@ -636,6 +645,7 @@ class SParameterSweepResult:
             input_powers_dbm=(
                 None if actual_input is None else np.ascontiguousarray(actual_input)
             ),
+            s21_reference=reference,
         )
 
     @property
@@ -935,6 +945,9 @@ def apply_power_calibration(
         frequency_gain_codes=result.frequency_gain_codes,
         actual_output_powers_dbm=dut_input,
         input_powers_dbm=dut_output,
+        s21_reference=(
+            "absolute_dut_power_planes" if dut_output is not None else None
+        ),
     )
 
 
@@ -2415,8 +2428,9 @@ def store_sparameter_result(
         ),
         unit="",
     )
-    mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit="ADC units")
-    mean_q = Parameter(MEAN_Q_PARAMETER, label="Mean Q", unit="ADC units")
+    signal_unit = "V" if is_qcs else "ADC units"
+    mean_i = Parameter(MEAN_I_PARAMETER, label="Mean I", unit=signal_unit)
+    mean_q = Parameter(MEAN_Q_PARAMETER, label="Mean Q", unit=signal_unit)
     magnitude_db = Parameter(
         MAGNITUDE_DB_PARAMETER,
         label="S-parameter magnitude",
@@ -2424,39 +2438,45 @@ def store_sparameter_result(
     )
     adc_magnitude_db = Parameter(
         ADC_MAGNITUDE_DB_PARAMETER,
-        label="Raw ADC magnitude",
-        unit="dB ADC",
+        label=("Raw M5200 voltage magnitude" if is_qcs else "Raw ADC magnitude"),
+        unit=("dBV" if is_qcs else "dB ADC"),
     )
     phase_deg = Parameter(
         PHASE_DEG_PARAMETER,
-        label="S-parameter unwrapped phase",
+        label=(
+            "Coherent receiver phase"
+            if is_qcs
+            else "S-parameter unwrapped phase"
+        ),
         unit="deg",
     )
-    i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit="ADC units")
-    q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit="ADC units")
+    i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=signal_unit)
+    q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=signal_unit)
     measurement.register_parameter(frequency)
     measurement.register_parameter(sample_index, paramtype="array")
     calibrated_gain = None
     actual_output_power = None
     actual_input_power = None
-    if result.calibrated:
+    if result.frequency_gain_codes is not None:
         calibrated_gain = Parameter(
             CALIBRATED_GAIN_PARAMETER,
             label="Applied frequency-compensated QICK gain",
             unit="",
         )
         measurement.register_parameter(calibrated_gain, setpoints=(frequency,))
+    if result.actual_output_powers_dbm is not None:
         actual_output_power = Parameter(
             ACTUAL_OUTPUT_POWER_PARAMETER,
             label="Power at DUT input plane",
             unit="dBm",
         )
+        measurement.register_parameter(actual_output_power, setpoints=(frequency,))
+    if result.input_powers_dbm is not None:
         actual_input_power = Parameter(
             ACTUAL_INPUT_POWER_PARAMETER,
             label="Power at DUT output plane",
             unit="dBm",
         )
-        measurement.register_parameter(actual_output_power, setpoints=(frequency,))
         measurement.register_parameter(actual_input_power, setpoints=(frequency,))
     for parameter in (
         mean_i,
@@ -2513,6 +2533,7 @@ def store_sparameter_result(
                 else result.input_powers_dbm.tolist()
             ),
             "physical_power_calibrated": result.physical_power_calibrated,
+            "s21_reference": result.s21_reference,
         },
         "formulas": {
             "mean_i": (
@@ -2574,20 +2595,20 @@ def store_sparameter_result(
                         int(result.frequency_gain_codes[index]),
                     )
                 )
-                if result.actual_output_powers_dbm is not None:
-                    values.append(
-                        (
-                            actual_output_power,
-                            float(result.actual_output_powers_dbm[index]),
-                        )
+            if actual_output_power is not None:
+                values.append(
+                    (
+                        actual_output_power,
+                        float(result.actual_output_powers_dbm[index]),
                     )
-                if result.input_powers_dbm is not None:
-                    values.append(
-                        (
-                            actual_input_power,
-                            float(result.input_powers_dbm[index]),
-                        )
+                )
+            if actual_input_power is not None:
+                values.append(
+                    (
+                        actual_input_power,
+                        float(result.input_powers_dbm[index]),
                     )
+                )
             datasaver.add_result(*values)
             percent = 65 + round(25 * (index + 1) / result.frequencies_mhz.size)
             _emit_progress(
@@ -3048,6 +3069,7 @@ def load_sparameter_run(
             frequency_gain_codes=payload.get("frequency_gain_codes"),
             actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
             input_powers_dbm=payload.get("input_powers_dbm"),
+            s21_reference=payload.get("s21_reference"),
         )
     return StoredSParameterSweep(
         run_id=int(dataset.run_id),

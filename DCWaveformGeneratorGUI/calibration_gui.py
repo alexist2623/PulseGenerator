@@ -2791,11 +2791,23 @@ class CalibrationPanel(QtWidgets.QWidget):
                 getattr(stored, "point_count", 0),
             )
         )
+        qcodes_run_id = int(getattr(stored, "qcodes_run_id", 0) or 0)
+        if qcodes_run_id:
+            run_label = (
+                f"QCoDeS Run {qcodes_run_id} "
+                f"(calibration record {int(stored.run_id)})"
+            )
+            plottr_message = (
+                f"\nOpen QCoDeS Run {qcodes_run_id} in Plottr Inspectr."
+            )
+        else:
+            run_label = f"calibration Run {stored.run_id}"
+            plottr_message = ""
         self.set_running(
             False,
             (
-                f"{board_type} calibration Run {stored.run_id}: "
-                f"{row_count:,} rows\n{stored.database_path}{plot_message}"
+                f"{board_type} {run_label}: {row_count:,} rows\n"
+                f"{stored.database_path}{plottr_message}{plot_message}"
             ),
         )
 

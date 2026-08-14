@@ -5484,7 +5484,7 @@ def test_sparameter_qcs_hides_qick_only_controls_and_restores_them():
     assert panel.qcs_amplitude.isVisible() is True
     assert panel.override_fpga_trigger_delay.isEnabled() is False
     assert panel.run_button.isEnabled() is True
-    assert panel.scan_time_label.text() == "Requested integration duration:"
+    assert panel.scan_time_label.text() == "Total I/Q averaging time:"
     assert all(
         term not in panel.path_hint.text()
         for term in ("HWH", "Nyquist", "board selection")
@@ -5545,6 +5545,72 @@ def test_qcs_front_panel_preflight_rejects_auxiliary_hardware_activity():
     with pytest.raises(ValueError, match="hardware task is running"):
         window._validate_qcs_front_panel_source_snapshot()
     window._experiment_thread = None
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_stability_uses_scoped_mapper_when_shared_experiment_is_draft(
+    monkeypatch,
+    tmp_path,
+):
+    """A complete Stability path must not validate AWG Tuning mapper state."""
+
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    configuration = front_panel.default_qcs_hardware_configuration(
+        ("dc_x", "dc_y"),
+        {3: "rf_probe"},
+        "digitizer",
+    )
+    payload = experiment.qcs_settings_dict()
+    payload.update(
+        {
+            "dc_channel_names": ["dc_x", "dc_y"],
+            "rf_channel_names": {"3": "rf_probe"},
+            "acquisition_channel_name": "digitizer",
+            "hardware_configuration": configuration,
+            "hardware_configuration_state": (
+                front_panel.QCS_HARDWARE_STATE_DRAFT
+            ),
+            "hardware_mapper_sha256": None,
+        }
+    )
+    experiment.set_qcs_settings(payload, 2)
+    window._propagate_qcs_hardware_configuration(
+        configuration,
+        ("dc_x", "dc_y"),
+        {3: "rf_probe"},
+        "digitizer",
+    )
+    scoped_path = tmp_path / "stability_scoped.qcs"
+    monkeypatch.setattr(
+        gui,
+        "qcs_workflow_mapper_output_path",
+        lambda _configuration, workflow: (
+            scoped_path if workflow == "stability" else None
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsaved physical changes"):
+        experiment.qcs_connection_values(2)
+
+    connection, scoped = window._qcs_stability_connection_values()
+
+    assert connection.mapper_path == str(scoped_path)
+    assert connection.mapper_sha256 is None
+    assert connection.dc_channel_names == ("dc_x", "dc_y")
+    assert connection.rf_channel_names == {3: "rf_probe"}
+    assert connection.acquisition_channel_name == "digitizer"
+    assert {
+        mapping["role"] for mapping in scoped["channel_mappings"]
+    } == {"dc", "rf", "acquisition"}
+    assert experiment.qcs_settings_dict()[
+        "hardware_configuration_state"
+    ] == front_panel.QCS_HARDWARE_STATE_DRAFT
     window.close()
     window.deleteLater()
     app.processEvents()

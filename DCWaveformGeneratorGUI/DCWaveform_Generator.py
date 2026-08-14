@@ -483,11 +483,39 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 41
+SETTINGS_VERSION = 42
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 EXECUTION_BACKEND_QICK = "qick"
 EXECUTION_BACKEND_QCS = "qcs"
+
+
+def _qcs_rf_calibration_database_has_records(path: str) -> bool:
+    """Return whether an existing database contains an M5300 calibration."""
+
+    database_path = Path(str(path).strip()).expanduser()
+    if not database_path.is_file():
+        return False
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            str(database_path),
+            timeout=0.1,
+        )
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'qcs_rf_power_calibration_runs'"
+        ).fetchone()
+        if table_exists is None:
+            return False
+        return connection.execute(
+            "SELECT 1 FROM qcs_rf_power_calibration_runs LIMIT 1"
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 EXECUTION_BACKENDS = (EXECUTION_BACKEND_QICK, EXECUTION_BACKEND_QCS)
 DEFAULT_EXECUTION_BACKEND = EXECUTION_BACKEND_QCS
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -3265,8 +3293,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "Latest compatible"
         )
         self.qcs_power_calibration_run_id.setToolTip(
-            "Run ID 0 selects the newest calibration matching the active "
-            "M5300 SMA connector, LO, and RF frequency"
+            "Calibration record ID 0 selects the newest calibration matching "
+            "the active M5300 SMA connector, LO, and RF frequency. This is "
+            "separate from the QCoDeS Run ID shown in Plottr Inspectr."
         )
         self.qcs_target_output_power_dbm = QtWidgets.QDoubleSpinBox()
         self.qcs_target_output_power_dbm.setRange(-200.0, 100.0)
@@ -3287,7 +3316,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             qcs_power_database_row,
         )
         qcs_power_calibration_form.addRow(
-            "Calibration Run ID:",
+            "Calibration record ID:",
             self.qcs_power_calibration_run_id,
         )
         qcs_power_calibration_form.addRow(
@@ -15115,22 +15144,82 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "gui_settings": qick_arguments["gui_settings"],
         }
 
+    def _qcs_stability_connection_values(
+        self,
+    ) -> tuple[QcsConnectionConfig, Mapping[str, object]]:
+        """Build the mapper owned by Stability from the shared inventory.
+
+        The graphical chassis inventory is shared by all tabs.  Native
+        ChannelMapper files are not: validating the Experiment/AWG mapper
+        here made a complete Stability selection fail whenever another tab
+        had an unrelated draft.  A content-addressed Stability mapper keeps
+        the physical endpoint selections isolated while retaining the same
+        installed-module view.
+        """
+
+        if self._qcs_mapper_commit_pending():
+            raise ValueError(
+                "The selected QCS SMA assignment is still being applied. "
+                "Wait for the background front-panel update to finish, then "
+                "run Stability again."
+            )
+        self._experiment_panel._commit_qcs_inter_iteration_delay()
+        mapper_configuration = (
+            self._stability_panel.qcs_mapper_configuration()
+        )
+        dc_names, rf_names, acquisition_name = qcs_role_bindings(
+            mapper_configuration,
+            required_dc_count=len(self._pulse),
+        )
+        mapper_path = qcs_workflow_mapper_output_path(
+            mapper_configuration,
+            "stability",
+        )
+        mapper_digest = (
+            qcs_mapper_file_sha256(mapper_path)
+            if mapper_path.is_file()
+            else None
+        )
+        connection = QcsConnectionConfig(
+            mapper_path=str(mapper_path),
+            mapper_sha256=mapper_digest,
+            dc_channel_names=tuple(dc_names),
+            dc_full_scale_v=float(
+                self._experiment_panel.qcs_dc_full_scale_v.value()
+            ),
+            rf_channel_names={
+                int(index): str(name)
+                for index, name in rf_names.items()
+            },
+            acquisition_channel_name=acquisition_name,
+            hw_demod=True,
+            init_time_s=(
+                float(self._experiment_panel.qcs_init_time_us.value())
+                * 1.0e-6
+            ),
+            blocking=bool(self._experiment_panel._qcs_blocking),
+        )
+        return connection, mapper_configuration
+
     def _stability_run_arguments(self, *, save: bool) -> dict:
         database_path = (
             self._stability_panel.database_path_value() if save else None
         )
         backend = self._experiment_panel.execution_backend()
         if backend == EXECUTION_BACKEND_QCS:
-            connection = self._experiment_panel.qcs_connection_values(
-                len(self._pulse)
+            # Synchronize the Stability selectors before deriving its scoped
+            # mapper.  Otherwise an output added or removed immediately before
+            # Run could leave qcs_mapper_configuration() with a stale count.
+            self._stability_panel.refresh_targets(
+                self._qick_output_names(),
+                tuple(range(len(self._pulse))),
+            )
+            connection, mapper_configuration = (
+                self._qcs_stability_connection_values()
             )
             run_config = self._experiment_panel.run_config_values(
                 require_run_config=save,
                 database_path=database_path,
-            )
-            self._stability_panel.refresh_targets(
-                self._qick_output_names(),
-                tuple(range(len(self._pulse))),
             )
             qcs_full_scale_mv = float(connection.dc_full_scale_v) * 1000.0
             stability_config = self._stability_panel.config(
@@ -15141,6 +15230,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 run_config=run_config,
                 stability_config=stability_config,
                 save=save,
+                mapper_configuration=mapper_configuration,
             )
 
         values = self._experiment_panel.values(
@@ -15270,17 +15360,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         run_config: Optional[QcodesRunConfig],
         stability_config,
         save: bool,
+        mapper_configuration: Mapping[str, object],
     ) -> dict:
         """Translate Stability controls into one native QCS X/Y sweep."""
         # Acquisition mode belongs to the measurement, not to the shared QCS
         # hardware connection.  AWG Tuning may independently request a raw
         # trace, while Stability always returns hardware-demodulated I/Q.
         connection = replace(connection, hw_demod=True)
-        mapper_path = Path(connection.mapper_path).expanduser()
-        if not mapper_path.is_file():
-            raise ValueError(
-                f"QCS ChannelMapper file not found: {mapper_path}"
-            )
         if not connection.blocking:
             raise ValueError(
                 "QCS Stability hardware sweep requires blocking execution"
@@ -15370,6 +15456,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 * 1.0e6
             ),
         )
+        power_calibration_values = (
+            self._stability_panel.qcs_power_calibration_values()
+        )
+        power_calibration = (
+            None
+            if power_calibration_values is None
+            else QcsRfPowerCalibrationConfig(**power_calibration_values)
+        )
         rf_pulses = (
             QcsRfPulseConfig(
                 gen_ch=rf_gen_ch,
@@ -15387,6 +15481,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 delay_s=readout_delay_s,
                 envelope="constant",
                 require_within_segment=False,
+                power_calibration=power_calibration,
             ),
         )
         acquisition = QcsAcquisitionConfig(
@@ -15405,10 +15500,39 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             phase_rad=0.0,
             envelope="constant",
         )
+        gui_settings = None
+        if save:
+            stability_mapper_saved = connection.mapper_sha256 is not None
+            qcs_settings_override = {
+                "mapper_path": connection.mapper_path,
+                "dc_channel_names": list(connection.dc_channel_names),
+                "dc_full_scale_v": float(connection.dc_full_scale_v),
+                "rf_channel_names": {
+                    str(index): name
+                    for index, name in connection.rf_channel_names.items()
+                },
+                "acquisition_channel_name": (
+                    connection.acquisition_channel_name
+                ),
+                "hw_demod": True,
+                "sample_rate_hz": sample_rate_hz,
+                "init_time_s": float(connection.init_time_s),
+                "blocking": bool(connection.blocking),
+                "hardware_configuration": dict(mapper_configuration),
+                "hardware_configuration_state": (
+                    QCS_HARDWARE_STATE_SAVED
+                    if stability_mapper_saved
+                    else QCS_HARDWARE_STATE_DRAFT
+                ),
+                "hardware_mapper_sha256": connection.mapper_sha256,
+            }
+            gui_settings = self._settings_to_dict(
+                qcs_settings_override=qcs_settings_override,
+            )
         return {
             "connection_config": connection,
             "run_config": run_config,
-            "gui_settings": self._settings_to_dict() if save else None,
+            "gui_settings": gui_settings,
             "stability_config": stability_config,
             "full_scale_mv": qcs_full_scale_mv,
             "sequence": sequence,
@@ -15419,6 +15543,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "rf_pulses": rf_pulses,
             "acquisition": acquisition,
             "readout_spec": None,
+            "mapper_configuration": mapper_configuration,
         }
 
     def _sparameter_run_arguments(self) -> dict:
@@ -16017,6 +16142,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     QCS_M5200_SAMPLE_RATE_HZ,
                 )
             ),
+            actual_output_powers_dbm=getattr(
+                execution,
+                "dut_input_powers_dbm",
+                None,
+            ),
+            input_powers_dbm=getattr(
+                execution,
+                "dut_output_powers_dbm",
+                None,
+            ),
+            s21_reference=(
+                "qcs_m5300_m5200_calibration_thru"
+                if getattr(execution, "dut_input_powers_dbm", None) is not None
+                else None
+            ),
         )
         self._sparameter_plot.set_result(result)
         self._dock_sparameter.show()
@@ -16334,6 +16474,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         calibration = getattr(stored, "calibration", None)
         if calibration is not None and hasattr(
             calibration,
+            "full_scale_power_dbm",
+        ):
+            self._stability_panel.adopt_qcs_power_calibration(
+                str(stored.database_path),
+                run_id=int(stored.run_id),
+                enable=True,
+            )
+        if calibration is not None and hasattr(
+            calibration,
             "corrected_maximum_abs_voltage_v",
         ):
             corrected_maximum = float(
@@ -16343,8 +16492,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 corrected_maximum
             )
             self._refresh_qcs_waveform_capacity()
+        qcodes_run_id = int(getattr(stored, "qcodes_run_id", 0) or 0)
+        if qcodes_run_id:
+            saved_label = (
+                f"QCoDeS Run {qcodes_run_id} "
+                f"(calibration record {int(stored.run_id)})"
+            )
+        else:
+            saved_label = f"Calibration Run {stored.run_id}"
         self.statusBar().showMessage(
-            f"Calibration Run {stored.run_id} saved to {stored.database_path}"
+            f"{saved_label} saved to {stored.database_path}"
             + (
                 f"; QCS DC full scale set to +/-{corrected_maximum:.9g} V"
                 if calibration is not None
@@ -17684,7 +17841,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "quantity": quantity,
         }
 
-    def _settings_to_dict(self) -> dict:
+    def _settings_to_dict(
+        self,
+        *,
+        qcs_settings_override: Optional[Mapping[str, object]] = None,
+    ) -> dict:
         """Return every user-editable experiment setting in canonical units."""
         experiment_values = self._experiment_panel.values(
             len(self._pulse),
@@ -17786,7 +17947,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "filter_tau_us": self._bias_t_filter_tau_us,
                 },
             },
-            "qcs": self._experiment_panel.qcs_settings_dict(),
+            "qcs": (
+                self._experiment_panel.qcs_settings_dict()
+                if qcs_settings_override is None
+                else dict(qcs_settings_override)
+            ),
             "experiment": {
                 "execution_backend": experiment_values["execution_backend"],
                 "qick_host": connection.host,
@@ -18438,6 +18603,37 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
         )
         raw_stability_settings = data.get("stability_diagram")
+        if raw_stability_settings is None:
+            raw_stability_settings = {}
+        elif isinstance(raw_stability_settings, dict):
+            raw_stability_settings = dict(raw_stability_settings)
+        if (
+            isinstance(raw_stability_settings, dict)
+            and "qcs_power_calibration_enabled"
+            not in raw_stability_settings
+        ):
+            # Settings written before Stability had its own calibrated-power
+            # controls already contain the Calibration tab's database.  If
+            # that database has an M5300 record, adopt it instead of silently
+            # retaining the old 20000/32767 relative-amplitude behavior.
+            raw_calibration_settings = data.get("calibration", {})
+            calibration_database_path = (
+                str(raw_calibration_settings.get("database_path", "")).strip()
+                if isinstance(raw_calibration_settings, dict)
+                else ""
+            )
+            if _qcs_rf_calibration_database_has_records(
+                calibration_database_path
+            ):
+                raw_stability_settings.update(
+                    {
+                        "qcs_power_calibration_enabled": True,
+                        "qcs_power_calibration_database_path": (
+                            calibration_database_path
+                        ),
+                        "qcs_power_calibration_run_id": 0,
+                    }
+                )
         stability_settings = normalize_stability_settings(
             raw_stability_settings,
             output_names=tuple(f"awg_{index}" for index in range(len(pulses))),

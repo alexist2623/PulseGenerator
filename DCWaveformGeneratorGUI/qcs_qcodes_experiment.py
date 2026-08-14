@@ -910,7 +910,7 @@ class QcsConnectionConfig:
 
 @dataclass(frozen=True)
 class QcsRfPowerCalibrationConfig:
-    """One fixed M5300A connector-power request for AWG Tuning."""
+    """One fixed M5300A connector-power request for a QCS RF pulse."""
 
     database_path: str
     target_power_dbm: float
@@ -926,10 +926,14 @@ class QcsRfPowerCalibrationConfig:
         if not isfinite(target_power_dbm):
             raise ValueError("QCS target RF output power must be finite")
         if isinstance(self.run_id, bool) or int(self.run_id) != self.run_id:
-            raise TypeError("QCS RF power-calibration run ID must be an integer")
+            raise TypeError(
+                "QCS RF power-calibration record ID must be an integer"
+            )
         run_id = int(self.run_id)
         if run_id < 0:
-            raise ValueError("QCS RF power-calibration run ID must be nonnegative")
+            raise ValueError(
+                "QCS RF power-calibration record ID must be nonnegative"
+            )
         object.__setattr__(self, "database_path", database_path)
         object.__setattr__(self, "target_power_dbm", target_power_dbm)
         object.__setattr__(self, "run_id", run_id)
@@ -1291,6 +1295,8 @@ class QcsSParameterExecutionResult:
     raw_result: Any
     program_summary: Mapping[str, Any]
     rf_settings: Mapping[str, Any]
+    dut_input_powers_dbm: Optional[np.ndarray] = None
+    dut_output_powers_dbm: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -7576,6 +7582,113 @@ def execute_qcs_sparameter_sweep(
     )
 
 
+def _apply_qcs_sparameter_power_reference(
+    execution: QcsSParameterExecutionResult,
+    *,
+    calibration: Any,
+    rf_amplitudes: float | Sequence[float],
+    sweep_config: Any,
+) -> QcsSParameterExecutionResult:
+    """Convert QCS receiver voltage into calibrated, thru-normalized S21.
+
+    The QCS M5300A power calibration is acquired through an M5200A loopback.
+    It therefore supplies both the programmed source-power reference and the
+    M5200 voltage-to-power conversion.  For each frequency this derives::
+
+        P_DUT_IN  = P_M5300_REFERENCE - LOSS1
+        P_DUT_OUT = P_M5200 + LOSS2 - AMPLIFIER_GAIN
+        |S21|_dB  = P_DUT_OUT - P_DUT_IN
+
+    Raw I/Q remains untouched so the uncalibrated receiver magnitude is still
+    available as ``adc_magnitude_db`` in the shared result model.
+    """
+
+    frequencies_hz = np.asarray(
+        execution.frequencies_hz,
+        dtype=float,
+    ).reshape(-1)
+    iq = np.asarray(execution.iq)
+    if iq.ndim != 4 or iq.shape[0] != frequencies_hz.size or iq.shape[-2:] != (
+        1,
+        2,
+    ):
+        raise ValueError(
+            "QCS S-parameter power conversion requires I/Q with shape "
+            "(frequency, repetition, 1, 2)"
+        )
+    mean_iq = np.mean(
+        iq[:, :, 0, 0].astype(np.float64)
+        + 1j * iq[:, :, 0, 1].astype(np.float64),
+        axis=1,
+    )
+    receiver_magnitude = np.abs(mean_iq)
+    if np.any(~np.isfinite(receiver_magnitude)):
+        raise ValueError(
+            "QCS S-parameter receiver magnitude must be finite"
+        )
+    receiver_magnitude = np.maximum(
+        receiver_magnitude,
+        np.finfo(np.float64).tiny,
+    )
+    receiver_connector_power_dbm = np.asarray(
+        calibration.input_reference.output_power_dbm(receiver_magnitude),
+        dtype=float,
+    ).reshape(-1)
+
+    amplitudes = np.asarray(rf_amplitudes, dtype=float).reshape(-1)
+    if amplitudes.size == 1:
+        amplitudes = np.full(frequencies_hz.shape, float(amplitudes[0]))
+    if amplitudes.size != frequencies_hz.size:
+        raise ValueError(
+            "QCS calibrated RF amplitudes must contain one value per frequency"
+        )
+    amplitudes = np.abs(amplitudes)
+    if np.any(~np.isfinite(amplitudes)) or np.any(amplitudes <= 0.0):
+        raise ValueError(
+            "QCS calibrated RF amplitudes must be finite and nonzero"
+        )
+    source_connector_power_dbm = np.asarray(
+        calibration.full_scale_power_dbm(frequencies_hz),
+        dtype=float,
+    ).reshape(-1) + 20.0 * np.log10(amplitudes)
+
+    def correction(name: str) -> float:
+        value = float(getattr(sweep_config, name, 0.0))
+        if not isfinite(value):
+            raise ValueError(f"QCS S-parameter {name} must be finite")
+        return value
+
+    loss1_db = correction("loss1_db")
+    loss2_db = correction("loss2_db")
+    amplifier_gain_db = correction("amplifier_gain_db")
+    dut_input_powers_dbm = source_connector_power_dbm - loss1_db
+    dut_output_powers_dbm = (
+        receiver_connector_power_dbm + loss2_db - amplifier_gain_db
+    )
+    calculation = {
+        "quantity": "loopback_normalized_s21",
+        "formula_db": "P_DUT_OUT_dBm - P_DUT_IN_dBm",
+        "source_reference": "M5300A/M5200A RF power calibration thru",
+        "receiver_conversion": (
+            "calibration.input_reference.output_power_dbm(abs(mean(I+jQ)))"
+        ),
+        "loss1_db": loss1_db,
+        "loss2_db": loss2_db,
+        "amplifier_gain_db": amplifier_gain_db,
+    }
+    summary = dict(execution.program_summary)
+    summary["s21_calculation"] = calculation
+    rf_settings = dict(execution.rf_settings)
+    rf_settings["s21"] = calculation
+    return replace(
+        execution,
+        program_summary=summary,
+        rf_settings=rf_settings,
+        dut_input_powers_dbm=np.ascontiguousarray(dut_input_powers_dbm),
+        dut_output_powers_dbm=np.ascontiguousarray(dut_output_powers_dbm),
+    )
+
+
 def run_qcs_sparameter_sweep(
     *,
     connection_config: QcsConnectionConfig,
@@ -7606,6 +7719,7 @@ def run_qcs_sparameter_sweep(
     calibration_enabled = bool(
         getattr(sweep_config, "power_calibration_enabled", False)
     )
+    calibration = None
     output_power_calibration = None
     calibrated_amplitudes: float | Sequence[float] = rf_amplitude
     if calibration_enabled:
@@ -7634,7 +7748,7 @@ def run_qcs_sparameter_sweep(
             )
         (
             output_identity,
-            _input_identity,
+            input_identity,
             expected_lo_frequency_hz,
         ) = resolve_m5300_m5200_identities(
             mapper,
@@ -7669,7 +7783,7 @@ def run_qcs_sparameter_sweep(
             getattr(sweep_config, "calibration_database_path"),
             run_id=requested_run_id,
             expected_output=output_identity,
-            expected_input=None,
+            expected_input=input_identity,
             expected_mapper_sha256=None,
             expected_lo_frequency_hz=expected_lo_frequency_hz,
             required_frequencies_hz=requested_hz,
@@ -7695,26 +7809,57 @@ def run_qcs_sparameter_sweep(
                     dtype=float,
                 ).tolist(),
                 "power_extrapolation": False,
+                "s21_reference": "M5300A/M5200A calibration thru",
             }
         )
-    execution = execute_qcs_sparameter_sweep(
-        connection_config=connection_config,
-        frequencies_hz=requested_hz,
-        rf_gen_ch=rf_gen_ch,
-        rf_amplitude=calibrated_amplitudes,
-        integration_duration_s=(
-            float(getattr(sweep_config, "scan_time_us")) * 1.0e-6
-        ),
-        repetitions_per_point=repetitions_per_point,
-        calibrated_output=calibration_enabled,
-        output_power_calibration=output_power_calibration,
-        progress_callback=progress_callback,
-        partial_callback=partial_callback,
-        qcs_module=(qcs if calibration_enabled else qcs_module),
-        mapper=mapper,
-        executor=executor,
-        cancellation=cancellation,
-    )
+
+    def with_power_reference(
+        current: QcsSParameterExecutionResult,
+    ) -> QcsSParameterExecutionResult:
+        if calibration is None:
+            return current
+        return _apply_qcs_sparameter_power_reference(
+            current,
+            calibration=calibration,
+            rf_amplitudes=calibrated_amplitudes,
+            sweep_config=sweep_config,
+        )
+
+    def publish_partial(current: QcsSParameterExecutionResult) -> None:
+        if partial_callback is not None:
+            partial_callback(with_power_reference(current))
+
+    try:
+        execution = execute_qcs_sparameter_sweep(
+            connection_config=connection_config,
+            frequencies_hz=requested_hz,
+            rf_gen_ch=rf_gen_ch,
+            rf_amplitude=calibrated_amplitudes,
+            integration_duration_s=(
+                float(getattr(sweep_config, "scan_time_us")) * 1.0e-6
+            ),
+            repetitions_per_point=repetitions_per_point,
+            calibrated_output=calibration_enabled,
+            output_power_calibration=output_power_calibration,
+            progress_callback=progress_callback,
+            partial_callback=(
+                publish_partial if partial_callback is not None else None
+            ),
+            qcs_module=(qcs if calibration_enabled else qcs_module),
+            mapper=mapper,
+            executor=executor,
+            cancellation=cancellation,
+        )
+    except QcsExperimentCancelled as exc:
+        partial = getattr(exc, "partial_result", None)
+        if partial is not None:
+            partial = with_power_reference(partial)
+        raise QcsExperimentCancelled(
+            str(exc),
+            partial_result=partial,
+            stored_result=getattr(exc, "stored_result", None),
+        ) from exc
+    execution = with_power_reference(execution)
     try:
         from .qick_sparameter_sweep import (
             SParameterSweepResult,
@@ -7737,6 +7882,13 @@ def run_qcs_sparameter_sweep(
         iq_traces,
         sample_rate_hz=float(
             execution.program_summary["sample_rate_hz"]
+        ),
+        actual_output_powers_dbm=execution.dut_input_powers_dbm,
+        input_powers_dbm=execution.dut_output_powers_dbm,
+        s21_reference=(
+            "qcs_m5300_m5200_calibration_thru"
+            if execution.dut_input_powers_dbm is not None
+            else None
         ),
     )
     if progress_callback is not None:
@@ -7856,6 +8008,11 @@ def compile_qcs_stability_hardware_sweep(
         raise ValueError(
             "a QCS acquisition virtual-channel name is required"
         )
+    rf_pulses = resolve_qcs_rf_power_calibrations(
+        connection_config=connection_config,
+        mapper=mapper,
+        rf_pulses=rf_pulses,
+    )
     dc_channels = []
     for name in connection_config.dc_channel_names:
         channel = _resolve_mapper_channel(mapper, name)
@@ -8282,21 +8439,24 @@ def compile_qcs_stability_hardware_sweep(
                     f"RF={rf_absolute_phase} and acquisition="
                     f"{acquisition_absolute_phase}"
                 )
-        programmed_rf_pulses.append(
-            {
-                "gen_ch": pulse.gen_ch,
-                "amplitude": pulse.amplitude,
-                "frequency_hz": pulse.frequency_hz,
-                "duration_s": pulse_duration_s,
-                "delay_s": pulse_delay_s,
-                "elapsed_duration_s": (
-                    acquisition_elapsed_duration_s
-                    if segment_count > 1
-                    else pulse_duration_s
-                ),
-                "segment_count": segment_count,
-            }
-        )
+        programmed_rf_pulse = {
+            "gen_ch": pulse.gen_ch,
+            "amplitude": pulse.amplitude,
+            "frequency_hz": pulse.frequency_hz,
+            "duration_s": pulse_duration_s,
+            "delay_s": pulse_delay_s,
+            "elapsed_duration_s": (
+                acquisition_elapsed_duration_s
+                if segment_count > 1
+                else pulse_duration_s
+            ),
+            "segment_count": segment_count,
+        }
+        if pulse.power_calibration_provenance is not None:
+            programmed_rf_pulse["power_calibration"] = dict(
+                pulse.power_calibration_provenance
+            )
+        programmed_rf_pulses.append(programmed_rf_pulse)
         pulse_elapsed_duration_s = (
             acquisition_elapsed_duration_s
             if segment_count > 1
