@@ -7,7 +7,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 import json
 from dataclasses import asdict, replace
-from math import ceil, prod, ulp
+from math import ceil, floor, prod, ulp
 from pathlib import Path
 import re
 import sqlite3
@@ -223,19 +223,27 @@ try:
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
+        QCS_NOISE_MAX_RAW_TRACE_SAMPLES,
+        QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
+        QCS_STABILITY_INTER_SEGMENT_DELAY_S,
         QcsAcquisitionConfig,
         QcsCancellationController,
         QcsConnectionConfig,
         QcsExperimentCancelled,
         QcsM5301CapacityReport,
         QcsNoiseTraceConfig,
+        QcsRfPowerCalibrationConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
+        qcs_stability_integration_segment_sample_counts,
+        plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
@@ -246,19 +254,27 @@ except ImportError:
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
+        QCS_NOISE_MAX_RAW_TRACE_SAMPLES,
+        QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
+        QCS_STABILITY_INTER_SEGMENT_DELAY_S,
         QcsAcquisitionConfig,
         QcsCancellationController,
         QcsConnectionConfig,
         QcsExperimentCancelled,
         QcsM5301CapacityReport,
         QcsNoiseTraceConfig,
+        QcsRfPowerCalibrationConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
+        qcs_stability_integration_segment_sample_counts,
+        plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
@@ -284,7 +300,10 @@ except ImportError:
     )
 
 try:
-    from .qick_sparameter_sweep import SParameterSweepConfig
+    from .qick_sparameter_sweep import (
+        SParameterSweepConfig,
+        SParameterSweepResult,
+    )
     from .sparameter_gui import (
         DEFAULT_SPARAMETER_DB_PATH,
         QcsSParameterSweepWorker,
@@ -294,7 +313,10 @@ try:
         SParameterSweepWorker,
     )
 except ImportError:
-    from qick_sparameter_sweep import SParameterSweepConfig
+    from qick_sparameter_sweep import (
+        SParameterSweepConfig,
+        SParameterSweepResult,
+    )
     from sparameter_gui import (
         DEFAULT_SPARAMETER_DB_PATH,
         QcsSParameterSweepWorker,
@@ -350,6 +372,7 @@ try:
         CalibrationWorker,
         default_calibration_settings,
         normalize_calibration_paths,
+        normalize_qcs_calibration_endpoint_settings,
     )
     from .qick_power_calibration import (
         InputPowerCalibrationConfig,
@@ -364,6 +387,7 @@ except ImportError:
         CalibrationWorker,
         default_calibration_settings,
         normalize_calibration_paths,
+        normalize_qcs_calibration_endpoint_settings,
     )
     from qick_power_calibration import (
         InputPowerCalibrationConfig,
@@ -414,6 +438,7 @@ try:
         qcs_hardware_mapper_fingerprint,
         qcs_mapper_file_sha256,
         qcs_role_bindings,
+        qcs_workflow_mapper_output_path,
         resize_incomplete_qcs_dc_mappings,
         resize_qcs_dc_mappings,
         synchronize_qcs_hardware_role_names,
@@ -437,6 +462,7 @@ except ImportError:
         qcs_hardware_mapper_fingerprint,
         qcs_mapper_file_sha256,
         qcs_role_bindings,
+        qcs_workflow_mapper_output_path,
         resize_incomplete_qcs_dc_mappings,
         resize_qcs_dc_mappings,
         synchronize_qcs_hardware_role_names,
@@ -457,7 +483,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 39
+SETTINGS_VERSION = 41
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 EXECUTION_BACKEND_QICK = "qick"
@@ -510,6 +536,10 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "power_sweep_start_dbm": -20.0,
     "power_sweep_stop_dbm": -20.0,
     "power_sweep_count": 1,
+    "qcs_power_calibration_enabled": False,
+    "qcs_power_calibration_database_path": DEFAULT_POWER_CALIBRATION_DB_PATH,
+    "qcs_power_calibration_run_id": 0,
+    "qcs_target_output_power_dbm": -20.0,
 }
 
 DEFAULT_RF_READOUT_SETTINGS = {
@@ -3199,6 +3229,75 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             "QCS RF waveform amplitude relative to the configured "
             "signal-generator output range"
         )
+        self.qcs_power_calibration_group = QtWidgets.QGroupBox(
+            "M5300A 50 Ohm output-power calibration"
+        )
+        self.qcs_power_calibration_group.setCheckable(True)
+        self.qcs_power_calibration_group.setChecked(False)
+        qcs_power_calibration_form = QtWidgets.QFormLayout(
+            self.qcs_power_calibration_group
+        )
+        self.qcs_power_calibration_database_path = QtWidgets.QLineEdit(
+            DEFAULT_POWER_CALIBRATION_DB_PATH
+        )
+        self.qcs_power_calibration_database_path.setPlaceholderText(
+            "Select the M5300A/M5200A calibration database"
+        )
+        self.browse_qcs_power_calibration = QtWidgets.QToolButton()
+        self.browse_qcs_power_calibration.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
+        )
+        self.browse_qcs_power_calibration.setToolTip(
+            "Choose the dedicated QCS M5300A/M5200A RF-power "
+            "calibration database"
+        )
+        qcs_power_database_row = QtWidgets.QHBoxLayout()
+        qcs_power_database_row.addWidget(
+            self.qcs_power_calibration_database_path,
+            1,
+        )
+        qcs_power_database_row.addWidget(
+            self.browse_qcs_power_calibration
+        )
+        self.qcs_power_calibration_run_id = QtWidgets.QSpinBox()
+        self.qcs_power_calibration_run_id.setRange(0, 2_147_483_647)
+        self.qcs_power_calibration_run_id.setSpecialValueText(
+            "Latest compatible"
+        )
+        self.qcs_power_calibration_run_id.setToolTip(
+            "Run ID 0 selects the newest calibration matching the active "
+            "M5300 SMA connector, LO, and RF frequency"
+        )
+        self.qcs_target_output_power_dbm = QtWidgets.QDoubleSpinBox()
+        self.qcs_target_output_power_dbm.setRange(-200.0, 100.0)
+        self.qcs_target_output_power_dbm.setDecimals(6)
+        self.qcs_target_output_power_dbm.setSuffix(" dBm")
+        self.qcs_target_output_power_dbm.setValue(-20.0)
+        self.qcs_power_calibration_status = QtWidgets.QLabel(
+            "Enable calibration to choose connector power in dBm. The "
+            "matching relative amplitude is resolved from the active "
+            "ChannelMapper when Run QCS starts."
+        )
+        self.qcs_power_calibration_status.setWordWrap(True)
+        self.qcs_power_calibration_status.setStyleSheet(
+            "QLabel { color: #4f5b66; }"
+        )
+        qcs_power_calibration_form.addRow(
+            "Calibration DB:",
+            qcs_power_database_row,
+        )
+        qcs_power_calibration_form.addRow(
+            "Calibration Run ID:",
+            self.qcs_power_calibration_run_id,
+        )
+        qcs_power_calibration_form.addRow(
+            "Target M5300 connector power:",
+            self.qcs_target_output_power_dbm,
+        )
+        qcs_power_calibration_form.addRow(
+            "Status:",
+            self.qcs_power_calibration_status,
+        )
         self._power_calibration_resolved_signature = None
         self.power_calibration_group = QtWidgets.QGroupBox(
             "Calibrated output power"
@@ -3433,6 +3532,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.qcs_amplitude_label = QtWidgets.QLabel("Relative amplitude:")
         form.addRow(self.gain_label, self.gain)
         form.addRow(self.qcs_amplitude_label, self.qcs_amplitude)
+        form.addRow(self.qcs_power_calibration_group)
         form.addRow(self.power_calibration_group)
         self.shared_path_note = QtWidgets.QLabel(
             "ATT and filter settings are edited from the HWH-backed Front Panel."
@@ -3442,7 +3542,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow(self.shared_path_note)
         self.qcs_path_note = QtWidgets.QLabel(
             "Module and SMA connector follow the QCS front-panel mapping. "
-            "Relative amplitude is a fraction of the configured output range."
+            "Use Relative amplitude directly, or enable M5300A calibration "
+            "to select connector power in dBm."
         )
         self.qcs_path_note.setWordWrap(True)
         self.qcs_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
@@ -3498,6 +3599,22 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             signal.connect(self.changed.emit)
         self.qcs_amplitude.valueChanged.connect(
             self._apply_qcs_amplitude_to_gain
+        )
+        self.browse_qcs_power_calibration.clicked.connect(
+            self._browse_qcs_power_calibration_database
+        )
+        self.qcs_power_calibration_group.toggled.connect(
+            self._update_qcs_power_calibration_controls
+        )
+        self.qcs_power_calibration_group.toggled.connect(self.changed.emit)
+        self.qcs_power_calibration_database_path.textChanged.connect(
+            self.changed.emit
+        )
+        self.qcs_power_calibration_run_id.valueChanged.connect(
+            self.changed.emit
+        )
+        self.qcs_target_output_power_dbm.valueChanged.connect(
+            self.changed.emit
         )
         self.gain.valueChanged.connect(self._sync_qcs_amplitude_from_gain)
         self.toggled.connect(self.changed.emit)
@@ -3567,6 +3684,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_frequency_sweep_controls()
         self._update_power_calibration_controls()
         self._update_power_sweep_controls()
+        self._update_qcs_power_calibration_controls()
         self.set_hardware_backend(self._hardware_backend)
         self.set_index(index)
 
@@ -3664,6 +3782,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._set_form_row_visible(self.qcs_lo_frequency_row, False)
         self._set_form_row_visible(self.gain, not is_qcs)
         self._set_form_row_visible(self.qcs_amplitude, is_qcs)
+        self._set_form_row_visible(
+            self.qcs_power_calibration_group,
+            is_qcs,
+        )
         self._set_form_row_visible(self.power_calibration_group, not is_qcs)
         self._set_form_row_visible(self.shared_path_note, not is_qcs)
         self._set_form_row_visible(self.qcs_path_note, is_qcs)
@@ -3738,6 +3860,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self._sync_qcs_amplitude_from_gain()
         self._sync_qcs_module_model()
+        self._update_qcs_power_calibration_controls()
         self._update_time_labels()
 
     def _update_duration_sweep_controls(self, *_args) -> None:
@@ -3828,6 +3951,85 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 "Calibration inputs changed. Apply the calibrated gain again.",
                 state="stale",
             )
+
+    def _update_qcs_power_calibration_controls(self, *_args) -> None:
+        is_qcs = self._hardware_backend == EXECUTION_BACKEND_QCS
+        is_m5300 = is_qcs and self.qcs_module_model.currentData() == "M5300A"
+        self.qcs_power_calibration_group.setEnabled(is_m5300)
+        calibrated = bool(
+            is_m5300 and self.qcs_power_calibration_group.isChecked()
+        )
+        self.qcs_amplitude.setEnabled(is_qcs and not calibrated)
+        if not is_m5300:
+            self.qcs_power_calibration_status.setText(
+                "Calibrated connector power requires this RF output to be "
+                "mapped to an M5300A SMA."
+            )
+            self.qcs_power_calibration_status.setStyleSheet(
+                "QLabel { color: #cf222e; }"
+            )
+        elif calibrated:
+            self.qcs_power_calibration_status.setText(
+                "The relative amplitude will be resolved at Run QCS from "
+                "the exact M5300 connector, LO, RF frequency, and requested "
+                "dBm. The calibration M5200 and mapper are provenance only."
+            )
+            self.qcs_power_calibration_status.setStyleSheet(
+                "QLabel { color: #1a7f37; }"
+            )
+        else:
+            self.qcs_power_calibration_status.setText(
+                "Enable calibration to choose M5300 connector power in dBm; "
+                "otherwise Relative amplitude is used directly."
+            )
+            self.qcs_power_calibration_status.setStyleSheet(
+                "QLabel { color: #4f5b66; }"
+            )
+
+    def _browse_qcs_power_calibration_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose QCS M5300A output-power calibration database",
+            self.qcs_power_calibration_database_path.text().strip()
+            or DEFAULT_POWER_CALIBRATION_DB_PATH,
+            "SQLite calibration database (*.db)",
+        )
+        if path:
+            self.qcs_power_calibration_database_path.setText(path)
+
+    def qcs_power_calibration_config(
+        self,
+    ) -> Optional[QcsRfPowerCalibrationConfig]:
+        """Return the fixed-power request for this mapped QCS RF output."""
+
+        if not self.qcs_power_calibration_group.isChecked():
+            return None
+        if self.qcs_module_model.currentData() != "M5300A":
+            raise ValueError(
+                f"RF Output {self._index + 1} calibrated QCS power requires "
+                "an M5300A mapping"
+            )
+        if self.frequency_sweep_enabled.isChecked():
+            raise ValueError(
+                f"RF Output {self._index + 1} calibrated QCS power currently "
+                "requires one fixed RF frequency; disable Sweep RF frequency"
+            )
+        database_path = self.qcs_power_calibration_database_path.text().strip()
+        if not database_path:
+            raise ValueError(
+                f"RF Output {self._index + 1} QCS power-calibration database "
+                "is missing"
+            )
+        if not Path(database_path).expanduser().is_file():
+            raise ValueError(
+                f"RF Output {self._index + 1} QCS power-calibration database "
+                f"was not found: {database_path}"
+            )
+        return QcsRfPowerCalibrationConfig(
+            database_path=database_path,
+            run_id=self.qcs_power_calibration_run_id.value(),
+            target_power_dbm=self.qcs_target_output_power_dbm.value(),
+        )
 
     def _browse_power_calibration_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -4347,6 +4549,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         # explicit exceptions after a mapping change so an M5301 -> M5300
         # reassignment does not leave the newly visible LO editor disabled.
         self._keep_front_panel_preview_enabled()
+        self._update_qcs_power_calibration_controls()
 
     def _sync_front_panel_selection(self, *_args) -> None:
         self.front_panel_preview.set_qcs_selection(
@@ -4542,6 +4745,18 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             "power_calibration_run_id": spec.power_calibration_run_id,
             "target_output_power_dbm": spec.target_output_power_dbm,
+            "qcs_power_calibration_enabled": (
+                self.qcs_power_calibration_group.isChecked()
+            ),
+            "qcs_power_calibration_database_path": (
+                self.qcs_power_calibration_database_path.text().strip()
+            ),
+            "qcs_power_calibration_run_id": (
+                self.qcs_power_calibration_run_id.value()
+            ),
+            "qcs_target_output_power_dbm": (
+                self.qcs_target_output_power_dbm.value()
+            ),
         }
 
     def load_settings(self, data: dict) -> None:
@@ -4574,6 +4789,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         if not isinstance(power_calibration_enabled, bool):
             raise TypeError("RF power_calibration_enabled must be boolean")
+        qcs_power_calibration_enabled = data.get(
+            "qcs_power_calibration_enabled",
+            False,
+        )
+        if not isinstance(qcs_power_calibration_enabled, bool):
+            raise TypeError(
+                "RF qcs_power_calibration_enabled must be boolean"
+            )
         spec = QickRfPulseSpec(
             gen_ch=int(data["gen_ch"]),
             segment_name=_resolve_stored_set_segment_name(
@@ -4734,11 +4957,29 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.power_calibration_group.setChecked(
             power_calibration_enabled
         )
+        self.qcs_power_calibration_database_path.setText(
+            str(
+                data.get(
+                    "qcs_power_calibration_database_path",
+                    DEFAULT_POWER_CALIBRATION_DB_PATH,
+                )
+            )
+        )
+        self.qcs_power_calibration_run_id.setValue(
+            int(data.get("qcs_power_calibration_run_id", 0))
+        )
+        self.qcs_target_output_power_dbm.setValue(
+            float(data.get("qcs_target_output_power_dbm", -20.0))
+        )
+        self.qcs_power_calibration_group.setChecked(
+            qcs_power_calibration_enabled
+        )
         self._update_board_controls()
         self._update_duration_sweep_controls()
         self._update_frequency_sweep_controls()
         self._update_power_calibration_controls()
         self._update_power_sweep_controls()
+        self._update_qcs_power_calibration_controls()
         self.setChecked(enabled)
 
 
@@ -5641,7 +5882,12 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.samples_label.setText("Stored FIR samples:")
         self.samples.setSingleStep(1)
         self.qcs_acquisition_duration_label.setText(
-            f"Acquisition time [{self._time_unit}]:"
+            (
+                "Total I/Q averaging time"
+                if self._qcs_hardware_demodulation
+                else "Raw trace duration"
+            )
+            + f" [{self._time_unit}]:"
         )
         self._update_qcs_acquisition_duration_constraints()
         self.frequency_label.setText(
@@ -5775,12 +6021,34 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         if self._qcs_hardware_demodulation:
             block = QCS_M5200_INTEGRATION_BLOCK_SAMPLES
             whole_samples = ((whole_samples + block - 1) // block) * block
-        if whole_samples > self.samples.maximum():
+        maximum_samples = self._qcs_max_acquisition_samples()
+        if whole_samples > maximum_samples:
+            mode_name = (
+                "total I/Q averaging"
+                if self._qcs_hardware_demodulation
+                else "raw trace"
+            )
             raise ValueError(
-                "QCS acquisition time exceeds the GUI limit of "
-                f"{self.samples.maximum():,} M5200 samples"
+                f"QCS {mode_name} time exceeds the GUI limit of "
+                f"{maximum_samples:,} M5200 samples"
             )
         return whole_samples
+
+    def _qcs_max_acquisition_samples(self) -> int:
+        """Return the result-mode-specific QCS acquisition ceiling."""
+
+        if self._qcs_hardware_demodulation:
+            duration_samples = int(
+                floor(
+                    QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S
+                    * self._qcs_acquisition_timing_rate_hz
+                )
+            )
+            return min(
+                QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
+                duration_samples,
+            )
+        return QCS_NOISE_MAX_RAW_TRACE_SAMPLES
 
     def _update_qcs_acquisition_duration_constraints(self) -> None:
         quantum = (
@@ -5788,7 +6056,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             if self._qcs_hardware_demodulation
             else 1
         )
-        maximum_samples = self.samples.maximum() // quantum * quantum
+        maximum_samples = (
+            self._qcs_max_acquisition_samples() // quantum * quantum
+        )
         seconds_per_sample = 1.0 / self._qcs_acquisition_timing_rate_hz
         with QtCore.QSignalBlocker(self.qcs_acquisition_duration):
             self.qcs_acquisition_duration.setRange(
@@ -5806,6 +6076,26 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                     quantum * seconds_per_sample * 1.0e9,
                     self._time_unit,
                 )
+            )
+        if self._qcs_hardware_demodulation:
+            self.qcs_acquisition_duration.setToolTip(
+                "Total effective M5200 I/Q averaging time. Up to 100 us is "
+                "executed in one bounded QCS pass. Longer requests are "
+                "accumulated from repeated bounded passes and reduced to one "
+                "sample-weighted complex I/Q result per point/repetition. "
+                "The selected AWG segment must cover the pre-delay plus one "
+                "pass (at most 100 us), not the complete accumulated time. "
+                "This is not one continuous raw trace."
+            )
+        else:
+            maximum_duration_s = (
+                maximum_samples / self._qcs_acquisition_timing_rate_hz
+            )
+            self.qcs_acquisition_duration.setToolTip(
+                "Raw M5200 trace duration. Every sample is returned and "
+                "stored, so this mode keeps its separate "
+                f"{maximum_samples:,}-sample "
+                f"({maximum_duration_s * 1.0e3:.6g} ms) payload limit."
             )
 
     def _qcs_acquisition_duration_changed(self, *_args) -> None:
@@ -5880,12 +6170,30 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             f"programmed time {effective_duration:.12g} {self._time_unit}. "
         )
         if self._qcs_hardware_demodulation:
+            pass_count = max(
+                1,
+                int(
+                    ceil(
+                        sample_count
+                        / QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES
+                    )
+                ),
+            )
+            if pass_count == 1:
+                pass_text = "one bounded QCS execution pass"
+            else:
+                pass_text = (
+                    f"{pass_count:,} bounded QCS execution passes; the GUI "
+                    "can stop between passes and retains the completed "
+                    "running average"
+                )
             self.qcs_acquisition_note.setText(
                 timing_text
-                + "Hardware demodulation uses a QCS IntegrationFilter in "
-                f"{sample_count // QCS_M5200_INTEGRATION_BLOCK_SAMPLES:,} "
-                "16-sample block(s) and returns one integrated I/Q value "
-                "per shot."
+                + "Hardware demodulation returns one accumulated complex "
+                "I/Q value per point/repetition. The requested total uses "
+                f"{pass_text}; each pass is at most 100 us and is internally "
+                "split into hardware-safe IntegrationFilter windows. The "
+                "selected AWG segment must cover one pass plus pre-delay."
             )
             return
         self.qcs_acquisition_note.setText(
@@ -5952,7 +6260,12 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             + f" [{unit}]:"
         )
         self.qcs_acquisition_duration_label.setText(
-            f"Acquisition time [{unit}]:"
+            (
+                "Total I/Q averaging time"
+                if self._qcs_hardware_demodulation
+                else "Raw trace duration"
+            )
+            + f" [{unit}]:"
         )
         self._update_qcs_acquisition_note()
 
@@ -6623,6 +6936,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.setRange(1.0, 1.0e6)
         self.full_scale_mv.setDecimals(6)
         self.full_scale_mv.setSuffix(" mV")
+        # Voltage-sweep coordinates are normalized by the execution
+        # backend's active AWG scale.  Keep that display scale separate from
+        # the dormant QICK full-scale widget so QCS does not inherit QICK's
+        # historical +/-800 mV limit.
+        self._sweep_voltage_scale_mv = float(full_scale_mv)
         self.awg_channels = QtWidgets.QLineEdit()
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
@@ -7380,14 +7698,19 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
 
         channel_details = []
-        for channel in report.channels:
+        for channel_index, channel in enumerate(report.channels):
             label = channel.output_name
             if channel.output_name in channel_names:
                 label += f" -> {channel_names[channel.output_name]}"
-            channel_details.append(
+            detail = (
                 f"{label}: {channel.rendered_samples:,} samples "
                 f"({channel.rendered_duration_us:.6f} us)"
             )
+            if channel_index < len(report.dc_channel_offsets_v):
+                offset_v = float(report.dc_channel_offsets_v[channel_index])
+                if not np.isclose(offset_v, 0.0, rtol=0.0, atol=1e-15):
+                    detail += f", fixed physical offset {offset_v * 1e3:+.9g} mV"
+            channel_details.append(detail)
         if report.exhaustive:
             inspection = (
                 f"All {report.sweep_point_count:,} software-sweep point(s) "
@@ -7403,7 +7726,9 @@ class ExperimentPanel(QtWidgets.QWidget):
             " Each output has its own budget; outputs are not added together. "
             "Ramps and independently rendered nonzero levels count. A fixed "
             "plateau directly following its ramp can use QCS Hold and does "
-            "not consume waveform samples; zero-voltage delays do not either."
+            "not consume waveform samples; zero-voltage delays do not either. "
+            "A globally constant output uses its mapped M5301 physical "
+            "offset and a zero residual waveform."
         )
         if report.exceeds_capacity:
             explanation += (
@@ -8320,7 +8645,7 @@ class ExperimentPanel(QtWidgets.QWidget):
                 f"{spec.start:.6g} to {spec.stop:.6g} us | "
                 f"{spec.count} points"
             )
-        scale_mv = self.full_scale_mv.value()
+        scale_mv = self._sweep_voltage_scale_mv
         return (
             f"{spec.output_name} / {spec.segment_name} | "
             f"{spec.start * scale_mv:.6g} to "
@@ -8380,7 +8705,7 @@ class ExperimentPanel(QtWidgets.QWidget):
                 float(spec.stop),
                 "us",
             )
-        scale_mv = self.full_scale_mv.value()
+        scale_mv = self._sweep_voltage_scale_mv
         return (
             "Voltage",
             f"{spec.output_name} / {spec.segment_name}",
@@ -8472,7 +8797,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
         self.sweep_parameter_target.setText(target)
         if unit == "mV":
-            endpoint_limit = max(1.0, self.full_scale_mv.value())
+            endpoint_limit = max(1.0, self._sweep_voltage_scale_mv)
             minimum, maximum = -endpoint_limit, endpoint_limit
             step = max(0.001, endpoint_limit / 1000.0)
         else:
@@ -8603,6 +8928,24 @@ class ExperimentPanel(QtWidgets.QWidget):
         current = self.selected_sweep_axis_keys()
         if current != previous:
             self.sweep_axes_changed.emit()
+        self._refresh_ddr_usage()
+
+    def set_sweep_voltage_scale(self, full_scale_mv: float) -> None:
+        """Display normalized voltage sweeps using the active AWG scale."""
+        full_scale_mv = float(full_scale_mv)
+        if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
+            raise ValueError("AWG voltage full scale must be positive")
+        if np.isclose(
+            full_scale_mv,
+            self._sweep_voltage_scale_mv,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            return
+        selected_key = self._selected_sweep_parameter_key()
+        self._sweep_voltage_scale_mv = full_scale_mv
+        self._refresh_sweep_parameter_table(selected_key=selected_key)
+        self._update_sweep_map_status()
         self._refresh_ddr_usage()
 
     def _on_sweep_axis_changed(self, _index: int) -> None:
@@ -9159,18 +9502,40 @@ class ExperimentPanel(QtWidgets.QWidget):
         output_details = tuple(rf_settings.get("output_details", ()))
         rf_summary = ""
         if output_details:
-            entries = [
-                (
-                    f"gen {item['gen_ch']}: ATT1/ATT2 "
-                    f"{item['commanded_att1_db']:.2f}/{item['commanded_att2_db']:.2f} dB, "
-                    f"{item['filter_type']} filter"
+            if rf_settings.get("backend") == EXECUTION_BACKEND_QCS:
+                entries = []
+                for item in output_details:
+                    calibration = item.get("power_calibration")
+                    if isinstance(calibration, Mapping):
+                        entries.append(
+                            f"RF {item['gen_ch']}: "
+                            f"{float(calibration['target_power_dbm']):.6g} dBm "
+                            f"from calibration Run "
+                            f"{int(calibration['run_id'])}, relative amplitude "
+                            f"{float(item['amplitude']):.9g} at "
+                            f"{float(item['frequency_hz']) / 1.0e6:.9g} MHz"
+                        )
+                    else:
+                        entries.append(
+                            f"RF {item['gen_ch']}: relative amplitude "
+                            f"{float(item['amplitude']):.9g} at "
+                            f"{float(item['frequency_hz']) / 1.0e6:.9g} MHz"
+                        )
+                rf_summary = "\nQCS RF output: " + "; ".join(entries)
+            else:
+                entries = [
+                    (
+                        f"gen {item['gen_ch']}: ATT1/ATT2 "
+                        f"{item['commanded_att1_db']:.2f}/"
+                        f"{item['commanded_att2_db']:.2f} dB, "
+                        f"{item['filter_type']} filter"
+                    )
+                    for item in output_details
+                ]
+                rf_summary = (
+                    "\nRF output retained from Front Panel Update: "
+                    + "; ".join(entries)
                 )
-                for item in output_details
-            ]
-            rf_summary = (
-                "\nRF output retained from Front Panel Update: "
-                + "; ".join(entries)
-            )
         fir_summary = ""
         ddr_result = getattr(result, "ddr_result", None)
         sample_rate_hz = getattr(ddr_result, "sample_rate_hz", None)
@@ -10345,9 +10710,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 initial_duration_ns=DEFAULT_GUI_DURATION_NS,
             )
         ]
+        self._awg_voltage_scale_mv = float(
+            DEFAULT_QCS_FULL_SCALE_V * 1000.0
+        )
+        self._awg_voltage_backend = DEFAULT_EXECUTION_BACKEND
+        self._loading_awg_settings = False
         self._pulse[0].v_bounds = (
-            -DEFAULT_QICK_FULL_SCALE_MV,
-            DEFAULT_QICK_FULL_SCALE_MV,
+            -self._awg_voltage_scale_mv,
+            self._awg_voltage_scale_mv,
         )
         self._rf_pulse_spec: Optional[QickRfPulseSpec] = None
         self._rf_pulse_specs: List[QickRfPulseSpec] = []
@@ -10443,6 +10813,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qcs_front_panel_source_snapshot = None
         self._qcs_front_panel_editor_initialized = False
         self._qcs_front_panel_auto_apply_selection = None
+        self._qcs_front_panel_pick_target = None
         self._qcs_front_panel_keep_open_after_selection = False
         self._qcs_m5201_route_context_active = False
         self._qcs_m5201_route_previous_auto_selection = None
@@ -10508,6 +10879,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         qcs_front_panel_buttons.rejected.connect(
             self._qcs_front_panel_dialog.close
         )
+        self._qcs_front_panel_dialog.finished.connect(
+            self._clear_qcs_front_panel_pick_context
+        )
         qcs_front_panel_layout.addWidget(qcs_front_panel_buttons)
         self._rf_ports_panel.specs_changed.connect(self._on_rf_specs_changed)
         self._rf_readout_panel.spec_changed.connect(self._on_readout_spec_changed)
@@ -10530,7 +10904,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             lambda _text: self._refresh_qcs_waveform_capacity()
         )
         self._experiment_panel.qcs_dc_full_scale_v.valueChanged.connect(
-            lambda _value: self._refresh_qcs_waveform_capacity()
+            self._on_qcs_dc_full_scale_changed
+        )
+        self._experiment_panel.full_scale_mv.valueChanged.connect(
+            self._on_qick_full_scale_changed
         )
         self._experiment_panel.qcs_init_time_us.valueChanged.connect(
             lambda _value: self._refresh_qcs_waveform_capacity()
@@ -10620,6 +10997,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
         )
+        self._sparameter_panel.stop_requested.connect(
+            self._stop_sparameter_sweep
+        )
         self._sparameter_panel.load_requested.connect(
             self._load_sparameter_run
         )
@@ -10681,6 +11061,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._qcs_front_panel.connector_selected.connect(
             self._on_qcs_front_panel_connector_selected
+        )
+        self._qcs_front_panel.connector_picked.connect(
+            self._on_qcs_front_panel_connector_picked
         )
         self._qcs_front_panel.m5201_route_selection_started.connect(
             self._on_qcs_m5201_route_selection_started
@@ -11330,11 +11713,170 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 12000,
             )
 
+    def _active_awg_full_scale_mv(
+        self,
+        backend: Optional[str] = None,
+    ) -> float:
+        """Return the physical AWG scale for the selected execution system."""
+        if backend is None:
+            backend = self._experiment_panel.execution_backend()
+        backend = str(backend).strip().lower()
+        if backend == EXECUTION_BACKEND_QCS:
+            return float(self._experiment_panel.qcs_dc_full_scale_v.value()) * 1000.0
+        if backend == EXECUTION_BACKEND_QICK:
+            return float(self._experiment_panel.full_scale_mv.value())
+        raise ValueError(f"unsupported execution backend {backend!r}")
+
+    def _set_awg_voltage_scale(
+        self,
+        full_scale_mv: float,
+        *,
+        backend: Optional[str] = None,
+    ) -> None:
+        """Change normalization while preserving every physical millivolt."""
+        full_scale_mv = float(full_scale_mv)
+        if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
+            raise ValueError("AWG full scale must be positive")
+        old_scale_mv = float(self._awg_voltage_scale_mv)
+        if old_scale_mv <= 0.0:
+            old_scale_mv = full_scale_mv
+
+        sweep_limit_mv = max(
+            (
+                max(abs(float(spec.start)), abs(float(spec.stop)))
+                * old_scale_mv
+                for spec in self._sweep_specs
+                if isinstance(spec, QickSweepSpec)
+            ),
+            default=0.0,
+        )
+        # Pulse levels are stored directly in millivolts and can remain
+        # visible in an intentionally invalid configuration; run validation
+        # will then report the exact over-range level.  Normalized sweep
+        # coordinates, however, must be convertible before the scale changes
+        # or their physical meaning would be lost.
+        required_mv = sweep_limit_mv
+        if required_mv > full_scale_mv + 1.0e-9:
+            label = (
+                "QCS"
+                if backend == EXECUTION_BACKEND_QCS
+                else "QICK"
+                if backend == EXECUTION_BACKEND_QICK
+                else "selected"
+            )
+            raise ValueError(
+                f"The voltage sweep reaches {required_mv:.6g} mV, "
+                f"outside the {label} +/-{full_scale_mv:.6g} mV full scale. "
+                "Reduce the programmed voltage before selecting that scale."
+            )
+
+        if not np.isclose(
+            old_scale_mv,
+            full_scale_mv,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            converted = []
+            for spec in self._sweep_specs:
+                if isinstance(spec, QickSweepSpec):
+                    converted.append(
+                        replace(
+                            spec,
+                            start=float(spec.start) * old_scale_mv / full_scale_mv,
+                            stop=float(spec.stop) * old_scale_mv / full_scale_mv,
+                        )
+                    )
+                else:
+                    converted.append(spec)
+            self._sweep_specs = converted
+
+        self._awg_voltage_scale_mv = full_scale_mv
+        if backend is not None:
+            self._awg_voltage_backend = str(backend).strip().lower()
+        for pulse in self._pulse:
+            pulse.v_bounds = (-full_scale_mv, full_scale_mv)
+        self._experiment_panel.set_sweep_voltage_scale(full_scale_mv)
+
+    def _on_qcs_dc_full_scale_changed(self, value_v: float) -> None:
+        """Apply a QCS scale edit without clipping existing AWG settings."""
+        if self._loading_awg_settings:
+            return
+        if self._experiment_panel.execution_backend() != EXECUTION_BACKEND_QCS:
+            self._refresh_qcs_waveform_capacity()
+            return
+        try:
+            self._set_awg_voltage_scale(
+                float(value_v) * 1000.0,
+                backend=EXECUTION_BACKEND_QCS,
+            )
+        except ValueError as exc:
+            with QtCore.QSignalBlocker(
+                self._experiment_panel.qcs_dc_full_scale_v
+            ):
+                self._experiment_panel.qcs_dc_full_scale_v.setValue(
+                    self._awg_voltage_scale_mv / 1000.0
+                )
+            self.statusBar().showMessage(
+                f"Cannot reduce QCS AWG full scale: {exc}",
+                12000,
+            )
+            return
+        self._multi_ctrl.refresh_table()
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+
+    def _on_qick_full_scale_changed(self, value_mv: float) -> None:
+        """Apply the legacy QICK scale only while QICK is active."""
+        if self._loading_awg_settings:
+            return
+        if self._experiment_panel.execution_backend() != EXECUTION_BACKEND_QICK:
+            return
+        try:
+            self._set_awg_voltage_scale(
+                value_mv,
+                backend=EXECUTION_BACKEND_QICK,
+            )
+        except ValueError as exc:
+            with QtCore.QSignalBlocker(self._experiment_panel.full_scale_mv):
+                self._experiment_panel.full_scale_mv.setValue(
+                    self._awg_voltage_scale_mv
+                )
+            self.statusBar().showMessage(
+                f"Cannot reduce QICK AWG full scale: {exc}",
+                12000,
+            )
+            return
+        self._qick_full_scale_mv = float(value_mv)
+        self._multi_ctrl.refresh_table()
+        self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+
     def _on_execution_backend_changed(self, backend: str) -> None:
         """Synchronize every hardware preview with the execution system."""
         backend = str(backend).strip().lower()
         if backend not in EXECUTION_BACKENDS:
             raise ValueError(f"unsupported execution backend {backend!r}")
+        if self._loading_awg_settings:
+            return
+        previous_backend = self._awg_voltage_backend
+        try:
+            self._set_awg_voltage_scale(
+                self._active_awg_full_scale_mv(backend),
+                backend=backend,
+            )
+        except ValueError as exc:
+            selector = self._experiment_panel.backend_selector
+            previous_index = selector.findData(previous_backend)
+            if previous_index >= 0:
+                with QtCore.QSignalBlocker(selector):
+                    selector.setCurrentIndex(previous_index)
+                self._experiment_panel._last_execution_backend = previous_backend
+                self._experiment_panel._update_execution_backend_controls()
+            self.statusBar().showMessage(
+                f"Cannot change AWG execution system: {exc}",
+                12000,
+            )
+            return
+        if backend == EXECUTION_BACKEND_QICK:
+            self._qick_full_scale_mv = self._active_awg_full_scale_mv(backend)
         if (
             backend != EXECUTION_BACKEND_QCS
             and hasattr(self, "_qcs_mapper_commit_revision")
@@ -11441,7 +11983,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         )
                     ),
                 )
-        self._refresh_qcs_waveform_capacity()
+        self._multi_ctrl.refresh_table()
+        self._refresh_sweep_overlay(sync_rows=True)
 
     def _show_active_front_panel(self, scope: str, target=None) -> None:
         """Open the front panel for the currently active execution system."""
@@ -11451,6 +11994,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ):
             self._show_qick_front_panel(scope, target)
             return
+        pick_only = target is not None and callable(
+            getattr(target, "accept_qcs_front_panel_connector", None)
+        )
+        self._qcs_front_panel_pick_target = target if pick_only else None
+        existing_mapping = (
+            target.current_qcs_mapping()
+            if pick_only
+            and callable(getattr(target, "current_qcs_mapping", None))
+            else None
+        )
+        self._qcs_front_panel.set_connector_pick_only(
+            pick_only,
+            existing_mapping,
+        )
         role = None
         logical_index = 0
         path_selections = None
@@ -11478,6 +12035,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif isinstance(target, RfReadoutPanel):
             role = "acquisition"
         shown = self._show_qcs_front_panel(role, logical_index)
+        if not shown:
+            self._qcs_front_panel_pick_target = None
+            self._qcs_front_panel.set_connector_pick_only(False)
         if shown:
             self._qcs_front_panel_keep_open_after_selection = (
                 target is self._stability_panel
@@ -11498,6 +12058,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if (
             shown
             and target is not None
+            and not pick_only
             and role in {"dc", "rf", "acquisition"}
         ):
             self._qcs_front_panel_auto_apply_selection = (
@@ -11866,6 +12427,47 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             int(channel),
             True,
         )
+
+    def _on_qcs_front_panel_connector_picked(
+        self,
+        role: str,
+        logical_index: int,
+        slot: int,
+        channel: int,
+        mapping: Mapping[str, object],
+    ) -> None:
+        """Apply a calibration-local SMA pick without touching Experiment."""
+
+        target = self._qcs_front_panel_pick_target
+        if target is None:
+            return
+        try:
+            expected_role, _expected_index = target.qcs_front_panel_selection()
+            if str(expected_role) != str(role):
+                raise ValueError(
+                    f"Expected a QCS {expected_role} connector, not {role}"
+                )
+            target.accept_qcs_front_panel_connector(mapping)
+        except (KeyError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Calibration connector was not selected",
+                str(exc),
+            )
+            return
+        self._qcs_front_panel_pick_target = None
+        self._qcs_front_panel.set_connector_pick_only(False)
+        self._qcs_front_panel_auto_apply_selection = None
+        self._qcs_front_panel_dialog.close()
+        self.statusBar().showMessage(
+            f"Calibration {role} uses slot {int(slot)} CH{int(channel)}; "
+            "the Experiment mapper is unchanged",
+            10000,
+        )
+
+    def _clear_qcs_front_panel_pick_context(self, *_args) -> None:
+        self._qcs_front_panel_pick_target = None
+        self._qcs_front_panel.set_connector_pick_only(False)
 
     def _on_qcs_front_panel_connector_selected(
         self,
@@ -12996,12 +13598,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _refresh_physical_waveforms(self, *, fit_view: bool = False) -> None:
+        full_scale_mv = self._active_awg_full_scale_mv()
         if self._bias_t_compensation_enabled:
             sequence = build_qick_sequence(
                 self._pulse,
                 output_names=self._qick_output_names(),
                 fabric_mhz=self._qick_fabric_mhz,
-                full_scale_mv=self._qick_full_scale_mv,
+                full_scale_mv=full_scale_mv,
                 sweep=(self._sweep_specs[0] if len(self._sweep_specs) == 1 else None),
                 sweeps=(tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None),
                 cross_capacitance=self._cross_capacitance,
@@ -13020,7 +13623,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             time_ns = np.asarray(cycles, dtype=float) * 1000.0 / self._qick_fabric_mhz
             physical_mv = np.vstack([
                 np.asarray(waveforms[name], dtype=float)
-                * self._qick_full_scale_mv
+                * full_scale_mv
                 for name in self._qick_output_names()
             ])
         else:
@@ -13041,6 +13644,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ):
             return
         try:
+            full_scale_mv = self._active_awg_full_scale_mv()
             arguments = self._experiment_run_arguments(
                 require_readout=False,
                 require_run_config=False,
@@ -13054,7 +13658,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 hardware_demodulation=(
                     self._experiment_panel.qcs_hw_demod.isChecked()
                 ),
-                source_full_scale_mv=self._qick_full_scale_mv,
+                source_full_scale_mv=full_scale_mv,
                 dc_full_scale_v=(
                     self._experiment_panel.qcs_dc_full_scale_v.value()
                 ),
@@ -13084,14 +13688,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 point_indices=point_indices,
                 fabric_mhz=self._qick_fabric_mhz,
                 amplitude_scale=(
-                    self._qick_full_scale_mv
+                    full_scale_mv
                     / (
                         self._experiment_panel.qcs_dc_full_scale_v.value()
                         * 1000.0
                     )
                 ),
-                auto_fixed_dc_offsets=(sweep_preview.mode == "hardware"),
-                source_full_scale_mv=self._qick_full_scale_mv,
+                auto_fixed_dc_offsets=(
+                    int(sequence.sweep_point_count) == 1
+                    or sweep_preview.mode == "hardware"
+                ),
+                source_full_scale_mv=full_scale_mv,
                 dc_full_scale_v=(
                     self._experiment_panel.qcs_dc_full_scale_v.value()
                 ),
@@ -13287,6 +13894,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             Tuple[str, str, str]
         ] = None,
     ) -> None:
+        full_scale_mv = self._active_awg_full_scale_mv()
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_sweep_specs(
                 self._active_map_sweep_specs(),
@@ -13330,10 +13938,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     upper_value = max(candidates, key=lambda item: item[0])[1]
                     lower_virtual[source_port].v[
                         point_index:point_index + 2
-                    ] = lower_value * self._qick_full_scale_mv
+                    ] = lower_value * full_scale_mv
                     upper_virtual[source_port].v[
                         point_index:point_index + 2
-                    ] = upper_value * self._qick_full_scale_mv
+                    ] = upper_value * full_scale_mv
                 time_ns, _virtual_lower, physical_lower = transform_virtual_waveforms(
                     lower_virtual,
                     self._cross_capacitance,
@@ -13378,9 +13986,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         output_name = f"awg_{port_index}"
         segment_name = f"set_{segment_index}"
         point_index = segment_index * 2
+        full_scale_mv = self._active_awg_full_scale_mv()
         current_amplitude = float(
             np.clip(
-                self._pulse[port_index].v[point_index] / self._qick_full_scale_mv,
+                self._pulse[port_index].v[point_index] / full_scale_mv,
                 -1.0,
                 1.0,
             )
@@ -13400,7 +14009,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             output_name=output_name,
             segment_name=segment_name,
             current_amplitude=current_amplitude,
-            full_scale_mv=self._qick_full_scale_mv,
+            full_scale_mv=full_scale_mv,
             initial=initial,
             cartesian_base_count=other_point_count,
             parent=self,
@@ -13418,8 +14027,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._notify_sweep_state_changed(fit_view=True)
         self.statusBar().showMessage(
             f"Sweep applied to {output_name}/{segment_name}: "
-            f"{new_spec.start * self._qick_full_scale_mv:.6g} mV to "
-            f"{new_spec.stop * self._qick_full_scale_mv:.6g} mV, "
+            f"{new_spec.start * full_scale_mv:.6g} mV to "
+            f"{new_spec.stop * full_scale_mv:.6g} mV, "
             f"{new_spec.count} axis points; "
             f"{self._sweep_cartesian_count()} Cartesian combinations"
         )
@@ -14044,8 +14653,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     count=int(count),
                 )
             elif axis_kind == "amplitude":
-                full_scale_mv = self._experiment_panel.full_scale_mv.value()
-                self._qick_full_scale_mv = float(full_scale_mv)
+                full_scale_mv = self._active_awg_full_scale_mv()
                 replacement = replace(
                     spec,
                     start=float(start) / full_scale_mv,
@@ -14156,7 +14764,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         elif is_qcs:
             result_detail = (
                 "one I/Q value/shot from "
-                f"{spec.samples_per_trigger:,} integration samples"
+                f"{spec.samples_per_trigger:,} total averaging samples"
                 if self._experiment_panel.qcs_hw_demod.isChecked()
                 else f"{spec.samples_per_trigger:,} trace samples/shot"
             )
@@ -14265,6 +14873,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "bias_t_compensation_duration_us"
         ]
         self._bias_t_filter_tau_us = values["bias_t_filter_tau_us"]
+        source_full_scale_mv = self._active_awg_full_scale_mv(
+            values["execution_backend"]
+        )
         if validate_qick_hardware:
             for panel in self._rf_ports_panel._panels:
                 panel.validate_power_calibration()
@@ -14300,7 +14911,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             tuple(pulse.copy() for pulse in self._pulse),
             output_names=self._qick_output_names(),
             fabric_mhz=self._qick_fabric_mhz,
-            full_scale_mv=self._qick_full_scale_mv,
+            full_scale_mv=source_full_scale_mv,
             sweep=sweep,
             sweeps=sweeps,
             rf_pulse_specs=rf_specs,
@@ -14317,6 +14928,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "connection_config": values["connection"],
             "run_config": values["run"],
             "sequence": sequence,
+            "source_full_scale_mv": source_full_scale_mv,
             "awg_channels": self._qick_awg_channels,
             "repetitions_per_sweep": self._qick_repetitions_per_sweep,
             "iq_repetition_policy": (
@@ -14343,7 +14955,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             hardware_demodulation=(
                 self._experiment_panel.qcs_hw_demod.isChecked()
             ),
-            source_full_scale_mv=self._qick_full_scale_mv,
+            source_full_scale_mv=qick_arguments["source_full_scale_mv"],
             dc_full_scale_v=(
                 self._experiment_panel.qcs_dc_full_scale_v.value()
             ),
@@ -14374,14 +14986,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 point_indices=capacity_point_indices,
                 fabric_mhz=self._qick_fabric_mhz,
                 amplitude_scale=(
-                    self._qick_full_scale_mv
+                    qick_arguments["source_full_scale_mv"]
                     / (
                         self._experiment_panel.qcs_dc_full_scale_v.value()
                         * 1000.0
                     )
                 ),
-                auto_fixed_dc_offsets=(sweep_preview.mode == "hardware"),
-                source_full_scale_mv=self._qick_full_scale_mv,
+                auto_fixed_dc_offsets=(
+                    int(sequence.sweep_point_count) == 1
+                    or sweep_preview.mode == "hardware"
+                ),
+                source_full_scale_mv=qick_arguments["source_full_scale_mv"],
                 dc_full_scale_v=(
                     self._experiment_panel.qcs_dc_full_scale_v.value()
                 ),
@@ -14421,22 +15036,29 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "QCS RF channel map is missing generator "
                 + ", ".join(str(channel) for channel in missing_rf_channels)
             )
+        active_rf_panels = tuple(
+            panel
+            for panel in self._rf_ports_panel._panels
+            if panel.isChecked()
+        )
+        if len(active_rf_panels) != len(rf_specs):
+            raise RuntimeError(
+                "QCS RF output editor state changed while preparing the run"
+            )
         rf_pulses = tuple(
             QcsRfPulseConfig(
                 gen_ch=int(spec.gen_ch),
                 at_segment=str(spec.segment_name),
                 duration_s=float(spec.duration_us) * 1.0e-6,
-                amplitude=(
-                    float(spec.gain)
-                    / (32767.0 if int(spec.gain) >= 0 else 32768.0)
-                ),
+                amplitude=float(panel.qcs_amplitude.value()),
                 frequency_hz=float(spec.frequency_mhz) * 1.0e6,
                 phase_rad=float(np.deg2rad(spec.phase_degrees)),
                 delay_s=float(spec.delay_us) * 1.0e-6,
                 envelope="constant",
                 require_within_segment=bool(spec.require_within_segment),
+                power_calibration=panel.qcs_power_calibration_config(),
             )
-            for spec in rf_specs
+            for panel, spec in zip(active_rf_panels, rf_specs)
         )
 
         readout_spec = qick_arguments["readout_spec"]
@@ -14487,7 +15109,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "iq_repetition_policy"
             ],
             "fabric_mhz": self._qick_fabric_mhz,
-            "source_full_scale_mv": self._qick_full_scale_mv,
+            "source_full_scale_mv": qick_arguments["source_full_scale_mv"],
             "rf_pulses": rf_pulses,
             "acquisition": acquisition,
             "gui_settings": qick_arguments["gui_settings"],
@@ -14650,16 +15272,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         save: bool,
     ) -> dict:
         """Translate Stability controls into one native QCS X/Y sweep."""
+        # Acquisition mode belongs to the measurement, not to the shared QCS
+        # hardware connection.  AWG Tuning may independently request a raw
+        # trace, while Stability always returns hardware-demodulated I/Q.
+        connection = replace(connection, hw_demod=True)
         mapper_path = Path(connection.mapper_path).expanduser()
         if not mapper_path.is_file():
             raise ValueError(
                 f"QCS ChannelMapper file not found: {mapper_path}"
-            )
-        if not connection.hw_demod:
-            raise ValueError(
-                "QCS Stability hardware sweep requires Single I/Q value "
-                "acquisition. Select AWG Tuning > QCS Acquisition > "
-                "Single I/Q value before running Stability."
             )
         if not connection.blocking:
             raise ValueError(
@@ -14698,8 +15318,27 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         qcs_full_scale_mv = float(connection.dc_full_scale_v) * 1000.0
         qcs_sequence_fabric_mhz = 300.0
         acquisition_duration_s = (
-            int(stability_config.trace_samples_per_point)
-            / sample_rate_hz
+            int(stability_config.trace_samples_per_point) / sample_rate_hz
+        )
+        stability_timing_block_samples = int(
+            2 * QCS_M5200_INTEGRATION_BLOCK_SAMPLES
+        )
+        averaging_plan = plan_qcs_total_iq_averaging(
+            acquisition_duration_s,
+            sample_rate_hz=sample_rate_hz,
+            block_samples=stability_timing_block_samples,
+            max_pass_samples=QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES,
+        )
+        pass_sample_count = int(averaging_plan.pass_sample_counts[0])
+        pass_acquisition_duration_s = pass_sample_count / sample_rate_hz
+        integration_segment_sample_counts = (
+            qcs_stability_integration_segment_sample_counts(
+                pass_sample_count
+            )
+        )
+        integration_dead_time_s = (
+            max(0, len(integration_segment_sample_counts) - 1)
+            * QCS_STABILITY_INTER_SEGMENT_DELAY_S
         )
         settle_s = float(stability_config.settle_time_us) * 1.0e-6
         # The M5301 needs a minimum direct ramp before Hold can retain a swept
@@ -14707,22 +15346,35 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         # reserve a falling ramp plus explicit zero after the full-level guard.
         # Thus "settle" continues to mean time spent at the requested voltage.
         readout_delay_s = settle_s + QCS_STABILITY_DC_RAMP_S
-        sequence = build_stability_hold_sequence(
+        # The public configuration records the requested total averaging
+        # time.  One physical Stability program must cover only one bounded
+        # pass; the backend reuses that program and combines pass results.
+        # Building the DC hold from the total sample count would incorrectly
+        # stretch every pass to as much as 100 ms.
+        pass_stability_config = replace(
             stability_config,
+            trace_samples_per_point=pass_sample_count,
+        )
+        sequence = build_stability_hold_sequence(
+            pass_stability_config,
             output_names=self._qick_output_names(),
             fabric_mhz=qcs_sequence_fabric_mhz,
             full_scale_mv=qcs_full_scale_mv,
             cross_capacitance=self._cross_capacitance.copy(),
             sample_period_us=1.0e6 / sample_rate_hz,
             target_edge_padding_us=(
-                QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
+                (
+                    QCS_STABILITY_DC_EDGE_PADDING_S
+                    + integration_dead_time_s
+                )
+                * 1.0e6
             ),
         )
         rf_pulses = (
             QcsRfPulseConfig(
                 gen_ch=rf_gen_ch,
                 at_segment=stability_config.x_axis.segment_name,
-                duration_s=acquisition_duration_s,
+                duration_s=pass_acquisition_duration_s,
                 amplitude=float(
                     self._stability_panel
                     .qcs_modulation_amplitude.value()
@@ -14777,11 +15429,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             connection = self._experiment_panel.qcs_connection_values(
                 len(self._pulse)
             )
-            if not connection.hw_demod:
-                raise ValueError(
-                    "QCS RF S-parameter requires Single I/Q value "
-                    "(hardware demodulation)."
-                )
+            # RF S-parameter is intrinsically a hardware-demodulated I/Q
+            # measurement.  Do not inherit AWG Tuning's independent choice
+            # between raw trace and Single I/Q acquisition.
+            connection = replace(connection, hw_demod=True)
             config = self._sparameter_panel.config()
             rf_gen_ch = (
                 self._sparameter_panel.path_diagram
@@ -15205,7 +15856,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if is_qcs:
             repetitions = int(arguments["repetitions_per_point"])
             sample_summary = (
-                f"{config.scan_time_us:g} us requested integration, "
+                f"{config.scan_time_us:g} us requested total I/Q averaging, "
                 f"{repetitions:,} repetition(s) per frequency"
             )
             power_count = 1
@@ -15252,7 +15903,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.finished.connect(self._on_sparameter_finished)
         worker.failed.connect(self._on_sparameter_failed)
         worker.progress_changed.connect(self._on_sparameter_progress)
-        if not is_qcs:
+        if is_qcs:
+            worker.partial_result.connect(self._on_qcs_sparameter_partial)
+            worker.stopped.connect(self._on_sparameter_stopped)
+            worker.stopped.connect(thread.quit)
+            worker.stopped.connect(worker.deleteLater)
+        else:
             worker.partial_result.connect(self._on_sparameter_partial)
             worker.warning_raised.connect(self._on_sparameter_warning)
         worker.finished.connect(thread.quit)
@@ -15264,6 +15920,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_thread = thread
         self._experiment_worker = worker
         thread.start()
+
+    def _stop_sparameter_sweep(self) -> None:
+        worker = self._experiment_worker
+        if not isinstance(worker, QcsSParameterSweepWorker):
+            return
+        first_request = worker.request_stop()
+        if not worker.is_stop_requested():
+            self._sparameter_panel.status.setText(
+                "QCS execution already completed; finalizing result"
+            )
+            return
+        self._sparameter_panel.set_stopping()
+        if first_request:
+            self.statusBar().showMessage(
+                "Stopping QCS RF S-parameter sweep..."
+            )
 
     def _load_sparameter_run(self, run_id: int) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -15322,6 +15994,49 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.statusBar().showMessage(
             f"RF sweep run {stored.run_id}: {power_count} power point(s) saved"
         )
+
+    def _on_qcs_sparameter_partial(self, execution) -> None:
+        """Display the cumulative I/Q average from completed QCS passes."""
+
+        iq = np.asarray(execution.iq)
+        if iq.ndim != 4 or iq.shape[-2:] != (1, 2):
+            raise ValueError(
+                "QCS S-parameter partial I/Q must have shape "
+                "(frequency, repetition, 1, 2)"
+            )
+        frequencies_mhz = (
+            np.asarray(execution.frequencies_hz, dtype=float) / 1.0e6
+        )
+        result = SParameterSweepResult.from_iq(
+            frequencies_mhz,
+            frequencies_mhz,
+            iq[:, :, 0, :],
+            sample_rate_hz=float(
+                execution.program_summary.get(
+                    "sample_rate_hz",
+                    QCS_M5200_SAMPLE_RATE_HZ,
+                )
+            ),
+        )
+        self._sparameter_plot.set_result(result)
+        self._dock_sparameter.show()
+        summary = execution.program_summary
+        completed = int(summary.get("completed_iq_averaging_passes", 0))
+        planned = int(summary.get("iq_averaging_pass_count", 0))
+        effective_ms = (
+            float(summary.get("effective_integration_duration_s", 0.0))
+            * 1.0e3
+        )
+        message = (
+            f"QCS RF sweep: {completed:,}/{planned:,} averaging passes, "
+            f"{effective_ms:.9g} ms effective I/Q time"
+        )
+        self._sparameter_panel.status.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _on_sparameter_stopped(self, message: str) -> None:
+        self._sparameter_panel.set_running(False, str(message))
+        self.statusBar().showMessage(str(message))
 
     def _on_sparameter_finished(self, stored) -> None:
         self._sparameter_panel.show_result(stored)
@@ -15522,14 +16237,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
         try:
             if is_qcs:
-                connection = self._experiment_panel.qcs_connection_values(
-                    len(self._pulse)
-                )
                 if mode == "qcs_rf_output":
-                    calibration_config = (
-                        self._calibration_panel.qcs_rf_output_config(
-                            connection
-                        )
+                    mapper_configuration = (
+                        self._calibration_panel.qcs_rf_mapper_configuration()
+                    )
+                    mapper_path = qcs_workflow_mapper_output_path(
+                        mapper_configuration,
+                        "calibration_rf",
+                    )
+                    calibration_config = self._calibration_panel.qcs_rf_output_config(
+                        mapper_path=mapper_path,
+                        init_time_s=(
+                            self._experiment_panel.qcs_init_time_us.value()
+                            * 1.0e-6
+                        ),
                     )
                 else:
                     calibration_config = (
@@ -15565,10 +16286,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 str(exc),
             )
             return
-        arguments = {
-            "connection_config": connection,
-            "calibration_config": calibration_config,
-        }
+        arguments = {"calibration_config": calibration_config}
+        if not is_qcs:
+            arguments["connection_config"] = connection
+        elif mode == "qcs_rf_output":
+            arguments["mapper_configuration"] = mapper_configuration
         if mode in ("input", "dc_voltage"):
             arguments["tproc_mhz"] = self._experiment_panel.tproc_mhz.value()
         label = {
@@ -15803,7 +16525,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         worker.request_stop()
         self._stability_panel.set_stopping()
         self.statusBar().showMessage(
-            "Stopping after the active stability scan completes"
+            "Stopping the active QCS pass; completed Stability averages "
+            "will remain displayed"
+            if isinstance(worker, QcsStabilityDiagramWorker)
+            else "Stopping after the active stability scan completes"
         )
 
     def _on_stability_progress(self, percent: int, message: str) -> None:
@@ -16172,7 +16897,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         dialog = AwgMetadataDialog(
             arguments["sequence"],
             fabric_mhz=self._qick_fabric_mhz,
-            full_scale_mv=self._qick_full_scale_mv,
+            full_scale_mv=arguments["source_full_scale_mv"],
             parent=self,
         )
         dialog.exec_()
@@ -16423,6 +17148,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if selected is None:
             return None
         try:
+            result_full_scale_mv = float(
+                dict(getattr(result, "program_summary", {}) or {}).get(
+                    "source_full_scale_mv",
+                    self._active_awg_full_scale_mv(),
+                )
+            )
             iq_values, unit, mode, _metadata = measurement_iq_values(
                 result.ddr_result.iq,
                 result.rf_settings,
@@ -16431,7 +17162,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 result.ddr_result,
                 x_axis_key=selected[0],
                 y_axis_key=selected[1],
-                full_scale_mv=self._qick_full_scale_mv,
+                full_scale_mv=result_full_scale_mv,
                 iq_values=iq_values,
                 value_unit=unit,
                 measurement_mode=mode,
@@ -17021,6 +17752,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "awg": {
                 "outputs": [pulse.to_dict() for pulse in self._pulse],
                 "cross_capacitance": self._cross_capacitance.tolist(),
+                "voltage_coordinate_full_scale_mv": (
+                    self._awg_voltage_scale_mv
+                ),
                 "sweeps": [
                     {
                         "axis_kind": spec.axis_kind,
@@ -17151,6 +17885,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["target_output_power_dbm"],
                 f"{label} target_output_power_dbm",
             )
+            qcs_power_calibration_enabled = self._json_bool(
+                entry["qcs_power_calibration_enabled"],
+                f"{label} qcs_power_calibration_enabled",
+            )
+            qcs_power_calibration_database_path = str(
+                entry["qcs_power_calibration_database_path"]
+            )
+            qcs_power_calibration_run_id = self._json_int(
+                entry["qcs_power_calibration_run_id"],
+                f"{label} qcs_power_calibration_run_id",
+            )
+            qcs_target_output_power_dbm = self._json_finite_float(
+                entry["qcs_target_output_power_dbm"],
+                f"{label} qcs_target_output_power_dbm",
+            )
+            if (
+                qcs_power_calibration_enabled
+                and not qcs_power_calibration_database_path.strip()
+            ):
+                raise ValueError(
+                    f"{label} QCS power-calibration database path is required"
+                )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], f"{label} generator channel"),
                 segment_name=_resolve_stored_set_segment_name(
@@ -17257,6 +18013,18 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     ),
                     "target_output_power_dbm": (
                         spec.target_output_power_dbm
+                    ),
+                    "qcs_power_calibration_enabled": (
+                        qcs_power_calibration_enabled
+                    ),
+                    "qcs_power_calibration_database_path": (
+                        qcs_power_calibration_database_path
+                    ),
+                    "qcs_power_calibration_run_id": (
+                        qcs_power_calibration_run_id
+                    ),
+                    "qcs_target_output_power_dbm": (
+                        qcs_target_output_power_dbm
                     ),
                 }
             )
@@ -17847,6 +18615,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if qcs_dc_full_scale_v <= 0.0:
             raise ValueError("QCS dc_full_scale_v must be positive")
+        sweep_voltage_scale_mv = self._json_finite_float(
+            awg.get(
+                "voltage_coordinate_full_scale_mv",
+                # Versions through 39 always normalized AWG voltage sweeps
+                # with the QICK field, even when QCS was selected.
+                full_scale_mv,
+            ),
+            "AWG voltage_coordinate_full_scale_mv",
+            positive=True,
+        )
         stability_full_scale_mv = (
             qcs_dc_full_scale_v * 1000.0
             if execution_backend == EXECUTION_BACKEND_QCS
@@ -18247,6 +19025,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             **calibration_defaults["qcs_rf_output"],
             **raw_qcs_rf_calibration,
         }
+        qcs_rf_calibration["output_endpoint"] = (
+            normalize_qcs_calibration_endpoint_settings(
+                qcs_rf_calibration.get("output_endpoint"),
+                label="QCS RF calibration output_endpoint",
+                allow_lo_frequency=True,
+            )
+        )
+        qcs_rf_calibration["input_endpoint"] = (
+            normalize_qcs_calibration_endpoint_settings(
+                qcs_rf_calibration.get("input_endpoint"),
+                label="QCS RF calibration input_endpoint",
+                allow_lo_frequency=False,
+            )
+        )
         for key in ("output_logical_index", "input_logical_index"):
             qcs_rf_calibration[key] = self._json_int(
                 qcs_rf_calibration[key],
@@ -18268,11 +19060,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "amplitude_start",
             "amplitude_end",
             "integration_duration_us",
-            "reference_slope",
-            "reference_intercept_dbm",
-            "nominal_volts_per_iq_unit",
-            "path_loss_db",
-            "reference_uncertainty_db",
         ):
             qcs_rf_calibration[key] = self._json_finite_float(
                 qcs_rf_calibration[key],
@@ -18291,24 +19078,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError(
                 "QCS RF calibration integration_duration_us must be positive"
             )
-        reference_mode = str(qcs_rf_calibration["reference_mode"])
-        if reference_mode not in {
-            "reference_calibrated",
-            "nominal_m5200_50ohm",
-        }:
-            raise ValueError(
-                "QCS RF calibration reference_mode is unsupported"
-            )
-        qcs_rf_calibration["reference_mode"] = reference_mode
-        qcs_rf_calibration["reference_source"] = str(
-            qcs_rf_calibration["reference_source"]
-        )
-        qcs_rf_calibration["acknowledge_nominal_scaling"] = (
-            self._json_bool(
-                qcs_rf_calibration["acknowledge_nominal_scaling"],
-                "QCS RF nominal-scaling acknowledgement",
-            )
-        )
+        # Versions through v22 exposed user-supplied I/Q-to-dBm slope,
+        # intercept, and nominal scale controls. QCS M5200 results are already
+        # voltage-scaled, so these legacy settings are intentionally ignored
+        # and removed during normalization.
+        for legacy_key in (
+            "reference_mode",
+            "reference_slope",
+            "reference_intercept_dbm",
+            "nominal_volts_per_iq_unit",
+            "reference_uncertainty_db",
+            "reference_source",
+            "acknowledge_nominal_scaling",
+            "path_loss_db",
+        ):
+            qcs_rf_calibration.pop(legacy_key, None)
         raw_qcs_dc_calibration = raw_calibration.get("qcs_dc_output", {})
         if not isinstance(raw_qcs_dc_calibration, dict):
             raise TypeError(
@@ -18319,6 +19103,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             **qcs_dc_defaults,
             **raw_qcs_dc_calibration,
         }
+        qcs_dc_calibration["endpoint"] = (
+            normalize_qcs_calibration_endpoint_settings(
+                qcs_dc_calibration.get("endpoint"),
+                label="QCS DC calibration endpoint",
+                allow_lo_frequency=False,
+            )
+        )
         qcs_dc_calibration["logical_index"] = self._json_int(
             qcs_dc_calibration["logical_index"],
             "QCS DC calibration logical index",
@@ -18431,6 +19222,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 entry["target_output_power_dbm"],
                 "RF target_output_power_dbm",
             )
+            qcs_power_calibration_enabled = self._json_bool(
+                entry["qcs_power_calibration_enabled"],
+                "RF qcs_power_calibration_enabled",
+            )
+            qcs_power_calibration_database_path = str(
+                entry["qcs_power_calibration_database_path"]
+            )
+            qcs_power_calibration_run_id = self._json_int(
+                entry["qcs_power_calibration_run_id"],
+                "RF qcs_power_calibration_run_id",
+            )
+            qcs_target_output_power_dbm = self._json_finite_float(
+                entry["qcs_target_output_power_dbm"],
+                "RF qcs_target_output_power_dbm",
+            )
+            if (
+                qcs_power_calibration_enabled
+                and not qcs_power_calibration_database_path.strip()
+            ):
+                raise ValueError(
+                    "RF QCS power-calibration database path is required"
+                )
             spec = QickRfPulseSpec(
                 gen_ch=self._json_int(entry["gen_ch"], "RF generator channel"),
                 segment_name=_resolve_stored_set_segment_name(
@@ -18535,6 +19348,18 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 ),
                 "target_output_power_dbm": (
                     spec.target_output_power_dbm
+                ),
+                "qcs_power_calibration_enabled": (
+                    qcs_power_calibration_enabled
+                ),
+                "qcs_power_calibration_database_path": (
+                    qcs_power_calibration_database_path
+                ),
+                "qcs_power_calibration_run_id": (
+                    qcs_power_calibration_run_id
+                ),
+                "qcs_target_output_power_dbm": (
+                    qcs_target_output_power_dbm
                 ),
             }})
 
@@ -18803,6 +19628,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "fabric_mhz": fabric_mhz,
             "tproc_mhz": tproc_mhz,
             "full_scale_mv": full_scale_mv,
+            "sweep_voltage_scale_mv": sweep_voltage_scale_mv,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "iq_repetition_policy": iq_repetition_policy,
@@ -18866,6 +19692,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         self._cross_capacitance = settings["cross_capacitance"].copy()
         self._sweep_specs = list(settings["sweeps"])
+        self._awg_voltage_scale_mv = settings["sweep_voltage_scale_mv"]
         self._qick_fabric_mhz = settings["fabric_mhz"]
         self._qick_tproc_mhz = settings["tproc_mhz"]
         self._qick_full_scale_mv = settings["full_scale_mv"]
@@ -18879,26 +19706,30 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_mode = settings["bias_t_mode"]
         self._bias_t_compensation_duration_us = settings["bias_t_duration_us"]
         self._bias_t_filter_tau_us = settings["bias_t_filter_tau_us"]
-        self._experiment_panel.load_settings(
-            settings["connection_config"],
-            settings["run_config"],
-            fabric_mhz=self._qick_fabric_mhz,
-            tproc_mhz=self._qick_tproc_mhz,
-            full_scale_mv=self._qick_full_scale_mv,
-            awg_channels=self._qick_awg_channels,
-            repetitions=self._qick_repetitions_per_sweep,
-            iq_repetition_policy=settings["iq_repetition_policy"],
-            awg_metadata_mode=settings["awg_metadata_mode"],
-            compile_validation_mode=settings["compile_validation_mode"],
-            bias_t_enabled=self._bias_t_compensation_enabled,
-            bias_t_compensation_type=self._bias_t_compensation_type,
-            bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
-            bias_t_mode=self._bias_t_compensation_mode,
-            bias_t_duration_us=self._bias_t_compensation_duration_us,
-            bias_t_filter_tau_us=self._bias_t_filter_tau_us,
-            execution_backend=settings["execution_backend"],
-            qcs_settings=settings["qcs_settings"],
-        )
+        self._loading_awg_settings = True
+        try:
+            self._experiment_panel.load_settings(
+                settings["connection_config"],
+                settings["run_config"],
+                fabric_mhz=self._qick_fabric_mhz,
+                tproc_mhz=self._qick_tproc_mhz,
+                full_scale_mv=self._qick_full_scale_mv,
+                awg_channels=self._qick_awg_channels,
+                repetitions=self._qick_repetitions_per_sweep,
+                iq_repetition_policy=settings["iq_repetition_policy"],
+                awg_metadata_mode=settings["awg_metadata_mode"],
+                compile_validation_mode=settings["compile_validation_mode"],
+                bias_t_enabled=self._bias_t_compensation_enabled,
+                bias_t_compensation_type=self._bias_t_compensation_type,
+                bias_t_compensation_mv=self._bias_t_compensation_voltage_mv,
+                bias_t_mode=self._bias_t_compensation_mode,
+                bias_t_duration_us=self._bias_t_compensation_duration_us,
+                bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+                execution_backend=settings["execution_backend"],
+                qcs_settings=settings["qcs_settings"],
+            )
+        finally:
+            self._loading_awg_settings = False
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._refresh_stability_targets()
         self._stability_panel.load_settings(settings["stability_diagram"])

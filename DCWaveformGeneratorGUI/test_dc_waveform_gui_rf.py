@@ -115,7 +115,7 @@ def test_gui_defaults_and_time_unit_round_trip():
     assert DEFAULT_QICK_FULL_SCALE_MV == 800.0
     assert window._experiment_panel.full_scale_mv.value() == 800.0
     assert window._qick_full_scale_mv == 800.0
-    assert window._pulse[0].v_bounds == (-800.0, 800.0)
+    assert window._pulse[0].v_bounds == (-2500.0, 2500.0)
     assert window._experiment_panel.bias_t_group.isChecked() is False
     assert window._experiment_panel.bias_t_type.currentData() == "dc"
     assert window._experiment_panel.bias_t_mode.currentData() == "fixed_voltage"
@@ -295,6 +295,100 @@ def test_segment_sweep_dialog_uses_voltage_values_but_returns_normalized_spec():
     assert spec.count == 7
     app.processEvents()
     dialog.close()
+
+
+def test_qcs_awg_voltage_and_segment_sweep_use_qcs_full_scale(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    control = window._multi_ctrl._ctrl_pannels[0]
+    experiment.qcs_dc_full_scale_v.setValue(2.5)
+    app.processEvents()
+
+    assert experiment.execution_backend() == gui.EXECUTION_BACKEND_QCS
+    assert experiment.full_scale_mv.value() == pytest.approx(800.0)
+    assert window._pulse[0].v_bounds == (-2500.0, 2500.0)
+
+    # The AWG table stores physical millivolts.  QCS must not silently clip
+    # this legal M5301 value to the dormant QICK +/-800 mV limit.
+    control.table.item(0, 4).setText("1500")
+    app.processEvents()
+    np.testing.assert_allclose(window._pulse[0].v[:2], [1500.0, 1500.0])
+    assert float(control.table.item(0, 4).text()) == pytest.approx(1500.0)
+
+    captured = {}
+
+    class AcceptedSweepDialog:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        @staticmethod
+        def exec_():
+            return QtWidgets.QDialog.Accepted
+
+        @staticmethod
+        def value():
+            return QickSweepSpec("set_0", "awg_0", -0.6, 0.8, 5)
+
+    monkeypatch.setattr(gui, "SweepSettingsDialog", AcceptedSweepDialog)
+    window._configure_segment_sweep(0, 0)
+    app.processEvents()
+
+    assert captured["full_scale_mv"] == pytest.approx(2500.0)
+    assert captured["current_amplitude"] == pytest.approx(0.6)
+    assert window._sweep_specs == [
+        QickSweepSpec("set_0", "awg_0", -0.6, 0.8, 5)
+    ]
+    assert experiment.sweep_parameter_table.rowCount() == 1
+    experiment.sweep_parameter_table.selectRow(0)
+    app.processEvents()
+    assert experiment.sweep_parameter_start.minimum() == pytest.approx(-2500.0)
+    assert experiment.sweep_parameter_start.maximum() == pytest.approx(2500.0)
+    assert experiment.sweep_parameter_start.value() == pytest.approx(-1500.0)
+    assert experiment.sweep_parameter_stop.value() == pytest.approx(2000.0)
+
+    graphics = window._plot._sweep_graphics[("awg_0", "set_0")]
+    np.testing.assert_allclose(graphics["lower_mv"][:2], [-1500.0, -1500.0])
+    np.testing.assert_allclose(graphics["upper_mv"][:2], [2000.0, 2000.0])
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_awg_scale_changes_preserve_physical_voltage_sweep_coordinates():
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.2, 0.24, 5)
+    ]
+    window._refresh_sweep_overlay(sync_rows=True)
+
+    # Expand QCS from +/-2.5 V to +/-5 V.  The normalized coordinates change,
+    # while their physical -500 mV and +600 mV endpoints do not.
+    experiment.qcs_dc_full_scale_v.setValue(5.0)
+    app.processEvents()
+    assert window._sweep_specs[0].start == pytest.approx(-0.1)
+    assert window._sweep_specs[0].stop == pytest.approx(0.12)
+    assert window._pulse[0].v_bounds == (-5000.0, 5000.0)
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
+    app.processEvents()
+    assert window._sweep_specs[0].start == pytest.approx(-0.625)
+    assert window._sweep_specs[0].stop == pytest.approx(0.75)
+    assert window._pulse[0].v_bounds == (-800.0, 800.0)
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    app.processEvents()
+    assert window._sweep_specs[0].start == pytest.approx(-0.1)
+    assert window._sweep_specs[0].stop == pytest.approx(0.12)
+    assert window._pulse[0].v_bounds == (-5000.0, 5000.0)
+    document = window._settings_to_dict()
+    assert document["awg"]["voltage_coordinate_full_scale_mv"] == 5000.0
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_ramp_rate_sweep_dialog_uses_duration_and_reports_derived_rate():
@@ -490,7 +584,7 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert panel.segment_label.text() == "Acquisition segment:"
     assert panel._delay_label.text() == "Acquisition pre-delay [us]:"
     assert panel.qcs_acquisition_duration_label.text() == (
-        "Acquisition time [us]:"
+        "Total I/Q averaging time [us]:"
     )
     assert (
         panel.frequency_label.text()
@@ -509,7 +603,7 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert "4,800 M5200 samples" in panel.qcs_acquisition_note.text()
     panel.setChecked(True)
     app.processEvents()
-    assert "one I/Q value/shot from 4,800 integration samples" in (
+    assert "one I/Q value/shot from 4,800 total averaging samples" in (
         window.statusBar().currentMessage()
     )
     visible_text = "\n".join(
@@ -546,7 +640,7 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert panel.qcs_trace_radio.isChecked() is False
     assert experiment.qcs_hw_demod.isChecked() is True
     assert panel.frequency_mhz.isHidden() is False
-    assert "one I/Q value/shot from 4,800 integration samples" in (
+    assert "one I/Q value/shot from 4,800 total averaging samples" in (
         window.statusBar().currentMessage()
     )
 
@@ -629,7 +723,7 @@ def test_qcs_acquisition_time_rounds_up_and_preserves_qick_samples():
     panel.set_time_unit("ns")
     assert panel.qcs_acquisition_duration.value() == pytest.approx(10.1)
     assert panel.qcs_acquisition_duration_label.text() == (
-        "Acquisition time [ns]:"
+        "Raw trace duration [ns]:"
     )
     assert panel.configured_spec().samples_per_trigger == 49
 
@@ -638,6 +732,42 @@ def test_qcs_acquisition_time_rounds_up_and_preserves_qick_samples():
     assert panel.samples.value() == 321
     assert panel.samples.isHidden() is False
     assert panel.qcs_acquisition_duration.isHidden() is True
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_total_iq_duration_has_a_separate_100_ms_ceiling_from_trace():
+    app = _application()
+    window = gui.MainWindow()
+    panel = window._rf_readout_panel
+
+    assert panel.qcs_single_iq_radio.isChecked() is True
+    assert panel.qcs_acquisition_duration.maximum() == pytest.approx(100_000.0)
+    panel.qcs_acquisition_duration.setValue(100_000.0)
+    app.processEvents()
+
+    assert panel.configured_spec().samples_per_trigger == 480_000_000
+    assert "1,000 bounded QCS execution passes" in (
+        panel.qcs_acquisition_note.text()
+    )
+    assert "Total I/Q averaging time" in (
+        panel.qcs_acquisition_duration_label.text()
+    )
+
+    panel.qcs_trace_radio.click()
+    app.processEvents()
+
+    assert panel.qcs_acquisition_duration.maximum() == pytest.approx(
+        10_000_000 / 4.8e9 * 1.0e6
+    )
+    assert panel.configured_spec().samples_per_trigger == 10_000_000
+    assert "Raw trace duration" in panel.qcs_acquisition_duration_label.text()
+    assert "10,000,000-sample" in panel.qcs_acquisition_duration.toolTip()
+
+    panel.qcs_single_iq_radio.click()
+    app.processEvents()
+    assert panel.qcs_acquisition_duration.maximum() == pytest.approx(100_000.0)
 
     window.close()
     app.processEvents()
@@ -788,6 +918,8 @@ def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
     )
     panel.set_qcs_front_panel_configuration(configuration)
     assert panel.qcs_module_model.currentData() == "M5300A"
+    assert panel.qcs_power_calibration_group.isHidden() is False
+    assert panel.qcs_power_calibration_group.isEnabled() is True
     moved_mappings = []
     for mapping in configuration["channel_mappings"]:
         mapping = dict(mapping)
@@ -807,6 +939,8 @@ def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
     )
     panel.set_qcs_front_panel_configuration(configuration)
     assert panel.qcs_module_model.currentData() == "M5301A"
+    assert panel.qcs_power_calibration_group.isVisible() is True
+    assert panel.qcs_power_calibration_group.isEnabled() is False
     assert "slot 2, SMA CH 2" in panel.qcs_module_model.toolTip()
 
     form = panel._form_layout
@@ -844,6 +978,7 @@ def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
 
     assert panel.qcs_module_model.isHidden() is True
     assert panel.qcs_amplitude.isHidden() is True
+    assert panel.qcs_power_calibration_group.isHidden() is True
     assert window._rf_ports_panel.add_button.text() == "Add RF Port"
     assert panel.remove_button.text() == "Remove RF Port"
     for field in qick_only_fields:
@@ -872,6 +1007,70 @@ def test_qcs_rf_output_uses_qcs_waveform_labels_and_module_choices():
         if label.isVisible()
     )
     assert "HWH-backed Front Panel" in visible_text
+
+    window.close()
+    app.processEvents()
+
+
+def test_awg_tuning_qcs_fixed_output_power_builds_calibration_request(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    panel = window._rf_ports_panel._panels[0]
+    logical_index = panel.gen_ch.value()
+    mapper_path = tmp_path / "qcs_mapper.qcs"
+    mapper_path.write_text("{}", encoding="utf-8")
+    calibration_path = tmp_path / "m5300_power.db"
+    calibration_path.write_bytes(b"calibration")
+
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    experiment.qcs_mapper_path.setText(str(mapper_path))
+    experiment.qcs_dc_channel_names.setText("gate")
+    experiment.qcs_rf_channel_names.setText(
+        f"{logical_index}=rf_drive"
+    )
+    experiment.qcs_acquisition_channel_name.setText("digitizer")
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("gate",),
+        {logical_index: "rf_drive"},
+        "digitizer",
+    )
+    panel.set_qcs_front_panel_configuration(configuration)
+    panel.setChecked(True)
+    panel.frequency_mhz.setValue(1250.0)
+    panel.qcs_amplitude.setValue(0.007)
+    panel.qcs_power_calibration_database_path.setText(
+        str(calibration_path)
+    )
+    panel.qcs_power_calibration_run_id.setValue(23)
+    panel.qcs_target_output_power_dbm.setValue(-27.5)
+    panel.qcs_power_calibration_group.setChecked(True)
+    window._rf_readout_panel.setChecked(True)
+    app.processEvents()
+
+    assert panel.qcs_power_calibration_group.isHidden() is False
+    assert panel.qcs_power_calibration_group.isEnabled() is True
+    assert panel.qcs_amplitude.isEnabled() is False
+    arguments = window._qcs_experiment_run_arguments()
+    pulse = arguments["rf_pulses"][0]
+
+    assert pulse.amplitude == pytest.approx(panel.qcs_amplitude.value())
+    assert pulse.power_calibration.database_path == str(calibration_path)
+    assert pulse.power_calibration.run_id == 23
+    assert pulse.power_calibration.target_power_dbm == pytest.approx(-27.5)
+    settings = panel.settings_dict()
+    assert settings["qcs_power_calibration_enabled"] is True
+    assert settings["qcs_power_calibration_database_path"] == str(
+        calibration_path
+    )
+    assert settings["qcs_power_calibration_run_id"] == 23
+    assert settings["qcs_target_output_power_dbm"] == pytest.approx(-27.5)
+
+    panel.frequency_sweep_enabled.setChecked(True)
+    with pytest.raises(ValueError, match="fixed RF frequency"):
+        window._qcs_experiment_run_arguments()
 
     window.close()
     app.processEvents()
@@ -1843,6 +2042,12 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     rf_panel.filter_type.setCurrentText("highpass")
     rf_panel.filter_cutoff.setValue(1.75)
     rf_panel.filter_bandwidth.setValue(0.625)
+    rf_panel.qcs_power_calibration_group.setChecked(True)
+    rf_panel.qcs_power_calibration_database_path.setText(
+        str(tmp_path / "qcs_m5300_power.db")
+    )
+    rf_panel.qcs_power_calibration_run_id.setValue(29)
+    rf_panel.qcs_target_output_power_dbm.setValue(-18.25)
     window._rf_ports_panel.add_port()
     disabled_rf_panel = window._rf_ports_panel._panels[1]
     disabled_rf_panel.gen_ch.setValue(4)
@@ -1944,6 +2149,15 @@ def test_settings_json_round_trip_restores_complete_gui_state(tmp_path):
     assert document["rf_outputs"][0]["filter_type"] == "highpass"
     assert document["rf_outputs"][0]["filter_cutoff"] == 1.75
     assert document["rf_outputs"][0]["filter_bandwidth"] == 0.625
+    assert document["rf_outputs"][0][
+        "qcs_power_calibration_enabled"
+    ] is True
+    assert document["rf_outputs"][0][
+        "qcs_power_calibration_run_id"
+    ] == 29
+    assert document["rf_outputs"][0][
+        "qcs_target_output_power_dbm"
+    ] == pytest.approx(-18.25)
     assert document["rf_readout"]["input_board_type"] == "DC_In"
     assert document["rf_readout"]["dc_measure_mode"] is True
     assert document["rf_readout"]["dc_measure_gain_v_per_a"] == 1.0e6
@@ -2179,7 +2393,7 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
         dc_full_scale_v=2.5,
         rf_channel_names={7: "rf_drive"},
         acquisition_channel_name="digitizer",
-        hw_demod=True,
+        hw_demod=False,
         blocking=True,
     )
     configuration = qcs_front_panel.default_qcs_hardware_configuration(
@@ -2220,9 +2434,17 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
         "run_config_values",
         lambda **_kwargs: None,
     )
+    window._rf_readout_panel.qcs_trace_radio.click()
+    app.processEvents()
+    assert window._rf_readout_panel.qcs_trace_radio.isChecked() is True
+    assert window._experiment_panel.qcs_hw_demod.isChecked() is False
     arguments = window._stability_run_arguments(save=False)
 
-    assert arguments["connection_config"] == connection
+    assert connection.hw_demod is False
+    assert arguments["connection_config"].hw_demod is True
+    assert arguments["connection_config"].mapper_path == connection.mapper_path
+    assert window._rf_readout_panel.qcs_trace_radio.isChecked() is True
+    assert window._experiment_panel.qcs_hw_demod.isChecked() is False
     assert arguments["repetitions_per_point"] == 4
     assert arguments["full_scale_mv"] == pytest.approx(2500.0)
     assert arguments["sequence"].sweep_shape == (3, 2)
@@ -2261,6 +2483,94 @@ def test_qcs_stability_arguments_build_native_hardware_sweep(
     )
     assert arguments["acquisition"].sample_count == 96
     assert arguments["readout_spec"] is None
+
+    window._stability_panel.qcs_integration_duration_us.setValue(100.0)
+    app.processEvents()
+    long_arguments = window._stability_run_arguments(save=False)
+    assert long_arguments["acquisition"].sample_count == 480_000
+    assert long_arguments["acquisition"].duration_s == pytest.approx(100e-6)
+    assert long_arguments["rf_pulses"][0].duration_s == pytest.approx(100e-6)
+    expected_long_target_us = (
+        25.0
+        + 100.0
+        + 0.280
+        + DEFAULT_STABILITY_POINT_GUARD_US
+        + gui.QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
+    )
+    assert long_arguments["sequence"].segments[0].duration_cycles == int(
+        np.ceil(expected_long_target_us * 300.0)
+    )
+    integration_note = window._stability_panel.qcs_integration_note.text()
+    assert "15 IntegrationFilter segment(s)" in integration_note
+    assert "0.28 us total dead time" in integration_note
+    assert "100.28 us" in integration_note
+
+    window._stability_panel.qcs_integration_duration_us.setValue(100_000.0)
+    app.processEvents()
+    aggregate_arguments = window._stability_run_arguments(save=False)
+    assert aggregate_arguments["acquisition"].sample_count == 480_000_000
+    assert aggregate_arguments["acquisition"].duration_s == pytest.approx(0.1)
+    # Only one bounded pass is scheduled at a time; the backend reuses this
+    # same 100 us RF/DC program and sample-weights all 1,000 pass results.
+    assert aggregate_arguments["rf_pulses"][0].duration_s == pytest.approx(
+        100e-6
+    )
+    assert aggregate_arguments["sequence"].segments[0].duration_cycles == int(
+        np.ceil(expected_long_target_us * 300.0)
+    )
+    aggregate_note = window._stability_panel.qcs_integration_note.text()
+    assert "1,000 bounded QCS passes" in aggregate_note
+    assert "100000 us total I/Q averaging time" in aggregate_note
+    app.processEvents()
+    window.close()
+
+
+def test_qcs_sparameter_uses_single_iq_without_changing_awg_tuning_mode(
+    tmp_path,
+    monkeypatch,
+):
+    app = _application()
+    window = gui.MainWindow()
+    mapper_path = tmp_path / "sparameter_mapper.qcs"
+    mapper_path.write_bytes(b"offline mapper placeholder")
+    connection = gui.QcsConnectionConfig(
+        mapper_path=str(mapper_path),
+        dc_channel_names=("dc_gate",),
+        dc_full_scale_v=2.5,
+        rf_channel_names={7: "rf_drive"},
+        acquisition_channel_name="digitizer",
+        hw_demod=False,
+        blocking=True,
+    )
+    configuration = qcs_front_panel.default_qcs_hardware_configuration(
+        ("dc_gate",),
+        {7: "rf_drive"},
+        "digitizer",
+    )
+    window._sparameter_panel.set_qcs_front_panel_configuration(configuration)
+    window._sparameter_panel.set_hardware_backend(
+        gui.EXECUTION_BACKEND_QCS
+    )
+    monkeypatch.setattr(
+        window._experiment_panel,
+        "qcs_connection_values",
+        lambda _output_count: connection,
+    )
+    monkeypatch.setattr(
+        window._experiment_panel,
+        "run_config_values",
+        lambda **_kwargs: None,
+    )
+    window._rf_readout_panel.qcs_trace_radio.click()
+    app.processEvents()
+
+    arguments = window._sparameter_run_arguments()
+
+    assert connection.hw_demod is False
+    assert arguments["connection_config"].hw_demod is True
+    assert arguments["connection_config"].mapper_path == connection.mapper_path
+    assert window._rf_readout_panel.qcs_trace_radio.isChecked() is True
+    assert window._experiment_panel.qcs_hw_demod.isChecked() is False
     app.processEvents()
     window.close()
 
@@ -2434,27 +2744,35 @@ def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
     assert panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
     assert panel.qcs_waveform_usage_group.isHidden() is False
     assert panel.qcs_waveform_usage_progress.maximum() == 98_304
+    # A globally constant output is now carried by the physical M5301
+    # offset, so use a true ramp to exercise the rendered-waveform ceiling.
+    def set_ramp(duration_ns):
+        pulse = PulseSequence(0.0, initial_duration_ns=1_000.0)
+        pulse.add_flat_ramp(duration_ns, 400.0, 100.0)
+        window._pulse[0] = pulse
+        window._plot._pulses[0] = pulse
+
+    set_ramp(1_000.0)
+    window._refresh_qcs_waveform_capacity()
     assert panel.qcs_waveform_usage_progress.value() == 2_400
     assert "2,400 / 98,304 samples" in (
         panel.qcs_waveform_usage_progress.format()
     )
 
-    window._pulse[0].t = np.asarray([0.0, 1_001.0])
-    window._pulse[0].v = np.asarray([100.0, 100.0])
+    set_ramp(1_001.0)
     window._refresh_qcs_waveform_capacity()
     assert panel.qcs_waveform_usage_progress.format() == "Invalid waveform setup"
     assert "16-sample waveform granularity" in (
         panel.qcs_waveform_usage_detail.text()
     )
 
-    window._pulse[0].t = np.asarray([0.0, 40_960.0])
-    window._pulse[0].v = np.asarray([100.0, 100.0])
+    set_ramp(40_960.0)
     window._refresh_qcs_waveform_capacity()
     assert panel.qcs_waveform_usage_progress.value() == 98_304
     assert "100.00%" in panel.qcs_waveform_usage_progress.format()
     assert "#c58a1c" in panel.qcs_waveform_usage_progress.styleSheet()
 
-    window._pulse[0].t = np.asarray([0.0, 40_966.0])
+    set_ramp(40_966.0)
     window._refresh_qcs_waveform_capacity()
     assert panel.qcs_waveform_usage_progress.value() == 98_304
     assert "98,320 / 98,304 samples (100.02%)" == (
@@ -2512,6 +2830,45 @@ def test_qcs_no_sweep_capacity_bar_counts_each_outputs_ramps_only():
     assert "outputs are not added together" in (
         panel.qcs_waveform_usage_detail.text()
     )
+
+    window.close()
+    app.processEvents()
+
+
+def test_qcs_constant_second_output_uses_offset_not_waveform_memory():
+    app = _application()
+    window = gui.MainWindow()
+
+    changing = PulseSequence(0.0, initial_duration_ns=1_000.0)
+    changing.add_flat_ramp(10_000.0, 400.0, 100.0)
+    changing.add_flat_ramp(10_000.0, 100_000.0, 0.0)
+    constant = PulseSequence(100.0, initial_duration_ns=1_000.0)
+    constant.add_flat_ramp(10_000.0, 400.0, 100.0)
+    constant.add_flat_ramp(10_000.0, 100_000.0, 100.0)
+
+    window._pulse[0] = changing
+    window._plot._pulses[0] = changing
+    window._add_port()
+    window._pulse[1].t = constant.t.copy()
+    window._pulse[1].v = constant.v.copy()
+    window._pulse[1].segment_names = list(constant.segment_names)
+    window._cross_capacitance = np.eye(2)
+    window._sweep_specs = []
+    window._refresh_sweep_overlay()
+    app.processEvents()
+
+    panel = window._experiment_panel
+    assert panel.qcs_waveform_usage_progress.value() == 48_000
+    assert panel.qcs_waveform_usage_progress.format() == (
+        "48,000 / 98,304 samples (48.83%)"
+    )
+    detail = panel.qcs_waveform_usage_detail.text()
+    assert "awg_0 -> dc_ch_1: 48,000 samples (20.000000 us)" in detail
+    assert "awg_1 -> dc_ch_2: 0 samples (0.000000 us)" in detail
+    assert "fixed physical offset +100 mV" in detail
+    assert "zero residual waveform" in detail
+    assert panel.qcs_sweep_execution_mode_label.text().endswith("No sweep")
+    assert "100 mV" in panel.qcs_sweep_execution_reason_label.text()
 
     window.close()
     app.processEvents()
@@ -2853,7 +3210,7 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
     )
     assert arguments["fabric_mhz"] == 300.0
-    assert arguments["source_full_scale_mv"] == pytest.approx(800.0)
+    assert arguments["source_full_scale_mv"] == pytest.approx(2500.0)
     assert len(arguments["rf_pulses"]) == 1
     qcs_rf = arguments["rf_pulses"][0]
     assert qcs_rf.gen_ch == 1
@@ -2892,6 +3249,49 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     assert readout.measurement_unit.currentData() == "current"
     app.processEvents()
     window.close()
+
+
+def test_qcs_run_arguments_preserve_physical_awg_voltage_and_sweep(
+    tmp_path,
+):
+    app = _application()
+    window = gui.MainWindow()
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    experiment.qcs_dc_full_scale_v.setValue(2.5)
+    mapper_path = tmp_path / "physical_voltage_mapper.qcs"
+    mapper_path.write_text("{}", encoding="utf-8")
+    experiment.qcs_mapper_path.setText(str(mapper_path))
+    experiment.qcs_dc_channel_names.setText("gate_a")
+    experiment.qcs_acquisition_channel_name.setText("digitizer")
+    window._rf_readout_panel.setChecked(True)
+    app.processEvents()
+
+    assert window._pulse[0].edit_voltage(0, 1500.0)
+    window._sweep_specs = [
+        QickSweepSpec("set_0", "awg_0", -0.6, 0.8, 5)
+    ]
+    window._notify_sweep_state_changed(fit_view=True)
+    app.processEvents()
+
+    arguments = window._qcs_experiment_run_arguments()
+
+    source_scale_mv = arguments["source_full_scale_mv"]
+    assert arguments["connection_config"].dc_full_scale_v == pytest.approx(2.5)
+    assert source_scale_mv == pytest.approx(2500.0)
+    set_0 = next(
+        segment
+        for segment in arguments["sequence"].segments
+        if segment.name == "set_0"
+    )
+    assert set_0.amplitudes[0] * source_scale_mv == pytest.approx(1500.0)
+    sweep_axis = arguments["sequence"].sweep_axes[0]
+    assert sweep_axis.points[0] * source_scale_mv == pytest.approx(-1500.0)
+    assert sweep_axis.points[-1] * source_scale_mv == pytest.approx(2000.0)
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_generated_qcs_code_uses_configured_dc_full_scale():
@@ -3218,6 +3618,49 @@ def test_qcs_experiment_worker_forwards_progress_and_events(monkeypatch):
     ]
 
 
+def test_experiment_panel_shows_calibrated_qcs_rf_result_without_qick_keys():
+    app = _application()
+    panel = gui.ExperimentPanel(
+        fabric_mhz=300.0,
+        tproc_mhz=300.0,
+        full_scale_mv=800.0,
+        awg_channels=(1,),
+        repetitions=1,
+    )
+    result = SimpleNamespace(
+        rf_settings={
+            "backend": gui.EXECUTION_BACKEND_QCS,
+            "output_details": (
+                {
+                    "gen_ch": 2,
+                    "amplitude": 0.125,
+                    "frequency_hz": 1.25e9,
+                    "duration_s": 1.0e-6,
+                    "power_calibration": {
+                        "run_id": 17,
+                        "target_power_dbm": -26.0,
+                    },
+                },
+            ),
+            "readout_details": {},
+        },
+        program_summary={},
+        ddr_result=None,
+        run_id=5,
+        row_count=1,
+        database_path="qcs_measurement.db",
+    )
+
+    panel.show_result(result)
+
+    assert "-26 dBm" in panel.run_status.text()
+    assert "calibration Run 17" in panel.run_status.text()
+    assert "relative amplitude 0.125" in panel.run_status.text()
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_qcs_experiment_worker_forwards_partial_results(monkeypatch):
     app = _application()
     partials_sent = [object(), object()]
@@ -3404,7 +3847,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 39
+    assert document["version"] == 41
     assert document["experiment"]["execution_backend"] == "qcs"
     assert document["experiment"]["iq_repetition_policy"] == (
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
@@ -4127,7 +4570,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 39
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 41
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

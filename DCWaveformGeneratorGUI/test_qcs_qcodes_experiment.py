@@ -19,6 +19,7 @@ import qcs_qcodes_experiment as backend
 from qcs_qcodes_experiment import (
     QcsAcquisitionConfig,
     QcsConnectionConfig,
+    QcsRfPowerCalibrationConfig,
     QcsRfPulseConfig,
     QcsUnsupportedFeatureError,
     compile_qcs_point,
@@ -108,6 +109,11 @@ class _Delay(_Waveform):
     pass
 
 
+class _IntegrationFilter:
+    def __init__(self, *waveforms):
+        self.waveforms = waveforms
+
+
 class _Expression:
     def __init__(self, value):
         self.value = value
@@ -174,6 +180,7 @@ class _FakeQcs:
     ArbitraryEnvelope = _Envelope
     Scalar = _Scalar
     Array = _Array
+    IntegrationFilter = _IntegrationFilter
 
 
 def _sequence():
@@ -318,6 +325,161 @@ def test_qcs_stability_integration_time_quantizes_upward(
 
     assert effective_s == pytest.approx(expected_s)
     assert sample_count == expected_samples
+
+
+def test_qcs_total_iq_averaging_plan_reuses_equal_bounded_passes():
+    plan = backend.plan_qcs_total_iq_averaging(0.1)
+
+    assert plan.pass_count == 1000
+    assert plan.pass_sample_counts == (480_000,) * 1000
+    assert plan.quantized_total_sample_count == 480_000_000
+    assert plan.quantized_total_duration_s == pytest.approx(0.1)
+    assert max(plan.pass_sample_counts) <= (
+        backend.QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES
+    )
+
+
+def test_qcs_total_iq_averaging_plan_quantizes_and_caps_total():
+    plan = backend.plan_qcs_total_iq_averaging(150e-6)
+
+    assert plan.pass_count == 2
+    assert len(set(plan.pass_sample_counts)) == 1
+    assert plan.quantized_total_duration_s >= 150e-6
+    assert all(
+        count % backend.QCS_M5200_INTEGRATION_BLOCK_SAMPLES == 0
+        for count in plan.pass_sample_counts
+    )
+    with pytest.raises(QcsUnsupportedFeatureError, match="limited to 100 ms"):
+        backend.plan_qcs_total_iq_averaging(100.001e-3)
+
+
+def test_qcs_generic_long_iq_reuses_program_and_weights_passes():
+    sequence = FineTuneSequence(("gate",)).add_set(
+        "read", [0.0], 60_000
+    )
+
+    class Executor:
+        def __init__(self):
+            self.programs = []
+
+        def execute(self, program):
+            self.programs.append(program)
+            value = float(len(self.programs) * 2 - 1)
+            return np.full(
+                (1, 1, len(program.acquisitions)),
+                value + 1j * (value + 1.0),
+                dtype=np.complex128,
+            )
+
+    executor = Executor()
+    result = execute_qcs_sequence(
+        connection_config=_connection(hw_demod=True),
+        sequence=sequence,
+        repetitions_per_sweep=1,
+        acquisition=_acquisition(
+            duration_s=150e-6,
+            sample_count=720_000,
+        ),
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_gate", "digitizer"),
+        executor=executor,
+    )
+
+    assert len(executor.programs) == 2
+    assert executor.programs[0] is executor.programs[1]
+    np.testing.assert_allclose(result.ddr_result.iq[0, 0, 0], [2.0, 3.0])
+    assert result.program_summary["iq_averaging_pass_count"] == 2
+    assert result.program_summary["executor_call_count"] == 2
+
+
+def test_qcs_stability_long_iq_publishes_cumulative_pass_results():
+    sequence = (
+        FineTuneSequence(("x_gate", "y_gate"))
+        .add_set("set_0", [0.0, 0.0], 27_000)
+        .add_amplitude_sweep("set_0", "x_gate", -0.1, 0.1, 2)
+        .add_amplitude_sweep("set_0", "y_gate", -0.2, 0.2, 2)
+        .set_cross_capacitance(np.eye(2))
+    )
+
+    class Executor:
+        def __init__(self):
+            self.programs = []
+
+        def execute(self, program):
+            self.programs.append(program)
+            value = float(len(self.programs) * 2 - 1)
+            return np.full(
+                (4, 1, len(program.acquisitions)),
+                value + 0j,
+                dtype=np.complex128,
+            )
+
+    executor = Executor()
+    partials = []
+    result = backend.execute_qcs_stability_hardware_sweep(
+        connection_config=_connection(
+            dc_channel_names=("dc_x", "dc_y"),
+            dc_full_scale_v=1.0,
+        ),
+        sequence=sequence,
+        repetitions_per_point=1,
+        acquisition=_acquisition(
+            at_segment="set_0",
+            duration_s=150e-6,
+            sample_count=720_000,
+        ),
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_x", "dc_y", "digitizer"),
+        executor=executor,
+        partial_callback=partials.append,
+    )
+
+    assert len(executor.programs) == 2
+    assert executor.programs[0] is executor.programs[1]
+    assert len(partials) == 2
+    assert partials[0].program_summary["partial"] is True
+    assert partials[-1].program_summary["partial"] is False
+    np.testing.assert_allclose(result.ddr_result.iq[..., 0], 2.0)
+    assert result.program_summary["iq_averaging_pass_count"] == 2
+    assert result.program_summary["executor_call_count"] == 2
+
+
+def test_qcs_sparameter_long_iq_reuses_program_and_weights_passes():
+    class Executor:
+        def __init__(self):
+            self.programs = []
+
+        def execute(self, program):
+            self.programs.append(program)
+            value = float(len(self.programs) * 2 - 1)
+            return np.full(
+                (2, 1, len(program.acquisitions)),
+                value + 1j * value,
+                dtype=np.complex128,
+            )
+
+    connection = _connection(
+        rf_channel_names={0: "rf_out"},
+    )
+    executor = Executor()
+    result = backend.execute_qcs_sparameter_sweep(
+        connection_config=connection,
+        frequencies_hz=(50e6, 60e6),
+        rf_gen_ch=0,
+        rf_amplitude=0.2,
+        integration_duration_s=150e-6,
+        repetitions_per_point=1,
+        qcs_module=_FakeQcs,
+        mapper=_Mapper("dc_gate", "rf_out", "digitizer"),
+        executor=executor,
+    )
+
+    assert len(executor.programs) == 2
+    assert executor.programs[0] is executor.programs[1]
+    np.testing.assert_allclose(result.iq[..., 0], 2.0)
+    np.testing.assert_allclose(result.iq[..., 1], 2.0)
+    assert result.program_summary["iq_averaging_pass_count"] == 2
+    assert result.program_summary["executor_call_count"] == 2
 
 
 def test_qcs_cancellation_aborts_only_owned_pending_programs():
@@ -886,6 +1048,79 @@ def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
             operation.kwargs["duration"] for operation in operations
         ) == pytest.approx(140.4e-6)
     assert compiled.duration_s == pytest.approx(140.4e-6)
+
+
+def test_no_sweep_globally_constant_output_uses_offset_and_resets():
+    sequence = (
+        FineTuneSequence(("awg_0", "awg_1"))
+        .add_set("initial", [0.0, 0.125], 300)
+        .add_ramp("ramp_up", 3_000)
+        .add_set("control", [0.125, 0.125], 120)
+        .add_ramp("ramp_down", 3_000)
+        .add_set("measure", [0.0, 0.125], 30_000)
+    )
+    report = backend.qcs_m5301_waveform_capacity_report(
+        sequence,
+        amplitude_scale=800.0 / 2_500.0,
+        auto_fixed_dc_offsets=True,
+        source_full_scale_mv=800.0,
+        dc_full_scale_v=2.5,
+    )
+    assert [channel.rendered_samples for channel in report.channels] == [
+        48_000,
+        0,
+    ]
+
+    preview = backend.qcs_sweep_execution_preview(
+        sequence,
+        hardware_demodulation=True,
+        source_full_scale_mv=800.0,
+        dc_full_scale_v=2.5,
+    )
+    assert preview.mode == "none"
+    np.testing.assert_allclose(preview.dc_channel_offsets_v, [0.0, 0.1])
+
+    mapper = _PhysicalMapper("dc_0", "dc_1", "digitizer")
+    offset_0 = mapper.offset_scalar("dc_0")
+    offset_1 = mapper.offset_scalar("dc_1")
+    calls = []
+
+    class Executor:
+        def execute(self, program):
+            calls.append(program)
+            if program.name == "PulseGenerator emergency DC reset":
+                assert offset_0.value == pytest.approx(0.0)
+                assert offset_1.value == pytest.approx(0.0)
+                return None
+            assert offset_0.value == pytest.approx(0.0)
+            assert offset_1.value == pytest.approx(0.1)
+            residual_operations = _program_waveform_operations(
+                program.waveforms[1]
+            )
+            assert all(type(operation) is _Delay for operation in residual_operations)
+            return np.asarray([1.0 + 2.0j])
+
+    result = execute_qcs_sequence(
+        connection_config=_connection(
+            dc_channel_names=("dc_0", "dc_1"),
+            dc_full_scale_v=2.5,
+        ),
+        sequence=sequence,
+        repetitions_per_sweep=1,
+        acquisition=_acquisition(at_segment="measure"),
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=Executor(),
+    )
+
+    assert len(calls) == 2
+    assert offset_1.value == pytest.approx(0.0)
+    assert result.program_summary["fixed_dc_offset_residualization"] is True
+    np.testing.assert_allclose(
+        result.program_summary["dc_channel_offsets_v"],
+        [0.0, 0.1],
+    )
+    assert result.program_summary["safety_reset_executor_call_count"] == 1
 
 
 def test_independent_nonzero_plateau_still_consumes_rendered_capacity():
@@ -3879,10 +4114,49 @@ def test_qcs_stability_hardware_sweep_requires_hardware_demodulation():
         )
 
 
-def test_qcs_stability_rejects_integration_above_measured_m5200_limit():
+def test_qcs_stability_segments_integration_above_single_filter_limit():
+    compiled = backend.compile_qcs_stability_hardware_sweep(
+        _stability_sequence(),
+        connection_config=_connection(
+            dc_channel_names=("dc_x", "dc_y"),
+            dc_full_scale_v=1.0,
+        ),
+        mapper=_Mapper("dc_x", "dc_y", "digitizer"),
+        repetitions_per_point=1,
+        fabric_mhz=300.0,
+        source_full_scale_mv=800.0,
+        acquisition=_acquisition(
+            at_segment="set_0",
+            duration_s=32_800 / backend.QCS_M5200_SAMPLE_RATE_HZ,
+            sample_count=32_800,
+        ),
+        qcs_module=_FakeQcs,
+    )
+
+    assert compiled.integration_segment_sample_counts == (16_416, 16_416)
+    assert compiled.acquisition_sample_count == 32_832
+    assert compiled.acquisition_duration_s == pytest.approx(
+        32_832 / backend.QCS_M5200_SAMPLE_RATE_HZ
+    )
+    assert compiled.acquisition_elapsed_duration_s == pytest.approx(
+        32_832 / backend.QCS_M5200_SAMPLE_RATE_HZ
+        + backend.QCS_STABILITY_INTER_SEGMENT_DELAY_S
+    )
+    assert len(compiled.program.acquisitions) == 2
+    assert (
+        compiled.program.acquisitions[0]["integration_filter"]
+        is compiled.program.acquisitions[1]["integration_filter"]
+    )
+    assert compiled.program.acquisitions[1]["pre_delay"] == pytest.approx(
+        backend.QCS_STABILITY_INTER_SEGMENT_DELAY_S
+    )
+
+
+def test_qcs_stability_rejects_integration_above_aggregate_limit():
+    sample_count = backend.QCS_STABILITY_MAX_INTEGRATION_SAMPLES + 32
     with pytest.raises(
         QcsUnsupportedFeatureError,
-        match=r"at most 32,768 samples",
+        match=r"aggregate limit.*480,000 samples",
     ):
         backend.compile_qcs_stability_hardware_sweep(
             _stability_sequence(),
@@ -3896,11 +4170,101 @@ def test_qcs_stability_rejects_integration_above_measured_m5200_limit():
             source_full_scale_mv=800.0,
             acquisition=_acquisition(
                 at_segment="set_0",
-                duration_s=32_800 / backend.QCS_M5200_SAMPLE_RATE_HZ,
-                sample_count=32_800,
+                duration_s=(
+                    sample_count / backend.QCS_M5200_SAMPLE_RATE_HZ
+                ),
+                sample_count=sample_count,
             ),
             qcs_module=_FakeQcs,
         )
+
+
+def test_qcs_stability_100us_segmented_iq_is_sample_weighted():
+    sequence = (
+        FineTuneSequence(("x_gate", "y_gate"))
+        .add_set("set_0", [0.0, 0.0], 36_600)
+        .add_amplitude_sweep("set_0", "x_gate", -0.1, 0.1, 2)
+        .add_amplitude_sweep("set_0", "y_gate", -0.2, 0.2, 2)
+        .set_cross_capacitance(np.eye(2))
+    )
+    connection = _connection(
+        dc_channel_names=("dc_x", "dc_y"),
+        dc_full_scale_v=1.0,
+        rf_channel_names={0: "rf_out"},
+    )
+    mapper = _Mapper("dc_x", "dc_y", "rf_out", "digitizer")
+    acquisition = _acquisition(
+        at_segment="set_0",
+        duration_s=100e-6,
+        pre_delay_s=10e-6,
+        sample_count=480_000,
+    )
+    rf_pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="set_0",
+        duration_s=100e-6,
+        amplitude=0.2,
+        frequency_hz=50e6,
+        delay_s=10e-6,
+        require_within_segment=False,
+    )
+    compiled = backend.compile_qcs_stability_hardware_sweep(
+        sequence,
+        connection_config=connection,
+        mapper=mapper,
+        repetitions_per_point=2,
+        acquisition=acquisition,
+        rf_pulses=(rf_pulse,),
+        qcs_module=_FakeQcs,
+    )
+
+    assert compiled.integration_segment_sample_counts == (32_000,) * 15
+    assert len(compiled.program.acquisitions) == 15
+    assert len({
+        id(entry["integration_filter"])
+        for entry in compiled.program.acquisitions
+    }) == 1
+    assert len(compiled.program.waveforms) == 2 + 15
+    assert compiled.acquisition_elapsed_duration_s == pytest.approx(100.28e-6)
+
+    raw = np.empty((4, 2, 15), dtype=np.complex128)
+    for point_index in range(4):
+        for repetition in range(2):
+            raw[point_index, repetition, :] = (
+                100 * point_index + 10 * repetition + np.arange(15)
+                + 1j * (np.arange(15) + 1)
+            )
+
+    class Executor:
+        @staticmethod
+        def execute(_program):
+            return raw
+
+    result = backend.execute_qcs_stability_hardware_sweep(
+        connection_config=connection,
+        sequence=sequence,
+        repetitions_per_point=2,
+        acquisition=acquisition,
+        rf_pulses=(rf_pulse,),
+        qcs_module=_FakeQcs,
+        mapper=mapper,
+        executor=Executor(),
+        compiled=compiled,
+    )
+
+    np.testing.assert_allclose(
+        result.ddr_result.iq[:, :, 0, 0],
+        np.asarray([[7, 17], [107, 117], [207, 217], [307, 317]]),
+    )
+    np.testing.assert_allclose(result.ddr_result.iq[:, :, 0, 1], 8.0)
+    assert result.program_summary["integration_segment_count"] == 15
+    assert result.program_summary["integration_sample_count"] == 480_000
+    assert result.program_summary["total_inter_segment_dead_time_s"] == (
+        pytest.approx(280e-9)
+    )
+    assert result.program_summary["acquisition_elapsed_duration_s"] == (
+        pytest.approx(100.28e-6)
+    )
 
 
 def test_qcs_stability_summary_reports_programmed_quantized_timing():
@@ -4023,6 +4387,17 @@ def test_qcs_stability_flat_result_uses_native_shot_x_y_order():
     )
     np.testing.assert_array_equal(flattened, normalized)
     np.testing.assert_array_equal(flattened_shot_last, normalized)
+
+
+def test_qcs_single_point_single_shot_scalar_iq_restores_axes():
+    normalized = normalize_qcs_hardware_sweep_iq(
+        np.asarray(1.25 - 0.5j),
+        repetitions_per_point=1,
+        sweep_shape=(1,),
+    )
+
+    assert normalized.shape == (1, 1, 1, 2)
+    np.testing.assert_allclose(normalized[0, 0, 0], [1.25, -0.5])
 
 
 def test_flat_software_sweep_iq_is_point_major_after_shape_is_stripped():
@@ -4327,6 +4702,150 @@ def test_calibrated_rf_power_sweep_fails_explicitly():
         backend.validate_qcs_capabilities(
             connection_config=_connection(),
             sequence=sequence,
+            acquisition=_acquisition(),
+        )
+
+
+def test_fixed_qcs_rf_power_calibration_resolves_after_mapper_load(
+    monkeypatch,
+    tmp_path,
+):
+    import qcs_rf_power_calibration as calibration_module
+
+    database_path = tmp_path / "m5300_power.db"
+    database_path.write_bytes(b"calibration")
+    output_identity = object()
+    input_identity = object()
+    captured = {}
+
+    class Calibration:
+        provenance = {
+            "schema": "pulse-generator-qcs-m5300-m5200-power-calibration-v1",
+            "run_id": 17,
+        }
+
+        @staticmethod
+        def relative_amplitudes_for_power(
+            frequencies_hz,
+            target_power_dbm,
+            *,
+            allow_power_extrapolation,
+        ):
+            captured["mapping"] = (
+                tuple(frequencies_hz),
+                target_power_dbm,
+                allow_power_extrapolation,
+            )
+            return np.asarray([0.125])
+
+        @staticmethod
+        def full_scale_power_dbm(frequencies_hz):
+            assert tuple(frequencies_hz) == (1.25e9,)
+            return np.asarray([-8.0])
+
+    def resolve_identities(mapper, output_name, input_name):
+        captured["identities"] = (mapper, output_name, input_name)
+        return output_identity, input_identity, 1.2e9
+
+    def load_calibration(database, **kwargs):
+        captured["database"] = database
+        captured["load"] = kwargs
+        return Calibration()
+
+    monkeypatch.setattr(
+        calibration_module,
+        "resolve_m5300_m5200_identities",
+        resolve_identities,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "load_m5300_power_calibration",
+        load_calibration,
+    )
+    mapper = object()
+    request = QcsRfPowerCalibrationConfig(
+        database_path=str(database_path),
+        run_id=17,
+        target_power_dbm=-26.0,
+    )
+    pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="read",
+        duration_s=100e-9,
+        amplitude=0.01,
+        frequency_hz=1.25e9,
+        power_calibration=request,
+    )
+    connection = _connection(
+        mapper_path=str(database_path),
+        rf_channel_names={0: "rf_drive"},
+    )
+
+    resolved = backend.resolve_qcs_rf_power_calibrations(
+        connection_config=connection,
+        mapper=mapper,
+        rf_pulses=(pulse,),
+    )
+
+    assert resolved[0].amplitude == pytest.approx(0.125)
+    assert resolved[0].power_calibration is request
+    assert resolved[0].power_calibration_provenance == {
+        "schema": "pulse-generator-qcs-m5300-m5200-power-calibration-v1",
+        "run_id": 17,
+        "target_power_dbm": -26.0,
+        "frequency_hz": 1.25e9,
+        "full_scale_power_dbm": -8.0,
+        "relative_amplitude": 0.125,
+        "power_extrapolation": False,
+    }
+    assert captured["identities"] == (mapper, "rf_drive", "digitizer")
+    assert captured["database"] == str(database_path)
+    assert captured["load"] == {
+        "run_id": 17,
+        "expected_output": output_identity,
+        "expected_input": None,
+        "expected_mapper_sha256": None,
+        "expected_lo_frequency_hz": 1.2e9,
+        "required_frequencies_hz": [1.25e9],
+        "termination_ohm": 50.0,
+    }
+    assert captured["mapping"] == ((1.25e9,), -26.0, False)
+    details = backend._qcs_rf_output_details(resolved)
+    assert details[0]["amplitude"] == pytest.approx(0.125)
+    assert details[0]["power_calibration"]["target_power_dbm"] == (
+        pytest.approx(-26.0)
+    )
+
+
+def test_qcs_calibrated_power_rejects_frequency_sweep():
+    sequence = _sequence().add_rf_frequency_sweep(
+        "read",
+        0,
+        100.0,
+        200.0,
+        3,
+    )
+    pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="read",
+        duration_s=100e-9,
+        amplitude=0.01,
+        frequency_hz=100e6,
+        power_calibration=QcsRfPowerCalibrationConfig(
+            database_path="m5300_power.db",
+            target_power_dbm=-20.0,
+        ),
+    )
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="fixed RF frequency",
+    ):
+        backend.validate_qcs_capabilities(
+            connection_config=_connection(
+                rf_channel_names={0: "rf_drive"}
+            ),
+            sequence=sequence,
+            rf_pulses=(pulse,),
             acquisition=_acquisition(),
         )
 

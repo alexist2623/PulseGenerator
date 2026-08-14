@@ -149,6 +149,25 @@ QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES = 480_000
 QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S = (
     QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES / QCS_M5200_SAMPLE_RATE_HZ
 )
+# A long Single-I/Q request is evaluated as repeated, independently safe
+# hardware passes.  One pass retains the 100 us aggregate integration that
+# was verified on the connected M5200A; the application-level total is capped
+# at 100 ms so an accidental unit error cannot submit an unbounded number of
+# programs.
+QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES = 480_000_000
+QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S = (
+    QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES / QCS_M5200_SAMPLE_RATE_HZ
+)
+# Stability uses the same connected-M5200 segmented-integration contract as
+# RF S-parameter acquisition.  Keep separate public names so each GUI can
+# describe its own measurement without coupling user-facing terminology.
+QCS_STABILITY_INTER_SEGMENT_DELAY_S = QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+QCS_STABILITY_MAX_INTEGRATION_SAMPLES = (
+    QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES
+)
+QCS_STABILITY_MAX_INTEGRATION_DURATION_S = (
+    QCS_STABILITY_MAX_INTEGRATION_SAMPLES / QCS_M5200_SAMPLE_RATE_HZ
+)
 # Raw M5200 captures have no documented QCS 2.5.5 hardware ceiling.  Keep a
 # separate, explicitly application-owned payload limit so an accidental long
 # Noise Analysis duration cannot allocate or transfer an unbounded trace.
@@ -199,6 +218,126 @@ QCS_M5301_MAX_ABS_OFFSET_SCALAR = 1.5
 
 class QcsUnsupportedFeatureError(ValueError):
     """Raised when a QICK-only semantic cannot be translated safely."""
+
+
+@dataclass(frozen=True)
+class QcsIqAveragingPlan:
+    """Quantized bounded-pass plan for one requested integrated-I/Q value."""
+
+    requested_total_duration_s: float
+    quantized_total_duration_s: float
+    quantized_total_sample_count: int
+    pass_sample_counts: Tuple[int, ...]
+    sample_rate_hz: float
+    block_samples: int
+    max_pass_samples: int
+
+    @property
+    def pass_count(self) -> int:
+        return len(self.pass_sample_counts)
+
+    @property
+    def max_pass_duration_s(self) -> float:
+        return self.max_pass_samples / self.sample_rate_hz
+
+
+def plan_qcs_total_iq_averaging(
+    duration_s: Any,
+    *,
+    sample_rate_hz: float = QCS_M5200_SAMPLE_RATE_HZ,
+    block_samples: int = QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+    max_pass_samples: int = QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES,
+) -> QcsIqAveragingPlan:
+    """Plan equal, reusable hardware passes for up to 100 ms of averaging.
+
+    Equal pass sizes let one compiled QCS Program be reused for every pass.
+    The requested total is rounded upward to the M5200 block grid and, when
+    multiple passes are needed, by at most one block per pass so no pass is
+    shorter than the requested aggregate integration.
+    """
+
+    requested_s = _positive_finite(
+        duration_s, "QCS total I/Q averaging duration"
+    )
+    rate_hz = _positive_finite(
+        sample_rate_hz, "QCS total I/Q averaging sample rate"
+    )
+    if isinstance(block_samples, bool):
+        raise TypeError("QCS I/Q averaging block size must be an integer")
+    block = int(block_samples)
+    if block < 1 or block != block_samples:
+        raise ValueError("QCS I/Q averaging block size must be positive")
+    if isinstance(max_pass_samples, bool):
+        raise TypeError("QCS I/Q averaging pass limit must be an integer")
+    pass_cap = int(max_pass_samples)
+    if pass_cap < block or pass_cap != max_pass_samples:
+        raise ValueError(
+            "QCS I/Q averaging pass limit must be a positive integer"
+        )
+    if pass_cap % block:
+        raise ValueError(
+            "QCS I/Q averaging pass limit must be a multiple of the "
+            f"{block}-sample block"
+        )
+    if requested_s > QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S + 1.0e-15:
+        raise QcsUnsupportedFeatureError(
+            "QCS total Single-I/Q averaging is limited to "
+            f"{QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S * 1.0e3:.9g} ms "
+            f"({QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES:,} M5200 samples); "
+            f"requested {requested_s * 1.0e3:.9g} ms"
+        )
+    rendered_samples = requested_s * rate_hz
+    nearest_samples = int(round(rendered_samples))
+    tolerance = max(1.0e-7, 8.0 * abs(float(np.spacing(rendered_samples))))
+    if np.isclose(
+        rendered_samples,
+        nearest_samples,
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        requested_samples = max(1, nearest_samples)
+    else:
+        requested_samples = max(1, int(np.ceil(rendered_samples)))
+    block_count = max(1, int(np.ceil(requested_samples / block)))
+    quantized_samples = block_count * block
+    if quantized_samples > QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES:
+        raise QcsUnsupportedFeatureError(
+            "QCS total Single-I/Q averaging quantizes above the 100 ms "
+            f"application limit ({quantized_samples:,} samples)"
+        )
+    pass_count = max(1, int(np.ceil(quantized_samples / pass_cap)))
+    samples_per_pass = int(
+        np.ceil(quantized_samples / pass_count / block) * block
+    )
+    if samples_per_pass > QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:
+        filter_count = int(
+            np.ceil(
+                samples_per_pass
+                / QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES
+            )
+        )
+        samples_per_filter = int(
+            np.ceil(samples_per_pass / filter_count / block) * block
+        )
+        samples_per_pass = samples_per_filter * filter_count
+    if samples_per_pass > pass_cap:
+        raise RuntimeError("internal QCS I/Q averaging pass exceeds its cap")
+    pass_samples = (samples_per_pass,) * pass_count
+    actual_total_samples = int(sum(pass_samples))
+    if actual_total_samples > QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES:
+        raise QcsUnsupportedFeatureError(
+            "QCS total Single-I/Q averaging equal-pass quantization exceeds "
+            "the 100 ms application limit"
+        )
+    return QcsIqAveragingPlan(
+        requested_total_duration_s=requested_s,
+        quantized_total_duration_s=actual_total_samples / rate_hz,
+        quantized_total_sample_count=actual_total_samples,
+        pass_sample_counts=pass_samples,
+        sample_rate_hz=rate_hz,
+        block_samples=block,
+        max_pass_samples=pass_cap,
+    )
 
 
 def _validate_qcs_software_sweep_point_count(point_count: int) -> None:
@@ -590,13 +729,101 @@ def quantize_qcs_stability_integration_duration(
         block_count = max(1, nearest_blocks)
     else:
         block_count = max(1, int(np.ceil(requested_blocks)))
-    sample_count = (
+    requested_sample_count = (
         block_count * QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES
     )
-    return (
-        block_count * QCS_STABILITY_INTEGRATION_QUANTUM_S,
-        sample_count,
+    plan = plan_qcs_total_iq_averaging(
+        requested_sample_count / QCS_M5200_SAMPLE_RATE_HZ,
+        sample_rate_hz=QCS_M5200_SAMPLE_RATE_HZ,
+        block_samples=QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES,
+        max_pass_samples=QCS_STABILITY_MAX_INTEGRATION_SAMPLES,
     )
+    return (
+        plan.quantized_total_duration_s,
+        plan.quantized_total_sample_count,
+    )
+
+
+def qcs_stability_integration_segment_sample_counts(
+    sample_count: Any,
+) -> tuple[int, ...]:
+    """Split one Stability average into equal legal M5200 filters.
+
+    Every segment uses the same sample count whenever more than one filter is
+    required.  Reusing one IntegrationFilter object is the connected-QCS
+    hardware-tested construction and avoids an additional filter allocation
+    for a small final remainder.
+    """
+
+    if isinstance(sample_count, bool):
+        raise TypeError("QCS Stability integration sample count must be integer")
+    count = int(sample_count)
+    if count < 1 or count != sample_count:
+        raise ValueError(
+            "QCS Stability integration sample count must be a positive integer"
+        )
+    block = QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES
+    if count % block:
+        raise ValueError(
+            "QCS Stability integration sample count must be a multiple of "
+            f"{block}; got {count}"
+        )
+    if count > QCS_STABILITY_MAX_INTEGRATION_SAMPLES:
+        raise QcsUnsupportedFeatureError(
+            "QCS Stability integration exceeds the verified aggregate limit "
+            f"of {QCS_STABILITY_MAX_INTEGRATION_SAMPLES:,} samples"
+        )
+    if count <= QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:
+        return (count,)
+    segment_count = int(
+        np.ceil(count / QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES)
+    )
+    segment_sample_count = int(
+        np.ceil(count / segment_count / block) * block
+    )
+    if segment_sample_count > QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:
+        raise RuntimeError(
+            "internal QCS Stability segment exceeds the connected M5200 "
+            "single-IntegrationFilter ceiling"
+        )
+    return (segment_sample_count,) * segment_count
+
+
+def _qcs_iq_integration_segment_sample_counts(
+    sample_count: Any,
+    *,
+    block_samples: int = QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
+) -> tuple[int, ...]:
+    """Split one verified pass into reusable legal IntegrationFilters."""
+
+    if isinstance(sample_count, bool):
+        raise TypeError("QCS integration sample count must be an integer")
+    count = int(sample_count)
+    block = int(block_samples)
+    if count < 1 or count != sample_count:
+        raise ValueError("QCS integration sample count must be positive")
+    if block < 1 or count % block:
+        raise ValueError(
+            "QCS integration sample count must be a multiple of "
+            f"{block}; got {count}"
+        )
+    if count > QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES:
+        raise QcsUnsupportedFeatureError(
+            "one QCS integrated-I/Q pass exceeds the verified aggregate "
+            f"limit of {QCS_SPARAMETER_MAX_INTEGRATION_SAMPLES:,} samples"
+        )
+    if count <= QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:
+        return (count,)
+    segment_count = int(
+        np.ceil(count / QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES)
+    )
+    segment_samples = int(np.ceil(count / segment_count / block) * block)
+    if segment_samples > QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:
+        raise RuntimeError(
+            "internal QCS segment exceeds the connected M5200 "
+            "single-IntegrationFilter ceiling"
+        )
+    return (segment_samples,) * segment_count
 
 
 def _channel_name(value: Any, label: str) -> str:
@@ -682,6 +909,33 @@ class QcsConnectionConfig:
 
 
 @dataclass(frozen=True)
+class QcsRfPowerCalibrationConfig:
+    """One fixed M5300A connector-power request for AWG Tuning."""
+
+    database_path: str
+    target_power_dbm: float
+    run_id: int = 0
+
+    def __post_init__(self) -> None:
+        database_path = str(self.database_path).strip()
+        if not database_path:
+            raise ValueError(
+                "QCS RF power-calibration database path must not be empty"
+            )
+        target_power_dbm = float(self.target_power_dbm)
+        if not isfinite(target_power_dbm):
+            raise ValueError("QCS target RF output power must be finite")
+        if isinstance(self.run_id, bool) or int(self.run_id) != self.run_id:
+            raise TypeError("QCS RF power-calibration run ID must be an integer")
+        run_id = int(self.run_id)
+        if run_id < 0:
+            raise ValueError("QCS RF power-calibration run ID must be nonnegative")
+        object.__setattr__(self, "database_path", database_path)
+        object.__setattr__(self, "target_power_dbm", target_power_dbm)
+        object.__setattr__(self, "run_id", run_id)
+
+
+@dataclass(frozen=True)
 class QcsRfPulseConfig:
     """One RF waveform placed relative to a named fine-tune segment."""
 
@@ -694,6 +948,8 @@ class QcsRfPulseConfig:
     delay_s: float = 0.0
     envelope: str = "constant"
     require_within_segment: bool = True
+    power_calibration: Optional[QcsRfPowerCalibrationConfig] = None
+    power_calibration_provenance: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.gen_ch, bool) or int(self.gen_ch) != self.gen_ch:
@@ -721,6 +977,24 @@ class QcsRfPulseConfig:
             )
         if not isinstance(self.require_within_segment, bool):
             raise TypeError("QCS RF require_within_segment must be boolean")
+        if (
+            self.power_calibration is not None
+            and not isinstance(
+                self.power_calibration,
+                QcsRfPowerCalibrationConfig,
+            )
+        ):
+            raise TypeError(
+                "QCS RF power_calibration must be a "
+                "QcsRfPowerCalibrationConfig"
+            )
+        provenance = self.power_calibration_provenance
+        if provenance is not None:
+            if not isinstance(provenance, Mapping):
+                raise TypeError(
+                    "QCS RF power-calibration provenance must be a mapping"
+                )
+            provenance = dict(provenance)
         object.__setattr__(self, "gen_ch", int(self.gen_ch))
         object.__setattr__(self, "at_segment", at_segment)
         object.__setattr__(self, "duration_s", duration_s)
@@ -729,6 +1003,11 @@ class QcsRfPulseConfig:
         object.__setattr__(self, "phase_rad", phase_rad)
         object.__setattr__(self, "delay_s", delay_s)
         object.__setattr__(self, "envelope", envelope)
+        object.__setattr__(
+            self,
+            "power_calibration_provenance",
+            provenance,
+        )
 
 
 @dataclass(frozen=True)
@@ -860,6 +1139,7 @@ class QcsM5301CapacityReport:
     channels: Tuple[QcsM5301ChannelCapacity, ...]
     inspected_point_count: int
     sweep_point_count: int
+    dc_channel_offsets_v: Tuple[float, ...] = ()
 
     @property
     def worst_channel(self) -> QcsM5301ChannelCapacity:
@@ -914,6 +1194,10 @@ class QcsCompiledPoint:
     duration_s: float
     acquisition_duration_s: Optional[float] = None
     acquisition_sample_rate_hz: Optional[float] = None
+    acquisition_sample_count: Optional[int] = None
+    integration_segment_sample_counts: Tuple[int, ...] = ()
+    inter_segment_delay_s: float = 0.0
+    acquisition_elapsed_duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -937,6 +1221,10 @@ class QcsCompiledHardwareSweep:
     dc_offset_init_compensation_v: Tuple[float, ...] = ()
     programmed_rf_pulses: Tuple[Mapping[str, Any], ...] = ()
     acquisition_pre_delay_s: Optional[float] = None
+    acquisition_sample_count: Optional[int] = None
+    integration_segment_sample_counts: Tuple[int, ...] = ()
+    inter_segment_delay_s: float = 0.0
+    acquisition_elapsed_duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1366,28 @@ class _QcsFixedDcOffsetPlan:
 
     source_offsets: Tuple[float, ...]
     offset_volts: Tuple[float, ...]
+    optional_offset_outputs: Tuple[bool, ...] = ()
+
+
+def _qcs_without_optional_dc_offsets(
+    plan: _QcsFixedDcOffsetPlan,
+) -> _QcsFixedDcOffsetPlan:
+    """Drop capacity-only constant-lane offsets from one compiler plan."""
+
+    optional = tuple(bool(value) for value in plan.optional_offset_outputs)
+    if len(optional) != len(plan.offset_volts):
+        return plan
+    return _QcsFixedDcOffsetPlan(
+        source_offsets=tuple(
+            0.0 if is_optional else float(value)
+            for value, is_optional in zip(plan.source_offsets, optional)
+        ),
+        offset_volts=tuple(
+            0.0 if is_optional else float(value)
+            for value, is_optional in zip(plan.offset_volts, optional)
+        ),
+        optional_offset_outputs=optional,
+    )
 
 
 @dataclass
@@ -2384,6 +2694,11 @@ def qcs_m5301_waveform_capacity_report(
         channels=channels,
         inspected_point_count=len(inspected),
         sweep_point_count=point_count,
+        dc_channel_offsets_v=(
+            tuple(float(value) for value in offset_plan.offset_volts)
+            if offset_plan is not None
+            else (0.0,) * len(output_names)
+        ),
     )
 
 
@@ -2618,7 +2933,127 @@ def _point_rf_pulse(
         delay_s=pulse.delay_s,
         envelope=pulse.envelope,
         require_within_segment=pulse.require_within_segment,
+        power_calibration=pulse.power_calibration,
+        power_calibration_provenance=(
+            pulse.power_calibration_provenance
+        ),
     )
+
+
+def resolve_qcs_rf_power_calibrations(
+    *,
+    connection_config: QcsConnectionConfig,
+    mapper: Any,
+    rf_pulses: Sequence[QcsRfPulseConfig],
+) -> Tuple[QcsRfPulseConfig, ...]:
+    """Resolve fixed connector dBm requests to mapped M5300 amplitudes.
+
+    Resolution intentionally happens after loading the active ChannelMapper.
+    That lets the calibration loader verify the exact M5300 output SMA and
+    active M5300 LO before a program is compiled or submitted to hardware.
+    The M5200 used to create the calibration and its scoped mapper digest are
+    retained as provenance; they are not properties of a later output path.
+    """
+
+    pulses = tuple(rf_pulses)
+    if not any(pulse.power_calibration is not None for pulse in pulses):
+        return pulses
+    acquisition_name = connection_config.acquisition_channel_name
+    if acquisition_name is None:
+        raise ValueError(
+            "QCS calibrated RF output power requires a mapped M5200 "
+            "acquisition input"
+        )
+    try:
+        from .qcs_rf_power_calibration import (
+            load_m5300_power_calibration,
+            resolve_m5300_m5200_identities,
+        )
+    except ImportError:
+        from qcs_rf_power_calibration import (
+            load_m5300_power_calibration,
+            resolve_m5300_m5200_identities,
+        )
+
+    resolved = []
+    for pulse in pulses:
+        request = pulse.power_calibration
+        if request is None:
+            resolved.append(pulse)
+            continue
+        try:
+            output_name = connection_config.rf_channel_names[pulse.gen_ch]
+        except KeyError as exc:
+            raise KeyError(
+                "QCS calibrated RF output power has no mapped virtual "
+                f"channel for gen_ch {pulse.gen_ch}"
+            ) from exc
+        output_identity, _input_identity, lo_frequency_hz = (
+            resolve_m5300_m5200_identities(
+                mapper,
+                output_name,
+                acquisition_name,
+            )
+        )
+        calibration = load_m5300_power_calibration(
+            request.database_path,
+            run_id=(request.run_id or None),
+            expected_output=output_identity,
+            expected_input=None,
+            expected_mapper_sha256=None,
+            expected_lo_frequency_hz=lo_frequency_hz,
+            required_frequencies_hz=[pulse.frequency_hz],
+            termination_ohm=50.0,
+        )
+        relative_amplitude = float(
+            calibration.relative_amplitudes_for_power(
+                [pulse.frequency_hz],
+                request.target_power_dbm,
+                allow_power_extrapolation=False,
+            )[0]
+        )
+        provenance = dict(calibration.provenance)
+        provenance.update(
+            {
+                "target_power_dbm": float(request.target_power_dbm),
+                "frequency_hz": float(pulse.frequency_hz),
+                "full_scale_power_dbm": float(
+                    calibration.full_scale_power_dbm(
+                        [pulse.frequency_hz]
+                    )[0]
+                ),
+                "relative_amplitude": relative_amplitude,
+                "power_extrapolation": False,
+            }
+        )
+        resolved.append(
+            replace(
+                pulse,
+                amplitude=relative_amplitude,
+                power_calibration_provenance=provenance,
+            )
+        )
+    return tuple(resolved)
+
+
+def _qcs_rf_output_details(
+    rf_pulses: Sequence[QcsRfPulseConfig],
+) -> Tuple[Mapping[str, Any], ...]:
+    details = []
+    for pulse in rf_pulses:
+        current = {
+            "gen_ch": pulse.gen_ch,
+            "amplitude": pulse.amplitude,
+            "frequency_hz": pulse.frequency_hz,
+            "duration_s": pulse.duration_s,
+            "delay_s": pulse.delay_s,
+        }
+        if pulse.power_calibration_provenance is not None:
+            current["power_calibration"] = dict(
+                pulse.power_calibration_provenance
+            )
+        details.append(current)
+    return tuple(details)
 
 
 def validate_qcs_capabilities(
@@ -2641,6 +3076,20 @@ def validate_qcs_capabilities(
             "data is complete before it is normalized and saved"
         )
     segment_names = {str(segment.name) for segment in sequence.segments}
+    for pulse in rf_pulses:
+        if pulse.power_calibration is None:
+            continue
+        if any(
+            isinstance(axis, RfFrequencySweep)
+            and axis.gen_ch == pulse.gen_ch
+            and axis.segment_name == pulse.at_segment
+            for axis in sequence.sweep_axes
+        ):
+            raise QcsUnsupportedFeatureError(
+                "QCS calibrated connector power in AWG Tuning currently "
+                "requires one fixed RF frequency; disable the RF frequency "
+                "sweep or use direct relative amplitude"
+            )
     for axis in sequence.sweep_axes:
         if isinstance(axis, RfPowerSweep):
             raise QcsUnsupportedFeatureError(
@@ -2851,6 +3300,9 @@ def compile_qcs_point(
     acquisition_channels = None
     acquisition_duration_s = None
     acquisition_sample_rate_hz = None
+    acquisition_sample_count = None
+    integration_segment_sample_counts: tuple[int, ...] = ()
+    acquisition_elapsed_duration_s = None
     if acquisition is not None:
         segment_start_s, segment_stop_s = boundary_seconds[
             acquisition.at_segment
@@ -2868,7 +3320,30 @@ def compile_qcs_point(
             acquisition,
             hardware_demodulation=connection_config.hw_demod,
         )
-        acquisition_stop_s = pre_delay_s + acquisition_duration_s
+        acquisition_sample_count = int(
+            round(acquisition_duration_s * acquisition_sample_rate_hz)
+        )
+        if connection_config.hw_demod:
+            integration_segment_sample_counts = (
+                _qcs_iq_integration_segment_sample_counts(
+                    acquisition_sample_count
+                )
+            )
+            acquisition_sample_count = int(
+                sum(integration_segment_sample_counts)
+            )
+            acquisition_duration_s = (
+                acquisition_sample_count / acquisition_sample_rate_hz
+            )
+            acquisition_elapsed_duration_s = (
+                acquisition_duration_s
+                + max(0, len(integration_segment_sample_counts) - 1)
+                * QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+            )
+        else:
+            integration_segment_sample_counts = (acquisition_sample_count,)
+            acquisition_elapsed_duration_s = acquisition_duration_s
+        acquisition_stop_s = pre_delay_s + acquisition_elapsed_duration_s
         if (
             connection_config.hw_demod
             and acquisition_stop_s > segment_stop_s + 1e-15
@@ -2878,26 +3353,65 @@ def compile_qcs_point(
                 f"{acquisition.at_segment!r}"
             )
         if connection_config.hw_demod:
-            integration_filter = acquisition.integration_filter
-            if integration_filter is None:
-                integration_filter = qcs.RFWaveform(
-                    duration=acquisition_duration_s,
-                    envelope=_qcs_envelope(qcs, acquisition.envelope),
-                    amplitude=1.0,
-                    rf_frequency=acquisition.frequency_hz,
-                    instantaneous_phase=acquisition.phase_rad,
-                    name=f"acquisition_filter_point_{point_index}",
+            if (
+                len(integration_segment_sample_counts) > 1
+                and acquisition.integration_filter is not None
+            ):
+                raise QcsUnsupportedFeatureError(
+                    "segmented QCS I/Q integration requires the built-in "
+                    "flat filter; a custom filter cannot be divided safely"
+                )
+            integration_filter_cache: dict[int, Any] = {}
+            for segment_index, segment_samples in enumerate(
+                integration_segment_sample_counts
+            ):
+                integration_filter = acquisition.integration_filter
+                if integration_filter is None:
+                    integration_filter = integration_filter_cache.get(
+                        segment_samples
+                    )
+                    if integration_filter is None:
+                        filter_waveform = qcs.RFWaveform(
+                            duration=(
+                                segment_samples / acquisition_sample_rate_hz
+                            ),
+                            envelope=_qcs_envelope(qcs, acquisition.envelope),
+                            amplitude=1.0,
+                            rf_frequency=acquisition.frequency_hz,
+                            instantaneous_phase=acquisition.phase_rad,
+                            name=(
+                                f"acquisition_filter_point_{point_index}_"
+                                f"{segment_samples}_samples"
+                            ),
+                        )
+                        integration_filter = (
+                            qcs.IntegrationFilter(filter_waveform)
+                            if len(integration_segment_sample_counts) > 1
+                            else filter_waveform
+                        )
+                        integration_filter_cache[segment_samples] = (
+                            integration_filter
+                        )
+                program.add_acquisition(
+                    integration_filter=integration_filter,
+                    channels=acquisition_channels,
+                    new_layer=False,
+                    pre_delay=(
+                        pre_delay_s
+                        if segment_index == 0
+                        else QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+                    ),
                 )
         else:
             # QCS requests raw trace capture by supplying a duration instead
             # of an IntegrationFilter/RFWaveform.
             integration_filter = acquisition_duration_s
-        program.add_acquisition(
-            integration_filter=integration_filter,
-            channels=acquisition_channels,
-            new_layer=False,
-            pre_delay=pre_delay_s,
-        )
+            program.add_acquisition(
+                integration_filter=integration_filter,
+                channels=acquisition_channels,
+                new_layer=False,
+                pre_delay=pre_delay_s,
+            )
         # A raw M5200 trace may intentionally continue across later segments
         # or beyond the DC waveform. QCS keeps it in this layer and pads the
         # shorter lanes with Delay; no M5301 waveform memory is consumed.
@@ -2912,6 +3426,14 @@ def compile_qcs_point(
         duration_s=duration_s,
         acquisition_duration_s=acquisition_duration_s,
         acquisition_sample_rate_hz=acquisition_sample_rate_hz,
+        acquisition_sample_count=acquisition_sample_count,
+        integration_segment_sample_counts=integration_segment_sample_counts,
+        inter_segment_delay_s=(
+            QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+            if connection_config.hw_demod
+            else 0.0
+        ),
+        acquisition_elapsed_duration_s=acquisition_elapsed_duration_s,
     )
 
 
@@ -3126,6 +3648,7 @@ def _qcs_fixed_dc_offset_plan(
     )
     source_offsets = []
     offset_volts = []
+    optional_offset_outputs = []
     for output_index in range(len(output_names)):
         candidates: Optional[list[float]] = None
         has_changing_interval = False
@@ -3156,8 +3679,46 @@ def _qcs_fixed_dc_offset_plan(
                 return None
 
         if not has_changing_interval:
+            # A globally constant output does not need any rendered M5301
+            # waveform samples.  Apply its level through the physical-channel
+            # offset and compile a zero residual instead.  Do not apply this
+            # optimization to merely piecewise-constant outputs: their levels
+            # still have to be represented by the program.
+            constant_output = _qcs_constant_sweep_value(
+                np.concatenate(
+                    (
+                        start_table[:, :, output_index].reshape(-1),
+                        end_table[:, :, output_index].reshape(-1),
+                    )
+                )
+            )
+            if constant_output is not None:
+                constant_output = (
+                    0.0
+                    if np.isclose(
+                        constant_output,
+                        0.0,
+                        rtol=0.0,
+                        atol=1e-12,
+                    )
+                    else float(constant_output)
+                )
+                constant_offset_v = constant_output * source_scale_v
+                constant_offset_scalar = (
+                    constant_offset_v
+                    / QCS_M5301_OFFSET_VOLTS_PER_SCALAR
+                )
+                if (
+                    abs(constant_offset_scalar)
+                    <= QCS_M5301_MAX_ABS_OFFSET_SCALAR + 1e-12
+                ):
+                    source_offsets.append(constant_output)
+                    offset_volts.append(float(constant_offset_v))
+                    optional_offset_outputs.append(True)
+                    continue
             source_offsets.append(0.0)
             offset_volts.append(0.0)
+            optional_offset_outputs.append(True)
             continue
 
         valid_candidates = []
@@ -3205,10 +3766,12 @@ def _qcs_fixed_dc_offset_plan(
         )
         source_offsets.append(float(selected))
         offset_volts.append(float(selected * source_scale_v))
+        optional_offset_outputs.append(False)
 
     return _QcsFixedDcOffsetPlan(
         source_offsets=tuple(source_offsets),
         offset_volts=tuple(offset_volts),
+        optional_offset_outputs=tuple(optional_offset_outputs),
     )
 
 
@@ -3578,9 +4141,38 @@ def qcs_sweep_execution_preview(
 
     point_count = int(sequence.sweep_point_count)
     if point_count <= 1:
+        offset_plan = (
+            None
+            if _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence)
+            else _qcs_fixed_dc_offset_plan(
+                sequence,
+                source_full_scale_mv=source_full_scale_mv,
+                dc_full_scale_v=dc_full_scale_v,
+            )
+        )
+        offsets = (
+            ()
+            if offset_plan is None
+            else tuple(offset_plan.offset_volts)
+        )
+        reasons = ["No voltage or RF sweep is configured."]
+        if any(
+            not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+            for value in offsets
+        ):
+            offset_text = ", ".join(
+                f"{value * 1e3:.9g} mV" for value in offsets
+            )
+            reasons.append(
+                "Globally constant DC output(s) use fixed physical M5301 "
+                f"offsets ({offset_text}) with a zero residual waveform; "
+                "mapped offset support is confirmed when the QCS Program "
+                "is compiled."
+            )
         return QcsSweepExecutionPreview(
             mode="none",
-            reasons=("No voltage or RF sweep is configured.",),
+            reasons=tuple(reasons),
+            dc_channel_offsets_v=offsets,
         )
     axis_kinds = tuple(
         str(getattr(axis, "axis_kind", "amplitude"))
@@ -4073,6 +4665,25 @@ def compile_qcs_synchronized_sweep(
         raise ValueError(
             "QCS fixed DC offset count must match the waveform output count"
         )
+    if not _mapper_supports_qcs_dc_offsets(
+        mapper,
+        channel_names=connection_config.dc_channel_names,
+        offset_volts=dc_offset_plan.offset_volts,
+    ):
+        # A globally constant lane uses offset only as a waveform-memory
+        # optimization.  Older/injected mappers without physical settings can
+        # render that lane exactly as before.  Offsets selected as the common
+        # endpoint of a varying ramp remain mandatory for synchronized sweep
+        # lowering and are deliberately not removed here.
+        fallback_offset_plan = _qcs_without_optional_dc_offsets(
+            dc_offset_plan
+        )
+        if _mapper_supports_qcs_dc_offsets(
+            mapper,
+            channel_names=connection_config.dc_channel_names,
+            offset_volts=fallback_offset_plan.offset_volts,
+        ):
+            dc_offset_plan = fallback_offset_plan
     compensation_config = getattr(sequence, "bias_t_compensation", None)
     offset_init_compensation_source = None
     if (
@@ -4160,6 +4771,37 @@ def compile_qcs_synchronized_sweep(
         acquisition,
         hardware_demodulation=connection_config.hw_demod,
     )
+    acquisition_sample_count = int(
+        round(acquisition_duration_s * acquisition_sample_rate_hz)
+    )
+    if connection_config.hw_demod:
+        integration_segment_sample_counts = (
+            _qcs_iq_integration_segment_sample_counts(
+                acquisition_sample_count
+            )
+        )
+        acquisition_sample_count = int(
+            sum(integration_segment_sample_counts)
+        )
+        acquisition_duration_s = (
+            acquisition_sample_count / acquisition_sample_rate_hz
+        )
+        acquisition_elapsed_duration_s = (
+            acquisition_duration_s
+            + max(0, len(integration_segment_sample_counts) - 1)
+            * QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+        )
+        if (
+            len(integration_segment_sample_counts) > 1
+            and acquisition.integration_filter is not None
+        ):
+            raise QcsUnsupportedFeatureError(
+                "segmented QCS I/Q integration requires the built-in flat "
+                "filter; a custom filter cannot be divided safely"
+            )
+    else:
+        integration_segment_sample_counts = (acquisition_sample_count,)
+        acquisition_elapsed_duration_s = acquisition_duration_s
     normalized_offset_values = np.asarray(
         dc_offset_plan.offset_volts,
         dtype=float,
@@ -4570,7 +5212,7 @@ def compile_qcs_synchronized_sweep(
             label="QCS acquisition pre-delay",
         )
         pre_delay_s = segment_start_s + acquisition_delay_s
-        acquisition_stop_s = pre_delay_s + acquisition_duration_s
+        acquisition_stop_s = pre_delay_s + acquisition_elapsed_duration_s
         if (
             connection_config.hw_demod
             and acquisition_stop_s > segment_stop_s + 1e-15
@@ -4592,24 +5234,55 @@ def compile_qcs_synchronized_sweep(
         force=point_count > 1 and not targets,
     )
     if connection_config.hw_demod:
-        integration_filter = acquisition.integration_filter
-        if integration_filter is None:
-            integration_filter = qcs.RFWaveform(
-                duration=acquisition_duration_s,
-                envelope=_qcs_envelope(qcs, acquisition.envelope),
-                amplitude=1.0,
-                rf_frequency=acquisition.frequency_hz,
-                instantaneous_phase=acquisition.phase_rad,
-                name="awg_acquisition_filter",
+        integration_filter_cache: dict[int, Any] = {}
+        for segment_index, segment_samples in enumerate(
+            integration_segment_sample_counts
+        ):
+            integration_filter = acquisition.integration_filter
+            if integration_filter is None:
+                integration_filter = integration_filter_cache.get(
+                    segment_samples
+                )
+                if integration_filter is None:
+                    filter_waveform = qcs.RFWaveform(
+                        duration=(
+                            segment_samples / acquisition_sample_rate_hz
+                        ),
+                        envelope=_qcs_envelope(qcs, acquisition.envelope),
+                        amplitude=1.0,
+                        rf_frequency=acquisition.frequency_hz,
+                        instantaneous_phase=acquisition.phase_rad,
+                        name=(
+                            "awg_acquisition_filter_"
+                            f"{segment_samples}_samples"
+                        ),
+                    )
+                    integration_filter = (
+                        qcs.IntegrationFilter(filter_waveform)
+                        if len(integration_segment_sample_counts) > 1
+                        else filter_waveform
+                    )
+                    integration_filter_cache[segment_samples] = (
+                        integration_filter
+                    )
+            program.add_acquisition(
+                integration_filter=integration_filter,
+                channels=acquisition_channels,
+                new_layer=False,
+                pre_delay=(
+                    acquisition_pre_delay
+                    if segment_index == 0
+                    else QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+                ),
             )
     else:
         integration_filter = acquisition_duration_s
-    program.add_acquisition(
-        integration_filter=integration_filter,
-        channels=acquisition_channels,
-        new_layer=False,
-        pre_delay=acquisition_pre_delay,
-    )
+        program.add_acquisition(
+            integration_filter=integration_filter,
+            channels=acquisition_channels,
+            new_layer=False,
+            pre_delay=acquisition_pre_delay,
+        )
 
     reasons = []
     if not connection_config.hw_demod and point_count > 1:
@@ -4696,6 +5369,16 @@ def compile_qcs_synchronized_sweep(
             )
             * (float(source_full_scale_mv) / 1000.0)
         ),
+        acquisition_sample_count=acquisition_sample_count,
+        integration_segment_sample_counts=tuple(
+            integration_segment_sample_counts
+        ),
+        inter_segment_delay_s=(
+            QCS_SPARAMETER_INTER_SEGMENT_DELAY_S
+            if connection_config.hw_demod
+            else 0.0
+        ),
+        acquisition_elapsed_duration_s=acquisition_elapsed_duration_s,
     )
 
 
@@ -4945,6 +5628,8 @@ def _execute_qcs_mixed_sweep(
     source_full_scale_mv: float,
     rf_pulses: Sequence[QcsRfPulseConfig],
     acquisition: QcsAcquisitionConfig,
+    iq_averaging_plan: Optional[QcsIqAveragingPlan],
+    requested_acquisition: QcsAcquisitionConfig,
     qcs_module: Any,
     progress_callback: Optional[ProgressCallback],
     event_callback: Optional[EventCallback],
@@ -4961,6 +5646,12 @@ def _execute_qcs_mixed_sweep(
     _validate_qcs_software_sweep_point_count(outer_count)
     if outer_count * inner_count != point_count:
         raise ValueError("QCS mixed-sweep partition does not cover every point")
+    averaging_plan = iq_averaging_plan
+    if averaging_plan is None:
+        averaging_plan = plan_qcs_total_iq_averaging(
+            acquisition.duration_s,
+            sample_rate_hz=acquisition.sample_rate_hz,
+        )
 
     hardware_axes = tuple(plan.hardware_axis_indices)
     software_axes = tuple(plan.software_axis_indices)
@@ -4976,6 +5667,7 @@ def _execute_qcs_mixed_sweep(
     safety_reset_executor_call_count = 0
     mixed_program_build_wall_s = float(plan.planning_wall_s)
     mixed_executor_wall_s = 0.0
+    measurement_executor_call_count = 0
     last_partial_publish_s = float("-inf")
     block_offset_values = []
     software_reasons = tuple(
@@ -4990,22 +5682,14 @@ def _execute_qcs_mixed_sweep(
 
     rf_settings = {
         "backend": "qcs",
-        "output_details": tuple(
-            {
-                "gen_ch": pulse.gen_ch,
-                "amplitude": pulse.amplitude,
-                "frequency_hz": pulse.frequency_hz,
-                "duration_s": pulse.duration_s,
-            }
-            for pulse in rf_pulses
-        ),
+        "output_details": _qcs_rf_output_details(rf_pulses),
         "readout_details": {
             "sample_rate_hz": None,
             "hw_demod": True,
             "reset_phase_every_shot": True,
             "frequency_hz": acquisition.frequency_hz,
             "duration_s": None,
-            "requested_sample_count": acquisition.sample_count,
+            "requested_sample_count": requested_acquisition.sample_count,
         },
     }
 
@@ -5036,12 +5720,13 @@ def _execute_qcs_mixed_sweep(
             "sweep_array_value_count": sweep_array_value_count,
             "repetitions_per_sweep": int(repetitions_per_sweep),
             "program_count": len(programs),
-            "executor_call_count": len(raw_results),
+            "executor_call_count": measurement_executor_call_count,
             "safety_reset_executor_call_count": (
                 safety_reset_executor_call_count
             ),
             "total_executor_call_count": (
-                len(raw_results) + safety_reset_executor_call_count
+                measurement_executor_call_count
+                + safety_reset_executor_call_count
             ),
             "fabric_mhz": float(fabric_mhz),
             "source_full_scale_mv": float(source_full_scale_mv),
@@ -5068,8 +5753,23 @@ def _execute_qcs_mixed_sweep(
             "hw_demod": True,
             "reset_phase_every_shot": True,
             "sample_rate_hz": effective_sample_rate_hz,
-            "acquisition_duration_s": effective_acquisition_duration_s,
-            "requested_sample_count": acquisition.sample_count,
+            "acquisition_duration_s": (
+                averaging_plan.quantized_total_duration_s
+            ),
+            "requested_sample_count": requested_acquisition.sample_count,
+            "requested_total_integration_duration_s": (
+                averaging_plan.requested_total_duration_s
+            ),
+            "quantized_total_integration_duration_s": (
+                averaging_plan.quantized_total_duration_s
+            ),
+            "iq_averaging_pass_count": averaging_plan.pass_count,
+            "completed_iq_averaging_passes": (
+                completed_iterations * averaging_plan.pass_count
+            ),
+            "per_pass_integration_duration_s": (
+                effective_acquisition_duration_s
+            ),
             "iq_shape": (
                 [] if full_iq is None else list(full_iq.shape)
             ),
@@ -5226,24 +5926,46 @@ def _execute_qcs_mixed_sweep(
                 cancellation.raise_if_requested(
                     "mixed QCS hardware-sweep execution"
                 )
-            executor_started_s = monotonic()
-            raw_result = _executor_execute(executor, compiled.program)
-            mixed_executor_wall_s += monotonic() - executor_started_s
-            # Once execute() returns normally, its complete native block is
-            # valid even if Stop raced with that return. Normalize, scatter,
-            # and publish it before honoring cancellation at the software-
-            # loop boundary. An actual active abort raises from execute() and
-            # therefore never reaches this completed-block path.
-            values = extract_qcs_acquisition(
-                raw_result,
-                compiled.acquisition_channels,
-                prefer_trace=False,
-            )
-            block_iq = normalize_qcs_hardware_sweep_iq(
-                values,
-                repetitions_per_point=repetitions_per_sweep,
-                sweep_shape=compiled.sweep_shape,
-                hardware_sweep=True,
+            block_weighted_sum = None
+            raw_result = None
+            for pass_index, pass_samples in enumerate(
+                averaging_plan.pass_sample_counts
+            ):
+                if cancellation is not None:
+                    cancellation.raise_if_requested(
+                        "mixed QCS integrated-I/Q averaging pass"
+                    )
+                executor_started_s = monotonic()
+                raw_result = _executor_execute(executor, compiled.program)
+                mixed_executor_wall_s += monotonic() - executor_started_s
+                measurement_executor_call_count += 1
+                pass_iq = _extract_qcs_segmented_hardware_sweep_iq(
+                    raw_result,
+                    acquisition_channels=compiled.acquisition_channels,
+                    segment_sample_counts=(
+                        compiled.integration_segment_sample_counts
+                        or (int(compiled.acquisition_sample_count or 1),)
+                    ),
+                    repetitions_per_point=repetitions_per_sweep,
+                    sweep_shape=compiled.sweep_shape,
+                    hardware_sweep=True,
+                )
+                weighted = np.asarray(pass_iq) * float(pass_samples)
+                if block_weighted_sum is None:
+                    block_weighted_sum = weighted
+                else:
+                    block_weighted_sum += weighted
+                if (
+                    cancellation is not None
+                    and pass_index + 1 < averaging_plan.pass_count
+                ):
+                    cancellation.raise_if_requested(
+                        "mixed QCS integrated-I/Q averaging boundary"
+                    )
+            if block_weighted_sum is None or raw_result is None:
+                raise RuntimeError("mixed QCS averaging completed no passes")
+            block_iq = block_weighted_sum / float(
+                sum(averaging_plan.pass_sample_counts)
             )
             if block_iq.shape[0] != global_indices.size:
                 raise ValueError(
@@ -5709,7 +6431,13 @@ def normalize_qcs_hardware_sweep_iq(
     point_count = int(np.prod(shape))
     flattened_repetition_first = (repetitions, point_count)
     flattened_repetition_last = (point_count, repetitions)
-    if array.shape == repetition_first and (
+    if array.ndim == 0 and expected_count == 1:
+        # The real QCS Results API removes every singleton axis for a
+        # one-point, one-shot acquisition and returns a scalar.  Restore the
+        # Program repetition shape before applying the common point/shot
+        # normalization.
+        grid = array.reshape(repetition_first)
+    elif array.shape == repetition_first and (
         hardware_sweep or repetition_first != repetition_last
     ):
         grid = array
@@ -6431,6 +7159,148 @@ def _extract_qcs_sparameter_iq(
     )
 
 
+def _extract_qcs_segmented_hardware_sweep_iq(
+    raw_result: Any,
+    *,
+    acquisition_channels: Any,
+    segment_sample_counts: Sequence[int],
+    repetitions_per_point: int,
+    sweep_shape: Sequence[int],
+    hardware_sweep: bool = True,
+) -> np.ndarray:
+    """Decode repeated IntegrationFilters and return one weighted I/Q value.
+
+    The real QCS Results API exposes each acquisition by ``acq_index``.  The
+    injected-array branch is deliberately explicit so tests do not imply an
+    undocumented production acquisition-axis order.
+    """
+
+    segment_samples = tuple(int(value) for value in segment_sample_counts)
+    if not segment_samples:
+        segment_samples = (1,)
+    if len(segment_samples) == 1:
+        values = extract_qcs_acquisition(raw_result, acquisition_channels)
+        return normalize_qcs_hardware_sweep_iq(
+            values,
+            repetitions_per_point=repetitions_per_point,
+            sweep_shape=sweep_shape,
+            hardware_sweep=hardware_sweep,
+        )
+
+    results = getattr(raw_result, "results", None)
+    get_iq = None if results is None else getattr(results, "get_iq", None)
+    if callable(get_iq):
+        normalized_segments = []
+        for segment_index in range(len(segment_samples)):
+            values = _first_result_value(
+                get_iq(
+                    acquisition_channels,
+                    avg=False,
+                    acq_index=segment_index,
+                ),
+                acquisition_channels,
+            )
+            normalized_segments.append(
+                normalize_qcs_hardware_sweep_iq(
+                    values,
+                    repetitions_per_point=repetitions_per_point,
+                    sweep_shape=sweep_shape,
+                    hardware_sweep=hardware_sweep,
+                )
+            )
+        segmented_iq = np.stack(normalized_segments, axis=0)
+        weights = np.asarray(segment_samples, dtype=np.float64)
+        weights /= float(np.sum(weights))
+        return np.sum(
+            segmented_iq
+            * weights[:, np.newaxis, np.newaxis, np.newaxis, np.newaxis],
+            axis=0,
+        )
+
+    try:
+        values = raw_result[acquisition_channels]
+    except (IndexError, KeyError, TypeError):
+        values = raw_result
+    array = _qcs_sparameter_complex_values(values)
+    repetitions = int(repetitions_per_point)
+    shape = tuple(int(value) for value in sweep_shape)
+    point_count = int(np.prod(shape))
+    segment_count = len(segment_samples)
+    weights = np.asarray(segment_samples, dtype=np.float64)
+    weights /= float(np.sum(weights))
+    point_major_shape = (point_count, repetitions, segment_count)
+    repetition_major_shape = (repetitions, *shape, segment_count)
+    flattened_repetition_major_shape = (
+        repetitions,
+        point_count,
+        segment_count,
+    )
+    if array.shape == point_major_shape:
+        averaged = np.sum(
+            array * weights[np.newaxis, np.newaxis, :],
+            axis=-1,
+        )
+        return normalize_qcs_hardware_sweep_iq(
+            averaged,
+            repetitions_per_point=repetitions,
+            sweep_shape=shape,
+            hardware_sweep=hardware_sweep,
+        )
+    if array.shape in (
+        repetition_major_shape,
+        flattened_repetition_major_shape,
+    ):
+        averaged = np.sum(
+            array * weights.reshape((1,) * (array.ndim - 1) + (-1,)),
+            axis=-1,
+        )
+        return normalize_qcs_hardware_sweep_iq(
+            averaged,
+            repetitions_per_point=repetitions,
+            sweep_shape=shape,
+            hardware_sweep=hardware_sweep,
+        )
+    raise ValueError(
+        "Injected QCS segmented Stability I/Q must have shape "
+        f"{point_major_shape}, {repetition_major_shape}, or "
+        f"{flattened_repetition_major_shape}; received {array.shape}"
+    )
+
+
+def _extract_qcs_compiled_point_iq(
+    raw_result: Any,
+    compiled: QcsCompiledPoint,
+    *,
+    repetitions_per_sweep: int,
+    hardware_demodulation: bool,
+) -> np.ndarray:
+    """Decode one fixed point, including repeated integration filters."""
+
+    if not hardware_demodulation:
+        values = extract_qcs_acquisition(
+            raw_result,
+            compiled.acquisition_channels,
+            prefer_trace=True,
+        )
+        return normalize_qcs_iq(
+            values,
+            repetitions_per_sweep=repetitions_per_sweep,
+            real_is_i_trace=True,
+        )
+    segmented = _extract_qcs_segmented_hardware_sweep_iq(
+        raw_result,
+        acquisition_channels=compiled.acquisition_channels,
+        segment_sample_counts=(
+            compiled.integration_segment_sample_counts
+            or (int(compiled.acquisition_sample_count or 1),)
+        ),
+        repetitions_per_point=repetitions_per_sweep,
+        sweep_shape=(1,),
+        hardware_sweep=False,
+    )
+    return segmented[0]
+
+
 def execute_qcs_sparameter_sweep(
     *,
     connection_config: QcsConnectionConfig,
@@ -6443,18 +7313,26 @@ def execute_qcs_sparameter_sweep(
     calibrated_output: bool = False,
     output_power_calibration: Optional[Mapping[str, Any]] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    partial_callback: Optional[PartialResultCallback] = None,
     qcs_module=None,
     mapper=None,
     executor=None,
     compiled: Optional[QcsCompiledSParameterSweep] = None,
+    cancellation: Optional[QcsCancellationController] = None,
 ) -> QcsSParameterExecutionResult:
     """Execute one coherent QCS S-parameter sweep without persistence."""
 
     qcs = _import_qcs() if qcs_module is None else qcs_module
+    averaging_plan = plan_qcs_total_iq_averaging(integration_duration_s)
+    pass_sample_count = averaging_plan.pass_sample_counts[0]
+    pass_duration_s = pass_sample_count / averaging_plan.sample_rate_hz
     if progress_callback is not None:
         progress_callback(0, "Validating QCS RF S-parameter sweep")
     if mapper is None:
         mapper = load_qcs_channel_mapper(connection_config, qcs_module=qcs)
+    if cancellation is not None:
+        cancellation.bind(qcs, mapper)
+        cancellation.raise_if_requested("QCS RF S-parameter setup")
     if compiled is None:
         if progress_callback is not None:
             progress_callback(10, "Compiling one QCS frequency sweep Program")
@@ -6464,11 +7342,16 @@ def execute_qcs_sparameter_sweep(
             frequencies_hz=frequencies_hz,
             rf_gen_ch=rf_gen_ch,
             rf_amplitude=rf_amplitude,
-            integration_duration_s=integration_duration_s,
+            integration_duration_s=pass_duration_s,
             repetitions_per_point=repetitions_per_point,
             phase_rad=phase_rad,
             calibrated_output=calibrated_output,
             qcs_module=qcs,
+        )
+    elif int(compiled.integration_sample_count) != pass_sample_count:
+        raise ValueError(
+            "precompiled QCS S-parameter Program integration does not match "
+            "the planned per-pass duration"
         )
     if executor is None:
         executor = build_qcs_executor(
@@ -6482,8 +7365,85 @@ def execute_qcs_sparameter_sweep(
             "Executing one QCS-resolved frequency sweep for "
             f"{compiled.frequencies_hz.size:,} frequencies",
         )
-    raw_result = _executor_execute(executor, compiled.program)
-    iq = _extract_qcs_sparameter_iq(raw_result, compiled)
+    if cancellation is not None:
+        cancellation.tag_program(compiled.program)
+    iq_weighted_sum = None
+    completed_passes = 0
+    raw_result = None
+    latest_partial = None
+    try:
+        for pass_index, pass_samples in enumerate(
+            averaging_plan.pass_sample_counts
+        ):
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "QCS RF S-parameter averaging pass"
+                )
+            raw_result = _executor_execute(executor, compiled.program)
+            pass_iq = _extract_qcs_sparameter_iq(raw_result, compiled)
+            weighted = np.asarray(pass_iq) * float(
+                pass_samples
+            )
+            if iq_weighted_sum is None:
+                iq_weighted_sum = weighted
+            else:
+                iq_weighted_sum += weighted
+            completed_passes += 1
+            completed_samples = int(
+                sum(averaging_plan.pass_sample_counts[:completed_passes])
+            )
+            current_iq = iq_weighted_sum / float(completed_samples)
+            latest_partial = QcsSParameterExecutionResult(
+                frequencies_hz=compiled.frequencies_hz.copy(),
+                iq=current_iq.copy(),
+                program=compiled.program,
+                raw_result=raw_result,
+                program_summary={
+                    "backend": "qcs",
+                    "measurement": "rf_s_parameter",
+                    "partial": completed_passes < averaging_plan.pass_count,
+                    "iq_averaging_pass_count": averaging_plan.pass_count,
+                    "completed_iq_averaging_passes": completed_passes,
+                    "requested_total_integration_duration_s": (
+                        averaging_plan.requested_total_duration_s
+                    ),
+                    "effective_integration_duration_s": (
+                        completed_samples / averaging_plan.sample_rate_hz
+                    ),
+                    "iq_shape": list(current_iq.shape),
+                },
+                rf_settings={"backend": "qcs"},
+            )
+            if partial_callback is not None:
+                partial_callback(latest_partial)
+            if progress_callback is not None:
+                progress_callback(
+                    35 + int(35 * completed_passes / averaging_plan.pass_count),
+                    "QCS integrated-I/Q pass "
+                    f"{completed_passes:,}/{averaging_plan.pass_count:,} acquired",
+                )
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "QCS RF S-parameter averaging boundary"
+                )
+    except BaseException as execution_error:
+        if cancellation is not None and cancellation.is_stop_requested():
+            raise QcsExperimentCancelled(
+                "QCS RF S-parameter sweep stopped by user; completed "
+                "averaging passes remain available",
+                partial_result=latest_partial,
+            ) from execution_error
+        raise
+    if iq_weighted_sum is None or raw_result is None:
+        raise RuntimeError("QCS S-parameter averaging completed no passes")
+    iq = iq_weighted_sum / float(
+        sum(averaging_plan.pass_sample_counts[:completed_passes])
+    )
+    if cancellation is not None and not cancellation.close_stop_window():
+        raise QcsExperimentCancelled(
+            "QCS RF S-parameter sweep stopped after a completed averaging pass",
+            partial_result=latest_partial,
+        )
     if progress_callback is not None:
         progress_callback(70, "QCS integrated I/Q frequency sweep acquired")
     summary = {
@@ -6495,7 +7455,7 @@ def execute_qcs_sparameter_sweep(
         "hardware_sweep_shape": [int(compiled.frequencies_hz.size)],
         "hardware_sweep_points": int(compiled.frequencies_hz.size),
         "program_count": 1,
-        "executor_call_count": 1,
+        "executor_call_count": completed_passes,
         "repetitions_per_point": int(compiled.repetitions_per_point),
         "frequency_scalar_shared_with_integration_filter": True,
         "rf_amplitude_frequency_dependent": bool(
@@ -6507,16 +7467,24 @@ def execute_qcs_sparameter_sweep(
             "inside hardware time"
         ),
         "requested_integration_duration_s": (
-            compiled.requested_integration_duration_s
+            averaging_plan.requested_total_duration_s
         ),
         "quantized_requested_integration_duration_s": (
-            compiled.quantized_requested_integration_duration_s
+            averaging_plan.quantized_total_duration_s
         ),
         "quantized_requested_integration_sample_count": (
-            compiled.quantized_requested_integration_sample_count
+            averaging_plan.quantized_total_sample_count
         ),
-        "integration_duration_s": compiled.integration_duration_s,
-        "integration_sample_count": compiled.integration_sample_count,
+        "integration_duration_s": averaging_plan.quantized_total_duration_s,
+        "integration_sample_count": averaging_plan.quantized_total_sample_count,
+        "iq_averaging_pass_count": averaging_plan.pass_count,
+        "completed_iq_averaging_passes": completed_passes,
+        "per_pass_integration_duration_s": compiled.integration_duration_s,
+        "per_pass_integration_sample_count": compiled.integration_sample_count,
+        "effective_integration_duration_s": (
+            sum(averaging_plan.pass_sample_counts[:completed_passes])
+            / averaging_plan.sample_rate_hz
+        ),
         "integration_segment_sample_counts": list(
             compiled.integration_segment_sample_counts
         ),
@@ -6565,16 +7533,20 @@ def execute_qcs_sparameter_sweep(
             "virtual_channel": connection_config.acquisition_channel_name,
             "hw_demod": True,
             "requested_integration_duration_s": (
-                compiled.requested_integration_duration_s
+                averaging_plan.requested_total_duration_s
             ),
             "quantized_requested_integration_duration_s": (
-                compiled.quantized_requested_integration_duration_s
+                averaging_plan.quantized_total_duration_s
             ),
             "quantized_requested_integration_sample_count": (
-                compiled.quantized_requested_integration_sample_count
+                averaging_plan.quantized_total_sample_count
             ),
-            "integration_duration_s": compiled.integration_duration_s,
-            "integration_sample_count": compiled.integration_sample_count,
+            "integration_duration_s": averaging_plan.quantized_total_duration_s,
+            "integration_sample_count": averaging_plan.quantized_total_sample_count,
+            "iq_averaging_pass_count": averaging_plan.pass_count,
+            "completed_iq_averaging_passes": completed_passes,
+            "per_pass_integration_duration_s": compiled.integration_duration_s,
+            "per_pass_integration_sample_count": compiled.integration_sample_count,
             "integration_segment_sample_counts": list(
                 compiled.integration_segment_sample_counts
             ),
@@ -6613,9 +7585,11 @@ def run_qcs_sparameter_sweep(
     rf_amplitude: float | Sequence[float],
     repetitions_per_point: int = 1,
     progress_callback: Optional[ProgressCallback] = None,
+    partial_callback: Optional[PartialResultCallback] = None,
     qcs_module=None,
     mapper=None,
     executor=None,
+    cancellation: Optional[QcsCancellationController] = None,
 ) -> Any:
     """Execute and store a QCS sweep using the existing S-parameter schema."""
 
@@ -6660,7 +7634,7 @@ def run_qcs_sparameter_sweep(
             )
         (
             output_identity,
-            input_identity,
+            _input_identity,
             expected_lo_frequency_hz,
         ) = resolve_m5300_m5200_identities(
             mapper,
@@ -6695,8 +7669,8 @@ def run_qcs_sparameter_sweep(
             getattr(sweep_config, "calibration_database_path"),
             run_id=requested_run_id,
             expected_output=output_identity,
-            expected_input=input_identity,
-            expected_mapper_sha256=connection_config.mapper_sha256,
+            expected_input=None,
+            expected_mapper_sha256=None,
             expected_lo_frequency_hz=expected_lo_frequency_hz,
             required_frequencies_hz=requested_hz,
             termination_ohm=50.0,
@@ -6735,9 +7709,11 @@ def run_qcs_sparameter_sweep(
         calibrated_output=calibration_enabled,
         output_power_calibration=output_power_calibration,
         progress_callback=progress_callback,
+        partial_callback=partial_callback,
         qcs_module=(qcs if calibration_enabled else qcs_module),
         mapper=mapper,
         executor=executor,
+        cancellation=cancellation,
     )
     try:
         from .qick_sparameter_sweep import (
@@ -6872,16 +7848,6 @@ def compile_qcs_stability_hardware_sweep(
             f"array{'s' if arrays_per_dc_output != 1 else ''}, allowing at "
             f"most {max_grid_points:,} points"
         )
-    result_value_count = point_count * repetitions
-    if result_value_count > MAX_QCS_STABILITY_RESULT_VALUES:
-        raise QcsUnsupportedFeatureError(
-            "QCS Stability would return "
-            f"{result_value_count:,} hardware-demodulated IQ values; the "
-            f"safe application limit is "
-            f"{MAX_QCS_STABILITY_RESULT_VALUES:,}. Reduce points or "
-            "repetitions."
-        )
-
     if len(connection_config.dc_channel_names) != int(sequence.n_outputs):
         raise ValueError(
             "QCS DC channel count must match the Stability output count"
@@ -6902,6 +7868,7 @@ def compile_qcs_stability_hardware_sweep(
             require_relative_phase=True,
         )
         dc_channels.append(channel)
+    rf_channels_by_gen_ch = {}
     for pulse in rf_pulses:
         if pulse.gen_ch not in connection_config.rf_channel_names:
             raise KeyError(
@@ -6918,6 +7885,7 @@ def compile_qcs_stability_hardware_sweep(
             role="RF",
             expected_instruments=("M5300AWG", "M5301AWG"),
         )
+        rf_channels_by_gen_ch[int(pulse.gen_ch)] = rf_channel
     acquisition_channels = _resolve_mapper_channel(
         mapper, connection_config.acquisition_channel_name
     )
@@ -6937,36 +7905,29 @@ def compile_qcs_stability_hardware_sweep(
         acquisition,
         hardware_demodulation=True,
     )
-    (
-        quantized_acquisition_duration_s,
-        quantized_acquisition_sample_count,
-    ) = quantize_qcs_stability_integration_duration(
-        acquisition_duration_s
-    )
+    if not np.isclose(
+        acquisition_sample_rate_hz,
+        QCS_M5200_SAMPLE_RATE_HZ,
+        rtol=0.0,
+        atol=1.0,
+    ):
+        raise QcsUnsupportedFeatureError(
+            "QCS Stability acquisition requires the M5200 "
+            f"{QCS_M5200_SAMPLE_RATE_HZ:g} S/s rate; mapper reports "
+            f"{acquisition_sample_rate_hz:g} S/s"
+        )
     resolved_acquisition_sample_count = int(
         round(acquisition_duration_s * acquisition_sample_rate_hz)
     )
     if (
-        resolved_acquisition_sample_count
-        > QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES
-    ):
-        raise QcsUnsupportedFeatureError(
-            "QCS Stability integration uses one M5200 IntegrationFilter "
-            f"and supports at most "
-            f"{QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:,} samples "
-            f"({QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6:.9g} "
-            "us) on the connected QCS 2.5.5 hardware; got "
-            f"{resolved_acquisition_sample_count:,} samples"
-        )
-    if (
         not np.isclose(
             acquisition_duration_s,
-            quantized_acquisition_duration_s,
+            resolved_acquisition_sample_count / acquisition_sample_rate_hz,
             rtol=0.0,
             atol=1.0e-15,
         )
         or resolved_acquisition_sample_count
-        != quantized_acquisition_sample_count
+        % QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES
     ):
         raise ValueError(
             "QCS Stability integration time must be a multiple of "
@@ -6976,9 +7937,45 @@ def compile_qcs_stability_hardware_sweep(
             f"{acquisition_duration_s * 1.0e9:.12g} ns "
             f"({resolved_acquisition_sample_count} samples)"
         )
-    # Rebuild from the exact synchronized quantum so decimal GUI residue does
-    # not reach the HCL backend.
-    acquisition_duration_s = quantized_acquisition_duration_s
+    integration_segment_sample_counts = (
+        qcs_stability_integration_segment_sample_counts(
+            resolved_acquisition_sample_count
+        )
+    )
+    acquisition_sample_count = int(sum(integration_segment_sample_counts))
+    acquisition_duration_s = (
+        acquisition_sample_count / acquisition_sample_rate_hz
+    )
+    segment_count = len(integration_segment_sample_counts)
+    total_inter_segment_dead_time_s = (
+        max(0, segment_count - 1)
+        * QCS_STABILITY_INTER_SEGMENT_DELAY_S
+    )
+    acquisition_elapsed_duration_s = (
+        acquisition_duration_s + total_inter_segment_dead_time_s
+    )
+    result_value_count = point_count * repetitions * segment_count
+    if result_value_count > MAX_QCS_STABILITY_RESULT_VALUES:
+        raise QcsUnsupportedFeatureError(
+            "QCS Stability would return "
+            f"{result_value_count:,} segmented hardware-demodulated IQ "
+            f"values ({point_count:,} points x {repetitions} repetitions x "
+            f"{segment_count} integrations); the safe application limit is "
+            f"{MAX_QCS_STABILITY_RESULT_VALUES:,}. Reduce points, "
+            "repetitions, or integration time."
+        )
+    if segment_count > 1:
+        if acquisition.integration_filter is not None:
+            raise QcsUnsupportedFeatureError(
+                "Segmented QCS Stability integration requires the built-in "
+                "flat IntegrationFilter; a custom integration filter cannot "
+                "be divided safely"
+            )
+        if acquisition.envelope != "constant":
+            raise QcsUnsupportedFeatureError(
+                "Segmented QCS Stability integration requires a flat "
+                "constant acquisition envelope"
+            )
 
     segments = tuple(sequence.segments)
     if (
@@ -7016,6 +8013,9 @@ def compile_qcs_stability_hardware_sweep(
         fabric_hz=fabric_hz,
         label="QCS Stability acquisition duration",
         positive=True,
+    )
+    acquisition_elapsed_duration_s = (
+        acquisition_duration_s + total_inter_segment_dead_time_s
     )
     acquisition_pre_delay_s = _fabric_aligned_seconds(
         acquisition.pre_delay_s,
@@ -7245,6 +8245,43 @@ def compile_qcs_stability_hardware_sweep(
             label=f"QCS RF gen_ch {pulse.gen_ch} duration",
             positive=True,
         )
+        if segment_count > 1:
+            if pulse.envelope != "constant":
+                raise QcsUnsupportedFeatureError(
+                    "Segmented QCS Stability integration requires a flat "
+                    f"constant RF envelope on gen_ch {pulse.gen_ch}"
+                )
+            if not np.isclose(
+                pulse_delay_s,
+                acquisition_pre_delay_s,
+                rtol=0.0,
+                atol=1.0e-15,
+            ) or not np.isclose(
+                pulse_duration_s,
+                acquisition_duration_s,
+                rtol=0.0,
+                atol=1.0e-15,
+            ):
+                raise QcsUnsupportedFeatureError(
+                    "Segmented QCS Stability requires each RF output to "
+                    "start with the acquisition and cover its complete "
+                    "integrated duration"
+                )
+            rf_channel = rf_channels_by_gen_ch[int(pulse.gen_ch)]
+            rf_absolute_phase = bool(
+                getattr(rf_channel, "absolute_phase", False)
+            )
+            acquisition_absolute_phase = bool(
+                getattr(acquisition_channels, "absolute_phase", False)
+            )
+            if rf_absolute_phase != acquisition_absolute_phase:
+                raise QcsUnsupportedFeatureError(
+                    "Segmented QCS Stability integration requires the "
+                    "mapped M5300 RF output and M5200 acquisition virtual "
+                    "channels to use matching absolute_phase settings; got "
+                    f"RF={rf_absolute_phase} and acquisition="
+                    f"{acquisition_absolute_phase}"
+                )
         programmed_rf_pulses.append(
             {
                 "gen_ch": pulse.gen_ch,
@@ -7252,28 +8289,66 @@ def compile_qcs_stability_hardware_sweep(
                 "frequency_hz": pulse.frequency_hz,
                 "duration_s": pulse_duration_s,
                 "delay_s": pulse_delay_s,
+                "elapsed_duration_s": (
+                    acquisition_elapsed_duration_s
+                    if segment_count > 1
+                    else pulse_duration_s
+                ),
+                "segment_count": segment_count,
             }
         )
-        if pulse_delay_s + pulse_duration_s > duration_s + 1e-15:
+        pulse_elapsed_duration_s = (
+            acquisition_elapsed_duration_s
+            if segment_count > 1
+            else pulse_duration_s
+        )
+        if pulse_delay_s + pulse_elapsed_duration_s > duration_s + 1e-15:
             raise ValueError(
                 f"QCS RF pulse on gen_ch {pulse.gen_ch} exceeds the "
                 "Stability hold"
             )
-        program.add_waveform(
-            qcs.RFWaveform(
-                duration=pulse_duration_s,
-                envelope=_qcs_envelope(qcs, pulse.envelope),
-                amplitude=pulse.amplitude,
-                rf_frequency=pulse.frequency_hz,
-                instantaneous_phase=pulse.phase_rad,
-                name=f"stability_rf_{pulse.gen_ch}",
-            ),
-            _resolve_mapper_channel(
-                mapper, connection_config.rf_channel_names[pulse.gen_ch]
-            ),
-            new_layer=False,
-            pre_delay=pulse_delay_s,
-        )
+        if segment_count == 1:
+            program.add_waveform(
+                qcs.RFWaveform(
+                    duration=pulse_duration_s,
+                    envelope=_qcs_envelope(qcs, pulse.envelope),
+                    amplitude=pulse.amplitude,
+                    rf_frequency=pulse.frequency_hz,
+                    instantaneous_phase=pulse.phase_rad,
+                    name=f"stability_rf_{pulse.gen_ch}",
+                ),
+                rf_channels_by_gen_ch[int(pulse.gen_ch)],
+                new_layer=False,
+                pre_delay=pulse_delay_s,
+            )
+        else:
+            last_segment_index = segment_count - 1
+            for segment_index, segment_samples in enumerate(
+                integration_segment_sample_counts
+            ):
+                output_duration_s = (
+                    segment_samples / acquisition_sample_rate_hz
+                )
+                if segment_index != last_segment_index:
+                    output_duration_s += QCS_STABILITY_INTER_SEGMENT_DELAY_S
+                waveform_options = {"new_layer": False}
+                if segment_index == 0:
+                    waveform_options["pre_delay"] = pulse_delay_s
+                program.add_waveform(
+                    qcs.RFWaveform(
+                        duration=output_duration_s,
+                        envelope=qcs.ConstantEnvelope(),
+                        amplitude=pulse.amplitude,
+                        rf_frequency=pulse.frequency_hz,
+                        instantaneous_phase=pulse.phase_rad,
+                        name=(
+                            f"stability_rf_{pulse.gen_ch}_segment_"
+                            f"{segment_index}"
+                        ),
+                    ),
+                    rf_channels_by_gen_ch[int(pulse.gen_ch)],
+                    **waveform_options,
+                )
 
     if acquisition.at_segment != segment_name:
         raise KeyError(
@@ -7281,26 +8356,61 @@ def compile_qcs_stability_hardware_sweep(
             f"{acquisition.at_segment!r}"
         )
     if (
-        acquisition_pre_delay_s + acquisition_duration_s
+        acquisition_pre_delay_s + acquisition_elapsed_duration_s
         > duration_s + 1e-15
     ):
         raise ValueError("QCS acquisition exceeds the Stability hold")
-    integration_filter = acquisition.integration_filter
-    if integration_filter is None:
-        integration_filter = qcs.RFWaveform(
-            duration=acquisition_duration_s,
-            envelope=_qcs_envelope(qcs, acquisition.envelope),
-            amplitude=1.0,
-            rf_frequency=acquisition.frequency_hz,
-            instantaneous_phase=acquisition.phase_rad,
-            name="stability_acquisition_filter",
+    if segment_count == 1:
+        integration_filter = acquisition.integration_filter
+        if integration_filter is None:
+            integration_filter = qcs.RFWaveform(
+                duration=acquisition_duration_s,
+                envelope=_qcs_envelope(qcs, acquisition.envelope),
+                amplitude=1.0,
+                rf_frequency=acquisition.frequency_hz,
+                instantaneous_phase=acquisition.phase_rad,
+                name="stability_acquisition_filter",
+            )
+        program.add_acquisition(
+            integration_filter=integration_filter,
+            channels=acquisition_channels,
+            new_layer=False,
+            pre_delay=acquisition_pre_delay_s,
         )
-    program.add_acquisition(
-        integration_filter=integration_filter,
-        channels=acquisition_channels,
-        new_layer=False,
-        pre_delay=acquisition_pre_delay_s,
-    )
+    else:
+        integration_filter_cache = {}
+        for segment_index, segment_samples in enumerate(
+            integration_segment_sample_counts
+        ):
+            integration_filter = integration_filter_cache.get(segment_samples)
+            if integration_filter is None:
+                segment_duration_s = (
+                    segment_samples / acquisition_sample_rate_hz
+                )
+                filter_waveform = qcs.RFWaveform(
+                    duration=segment_duration_s,
+                    envelope=qcs.ConstantEnvelope(),
+                    amplitude=1.0,
+                    rf_frequency=acquisition.frequency_hz,
+                    instantaneous_phase=acquisition.phase_rad,
+                    name=(
+                        "stability_acquisition_filter_"
+                        f"{segment_samples}_samples"
+                    ),
+                )
+                integration_filter = qcs.IntegrationFilter(filter_waveform)
+                integration_filter_cache[segment_samples] = integration_filter
+            acquisition_options = {"new_layer": False}
+            acquisition_options["pre_delay"] = (
+                acquisition_pre_delay_s
+                if segment_index == 0
+                else QCS_STABILITY_INTER_SEGMENT_DELAY_S
+            )
+            program.add_acquisition(
+                integration_filter=integration_filter,
+                channels=acquisition_channels,
+                **acquisition_options,
+            )
 
     if compensation_amplitudes is not None:
         for output_index, output_name in enumerate(output_names):
@@ -7359,6 +8469,12 @@ def compile_qcs_stability_hardware_sweep(
         ),
         programmed_rf_pulses=tuple(programmed_rf_pulses),
         acquisition_pre_delay_s=acquisition_pre_delay_s,
+        acquisition_sample_count=acquisition_sample_count,
+        integration_segment_sample_counts=tuple(
+            integration_segment_sample_counts
+        ),
+        inter_segment_delay_s=QCS_STABILITY_INTER_SEGMENT_DELAY_S,
+        acquisition_elapsed_duration_s=acquisition_elapsed_duration_s,
     )
 
 
@@ -7372,13 +8488,35 @@ def execute_qcs_stability_hardware_sweep(
     rf_pulses: Sequence[QcsRfPulseConfig] = (),
     acquisition: Optional[QcsAcquisitionConfig] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    partial_callback: Optional[PartialResultCallback] = None,
     qcs_module=None,
     mapper=None,
     executor=None,
     compiled: Optional[QcsCompiledHardwareSweep] = None,
+    cancellation: Optional[QcsCancellationController] = None,
 ) -> QcsExecutionResult:
-    """Execute one complete two-axis Stability scan with one HCL call."""
+    """Execute a Stability scan, averaging repeated bounded HCL passes."""
     qcs = _import_qcs() if qcs_module is None else qcs_module
+    if acquisition is None:
+        raise ValueError("QCS Stability hardware sweep requires an acquisition")
+    requested_total_duration_s = acquisition.duration_s
+    if acquisition.sample_count is not None:
+        requested_total_duration_s = (
+            acquisition.sample_count / QCS_M5200_SAMPLE_RATE_HZ
+        )
+    averaging_plan = plan_qcs_total_iq_averaging(
+        requested_total_duration_s,
+        sample_rate_hz=QCS_M5200_SAMPLE_RATE_HZ,
+        block_samples=QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES,
+        max_pass_samples=QCS_STABILITY_MAX_INTEGRATION_SAMPLES,
+    )
+    pass_sample_count = averaging_plan.pass_sample_counts[0]
+    pass_acquisition = replace(
+        acquisition,
+        duration_s=pass_sample_count / averaging_plan.sample_rate_hz,
+        sample_count=pass_sample_count,
+        sample_rate_hz=averaging_plan.sample_rate_hz,
+    )
     if progress_callback is not None:
         progress_callback(0, "Validating QCS hardware sweep")
     if not connection_config.hw_demod:
@@ -7390,6 +8528,9 @@ def execute_qcs_stability_hardware_sweep(
             connection_config,
             qcs_module=qcs,
         )
+    if cancellation is not None:
+        cancellation.bind(qcs, mapper)
+        cancellation.raise_if_requested("QCS Stability setup")
     if compiled is None:
         if progress_callback is not None:
             progress_callback(
@@ -7404,8 +8545,13 @@ def execute_qcs_stability_hardware_sweep(
             fabric_mhz=fabric_mhz,
             source_full_scale_mv=source_full_scale_mv,
             rf_pulses=rf_pulses,
-            acquisition=acquisition,
+            acquisition=pass_acquisition,
             qcs_module=qcs,
+        )
+    elif int(compiled.acquisition_sample_count or 0) != pass_sample_count:
+        raise ValueError(
+            "precompiled QCS Stability Program integration does not match "
+            "the planned per-pass duration"
         )
     if executor is None:
         executor = build_qcs_executor(
@@ -7422,17 +8568,129 @@ def execute_qcs_stability_hardware_sweep(
                 f"{compiled.sweep_shape[0]} x "
                 f"{compiled.sweep_shape[1]} points"
             ),
+    )
+    if cancellation is not None:
+        cancellation.tag_program(compiled.program)
+    iq_weighted_sum = None
+    completed_passes = 0
+    raw_result = None
+    latest_partial = None
+
+    def stability_partial(current_iq: np.ndarray) -> QcsExecutionResult:
+        completed_samples = int(
+            sum(averaging_plan.pass_sample_counts[:completed_passes])
         )
-    raw_result = _executor_execute(executor, compiled.program)
-    values = extract_qcs_acquisition(
-        raw_result,
-        compiled.acquisition_channels,
+        partial_ddr = FineTuneDdrResult(
+            sweep_points=np.asarray(sequence.sweep_points),
+            iq=np.asarray(current_iq).copy(),
+            sweep_axes=tuple(sequence.sweep_axes),
+            sweep_shape=tuple(sequence.sweep_shape),
+            cross_capacitance=np.asarray(sequence.cross_capacitance).copy(),
+            sample_rate_hz=compiled.acquisition_sample_rate_hz,
+            fir_rate_profile="qcs_hardware_demod",
+        )
+        partial_summary = {
+            "backend": "qcs",
+            "measurement": "stability_diagram",
+            "hardware_sweep": True,
+            "partial": completed_passes < averaging_plan.pass_count,
+            "completed_points": int(np.prod(compiled.sweep_shape)),
+            "planned_points": int(np.prod(compiled.sweep_shape)),
+            "iq_averaging_pass_count": averaging_plan.pass_count,
+            "completed_iq_averaging_passes": completed_passes,
+            "requested_total_integration_duration_s": (
+                averaging_plan.requested_total_duration_s
+            ),
+            "quantized_total_integration_duration_s": (
+                averaging_plan.quantized_total_duration_s
+            ),
+            "per_pass_integration_duration_s": (
+                compiled.acquisition_duration_s
+            ),
+            "effective_integration_duration_s": (
+                completed_samples / compiled.acquisition_sample_rate_hz
+            ),
+            "iq_shape": list(current_iq.shape),
+        }
+        return QcsExecutionResult(
+            ddr_result=partial_ddr,
+            programs=(compiled.program,),
+            raw_results=(() if raw_result is None else (raw_result,)),
+            program_summary=partial_summary,
+            rf_settings={
+                "backend": "qcs",
+                "readout_details": {
+                    "hw_demod": True,
+                    "effective_integration_duration_s": (
+                        completed_samples / compiled.acquisition_sample_rate_hz
+                    ),
+                },
+            },
+        )
+
+    try:
+        for pass_samples in averaging_plan.pass_sample_counts:
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "QCS Stability averaging pass"
+                )
+            raw_result = _executor_execute(executor, compiled.program)
+            pass_iq = _extract_qcs_segmented_hardware_sweep_iq(
+                raw_result,
+                acquisition_channels=compiled.acquisition_channels,
+                segment_sample_counts=(
+                    compiled.integration_segment_sample_counts
+                    or (int(compiled.acquisition_sample_count or 1),)
+                ),
+                repetitions_per_point=repetitions_per_point,
+                sweep_shape=compiled.sweep_shape,
+            )
+            weighted = np.asarray(pass_iq) * float(
+                pass_samples
+            )
+            if iq_weighted_sum is None:
+                iq_weighted_sum = weighted
+            else:
+                iq_weighted_sum += weighted
+            completed_passes += 1
+            completed_samples = int(
+                sum(averaging_plan.pass_sample_counts[:completed_passes])
+            )
+            iq = iq_weighted_sum / float(completed_samples)
+            latest_partial = stability_partial(iq)
+            if partial_callback is not None:
+                partial_callback(latest_partial)
+            if progress_callback is not None:
+                progress_callback(
+                    35 + int(65 * completed_passes / averaging_plan.pass_count),
+                    "QCS Stability averaging pass "
+                    f"{completed_passes:,}/{averaging_plan.pass_count:,} acquired",
+                )
+            if cancellation is not None:
+                cancellation.raise_if_requested(
+                    "QCS Stability averaging boundary"
+                )
+    except BaseException as execution_error:
+        if (
+            cancellation is not None
+            and cancellation.is_stop_requested()
+        ):
+            raise QcsExperimentCancelled(
+                "QCS Stability scan stopped by user; completed averaging "
+                "passes remain available",
+                partial_result=latest_partial,
+            ) from execution_error
+        raise
+    if iq_weighted_sum is None or raw_result is None:
+        raise RuntimeError("QCS Stability averaging completed no passes")
+    iq = iq_weighted_sum / float(
+        sum(averaging_plan.pass_sample_counts[:completed_passes])
     )
-    iq = normalize_qcs_hardware_sweep_iq(
-        values,
-        repetitions_per_point=repetitions_per_point,
-        sweep_shape=compiled.sweep_shape,
-    )
+    if cancellation is not None and not cancellation.close_stop_window():
+        raise QcsExperimentCancelled(
+            "QCS Stability scan stopped after its final averaging pass",
+            partial_result=latest_partial,
+        )
     ddr_result = FineTuneDdrResult(
         sweep_points=np.asarray(sequence.sweep_points),
         iq=iq,
@@ -7463,6 +8721,8 @@ def execute_qcs_stability_hardware_sweep(
         "hardware_sweep_points": point_count,
         "software_sweep_points": 0,
         "program_count": 1,
+        "executor_call_count": completed_passes,
+        "compiled_program_reused": completed_passes > 1,
         "repetitions_per_point": int(repetitions_per_point),
         "fabric_mhz": float(fabric_mhz),
         "source_full_scale_mv": float(source_full_scale_mv),
@@ -7479,7 +8739,47 @@ def execute_qcs_stability_hardware_sweep(
         "reset_phase_every_shot": True,
         "acquisition_result_type": "integrated_iq",
         "sample_rate_hz": compiled.acquisition_sample_rate_hz,
-        "acquisition_duration_s": compiled.acquisition_duration_s,
+        "acquisition_duration_s": averaging_plan.quantized_total_duration_s,
+        "integration_duration_s": averaging_plan.quantized_total_duration_s,
+        "integration_sample_count": averaging_plan.quantized_total_sample_count,
+        "requested_total_integration_duration_s": (
+            averaging_plan.requested_total_duration_s
+        ),
+        "quantized_total_integration_duration_s": (
+            averaging_plan.quantized_total_duration_s
+        ),
+        "quantized_total_integration_sample_count": (
+            averaging_plan.quantized_total_sample_count
+        ),
+        "iq_averaging_pass_count": averaging_plan.pass_count,
+        "completed_iq_averaging_passes": completed_passes,
+        "per_pass_integration_duration_s": compiled.acquisition_duration_s,
+        "per_pass_integration_sample_count": compiled.acquisition_sample_count,
+        "effective_integration_duration_s": (
+            sum(averaging_plan.pass_sample_counts[:completed_passes])
+            / compiled.acquisition_sample_rate_hz
+        ),
+        "integration_segment_sample_counts": list(
+            compiled.integration_segment_sample_counts
+        ),
+        "integration_segment_count": len(
+            compiled.integration_segment_sample_counts
+        ) or 1,
+        "inter_segment_delay_s": compiled.inter_segment_delay_s,
+        "total_inter_segment_dead_time_s": max(
+            0,
+            len(compiled.integration_segment_sample_counts) - 1,
+        ) * compiled.inter_segment_delay_s,
+        "acquisition_elapsed_duration_s": (
+            compiled.acquisition_elapsed_duration_s
+            if compiled.acquisition_elapsed_duration_s is not None
+            else compiled.acquisition_duration_s
+        ),
+        "hardware_demodulated_iq_reduction": (
+            "sample_count_weighted_complex_mean"
+            if len(compiled.integration_segment_sample_counts) > 1
+            else "single_integration_filter"
+        ),
         "acquisition_pre_delay_s": compiled.acquisition_pre_delay_s,
         "measurement_hold_duration_s": measurement_hold_duration_s,
         "point_program_duration_s": float(compiled.duration_s),
@@ -7487,9 +8787,7 @@ def execute_qcs_stability_hardware_sweep(
         "nominal_point_period_s": (
             float(compiled.duration_s) + inter_iteration_delay_s
         ),
-        "requested_sample_count": (
-            None if acquisition is None else acquisition.sample_count
-        ),
+        "requested_sample_count": acquisition.sample_count,
         "bias_t_compensation_applied": (
             compiled.bias_t_compensation_applied
         ),
@@ -7530,14 +8828,45 @@ def execute_qcs_stability_hardware_sweep(
             "frequency_hz": (
                 0.0 if acquisition is None else acquisition.frequency_hz
             ),
-            "duration_s": compiled.acquisition_duration_s,
+            "duration_s": averaging_plan.quantized_total_duration_s,
+            "integration_duration_s": averaging_plan.quantized_total_duration_s,
+            "integration_sample_count": averaging_plan.quantized_total_sample_count,
+            "requested_total_integration_duration_s": (
+                averaging_plan.requested_total_duration_s
+            ),
+            "quantized_total_integration_duration_s": (
+                averaging_plan.quantized_total_duration_s
+            ),
+            "iq_averaging_pass_count": averaging_plan.pass_count,
+            "completed_iq_averaging_passes": completed_passes,
+            "per_pass_integration_duration_s": compiled.acquisition_duration_s,
+            "per_pass_integration_sample_count": compiled.acquisition_sample_count,
+            "integration_segment_sample_counts": list(
+                compiled.integration_segment_sample_counts
+            ),
+            "integration_segment_count": len(
+                compiled.integration_segment_sample_counts
+            ) or 1,
+            "inter_segment_delay_s": compiled.inter_segment_delay_s,
+            "total_inter_segment_dead_time_s": max(
+                0,
+                len(compiled.integration_segment_sample_counts) - 1,
+            ) * compiled.inter_segment_delay_s,
+            "elapsed_duration_s": (
+                compiled.acquisition_elapsed_duration_s
+                if compiled.acquisition_elapsed_duration_s is not None
+                else compiled.acquisition_duration_s
+            ),
+            "hardware_demodulated_iq_reduction": (
+                "sample_count_weighted_complex_mean"
+                if len(compiled.integration_segment_sample_counts) > 1
+                else "single_integration_filter"
+            ),
             "pre_delay_s": compiled.acquisition_pre_delay_s,
             "measurement_hold_duration_s": measurement_hold_duration_s,
             "point_program_duration_s": float(compiled.duration_s),
             "inter_iteration_delay_s": inter_iteration_delay_s,
-            "requested_sample_count": (
-                None if acquisition is None else acquisition.sample_count
-            ),
+            "requested_sample_count": acquisition.sample_count,
             # "adc" denotes the GUI's uncalibrated numeric representation;
             # the QCS payload itself is integrated I/Q, not a raw ADC trace.
             "measurement_representation": "adc",
@@ -7592,6 +8921,7 @@ def execute_qcs_sequence(
     fixed_voltage_bias_t_sweep = (
         _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence)
     )
+    point_count = int(sequence.sweep_point_count)
     dc_offset_plan = (
         None
         if fixed_voltage_bias_t_sweep
@@ -7622,6 +8952,7 @@ def execute_qcs_sequence(
         and not fixed_voltage_bias_t_sweep
         and (
             not nonzero_dc_offset
+            or point_count <= 1
             or host_preview.mode == "hardware"
         )
     )
@@ -7696,6 +9027,66 @@ def execute_qcs_sequence(
     _resolve_mapper_channel(
         mapper, connection_config.acquisition_channel_name
     )
+    requested_acquisition = acquisition
+    iq_averaging_plan: Optional[QcsIqAveragingPlan] = None
+    if connection_config.hw_demod:
+        acquisition_channel = _resolve_mapper_channel(
+            mapper, connection_config.acquisition_channel_name
+        )
+        acquisition_rate_hz = _mapped_channel_sample_rate(
+            mapper, acquisition_channel
+        )
+        if acquisition_rate_hz is None:
+            acquisition_rate_hz = acquisition.sample_rate_hz
+        requested_total_duration_s = acquisition.duration_s
+        if acquisition.sample_count is not None:
+            requested_total_duration_s = (
+                acquisition.sample_count / acquisition_rate_hz
+            )
+        iq_averaging_plan = plan_qcs_total_iq_averaging(
+            requested_total_duration_s,
+            sample_rate_hz=acquisition_rate_hz,
+        )
+        if (
+            iq_averaging_plan.pass_count > 1
+            and acquisition.integration_filter is not None
+        ):
+            raise QcsUnsupportedFeatureError(
+                "multi-pass QCS I/Q averaging requires the built-in flat "
+                "filter; a custom filter cannot be repeated safely"
+            )
+        pass_sample_count = iq_averaging_plan.pass_sample_counts[0]
+        acquisition = replace(
+            acquisition,
+            duration_s=pass_sample_count / acquisition_rate_hz,
+            sample_count=pass_sample_count,
+            sample_rate_hz=acquisition_rate_hz,
+        )
+    rf_pulses = resolve_qcs_rf_power_calibrations(
+        connection_config=connection_config,
+        mapper=mapper,
+        rf_pulses=rf_pulses,
+    )
+    if dc_offset_plan is not None and not _mapper_supports_qcs_dc_offsets(
+        mapper,
+        channel_names=connection_config.dc_channel_names,
+        offset_volts=dc_offset_plan.offset_volts,
+    ):
+        fallback_offset_plan = _qcs_without_optional_dc_offsets(
+            dc_offset_plan
+        )
+        if _mapper_supports_qcs_dc_offsets(
+            mapper,
+            channel_names=connection_config.dc_channel_names,
+            offset_volts=fallback_offset_plan.offset_volts,
+        ):
+            if fallback_offset_plan.offset_volts != dc_offset_plan.offset_volts:
+                synchronized_capacity_prevalidated = False
+            dc_offset_plan = fallback_offset_plan
+            nonzero_dc_offset = any(
+                not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+                for value in dc_offset_plan.offset_volts
+            )
     if event_callback is not None:
         event_callback(
             "connection", "completed", "QCS ChannelMapper loaded"
@@ -7703,7 +9094,6 @@ def execute_qcs_sequence(
     if progress_callback is not None:
         progress_callback(8, "QCS ChannelMapper loaded")
 
-    point_count = int(sequence.sweep_point_count)
     full_sweep_preview = host_preview
     has_multiple_sweep_axes = len(tuple(sequence.sweep_axes)) >= 2
     has_native_candidate_axis = bool(
@@ -7787,6 +9177,8 @@ def execute_qcs_sequence(
             source_full_scale_mv=source_full_scale_mv,
             rf_pulses=rf_pulses,
             acquisition=acquisition,
+            iq_averaging_plan=iq_averaging_plan,
+            requested_acquisition=requested_acquisition,
             qcs_module=qcs,
             progress_callback=progress_callback,
             event_callback=event_callback,
@@ -7806,7 +9198,7 @@ def execute_qcs_sequence(
             "voltage sweep, so QCS uses fixed numeric point programs with a "
             "direct ramp-to-Hold compensation tail."
         )
-    if nonzero_dc_offset:
+    if nonzero_dc_offset and point_count > 1:
         assert host_preview is not None
         if host_preview.mode != "hardware":
             fixed_numeric_dc_ramp = True
@@ -7829,6 +9221,7 @@ def execute_qcs_sequence(
         )
     if (
         nonzero_dc_offset
+        and point_count > 1
         and not fixed_numeric_dc_ramp
         and any(
             bool(
@@ -7920,7 +9313,11 @@ def execute_qcs_sequence(
                 _capacity_prevalidated=synchronized_capacity_prevalidated,
                 _dc_offset_plan=dc_offset_plan,
             )
-        if nonzero_dc_offset and not compiled.hardware_sweep:
+        if (
+            nonzero_dc_offset
+            and point_count > 1
+            and not compiled.hardware_sweep
+        ):
             _set_qcs_dc_channel_offsets(
                 mapper,
                 channel_names=connection_config.dc_channel_names,
@@ -7973,7 +9370,11 @@ def execute_qcs_sequence(
     if cancellation is not None:
         cancellation.raise_if_requested("QCS executor setup")
 
-    def close_cancellation_window(*, dc_already_reset: bool = False) -> None:
+    def close_cancellation_window(
+        *,
+        dc_already_reset: bool = False,
+        partial_result: Optional[QcsExecutionResult] = None,
+    ) -> None:
         """Resolve the final Stop/result-processing race atomically."""
         if cancellation is None or cancellation.close_stop_window():
             return
@@ -7993,8 +9394,16 @@ def execute_qcs_sequence(
                 ) from reset_error
         raise QcsExperimentCancelled(
             "QCS experiment stopped by user after acquisition; DC outputs "
-            "were reset to zero"
+            "were reset to zero",
+            partial_result=partial_result,
         )
+
+    averaging_pass_counts = (
+        (1,)
+        if iq_averaging_plan is None
+        else iq_averaging_plan.pass_sample_counts
+    )
+    measurement_executor_call_count = 0
 
     if fixed_numeric_dc_ramp:
         if event_callback is not None:
@@ -8011,54 +9420,130 @@ def execute_qcs_sequence(
                     "QCS point(s)"
                 ),
             )
-        point_iq = []
-        raw_results_list = []
+        point_weighted_iq = [None] * point_count
+        raw_results_list = [None] * point_count
         executed_sample_rates = []
+        latest_partial_execution = None
         try:
-            for point_index, current in enumerate(compiled_points):
-                if cancellation is not None:
-                    cancellation.raise_if_requested(
-                        "fixed-numeric QCS point execution"
-                    )
-                    cancellation.tag_program(current.program)
-                    cancellation.raise_if_requested(
-                        "fixed-numeric QCS point execution"
-                    )
-                raw_result = _executor_execute(executor, current.program)
-                if cancellation is not None:
-                    cancellation.raise_if_requested(
-                        "fixed-numeric QCS point execution"
-                    )
-                raw_results_list.append(raw_result)
-                if not connection_config.hw_demod:
-                    executed_sample_rate = _executed_program_sample_rate(
+            total_calls = point_count * len(averaging_pass_counts)
+            completed_calls = 0
+            for pass_index, pass_samples in enumerate(averaging_pass_counts):
+                for point_index, current in enumerate(compiled_points):
+                    if cancellation is not None:
+                        cancellation.raise_if_requested(
+                            "fixed-numeric QCS point execution"
+                        )
+                        cancellation.tag_program(current.program)
+                        cancellation.raise_if_requested(
+                            "fixed-numeric QCS point execution"
+                        )
+                    raw_result = _executor_execute(executor, current.program)
+                    measurement_executor_call_count += 1
+                    if cancellation is not None:
+                        cancellation.raise_if_requested(
+                            "fixed-numeric QCS point execution"
+                        )
+                    raw_results_list[point_index] = raw_result
+                    if not connection_config.hw_demod:
+                        executed_sample_rate = _executed_program_sample_rate(
+                            raw_result,
+                            current.acquisition_channels,
+                        )
+                        if executed_sample_rate is not None:
+                            executed_sample_rates.append(executed_sample_rate)
+                    pass_iq = _extract_qcs_compiled_point_iq(
                         raw_result,
-                        current.acquisition_channels,
-                    )
-                    if executed_sample_rate is not None:
-                        executed_sample_rates.append(executed_sample_rate)
-                values = extract_qcs_acquisition(
-                    raw_result,
-                    current.acquisition_channels,
-                    prefer_trace=not connection_config.hw_demod,
-                )
-                point_iq.append(
-                    normalize_qcs_iq(
-                        values,
+                        current,
                         repetitions_per_sweep=repetitions_per_sweep,
-                        real_is_i_trace=not connection_config.hw_demod,
+                        hardware_demodulation=connection_config.hw_demod,
                     )
-                )
-                if progress_callback is not None:
-                    progress_callback(
-                        35 + int(35 * (point_index + 1) / point_count),
-                        (
-                            f"Acquired fixed numeric QCS point "
-                            f"{point_index + 1:,}/{point_count:,}"
+                    weighted = np.asarray(pass_iq) * float(
+                        pass_samples
+                    )
+                    if point_weighted_iq[point_index] is None:
+                        point_weighted_iq[point_index] = weighted
+                    else:
+                        point_weighted_iq[point_index] += weighted
+                    completed_calls += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            35 + int(35 * completed_calls / total_calls),
+                            "Acquired fixed numeric QCS execution "
+                            f"{completed_calls:,}/{total_calls:,}",
+                        )
+                if connection_config.hw_demod:
+                    completed_pass_count = pass_index + 1
+                    completed_samples = int(
+                        sum(
+                            averaging_pass_counts[:completed_pass_count]
+                        )
+                    )
+                    partial_iq = np.stack(
+                        [
+                            value / float(completed_samples)
+                            for value in point_weighted_iq
+                        ],
+                        axis=0,
+                    )
+                    partial_ddr = FineTuneDdrResult(
+                        sweep_points=np.asarray(sequence.sweep_points),
+                        iq=partial_iq,
+                        sweep_axes=tuple(sequence.sweep_axes),
+                        sweep_shape=tuple(sequence.sweep_shape),
+                        cross_capacitance=np.asarray(
+                            sequence.cross_capacitance
+                        ).copy(),
+                        sample_rate_hz=float(
+                            compiled_points[0].acquisition_sample_rate_hz
                         ),
+                        fir_rate_profile="qcs_hardware_demod",
                     )
+                    latest_partial_execution = QcsExecutionResult(
+                        ddr_result=partial_ddr,
+                        programs=tuple(
+                            current.program for current in compiled_points
+                        ),
+                        raw_results=tuple(
+                            value
+                            for value in raw_results_list
+                            if value is not None
+                        ),
+                        program_summary={
+                            "backend": "qcs",
+                            "partial": (
+                                completed_pass_count
+                                < len(averaging_pass_counts)
+                            ),
+                            "completed_points": point_count,
+                            "planned_points": point_count,
+                            "iq_averaging_pass_count": len(
+                                averaging_pass_counts
+                            ),
+                            "completed_iq_averaging_passes": (
+                                completed_pass_count
+                            ),
+                            "effective_integration_duration_s": (
+                                completed_samples
+                                / float(
+                                    compiled_points[
+                                        0
+                                    ].acquisition_sample_rate_hz
+                                )
+                            ),
+                            "iq_shape": list(partial_iq.shape),
+                        },
+                        rf_settings={"backend": "qcs"},
+                    )
+                    if partial_callback is not None:
+                        partial_callback(latest_partial_execution)
             try:
-                iq = np.stack(point_iq, axis=0)
+                iq = np.stack(
+                    [
+                        value / float(sum(averaging_pass_counts))
+                        for value in point_weighted_iq
+                    ],
+                    axis=0,
+                )
             except ValueError as exc:
                 raise ValueError(
                     "fixed numeric QCS DC-ramp points returned inconsistent "
@@ -8090,18 +9575,18 @@ def execute_qcs_sequence(
                     "QCS stop was requested, but the emergency DC reset "
                     "failed; the physical output state is unknown"
                 ) from reset_error_caught
-            if (
-                cancellation_requested
-                and not isinstance(execution_error, QcsExperimentCancelled)
-            ):
+            if cancellation_requested:
                 raise QcsExperimentCancelled(
-                    "QCS experiment stopped by user; DC outputs were reset "
-                    "to zero"
+                    "QCS experiment stopped by user; completed averaging "
+                    "passes remain available and DC outputs were reset to zero",
+                    partial_result=latest_partial_execution,
                 ) from execution_error
             raise
-        close_cancellation_window()
+        close_cancellation_window(partial_result=latest_partial_execution)
         programs = tuple(current.program for current in compiled_points)
-        raw_results = tuple(raw_results_list)
+        raw_results = tuple(
+            value for value in raw_results_list if value is not None
+        )
         effective_acquisition_duration_s = max(
             float(current.acquisition_duration_s) for current in compiled_points
         )
@@ -8155,49 +9640,129 @@ def execute_qcs_sequence(
         )
         if cancellation is not None:
             cancellation.tag_program(compiled.program)
+        latest_partial_execution = None
         try:
-            if cancellation is not None:
-                cancellation.raise_if_requested(
-                    "synchronized QCS program execution"
-                )
-            raw_result = _executor_execute(executor, compiled.program)
-            if cancellation is not None:
-                cancellation.raise_if_requested(
-                    "synchronized QCS program execution"
-                )
             effective_acquisition_duration_s = compiled.acquisition_duration_s
             effective_sample_rate_hz = compiled.acquisition_sample_rate_hz
-            if not connection_config.hw_demod:
-                executed_sample_rate = _executed_program_sample_rate(
-                    raw_result,
-                    compiled.acquisition_channels,
+            iq_weighted_sum = None
+            raw_result = None
+            for pass_index, pass_samples in enumerate(
+                averaging_pass_counts
+            ):
+                if cancellation is not None:
+                    cancellation.raise_if_requested(
+                        "synchronized QCS program execution"
+                    )
+                raw_result = _executor_execute(executor, compiled.program)
+                measurement_executor_call_count += 1
+                if cancellation is not None:
+                    cancellation.raise_if_requested(
+                        "synchronized QCS program execution"
+                    )
+                if not connection_config.hw_demod:
+                    executed_sample_rate = _executed_program_sample_rate(
+                        raw_result,
+                        compiled.acquisition_channels,
+                    )
+                    if executed_sample_rate is not None:
+                        effective_sample_rate_hz = executed_sample_rate
+                    values = extract_qcs_acquisition(
+                        raw_result,
+                        compiled.acquisition_channels,
+                        prefer_trace=True,
+                    )
+                    if point_count == 1:
+                        pass_iq = normalize_qcs_iq(
+                            values,
+                            repetitions_per_sweep=repetitions_per_sweep,
+                            real_is_i_trace=True,
+                        )[np.newaxis, ...]
+                    else:
+                        pass_iq = normalize_qcs_synchronized_trace(
+                            values,
+                            repetitions_per_point=repetitions_per_sweep,
+                            sweep_shape=compiled.sweep_shape,
+                        )
+                else:
+                    pass_iq = _extract_qcs_segmented_hardware_sweep_iq(
+                        raw_result,
+                        acquisition_channels=compiled.acquisition_channels,
+                        segment_sample_counts=(
+                            compiled.integration_segment_sample_counts
+                            or (int(compiled.acquisition_sample_count or 1),)
+                        ),
+                        repetitions_per_point=repetitions_per_sweep,
+                        sweep_shape=compiled.sweep_shape,
+                        hardware_sweep=compiled.hardware_sweep,
+                    )
+                weighted = np.asarray(pass_iq) * float(
+                    pass_samples
                 )
-                if executed_sample_rate is not None:
-                    effective_sample_rate_hz = executed_sample_rate
-            values = extract_qcs_acquisition(
-                raw_result,
-                compiled.acquisition_channels,
-                prefer_trace=not connection_config.hw_demod,
-            )
-            if connection_config.hw_demod:
-                iq = normalize_qcs_hardware_sweep_iq(
-                    values,
-                    repetitions_per_point=repetitions_per_sweep,
-                    sweep_shape=compiled.sweep_shape,
-                    hardware_sweep=compiled.hardware_sweep,
+                if iq_weighted_sum is None:
+                    iq_weighted_sum = weighted
+                else:
+                    iq_weighted_sum += weighted
+                completed_pass_count = pass_index + 1
+                completed_sample_count = int(
+                    sum(averaging_pass_counts[:completed_pass_count])
                 )
-            elif point_count == 1:
-                iq = normalize_qcs_iq(
-                    values,
-                    repetitions_per_sweep=repetitions_per_sweep,
-                    real_is_i_trace=True,
-                )[np.newaxis, ...]
-            else:
-                iq = normalize_qcs_synchronized_trace(
-                    values,
-                    repetitions_per_point=repetitions_per_sweep,
-                    sweep_shape=compiled.sweep_shape,
-                )
+                iq = iq_weighted_sum / float(completed_sample_count)
+                if connection_config.hw_demod:
+                    partial_ddr = FineTuneDdrResult(
+                        sweep_points=np.asarray(sequence.sweep_points),
+                        iq=iq.copy(),
+                        sweep_axes=tuple(sequence.sweep_axes),
+                        sweep_shape=tuple(sequence.sweep_shape),
+                        cross_capacitance=np.asarray(
+                            sequence.cross_capacitance
+                        ).copy(),
+                        sample_rate_hz=effective_sample_rate_hz,
+                        fir_rate_profile="qcs_hardware_demod",
+                    )
+                    latest_partial_execution = QcsExecutionResult(
+                        ddr_result=partial_ddr,
+                        programs=(compiled.program,),
+                        raw_results=(raw_result,),
+                        program_summary={
+                            "backend": "qcs",
+                            "partial": (
+                                completed_pass_count
+                                < len(averaging_pass_counts)
+                            ),
+                            "completed_points": point_count,
+                            "planned_points": point_count,
+                            "iq_averaging_pass_count": len(
+                                averaging_pass_counts
+                            ),
+                            "completed_iq_averaging_passes": (
+                                completed_pass_count
+                            ),
+                            "effective_integration_duration_s": (
+                                completed_sample_count
+                                / effective_sample_rate_hz
+                            ),
+                            "iq_shape": list(iq.shape),
+                        },
+                        rf_settings={"backend": "qcs"},
+                    )
+                    if partial_callback is not None:
+                        partial_callback(latest_partial_execution)
+                if progress_callback is not None and len(
+                    averaging_pass_counts
+                ) > 1:
+                    progress_callback(
+                        35
+                        + int(
+                            35
+                            * completed_pass_count
+                            / len(averaging_pass_counts)
+                        ),
+                        "QCS integrated-I/Q pass "
+                        f"{completed_pass_count:,}/"
+                        f"{len(averaging_pass_counts):,} acquired",
+                    )
+            if iq_weighted_sum is None or raw_result is None:
+                raise RuntimeError("QCS averaging completed no passes")
         except BaseException as execution_error:
             cancellation_requested = bool(
                 cancellation is not None
@@ -8225,13 +9790,11 @@ def execute_qcs_sequence(
                     "QCS stop was requested, but the emergency DC reset "
                     "failed; the physical output state is unknown"
                 ) from reset_error_caught
-            if (
-                cancellation_requested
-                and not isinstance(execution_error, QcsExperimentCancelled)
-            ):
+            if cancellation_requested:
                 raise QcsExperimentCancelled(
-                    "QCS experiment stopped by user; DC outputs were reset "
-                    "to zero"
+                    "QCS experiment stopped by user; completed averaging "
+                    "passes remain available and DC outputs were reset to zero",
+                    partial_result=latest_partial_execution,
                 ) from execution_error
             raise
         if offset_reset_required:
@@ -8249,7 +9812,10 @@ def execute_qcs_sequence(
                     "QCS acquisition completed, but the automatic M5301 "
                     "fixed-offset reset failed"
                 ) from reset_error
-        close_cancellation_window(dc_already_reset=offset_reset_required)
+        close_cancellation_window(
+            dc_already_reset=offset_reset_required,
+            partial_result=latest_partial_execution,
+        )
         programs = (compiled.program,)
         raw_results = (raw_result,)
         hardware_sweep = compiled.hardware_sweep
@@ -8292,7 +9858,8 @@ def execute_qcs_sequence(
             "completed",
             (
                 f"Acquired {point_count:,} QCS point(s) with "
-                f"{len(raw_results):,} measurement execution(s) through "
+                f"{measurement_executor_call_count:,} measurement "
+                "execution(s) through "
                 f"one executor{reset_text}"
             ),
         )
@@ -8327,12 +9894,14 @@ def execute_qcs_sequence(
         "sweep_array_value_count": sweep_array_value_count,
         "repetitions_per_sweep": int(repetitions_per_sweep),
         "program_count": len(programs),
-        "executor_call_count": len(raw_results),
+        "executor_call_count": measurement_executor_call_count,
+        "retained_raw_result_count": len(raw_results),
         "safety_reset_executor_call_count": (
             safety_reset_executor_call_count
         ),
         "total_executor_call_count": (
-            len(raw_results) + safety_reset_executor_call_count
+            measurement_executor_call_count
+            + safety_reset_executor_call_count
         ),
         "fabric_mhz": float(fabric_mhz),
         "source_full_scale_mv": float(source_full_scale_mv),
@@ -8356,28 +9925,65 @@ def execute_qcs_sequence(
         "hw_demod": connection_config.hw_demod,
         "reset_phase_every_shot": True,
         "sample_rate_hz": effective_sample_rate_hz,
-        "acquisition_duration_s": effective_acquisition_duration_s,
-        "requested_sample_count": acquisition.sample_count,
+        "acquisition_duration_s": (
+            effective_acquisition_duration_s
+            if iq_averaging_plan is None
+            else iq_averaging_plan.quantized_total_duration_s
+        ),
+        "requested_sample_count": requested_acquisition.sample_count,
+        "requested_total_integration_duration_s": (
+            None
+            if iq_averaging_plan is None
+            else iq_averaging_plan.requested_total_duration_s
+        ),
+        "quantized_total_integration_duration_s": (
+            None
+            if iq_averaging_plan is None
+            else iq_averaging_plan.quantized_total_duration_s
+        ),
+        "quantized_total_integration_sample_count": (
+            None
+            if iq_averaging_plan is None
+            else iq_averaging_plan.quantized_total_sample_count
+        ),
+        "iq_averaging_pass_count": len(averaging_pass_counts),
+        "completed_iq_averaging_passes": len(averaging_pass_counts),
+        "per_pass_integration_duration_s": effective_acquisition_duration_s,
+        "per_pass_integration_sample_count": (
+            None
+            if iq_averaging_plan is None
+            else iq_averaging_plan.pass_sample_counts[0]
+        ),
+        "effective_integration_duration_s": (
+            None
+            if iq_averaging_plan is None
+            else sum(averaging_pass_counts) / effective_sample_rate_hz
+        ),
         "iq_shape": list(iq.shape),
     }
     rf_settings = {
         "backend": "qcs",
-        "output_details": tuple(
-            {
-                "gen_ch": pulse.gen_ch,
-                "amplitude": pulse.amplitude,
-                "frequency_hz": pulse.frequency_hz,
-                "duration_s": pulse.duration_s,
-            }
-            for pulse in rf_pulses
-        ),
+        "output_details": _qcs_rf_output_details(rf_pulses),
         "readout_details": {
             "sample_rate_hz": effective_sample_rate_hz,
             "hw_demod": connection_config.hw_demod,
             "reset_phase_every_shot": True,
             "frequency_hz": acquisition.frequency_hz,
-            "duration_s": effective_acquisition_duration_s,
-            "requested_sample_count": acquisition.sample_count,
+            "duration_s": (
+                effective_acquisition_duration_s
+                if iq_averaging_plan is None
+                else iq_averaging_plan.quantized_total_duration_s
+            ),
+            "requested_sample_count": requested_acquisition.sample_count,
+            "iq_averaging_pass_count": len(averaging_pass_counts),
+            "per_pass_integration_duration_s": (
+                effective_acquisition_duration_s
+            ),
+            "effective_integration_duration_s": (
+                None
+                if iq_averaging_plan is None
+                else sum(averaging_pass_counts) / effective_sample_rate_hz
+            ),
         },
     }
     return QcsExecutionResult(
@@ -8652,6 +10258,8 @@ __all__ = [
     "QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S",
     "QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES",
     "QCS_M5200_SAMPLE_RATE_HZ",
+    "QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S",
+    "QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES",
     "QCS_NOISE_MAX_RAW_TRACE_SAMPLES",
     "QCS_SPARAMETER_INTER_SEGMENT_DELAY_S",
     "QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S",
@@ -8659,6 +10267,9 @@ __all__ = [
     "QCS_STABILITY_INTEGRATION_BLOCK_SAMPLES",
     "QCS_STABILITY_INTEGRATION_FABRIC_CYCLES",
     "QCS_STABILITY_INTEGRATION_QUANTUM_S",
+    "QCS_STABILITY_INTER_SEGMENT_DELAY_S",
+    "QCS_STABILITY_MAX_INTEGRATION_DURATION_S",
+    "QCS_STABILITY_MAX_INTEGRATION_SAMPLES",
     "QCS_STABILITY_DC_EDGE_PADDING_FABRIC_CYCLES",
     "QCS_STABILITY_DC_EDGE_PADDING_S",
     "QCS_STABILITY_DC_RAMP_FABRIC_CYCLES",
@@ -8675,10 +10286,12 @@ __all__ = [
     "QcsConnectionConfig",
     "QcsExperimentCancelled",
     "QcsExecutionResult",
+    "QcsIqAveragingPlan",
     "QcsM5301CapacityReport",
     "QcsM5301ChannelCapacity",
     "QcsNoiseTraceConfig",
     "QcsNoiseTraceResult",
+    "QcsRfPowerCalibrationConfig",
     "QcsRfPulseConfig",
     "QcsSParameterExecutionResult",
     "QcsSweepExecutionPreview",
@@ -8699,13 +10312,16 @@ __all__ = [
     "normalize_qcs_hardware_sweep_iq",
     "normalize_qcs_iq",
     "normalize_qcs_synchronized_trace",
+    "plan_qcs_total_iq_averaging",
     "quantize_qcs_raw_trace_duration",
     "quantize_qcs_stability_integration_duration",
+    "qcs_stability_integration_segment_sample_counts",
     "qcs_m5301_capacity_preview_point_indices",
     "qcs_m5301_waveform_capacity_report",
     "qcs_sweep_execution_preview",
     "run_qcs_qcodes_experiment",
     "run_qcs_sparameter_sweep",
+    "resolve_qcs_rf_power_calibrations",
     "validate_qcs_capabilities",
     "validate_qcs_m5301_waveform_capacity",
 ]

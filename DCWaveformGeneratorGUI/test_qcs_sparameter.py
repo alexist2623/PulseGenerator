@@ -541,10 +541,26 @@ def test_qcs_panel_uses_segmented_integration_default_and_maximum():
     panel.set_hardware_backend("qcs")
 
     assert panel.scan_time_us.value() == pytest.approx(1.0)
-    assert panel.scan_time_us.maximum() == pytest.approx(100.0)
+    assert panel.scan_time_us.maximum() == pytest.approx(100_000.0)
+    assert panel.scan_time_label.text() == "Total I/Q averaging time:"
+    assert "bounded QCS passes" in panel.scan_time_us.toolTip()
+    assert panel.stop_button.isHidden() is False
+    panel.show()
+    application.processEvents()
+    assert panel.stop_button.isVisible() is True
+    assert panel.stop_button.isEnabled() is False
+    stopped = []
+    panel.stop_requested.connect(lambda: stopped.append(True))
+    panel.set_running(True, "QCS sweep running")
+    assert panel.stop_button.isEnabled() is True
+    panel.stop_button.click()
+    assert stopped == [True]
+    panel.set_stopping()
+    assert panel.stop_button.isEnabled() is False
+    panel.set_running(False, "Ready")
 
-    panel.scan_time_us.setValue(101.0)
-    assert panel.scan_time_us.value() == pytest.approx(100.0)
+    panel.scan_time_us.setValue(100_001.0)
+    assert panel.scan_time_us.value() == pytest.approx(100_000.0)
     panel.deleteLater()
     application.processEvents()
 
@@ -585,7 +601,7 @@ def test_qcs_result_status_describes_integrated_shots_not_fir_samples():
     assert panel.running_update is not None
     _running, message = panel.running_update
     assert "4 integrated I/Q shot(s) per point" in message
-    assert "10 us integration" in message
+    assert "10 us total I/Q averaging" in message
     assert "FIR" not in message
 
 

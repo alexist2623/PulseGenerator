@@ -210,6 +210,9 @@ def test_waveform_time_drag_shares_matching_segment_timing():
 def test_awg_sweep_parameter_table_edits_all_supported_sweep_types():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     _add_segments(window, 2)
     window._sweep_specs = [
         QickSweepSpec("set_1", "awg_0", -0.25, 0.5, 5),
@@ -794,6 +797,9 @@ def test_insert_remaps_rf_duration_sweep_anchor_and_selected_map_axis():
 def test_experiment_sweep_edit_atomically_refreshes_waveform_and_markers():
     app = _application()
     window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(
+        gui.EXECUTION_BACKEND_QICK
+    )
     _add_segments(window, 2)
     window._sweep_specs = [
         QickSweepSpec("set_2", "awg_0", -0.25, 0.5, 5),

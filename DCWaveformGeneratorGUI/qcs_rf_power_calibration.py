@@ -5,21 +5,25 @@ the legacy QICK gain-code calibration schema.  One calibration point records
 the M5300A relative amplitude, the integrated M5200A I/Q value, and the power
 at the M5300A 50-ohm connector.
 
-An M5200A IntegrationFilter result is *not* intrinsically a traceable dBm
-measurement.  Absolute power may therefore be produced in only two explicit
-modes:
+QCS returns M5200A trace samples in volts.  For a matched coherent RF
+IntegrationFilter, ``abs(I + 1j*Q)`` is the RF peak voltage at the M5200A
+connector.  The production calibration therefore converts that measured
+voltage directly to power into 50 ohms:
+
+``qcs_m5200_voltage_50ohm``
+    Compute ``Vpk**2 / (2*50 ohm)`` from the measured I/Q magnitude.  The
+    resulting M5300A map is derived directly from the voltage measured by the
+    connected M5200A; no external source or operator-supplied fit is used.
+
+Two older reference modes remain readable for database compatibility, but
+new GUI calibrations no longer create them:
 
 ``reference_calibrated``
     Apply a previously measured linear transfer from ``20*log10(|I+jQ|)`` to
     dBm at the M5200A input, then add the measured cable/path loss.
 
 ``nominal_m5200_50ohm``
-    Treat ``|I+jQ| * volts_per_iq_unit`` as the peak voltage of a coherent
-    sine and use ``Vpk**2 / (2*50 ohm)``.  The caller must explicitly
-    acknowledge that this is a nominal assumption, not a traceable
-    calibration.  QCS/HCL normalization and the selected M5200A range must be
-    verified in the laboratory before this mode is used as an absolute dBm
-    reference.
+    Legacy user-supplied volts-per-I/Q scaling.
 
 The fitted response follows the QICK 50 kSPS calibration strategy: at each
 frequency, upper-amplitude points estimate
@@ -49,12 +53,33 @@ QCS_RF_CALIBRATION_RUN_TABLE = "qcs_rf_power_calibration_runs"
 QCS_RF_CALIBRATION_POINT_TABLE = "qcs_rf_power_calibration_points"
 REFERENCE_CALIBRATED = "reference_calibrated"
 NOMINAL_M5200_50OHM = "nominal_m5200_50ohm"
-CALIBRATION_QUALITIES = (REFERENCE_CALIBRATED, NOMINAL_M5200_50OHM)
+QCS_M5200_VOLTAGE_50OHM = "qcs_m5200_voltage_50ohm"
+CALIBRATION_QUALITIES = (
+    QCS_M5200_VOLTAGE_50OHM,
+    REFERENCE_CALIBRATED,
+    NOMINAL_M5200_50OHM,
+)
 
 M5200_SAMPLE_RATE_HZ = 4_800_000_000.0
 M5200_INTEGRATION_BLOCK_SAMPLES = 16
 M5200_MAX_INTEGRATION_SAMPLES = 32_768
 QCS_FABRIC_CLOCK_HZ = 300_000_000.0
+# Keep each submitted acquisition program inside the segmented 100 us
+# construction already exercised on the connected QCS 2.5.5 system.  A
+# longer calibration average reuses the same mapper, backend, executor, and
+# (for equal-sized passes) Program rather than creating thousands of layers in
+# one HCL graph.
+QCS_RF_CALIBRATION_INTER_SEGMENT_DELAY_S = 20.0e-9
+QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES = 480_000
+QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_DURATION_S = (
+    QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES
+    / M5200_SAMPLE_RATE_HZ
+)
+QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_SAMPLES = 480_000_000
+QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S = (
+    QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_SAMPLES
+    / M5200_SAMPLE_RATE_HZ
+)
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -137,10 +162,12 @@ class QcsPhysicalChannelIdentity:
 class M5200PowerReference:
     """Conversion from an M5200A integrated-IQ magnitude to connector dBm.
 
+    For a current QCS voltage reference, ``iq_magnitude`` is the coherent RF
+    peak voltage in volts and is converted directly using a 50-ohm load.
     For a calibrated reference, ``power_dbm`` is
     ``slope * 20*log10(iq_magnitude) + intercept_dbm + path_loss_db``.
-    For nominal conversion, ``iq_magnitude * volts_per_iq_unit`` is assumed
-    to be coherent-sine peak voltage at the M5200A connector.
+    The calibrated and nominal branches are retained only to load legacy
+    calibration databases.
     """
 
     mode: str
@@ -156,7 +183,8 @@ class M5200PowerReference:
         mode = str(self.mode).strip().lower()
         if mode not in CALIBRATION_QUALITIES:
             raise ValueError(
-                "M5200 reference mode must be 'reference_calibrated' or "
+                "M5200 reference mode must be "
+                "'qcs_m5200_voltage_50ohm', 'reference_calibrated', or "
                 "'nominal_m5200_50ohm'"
             )
         path_loss = _finite(self.path_loss_db, "path_loss_db")
@@ -173,7 +201,9 @@ class M5200PowerReference:
                     "reference_calibrated mode requires intercept_dbm"
                 )
             intercept = _finite(intercept, "reference intercept_dbm")
-        elif not bool(self.acknowledge_nominal_scaling):
+        elif mode == NOMINAL_M5200_50OHM and not bool(
+            self.acknowledge_nominal_scaling
+        ):
             raise ValueError(
                 "nominal M5200 50-ohm conversion requires explicit "
                 "acknowledge_nominal_scaling=True"
@@ -193,6 +223,17 @@ class M5200PowerReference:
         object.__setattr__(self, "volts_per_iq_unit", volts_per_unit)
         object.__setattr__(self, "source", str(self.source).strip())
         object.__setattr__(self, "uncertainty_db", uncertainty)
+
+    @classmethod
+    def qcs_voltage_50ohm(
+        cls,
+    ) -> "M5200PowerReference":
+        """Build the automatic QCS volts-to-50-ohm power reference."""
+
+        return cls(
+            mode=QCS_M5200_VOLTAGE_50OHM,
+            source="Keysight QCS M5200 voltage-scaled I/Q",
+        )
 
     @classmethod
     def nominal_50ohm(
@@ -246,7 +287,13 @@ class M5200PowerReference:
                 + float(self.intercept_dbm)
             )
         else:
+            # QCS M5200 I/Q is already expressed in volts.  Only the legacy
+            # nominal mode applies an additional user-provided multiplier.
+            # For a coherent sine, the matched IntegrationFilter magnitude is
+            # Vpk, so P = Vpk^2 / (2R).
             peak_voltage = magnitude * self.volts_per_iq_unit
+            if self.mode == QCS_M5200_VOLTAGE_50OHM:
+                peak_voltage = magnitude
             watts = peak_voltage**2 / (2.0 * 50.0)
             result = 10.0 * np.log10(watts * 1000.0)
         return result + self.path_loss_db
@@ -309,6 +356,16 @@ class M5300PowerCalibrationConfig:
             "integration_duration_s",
             positive=True,
         )
+        if (
+            integration
+            > QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S
+        ):
+            raise ValueError(
+                "M5300/M5200 calibration total integrated I/Q averaging "
+                f"time must not exceed "
+                f"{QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S * 1e3:g} "
+                "ms"
+            )
         repetitions = _integer(self.repetitions, "repetitions", 1)
         init_time = _finite(self.init_time_s, "init_time_s")
         if init_time < 0.0:
@@ -318,8 +375,11 @@ class M5300PowerCalibrationConfig:
             lo_frequency = _finite(
                 lo_frequency,
                 "expected_lo_frequency_hz",
-                positive=True,
             )
+            if lo_frequency < 0.0:
+                raise ValueError(
+                    "expected_lo_frequency_hz must be nonnegative"
+                )
         object.__setattr__(self, "database_path", database_path)
         object.__setattr__(self, "mapper_path", mapper_path)
         object.__setattr__(self, "rf_channel_name", rf_name)
@@ -362,6 +422,10 @@ class M5300PowerCalibration:
             raise ValueError("QCS RF calibration output must be M5300A")
         if self.input_identity.module_model != "M5200A":
             raise ValueError("QCS RF calibration input must be M5200A")
+        lo_frequency = _finite(self.lo_frequency_hz, "lo_frequency_hz")
+        if lo_frequency < 0.0:
+            raise ValueError("lo_frequency_hz must be nonnegative")
+        object.__setattr__(self, "lo_frequency_hz", lo_frequency)
         if not np.isclose(float(self.termination_ohm), 50.0):
             raise ValueError("M5300 RF calibration requires 50-ohm termination")
         if self.calibration_quality not in CALIBRATION_QUALITIES:
@@ -737,7 +801,9 @@ def store_m5300_power_calibration(
         value not in "0123456789abcdef" for value in mapper_digest
     ):
         raise ValueError("mapper_sha256 must contain 64 hexadecimal characters")
-    lo_frequency = _finite(lo_frequency_hz, "lo_frequency_hz", positive=True)
+    lo_frequency = _finite(lo_frequency_hz, "lo_frequency_hz")
+    if lo_frequency < 0.0:
+        raise ValueError("lo_frequency_hz must be nonnegative")
     integration = _finite(
         integration_duration_s,
         "integration_duration_s",
@@ -928,13 +994,20 @@ def _validate_loaded_calibration(
         digest = str(expected_mapper_sha256).strip().lower()
         if calibration.mapper_sha256 != digest:
             raise ValueError("calibration mapper does not match the active QCS mapper")
-    if expected_lo_frequency_hz is not None and not np.isclose(
-        calibration.lo_frequency_hz,
-        float(expected_lo_frequency_hz),
-        rtol=0.0,
-        atol=1.0,
-    ):
-        raise ValueError("calibration M5300 LO frequency does not match")
+    if expected_lo_frequency_hz is not None:
+        expected_lo = _finite(
+            expected_lo_frequency_hz,
+            "expected_lo_frequency_hz",
+        )
+        if expected_lo < 0.0:
+            raise ValueError("expected_lo_frequency_hz must be nonnegative")
+        if not np.isclose(
+            calibration.lo_frequency_hz,
+            expected_lo,
+            rtol=0.0,
+            atol=1.0,
+        ):
+            raise ValueError("calibration M5300 LO frequency does not match")
     if not np.isclose(
         calibration.termination_ohm,
         float(termination_ohm),
@@ -1095,12 +1168,30 @@ def resolve_m5300_m5200_identities(
     lo_frequency_hz = _finite(
         _scalar_value(lo_scalar),
         "mapped M5300A LO frequency",
-        positive=True,
     )
+    if lo_frequency_hz < 0.0:
+        raise ValueError("mapped M5300A LO frequency must be nonnegative")
     return output_identity, input_identity, lo_frequency_hz
 
 
-def _quantized_integration_duration(requested_s: float) -> Tuple[float, int]:
+@dataclass(frozen=True)
+class _M5200IntegrationPass:
+    """One bounded QCS execution contributing to a longer I/Q average."""
+
+    segment_sample_counts: Tuple[int, ...]
+
+    @property
+    def sample_count(self) -> int:
+        return int(sum(self.segment_sample_counts))
+
+    @property
+    def duration_s(self) -> float:
+        return self.sample_count / M5200_SAMPLE_RATE_HZ
+
+
+def _quantized_integration_sample_count(requested_s: float) -> int:
+    """Round total requested averaging time upward to one 16-sample block."""
+
     requested = _finite(requested_s, "integration_duration_s", positive=True)
     sample_count = max(
         M5200_INTEGRATION_BLOCK_SAMPLES,
@@ -1114,16 +1205,76 @@ def _quantized_integration_duration(requested_s: float) -> Tuple[float, int]:
         )
         * M5200_INTEGRATION_BLOCK_SAMPLES,
     )
-    if sample_count > M5200_MAX_INTEGRATION_SAMPLES:
+    if sample_count > QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_SAMPLES:
         raise ValueError(
-            "M5200 calibration IntegrationFilter exceeds the measured "
+            "M5200 calibration total integrated I/Q averaging time exceeds "
+            f"{QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S * 1e3:g} "
+            "ms"
+        )
+    return sample_count
+
+
+def _integration_filter_segments(sample_count: int) -> Tuple[int, ...]:
+    """Split one <=100 us pass into equal, reusable IntegrationFilters."""
+
+    count = _integer(sample_count, "integration pass sample_count", 1)
+    if count % M5200_INTEGRATION_BLOCK_SAMPLES:
+        raise ValueError(
+            "integration pass sample count must be a multiple of "
+            f"{M5200_INTEGRATION_BLOCK_SAMPLES}"
+        )
+    if count > QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES:
+        raise ValueError(
+            "integration pass exceeds the bounded 100 us QCS pass"
+        )
+    if count <= M5200_MAX_INTEGRATION_SAMPLES:
+        return (count,)
+    segment_count = int(
+        np.ceil(count / M5200_MAX_INTEGRATION_SAMPLES)
+    )
+    segment_samples = int(
+        np.ceil(
+            count
+            / segment_count
+            / M5200_INTEGRATION_BLOCK_SAMPLES
+        )
+        * M5200_INTEGRATION_BLOCK_SAMPLES
+    )
+    if segment_samples > M5200_MAX_INTEGRATION_SAMPLES:
+        raise RuntimeError(
+            "internal M5200 calibration segment exceeds the measured "
             f"{M5200_MAX_INTEGRATION_SAMPLES:,}-sample limit"
         )
-    duration = sample_count / M5200_SAMPLE_RATE_HZ
-    cycles = duration * QCS_FABRIC_CLOCK_HZ
-    if not np.isclose(cycles, round(cycles), atol=1.0e-7, rtol=0.0):
-        raise ValueError("integration duration does not align to QCS fabric")
-    return duration, sample_count
+    return (segment_samples,) * segment_count
+
+
+def _integration_pass_plan(
+    requested_s: float,
+) -> Tuple[_M5200IntegrationPass, ...]:
+    """Plan a <=100 ms average as reusable <=100 us QCS passes."""
+
+    remaining = _quantized_integration_sample_count(requested_s)
+    passes = []
+    while remaining:
+        requested_pass_samples = min(
+            remaining,
+            QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES,
+        )
+        segments = _integration_filter_segments(requested_pass_samples)
+        passes.append(_M5200IntegrationPass(segments))
+        # Equal-filter segmentation can round a partial final pass upward by
+        # a few 16-sample blocks. It still fulfills (never shortens) the user
+        # request, so consume the requested part rather than the rounded part.
+        remaining -= requested_pass_samples
+    return tuple(passes)
+
+
+def _quantized_integration_duration(requested_s: float) -> Tuple[float, int]:
+    """Return the actual total integrated duration of the bounded pass plan."""
+
+    passes = _integration_pass_plan(requested_s)
+    sample_count = int(sum(current.sample_count for current in passes))
+    return sample_count / M5200_SAMPLE_RATE_HZ, sample_count
 
 
 def _first_result_value(value: Any, channels: Any) -> Any:
@@ -1139,15 +1290,26 @@ def _first_result_value(value: Any, channels: Any) -> Any:
     return next(iter(value.values()))
 
 
-def _mean_iq_from_result(
+def _point_repetition_iq_from_result(
     raw_result: Any,
     channels: Any,
     point_count: int,
     repetitions: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+    *,
+    acquisition_index: int = -1,
+) -> np.ndarray:
+    """Return one acquisition as complex ``(point, repetition)`` values."""
+
     results = getattr(raw_result, "results", None)
     if results is not None and callable(getattr(results, "get_iq", None)):
-        values = _first_result_value(results.get_iq(channels, avg=False), channels)
+        values = _first_result_value(
+            results.get_iq(
+                channels,
+                avg=False,
+                acq_index=int(acquisition_index),
+            ),
+            channels,
+        )
     else:
         try:
             values = raw_result[channels]
@@ -1167,20 +1329,182 @@ def _mean_iq_from_result(
         raise ValueError(
             "QCS calibration IQ result size does not match grid x repetitions"
         )
-    if array.ndim >= 2 and array.shape[0] == repetitions:
-        shot_point = array.reshape(repetitions, point_count)
-        point_shot = shot_point.T
-    elif array.ndim >= 2 and array.shape[0] == point_count:
+    # This Program is constructed as an outer QCS-resolved sweep containing
+    # an inner hardware Repeat, so production results are point-first. Keep a
+    # repetition-first adapter branch for injected/older results, but resolve
+    # a square point_count == repetitions result according to the real graph.
+    if array.ndim >= 2 and array.shape[:2] == (
+        point_count,
+        repetitions,
+    ):
         point_shot = array.reshape(point_count, repetitions)
+    elif array.ndim >= 2 and array.shape[:2] == (
+        repetitions,
+        point_count,
+    ):
+        point_shot = array.reshape(repetitions, point_count).T
     elif array.ndim >= 2 and array.shape[-1] == repetitions:
         point_shot = array.reshape(point_count, repetitions)
     else:
         point_shot = array.reshape(point_count, repetitions)
+    point_shot = np.asarray(point_shot, dtype=np.complex128)
+    if not np.all(np.isfinite(point_shot)):
+        raise ValueError("QCS calibration IQ result contains non-finite values")
+    return point_shot
+
+
+def _mean_iq_from_result(
+    raw_result: Any,
+    channels: Any,
+    point_count: int,
+    repetitions: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    point_shot = _point_repetition_iq_from_result(
+        raw_result,
+        channels,
+        point_count,
+        repetitions,
+    )
     means = np.mean(point_shot, axis=1)
     return means.real, means.imag
 
 
 CalibrationMeasurementRunner = Callable[..., Tuple[Any, Any]]
+
+
+def _build_m5300_calibration_pass_program(
+    *,
+    qcs_module: Any,
+    output_channels: Any,
+    input_channels: Any,
+    frequencies_hz: np.ndarray,
+    relative_amplitudes: np.ndarray,
+    segment_sample_counts: Tuple[int, ...],
+    repetitions: int,
+) -> Any:
+    """Build one reusable <=100 us segmented calibration Program."""
+
+    segments = tuple(int(value) for value in segment_sample_counts)
+    if not segments:
+        raise ValueError("calibration integration pass has no segments")
+    if any(
+        value < M5200_INTEGRATION_BLOCK_SAMPLES
+        or value % M5200_INTEGRATION_BLOCK_SAMPLES
+        or value > M5200_MAX_INTEGRATION_SAMPLES
+        for value in segments
+    ):
+        raise ValueError("calibration integration pass contains an invalid filter")
+    if len(segments) > 1 and bool(
+        getattr(output_channels, "absolute_phase", False)
+    ) != bool(getattr(input_channels, "absolute_phase", False)):
+        raise ValueError(
+            "segmented M5300/M5200 calibration requires matching "
+            "absolute_phase settings on output and acquisition channels"
+        )
+
+    frequency = qcs_module.Scalar(
+        "m5300_calibration_frequency_hz",
+        value=float(frequencies_hz[0]),
+        dtype=float,
+    )
+    amplitude = qcs_module.Scalar(
+        "m5300_calibration_relative_amplitude",
+        value=float(relative_amplitudes[0]),
+        dtype=float,
+    )
+    frequency_values = qcs_module.Array(
+        "m5300_calibration_frequency_values_hz",
+        value=frequencies_hz,
+        dtype=float,
+    )
+    amplitude_values = qcs_module.Array(
+        "m5300_calibration_amplitude_values",
+        value=relative_amplitudes,
+        dtype=float,
+    )
+    program = qcs_module.Program(
+        name="M5300A RF power calibration integration pass"
+    )
+    integration_filter_cache = {}
+    last_segment_index = len(segments) - 1
+    for segment_index, segment_samples in enumerate(segments):
+        segment_duration_s = segment_samples / M5200_SAMPLE_RATE_HZ
+        output_duration_s = segment_duration_s
+        if segment_index != last_segment_index:
+            output_duration_s += QCS_RF_CALIBRATION_INTER_SEGMENT_DELAY_S
+        output_waveform = qcs_module.RFWaveform(
+            duration=output_duration_s,
+            envelope=qcs_module.ConstantEnvelope(),
+            amplitude=amplitude,
+            rf_frequency=frequency,
+            instantaneous_phase=0.0,
+            name=f"m5300_power_calibration_output_{segment_index}",
+        )
+        integration_filter = integration_filter_cache.get(segment_samples)
+        if integration_filter is None:
+            filter_waveform = qcs_module.RFWaveform(
+                duration=segment_duration_s,
+                envelope=qcs_module.ConstantEnvelope(),
+                amplitude=1.0,
+                rf_frequency=frequency,
+                instantaneous_phase=0.0,
+                name=(
+                    "m5200_power_calibration_filter_"
+                    f"{segment_samples}_samples"
+                ),
+            )
+            integration_filter = qcs_module.IntegrationFilter(
+                filter_waveform
+            )
+            integration_filter_cache[segment_samples] = integration_filter
+        program.add_waveform(
+            output_waveform,
+            output_channels,
+            new_layer=segment_index == 0,
+        )
+        acquisition_options = {"new_layer": False}
+        if segment_index > 0:
+            acquisition_options["pre_delay"] = (
+                QCS_RF_CALIBRATION_INTER_SEGMENT_DELAY_S
+            )
+        program.add_acquisition(
+            integration_filter=integration_filter,
+            channels=input_channels,
+            **acquisition_options,
+        )
+    # Frequency appears inside the IntegrationFilter and therefore remains a
+    # QCS-resolved software sweep. Repeat is inserted first so repetitions are
+    # performed at each frequency/amplitude point.
+    program.n_shots(repetitions)
+    program.sweep(
+        (frequency_values, amplitude_values),
+        (frequency, amplitude),
+    )
+    return program
+
+
+def _integrated_iq_from_pass_result(
+    raw_result: Any,
+    channels: Any,
+    *,
+    point_count: int,
+    repetitions: int,
+    segment_sample_counts: Tuple[int, ...],
+) -> np.ndarray:
+    """Sample-weight one pass into complex ``(point, repetition)`` I/Q."""
+
+    segments = tuple(int(value) for value in segment_sample_counts)
+    weighted = np.zeros((point_count, repetitions), dtype=np.complex128)
+    for segment_index, segment_samples in enumerate(segments):
+        values = _point_repetition_iq_from_result(
+            raw_result,
+            channels,
+            point_count,
+            repetitions,
+            acquisition_index=segment_index,
+        )
+        weighted += values * float(segment_samples)
+    return weighted / float(sum(segments))
 
 
 def run_m5300_power_calibration(
@@ -1197,8 +1521,11 @@ def run_m5300_power_calibration(
     keyword arguments ``config``, ``mapper``, ``output_channels``,
     ``input_channels``, ``frequencies_hz`` (flattened Cartesian grid), and
     ``relative_amplitudes``.  It returns mean-I and mean-Q arrays with one
-    value per grid point.  When omitted, one QCS Program with a flat
-    IntegrationFilter and paired frequency/amplitude arrays is executed.
+    value per grid point.  When omitted, total averaging time is divided into
+    <=100 us QCS passes. Each pass contains <=32,768-sample flat
+    IntegrationFilters, and completed pass/segment values are sample-weighted
+    before repetitions are averaged. Mapper, backend, executor, and equal-pass
+    Program objects are reused across the complete calibration.
     """
 
     def progress(percent: int, text: str) -> None:
@@ -1247,9 +1574,11 @@ def run_m5300_power_calibration(
     )
     flat_frequencies = frequency_grid.reshape(-1)
     flat_amplitudes = amplitude_grid.reshape(-1)
-    actual_duration_s, _sample_count = _quantized_integration_duration(
-        config.integration_duration_s
+    pass_plan = _integration_pass_plan(config.integration_duration_s)
+    actual_sample_count = int(
+        sum(current.sample_count for current in pass_plan)
     )
+    actual_duration_s = actual_sample_count / M5200_SAMPLE_RATE_HZ
     progress(10, "Prepared M5300A/M5200A calibration grid")
 
     if measurement_runner is not None:
@@ -1265,54 +1594,6 @@ def run_m5300_power_calibration(
     else:
         if qcs_module is None:
             import keysight.qcs as qcs_module
-        frequency = qcs_module.Scalar(
-            "m5300_calibration_frequency_hz",
-            value=float(flat_frequencies[0]),
-            dtype=float,
-        )
-        amplitude = qcs_module.Scalar(
-            "m5300_calibration_relative_amplitude",
-            value=float(flat_amplitudes[0]),
-            dtype=float,
-        )
-        frequency_values = qcs_module.Array(
-            "m5300_calibration_frequency_values_hz",
-            value=flat_frequencies,
-            dtype=float,
-        )
-        amplitude_values = qcs_module.Array(
-            "m5300_calibration_amplitude_values",
-            value=flat_amplitudes,
-            dtype=float,
-        )
-        output_waveform = qcs_module.RFWaveform(
-            duration=actual_duration_s,
-            envelope=qcs_module.ConstantEnvelope(),
-            amplitude=amplitude,
-            rf_frequency=frequency,
-            instantaneous_phase=0.0,
-            name="m5300_power_calibration_output",
-        )
-        filter_waveform = qcs_module.RFWaveform(
-            duration=actual_duration_s,
-            envelope=qcs_module.ConstantEnvelope(),
-            amplitude=1.0,
-            rf_frequency=frequency,
-            instantaneous_phase=0.0,
-            name="m5200_power_calibration_filter",
-        )
-        program = qcs_module.Program(name="M5300A RF power calibration")
-        program.add_waveform(output_waveform, output_channels)
-        program.add_acquisition(
-            integration_filter=qcs_module.IntegrationFilter(filter_waveform),
-            channels=input_channels,
-            new_layer=False,
-        )
-        program.n_shots(config.repetitions)
-        program.sweep(
-            (frequency_values, amplitude_values),
-            (frequency, amplitude),
-        )
         backend = qcs_module.HclBackend(
             channel_mapper=mapper,
             hw_demod=True,
@@ -1322,14 +1603,65 @@ def run_m5300_power_calibration(
             keep_progress_bar=False,
             reset_phase_every_shot=True,
         )
-        progress(35, "Executing one QCS M5300A calibration Program")
-        raw_result = qcs_module.Executor(backend).execute(program)
-        mean_i, mean_q = _mean_iq_from_result(
-            raw_result,
-            input_channels,
-            flat_frequencies.size,
-            config.repetitions,
+        executor = qcs_module.Executor(backend)
+        program_cache = {}
+        weighted_iq = np.zeros(
+            (flat_frequencies.size, config.repetitions),
+            dtype=np.complex128,
         )
+        completed_samples = 0
+        pass_count = len(pass_plan)
+        progress(
+            15,
+            f"Executing {pass_count:,} bounded QCS calibration pass(es)",
+        )
+        last_progress_percent = 15
+        for pass_index, current_pass in enumerate(pass_plan):
+            program_key = current_pass.segment_sample_counts
+            program = program_cache.get(program_key)
+            if program is None:
+                program = _build_m5300_calibration_pass_program(
+                    qcs_module=qcs_module,
+                    output_channels=output_channels,
+                    input_channels=input_channels,
+                    frequencies_hz=flat_frequencies,
+                    relative_amplitudes=flat_amplitudes,
+                    segment_sample_counts=program_key,
+                    repetitions=config.repetitions,
+                )
+                program_cache[program_key] = program
+            raw_result = executor.execute(program)
+            pass_iq = _integrated_iq_from_pass_result(
+                raw_result,
+                input_channels,
+                point_count=flat_frequencies.size,
+                repetitions=config.repetitions,
+                segment_sample_counts=program_key,
+            )
+            weighted_iq += pass_iq * float(current_pass.sample_count)
+            completed_samples += current_pass.sample_count
+            completed_percent = 15 + int(
+                60 * (pass_index + 1) / pass_count
+            )
+            if (
+                completed_percent != last_progress_percent
+                or pass_index + 1 == pass_count
+            ):
+                progress(
+                    completed_percent,
+                    (
+                        f"Acquired QCS M5300A calibration pass "
+                        f"{pass_index + 1:,}/{pass_count:,}"
+                    ),
+                )
+                last_progress_percent = completed_percent
+        if completed_samples != actual_sample_count:
+            raise RuntimeError(
+                "internal QCS RF calibration integration accounting mismatch"
+            )
+        point_repetition_iq = weighted_iq / float(completed_samples)
+        means = np.mean(point_repetition_iq, axis=1)
+        mean_i, mean_q = means.real, means.imag
     mean_i = np.asarray(mean_i, dtype=float).reshape(frequency_grid.shape)
     mean_q = np.asarray(mean_q, dtype=float).reshape(frequency_grid.shape)
     progress(80, "Storing tagged QCS RF power calibration")
@@ -1358,6 +1690,11 @@ __all__ = [
     "M5300PowerCalibration",
     "M5300PowerCalibrationConfig",
     "NOMINAL_M5200_50OHM",
+    "QCS_M5200_VOLTAGE_50OHM",
+    "QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_DURATION_S",
+    "QCS_RF_CALIBRATION_MAX_PASS_INTEGRATION_SAMPLES",
+    "QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S",
+    "QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_SAMPLES",
     "QCS_RF_POWER_CALIBRATION_SCHEMA",
     "QcsPhysicalChannelIdentity",
     "REFERENCE_CALIBRATED",

@@ -176,6 +176,8 @@ class QcsM5301DcCalibrationConfig:
     chassis: int
     slot: int
     channel: int
+    ip_address: Optional[str] = None
+    host_controller: int = 0
     module_serial: str = ""
     virtual_channel_name: str = "m5301_dc_calibration"
     voltage_start_v: float = -4.0
@@ -196,6 +198,13 @@ class QcsM5301DcCalibrationConfig:
         _integer(self.chassis, "chassis", 1)
         _integer(self.slot, "slot", 1)
         _integer(self.channel, "channel", 1)
+        ip_address = (
+            None
+            if self.ip_address is None or not str(self.ip_address).strip()
+            else str(self.ip_address).strip()
+        )
+        object.__setattr__(self, "ip_address", ip_address)
+        _integer(self.host_controller, "host_controller", 0)
         if not str(self.virtual_channel_name).strip():
             raise ValueError("virtual_channel_name must not be empty")
         start = _finite(self.voltage_start_v, "voltage_start_v")
@@ -628,10 +637,25 @@ def _reject_nonzero_mapped_offset(
 
 def _create_mapper(qcs: Any, config: QcsM5301DcCalibrationConfig) -> tuple[Any, Any]:
     channel = qcs.Channels(range(1), str(config.virtual_channel_name))
-    mapper = qcs.ChannelMapper()
+    mapper = (
+        qcs.ChannelMapper()
+        if config.ip_address is None
+        else qcs.ChannelMapper(ip_address=config.ip_address)
+    )
+    address_type = getattr(qcs, "Address", None)
+    address = (
+        config.physical_address
+        if address_type is None
+        else address_type(
+            int(config.chassis),
+            int(config.slot),
+            int(config.channel),
+            host_controller=int(config.host_controller),
+        )
+    )
     mapper.add_channel_mapping(
         channels=channel,
-        addresses=[config.physical_address],
+        addresses=[address],
         instrument_types=qcs.InstrumentEnum.M5301AWG,
     )
     return mapper, channel

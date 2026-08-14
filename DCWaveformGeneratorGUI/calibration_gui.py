@@ -5,7 +5,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 import traceback
 from typing import Any, Mapping
@@ -51,10 +51,15 @@ try:
         QcsM5301DcCalibrationConfig,
         run_qcs_m5301_dc_output_calibration,
     )
-    from .qcs_qcodes_experiment import load_qcs_channel_mapper
+    from .qcs_front_panel import (
+        save_qcs_channel_mapper,
+        scoped_qcs_hardware_configuration,
+    )
     from .qcs_rf_power_calibration import (
         M5200PowerReference,
         M5300PowerCalibrationConfig,
+        QCS_M5200_VOLTAGE_50OHM,
+        QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S,
         run_m5300_power_calibration,
     )
 except ImportError:
@@ -75,10 +80,15 @@ except ImportError:
         QcsM5301DcCalibrationConfig,
         run_qcs_m5301_dc_output_calibration,
     )
-    from qcs_qcodes_experiment import load_qcs_channel_mapper
+    from qcs_front_panel import (
+        save_qcs_channel_mapper,
+        scoped_qcs_hardware_configuration,
+    )
     from qcs_rf_power_calibration import (
         M5200PowerReference,
         M5300PowerCalibrationConfig,
+        QCS_M5200_VOLTAGE_50OHM,
+        QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S,
         run_m5300_power_calibration,
     )
 
@@ -86,6 +96,55 @@ except ImportError:
 DEFAULT_CALIBRATION_DB_PATH = str(Path.home() / "gain_pwr_calb.db")
 MAX_INPUT_CALIBRATION_PLOT_CURVES = 32
 CALIBRATION_PATH_MODES = ("output", "input", "dc_voltage")
+
+
+def normalize_qcs_calibration_endpoint_settings(
+    values: Mapping[str, object] | None,
+    *,
+    label: str,
+    allow_lo_frequency: bool,
+) -> Mapping[str, object] | None:
+    """Validate one persisted workflow-local physical QCS endpoint."""
+
+    if values is None:
+        return None
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{label} must be a JSON object or null")
+
+    def integer(key: str, minimum: int) -> int:
+        raw = values.get(key)
+        if isinstance(raw, bool):
+            raise TypeError(f"{label} {key} must be an integer")
+        result = int(raw)
+        if result != raw or result < minimum:
+            raise ValueError(
+                f"{label} {key} must be an integer >= {minimum}"
+            )
+        return result
+
+    raw_ip = values.get("ip_address")
+    ip_address = (
+        None
+        if raw_ip is None or not str(raw_ip).strip()
+        else str(raw_ip).strip()
+    )
+    lo_frequency_hz = values.get("lo_frequency_hz")
+    if lo_frequency_hz in (None, ""):
+        lo_frequency_hz = None
+    else:
+        lo_frequency_hz = float(lo_frequency_hz)
+        if not np.isfinite(lo_frequency_hz) or not 0.0 <= lo_frequency_hz <= 18e9:
+            raise ValueError(f"{label} LO frequency must be in [0, 18] GHz")
+        if not allow_lo_frequency:
+            raise ValueError(f"{label} does not support an LO frequency")
+    return {
+        "ip_address": ip_address,
+        "chassis": integer("chassis", 1),
+        "host_controller": integer("host_controller", 0),
+        "slot": integer("slot", 1),
+        "channel": integer("channel", 1),
+        "lo_frequency_hz": lo_frequency_hz,
+    }
 
 
 def _legacy_calibration_paths(
@@ -233,7 +292,7 @@ class _CalibrationPathWidget(RfPathCorrectionWidget):
 
 
 class _QcsCalibrationPreview(QtWidgets.QGroupBox):
-    """Small shared-chassis preview selecting one QCS calibration endpoint."""
+    """Shared chassis view with a calibration-owned physical endpoint."""
 
     front_panel_requested = QtCore.pyqtSignal()
 
@@ -241,6 +300,9 @@ class _QcsCalibrationPreview(QtWidgets.QGroupBox):
         super().__init__(title, parent)
         self._role = str(role).strip().lower()
         self._configuration = None
+        self._selected_mapping = None
+        self._selection_hardware_identity = None
+        self._allow_legacy_logical_selection = True
         self._preferred_logical_index = 0
         layout = QtWidgets.QVBoxLayout(self)
         self.preview = HardwareFrontPanelPreview(self)
@@ -251,7 +313,6 @@ class _QcsCalibrationPreview(QtWidgets.QGroupBox):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Mapped connector:"))
         self.mapping = QtWidgets.QComboBox(self)
-        self.mapping.currentIndexChanged.connect(self._selection_changed)
         row.addWidget(self.mapping, 1)
         layout.addLayout(row)
 
@@ -263,77 +324,247 @@ class _QcsCalibrationPreview(QtWidgets.QGroupBox):
         configuration: Mapping[str, object] | None,
     ) -> None:
         self._configuration = configuration
-        self.preview.set_qcs_configuration(configuration)
-        current = self.mapping.currentData()
-        if current is None:
-            current = self._preferred_logical_index
-        modules = (
-            {}
-            if configuration is None
-            else {
-                int(module["slot"]): str(module["model"])
-                for module in configuration["modules"]
-            }
-        )
-        mappings = (
-            []
-            if configuration is None
-            else sorted(
+        current_identity = self._current_hardware_identity()
+        if (
+            configuration is not None
+            and
+            self._selected_mapping is not None
+            and self._selection_hardware_identity != current_identity
+        ):
+            self._selected_mapping = None
+            self._selection_hardware_identity = None
+        if (
+            configuration is not None
+            and self._selected_mapping is None
+            and self._allow_legacy_logical_selection
+        ):
+            legacy = next(
                 (
-                    item
+                    dict(item)
                     for item in configuration["channel_mappings"]
                     if str(item["role"]) == self._role
+                    and int(item["logical_index"])
+                    == self._preferred_logical_index
                 ),
-                key=lambda item: int(item["logical_index"]),
+                None,
             )
-        )
-        with QtCore.QSignalBlocker(self.mapping):
-            self.mapping.clear()
-            for item in mappings:
-                logical = int(item["logical_index"])
-                model = modules.get(int(item["slot"]), "Unknown")
-                self.mapping.addItem(
-                    f"{logical}: {item['virtual_name']} | {model}, "
-                    f"slot {int(item['slot'])}, SMA CH {int(item['channel'])}",
-                    logical,
-                )
-            selected = self.mapping.findData(current)
-            self.mapping.setCurrentIndex(selected if selected >= 0 else 0)
-        self.mapping.setEnabled(bool(mappings))
-        self._selection_changed()
+            if legacy is not None:
+                self._selected_mapping = self._local_mapping(legacy)
+                self._selection_hardware_identity = current_identity
+        if (
+            configuration is not None
+            and self._selected_mapping is not None
+            and not self._selected_connector_is_installed()
+        ):
+            self._selected_mapping = None
+            self._selection_hardware_identity = None
+        self._refresh_selection()
 
     def set_logical_index(self, logical_index: int) -> None:
         self._preferred_logical_index = int(logical_index)
-        selected = self.mapping.findData(self._preferred_logical_index)
-        if selected >= 0:
-            self.mapping.setCurrentIndex(selected)
+        if self._configuration is not None and self._selected_mapping is None:
+            self.set_qcs_front_panel_configuration(self._configuration)
 
     def qcs_front_panel_selection(self) -> tuple[str, int]:
-        logical = self.mapping.currentData()
-        return self._role, int(
-            self._preferred_logical_index if logical is None else logical
-        )
+        return self._role, 0
 
     def selected_mapping(self) -> Mapping[str, object]:
         if self._configuration is None:
             raise ValueError("Identify or configure QCS hardware first")
-        role, logical = self.qcs_front_panel_selection()
-        try:
-            return next(
-                item
-                for item in self._configuration["channel_mappings"]
-                if str(item["role"]) == role
-                and int(item["logical_index"]) == logical
-            )
-        except StopIteration as exc:
+        if self._selected_mapping is None:
             raise ValueError(
-                f"QCS {role} logical channel {logical} is not mapped"
-            ) from exc
+                f"Select the QCS calibration {self._role} SMA in the front panel"
+            )
+        if not self._selected_connector_is_installed():
+            raise ValueError(
+                f"The selected QCS calibration {self._role} SMA is no longer "
+                "present in the identified chassis"
+            )
+        return dict(self._selected_mapping)
 
-    def _selection_changed(self, *_args) -> None:
-        role, logical = self.qcs_front_panel_selection()
-        self._preferred_logical_index = logical
-        self.preview.set_qcs_selection(role, logical)
+    def current_qcs_mapping(self) -> Mapping[str, object] | None:
+        """Return the local selection for the pick-only front-panel context."""
+
+        return (
+            None
+            if self._selected_mapping is None
+            else dict(self._selected_mapping)
+        )
+
+    def accept_qcs_front_panel_connector(
+        self,
+        mapping: Mapping[str, object],
+    ) -> None:
+        """Store one physical connector without changing another tab's mapper."""
+
+        candidate = self._local_mapping(mapping)
+        expected_model = {
+            "rf": "M5300A",
+            "acquisition": "M5200A",
+            "dc": "M5301A",
+        }[self._role]
+        model = self._module_model(int(candidate["slot"]))
+        if model != expected_model:
+            raise ValueError(
+                f"QCS calibration {self._role} requires {expected_model}; "
+                f"selected {model or 'unknown module'}"
+            )
+        self._selected_mapping = candidate
+        self._selection_hardware_identity = self._current_hardware_identity()
+        self._allow_legacy_logical_selection = False
+        self._refresh_selection()
+
+    def selection_settings(self) -> Mapping[str, object] | None:
+        if self._selected_mapping is None:
+            return None
+        identity = self._selection_hardware_identity
+        if identity is None:
+            return None
+        return {
+            "ip_address": identity[0],
+            "chassis": identity[1],
+            "host_controller": identity[2],
+            "slot": int(self._selected_mapping["slot"]),
+            "channel": int(self._selected_mapping["channel"]),
+            "lo_frequency_hz": self._selected_mapping.get("lo_frequency_hz"),
+        }
+
+    def set_selection_settings(
+        self,
+        values: Mapping[str, object] | None,
+    ) -> None:
+        self._allow_legacy_logical_selection = False
+        if values is None:
+            self._selected_mapping = None
+            self._selection_hardware_identity = None
+            self._refresh_selection()
+            return
+        normalized = normalize_qcs_calibration_endpoint_settings(
+            values,
+            label=f"QCS calibration {self._role} endpoint",
+            allow_lo_frequency=self._role == "rf",
+        )
+        candidate = dict(normalized)
+        self._selected_mapping = self._local_mapping(candidate)
+        self._selection_hardware_identity = (
+            normalized["ip_address"],
+            int(normalized["chassis"]),
+            int(normalized["host_controller"]),
+        )
+        if (
+            self._configuration is not None
+            and self._selection_hardware_identity
+            != self._current_hardware_identity()
+        ):
+            self._selected_mapping = None
+            self._selection_hardware_identity = None
+        self._refresh_selection()
+
+    def _local_mapping(
+        self,
+        mapping: Mapping[str, object],
+    ) -> dict:
+        names = {
+            "rf": "calibration_rf_output",
+            "acquisition": "calibration_acquisition",
+            "dc": "calibration_dc_output",
+        }
+        lo_frequency_hz = mapping.get("lo_frequency_hz")
+        return {
+            "role": self._role,
+            "logical_index": 0,
+            "virtual_name": names[self._role],
+            "label": int(mapping.get("label", 0)),
+            "absolute_phase": bool(
+                mapping.get("absolute_phase", self._role != "dc")
+            ),
+            "lo_frequency_hz": (
+                None
+                if lo_frequency_hz in (None, "")
+                else float(lo_frequency_hz)
+            ),
+            "slot": int(mapping["slot"]),
+            "channel": int(mapping["channel"]),
+        }
+
+    def _module_model(self, slot: int) -> str | None:
+        if self._configuration is None:
+            return None
+        return next(
+            (
+                str(module["model"])
+                for module in self._configuration["modules"]
+                if int(module["slot"]) == int(slot)
+            ),
+            None,
+        )
+
+    def _current_hardware_identity(self):
+        if self._configuration is None:
+            return None
+        return (
+            (
+                None
+                if self._configuration.get("ip_address") is None
+                else str(self._configuration["ip_address"]).strip() or None
+            ),
+            int(self._configuration["chassis"]),
+            int(self._configuration["host_controller"]),
+        )
+
+    def _selected_connector_is_installed(self) -> bool:
+        if self._selected_mapping is None:
+            return False
+        model = self._module_model(int(self._selected_mapping["slot"]))
+        expected_model = {
+            "rf": "M5300A",
+            "acquisition": "M5200A",
+            "dc": "M5301A",
+        }[self._role]
+        maximum_channel = {
+            "M5300A": 4,
+            "M5200A": 2,
+            "M5301A": 4,
+        }[expected_model]
+        channel = int(self._selected_mapping["channel"])
+        return model == expected_model and 1 <= channel <= maximum_channel
+
+    def _refresh_selection(self) -> None:
+        preview_configuration = None
+        if self._configuration is not None:
+            preview_configuration = dict(self._configuration)
+            preview_configuration["channel_mappings"] = (
+                []
+                if self._selected_mapping is None
+                else [dict(self._selected_mapping)]
+            )
+            preview_configuration["downconverter_links"] = []
+        self.preview.set_qcs_configuration(preview_configuration)
+        self.preview.set_qcs_selection(self._role, 0)
+        with QtCore.QSignalBlocker(self.mapping):
+            self.mapping.clear()
+            if self._selected_mapping is None:
+                self.mapping.addItem("Not selected", None)
+            else:
+                model = self._module_model(int(self._selected_mapping["slot"]))
+                lo_text = ""
+                if self._role == "rf":
+                    lo = self._selected_mapping.get("lo_frequency_hz")
+                    lo_text = (
+                        "; LO not set"
+                        if lo is None
+                        else f"; LO {float(lo) / 1.0e9:.9g} GHz"
+                    )
+                self.mapping.addItem(
+                    f"{model or 'Unknown'}, slot "
+                    f"{int(self._selected_mapping['slot'])}, SMA CH "
+                    f"{int(self._selected_mapping['channel'])}{lo_text}",
+                    (
+                        int(self._selected_mapping["slot"]),
+                        int(self._selected_mapping["channel"]),
+                    ),
+                )
+        self.mapping.setEnabled(False)
 
 
 def input_calibration_plot_data(
@@ -1366,10 +1597,21 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.qcs_rf_amplitude_end.setValue(1.0)
         self.qcs_rf_amplitude_points = self._points(10)
         self.qcs_rf_integration_us = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_integration_us.setRange(0.003333333, 6.826666666)
+        self.qcs_rf_integration_us.setRange(
+            16.0 / 4_800_000_000.0 * 1.0e6,
+            QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S * 1.0e6,
+        )
         self.qcs_rf_integration_us.setDecimals(9)
         self.qcs_rf_integration_us.setValue(1.0)
         self.qcs_rf_integration_us.setSuffix(" us")
+        self.qcs_rf_integration_us.setToolTip(
+            "Total M5200 integrated I/Q averaging time. QCS executes this "
+            "as reusable passes no longer than 100 us; each pass uses flat "
+            "IntegrationFilters no longer than 32,768 samples. Passes and "
+            "filters are sample-weighted into one I/Q value per repetition. "
+            "Passes are separate QCS executions, so this is total integrated "
+            "time rather than one continuous acquisition window."
+        )
         self.qcs_rf_repetitions = QtWidgets.QSpinBox()
         self.qcs_rf_repetitions.setRange(1, 1_000_000)
         self.qcs_rf_repetitions.setValue(100)
@@ -1380,75 +1622,13 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Start relative amplitude:", self.qcs_rf_amplitude_start),
             ("Stop relative amplitude:", self.qcs_rf_amplitude_end),
             ("Amplitude points:", self.qcs_rf_amplitude_points),
-            ("Flat I/Q integration duration:", self.qcs_rf_integration_us),
+            (
+                "Total integrated I/Q averaging time:",
+                self.qcs_rf_integration_us,
+            ),
             ("Repetitions / grid point:", self.qcs_rf_repetitions),
         ):
             form.addRow(label, widget)
-
-        reference_group = QtWidgets.QGroupBox(
-            "M5200A 50 Ohm Power Reference"
-        )
-        reference_form = QtWidgets.QFormLayout(reference_group)
-        self.qcs_rf_reference_mode = QtWidgets.QComboBox()
-        self.qcs_rf_reference_mode.addItem(
-            "Calibrated I/Q-to-dBm reference",
-            "reference_calibrated",
-        )
-        self.qcs_rf_reference_mode.addItem(
-            "Nominal M5200 50 Ohm conversion (not traceable)",
-            "nominal_m5200_50ohm",
-        )
-        self.qcs_rf_reference_mode.setCurrentIndex(1)
-        self.qcs_rf_reference_slope = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_reference_slope.setRange(0.000001, 1000.0)
-        self.qcs_rf_reference_slope.setDecimals(9)
-        self.qcs_rf_reference_slope.setValue(1.0)
-        self.qcs_rf_reference_intercept_dbm = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_reference_intercept_dbm.setRange(-500.0, 500.0)
-        self.qcs_rf_reference_intercept_dbm.setDecimals(9)
-        self.qcs_rf_reference_intercept_dbm.setSuffix(" dBm")
-        self.qcs_rf_nominal_volts_per_iq = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_nominal_volts_per_iq.setRange(1.0e-12, 100.0)
-        self.qcs_rf_nominal_volts_per_iq.setDecimals(12)
-        self.qcs_rf_nominal_volts_per_iq.setValue(0.9)
-        self.qcs_rf_nominal_volts_per_iq.setSuffix(" V / I-Q unit")
-        self.qcs_rf_path_loss_db = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_path_loss_db.setRange(-200.0, 200.0)
-        self.qcs_rf_path_loss_db.setDecimals(9)
-        self.qcs_rf_path_loss_db.setSuffix(" dB")
-        self.qcs_rf_reference_uncertainty_db = QtWidgets.QDoubleSpinBox()
-        self.qcs_rf_reference_uncertainty_db.setRange(0.0, 200.0)
-        self.qcs_rf_reference_uncertainty_db.setDecimals(6)
-        self.qcs_rf_reference_uncertainty_db.setSuffix(" dB")
-        self.qcs_rf_reference_source = QtWidgets.QLineEdit()
-        self.qcs_rf_reference_source.setPlaceholderText(
-            "Reference instrument/run or nominal range assumption"
-        )
-        self.qcs_rf_acknowledge_nominal = QtWidgets.QCheckBox(
-            "I acknowledge that nominal M5200 scaling is not a traceable "
-            "absolute-power calibration"
-        )
-        reference_form.addRow("Conversion mode:", self.qcs_rf_reference_mode)
-        reference_form.addRow("Calibrated log slope:", self.qcs_rf_reference_slope)
-        reference_form.addRow(
-            "Calibrated intercept:",
-            self.qcs_rf_reference_intercept_dbm,
-        )
-        reference_form.addRow(
-            "Nominal M5200 voltage scale:",
-            self.qcs_rf_nominal_volts_per_iq,
-        )
-        reference_form.addRow("Cable/path loss:", self.qcs_rf_path_loss_db)
-        reference_form.addRow(
-            "Reference uncertainty:",
-            self.qcs_rf_reference_uncertainty_db,
-        )
-        reference_form.addRow("Reference source:", self.qcs_rf_reference_source)
-        reference_form.addRow(self.qcs_rf_acknowledge_nominal)
-        vertical.insertWidget(2, reference_group)
-        self.qcs_rf_reference_mode.currentIndexChanged.connect(
-            self._update_qcs_rf_reference_controls
-        )
 
         self.run_qcs_rf_button = QtWidgets.QPushButton(
             "Run M5300A / M5200A Power Calibration"
@@ -1459,7 +1639,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.run_qcs_rf_button.clicked.connect(
             self.qcs_rf_output_requested.emit
         )
-        vertical.insertWidget(3, self.run_qcs_rf_button)
+        vertical.insertWidget(2, self.run_qcs_rf_button)
         self.qcs_rf_result = QtWidgets.QLabel(
             "No M5300A calibration has been run in this session."
         )
@@ -1467,24 +1647,27 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.qcs_rf_result.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        vertical.insertWidget(4, self.qcs_rf_result)
-        self._update_qcs_rf_reference_controls()
+        vertical.insertWidget(3, self.qcs_rf_result)
         return scroll
 
-    def _update_qcs_rf_reference_controls(self, *_args) -> None:
-        calibrated = (
-            self.qcs_rf_reference_mode.currentData()
-            == "reference_calibrated"
+    def qcs_rf_mapper_configuration(self) -> Mapping[str, object]:
+        """Build the two-channel mapper recipe owned by RF calibration."""
+
+        if self._qcs_front_panel_configuration is None:
+            raise ValueError("Identify or configure the QCS front panel first")
+        output = self.qcs_rf_output_preview.selected_mapping()
+        acquisition = self.qcs_rf_input_preview.selected_mapping()
+        return scoped_qcs_hardware_configuration(
+            self._qcs_front_panel_configuration,
+            (output, acquisition),
+            downconverter_links=(),
         )
-        self.qcs_rf_reference_slope.setEnabled(calibrated)
-        self.qcs_rf_reference_intercept_dbm.setEnabled(calibrated)
-        self.qcs_rf_reference_uncertainty_db.setEnabled(calibrated)
-        self.qcs_rf_nominal_volts_per_iq.setEnabled(not calibrated)
-        self.qcs_rf_acknowledge_nominal.setEnabled(not calibrated)
 
     def qcs_rf_output_config(
         self,
-        connection_config,
+        *,
+        mapper_path: str | Path,
+        init_time_s: float,
     ) -> M5300PowerCalibrationConfig:
         if self._qcs_front_panel_configuration is None:
             raise ValueError("Identify or configure the QCS front panel first")
@@ -1513,24 +1696,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             self.qcs_rf_amplitude_end.value(),
             self.qcs_rf_amplitude_points.value(),
         )
-        mode = str(self.qcs_rf_reference_mode.currentData())
-        if mode == "reference_calibrated":
-            reference = M5200PowerReference.calibrated(
-                slope=self.qcs_rf_reference_slope.value(),
-                intercept_dbm=self.qcs_rf_reference_intercept_dbm.value(),
-                path_loss_db=self.qcs_rf_path_loss_db.value(),
-                source=self.qcs_rf_reference_source.text().strip(),
-                uncertainty_db=self.qcs_rf_reference_uncertainty_db.value(),
-            )
-        else:
-            reference = M5200PowerReference.nominal_50ohm(
-                volts_per_iq_unit=self.qcs_rf_nominal_volts_per_iq.value(),
-                path_loss_db=self.qcs_rf_path_loss_db.value(),
-                acknowledge_nominal_scaling=(
-                    self.qcs_rf_acknowledge_nominal.isChecked()
-                ),
-                source=self.qcs_rf_reference_source.text().strip(),
-            )
+        reference = M5200PowerReference.qcs_voltage_50ohm()
         lo_frequency_hz = output.get("lo_frequency_hz")
         if lo_frequency_hz is None:
             raise ValueError(
@@ -1539,7 +1705,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             )
         return M5300PowerCalibrationConfig(
             database_path=self.database_path_value(),
-            mapper_path=str(connection_config.mapper_path),
+            mapper_path=str(mapper_path),
             rf_channel_name=str(output["virtual_name"]),
             acquisition_channel_name=str(acquisition["virtual_name"]),
             frequencies_hz=tuple(
@@ -1551,7 +1717,7 @@ class CalibrationPanel(QtWidgets.QWidget):
                 self.qcs_rf_integration_us.value() * 1.0e-6
             ),
             repetitions=self.qcs_rf_repetitions.value(),
-            init_time_s=float(connection_config.init_time_s),
+            init_time_s=float(init_time_s),
             expected_lo_frequency_hz=float(lo_frequency_hz),
         )
 
@@ -1700,6 +1866,17 @@ class CalibrationPanel(QtWidgets.QWidget):
             chassis=int(self._qcs_front_panel_configuration["chassis"]),
             slot=int(mapping["slot"]),
             channel=int(mapping["channel"]),
+            ip_address=(
+                None
+                if self._qcs_front_panel_configuration.get("ip_address") is None
+                else str(
+                    self._qcs_front_panel_configuration["ip_address"]
+                ).strip()
+                or None
+            ),
+            host_controller=int(
+                self._qcs_front_panel_configuration["host_controller"]
+            ),
             virtual_channel_name=str(mapping["virtual_name"]),
             voltage_start_v=self.qcs_dc_start_v.value(),
             voltage_stop_v=self.qcs_dc_stop_v.value(),
@@ -2213,6 +2390,12 @@ class CalibrationPanel(QtWidgets.QWidget):
             },
             "dc_voltage_application": dict(dc_application),
             "qcs_rf_output": {
+                "output_endpoint": (
+                    self.qcs_rf_output_preview.selection_settings()
+                ),
+                "input_endpoint": (
+                    self.qcs_rf_input_preview.selection_settings()
+                ),
                 "output_logical_index": (
                     self.qcs_rf_output_preview.qcs_front_panel_selection()[1]
                 ),
@@ -2227,26 +2410,9 @@ class CalibrationPanel(QtWidgets.QWidget):
                 "amplitude_points": self.qcs_rf_amplitude_points.value(),
                 "integration_duration_us": self.qcs_rf_integration_us.value(),
                 "repetitions": self.qcs_rf_repetitions.value(),
-                "reference_mode": str(
-                    self.qcs_rf_reference_mode.currentData()
-                ),
-                "reference_slope": self.qcs_rf_reference_slope.value(),
-                "reference_intercept_dbm": (
-                    self.qcs_rf_reference_intercept_dbm.value()
-                ),
-                "nominal_volts_per_iq_unit": (
-                    self.qcs_rf_nominal_volts_per_iq.value()
-                ),
-                "path_loss_db": self.qcs_rf_path_loss_db.value(),
-                "reference_uncertainty_db": (
-                    self.qcs_rf_reference_uncertainty_db.value()
-                ),
-                "reference_source": self.qcs_rf_reference_source.text(),
-                "acknowledge_nominal_scaling": (
-                    self.qcs_rf_acknowledge_nominal.isChecked()
-                ),
             },
             "qcs_dc_output": {
+                "endpoint": self.qcs_dc_preview.selection_settings(),
                 "logical_index": self.qcs_dc_preview.qcs_front_panel_selection()[1],
                 "voltage_start_v": self.qcs_dc_start_v.value(),
                 "voltage_stop_v": self.qcs_dc_stop_v.value(),
@@ -2391,23 +2557,6 @@ class CalibrationPanel(QtWidgets.QWidget):
             (self.qcs_rf_amplitude_points, "amplitude_points", 10),
             (self.qcs_rf_integration_us, "integration_duration_us", 1.0),
             (self.qcs_rf_repetitions, "repetitions", 100),
-            (self.qcs_rf_reference_slope, "reference_slope", 1.0),
-            (
-                self.qcs_rf_reference_intercept_dbm,
-                "reference_intercept_dbm",
-                0.0,
-            ),
-            (
-                self.qcs_rf_nominal_volts_per_iq,
-                "nominal_volts_per_iq_unit",
-                0.9,
-            ),
-            (self.qcs_rf_path_loss_db, "path_loss_db", 0.0),
-            (
-                self.qcs_rf_reference_uncertainty_db,
-                "reference_uncertainty_db",
-                0.0,
-            ),
         )
         for widget, key, default in qcs_rf_assignments:
             widget.setValue(qcs_rf.get(key, default))
@@ -2417,19 +2566,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.qcs_rf_input_preview.set_logical_index(
             int(qcs_rf.get("input_logical_index", 0))
         )
-        reference_index = self.qcs_rf_reference_mode.findData(
-            str(qcs_rf.get("reference_mode", "nominal_m5200_50ohm"))
-        )
-        self.qcs_rf_reference_mode.setCurrentIndex(
-            max(0, reference_index)
-        )
-        self.qcs_rf_reference_source.setText(
-            str(qcs_rf.get("reference_source", ""))
-        )
-        self.qcs_rf_acknowledge_nominal.setChecked(
-            bool(qcs_rf.get("acknowledge_nominal_scaling", False))
-        )
-        self._update_qcs_rf_reference_controls()
+        if "output_endpoint" in qcs_rf:
+            self.qcs_rf_output_preview.set_selection_settings(
+                qcs_rf["output_endpoint"]
+            )
+        if "input_endpoint" in qcs_rf:
+            self.qcs_rf_input_preview.set_selection_settings(
+                qcs_rf["input_endpoint"]
+            )
         qcs_dc_assignments = (
             (self.qcs_dc_start_v, "voltage_start_v", -2.0),
             (self.qcs_dc_stop_v, "voltage_stop_v", 2.0),
@@ -2446,6 +2590,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.qcs_dc_preview.set_logical_index(
             int(qcs_dc.get("logical_index", 0))
         )
+        if "endpoint" in qcs_dc:
+            self.qcs_dc_preview.set_selection_settings(qcs_dc["endpoint"])
         self.qcs_dc_experiment_name.setText(
             str(
                 qcs_dc.get(
@@ -2542,13 +2688,18 @@ class CalibrationPanel(QtWidgets.QWidget):
                 qcs_calibration.full_scale_power_dbm(frequencies_hz),
                 dtype=float,
             )
+            reference_quality = (
+                "automatic QCS M5200 voltage-to-50-Ohm conversion"
+                if qcs_calibration.calibration_quality
+                == QCS_M5200_VOLTAGE_50OHM
+                else str(qcs_calibration.calibration_quality)
+            )
             self.qcs_rf_result.setText(
                 f"M5300A 50 Ohm full-scale map stored for "
                 f"{frequencies_hz.size:,} frequency grid rows. "
                 f"Full-scale power spans {np.min(full_scale_dbm):.6g} to "
                 f"{np.max(full_scale_dbm):.6g} dBm. "
-                f"Reference quality: "
-                f"{qcs_calibration.calibration_quality}; "
+                f"M5200 conversion: {reference_quality}; "
                 f"output {qcs_calibration.output_identity.describe()}; "
                 f"input {qcs_calibration.input_identity.describe()}."
             )
@@ -2677,13 +2828,17 @@ class CalibrationWorker(QtCore.QObject):
         try:
             kwargs = dict(self.kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
-            if self.mode in {"qcs_rf_output", "qcs_dc_output"}:
-                connection_config = kwargs.pop("connection_config")
-                kwargs["mapper"] = load_qcs_channel_mapper(
-                    connection_config
-                )
             if self.mode == "qcs_rf_output":
-                kwargs["config"] = kwargs.pop("calibration_config")
+                mapper_configuration = kwargs.pop("mapper_configuration")
+                calibration_config = kwargs.pop("calibration_config")
+                saved_mapper_path = save_qcs_channel_mapper(
+                    mapper_configuration,
+                    calibration_config.mapper_path,
+                )
+                kwargs["config"] = replace(
+                    calibration_config,
+                    mapper_path=str(saved_mapper_path),
+                )
             runners = {
                 "output": run_output_power_calibration,
                 "input": run_input_power_calibration,
@@ -2730,6 +2885,8 @@ def default_calibration_settings() -> Mapping[str, Any]:
             "run_id": 0,
         },
         "qcs_rf_output": {
+            "output_endpoint": None,
+            "input_endpoint": None,
             "output_logical_index": 0,
             "input_logical_index": 0,
             "frequency_start_mhz": 10.0,
@@ -2740,16 +2897,9 @@ def default_calibration_settings() -> Mapping[str, Any]:
             "amplitude_points": 10,
             "integration_duration_us": 1.0,
             "repetitions": 100,
-            "reference_mode": "nominal_m5200_50ohm",
-            "reference_slope": 1.0,
-            "reference_intercept_dbm": 0.0,
-            "nominal_volts_per_iq_unit": 0.9,
-            "path_loss_db": 0.0,
-            "reference_uncertainty_db": 0.0,
-            "reference_source": "",
-            "acknowledge_nominal_scaling": False,
         },
         "qcs_dc_output": {
+            "endpoint": None,
             "logical_index": 0,
             "voltage_start_v": -2.0,
             "voltage_stop_v": 2.0,
@@ -2782,4 +2932,5 @@ __all__ = [
     "default_calibration_settings",
     "input_calibration_plot_data",
     "normalize_calibration_paths",
+    "normalize_qcs_calibration_endpoint_settings",
 ]

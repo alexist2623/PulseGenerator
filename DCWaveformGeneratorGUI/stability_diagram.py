@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
 from pathlib import Path
 import sqlite3
 from threading import Event
@@ -26,6 +27,7 @@ except ImportError:
     pg = None
 
 try:
+    from . import qcs_qcodes_experiment as _qcs_qcodes_backend
     from .dc_waveform_core import (
         BIAS_T_COMPENSATION_MODES,
         BIAS_T_COMPENSATION_TYPES,
@@ -59,23 +61,29 @@ try:
     from .qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
         QCS_FABRIC_CLOCK_HZ,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
         QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
         QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_STABILITY_INTEGRATION_QUANTUM_S,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
+        QcsCancellationController,
+        QcsExperimentCancelled,
         StoredQcsExperiment,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         quantize_qcs_stability_integration_duration,
     )
     from .hardware_front_panel import HardwareFrontPanelPreview
     from .sparameter_gui import RfPathCorrectionWidget
 except ImportError:
+    import qcs_qcodes_experiment as _qcs_qcodes_backend
     from dc_waveform_core import (
         BIAS_T_COMPENSATION_MODES,
         BIAS_T_COMPENSATION_TYPES,
@@ -109,22 +117,95 @@ except ImportError:
     from qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
         QCS_FABRIC_CLOCK_HZ,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
         QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
         QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_STABILITY_INTEGRATION_QUANTUM_S,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
+        QcsCancellationController,
+        QcsExperimentCancelled,
         StoredQcsExperiment,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         quantize_qcs_stability_integration_duration,
     )
     from hardware_front_panel import HardwareFrontPanelPreview
     from sparameter_gui import RfPathCorrectionWidget
+
+
+# QCS 2.5.5 permits one M5200 IntegrationFilter to contain at most 32,768
+# samples. Readouts up to the hardware-verified 100 us pass size are assembled
+# from reusable filters. Longer requested times are accumulated across bounded
+# QCS passes and reduced to one sample-weighted complex I/Q value.
+QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_SAMPLES = int(
+    QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES
+)
+QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_DURATION_S = float(
+    QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S
+)
+QCS_STABILITY_INTER_SEGMENT_DELAY_S = float(
+    getattr(
+        _qcs_qcodes_backend,
+        "QCS_STABILITY_INTER_SEGMENT_DELAY_S",
+        20.0e-9,
+    )
+)
+_backend_stability_integration_segments = getattr(
+    _qcs_qcodes_backend,
+    "qcs_stability_integration_segment_sample_counts",
+    None,
+)
+
+
+def _stability_integration_segment_sample_counts(
+    sample_count: int,
+) -> tuple[int, ...]:
+    """Return the backend's equal-filter plan, with a compatible fallback."""
+
+    sample_count = int(sample_count)
+    if sample_count <= 0:
+        raise ValueError("stability QCS integration sample count must be positive")
+    if callable(_backend_stability_integration_segments):
+        segments = tuple(
+            int(value)
+            for value in _backend_stability_integration_segments(sample_count)
+        )
+    else:
+        segment_count = max(
+            1,
+            int(
+                math.ceil(
+                    sample_count
+                    / float(QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES)
+                )
+            ),
+        )
+        samples_per_segment = int(
+            math.ceil(
+                sample_count
+                / float(segment_count * 32)
+            )
+            * 32
+        )
+        segments = (samples_per_segment,) * segment_count
+    if not segments or any(value <= 0 for value in segments):
+        raise ValueError("QCS returned an invalid stability integration plan")
+    if any(
+        value > QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES
+        for value in segments
+    ):
+        raise ValueError(
+            "QCS stability integration segment exceeds the M5200 "
+            f"{QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:,}-sample limit"
+        )
+    return segments
 
 
 DEFAULT_STABILITY_START_MV = -100.0
@@ -1990,17 +2071,24 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
         self._kwargs = dict(kwargs)
         self._continuous = bool(continuous)
         self._stop_event = Event()
+        self._cancellation = QcsCancellationController()
 
-    def request_stop(self) -> None:
-        """Stop after the active complete QCS hardware grid."""
+    def request_stop(self) -> bool:
+        """Abort the active QCS pass and retain earlier complete passes."""
+
         self._stop_event.set()
+        return self._cancellation.request_stop()
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
             self._run()
+        except QcsExperimentCancelled:
+            self.stopped.emit()
         except Exception:
             self.failed.emit(traceback.format_exc())
+        finally:
+            self._cancellation.mark_finished()
 
     def _run(self) -> None:
         kwargs = dict(self._kwargs)
@@ -2034,6 +2122,33 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 qcs_module=qcs_module,
             )
         if compiled is None:
+            averaging_plan = plan_qcs_total_iq_averaging(
+                acquisition.duration_s,
+                sample_rate_hz=acquisition.sample_rate_hz,
+                block_samples=int(
+                    round(
+                        QCS_STABILITY_INTEGRATION_QUANTUM_S
+                        * QCS_M5200_SAMPLE_RATE_HZ
+                    )
+                ),
+                max_pass_samples=int(
+                    getattr(
+                        _qcs_qcodes_backend,
+                        "QCS_STABILITY_MAX_INTEGRATION_SAMPLES",
+                        480_000,
+                    )
+                ),
+            )
+            pass_sample_count = int(
+                averaging_plan.pass_sample_counts[0]
+            )
+            pass_acquisition = replace(
+                acquisition,
+                duration_s=(
+                    pass_sample_count / acquisition.sample_rate_hz
+                ),
+                sample_count=pass_sample_count,
+            )
             compiled = compile_qcs_stability_hardware_sweep(
                 sequence,
                 connection_config=connection_config,
@@ -2042,7 +2157,7 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 fabric_mhz=fabric_mhz,
                 source_full_scale_mv=full_scale_mv,
                 rf_pulses=rf_pulses,
-                acquisition=acquisition,
+                acquisition=pass_acquisition,
                 qcs_module=qcs_module,
             )
         if executor is None:
@@ -2067,6 +2182,8 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
         iteration = 0
         while not self._stop_event.is_set():
             iteration += 1
+            if iteration > 1:
+                self._cancellation = QcsCancellationController()
             acquisition_progress_end = 99 if self._continuous else 64
 
             def scan_progress(percent: int, message: str) -> None:
@@ -2080,20 +2197,56 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                     f"Scan {iteration}: {message}",
                 )
 
-            execution = execute_qcs_stability_hardware_sweep(
-                connection_config=connection_config,
-                sequence=sequence,
-                repetitions_per_point=repetitions_per_point,
-                fabric_mhz=fabric_mhz,
-                source_full_scale_mv=full_scale_mv,
-                rf_pulses=rf_pulses,
-                acquisition=acquisition,
-                progress_callback=scan_progress,
-                qcs_module=qcs_module,
-                mapper=mapper,
-                executor=executor,
-                compiled=compiled,
-            )
+            latest_partial_percent = -1
+
+            def scan_partial(partial_execution, *, force: bool = False) -> None:
+                nonlocal latest_partial_percent
+                summary = partial_execution.program_summary
+                completed = int(
+                    summary.get("completed_iq_averaging_passes", 0)
+                )
+                planned = max(
+                    1,
+                    int(summary.get("iq_averaging_pass_count", 1)),
+                )
+                percent = int(100 * completed / planned)
+                if completed >= planned and not force:
+                    return
+                if not force and percent <= latest_partial_percent:
+                    return
+                latest_partial_percent = percent
+                partial_diagram = reduce_fir_stability_result(
+                    partial_execution.ddr_result,
+                    stability_config,
+                    full_scale_mv=full_scale_mv,
+                    iteration=iteration,
+                    readout_spec=readout_spec,
+                )
+                self.scan_ready.emit(partial_diagram)
+
+            try:
+                execution = execute_qcs_stability_hardware_sweep(
+                    connection_config=connection_config,
+                    sequence=sequence,
+                    repetitions_per_point=repetitions_per_point,
+                    fabric_mhz=fabric_mhz,
+                    source_full_scale_mv=full_scale_mv,
+                    rf_pulses=rf_pulses,
+                    acquisition=acquisition,
+                    progress_callback=scan_progress,
+                    partial_callback=scan_partial,
+                    qcs_module=qcs_module,
+                    mapper=mapper,
+                    executor=executor,
+                    compiled=compiled,
+                    cancellation=self._cancellation,
+                )
+            except QcsExperimentCancelled as exc:
+                partial = getattr(exc, "partial_result", None)
+                if partial is not None:
+                    scan_partial(partial, force=True)
+                self.stopped.emit()
+                return
             diagram = reduce_fir_stability_result(
                 execution.ddr_result,
                 stability_config,
@@ -2137,6 +2290,15 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 ],
                 "stability_grid_shape": list(compiled.sweep_shape),
                 "hardware_sweep_program_count": 1,
+                "executor_call_count": int(
+                    execution.program_summary.get("executor_call_count", 1)
+                ),
+                "iq_averaging_pass_count": int(
+                    execution.program_summary.get(
+                        "iq_averaging_pass_count",
+                        1,
+                    )
+                ),
                 "hardware_demodulation": True,
                 "acquisition_result_type": "integrated_iq",
                 "bias_t_compensation_applied": (
@@ -2164,7 +2326,10 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 "qick_only_settings_dormant": True,
                 "coordinate_full_scale_mv": full_scale_mv,
                 "integration_duration_s": (
-                    compiled.acquisition_duration_s
+                    execution.program_summary.get(
+                        "integration_duration_s",
+                        compiled.acquisition_duration_s,
+                    )
                 ),
                 "requested_acquisition_samples": (
                     acquisition.sample_count
@@ -3091,7 +3256,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.qcs_integration_duration_us.setRange(
             qcs_integration_quantum_us,
-            QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6,
+            QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_DURATION_S * 1.0e6,
         )
         self.qcs_integration_duration_us.setDecimals(12)
         self.qcs_integration_duration_us.setSingleStep(
@@ -3103,15 +3268,23 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S * 1.0e6
         )
         self.qcs_integration_duration_us.setToolTip(
-            "Enter the desired M5200 integration (sampling-window) time in "
+            "Enter the desired total M5200 I/Q averaging time in "
             "microseconds; the GUI calculates the sample count automatically. "
             "Stability synchronizes the RF waveform and acquisition, so the "
             "requested time is rounded upward to a "
-            "6.666667 ns (32-sample) timing quantum. The connected QCS "
-            f"2.5.5 ceiling is "
+            "6.666667 ns (32-sample) timing quantum. A readout longer than "
+            f"{QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6:.9g} us "
+            "is split into equal IntegrationFilter windows separated by "
+            f"{QCS_STABILITY_INTER_SEGMENT_DELAY_S * 1.0e9:.9g} ns. Above "
+            "100 us, bounded QCS passes revisit the grid and their completed "
+            "results are reduced into a running sample-weighted complex I/Q "
+            "average. The total Stability ceiling is "
+            f"{QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_SAMPLES:,} samples "
+            f"({QCS_STABILITY_MAX_AGGREGATE_INTEGRATION_DURATION_S * 1.0e6:.9g} "
+            "us). This is an effective averaging time, not one continuous "
+            "raw trace; each IntegrationFilter remains limited to "
             f"{QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:,} samples "
-            f"({QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S * 1.0e6:.9g} "
-            "us)."
+            "and Stop is checked between bounded passes."
         )
         self._qcs_integration_requested_us = (
             self.qcs_integration_duration_us.value()
@@ -3131,10 +3304,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.qcs_point_timing_note.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        self.qcs_point_timing_note.setStyleSheet(
-            "QLabel { color: #3f4f5f; background: #edf5fb; "
-            "border: 1px solid #b8cfdf; padding: 5px; }"
-        )
+        # Keep the calculated timing text available to diagnostics/tests, but
+        # do not expose the verbose per-point breakdown in the compact GUI.
+        self.qcs_point_timing_note.hide()
         self._fir_sample_rate_hz: Optional[float] = None
         self._fir_trigger_delay_us = 0.0
         self._fir_uses_fpga_trigger_delay: Optional[bool] = None
@@ -3246,7 +3418,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "FIR trace samples / point:"
         )
         self.qcs_integration_duration_label = QtWidgets.QLabel(
-            "Integration / sampling time:"
+            "Total I/Q averaging time:"
         )
         self.settle_time_label = QtWidgets.QLabel("Settle before readout:")
         acquisition_form.addRow(self.repetitions_label, self.repetitions)
@@ -3256,7 +3428,6 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.qcs_integration_duration_us,
         )
         acquisition_form.addRow(self.qcs_integration_note)
-        acquisition_form.addRow(self.qcs_point_timing_note)
         acquisition_form.addRow(self.settle_time_label, self.settle_time_us)
         self.fpga_delay_label = QtWidgets.QLabel(
             "FPGA trigger-to-store delay:"
@@ -3679,10 +3850,59 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self,
         requested_us: Optional[float] = None,
     ) -> tuple[float, int]:
+        effective_s, sample_count, _segments, _dead_s, _elapsed_s = (
+            self._qcs_integration_plan(requested_us)
+        )
+        return effective_s, sample_count
+
+    def _qcs_integration_plan(
+        self,
+        requested_us: Optional[float] = None,
+    ) -> tuple[float, int, tuple[int, ...], float, float]:
+        """Resolve total I/Q averaging across bounded QCS readout passes."""
+
         if requested_us is None:
             requested_us = self.qcs_integration_duration_us.value()
-        return quantize_qcs_stability_integration_duration(
-            float(requested_us) * 1.0e-6
+        requested_s = float(requested_us) * 1.0e-6
+        stability_block_samples = int(
+            round(
+                QCS_STABILITY_INTEGRATION_QUANTUM_S
+                * QCS_M5200_SAMPLE_RATE_HZ
+            )
+        )
+        averaging_plan = plan_qcs_total_iq_averaging(
+            requested_s,
+            sample_rate_hz=QCS_M5200_SAMPLE_RATE_HZ,
+            block_samples=stability_block_samples,
+            max_pass_samples=int(
+                getattr(
+                    _qcs_qcodes_backend,
+                    "QCS_STABILITY_MAX_INTEGRATION_SAMPLES",
+                    480_000,
+                )
+            ),
+        )
+        pass_segment_samples = tuple(
+            _stability_integration_segment_sample_counts(pass_samples)
+            for pass_samples in averaging_plan.pass_sample_counts
+        )
+        segment_samples = tuple(
+            segment
+            for pass_segments in pass_segment_samples
+            for segment in pass_segments
+        )
+        sample_count = int(sum(averaging_plan.pass_sample_counts))
+        effective_s = sample_count / QCS_M5200_SAMPLE_RATE_HZ
+        dead_time_s = (
+            sum(max(0, len(segments) - 1) for segments in pass_segment_samples)
+            * QCS_STABILITY_INTER_SEGMENT_DELAY_S
+        )
+        return (
+            effective_s,
+            sample_count,
+            segment_samples,
+            dead_time_s,
+            effective_s + dead_time_s,
         )
 
     def _update_qcs_integration_note(
@@ -3691,21 +3911,65 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     ) -> None:
         if requested_us is None:
             requested_us = self._qcs_integration_requested_us
-        effective_s, sample_count = self._qcs_integration_timing(requested_us)
+        (
+            effective_s,
+            sample_count,
+            segment_samples,
+            dead_time_s,
+            elapsed_s,
+        ) = self._qcs_integration_plan(requested_us)
         effective_us = effective_s * 1.0e6
-        if effective_us - float(requested_us) > 1.0e-12:
-            self.qcs_integration_note.setText(
-                f"Requested {float(requested_us):.12g} us was adjusted "
-                f"upward to {effective_us:.12g} us "
-                f"({sample_count:,} M5200 samples) to satisfy the "
-                f"{QCS_STABILITY_INTEGRATION_QUANTUM_S * 1.0e9:.6f} ns "
-                "QCS timing quantum."
+        dead_time_us = dead_time_s * 1.0e6
+        elapsed_us = elapsed_s * 1.0e6
+        segment_count = len(segment_samples)
+        stability_block_samples = int(
+            round(
+                QCS_STABILITY_INTEGRATION_QUANTUM_S
+                * QCS_M5200_SAMPLE_RATE_HZ
             )
-            self._update_qcs_point_timing_note(effective_s)
-            return
+        )
+        averaging_plan = plan_qcs_total_iq_averaging(
+            float(requested_us) * 1.0e-6,
+            sample_rate_hz=QCS_M5200_SAMPLE_RATE_HZ,
+            block_samples=stability_block_samples,
+            max_pass_samples=int(
+                getattr(
+                    _qcs_qcodes_backend,
+                    "QCS_STABILITY_MAX_INTEGRATION_SAMPLES",
+                    480_000,
+                )
+            ),
+        )
+        pass_count = len(averaging_plan.pass_sample_counts)
+        gaps = max(0, segment_count - pass_count)
+        if len(set(segment_samples)) == 1:
+            segment_size_text = f"{segment_samples[0]:,} samples each"
+        else:
+            segment_size_text = (
+                f"{min(segment_samples):,}-{max(segment_samples):,} samples each"
+            )
+        adjustment_text = (
+            "adjusted upward to"
+            if effective_us - float(requested_us) > 1.0e-12
+            else "programmed as"
+        )
+        pass_text = (
+            "one bounded QCS pass"
+            if pass_count == 1
+            else f"{pass_count:,} bounded QCS passes"
+        )
         self.qcs_integration_note.setText(
-            f"Programmed {effective_us:.12g} us "
-            f"({sample_count:,} M5200 samples); this satisfies the "
+            f"Requested {float(requested_us):.12g} us; {adjustment_text} "
+            f"{effective_us:.12g} us total I/Q averaging time "
+            f"({sample_count:,} M5200 samples) using {pass_text} and "
+            f"{segment_count:,} IntegrationFilter segment(s), "
+            f"{segment_size_text}. The {gaps} inter-segment gap(s) are "
+            f"{QCS_STABILITY_INTER_SEGMENT_DELAY_S * 1.0e9:.9g} ns each "
+            f"({dead_time_us:.12g} us total dead time), so the elapsed "
+            f"filter time is {elapsed_us:.12g} us, excluding pass overhead. "
+            "Completed passes are combined as a running sample-weighted "
+            "complex I/Q average and remain available if Stop is requested. "
+            "This satisfies the "
             f"{QCS_STABILITY_INTEGRATION_QUANTUM_S * 1.0e9:.6f} ns "
             "QCS timing quantum."
         )
@@ -3724,7 +3988,19 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             integration_duration_s, _samples = self._qcs_integration_timing(
                 self._qcs_integration_requested_us
             )
+        (
+            integration_duration_s,
+            integration_samples,
+            segment_samples,
+            dead_time_s,
+            readout_elapsed_s,
+        ) = self._qcs_integration_plan(
+            float(integration_duration_s) * 1.0e6
+        )
         integration_us = float(integration_duration_s) * 1.0e6
+        dead_time_us = dead_time_s * 1.0e6
+        readout_elapsed_us = readout_elapsed_s * 1.0e6
+        segment_count = len(segment_samples)
         requested_settle_us = float(self.settle_time_us.value())
         ramp_edge_us = QCS_STABILITY_DC_RAMP_S * 1.0e6
         edge_padding_us = QCS_STABILITY_DC_EDGE_PADDING_S * 1.0e6
@@ -3738,7 +4014,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             * 1.0e6
         )
         effective_settle_us = readout_start_us - ramp_edge_us
-        readout_end_us = readout_start_us + integration_us
+        readout_end_us = readout_start_us + readout_elapsed_us
         # Use the exact duration-to-cycle conversion used by
         # build_qick_sequence.  This intentionally has no near-integer
         # tolerance: the sequence builder always ceilings the raw float.
@@ -3746,7 +4022,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         measurement_cycles = _cycles_from_ns(
             (
                 requested_settle_us
-                + integration_us
+                + readout_elapsed_us
                 + DEFAULT_STABILITY_POINT_GUARD_US
                 + edge_padding_us
             )
@@ -3798,9 +4074,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             f"during 0-"
             f"{ramp_edge_us:.12g} us, then keeps the full target voltage "
             f"through {plateau_end_us:.12g} us. RF output and acquisition "
-            f"run together from {readout_start_us:.12g} to "
+            f"readout spans {readout_start_us:.12g} to "
             f"{readout_end_us:.12g} us, after {effective_settle_us:.12g} us "
-            f"at the full target voltage; the post-readout full-level guard "
+            f"at the full target voltage. It integrates {integration_us:.12g} "
+            f"us ({integration_samples:,} samples) in {segment_count} "
+            f"segment(s), with {dead_time_us:.12g} us total inter-segment "
+            f"dead time; elapsed readout is {readout_elapsed_us:.12g} us. The "
+            f"post-readout full-level guard "
             f"is {post_readout_guard_us:.12g} us (requested "
             f"{DEFAULT_STABILITY_POINT_GUARD_US:.12g} us). The target then "
             f"ramps to 0 V and ends with an explicit terminal-zero interval."
@@ -3854,7 +4134,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             is_qcs,
         )
         self.qcs_integration_note.setVisible(is_qcs)
-        self.qcs_point_timing_note.setVisible(is_qcs)
+        self.qcs_point_timing_note.setVisible(False)
         self._set_acquisition_row_visible(
             self.qcs_modulation_amplitude,
             is_qcs,
@@ -4744,7 +5024,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
 
     def set_stopping(self) -> None:
         self.stop_button.setEnabled(False)
-        self.status.setText("Stopping after the active full scan completes...")
+        self.status.setText(
+            "Stopping the active QCS pass; completed averages remain usable..."
+            if self._hardware_backend == "qcs"
+            else "Stopping after the active full scan completes..."
+        )
 
     def update_progress(self, percent: int, message: str) -> None:
         self.progress.setValue(max(0, min(100, int(percent))))

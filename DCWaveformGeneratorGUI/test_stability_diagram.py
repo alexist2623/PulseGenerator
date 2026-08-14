@@ -24,7 +24,7 @@ from qick_qcodes_experiment import (
     QickConnectionConfig,
     store_qick_result,
 )
-from qcs_qcodes_experiment import QcsConnectionConfig
+from qcs_qcodes_experiment import QcsAcquisitionConfig, QcsConnectionConfig
 import qcs_front_panel as front_panel
 import stability_diagram as stability
 from fir_ddr_profile import FirDdrProfile
@@ -793,7 +793,12 @@ def test_qcs_continuous_worker_runs_one_native_grid_without_storage(
             "repetitions_per_point": 2,
             "fabric_mhz": 300.0,
             "rf_pulses": (),
-            "acquisition": SimpleNamespace(sample_count=3),
+            "acquisition": QcsAcquisitionConfig(
+                at_segment="set_0",
+                duration_s=32 / 4.8e9,
+                sample_rate_hz=4.8e9,
+                sample_count=32,
+            ),
             "readout_spec": None,
         },
         continuous=True,
@@ -921,7 +926,12 @@ def test_qcs_single_worker_persists_effective_scale_and_monotonic_progress(
             "repetitions_per_point": 2,
             "fabric_mhz": 300.0,
             "rf_pulses": (),
-            "acquisition": SimpleNamespace(sample_count=3),
+            "acquisition": QcsAcquisitionConfig(
+                at_segment="set_0",
+                duration_s=32 / 4.8e9,
+                sample_rate_hz=4.8e9,
+                sample_count=32,
+            ),
             "readout_spec": None,
         },
         continuous=False,
@@ -1222,7 +1232,7 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.qcs_integration_duration_us.isVisible() is True
     assert (
         panel.qcs_integration_duration_label.text()
-        == "Integration / sampling time:"
+        == "Total I/Q averaging time:"
     )
     assert "calculates the sample count automatically" in (
         panel.qcs_integration_duration_us.toolTip()
@@ -1396,7 +1406,21 @@ def test_stability_qcs_integration_time_rounds_up_and_reports_effective_time():
     panel.qcs_integration_duration_us.editingFinished.emit()
     assert panel.qcs_integration_duration_us.value() == pytest.approx(0.020)
     assert panel.config(full_scale_mv=2500.0).trace_samples_per_point == 96
-    assert "Programmed 0.02 us" in panel.qcs_integration_note.text()
+    assert "programmed as 0.02 us total I/Q averaging time" in (
+        panel.qcs_integration_note.text()
+    )
+
+    assert panel.qcs_integration_duration_us.maximum() == pytest.approx(
+        100_000.0
+    )
+    panel.qcs_integration_duration_us.setValue(100_000.0)
+    panel.qcs_integration_duration_us.editingFinished.emit()
+    config = panel.config(full_scale_mv=2500.0)
+    assert config.trace_samples_per_point == 480_000_000
+    assert "1,000 bounded QCS passes" in panel.qcs_integration_note.text()
+    assert "running sample-weighted complex I/Q average" in (
+        panel.qcs_integration_note.text()
+    )
 
     panel.close()
 

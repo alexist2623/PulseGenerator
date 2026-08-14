@@ -38,7 +38,9 @@ try:
     from .hardware_front_panel import HardwareFrontPanelPreview
     from .fir_ddr_profile import format_sample_rate_hz
     from .qcs_qcodes_experiment import (
-        QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QcsCancellationController,
+        QcsExperimentCancelled,
         run_qcs_sparameter_sweep,
     )
 except ImportError:
@@ -55,7 +57,9 @@ except ImportError:
     from hardware_front_panel import HardwareFrontPanelPreview
     from fir_ddr_profile import format_sample_rate_hz
     from qcs_qcodes_experiment import (
-        QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S,
+        QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
+        QcsCancellationController,
+        QcsExperimentCancelled,
         run_qcs_sparameter_sweep,
     )
 
@@ -962,6 +966,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     """Controls for an RF-only generator/readout hardware frequency sweep."""
 
     run_requested = QtCore.pyqtSignal()
+    stop_requested = QtCore.pyqtSignal()
     load_requested = QtCore.pyqtSignal(int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
@@ -1036,13 +1041,17 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.scan_time_us.setDecimals(6)
         self.scan_time_us.setValue(1.0)
         self.scan_time_us.setSuffix(" us")
+        # Keep an explicit Python-owned label.  Relying on QFormLayout's
+        # implicit label wrapper can leave a stale SIP wrapper after other
+        # experiment panels are created and destroyed in the same process.
+        self.scan_time_label = QtWidgets.QLabel("Scan time per point:")
         sweep_form.addRow("Start frequency:", self.frequency_start_mhz)
         sweep_form.addRow("End frequency:", self.frequency_end_mhz)
         sweep_form.addRow("Frequency points:", self.frequency_points)
         sweep_form.addRow("Single output gain:", self.gain)
         sweep_form.addRow("QCS relative amplitude:", self.qcs_amplitude)
         sweep_form.addRow("Single target power:", self.output_power_dbm)
-        sweep_form.addRow("Scan time per point:", self.scan_time_us)
+        sweep_form.addRow(self.scan_time_label, self.scan_time_us)
         self.gain_label = sweep_form.labelForField(self.gain)
         self.qcs_amplitude_label = sweep_form.labelForField(
             self.qcs_amplitude
@@ -1050,7 +1059,6 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.output_power_label = sweep_form.labelForField(
             self.output_power_dbm
         )
-        self.scan_time_label = sweep_form.labelForField(self.scan_time_us)
         content_layout.addWidget(sweep_group)
 
         self.power_calibration_enabled = QtWidgets.QGroupBox(
@@ -1244,6 +1252,13 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
         self.run_button.clicked.connect(self.run_requested.emit)
+        self.stop_button = QtWidgets.QPushButton("Stop QCS Sweep")
+        self.stop_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        )
+        self.stop_button.setEnabled(False)
+        self.stop_button.setVisible(False)
+        self.stop_button.clicked.connect(self.stop_requested.emit)
         self.run_id = QtWidgets.QSpinBox()
         self.run_id.setRange(0, 2_147_483_647)
         self.run_id.setSpecialValueText("Latest S-parameter run")
@@ -1257,7 +1272,10 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         load_row = QtWidgets.QHBoxLayout()
         load_row.addWidget(self.run_id, 1)
         load_row.addWidget(self.load_button)
-        outer.addWidget(self.run_button)
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.addWidget(self.run_button, 1)
+        run_row.addWidget(self.stop_button)
+        outer.addLayout(run_row)
         outer.addLayout(load_row)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
@@ -1497,16 +1515,16 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         is_qcs = self._hardware_backend == "qcs"
         if is_qcs:
             qcs_max_us = float(
-                QCS_SPARAMETER_MAX_INTEGRATION_DURATION_S * 1.0e6
+                QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S * 1.0e6
             )
             self.scan_time_us.setMaximum(qcs_max_us)
             self.scan_time_us.setToolTip(
-                "QCS uses flat M5200 hardware-demodulation filters. Above "
-                "the single-filter limit, the measurement is split into "
-                "equal repeated integrations separated by a hardware-safe "
-                "20 ns guard; their "
-                "complex I/Q values are combined with sample-count "
-                f"weights. Hardware-tested maximum: {qcs_max_us:g} us."
+                "Total effective M5200 I/Q averaging time per frequency. "
+                "Up to 100 us is executed in one bounded QCS pass using "
+                "hardware-safe IntegrationFilter windows. Longer requests "
+                "repeat bounded QCS passes and combine completed complex I/Q "
+                "results with sample-count weights. This is not a continuous "
+                f"raw trace. Maximum total: {qcs_max_us:g} us."
             )
         else:
             self.scan_time_us.setMaximum(1.0e6)
@@ -1535,7 +1553,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.qcs_amplitude_label.setVisible(is_qcs)
         self.qcs_amplitude.setVisible(is_qcs)
         self.scan_time_label.setText(
-            "Requested integration duration:"
+            "Total I/Q averaging time:"
             if is_qcs
             else "Scan time per point:"
         )
@@ -1569,6 +1587,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_fpga_trigger_delay_controls()
         self._update_power_control_state(False)
         self.run_button.setEnabled(not self._running)
+        self.stop_button.setVisible(is_qcs)
+        self.stop_button.setEnabled(is_qcs and self._running)
 
     def set_qcs_front_panel_configuration(
         self,
@@ -1802,6 +1822,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.run_button.setEnabled(
             not running
         )
+        self.stop_button.setEnabled(
+            running and self._hardware_backend == "qcs"
+        )
         self.load_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
         self.browse_database.setEnabled(not running)
@@ -1823,6 +1846,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self.progress.setValue(0)
         self.status.setText(message)
 
+    def set_stopping(self, message: str = "Stopping QCS RF sweep...") -> None:
+        """Prevent duplicate Stop requests while QCS abort/cleanup finishes."""
+
+        self.stop_button.setEnabled(False)
+        self.status.setText(str(message))
+
     def update_progress(self, percent: int, message: str) -> None:
         percent = max(0, min(100, int(percent)))
         self.progress.setValue(percent)
@@ -1840,12 +1869,17 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         if is_qcs:
             readout = rf_settings.get("readout", {})
             integration_duration_s = (
-                float(readout.get("integration_duration_s", 0.0))
+                float(
+                    readout.get(
+                        "total_iq_averaging_duration_s",
+                        readout.get("integration_duration_s", 0.0),
+                    )
+                )
                 if isinstance(readout, Mapping)
                 else 0.0
             )
             integration_text = (
-                f", {integration_duration_s * 1.0e6:g} us integration"
+                f", {integration_duration_s * 1.0e6:g} us total I/Q averaging"
                 if integration_duration_s > 0.0
                 else ""
             )
@@ -2715,22 +2749,75 @@ class QcsSParameterSweepWorker(QtCore.QObject):
     """Run one QCS-resolved RF frequency sweep off the GUI thread."""
 
     finished = QtCore.pyqtSignal(object)
+    stopped = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
     progress_changed = QtCore.pyqtSignal(int, str)
+    partial_result = QtCore.pyqtSignal(object)
 
     def __init__(self, kwargs: Mapping[str, Any], parent=None):
         super().__init__(parent)
         self._kwargs = dict(kwargs)
+        self._cancellation = QcsCancellationController()
+
+    def request_stop(self) -> bool:
+        """Request cooperative cancellation and abort an active QCS pass."""
+
+        return self._cancellation.request_stop()
+
+    def is_stop_requested(self) -> bool:
+        return self._cancellation.is_stop_requested()
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
             kwargs = dict(self._kwargs)
             kwargs["progress_callback"] = self.progress_changed.emit
+            latest_reported_percent = -1
+
+            def publish_partial(execution) -> None:
+                nonlocal latest_reported_percent
+                summary = getattr(execution, "program_summary", {})
+                completed = int(
+                    summary.get("completed_iq_averaging_passes", 0)
+                )
+                planned = max(
+                    1,
+                    int(summary.get("iq_averaging_pass_count", 1)),
+                )
+                percent = int(100 * completed / planned)
+                if percent > latest_reported_percent or completed == planned:
+                    latest_reported_percent = percent
+                    self.partial_result.emit(execution)
+
+            kwargs["partial_callback"] = publish_partial
+            kwargs["cancellation"] = self._cancellation
             stored = run_qcs_sparameter_sweep(**kwargs)
+        except QcsExperimentCancelled as exc:
+            partial = getattr(exc, "partial_result", None)
+            if partial is not None:
+                self.partial_result.emit(partial)
+                summary = getattr(partial, "program_summary", {})
+                completed = int(
+                    summary.get("completed_iq_averaging_passes", 0)
+                )
+                planned = int(summary.get("iq_averaging_pass_count", 0))
+                message = (
+                    "Stopped by user after "
+                    f"{completed:,}/{planned:,} completed I/Q averaging "
+                    "passes; the cumulative result remains displayed"
+                )
+            else:
+                message = (
+                    "Stopped by user before a complete QCS averaging pass"
+                )
+            self._cancellation.mark_finished()
+            self.stopped.emit(message)
+            return
         except Exception:
+            self._cancellation.mark_finished()
             self.failed.emit(traceback.format_exc())
             return
+        self._cancellation.mark_finished()
         self.finished.emit(stored)
 
 

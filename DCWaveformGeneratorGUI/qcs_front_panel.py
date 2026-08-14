@@ -1111,6 +1111,50 @@ def qcs_hardware_mapper_fingerprint(
     return hashlib.sha256(payload).hexdigest()
 
 
+def scoped_qcs_hardware_configuration(
+    inventory: Mapping[str, Any],
+    channel_mappings: Sequence[Mapping[str, Any]],
+    *,
+    downconverter_links: Sequence[Mapping[str, Any]] = (),
+) -> dict:
+    """Return a mapper recipe containing only one workflow's channels.
+
+    The installed chassis and module inventory are shared by every GUI tab,
+    but virtual channels and mixer routes are workflow-owned.
+    """
+
+    normalized = normalize_qcs_hardware_configuration(inventory)
+    scoped = dict(normalized)
+    scoped["channel_mappings"] = [dict(item) for item in channel_mappings]
+    scoped["downconverter_links"] = [
+        dict(item) for item in downconverter_links
+    ]
+    return normalize_qcs_hardware_configuration(scoped)
+
+
+def qcs_workflow_mapper_output_path(
+    configuration: Mapping[str, Any],
+    workflow: str,
+) -> Path:
+    """Return a stable app-owned native mapper path for one workflow."""
+
+    workflow_name = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(workflow).strip().lower(),
+    ).strip("_")
+    if not workflow_name:
+        raise ValueError("QCS mapper workflow name must not be empty")
+    app_data = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.AppLocalDataLocation
+    )
+    root = Path(app_data) if app_data else Path.home() / ".pulsegenerator"
+    mapper_directory = root / "qcs_mappers"
+    mapper_directory.mkdir(parents=True, exist_ok=True)
+    fingerprint = qcs_hardware_mapper_fingerprint(configuration)
+    return mapper_directory / f"{workflow_name}_{fingerprint[:24]}.qcs"
+
+
 def synchronize_qcs_hardware_role_names(
     configuration: Mapping[str, Any],
     dc_channel_names: Sequence[str],
@@ -2593,6 +2637,7 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
 
     identify_requested = QtCore.pyqtSignal(str)
     connector_selected = QtCore.pyqtSignal(str, int, int, int, bool)
+    connector_picked = QtCore.pyqtSignal(str, int, int, int, object)
     m5201_route_selection_started = QtCore.pyqtSignal()
     m5201_route_selection_finished = QtCore.pyqtSignal()
     m5300_lo_frequency_changed = QtCore.pyqtSignal(
@@ -2624,6 +2669,8 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         self._syncing_downconverter_lo = False
         self._pending_m5201_route: Optional[tuple[int, int]] = None
         self._focused_mapping: Optional[tuple[str, int]] = None
+        self._connector_pick_only = False
+        self._connector_pick_existing: Optional[dict] = None
         # RF-path previews such as Stability and S-Parameter select either
         # endpoint from one full chassis view. Other callers retain a strict
         # single-role focus.
@@ -4129,6 +4176,58 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                         connector is not None
                         and connector.get("model") == "M5300A"
                     ):
+                        if self._connector_pick_only:
+                            if (
+                                self._focused_mapping is None
+                                or self._focused_mapping[0] != "rf"
+                            ):
+                                return True
+                            slot = int(connector["slot"])
+                            channel = int(connector["channel"])
+                            existing = self._connector_pick_existing
+                            current_lo_hz = None
+                            if (
+                                existing is not None
+                                and int(existing.get("slot", -1)) == slot
+                                and int(existing.get("channel", -1)) == channel
+                            ):
+                                current_lo_hz = existing.get("lo_frequency_hz")
+                            lo_ghz, accepted = QtWidgets.QInputDialog.getDouble(
+                                self,
+                                "Calibration M5300 RF Output LO",
+                                "M5300 local-oscillator frequency [GHz]:",
+                                (
+                                    5.0
+                                    if current_lo_hz is None
+                                    else float(current_lo_hz) / 1.0e9
+                                ),
+                                0.0,
+                                18.0,
+                                9,
+                            )
+                            if accepted:
+                                logical_index = int(
+                                    self._focused_mapping[1]
+                                )
+                                picked = {
+                                    "role": "rf",
+                                    "logical_index": logical_index,
+                                    "virtual_name": "calibration_rf_output",
+                                    "label": 0,
+                                    "absolute_phase": True,
+                                    "lo_frequency_hz": float(lo_ghz) * 1.0e9,
+                                    "slot": slot,
+                                    "channel": channel,
+                                    "model": "M5300A",
+                                }
+                                self.connector_picked.emit(
+                                    "rf",
+                                    logical_index,
+                                    slot,
+                                    channel,
+                                    picked,
+                                )
+                            return True
                         self._prompt_m5300_lo_frequency(
                             int(connector["slot"]),
                             int(connector["channel"]),
@@ -4143,19 +4242,24 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 # which experiment channel opened this shared front panel.
                 # Selecting either connector of a pair arms the next M5200A
                 # SMA click while preserving the original DC/RF focus.
-                downconverter = qcs_chassis_connector_at_point(
-                    configuration,
-                    source_x,
-                    source_y,
-                    role="downconverter",
-                )
+                downconverter = None
+                if not self._connector_pick_only:
+                    downconverter = qcs_chassis_connector_at_point(
+                        configuration,
+                        source_x,
+                        source_y,
+                        role="downconverter",
+                    )
                 if downconverter is not None:
                     self.show_m5201_route_dialog(
                         int(downconverter["slot"]),
                         int(downconverter["channel"]),
                     )
                     return True
-                if self._pending_m5201_route is not None:
+                if (
+                    not self._connector_pick_only
+                    and self._pending_m5201_route is not None
+                ):
                     digitizer = qcs_chassis_connector_at_point(
                         configuration,
                         source_x,
@@ -4294,6 +4398,20 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
         """Return every endpoint highlighted by the active selection mode."""
 
         if self._rf_acquisition_path_focus is None:
+            if self._connector_pick_only:
+                if (
+                    self._connector_pick_existing is not None
+                    and self._focused_mapping is not None
+                    and str(self._connector_pick_existing.get("role", ""))
+                    == self._focused_mapping[0]
+                ):
+                    return (
+                        (
+                            int(self._connector_pick_existing["slot"]),
+                            int(self._connector_pick_existing["channel"]),
+                        ),
+                    )
+                return ()
             address = self._focused_mapping_address(configuration)
             addresses = [] if address is None else [address]
             if (
@@ -5258,6 +5376,87 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
                 error=True,
             )
             return False
+
+        if self._connector_pick_only:
+            mappings = self._mappings_from_widgets()
+            selected_mapping = next(
+                (
+                    mapping
+                    for mapping in mappings
+                    if (int(mapping["slot"]), int(mapping["channel"]))
+                    == (slot, channel)
+                ),
+                None,
+            )
+            local_mapping = self._connector_pick_existing
+            if (
+                local_mapping is not None
+                and (
+                    int(local_mapping.get("slot", -1)),
+                    int(local_mapping.get("channel", -1)),
+                )
+                == (slot, channel)
+            ):
+                selected_mapping = dict(local_mapping)
+            lo_frequency_hz = (
+                None
+                if selected_mapping is None
+                else selected_mapping.get("lo_frequency_hz")
+            )
+            if role == "rf" and model == "M5300A" and lo_frequency_hz is None:
+                lo_frequency_ghz, accepted = QtWidgets.QInputDialog.getDouble(
+                    self,
+                    "M5300 RF Output LO",
+                    "M5300 local-oscillator frequency [GHz]:",
+                    5.0,
+                    0.0,
+                    18.0,
+                    9,
+                )
+                if not accepted:
+                    self._set_status(
+                        "M5300 LO entry was cancelled; the calibration "
+                        "connector was not changed.",
+                        error=False,
+                    )
+                    return False
+                lo_frequency_hz = float(lo_frequency_ghz) * 1.0e9
+            picked = {
+                "role": role,
+                "logical_index": int(logical_index),
+                "virtual_name": (
+                    "calibration_rf_output"
+                    if role == "rf"
+                    else (
+                        "calibration_acquisition"
+                        if role == "acquisition"
+                        else "calibration_dc_output"
+                    )
+                ),
+                "label": 0,
+                "absolute_phase": role != "dc",
+                "lo_frequency_hz": (
+                    None
+                    if role != "rf" or lo_frequency_hz is None
+                    else float(lo_frequency_hz)
+                ),
+                "slot": slot,
+                "channel": channel,
+                "model": model,
+            }
+            self._set_status(
+                f"Selected {model} slot {slot} CH{channel} for this "
+                "calibration only; the Experiment mapper was not changed.",
+                error=False,
+            )
+            self.connector_picked.emit(
+                role,
+                int(logical_index),
+                slot,
+                channel,
+                picked,
+            )
+            return True
 
         clean_imported_configuration = None
         if not self._mapper_write_allowed:
@@ -6809,6 +7008,21 @@ class QcsFrontPanelControl(QtWidgets.QWidget):
             self.status.setStyleSheet(style_sheet)
             self._status_before_lock = None
 
+    def set_connector_pick_only(
+        self,
+        enabled: bool,
+        existing_mapping: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Select a physical SMA without editing the shared mapper recipe."""
+
+        self._connector_pick_only = bool(enabled)
+        self._connector_pick_existing = (
+            None if existing_mapping is None else dict(existing_mapping)
+        )
+        if hasattr(self, "_preview_refresh_timer"):
+            self._preview_refresh_timer.stop()
+            self._refresh_reference_preview()
+
 
 __all__ = [
     "DEFAULT_QCS_IP_ADDRESS",
@@ -6838,8 +7052,10 @@ __all__ = [
     "qcs_hardware_mapper_fingerprint",
     "qcs_mapper_file_sha256",
     "qcs_role_bindings",
+    "qcs_workflow_mapper_output_path",
     "resize_qcs_dc_mappings",
     "save_qcs_channel_mapper",
+    "scoped_qcs_hardware_configuration",
     "synchronize_qcs_hardware_role_names",
     "validate_imported_qcs_role_configuration",
 ]

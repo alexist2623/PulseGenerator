@@ -856,7 +856,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.qcs_duration_us.setToolTip(
             "Raw M5200 capture duration. The value is rounded upward to one "
             "4.8 GSa/s sample. The 10,000,000-sample maximum is a GUI payload "
-            "limit, not a stated M5200 hardware limit."
+            "limit, not a stated M5200 hardware limit. The 100 ms total-I/Q "
+            "averaging option used by Single-I/Q experiments does not apply "
+            "here because Noise Analysis must preserve every trace sample."
         )
         self.qcs_duration_note = QtWidgets.QLabel(acquisition_group)
         self.qcs_duration_note.setWordWrap(True)
@@ -1407,7 +1409,9 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             f"{sample_count:,} M5200 samples at "
             f"{QCS_M5200_SAMPLE_RATE_HZ / 1.0e9:g} GSa/s; "
             f"effective {duration_s * 1.0e6:.9g} us; "
-            f"approximately {payload_label} stored as float64."
+            f"approximately {payload_label} stored as float64. This is a raw "
+            "trace, so it is intentionally not expanded to the 100 ms "
+            "Single-I/Q averaging ceiling."
         )
 
     def _update_input_board_controls(self, _board: str = "") -> None:
