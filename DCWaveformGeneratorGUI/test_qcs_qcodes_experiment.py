@@ -268,6 +268,19 @@ def _two_output_bias_t_screenshot_sequence():
     )
 
 
+def _two_output_nonzero_initial_hold_sequence():
+    """Two-output waveform matching the reported 100/10/0.4/10/200 us rows."""
+
+    return (
+        FineTuneSequence(("awg_0", "awg_1"))
+        .add_set("set_0", [-0.25, 0.1875], 30_000)
+        .add_ramp("ramp_0", 3_000)
+        .add_set("set_1", [0.375, -0.25], 120)
+        .add_ramp("ramp_1", 3_000)
+        .add_set("set_2", [-0.125, 0.375], 60_000)
+    )
+
+
 def _connection(**changes):
     values = {
         "mapper_path": "unused.json",
@@ -292,8 +305,7 @@ def _acquisition(**changes):
 def _stability_sequence():
     return (
         FineTuneSequence(("x_gate", "y_gate"))
-        # A fully rendered 40 us plateau remains below the connected HCL
-        # M5301 limit and avoids the hardware-invalid constant-seed + Hold.
+        # The 40 us plateau is lowered to a minimum constant seed plus Hold.
         .add_set("set_0", [0.0, 0.0], 12_000)
         .add_amplitude_sweep("set_0", "x_gate", -0.25, 0.25, 3)
         .add_amplitude_sweep("set_0", "y_gate", -0.5, 0.5, 2)
@@ -725,9 +737,14 @@ def test_compile_converts_gui_millivolts_to_qcs_relative_amplitude():
         qcs_module=_FakeQcs,
     )
 
-    dc_waveform = compiled.program.waveforms[0][0]
+    dc_operations = _program_waveform_operations(compiled.program.waveforms[0])
+    dc_waveform = dc_operations[0]
     # 0.5 of the GUI's 800 mV scale is 400 mV, or 0.16 of 2.5 V.
     assert dc_waveform.kwargs["amplitude"] == pytest.approx(0.16)
+    assert [type(operation) for operation in dc_operations] == [
+        _Waveform,
+        _Hold,
+    ]
     assert compiled.program.waveforms[0][2]["new_layer"] is True
     assert compiled.program.shots == 2
     assert compiled.program.acquisitions[0]["pre_delay"] == 0.0
@@ -863,10 +880,12 @@ def test_compile_preserves_instantaneous_set_before_next_hold():
     )
     assert [type(operation) for operation in operations] == [
         _Waveform,
+        _Hold,
         _Waveform,
+        _Hold,
     ]
     assert operations[0].kwargs["amplitude"] == pytest.approx(0.032)
-    assert operations[1].kwargs["amplitude"] == pytest.approx(0.064)
+    assert operations[2].kwargs["amplitude"] == pytest.approx(0.064)
     assert sum(
         operation.kwargs["duration"] for operation in operations
     ) == pytest.approx(20e-6)
@@ -887,10 +906,13 @@ def test_compile_emits_explicit_terminal_dc_reset_for_compensation():
 
     assert [type(operation) for operation in operations] == [
         _Waveform,
+        _Hold,
         _Delay,
     ]
     assert operations[0].kwargs["amplitude"] == pytest.approx(0.1)
-    assert operations[1].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[1].kwargs["duration"] == pytest.approx(296 / 300e6)
+    assert operations[2].kwargs["duration"] == pytest.approx(4 / 300e6)
 
 
 def test_m5301_ramp_rejects_unrepresentable_odd_fabric_cycle_duration():
@@ -908,8 +930,8 @@ def test_m5301_ramp_rejects_unrepresentable_odd_fabric_cycle_duration():
 def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
     exact_limit = (
         FineTuneSequence(("gate",))
-        .add_set("initial", [0.001], 6_288)
-        .add_ramp("ramp", 6_000)
+        .add_set("initial", [0.0], 4)
+        .add_ramp("ramp", 12_288)
         .add_set("final", [0.002], 30_000)
     )
     compiled = compile_qcs_point(
@@ -936,8 +958,8 @@ def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
 
     over_limit = (
         FineTuneSequence(("gate",))
-        .add_set("initial", [0.001], 6_290)
-        .add_ramp("ramp", 6_000)
+        .add_set("initial", [0.0], 4)
+        .add_ramp("ramp", 12_290)
         .add_set("final", [0.002], 30_000)
     )
     with pytest.raises(
@@ -1050,6 +1072,124 @@ def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
     assert compiled.duration_s == pytest.approx(140.4e-6)
 
 
+def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
+    sequence = _two_output_nonzero_initial_hold_sequence()
+    report = backend.qcs_m5301_waveform_capacity_report(sequence)
+    assert [channel.rendered_fabric_cycles for channel in report.channels] == [
+        6_004,
+        6_004,
+    ]
+    assert [channel.rendered_samples for channel in report.channels] == [
+        48_032,
+        48_032,
+    ]
+
+    connection = _connection(
+        dc_channel_names=("dc_0", "dc_1"),
+        rf_channel_names={0: "rf_drive"},
+    )
+    mapper = _PhysicalMapper("dc_0", "dc_1", "rf_drive", "digitizer")
+    rf_pulse = QcsRfPulseConfig(
+        gen_ch=0,
+        at_segment="set_1",
+        duration_s=100e-9,
+        amplitude=0.2,
+        frequency_hz=50e6,
+    )
+    acquisition = _acquisition(
+        at_segment="set_1",
+        duration_s=100e-9,
+    )
+    compiled_programs = (
+        compile_qcs_point(
+            sequence,
+            0,
+            connection_config=connection,
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            rf_pulses=(rf_pulse,),
+            acquisition=acquisition,
+            qcs_module=_FakeQcs,
+        ),
+        backend.compile_qcs_synchronized_sweep(
+            sequence,
+            connection_config=connection,
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            rf_pulses=(rf_pulse,),
+            acquisition=acquisition,
+            qcs_module=_FakeQcs,
+        ),
+    )
+
+    for compiled in compiled_programs:
+        for dc_entry in compiled.program.waveforms[:2]:
+            operations = _program_waveform_operations(dc_entry)
+            seed = next(
+                operation
+                for operation in operations
+                if str(operation.kwargs.get("name", "")).endswith(
+                    "interval_0_set"
+                )
+            )
+            initial_hold = next(
+                operation
+                for operation in operations
+                if str(operation.kwargs.get("name", "")).endswith(
+                    "interval_0_hold"
+                )
+            )
+            assert type(seed) is _Waveform
+            assert type(initial_hold) is _Hold
+            assert seed.kwargs["duration"] == pytest.approx(4 / 300e6)
+            assert initial_hold.kwargs["duration"] == pytest.approx(
+                100e-6 - 4 / 300e6
+            )
+            assert sum(
+                operation.kwargs["duration"] for operation in operations
+            ) == pytest.approx(320.4e-6)
+
+        rf_entry = next(
+            entry for entry in compiled.program.waveforms if entry[1].name == "rf_drive"
+        )
+        assert rf_entry[2]["pre_delay"] == pytest.approx(110e-6)
+        assert compiled.program.acquisitions[0]["pre_delay"] == pytest.approx(
+            110e-6
+        )
+        assert compiled.duration_s == pytest.approx(320.4e-6)
+
+
+def test_real_qcs_255_constant_seed_hold_renders_requested_voltage():
+    try:
+        import keysight.qcs as qcs
+    except Exception as exc:
+        pytest.skip(f"installed QCS runtime is unavailable: {exc}")
+    from keysight.qcs.channels.render import render as render_qcs_channel
+
+    operations = backend._qcs_constant_dc_interval(
+        qcs,
+        duration_s=100e-6,
+        amplitude=0.1,
+        name="initial",
+        fabric_hz=300e6,
+    )
+
+    assert [type(operation).__name__ for operation in operations] == [
+        "DCWaveform",
+        "Hold",
+    ]
+    assert operations[0].duration.value == pytest.approx(4 / 300e6)
+    assert sum(operation.duration.value for operation in operations) == (
+        pytest.approx(100e-6)
+    )
+    rendered, _phasor = render_qcs_channel(operations, 2.4e9)
+    assert len(rendered) == 240_000
+    np.testing.assert_allclose(rendered.real, 0.1)
+    np.testing.assert_array_equal(rendered.imag, 0.0)
+
+
 def test_no_sweep_globally_constant_output_uses_offset_and_resets():
     sequence = (
         FineTuneSequence(("awg_0", "awg_1"))
@@ -1123,7 +1263,7 @@ def test_no_sweep_globally_constant_output_uses_offset_and_resets():
     assert result.program_summary["safety_reset_executor_call_count"] == 1
 
 
-def test_independent_nonzero_plateau_still_consumes_rendered_capacity():
+def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
     sequence = FineTuneSequence(("gate",)).add_set(
         "independent_level",
         [0.1],
@@ -1131,8 +1271,8 @@ def test_independent_nonzero_plateau_still_consumes_rendered_capacity():
     )
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
-    assert report.worst_channel.rendered_fabric_cycles == 6_000
-    assert report.worst_channel.rendered_samples == 48_000
+    assert report.worst_channel.rendered_fabric_cycles == 4
+    assert report.worst_channel.rendered_samples == 32
 
     compiled = compile_qcs_point(
         sequence,
@@ -1143,7 +1283,14 @@ def test_independent_nonzero_plateau_still_consumes_rendered_capacity():
         qcs_module=_FakeQcs,
     )
     operations = _program_waveform_operations(compiled.program.waveforms[0])
-    assert [type(operation) for operation in operations] == [_Waveform]
+    assert [type(operation) for operation in operations] == [
+        _Waveform,
+        _Hold,
+    ]
+    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert sum(
+        operation.kwargs["duration"] for operation in operations
+    ) == pytest.approx(20e-6)
 
 
 def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
@@ -1160,7 +1307,8 @@ def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
         sequence,
         amplitude_scale=0.8 / 2.5,
     )
-    assert conservative.exceeds_capacity is True
+    assert conservative.exceeds_capacity is False
+    assert conservative.worst_channel.rendered_fabric_cycles == 2_004
 
     optimized = backend.validate_qcs_m5301_waveform_capacity(
         sequence,
@@ -1170,8 +1318,8 @@ def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
         dc_full_scale_v=2.5,
     )
     assert optimized.exceeds_capacity is False
-    # Both constant plateaus directly follow ramps and are retained with Hold;
-    # only the two 1,000-cycle ramps consume rendered waveform memory.
+    # The fixed offset makes the initial baseline a zero delay. Both later
+    # plateaus directly follow ramps, so only the two ramps consume memory.
     assert optimized.worst_channel.rendered_fabric_cycles == 2_000
     assert optimized.worst_channel.rendered_samples == 16_000
 
@@ -1330,9 +1478,8 @@ def test_fixed_voltage_bias_t_duration_sweep_capacity_matches_point_compile():
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
     assert report.exceeds_capacity is False
-    # The longest user plateau consumes 6,000 cycles; the long Bias-T tail
-    # consumes only its four-cycle ramp seed because its plateau is a Hold.
-    assert report.worst_channel.rendered_fabric_cycles == 6_004
+    # The user plateau and Bias-T tail each consume one four-cycle seed.
+    assert report.worst_channel.rendered_fabric_cycles == 8
 
     for point_index in range(sequence.sweep_point_count):
         compiled = compile_qcs_point(
@@ -1397,7 +1544,7 @@ def test_m5301_capacity_counts_only_nonzero_terminal_waveform():
             return (
                 np.asarray([0.0, 12_284.0, 12_284.0]),
                 {
-                    "active": np.asarray([0.1, 0.1, 0.2]),
+                    "active": np.asarray([0.0, 0.1, 0.2]),
                     "zero": np.asarray([0.0, 0.0, 0.0]),
                 },
                 {},
@@ -2739,13 +2886,18 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
     )
     assert [type(operation) for operation in operations] == [
         _Waveform,
+        _Hold,
         _Delay,
         _Waveform,
+        _Hold,
         _Delay,
     ]
-    assert operations[1].kwargs["duration"] == pytest.approx(34 / 300e6)
-    assert operations[2].kwargs["duration"] == pytest.approx(302 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[1].kwargs["duration"] == pytest.approx(296 / 300e6)
+    assert operations[2].kwargs["duration"] == pytest.approx(34 / 300e6)
     assert operations[3].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[4].kwargs["duration"] == pytest.approx(298 / 300e6)
+    assert operations[5].kwargs["duration"] == pytest.approx(4 / 300e6)
     arrays, variables = compiled.program.sweeps[0]
     by_name = {
         variable.name: array.value
@@ -4123,7 +4275,7 @@ def test_qcs_stability_hold_avoids_the_measured_direct_waveform_limit():
         _Hold,
     ]
     assert operations[0].kwargs["amplitude"] is amplitude
-    assert operations[0].kwargs["duration"] == pytest.approx(1e-6)
+    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
     assert sum(
         operation.kwargs["duration"] for operation in operations
     ) == pytest.approx(duration_s)
@@ -4141,27 +4293,27 @@ def test_qcs_constant_dc_interval_preserves_short_timing_boundaries():
 
     direct = backend._qcs_constant_dc_interval(
         _FakeQcs,
-        duration_s=300 / 300e6,
+        duration_s=4 / 300e6,
         amplitude=amplitude,
         name="direct",
         fabric_hz=300e6,
     )
     held = backend._qcs_constant_dc_interval(
         _FakeQcs,
-        duration_s=301 / 300e6,
+        duration_s=5 / 300e6,
         amplitude=amplitude,
         name="held",
         fabric_hz=300e6,
     )
 
     assert type(direct) is _Waveform
-    assert direct.kwargs["duration"] == pytest.approx(1e-6)
+    assert direct.kwargs["duration"] == pytest.approx(4 / 300e6)
     assert [type(operation) for operation in held] == [_Waveform, _Hold]
-    assert held[0].kwargs["duration"] == pytest.approx(1e-6)
+    assert held[0].kwargs["duration"] == pytest.approx(4 / 300e6)
     assert held[1].kwargs["duration"] == pytest.approx(1 / 300e6)
     assert sum(
         operation.kwargs["duration"] for operation in held
-    ) == pytest.approx(301 / 300e6)
+    ) == pytest.approx(5 / 300e6)
 
     with pytest.raises(ValueError, match="at least 4 QCS fabric cycles"):
         backend._qcs_constant_dc_interval(

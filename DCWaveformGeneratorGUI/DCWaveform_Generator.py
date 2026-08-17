@@ -7082,9 +7082,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             "The tested QCS 2.5.5 HCL backend accepts 98,304 rendered M5301 "
             "samples (40.960 us) per physical DC output and program. This is "
             "the QCS/HCL program budget, not the module's onboard-memory "
-            "specification. Ramps and independently rendered nonzero levels "
-            "consume capacity. A plateau directly following its ramp can use "
-            "QCS Hold; zero-voltage delays consume no waveform samples."
+            "specification. Ramps and a minimum seed for independently "
+            "established nonzero levels consume capacity. The rest of each "
+            "fixed plateau uses QCS Hold; zero-voltage delays consume no "
+            "waveform samples."
         )
         self.awg_metadata_mode = QtWidgets.QComboBox()
         self.awg_metadata_mode.addItem(
@@ -7753,9 +7754,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             )
         explanation = (
             " Each output has its own budget; outputs are not added together. "
-            "Ramps and independently rendered nonzero levels count. A fixed "
-            "plateau directly following its ramp can use QCS Hold and does "
-            "not consume waveform samples; zero-voltage delays do not either. "
+            "Ramps and the minimum seed for each independently established "
+            "nonzero level count. The rest of each fixed plateau uses QCS "
+            "Hold and does not consume waveform samples; zero-voltage delays "
+            "do not either. "
             "A globally constant output uses its mapped M5301 physical "
             "offset and a zero residual waveform."
         )

@@ -3024,7 +3024,7 @@ def test_qcs_sweep_execution_indicator_tracks_live_voltage_sweep_and_trace_mode(
         "Hardware sweep (planned)"
     )
     assert "M5301 offset" in panel.qcs_sweep_execution_reason_label.text()
-    assert panel.qcs_waveform_usage_progress.value() == 72_000
+    assert panel.qcs_waveform_usage_progress.value() == 48_032
 
     panel.qcs_hw_demod.setChecked(False)
     app.processEvents()
@@ -3155,7 +3155,7 @@ def test_qcs_sweep_indicator_accepts_two_output_101_by_101_hardware_grid():
     )
     reason = panel.qcs_sweep_execution_reason_label.text()
     assert "0.07 us inter-iteration delay" in reason
-    assert panel.qcs_waveform_usage_progress.value() == 72_000
+    assert panel.qcs_waveform_usage_progress.value() == 48_032
 
     window._active_experiment_backend = gui.EXECUTION_BACKEND_QCS
     window._on_experiment_event(

@@ -173,12 +173,10 @@ QCS_STABILITY_MAX_INTEGRATION_DURATION_S = (
 # Noise Analysis duration cannot allocate or transfer an unbounded trace.
 # At the standard 4.8 GSa/s M5200 rate this is 2.083333... ms per repetition.
 QCS_NOISE_MAX_RAW_TRACE_SAMPLES = 10_000_000
-# Retained for the legacy helper that constructs a seed plus ``Hold``.  The
-# synchronized AWG-tuning path does not use a constant seed: it uses ``Hold``
-# only when a preceding ramp has already established the exact same endpoint.
-# That direct ramp-to-Hold form was validated by the 101 x 101, 100 us
-# hardware-demodulation test on the connected M5301A/M5200A system.
-QCS_M5301_HOLD_SEED_FABRIC_CYCLES = 300
+# A fixed nonzero plateau is established with the shortest legal M5301
+# ``DCWaveform`` and retains that sample with ``Hold`` for the remainder.  The
+# seed is one 32-sample (four-fabric-cycle) minimum waveform.
+QCS_M5301_HOLD_SEED_FABRIC_CYCLES = 4
 QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES = 4
 QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES = 2
 # The connected HCL sandbox accepts an aggregate 98,304 rendered M5301
@@ -1854,7 +1852,8 @@ def _qcs_parameterized_dc_interval(
             f"require at least {QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES} cycles "
             f"({minimum_s * 1e9:.9g} ns)"
         )
-    if not zero_interval:
+    fixed_duration = bool(np.all(duration_cycles == duration_cycles[0]))
+    if not zero_interval and not (pointwise_constant and fixed_duration):
         invalid_granularity = np.flatnonzero(
             duration_cycles
             % QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES
@@ -1893,6 +1892,18 @@ def _qcs_parameterized_dc_interval(
             channel_name=channel_name,
             description=f"{channel_name} interval {interval_index} amplitude",
         )
+        if fixed_duration:
+            return _qcs_constant_dc_interval(
+                qcs,
+                duration_s=float(durations[0]),
+                amplitude=amplitude,
+                name=prefix,
+                fabric_hz=fabric_hz,
+            )
+        # A swept duration cannot currently express ``duration - seed`` as a
+        # direct HCL target without changing the operation topology at the
+        # minimum duration. Preserve the existing complete-waveform lowering
+        # for that case; fixed numeric points still use seed plus Hold.
         return qcs.DCWaveform(
             duration=duration,
             envelope=qcs.ConstantEnvelope(),
@@ -1982,13 +1993,11 @@ def _qcs_parameterized_dc_hold_mask(
     end_table: np.ndarray,
     fabric_hz: float,
 ) -> np.ndarray:
-    """Mark plateaus that can directly retain the preceding ramp endpoint.
+    """Mark plateaus that can retain an already established DC endpoint.
 
-    The optimization is deliberately narrower than a generic seed-and-Hold
-    rewrite.  A plateau is held only when every sweep point starts and ends at
-    the preceding ramp's endpoint and its duration is fixed.  This is the form
-    exercised on the connected hardware; an independently seeded constant
-    level continues to use a rendered ``DCWaveform``.
+    The first independent nonzero plateau emits a minimum legal constant seed
+    followed by ``Hold``.  A later fixed plateau at the same endpoint can use
+    ``Hold`` directly after either that seed or a changing waveform.
     """
 
     durations = np.asarray(duration_table_s, dtype=float)
@@ -2001,7 +2010,7 @@ def _qcs_parameterized_dc_hold_mask(
             "QCS synchronized DC hold analysis requires equal 2D tables"
         )
     hold_mask = np.zeros(durations.shape[1], dtype=bool)
-    retained_from_ramp = False
+    retained_output = False
     previous_ends = None
     for interval_index in range(durations.shape[1]):
         current_durations = durations[:, interval_index]
@@ -2042,7 +2051,7 @@ def _qcs_parameterized_dc_hold_mask(
             )
         )
         hold_mask[interval_index] = bool(
-            retained_from_ramp
+            retained_output
             and pointwise_constant
             and not zero_interval
             and fixed_duration
@@ -2050,13 +2059,15 @@ def _qcs_parameterized_dc_hold_mask(
         )
 
         if zero_interval:
-            retained_from_ramp = False
+            retained_output = False
         elif hold_mask[interval_index]:
-            # Consecutive plateaus at the same endpoint may stay in the same
-            # direct ramp-to-Hold chain.
-            retained_from_ramp = True
+            retained_output = True
+        elif pointwise_constant:
+            # The lowering below emits a constant seed (or a complete short
+            # waveform) whose endpoint can be retained by a following Hold.
+            retained_output = True
         else:
-            retained_from_ramp = not pointwise_constant
+            retained_output = True
         previous_ends = current_ends
     return hold_mask
 
@@ -2072,7 +2083,7 @@ def _qcs_parameterized_dc_operations(
     output_index: int,
     fabric_hz: float,
 ) -> list[Any]:
-    """Lower one output, retaining eligible swept ramp endpoints with Hold."""
+    """Lower one output with minimum constant seeds and retained Holds."""
 
     durations = np.asarray(duration_table_s, dtype=float)
     starts = np.asarray(start_table, dtype=float)
@@ -2097,19 +2108,21 @@ def _qcs_parameterized_dc_operations(
                 )
             )
             continue
-        operations.append(
-            _qcs_parameterized_dc_interval(
-                qcs,
-                duration_values_s=durations[:, interval_index],
-                start_values=starts[:, interval_index],
-                end_values=ends[:, interval_index],
-                targets=targets,
-                channel_name=channel_name,
-                output_index=output_index,
-                interval_index=interval_index,
-                fabric_hz=fabric_hz,
-            )
+        interval = _qcs_parameterized_dc_interval(
+            qcs,
+            duration_values_s=durations[:, interval_index],
+            start_values=starts[:, interval_index],
+            end_values=ends[:, interval_index],
+            targets=targets,
+            channel_name=channel_name,
+            output_index=output_index,
+            interval_index=interval_index,
+            fabric_hz=fabric_hz,
         )
+        if isinstance(interval, (list, tuple)):
+            operations.extend(interval)
+        else:
+            operations.append(interval)
     return operations
 
 
@@ -2142,10 +2155,7 @@ def _qcs_constant_dc_interval(
             f"{QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES} QCS fabric cycles "
             f"({minimum_s * 1e9:.9g} ns) for an M5301 waveform"
         )
-    seed_cycles = min(
-        duration_cycles,
-        QCS_M5301_HOLD_SEED_FABRIC_CYCLES,
-    )
+    seed_cycles = min(duration_cycles, QCS_M5301_HOLD_SEED_FABRIC_CYCLES)
     # M5301 waveform data has a 16-sample granularity. At 2.4 GSa/s on
     # the 300 MHz fabric this is two fabric cycles. Leave an odd final
     # cycle to Hold instead of asking the driver to pad the voltage seed.
@@ -2438,7 +2448,7 @@ def _qcs_m5301_rendered_fabric_cycles(
         raise ValueError("QCS DC vertices must have a positive duration")
 
     rendered_cycles = 0
-    retained_from_ramp = False
+    retained_output = False
     previous_end_value = None
     for interval_index in range(unique_times.size - 1):
         duration_cycles = int(
@@ -2454,9 +2464,9 @@ def _qcs_m5301_rendered_fabric_cycles(
             pointwise_constant
             and np.isclose(start_value, 0.0, rtol=0.0, atol=1e-15)
         )
-        is_continuous_ramp_hold = bool(
+        is_retained_hold = bool(
             allow_continuous_ramp_holds
-            and retained_from_ramp
+            and retained_output
             and pointwise_constant
             and not is_zero_delay
             and previous_end_value is not None
@@ -2469,11 +2479,11 @@ def _qcs_m5301_rendered_fabric_cycles(
             and duration_cycles >= QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES
         )
         if is_zero_delay:
-            retained_from_ramp = False
+            retained_output = False
             previous_end_value = end_value
             continue
-        if is_continuous_ramp_hold:
-            retained_from_ramp = True
+        if is_retained_hold:
+            retained_output = True
             previous_end_value = end_value
             continue
         interval_name = f"{name}_interval_{interval_index}"
@@ -2483,10 +2493,20 @@ def _qcs_m5301_rendered_fabric_cycles(
                 f"{QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES} QCS fabric cycles "
                 "(13.333333 ns) for an M5301 waveform"
             )
-        if (
-            duration_cycles
-            % QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES
-        ):
+        if pointwise_constant:
+            seed_cycles = min(
+                duration_cycles,
+                QCS_M5301_HOLD_SEED_FABRIC_CYCLES,
+            )
+            seed_cycles -= (
+                seed_cycles
+                % QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES
+            )
+            rendered_cycles += seed_cycles
+            retained_output = True
+            previous_end_value = end_value
+            continue
+        if duration_cycles % QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES:
             raise ValueError(
                 f"{interval_name} duration must be a multiple of "
                 f"{QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES} QCS "
@@ -2494,7 +2514,7 @@ def _qcs_m5301_rendered_fabric_cycles(
                 "waveform granularity"
             )
         rendered_cycles += duration_cycles
-        retained_from_ramp = not pointwise_constant
+        retained_output = True
         previous_end_value = end_value
 
     if append_terminal_value:
@@ -2524,10 +2544,10 @@ def _raise_qcs_m5301_capacity_error(
         f"{point_text}: {rendered_samples:,} / "
         f"{QCS_M5301_MAX_RENDERED_SAMPLES:,} samples "
         f"({rendered_duration_us:.6f} / 40.960000 us). The 40.960 us "
-        "capacity includes every ramp and independently rendered nonzero "
-        "hold on that physical output. A fixed plateau that directly follows "
-        "its ramp endpoint can use QCS Hold, and zero-voltage delays use no "
-        "waveform samples. Shorten the remaining rendered intervals."
+        "capacity includes every ramp and the minimum DCWaveform seed used to "
+        "establish each independent nonzero plateau on that physical output. "
+        "The rest of a fixed plateau uses QCS Hold, and zero-voltage delays "
+        "use no waveform samples. Shorten the remaining rendered intervals."
     )
 
 
@@ -2678,8 +2698,8 @@ def qcs_m5301_waveform_capacity_report(
                 # A plateau that directly continues the preceding ramp can
                 # retain that endpoint with QCS Hold in every execution mode.
                 # This is independent of Bias-T compensation or fixed-offset
-                # optimization; independently established constants remain
-                # rendered waveforms and are still charged to this output.
+                # optimization. Independently established constants are
+                # charged only for their minimum seed waveform.
                 allow_continuous_ramp_holds=True,
             )
             if rendered_cycles > worst_cycles[output_index]:
@@ -2755,10 +2775,10 @@ def _qcs_dc_waveform_operations(
     before the SET at its end. Nonzero constant intervals and changing
     intervals use real DCWaveforms; zero intervals use Delay.
 
-    ``Hold`` is used only when a preceding ramp has established the exact
-    same endpoint.  This narrow direct-ramp-to-Hold form was verified on the
-    connected QCS 2.5.5 M5301; an independently seeded constant level remains
-    a rendered ``DCWaveform`` because that form returned to baseline.
+    A fixed nonzero plateau starts with the shortest legal constant
+    ``DCWaveform`` and uses ``Hold`` for its remaining duration. If a preceding
+    waveform has already established the same endpoint, the complete plateau
+    can be represented by ``Hold`` without another seed.
     """
     rendered_cycles = _qcs_m5301_rendered_fabric_cycles(
         times_cycles=times_cycles,
@@ -2838,27 +2858,12 @@ def _qcs_dc_waveform_operations(
                     name=interval_name,
                 )
             else:
-                if duration_cycles < QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES:
-                    raise ValueError(
-                        f"{interval_name} duration must be at least "
-                        f"{QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES} QCS "
-                        "fabric cycles for a nonzero M5301 DC waveform"
-                    )
-                if (
-                    duration_cycles
-                    % QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES
-                ):
-                    raise ValueError(
-                        f"{interval_name} duration must be a multiple of "
-                        f"{QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES} "
-                        "QCS fabric cycles for the M5301 16-sample "
-                        "waveform granularity"
-                    )
-                interval = qcs.DCWaveform(
-                    duration=duration_s,
-                    envelope=qcs.ConstantEnvelope(),
+                interval = _qcs_constant_dc_interval(
+                    qcs,
+                    duration_s=duration_s,
                     amplitude=start_value,
                     name=interval_name,
+                    fabric_hz=fabric_hz,
                 )
         else:
             interval = _qcs_ramp_dc_interval(
@@ -4995,9 +5000,27 @@ def compile_qcs_synchronized_sweep(
                 )
             )
             if active and not hold_mask[current_interval]:
-                fixed_graph_cycles += int(
-                    np.max(duration_cycles_table[:, current_interval])
+                interval_starts = start_table[
+                    :, current_interval, output_index
+                ]
+                interval_ends = end_table[:, current_interval, output_index]
+                interval_durations = duration_cycles_table[:, current_interval]
+                fixed_constant = bool(
+                    np.allclose(
+                        interval_starts,
+                        interval_ends,
+                        rtol=0.0,
+                        atol=1e-15,
+                    )
+                    and np.all(interval_durations == interval_durations[0])
                 )
+                if fixed_constant:
+                    fixed_graph_cycles += min(
+                        int(interval_durations[0]),
+                        QCS_M5301_HOLD_SEED_FABRIC_CYCLES,
+                    )
+                else:
+                    fixed_graph_cycles += int(np.max(interval_durations))
         if fixed_graph_cycles > QCS_M5301_MAX_RENDERED_FABRIC_CYCLES:
             _raise_qcs_m5301_capacity_error(
                 output_name=output_name,
