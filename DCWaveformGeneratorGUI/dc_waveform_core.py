@@ -29,6 +29,10 @@ DEFAULT_QCS_FULL_SCALE_V = 2.5
 # The connected HCL sandbox gives all rendered DCWaveforms on one M5301
 # channel one aggregate 98,304-sample buffer (40.960 us at 2.4 GSa/s).
 _QCS_DC_RENDERED_BUFFER_MAX_NS = 40_960.0
+# A 1 us constant seed followed by QCS Hold avoids rendering a complete long
+# plateau and avoids the negative internal Delay produced by the connected HCL
+# execution path for a minimum four-fabric-cycle seed.
+_QCS_DC_HOLD_SEED_NS = 1_000.0
 DEFAULT_QICK_FABRIC_MHZ = 300.0
 DEFAULT_QICK_TPROC_MHZ = 300.0
 DEFAULT_QICK_FULL_SCALE_MV = 800.0
@@ -1220,41 +1224,86 @@ def _qcs_channel_samples_code(
     channel_name: str,
     *,
     include_adds: bool = True,
+    interval_starts_mv=None,
+    interval_ends_mv=None,
 ) -> str:
     """Generate QCS segments from an arbitrary piecewise-linear trace."""
     time_values = np.asarray(time_ns, dtype=float)
     voltage_values = np.asarray(voltage_mv, dtype=float)
-    if (
-        time_values.ndim != 1
-        or voltage_values.shape != time_values.shape
-        or time_values.size < 2
-    ):
-        raise ValueError("QCS time and voltage traces must be equal-length vectors")
-    if not np.all(np.isfinite(time_values)) or not np.all(np.isfinite(voltage_values)):
-        raise ValueError("QCS waveform points must be finite")
-    if np.any(np.diff(time_values) <= 0.0):
-        raise ValueError("QCS waveform times must be strictly increasing")
+    if interval_starts_mv is None and interval_ends_mv is None:
+        if (
+            time_values.ndim != 1
+            or voltage_values.shape != time_values.shape
+            or time_values.size < 2
+        ):
+            raise ValueError(
+                "QCS time and voltage traces must be equal-length vectors"
+            )
+        if not np.all(np.isfinite(time_values)) or not np.all(
+            np.isfinite(voltage_values)
+        ):
+            raise ValueError("QCS waveform points must be finite")
+        if np.any(np.diff(time_values) <= 0.0):
+            raise ValueError("QCS waveform times must be strictly increasing")
+        duration_values = np.diff(time_values)
+        start_values = voltage_values[:-1]
+        end_values = voltage_values[1:]
+    else:
+        if interval_starts_mv is None or interval_ends_mv is None:
+            raise ValueError(
+                "QCS interval starts and ends must be provided together"
+            )
+        duration_values = time_values
+        start_values = np.asarray(interval_starts_mv, dtype=float)
+        end_values = np.asarray(interval_ends_mv, dtype=float)
+        if (
+            duration_values.ndim != 1
+            or start_values.shape != duration_values.shape
+            or end_values.shape != duration_values.shape
+            or duration_values.size < 1
+            or not np.all(np.isfinite(duration_values))
+            or not np.all(np.isfinite(start_values))
+            or not np.all(np.isfinite(end_values))
+            or np.any(duration_values <= 0.0)
+        ):
+            raise ValueError(
+                "QCS interval durations, starts, and ends must be finite "
+                "equal-length vectors with positive durations"
+            )
 
     interval_plans = []
-    for index in range(time_values.size - 1):
-        duration_ns = float(time_values[index + 1] - time_values[index])
-        start_mv = float(voltage_values[index])
-        end_mv = float(voltage_values[index + 1])
+    for duration_value, start_value, end_value in zip(
+        duration_values,
+        start_values,
+        end_values,
+    ):
+        duration_ns = float(duration_value)
+        start_mv = float(start_value)
+        end_mv = float(end_value)
         is_flat = bool(
             np.isclose(start_mv, end_mv, rtol=0.0, atol=1.0e-12)
         )
-        kind = (
-            "zero_delay"
-            if is_flat
+        if (
+            is_flat
             and np.isclose(start_mv, 0.0, rtol=0.0, atol=1.0e-12)
-            else "waveform"
-        )
+        ):
+            kind = "zero_delay"
+        elif is_flat and duration_ns > _QCS_DC_HOLD_SEED_NS + 1.0e-9:
+            kind = "seed_hold"
+        else:
+            kind = "waveform"
         interval_plans.append(
             (kind, duration_ns, start_mv, end_mv)
         )
 
     rendered_duration_ns = sum(
-        0.0 if kind == "zero_delay" else duration_ns
+        (
+            0.0
+            if kind == "zero_delay"
+            else min(duration_ns, _QCS_DC_HOLD_SEED_NS)
+            if kind == "seed_hold"
+            else duration_ns
+        )
         for kind, duration_ns, _start, _end in interval_plans
     )
     if rendered_duration_ns > _QCS_DC_RENDERED_BUFFER_MAX_NS + 1e-9:
@@ -1282,7 +1331,7 @@ def _qcs_channel_samples_code(
             ]
         )
     for index, plan in enumerate(interval_plans):
-        kind, _duration_ns, start_mv, end_mv = plan
+        kind, duration_ns, start_mv, end_mv = plan
         duration_name = f"{channel_name}_dc_segment_duration_{index}"
         waveform_name = f"{channel_name}_dc_segment_{index}"
         if kind == "zero_delay":
@@ -1291,6 +1340,28 @@ def _qcs_channel_samples_code(
                     f"    {waveform_name} = qcs.Delay(",
                     f"        duration={duration_name},",
                     "    )",
+                    "",
+                ]
+            )
+        elif kind == "seed_hold":
+            seed_duration_name = f"{duration_name}_set"
+            hold_duration_name = f"{duration_name}_hold"
+            lines.extend(
+                [
+                    f"    {seed_duration_name} = {_QCS_DC_HOLD_SEED_NS:.12g} * ns",
+                    f"    {hold_duration_name} = {duration_ns - _QCS_DC_HOLD_SEED_NS:.12g} * ns",
+                    f"    {waveform_name} = [",
+                    "        qcs.DCWaveform(",
+                    f"            duration={seed_duration_name},",
+                    "            envelope=qcs.ConstantEnvelope(),",
+                    f"            amplitude={start_mv:.12g} * mV,",
+                    f"            name={waveform_name!r} + '_set',",
+                    "        ),",
+                    "        qcs.Hold(",
+                    f"            duration={hold_duration_name},",
+                    f"            name={waveform_name!r} + '_hold',",
+                    "        ),",
+                    "    ]",
                     "",
                 ]
             )
@@ -1325,7 +1396,7 @@ def _qcs_channel_samples_code(
                 ]
             )
     if include_adds:
-        for index in range(time_values.size - 1):
+        for index in range(len(interval_plans)):
             lines.append(
                 f"    program.add_waveform({channel_name}_dc_segment_{index}, "
                 f"{channel_name})"
@@ -1340,8 +1411,20 @@ def generate_qcs_program_code(
     channel_names: Optional[Sequence[str]] = None,
     full_scale_v: Real = DEFAULT_QCS_FULL_SCALE_V,
     cross_capacitance=None,
+    fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ,
+    bias_t_compensation_enabled: bool = False,
+    bias_t_compensation_type: str = "dc",
+    bias_t_compensation_voltage_mv: Optional[Real] = None,
+    bias_t_compensation_mode: str = "fixed_voltage",
+    bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
+    bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
 ) -> str:
-    """Generate Keysight QCS code for physical, cross-compensated outputs."""
+    """Generate an offline Keysight QCS source preview.
+
+    This formatter never imports QCS, loads a mapper, compiles a Program, or
+    contacts hardware.  When Bias-T compensation is enabled, the preview uses
+    the first Cartesian point and includes its generated compensation tail.
+    """
     pulses = tuple(pulses)
     if not pulses:
         raise ValueError("at least one pulse is required")
@@ -1352,10 +1435,52 @@ def generate_qcs_program_code(
     if len(channel_names) != len(pulses):
         raise ValueError("channel_names length must match the pulse count")
     matrix = _coerce_cross_capacitance(cross_capacitance, len(pulses))
-    common_time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
-        pulses,
-        matrix,
-    )
+    if bias_t_compensation_enabled:
+        preview_output_names = tuple(
+            f"awg_{index}" for index in range(len(pulses))
+        )
+        preview_sequence = build_qick_sequence(
+            tuple(pulse.copy() for pulse in pulses),
+            output_names=preview_output_names,
+            fabric_mhz=fabric_mhz,
+            full_scale_mv=full_scale_v * 1000.0,
+            cross_capacitance=matrix,
+            bias_t_compensation_enabled=True,
+            bias_t_compensation_type=bias_t_compensation_type,
+            bias_t_compensation_voltage_mv=bias_t_compensation_voltage_mv,
+            bias_t_compensation_mode=bias_t_compensation_mode,
+            bias_t_compensation_duration_us=bias_t_compensation_duration_us,
+            bias_t_filter_tau_us=bias_t_filter_tau_us,
+        )
+        cycles, waveforms, _boundaries = (
+            preview_sequence.compensated_waveform_vertices(0)
+        )
+        raw_time_ns = np.asarray(cycles, dtype=float) * 1000.0 / float(
+            fabric_mhz
+        )
+        physical_mv = np.vstack(
+            [
+                np.asarray(waveforms[name], dtype=float)
+                * full_scale_v
+                * 1000.0
+                for name in preview_output_names
+            ]
+        )
+        group_starts = np.flatnonzero(
+            np.r_[True, np.diff(raw_time_ns) != 0.0]
+        )
+        group_stops = np.r_[group_starts[1:], raw_time_ns.size]
+        unique_time_ns = raw_time_ns[group_starts]
+        common_time_ns = np.diff(unique_time_ns)
+        interval_starts_mv = physical_mv[:, group_stops[:-1] - 1]
+        interval_ends_mv = physical_mv[:, group_starts[1:]]
+    else:
+        common_time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
+            pulses,
+            matrix,
+        )
+        interval_starts_mv = None
+        interval_ends_mv = None
     traces = tuple(
         (common_time_ns, physical_mv[index]) for index in range(len(pulses))
     )
@@ -1369,7 +1494,8 @@ def generate_qcs_program_code(
             )
 
     lines = [
-        '"""Generated Keysight QCS DC waveforms."""',
+        '"""Offline preview of the Keysight QCS DC Program source."""',
+        "# No mapper was loaded and no QCS compile or hardware submission was performed.",
         "",
         "import keysight.qcs as qcs",
         "",
@@ -1385,17 +1511,34 @@ def generate_qcs_program_code(
     for name in channel_names:
         lines.append(f"    {name}: qcs.Channels,")
     lines.extend([") -> qcs.Program:", "    # RAMP envelopes are unit-normalized; amplitude carries physical scale."])
-    for (trace_time_ns, voltage_mv), name in zip(traces, channel_names):
+    for output_index, ((trace_time_ns, voltage_mv), name) in enumerate(
+        zip(traces, channel_names)
+    ):
         lines.append(
             _qcs_channel_samples_code(
                 trace_time_ns,
                 voltage_mv,
                 name,
                 include_adds=False,
+                interval_starts_mv=(
+                    None
+                    if interval_starts_mv is None
+                    else interval_starts_mv[output_index]
+                ),
+                interval_ends_mv=(
+                    None
+                    if interval_ends_mv is None
+                    else interval_ends_mv[output_index]
+                ),
             ).rstrip()
         )
     lines.append("    # All outputs for one interval share a QCS layer.")
-    for interval_index in range(len(common_time_ns) - 1):
+    interval_count = (
+        len(common_time_ns)
+        if interval_starts_mv is not None
+        else len(common_time_ns) - 1
+    )
+    for interval_index in range(interval_count):
         for channel_index, name in enumerate(channel_names):
             lines.append(
                 f"    program.add_waveform("

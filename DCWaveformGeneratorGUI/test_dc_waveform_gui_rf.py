@@ -2735,7 +2735,9 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
     assert panel.run_button.text() == "Run QCS Experiment"
     assert panel.backend_selector.isHidden() is True
     assert panel.execution_system_label.text() == "Keysight QCS / M5000"
-    assert panel.show_program_button.isHidden() is True
+    assert panel.show_program_button.isHidden() is False
+    assert panel.show_program_button.isEnabled() is True
+    assert panel.show_program_button.text() == "Show QCS Program"
     assert panel.ddr_usage_group.isHidden() is True
     assert panel.qcs_waveform_usage_group.isHidden() is False
     assert panel.qcs_waveform_usage_group.isEnabled() is True
@@ -2769,7 +2771,7 @@ def test_experiment_panel_selects_qcs_and_preserves_qick_connection(tmp_path):
 
     assert panel.run_button.text() == "Run QCS Experiment"
     assert panel.qcs_connection_group.isHidden() is False
-    assert panel.show_program_button.isEnabled() is False
+    assert panel.show_program_button.isEnabled() is True
     assert panel.ddr_usage_group.isEnabled() is False
     assert panel.compile_validation_mode.isEnabled() is False
     values = panel.values(1)
@@ -2901,7 +2903,7 @@ def test_qcs_no_sweep_capacity_bar_counts_each_outputs_ramps_only():
     app.processEvents()
 
 
-def test_qcs_constant_second_output_uses_offset_not_waveform_memory():
+def test_qcs_constant_second_output_uses_waveform_not_channel_offset():
     app = _application()
     window = gui.MainWindow()
 
@@ -2930,11 +2932,12 @@ def test_qcs_constant_second_output_uses_offset_not_waveform_memory():
     )
     detail = panel.qcs_waveform_usage_detail.text()
     assert "awg_0 -> dc_ch_1: 48,000 samples (20.000000 us)" in detail
-    assert "awg_1 -> dc_ch_2: 0 samples (0.000000 us)" in detail
-    assert "fixed physical offset +100 mV" in detail
-    assert "zero residual waveform" in detail
+    assert "awg_1 -> dc_ch_2: 2,400 samples (1.000000 us)" in detail
+    assert "mapped physical-channel offsets are not used" in detail
     assert panel.qcs_sweep_execution_mode_label.text().endswith("No sweep")
-    assert "100 mV" in panel.qcs_sweep_execution_reason_label.text()
+    assert "physical channel offsets are disabled" in (
+        panel.qcs_sweep_execution_reason_label.text()
+    )
 
     window.close()
     app.processEvents()
@@ -3591,6 +3594,45 @@ def test_show_program_snapshot_allows_disabled_readout():
     window.close()
 
 
+def test_show_qcs_program_is_offline_source_only(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    shown = []
+
+    monkeypatch.setattr(
+        window,
+        "_generate_qcs_code",
+        lambda: "# offline QCS source\n",
+    )
+
+    class FakeDialog:
+        def __init__(self, code, parent=None):
+            shown.append((code, parent is window))
+
+        def exec_(self):
+            shown.append("exec")
+
+    monkeypatch.setattr(gui, "QcsProgramCodeDialog", FakeDialog)
+    monkeypatch.setattr(
+        gui,
+        "connect_qick",
+        lambda *_args, **_kwargs: pytest.fail("QICK connection was attempted"),
+    )
+    monkeypatch.setattr(
+        gui,
+        "build_qick_program",
+        lambda *_args, **_kwargs: pytest.fail("QICK compilation was attempted"),
+    )
+
+    window._show_program()
+    app.processEvents()
+
+    assert shown == [("# offline QCS source\n", True), "exec"]
+    assert window._experiment_thread is None
+    window.close()
+
+
 def test_qick_program_worker_compiles_and_returns_assembly(monkeypatch):
     app = _application()
     calls = []
@@ -3806,6 +3848,20 @@ def test_qick_assembly_dialog_is_read_only_and_copyable():
     dialog.copy_button.click()
     app.processEvents()
     assert QtWidgets.QApplication.clipboard().text() == assembly
+
+
+def test_qcs_program_code_dialog_is_read_only_and_copyable():
+    app = _application()
+    code = "import keysight.qcs as qcs\nprogram = qcs.Program()\n"
+    dialog = gui.QcsProgramCodeDialog(code)
+
+    assert dialog.code_text.isReadOnly() is True
+    assert dialog.code_text.toPlainText() == code
+    assert "No ChannelMapper" in dialog.summary_label.text()
+    dialog.copy_button.click()
+    app.processEvents()
+    assert QtWidgets.QApplication.clipboard().text() == code
+    dialog.close()
 
 
 def test_detailed_error_dialog_copies_summary_and_traceback():

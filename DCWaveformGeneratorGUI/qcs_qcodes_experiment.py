@@ -9,9 +9,10 @@ sweep. When only part of a Cartesian grid is hardware-compatible, those axes
 remain in a native inner sweep while Python iterates the unsupported outer
 coordinates, exposing every completed block for live plotting and Stop-safe
 retention. Other unsupported configurations use a QCS-managed software sweep.
-Eligible common-baseline M5301 ramps use one fixed physical offset plus
-hardware-swept residual amplitudes. Incompatible ramps use fixed numeric
-per-point programs, avoiding a measured QCS 2.5.5 waveform-addition failure.
+M5301 channel offsets are never used to establish a sweep voltage. Compatible
+ramps sweep DCWaveform amplitudes around zero; incompatible ramps use fixed
+numeric per-point programs, avoiding a measured QCS 2.5.5 waveform-addition
+failure.
 
 Stability Diagram retains its specialized two-axis compiler because it also
 implements dedicated Bias-T compensation and scan-budget validation.
@@ -173,10 +174,13 @@ QCS_STABILITY_MAX_INTEGRATION_DURATION_S = (
 # Noise Analysis duration cannot allocate or transfer an unbounded trace.
 # At the standard 4.8 GSa/s M5200 rate this is 2.083333... ms per repetition.
 QCS_NOISE_MAX_RAW_TRACE_SAMPLES = 10_000_000
-# A fixed nonzero plateau is established with the shortest legal M5301
-# ``DCWaveform`` and retains that sample with ``Hold`` for the remainder.  The
-# seed is one 32-sample (four-fabric-cycle) minimum waveform.
-QCS_M5301_HOLD_SEED_FABRIC_CYCLES = 4
+# A fixed nonzero plateau is established with a 1 us M5301 ``DCWaveform`` and
+# retains that sample with ``Hold`` for the remainder.  Although the client-side
+# renderer accepts a four-fabric-cycle seed, the connected HCL execution path
+# can lower that minimum seed to a negative internal Delay.  A 300-cycle seed
+# is still small compared with the 40.960 us rendered-waveform budget and is
+# the hardware-safe construction used for long AWG Tuning plateaus.
+QCS_M5301_HOLD_SEED_FABRIC_CYCLES = 300
 QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES = 4
 QCS_M5301_WAVEFORM_GRANULARITY_FABRIC_CYCLES = 2
 # The connected HCL sandbox accepts an aggregate 98,304 rendered M5301
@@ -1567,12 +1571,25 @@ def _set_qcs_dc_channel_offsets(
     offset_volts: Sequence[float],
     require_nonzero_support: bool,
 ) -> Tuple[Any, ...]:
-    """Set fixed physical offsets without adding them to a QCS sweep."""
+    """Keep mapped physical offsets at zero.
+
+    Channel offsets are not a PulseGenerator voltage-control or hardware-sweep
+    mechanism.  The nonzero guard makes that contract explicit even if an old
+    caller or saved execution plan still supplies offset metadata.
+    """
 
     names = tuple(str(value) for value in channel_names)
     values = tuple(float(value) for value in offset_volts)
     if len(names) != len(values):
         raise ValueError("QCS DC offset count must match the DC channel count")
+    if any(
+        not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+        for value in values
+    ):
+        raise QcsUnsupportedFeatureError(
+            "QCS physical channel offsets are disabled; voltage sweeps must "
+            "use DCWaveform amplitudes"
+        )
     scalars = []
     for name, offset_v in zip(names, values):
         channel = _resolve_mapper_channel(mapper, name)
@@ -2596,7 +2613,11 @@ def qcs_m5301_waveform_capacity_report(
     source_full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV,
     dc_full_scale_v: float = DEFAULT_QCS_FULL_SCALE_V,
 ) -> QcsM5301CapacityReport:
-    """Measure per-output M5301 usage at selected software-sweep points."""
+    """Measure per-output M5301 usage without physical-channel offsets.
+
+    ``auto_fixed_dc_offsets`` is retained only as a source-compatible legacy
+    keyword. It no longer changes the waveform or capacity calculation.
+    """
     fabric_hz = _positive_finite(fabric_mhz, "fabric clock") * 1.0e6
     if not np.isclose(
         fabric_hz,
@@ -2627,20 +2648,10 @@ def qcs_m5301_waveform_capacity_report(
     output_names = tuple(str(name) for name in sequence.output_names)
     if not output_names:
         raise ValueError("QCS sequence must contain at least one DC output")
-    fixed_source_offsets = (0.0,) * len(output_names)
-    offset_plan = None
-    if (
-        auto_fixed_dc_offsets
-        and not _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence)
-    ):
-        offset_plan = _qcs_fixed_dc_offset_plan(
-            sequence,
-            source_full_scale_mv=source_full_scale_mv,
-            dc_full_scale_v=dc_full_scale_v,
-            analysis_point_indices=inspected,
-        )
-        if offset_plan is not None:
-            fixed_source_offsets = offset_plan.source_offsets
+    # Legacy arguments remain accepted for callers that persist preview
+    # settings, but ChannelMapper offsets are intentionally not part of the
+    # waveform model.
+    del auto_fixed_dc_offsets, source_full_scale_mv, dc_full_scale_v
     worst_cycles = [0] * len(output_names)
     worst_points = [inspected[0]] * len(output_names)
     worst_coordinates = [tuple(sequence.sweep_coordinate(inspected[0]))] * len(
@@ -2657,13 +2668,10 @@ def qcs_m5301_waveform_capacity_report(
         times_cycles = np.asarray(times_cycles, dtype=float)
         source_waveforms = {
             output_name: (
-                (
-                    np.asarray(waveforms[output_name], dtype=float)
-                    - fixed_source_offsets[output_index]
-                )
+                np.asarray(waveforms[output_name], dtype=float)
                 * amplitude_scale
             )
-            for output_index, output_name in enumerate(output_names)
+            for output_name in output_names
         }
         if any(
             values.ndim != 1 or values.shape != times_cycles.shape
@@ -2697,9 +2705,8 @@ def qcs_m5301_waveform_capacity_report(
                 append_terminal_value=append_terminal_value,
                 # A plateau that directly continues the preceding ramp can
                 # retain that endpoint with QCS Hold in every execution mode.
-                # This is independent of Bias-T compensation or fixed-offset
-                # optimization. Independently established constants are
-                # charged only for their minimum seed waveform.
+                # This is independent of Bias-T compensation. Independently
+                # established constants are charged for their seed waveform.
                 allow_continuous_ramp_holds=True,
             )
             if rendered_cycles > worst_cycles[output_index]:
@@ -2720,11 +2727,7 @@ def qcs_m5301_waveform_capacity_report(
         channels=channels,
         inspected_point_count=len(inspected),
         sweep_point_count=point_count,
-        dc_channel_offsets_v=(
-            tuple(float(value) for value in offset_plan.offset_volts)
-            if offset_plan is not None
-            else (0.0,) * len(output_names)
-        ),
+        dc_channel_offsets_v=(0.0,) * len(output_names),
     )
 
 
@@ -3549,15 +3552,13 @@ def _qcs_fixed_dc_offset_plan(
     cancellation: Optional[QcsCancellationController] = None,
     analysis_point_indices: Optional[Sequence[int]] = None,
 ) -> Optional[_QcsFixedDcOffsetPlan]:
-    """Choose one fixed offset per output for a safe residual sweep.
+    """Validate a synchronized sweep using zero physical channel offsets.
 
     Every *swept* changing interval must have at least one endpoint that is
-    constant across the complete Cartesian sweep, and all swept changing
-    intervals on one physical output must share the same endpoint. A fully
-    numeric ramp is emitted as one fixed ArbitraryEnvelope and does not
-    constrain the choice. The common swept endpoint becomes the physical
-    offset; every level is emitted as a residual waveform. Zero remains
-    preferred because it needs no physical-offset support.
+    zero across the complete Cartesian sweep. A fully numeric ramp is emitted
+    as one fixed ArbitraryEnvelope and does not constrain this check. Nonzero
+    common baselines deliberately return ``None`` so the caller uses fixed
+    numeric point programs instead of changing a ChannelMapper offset.
     """
 
     point_count = int(sequence.sweep_point_count)
@@ -3690,43 +3691,8 @@ def _qcs_fixed_dc_offset_plan(
                 return None
 
         if not has_changing_interval:
-            # A globally constant output does not need any rendered M5301
-            # waveform samples.  Apply its level through the physical-channel
-            # offset and compile a zero residual instead.  Do not apply this
-            # optimization to merely piecewise-constant outputs: their levels
-            # still have to be represented by the program.
-            constant_output = _qcs_constant_sweep_value(
-                np.concatenate(
-                    (
-                        start_table[:, :, output_index].reshape(-1),
-                        end_table[:, :, output_index].reshape(-1),
-                    )
-                )
-            )
-            if constant_output is not None:
-                constant_output = (
-                    0.0
-                    if np.isclose(
-                        constant_output,
-                        0.0,
-                        rtol=0.0,
-                        atol=1e-12,
-                    )
-                    else float(constant_output)
-                )
-                constant_offset_v = constant_output * source_scale_v
-                constant_offset_scalar = (
-                    constant_offset_v
-                    / QCS_M5301_OFFSET_VOLTS_PER_SCALAR
-                )
-                if (
-                    abs(constant_offset_scalar)
-                    <= QCS_M5301_MAX_ABS_OFFSET_SCALAR + 1e-12
-                ):
-                    source_offsets.append(constant_output)
-                    offset_volts.append(float(constant_offset_v))
-                    optional_offset_outputs.append(True)
-                    continue
+            # Fixed numeric levels remain DCWaveform operations. They must not
+            # be moved into the mapped physical-channel offset.
             source_offsets.append(0.0)
             offset_volts.append(0.0)
             optional_offset_outputs.append(True)
@@ -3734,20 +3700,14 @@ def _qcs_fixed_dc_offset_plan(
 
         valid_candidates = []
         for raw_candidate in candidates or ():
-            candidate = (
-                0.0
-                if np.isclose(raw_candidate, 0.0, rtol=0.0, atol=1e-12)
-                else float(raw_candidate)
-            )
-            offset_v = candidate * source_scale_v
-            offset_scalar = (
-                offset_v / QCS_M5301_OFFSET_VOLTS_PER_SCALAR
-            )
-            if (
-                abs(offset_scalar)
-                > QCS_M5301_MAX_ABS_OFFSET_SCALAR + 1e-12
+            if not np.isclose(
+                raw_candidate,
+                0.0,
+                rtol=0.0,
+                atol=1e-12,
             ):
                 continue
+            candidate = 0.0
             residual_peak = float(
                 max(
                     np.max(
@@ -3767,16 +3727,8 @@ def _qcs_fixed_dc_offset_plan(
             valid_candidates.append(candidate)
         if not valid_candidates:
             return None
-        selected = min(
-            valid_candidates,
-            key=lambda value: (
-                0 if value == 0.0 else 1,
-                abs(value),
-                value,
-            ),
-        )
-        source_offsets.append(float(selected))
-        offset_volts.append(float(selected * source_scale_v))
+        source_offsets.append(0.0)
+        offset_volts.append(0.0)
         optional_offset_outputs.append(False)
 
     return _QcsFixedDcOffsetPlan(
@@ -3792,7 +3744,7 @@ def _qcs_sequence_requires_fixed_numeric_dc_ramp(
     source_full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV,
     dc_full_scale_v: float = DEFAULT_QCS_FULL_SCALE_V,
 ) -> bool:
-    """Return whether no fixed-offset synchronized representation exists."""
+    """Return whether no zero-offset synchronized representation exists."""
 
     return _qcs_fixed_dc_offset_plan(
         sequence,
@@ -4152,38 +4104,13 @@ def qcs_sweep_execution_preview(
 
     point_count = int(sequence.sweep_point_count)
     if point_count <= 1:
-        offset_plan = (
-            None
-            if _qcs_fixed_voltage_bias_t_varies_with_sweep(sequence)
-            else _qcs_fixed_dc_offset_plan(
-                sequence,
-                source_full_scale_mv=source_full_scale_mv,
-                dc_full_scale_v=dc_full_scale_v,
-            )
-        )
-        offsets = (
-            ()
-            if offset_plan is None
-            else tuple(offset_plan.offset_volts)
-        )
-        reasons = ["No voltage or RF sweep is configured."]
-        if any(
-            not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
-            for value in offsets
-        ):
-            offset_text = ", ".join(
-                f"{value * 1e3:.9g} mV" for value in offsets
-            )
-            reasons.append(
-                "Globally constant DC output(s) use fixed physical M5301 "
-                f"offsets ({offset_text}) with a zero residual waveform; "
-                "mapped offset support is confirmed when the QCS Program "
-                "is compiled."
-            )
         return QcsSweepExecutionPreview(
             mode="none",
-            reasons=tuple(reasons),
-            dc_channel_offsets_v=offsets,
+            reasons=(
+                "No voltage or RF sweep is configured. Fixed levels use "
+                "DCWaveform amplitudes; physical channel offsets are disabled.",
+            ),
+            dc_channel_offsets_v=(0.0,) * len(sequence.output_names),
         )
     axis_kinds = tuple(
         str(getattr(axis, "axis_kind", "amplitude"))
@@ -4214,6 +4141,7 @@ def qcs_sweep_execution_preview(
     def early_software_or_hybrid(reason: str) -> QcsSweepExecutionPreview:
         if (
             bool(hardware_demodulation)
+            and len(tuple(sequence.sweep_axes)) >= 2
             and candidate_hardware_points > 1
             and candidate_software_points <= MAX_QCS_SOFTWARE_SWEEP_POINTS
         ):
@@ -4265,8 +4193,9 @@ def qcs_sweep_execution_preview(
     if offset_plan is None:
         return early_software_or_hybrid(
             (
-                "Voltage ramps do not share one fixed endpoint, so QCS must "
-                "execute fixed numeric point programs."
+                "Voltage ramps do not share a zero endpoint. Physical channel "
+                "offsets are disabled, so QCS must execute fixed numeric "
+                "point programs."
             )
         )
 
@@ -4286,6 +4215,7 @@ def qcs_sweep_execution_preview(
     if reasons:
         if (
             bool(hardware_demodulation)
+            and len(tuple(sequence.sweep_axes)) >= 2
             and candidate_hardware_points > 1
             and candidate_software_points <= MAX_QCS_SOFTWARE_SWEEP_POINTS
         ):
@@ -4314,41 +4244,11 @@ def qcs_sweep_execution_preview(
             reasons=tuple(reasons),
             dc_channel_offsets_v=tuple(offset_plan.offset_volts),
         )
-    nonzero_offset = any(
-        not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
-        for value in offset_plan.offset_volts
-    )
+    del init_time_s
     confirmation = (
-        "The waveform is hardware-sweepable; mapped M5301 offset support is "
-        "confirmed when the QCS Program is compiled."
-        if nonzero_offset
-        else (
-            "The waveform is hardware-sweepable; mapped channel settings are "
-            "confirmed when the QCS Program is compiled."
-        )
+        "The waveform is hardware-sweepable using DCWaveform amplitudes; "
+        "physical channel offsets are disabled."
     )
-    if nonzero_offset:
-        configured_gap_s = _nonnegative_finite(
-            init_time_s,
-            "QCS inter-iteration delay",
-        )
-        offset_text = ", ".join(
-            f"{value * 1e3:.9g} mV" for value in offset_plan.offset_volts
-        )
-        confirmation += (
-            f" The fixed physical offset(s) ({offset_text}) remain present "
-            "during the configured "
-            f"{configured_gap_s * 1e6:.9g} us inter-iteration delay."
-        )
-        compensation = getattr(sequence, "bias_t_compensation", None)
-        if (
-            isinstance(compensation, BiasTCompensationConfig)
-            and compensation.mode == "fixed_time"
-        ):
-            confirmation += (
-                " Fixed-time Bias-T compensation includes that inter-shot "
-                "offset area."
-            )
     return QcsSweepExecutionPreview(
         mode="hardware",
         reasons=(confirmation,),
@@ -4641,10 +4541,10 @@ def compile_qcs_synchronized_sweep(
         )
     if dc_offset_plan is None:
         raise QcsUnsupportedFeatureError(
-            "QCS synchronized compilation cannot avoid M5301 waveform "
-            "addition with one fixed offset per output; use "
+            "QCS synchronized compilation requires a zero-baseline M5301 "
+            "amplitude sweep; physical channel offsets are disabled. Use "
             "execute_qcs_sequence for hardware-safe fixed numeric point "
-            "programs"
+            "programs."
         )
     # The exact fixed operation graph is validated below after all Cartesian
     # duration/amplitude tables have been assembled. Avoid another full sweep
@@ -5847,7 +5747,6 @@ def _execute_qcs_mixed_sweep(
             _qcs_sequence_slice(sequence, fixed),
             fabric_mhz=fabric_mhz,
             amplitude_scale=capacity_scale,
-            auto_fixed_dc_offsets=True,
             source_full_scale_mv=source_full_scale_mv,
             dc_full_scale_v=connection_config.dc_full_scale_v,
         )
@@ -5908,9 +5807,8 @@ def _execute_qcs_mixed_sweep(
             if outer_index == 0:
                 # The planner already compiled this exact all-zero outer
                 # coordinate. Reuse it: a large native inner grid can take
-                # seconds to build. Planning reset its mapper offsets for
-                # safety, so restore only those settings immediately before
-                # the corresponding program is submitted.
+                # seconds to build. Planning kept mapper offsets at zero;
+                # enforce that invariant again immediately before submission.
                 compiled = plan.first_compiled
                 _set_qcs_dc_channel_offsets(
                     mapper,
@@ -9178,7 +9076,6 @@ def execute_qcs_sequence(
                 float(source_full_scale_mv)
                 / (float(connection_config.dc_full_scale_v) * 1000.0)
             ),
-            auto_fixed_dc_offsets=True,
             source_full_scale_mv=source_full_scale_mv,
             dc_full_scale_v=connection_config.dc_full_scale_v,
         )
@@ -9372,8 +9269,9 @@ def execute_qcs_sequence(
         dc_offset_plan is None or fixed_voltage_bias_t_sweep
     )
     fixed_numeric_dc_reason = (
-        "Voltage ramps do not share one fixed endpoint, so QCS uses fixed "
-        "numeric point programs and splits bipolar ramps at 0 V."
+        "Voltage ramps do not share a zero endpoint. Physical channel offsets "
+        "are disabled, so QCS uses fixed numeric point programs and splits "
+        "bipolar ramps at 0 V."
     )
     if fixed_voltage_bias_t_sweep:
         fixed_numeric_dc_reason = (
@@ -9517,13 +9415,9 @@ def execute_qcs_sequence(
             _validate_qcs_software_sweep_point_count(point_count)
         if event_callback is not None:
             if compiled.hardware_sweep:
-                offset_text = ", ".join(
-                    f"{value * 1e3:.9g} mV"
-                    for value in compiled.dc_channel_offsets_v
-                )
                 build_message = (
-                    "Compiled one native QCS hardware sweep; fixed M5301 "
-                    f"offsets: {offset_text}"
+                    "Compiled one native QCS hardware sweep using "
+                    "DCWaveform amplitudes; physical offsets are disabled"
                 )
             else:
                 build_message = "Compiled one QCS-managed software sweep"

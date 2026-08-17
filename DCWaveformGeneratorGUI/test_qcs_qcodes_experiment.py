@@ -741,10 +741,7 @@ def test_compile_converts_gui_millivolts_to_qcs_relative_amplitude():
     dc_waveform = dc_operations[0]
     # 0.5 of the GUI's 800 mV scale is 400 mV, or 0.16 of 2.5 V.
     assert dc_waveform.kwargs["amplitude"] == pytest.approx(0.16)
-    assert [type(operation) for operation in dc_operations] == [
-        _Waveform,
-        _Hold,
-    ]
+    assert [type(operation) for operation in dc_operations] == [_Waveform]
     assert compiled.program.waveforms[0][2]["new_layer"] is True
     assert compiled.program.shots == 2
     assert compiled.program.acquisitions[0]["pre_delay"] == 0.0
@@ -906,13 +903,11 @@ def test_compile_emits_explicit_terminal_dc_reset_for_compensation():
 
     assert [type(operation) for operation in operations] == [
         _Waveform,
-        _Hold,
         _Delay,
     ]
     assert operations[0].kwargs["amplitude"] == pytest.approx(0.1)
-    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
-    assert operations[1].kwargs["duration"] == pytest.approx(296 / 300e6)
-    assert operations[2].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
+    assert operations[1].kwargs["duration"] == pytest.approx(4 / 300e6)
 
 
 def test_m5301_ramp_rejects_unrepresentable_odd_fabric_cycle_duration():
@@ -1076,12 +1071,12 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
     sequence = _two_output_nonzero_initial_hold_sequence()
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
     assert [channel.rendered_fabric_cycles for channel in report.channels] == [
-        6_004,
-        6_004,
+        6_300,
+        6_300,
     ]
     assert [channel.rendered_samples for channel in report.channels] == [
-        48_032,
-        48_032,
+        50_400,
+        50_400,
     ]
 
     connection = _connection(
@@ -1143,9 +1138,9 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
             )
             assert type(seed) is _Waveform
             assert type(initial_hold) is _Hold
-            assert seed.kwargs["duration"] == pytest.approx(4 / 300e6)
+            assert seed.kwargs["duration"] == pytest.approx(300 / 300e6)
             assert initial_hold.kwargs["duration"] == pytest.approx(
-                100e-6 - 4 / 300e6
+                100e-6 - 300 / 300e6
             )
             assert sum(
                 operation.kwargs["duration"] for operation in operations
@@ -1180,7 +1175,7 @@ def test_real_qcs_255_constant_seed_hold_renders_requested_voltage():
         "DCWaveform",
         "Hold",
     ]
-    assert operations[0].duration.value == pytest.approx(4 / 300e6)
+    assert operations[0].duration.value == pytest.approx(300 / 300e6)
     assert sum(operation.duration.value for operation in operations) == (
         pytest.approx(100e-6)
     )
@@ -1190,7 +1185,7 @@ def test_real_qcs_255_constant_seed_hold_renders_requested_voltage():
     np.testing.assert_array_equal(rendered.imag, 0.0)
 
 
-def test_no_sweep_globally_constant_output_uses_offset_and_resets():
+def test_no_sweep_globally_constant_output_uses_waveform_and_zero_offset():
     sequence = (
         FineTuneSequence(("awg_0", "awg_1"))
         .add_set("initial", [0.0, 0.125], 300)
@@ -1208,7 +1203,7 @@ def test_no_sweep_globally_constant_output_uses_offset_and_resets():
     )
     assert [channel.rendered_samples for channel in report.channels] == [
         48_000,
-        0,
+        2_400,
     ]
 
     preview = backend.qcs_sweep_execution_preview(
@@ -1218,7 +1213,7 @@ def test_no_sweep_globally_constant_output_uses_offset_and_resets():
         dc_full_scale_v=2.5,
     )
     assert preview.mode == "none"
-    np.testing.assert_allclose(preview.dc_channel_offsets_v, [0.0, 0.1])
+    np.testing.assert_allclose(preview.dc_channel_offsets_v, [0.0, 0.0])
 
     mapper = _PhysicalMapper("dc_0", "dc_1", "digitizer")
     offset_0 = mapper.offset_scalar("dc_0")
@@ -1233,11 +1228,14 @@ def test_no_sweep_globally_constant_output_uses_offset_and_resets():
                 assert offset_1.value == pytest.approx(0.0)
                 return None
             assert offset_0.value == pytest.approx(0.0)
-            assert offset_1.value == pytest.approx(0.1)
-            residual_operations = _program_waveform_operations(
+            assert offset_1.value == pytest.approx(0.0)
+            waveform_operations = _program_waveform_operations(
                 program.waveforms[1]
             )
-            assert all(type(operation) is _Delay for operation in residual_operations)
+            assert any(
+                type(operation) is _Waveform
+                for operation in waveform_operations
+            )
             return np.asarray([1.0 + 2.0j])
 
     result = execute_qcs_sequence(
@@ -1253,14 +1251,31 @@ def test_no_sweep_globally_constant_output_uses_offset_and_resets():
         executor=Executor(),
     )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert offset_1.value == pytest.approx(0.0)
-    assert result.program_summary["fixed_dc_offset_residualization"] is True
+    assert result.program_summary["fixed_dc_offset_residualization"] is False
     np.testing.assert_allclose(
         result.program_summary["dc_channel_offsets_v"],
-        [0.0, 0.1],
+        [0.0, 0.0],
     )
-    assert result.program_summary["safety_reset_executor_call_count"] == 1
+    assert result.program_summary["safety_reset_executor_call_count"] == 0
+
+
+def test_nonzero_physical_channel_offset_is_rejected():
+    mapper = _PhysicalMapper("dc_gate")
+
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="physical channel offsets are disabled",
+    ):
+        backend._set_qcs_dc_channel_offsets(
+            mapper,
+            channel_names=("dc_gate",),
+            offset_volts=(0.080,),
+            require_nonzero_support=True,
+        )
+
+    assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
 
 
 def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
@@ -1271,8 +1286,8 @@ def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
     )
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
-    assert report.worst_channel.rendered_fabric_cycles == 4
-    assert report.worst_channel.rendered_samples == 32
+    assert report.worst_channel.rendered_fabric_cycles == 300
+    assert report.worst_channel.rendered_samples == 2_400
 
     compiled = compile_qcs_point(
         sequence,
@@ -1287,13 +1302,13 @@ def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
         _Waveform,
         _Hold,
     ]
-    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
     assert sum(
         operation.kwargs["duration"] for operation in operations
     ) == pytest.approx(20e-6)
 
 
-def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
+def test_m5301_capacity_preview_legacy_offset_flag_has_no_effect():
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("baseline_before", [0.10], 20_000)
@@ -1308,20 +1323,19 @@ def test_m5301_capacity_preview_accounts_for_automatic_fixed_offset():
         amplitude_scale=0.8 / 2.5,
     )
     assert conservative.exceeds_capacity is False
-    assert conservative.worst_channel.rendered_fabric_cycles == 2_004
+    assert conservative.worst_channel.rendered_fabric_cycles == 2_300
 
-    optimized = backend.validate_qcs_m5301_waveform_capacity(
+    legacy_flag_report = backend.validate_qcs_m5301_waveform_capacity(
         sequence,
         amplitude_scale=0.8 / 2.5,
         auto_fixed_dc_offsets=True,
         source_full_scale_mv=800.0,
         dc_full_scale_v=2.5,
     )
-    assert optimized.exceeds_capacity is False
-    # The fixed offset makes the initial baseline a zero delay. Both later
-    # plateaus directly follow ramps, so only the two ramps consume memory.
-    assert optimized.worst_channel.rendered_fabric_cycles == 2_000
-    assert optimized.worst_channel.rendered_samples == 16_000
+    assert legacy_flag_report.exceeds_capacity is False
+    assert legacy_flag_report.worst_channel.rendered_fabric_cycles == 2_300
+    assert legacy_flag_report.worst_channel.rendered_samples == 18_400
+    assert legacy_flag_report.dc_channel_offsets_v == (0.0,)
 
 
 def test_two_output_bias_t_guard_and_tail_are_qcs_aligned_and_fit_capacity():
@@ -1478,8 +1492,9 @@ def test_fixed_voltage_bias_t_duration_sweep_capacity_matches_point_compile():
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
     assert report.exceeds_capacity is False
-    # The user plateau and Bias-T tail each consume one four-cycle seed.
-    assert report.worst_channel.rendered_fabric_cycles == 8
+    # The independent user plateau uses a 1 us hardware-safe seed. The
+    # ramp-to-Hold Bias-T tail retains its four-cycle ramp seed.
+    assert report.worst_channel.rendered_fabric_cycles == 304
 
     for point_index in range(sequence.sweep_point_count):
         compiled = compile_qcs_point(
@@ -1911,46 +1926,27 @@ def test_execute_native_awg_sweep_uses_one_program_in_c_order():
     )
 
 
-def test_fixed_m5301_offset_enables_native_segment_amplitude_sweep():
+def test_nonzero_baseline_amplitude_sweep_uses_fixed_numeric_waveforms():
     sequence = _fixed_baseline_offset_sequence()
     mapper = _PhysicalMapper("dc_gate", "digitizer")
     offset = mapper.offset_scalar("dc_gate")
-    returned = np.asarray(
-        [
-            [1.0 + 1.0j, 2.0 + 2.0j, 3.0 + 3.0j],
-            [4.0 + 4.0j, 5.0 + 5.0j, 6.0 + 6.0j],
-        ]
-    )
     calls = []
 
     class Executor:
         def execute(self, program):
             calls.append(program)
-            if program.name == "PulseGenerator emergency DC reset":
-                assert offset.value == pytest.approx(0.0)
-                return None
-
-            # GUI amplitudes use the 800 mV source scale. The common 0.10
-            # baseline therefore becomes an 80 mV physical-channel offset.
-            assert offset.value == pytest.approx(0.080)
-            assert program.repetition_calls == ["sweep", "shots"]
-            assert len(program.sweeps) == 1
-            arrays, variables = program.sweeps[0]
-            assert len(arrays) == len(variables) == 2
-            assert all(variable is not offset for variable in variables)
-            for array in arrays:
-                # Residual target levels are 80/160/240 mV, normalized by
-                # the independent 2.5 V DCWaveform full scale.
-                np.testing.assert_allclose(
-                    array.value,
-                    [0.032, 0.064, 0.096],
-                )
+            assert offset.value == pytest.approx(0.0)
+            assert program.repetition_calls == ["shots"]
+            assert program.sweeps == []
             operations = _program_waveform_operations(program.waveforms[0])
             assert not any(
                 isinstance(operation, _CombinedWaveform)
                 for operation in operations
             )
-            return returned
+            index = len(calls)
+            return np.asarray(
+                [index + 1.0j, index + 10.0 + 2.0j]
+            )
 
     result = execute_qcs_sequence(
         connection_config=_connection(),
@@ -1962,110 +1958,48 @@ def test_fixed_m5301_offset_enables_native_segment_amplitude_sweep():
         executor=Executor(),
     )
 
-    assert len(calls) == 2
-    assert calls[-1].name == "PulseGenerator emergency DC reset"
+    assert len(calls) == sequence.sweep_point_count
     assert offset.value == pytest.approx(0.0)
-    assert result.program_summary["hardware_sweep"] is True
-    assert result.program_summary["sweep_execution_mode"] == "hardware_flattened"
-    assert result.program_summary["program_count"] == 1
-    assert result.program_summary["executor_call_count"] == 1
-    assert result.program_summary["safety_reset_executor_call_count"] == 1
-    assert result.program_summary["total_executor_call_count"] == 2
-    assert result.program_summary["fixed_dc_offset_residualization"] is True
+    assert result.program_summary["hardware_sweep"] is False
+    assert result.program_summary["sweep_execution_mode"] == (
+        "software_fixed_numeric_dc_ramp"
+    )
+    assert result.program_summary["program_count"] == 3
+    assert result.program_summary["executor_call_count"] == 3
+    assert result.program_summary["safety_reset_executor_call_count"] == 0
+    assert result.program_summary["fixed_dc_offset_residualization"] is False
     np.testing.assert_allclose(
         result.program_summary["dc_channel_offsets_v"],
-        [0.080],
+        [0.0],
     )
     assert result.ddr_result.iq.shape == (3, 2, 1, 2)
     np.testing.assert_allclose(
         result.ddr_result.iq[:, :, 0, 0],
-        [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]],
+        [[1.0, 11.0], [2.0, 12.0], [3.0, 13.0]],
     )
 
 
-def test_swept_negative_plateau_uses_one_native_hardware_sweep_and_hold():
+def test_nonzero_baseline_plateau_rejects_direct_hardware_sweep():
     sequence = _swept_negative_plateau_sequence()
     mapper = _PhysicalMapper("dc_gate", "digitizer")
 
-    compiled = backend.compile_qcs_synchronized_sweep(
-        sequence,
-        connection_config=_connection(dc_full_scale_v=2.5),
-        mapper=mapper,
-        repetitions_per_sweep=1,
-        source_full_scale_mv=800.0,
-        acquisition=_acquisition(
-            at_segment="swept_negative",
-            duration_s=1e-6,
-        ),
-        qcs_module=_FakeQcs,
-    )
-
-    assert compiled.hardware_sweep is True
-    assert compiled.software_sweep_reasons == ()
-    assert compiled.program.repetition_calls == ["sweep", "shots"]
-    np.testing.assert_allclose(compiled.dc_channel_offsets_v, [0.100])
-    assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.100)
-
-    operations = _program_waveform_operations(
-        compiled.program.waveforms[0]
-    )
-    operations_by_name = {
-        operation.kwargs.get("name"): operation
-        for operation in operations
-    }
-    ramp = operations_by_name["awg_dc_0_interval_3_rising"]
-    assert ramp.kwargs["duration"] == pytest.approx(10e-6)
-    plateau_operations = [
-        operation
-        for operation in operations
-        if str(operation.kwargs.get("name", "")).startswith(
-            "awg_dc_0_interval_4"
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="physical channel offsets are disabled",
+    ):
+        backend.compile_qcs_synchronized_sweep(
+            sequence,
+            connection_config=_connection(dc_full_scale_v=2.5),
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=_acquisition(
+                at_segment="swept_negative",
+                duration_s=1e-6,
+            ),
+            qcs_module=_FakeQcs,
         )
-    ]
-    assert any(
-        isinstance(operation, _Hold)
-        for operation in plateau_operations
-    )
-    assert sum(
-        operation.kwargs["duration"] for operation in plateau_operations
-    ) == pytest.approx(100e-6)
-
-    arrays, variables = compiled.program.sweeps[0]
-    sweep_values_by_variable = {
-        id(variable): np.asarray(array.value)
-        for array, variable in zip(arrays, variables)
-    }
-    expected_residual = np.linspace(-0.100, -0.250, 5)
-    expected_residual = (expected_residual - 0.100) / 2.5
-    np.testing.assert_allclose(
-        sweep_values_by_variable[id(ramp.kwargs["amplitude"])],
-        expected_residual,
-    )
-
-    # A short swept SET may precede Hold, or the compiler may directly Hold
-    # the endpoint established by the incoming ramp. In both cases the
-    # plateau voltage follows the same hardware-swept endpoint values.
-    plateau_seed = next(
-        (
-            operation
-            for operation in plateau_operations
-            if isinstance(operation, _Waveform)
-            and not isinstance(operation, _Hold)
-        ),
-        None,
-    )
-    if plateau_seed is None:
-        assert isinstance(plateau_operations[0], _Hold)
-        assert operations.index(plateau_operations[0]) == (
-            operations.index(ramp) + 1
-        )
-    else:
-        np.testing.assert_allclose(
-            sweep_values_by_variable[
-                id(plateau_seed.kwargs["amplitude"])
-            ],
-            expected_residual,
-        )
+    assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
 
 
 def test_swept_negative_plateau_capacity_preview_counts_hold_seed_only():
@@ -2115,7 +2049,7 @@ def test_duration_swept_plateau_capacity_models_fixed_outer_slice_hold():
     assert report.worst_channel.rendered_fabric_cycles == 3_000
 
 
-def test_swept_negative_plateau_preview_reports_planned_hardware_mode():
+def test_nonzero_baseline_plateau_preview_reports_software_mode():
     preview = backend.qcs_sweep_execution_preview(
         _swept_negative_plateau_sequence(),
         hardware_demodulation=True,
@@ -2123,10 +2057,9 @@ def test_swept_negative_plateau_preview_reports_planned_hardware_mode():
         dc_full_scale_v=2.5,
     )
 
-    assert preview.mode == "hardware"
-    assert preview.exact is False
-    assert preview.dc_channel_offsets_v == pytest.approx((0.100,))
-    assert "confirmed" in preview.reasons[0]
+    assert preview.mode == "software"
+    assert preview.dc_channel_offsets_v == ()
+    assert "Physical channel offsets are disabled" in preview.reasons[0]
 
     trace_preview = backend.qcs_sweep_execution_preview(
         _swept_negative_plateau_sequence(),
@@ -2135,10 +2068,10 @@ def test_swept_negative_plateau_preview_reports_planned_hardware_mode():
         dc_full_scale_v=2.5,
     )
     assert trace_preview.mode == "software"
-    assert any("Raw trace" in reason for reason in trace_preview.reasons)
+    assert "Physical channel offsets are disabled" in trace_preview.reasons[0]
 
 
-def test_101_by_101_voltage_grid_uses_hardware_limit_not_software_limit():
+def test_101_by_101_nonzero_baseline_grid_cannot_use_direct_hardware_sweep():
     sequence = _two_output_swept_negative_plateau_sequence()
     connection = _connection(
         dc_channel_names=("dc_gate_a", "dc_gate_b"),
@@ -2153,28 +2086,28 @@ def test_101_by_101_voltage_grid_uses_hardware_limit_not_software_limit():
         dc_full_scale_v=2.5,
         init_time_s=100e-6,
     )
-    compiled = backend.compile_qcs_synchronized_sweep(
-        sequence,
-        connection_config=connection,
-        mapper=mapper,
-        repetitions_per_sweep=1,
-        source_full_scale_mv=800.0,
-        acquisition=_acquisition(
-            at_segment="swept_negative",
-            duration_s=1e-6,
-        ),
-        qcs_module=_FakeQcs,
-    )
-
     assert sequence.sweep_point_count == 10_201
-    assert preview.mode == "hardware"
+    assert preview.mode == "hybrid"
     assert preview.exact is False
-    assert "100 us inter-iteration" in " ".join(preview.reasons)
-    assert compiled.hardware_sweep is True
-    assert compiled.sweep_shape == (101, 101)
-    assert compiled.sweep_variable_count == 2
-    assert compiled.sweep_array_value_count == 20_402
-    assert compiled.program.repetition_calls == ["sweep", "shots"]
+    assert "Physical channel offsets are disabled" in " ".join(
+        preview.reasons
+    )
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="physical channel offsets are disabled",
+    ):
+        backend.compile_qcs_synchronized_sweep(
+            sequence,
+            connection_config=connection,
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=_acquisition(
+                at_segment="swept_negative",
+                duration_s=1e-6,
+            ),
+            qcs_module=_FakeQcs,
+        )
 
 
 def test_101_by_101_trace_grid_is_rejected_as_oversized_software_sweep():
@@ -2187,11 +2120,11 @@ def test_101_by_101_trace_grid_is_rejected_as_oversized_software_sweep():
     )
 
     assert preview.mode == "invalid"
-    assert "10,000-point limit" in " ".join(preview.reasons)
+    assert "10,000-point software-sweep limit" in " ".join(preview.reasons)
 
     with pytest.raises(
         QcsUnsupportedFeatureError,
-        match="software sweeps are limited to 10,000",
+        match="physical channel offsets are disabled",
     ):
         backend.compile_qcs_synchronized_sweep(
             sequence,
@@ -2213,7 +2146,7 @@ def test_101_by_101_trace_grid_is_rejected_as_oversized_software_sweep():
         )
 
 
-def test_unrelated_fixed_ramp_does_not_block_offset_hardware_sweep():
+def test_nonzero_sweep_anchor_blocks_zero_offset_hardware_sweep():
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("initial", [-0.25], 300)
@@ -2228,23 +2161,23 @@ def test_unrelated_fixed_ramp_does_not_block_offset_hardware_sweep():
     )
     mapper = _PhysicalMapper("dc_gate", "digitizer")
 
-    compiled = backend.compile_qcs_synchronized_sweep(
-        sequence,
-        connection_config=_connection(dc_full_scale_v=2.5),
-        mapper=mapper,
-        repetitions_per_sweep=1,
-        source_full_scale_mv=800.0,
-        acquisition=_acquisition(
-            at_segment="swept_plateau",
-            duration_s=100e-9,
-        ),
-        qcs_module=_FakeQcs,
-    )
-
-    assert compiled.hardware_sweep is True
-    assert compiled.sweep_variable_count == 1
-    assert compiled.dc_channel_offsets_v == pytest.approx((0.100,))
-    assert compiled.program.repetition_calls == ["sweep", "shots"]
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="physical channel offsets are disabled",
+    ):
+        backend.compile_qcs_synchronized_sweep(
+            sequence,
+            connection_config=_connection(dc_full_scale_v=2.5),
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=_acquisition(
+                at_segment="swept_plateau",
+                duration_s=100e-9,
+            ),
+            qcs_module=_FakeQcs,
+        )
+    assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
 
 
 def test_zero_offset_ramp_to_long_plateau_uses_hold_in_direct_compiler():
@@ -2276,7 +2209,7 @@ def test_zero_offset_ramp_to_long_plateau_uses_hold_in_direct_compiler():
     assert any(isinstance(operation, _Hold) for operation in operations)
 
 
-def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
+def test_fixed_time_compensation_uses_numeric_points_without_channel_offset():
     sequence = _swept_negative_plateau_sequence(
         plateau_cycles=300,
         ramp_cycles=600,
@@ -2292,13 +2225,8 @@ def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
     class Executor:
         def execute(self, program):
             calls.append(program)
-            if len(calls) == 1:
-                assert mapper.offset_scalar("dc_gate").value == pytest.approx(
-                    0.100
-                )
-                return np.full(sequence.sweep_point_count, 1.0 + 2.0j)
             assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
-            return None
+            return np.asarray([1.0 + 2.0j])
 
     result = execute_qcs_sequence(
         connection_config=_connection(dc_full_scale_v=2.5),
@@ -2314,45 +2242,20 @@ def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
         executor=Executor(),
     )
 
-    assert len(calls) == 2
-    assert result.program_summary["hardware_sweep"] is True
-    assert result.program_summary["sweep_execution_mode"] == "hardware_flattened"
-    assert result.program_summary["program_count"] == 1
-    assert result.program_summary["executor_call_count"] == 1
-    assert result.program_summary["safety_reset_executor_call_count"] == 1
-    assert result.program_summary["dc_channel_offsets_v"] == pytest.approx(
-        [0.100]
+    assert len(calls) == sequence.sweep_point_count
+    assert result.program_summary["hardware_sweep"] is False
+    assert result.program_summary["sweep_execution_mode"] == (
+        "software_fixed_numeric_dc_ramp"
     )
-    expected_init_compensation_v = -0.100 * (
-        backend.DEFAULT_QCS_INIT_TIME_S
-        * (sequence.sweep_point_count - 1)
-        / sequence.sweep_point_count
-        / (3_000 / 300e6)
+    assert result.program_summary["program_count"] == sequence.sweep_point_count
+    assert result.program_summary["executor_call_count"] == sequence.sweep_point_count
+    assert result.program_summary["safety_reset_executor_call_count"] == 0
+    assert result.program_summary["dc_channel_offsets_v"] == pytest.approx(
+        [0.0]
     )
     assert result.program_summary[
         "dc_offset_init_compensation_v"
-    ] == pytest.approx([expected_init_compensation_v])
-
-    arrays, variables = calls[0].sweeps[0]
-    values_by_name = {
-        variable.name: np.asarray(array.value)
-        for array, variable in zip(arrays, variables)
-    }
-    compensation_values = values_by_name[
-        "awg_dc_0_interval_6_amplitude"
-    ]
-    original_target = sequence.bias_t_compensation_preview(0)[
-        0
-    ].target_amplitude
-    expected_first = (
-        (
-            original_target
-            + expected_init_compensation_v / 0.800
-        )
-        * (800.0 / 2_500.0)
-        - 0.100 / 2.5
-    )
-    assert compensation_values[0] == pytest.approx(expected_first)
+    ] == pytest.approx([0.0])
 
     preview = backend.qcs_sweep_execution_preview(
         sequence,
@@ -2361,9 +2264,8 @@ def test_fixed_time_compensation_stays_in_hardware_when_within_budget():
         dc_full_scale_v=2.5,
         init_time_s=100e-6,
     )
-    assert "includes that inter-shot offset area" in " ".join(
-        preview.reasons
-    )
+    assert preview.mode == "software"
+    assert "Physical channel offsets are disabled" in " ".join(preview.reasons)
 
 
 def test_nonzero_offset_trace_sweep_uses_zero_offset_fixed_numeric_points():
@@ -2403,7 +2305,7 @@ def test_nonzero_offset_trace_sweep_uses_zero_offset_fixed_numeric_points():
     ] == "software_fixed_numeric_dc_ramp"
     assert result.program_summary["dc_channel_offsets_v"] == [0.0]
     assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
-    assert "cannot remain active" in " ".join(
+    assert "Physical channel offsets are disabled" in " ".join(
         result.program_summary["software_sweep_reasons"]
     )
 
@@ -2444,7 +2346,7 @@ def test_fixed_offset_is_not_used_without_a_common_idle_baseline():
     )
 
 
-def test_fixed_offset_execution_failure_resets_physical_offset():
+def test_numeric_sweep_execution_failure_keeps_physical_offset_zero():
     mapper = _PhysicalMapper("dc_gate", "digitizer")
     offset = mapper.offset_scalar("dc_gate")
     calls = []
@@ -2453,7 +2355,7 @@ def test_fixed_offset_execution_failure_resets_physical_offset():
         def execute(self, program):
             calls.append(program)
             if len(calls) == 1:
-                assert offset.value == pytest.approx(0.080)
+                assert offset.value == pytest.approx(0.0)
                 raise RuntimeError("injected fixed-offset failure")
             assert program.name == "PulseGenerator emergency DC reset"
             assert offset.value == pytest.approx(0.0)
@@ -2575,7 +2477,10 @@ def test_public_synchronized_compiler_rejects_waveform_addition():
         .add_amplitude_sweep("end", "gate", 0.09, 0.11, 2)
     )
 
-    with pytest.raises(QcsUnsupportedFeatureError, match="waveform addition"):
+    with pytest.raises(
+        QcsUnsupportedFeatureError,
+        match="physical channel offsets are disabled",
+    ):
         backend.compile_qcs_synchronized_sweep(
             sequence,
             connection_config=_connection(),
@@ -2886,18 +2791,16 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
     )
     assert [type(operation) for operation in operations] == [
         _Waveform,
-        _Hold,
         _Delay,
         _Waveform,
         _Hold,
         _Delay,
     ]
-    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
-    assert operations[1].kwargs["duration"] == pytest.approx(296 / 300e6)
-    assert operations[2].kwargs["duration"] == pytest.approx(34 / 300e6)
-    assert operations[3].kwargs["duration"] == pytest.approx(4 / 300e6)
-    assert operations[4].kwargs["duration"] == pytest.approx(298 / 300e6)
-    assert operations[5].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
+    assert operations[1].kwargs["duration"] == pytest.approx(34 / 300e6)
+    assert operations[2].kwargs["duration"] == pytest.approx(300 / 300e6)
+    assert operations[3].kwargs["duration"] == pytest.approx(2 / 300e6)
+    assert operations[4].kwargs["duration"] == pytest.approx(4 / 300e6)
     arrays, variables = compiled.program.sweeps[0]
     by_name = {
         variable.name: array.value
@@ -3456,7 +3359,7 @@ def test_mixed_stop_after_completed_executor_return_retains_that_block():
     )
 
 
-def test_long_hold_hybrid_validates_per_inner_slice_and_executes():
+def test_nonzero_baseline_long_hold_falls_back_to_numeric_points():
     sequence = _swept_negative_plateau_sequence().add_hold_duration_sweep(
         "swept_negative",
         100.0,
@@ -3483,7 +3386,8 @@ def test_long_hold_hybrid_validates_per_inner_slice_and_executes():
                 reset_programs.append(program)
                 return None
             measurement_programs.append(program)
-            return np.arange(5, dtype=float) + 1.0j
+            assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
+            return np.asarray([1.0 + 1.0j])
 
     result = execute_qcs_sequence(
         connection_config=connection,
@@ -3497,17 +3401,12 @@ def test_long_hold_hybrid_validates_per_inner_slice_and_executes():
     )
 
     assert result.program_summary["sweep_execution_mode"] == (
-        "hybrid_hardware_software"
+        "software_fixed_numeric_dc_ramp"
     )
-    assert result.program_summary["hardware_points_per_iteration"] == 5
-    assert result.program_summary["software_iteration_count"] == 3
-    assert result.program_summary["completed_points"] == 15
-    assert len(measurement_programs) == 3
-    assert len(reset_programs) == 3
-    np.testing.assert_allclose(
-        result.program_summary["dc_channel_offsets_v_by_iteration"],
-        [[0.1], [0.1], [0.1]],
-    )
+    assert result.program_summary["program_count"] == 15
+    assert len(measurement_programs) == 15
+    assert len(reset_programs) == 0
+    assert result.program_summary["dc_channel_offsets_v"] == [0.0]
     assert mapper.offset_scalar("dc_gate").value == pytest.approx(0.0)
 
 
@@ -4275,7 +4174,7 @@ def test_qcs_stability_hold_avoids_the_measured_direct_waveform_limit():
         _Hold,
     ]
     assert operations[0].kwargs["amplitude"] is amplitude
-    assert operations[0].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
     assert sum(
         operation.kwargs["duration"] for operation in operations
     ) == pytest.approx(duration_s)
@@ -5692,17 +5591,38 @@ def test_generated_qcs_code_uses_delay_for_long_zero_interval():
     ) == pytest.approx(50e-6)
 
 
-def test_generated_qcs_code_rejects_long_nonzero_hold():
+def test_generated_qcs_code_uses_safe_seed_and_hold_for_long_nonzero_flat():
     pulse = PulseSequence(25.0, 50_000.0)
 
-    with pytest.raises(
-        ValueError,
-        match=r"120,000 rendered M5301 samples.*Hold.*did not preserve",
-    ):
-        generate_qcs_program_code(
-            (pulse,),
-            channel_names=("gate",),
-        )
+    code = generate_qcs_program_code(
+        (pulse,),
+        channel_names=("gate",),
+    )
+
+    assert "qcs.Hold(" in code
+    assert "1000 * ns" in code
+    assert "49000 * ns" in code
+
+
+def test_generated_qcs_code_includes_fixed_time_compensation_offline():
+    pulse = PulseSequence(100.0, 200_000.0)
+
+    code = generate_qcs_program_code(
+        (pulse,),
+        channel_names=("gate",),
+        full_scale_v=2.5,
+        bias_t_compensation_enabled=True,
+        bias_t_compensation_type="dc",
+        bias_t_compensation_mode="fixed_time",
+        bias_t_compensation_duration_us=50.0,
+    )
+
+    assert "No mapper was loaded" in code
+    assert "value=200000 * ns" in code
+    assert "value=50000 * ns" in code
+    assert "amplitude=100 * mV" in code
+    assert "amplitude=-400" in code
+    assert code.count("qcs.Hold(") == 2
 
 
 def test_generated_qcs_code_rejects_ramp_beyond_aggregate_hcl_buffer():

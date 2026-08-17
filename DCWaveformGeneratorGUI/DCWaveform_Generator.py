@@ -7728,7 +7728,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         )
 
         channel_details = []
-        for channel_index, channel in enumerate(report.channels):
+        for channel in report.channels:
             label = channel.output_name
             if channel.output_name in channel_names:
                 label += f" -> {channel_names[channel.output_name]}"
@@ -7736,10 +7736,6 @@ class ExperimentPanel(QtWidgets.QWidget):
                 f"{label}: {channel.rendered_samples:,} samples "
                 f"({channel.rendered_duration_us:.6f} us)"
             )
-            if channel_index < len(report.dc_channel_offsets_v):
-                offset_v = float(report.dc_channel_offsets_v[channel_index])
-                if not np.isclose(offset_v, 0.0, rtol=0.0, atol=1e-15):
-                    detail += f", fixed physical offset {offset_v * 1e3:+.9g} mV"
             channel_details.append(detail)
         if report.exhaustive:
             inspection = (
@@ -7758,8 +7754,8 @@ class ExperimentPanel(QtWidgets.QWidget):
             "nonzero level count. The rest of each fixed plateau uses QCS "
             "Hold and does not consume waveform samples; zero-voltage delays "
             "do not either. "
-            "A globally constant output uses its mapped M5301 physical "
-            "offset and a zero residual waveform."
+            "Fixed output levels remain explicit DCWaveform amplitudes; "
+            "mapped physical-channel offsets are not used."
         )
         if report.exceeds_capacity:
             explanation += (
@@ -7938,8 +7934,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.compile_validation_label.setVisible(is_qick)
         self.compile_validation_mode.setVisible(is_qick)
         self.compile_validation_mode.setEnabled(is_qick and not self._running)
-        self.show_program_button.setVisible(is_qick)
-        self.show_program_button.setEnabled(is_qick and not self._running)
+        self.show_program_button.setVisible(True)
+        self.show_program_button.setEnabled(not self._running)
         self.stop_button.setVisible(not is_qick)
         self.stop_button.setEnabled(
             not is_qick and self._running and self._stop_available
@@ -7947,7 +7943,13 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.show_program_button.setToolTip(
             "Compile the current settings and show the tProcessor assembly"
             if is_qick
-            else "QICK tProcessor assembly is unavailable for Keysight QCS"
+            else (
+                "Show an offline QCS Python source preview without loading a "
+                "mapper, compiling a Program, or contacting hardware"
+            )
+        )
+        self.show_program_button.setText(
+            "Show QICK Program" if is_qick else "Show QCS Program"
         )
         self.run_button.setText(
             "Run QICK Experiment" if is_qick else "Run QCS Experiment"
@@ -9497,22 +9499,11 @@ class ExperimentPanel(QtWidgets.QWidget):
                     ),
                 )
             elif bool(program_summary.get("hardware_sweep", False)):
-                offsets = tuple(
-                    float(value)
-                    for value in program_summary.get("dc_channel_offsets_v", ())
-                )
-                offset_reason = (
-                    " Fixed M5301 offsets: "
-                    + ", ".join(f"{value * 1e3:.9g} mV" for value in offsets)
-                    + "."
-                    if offsets
-                    else ""
-                )
                 preview = QcsSweepExecutionPreview(
                     mode="hardware",
                     reasons=(
-                        "Confirmed by the completed QCS Program."
-                        + offset_reason,
+                        "Confirmed by the completed QCS Program; DC voltage "
+                        "was swept through waveform amplitudes.",
                     ),
                 )
             else:
@@ -9924,6 +9915,68 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         if not output_path.suffix:
             output_path = output_path.with_suffix(".asm")
         output_path.write_text(self._assembly, encoding="utf-8")
+        self.status_label.setText(f"Saved to {output_path}")
+
+
+class QcsProgramCodeDialog(QtWidgets.QDialog):
+    """Read-only offline QCS source viewer with copy and save actions."""
+
+    def __init__(self, code: str, parent=None):
+        super().__init__(parent)
+        self._code = str(code)
+        self.setWindowTitle("QCS Program Source Preview")
+        self.resize(1000, 760)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.summary_label = QtWidgets.QLabel(
+            "Generated locally from the current AWG Tuning settings. No "
+            "ChannelMapper was loaded, and no QCS compile, connection, or "
+            "hardware submission was performed."
+        )
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.code_text = QtWidgets.QPlainTextEdit(self)
+        self.code_text.setReadOnly(True)
+        self.code_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.code_text.setFont(
+            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        )
+        self.code_text.setPlainText(self._code)
+        layout.addWidget(self.code_text, 1)
+
+        self.status_label = QtWidgets.QLabel("Offline source preview ready.")
+        layout.addWidget(self.status_label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        self.copy_button = buttons.addButton(
+            "Copy", QtWidgets.QDialogButtonBox.ActionRole
+        )
+        self.save_button = buttons.addButton(
+            "Save As...", QtWidgets.QDialogButtonBox.ActionRole
+        )
+        self.copy_button.clicked.connect(self._copy_code)
+        self.save_button.clicked.connect(self._save_code)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _copy_code(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self._code)
+        self.status_label.setText("QCS source copied to the clipboard.")
+
+    def _save_code(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save QCS Program source preview",
+            "qcs_program_preview.py",
+            "Python files (*.py);;Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".py")
+        output_path.write_text(self._code, encoding="utf-8")
         self.status_label.setText(f"Saved to {output_path}")
 
 
@@ -10985,9 +11038,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             lambda running: self._rf_readout_panel
             .set_qcs_acquisition_mode_editing_enabled(not running)
         )
-        self._experiment_panel.show_program_requested.connect(
-            self._show_qick_program
-        )
+        self._experiment_panel.show_program_requested.connect(self._show_program)
         self._experiment_panel.awg_metadata_requested.connect(
             self._show_awg_metadata
         )
@@ -13702,11 +13753,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 sweep_preview
             )
             if sweep_preview.mode == "hybrid":
-                # A mixed sweep can choose a different safe fixed offset and
-                # Hold graph for each Python-loop coordinate. A full-grid
-                # host estimate can therefore reject a valid partition. The
-                # worker performs an exhaustive all-slices capacity preflight
-                # before its first hardware submission.
+                # A mixed sweep can choose a different safe Hold graph for
+                # each Python-loop coordinate. The worker performs an
+                # exhaustive all-slices capacity preflight before its first
+                # hardware submission.
                 self._experiment_panel.set_qcs_mixed_waveform_capacity_pending()
                 return
             point_indices = (
@@ -13724,10 +13774,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         self._experiment_panel.qcs_dc_full_scale_v.value()
                         * 1000.0
                     )
-                ),
-                auto_fixed_dc_offsets=(
-                    int(sequence.sweep_point_count) == 1
-                    or sweep_preview.mode == "hardware"
                 ),
                 source_full_scale_mv=full_scale_mv,
                 dc_full_scale_v=(
@@ -15001,10 +15047,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         # capacity feedback bounded here; QCS compilation still validates the
         # complete sweep before submitting anything to hardware.
         if sweep_preview.mode == "hybrid":
-            # Do not apply one full-grid offset model here: the exact mixed
-            # partition can use a different legal offset/Hold graph in each
-            # outer coordinate. The worker validates every coordinate before
-            # executing any of them.
+            # The exact mixed partition can use a different legal Hold graph
+            # in each outer coordinate. The worker validates every coordinate
+            # before executing any of them.
             self._experiment_panel.set_qcs_mixed_waveform_capacity_pending()
         else:
             capacity_point_indices = (
@@ -15022,10 +15067,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         self._experiment_panel.qcs_dc_full_scale_v.value()
                         * 1000.0
                     )
-                ),
-                auto_fixed_dc_offsets=(
-                    int(sequence.sweep_point_count) == 1
-                    or sweep_preview.mode == "hardware"
                 ),
                 source_full_scale_mv=qick_arguments["source_full_scale_mv"],
                 dc_full_scale_v=(
@@ -17059,6 +17100,42 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             full_scale_mv=arguments["source_full_scale_mv"],
             parent=self,
         )
+        dialog.exec_()
+
+    def _show_program(self) -> None:
+        """Show the backend-appropriate Program without running hardware."""
+
+        if (
+            self._experiment_panel.execution_backend()
+            == EXECUTION_BACKEND_QCS
+        ):
+            self._show_qcs_program()
+        else:
+            self._show_qick_program()
+
+    def _show_qcs_program(self) -> None:
+        """Show a pure source snapshot without importing or invoking QCS."""
+
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "QCS task running",
+                "Wait for the current QCS task to finish.",
+            )
+            return
+        try:
+            code = self._generate_qcs_code()
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Cannot show QCS program",
+                str(exc),
+            )
+            return
+        self.statusBar().showMessage(
+            "Showing offline QCS source; no mapper, compile, or hardware call"
+        )
+        dialog = QcsProgramCodeDialog(code, self)
         dialog.exec_()
 
     def _show_qick_program(self) -> None:
@@ -20118,7 +20195,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._show_generated_code("Generated QCS pulse", path, code_str)
 
     def _generate_qcs_code(self) -> str:
-        """Generate QCS code for the current pulse sequence."""
+        """Generate QCS code locally from the current AWG Tuning settings."""
         return generate_qcs_program_code(
             self._pulse,
             channel_names=(
@@ -20130,6 +20207,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._experiment_panel.qcs_dc_full_scale_v.value()
             ),
             cross_capacitance=self._cross_capacitance,
+            fabric_mhz=self._qick_fabric_mhz,
+            bias_t_compensation_enabled=(
+                self._experiment_panel.bias_t_group.isChecked()
+            ),
+            bias_t_compensation_type=str(
+                self._experiment_panel.bias_t_type.currentData()
+            ),
+            bias_t_compensation_voltage_mv=(
+                self._experiment_panel.bias_t_compensation_mv.value()
+            ),
+            bias_t_compensation_mode=str(
+                self._experiment_panel.bias_t_mode.currentData()
+            ),
+            bias_t_compensation_duration_us=(
+                self._experiment_panel.bias_t_duration_us.value()
+            ),
+            bias_t_filter_tau_us=(
+                self._experiment_panel.bias_t_filter_tau_us.value()
+            ),
         )
 
     def _qick_output_names(self) -> Tuple[str, ...]:
