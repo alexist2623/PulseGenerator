@@ -2869,8 +2869,8 @@ def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
     assert panel.execution_backend() == gui.EXECUTION_BACKEND_QCS
     assert panel.qcs_waveform_usage_group.isHidden() is False
     assert panel.qcs_waveform_usage_progress.maximum() == 98_304
-    # A globally constant output is now carried by the physical M5301
-    # offset, so use a true ramp to exercise the rendered-waveform ceiling.
+    # Use a true ramp to exercise the rendered-waveform ceiling, including
+    # the four-fabric-cycle ramp that explicitly returns the output to zero.
     def set_ramp(duration_ns):
         pulse = PulseSequence(0.0, initial_duration_ns=1_000.0)
         pulse.add_flat_ramp(duration_ns, 400.0, 100.0)
@@ -2879,8 +2879,8 @@ def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
 
     set_ramp(1_000.0)
     window._refresh_qcs_waveform_capacity()
-    assert panel.qcs_waveform_usage_progress.value() == 2_400
-    assert "2,400 / 98,304 samples" in (
+    assert panel.qcs_waveform_usage_progress.value() == 2_432
+    assert "2,432 / 98,304 samples" in (
         panel.qcs_waveform_usage_progress.format()
     )
 
@@ -2891,21 +2891,21 @@ def test_qcs_waveform_capacity_bar_blocks_over_limit_awg_setup():
         panel.qcs_waveform_usage_detail.text()
     )
 
+    set_ramp(40_940.0)
+    window._refresh_qcs_waveform_capacity()
+    assert panel.qcs_waveform_usage_progress.value() == 98_288
+    assert "99.98%" in panel.qcs_waveform_usage_progress.format()
+    assert "#c58a1c" in panel.qcs_waveform_usage_progress.styleSheet()
+
     set_ramp(40_960.0)
     window._refresh_qcs_waveform_capacity()
     assert panel.qcs_waveform_usage_progress.value() == 98_304
-    assert "100.00%" in panel.qcs_waveform_usage_progress.format()
-    assert "#c58a1c" in panel.qcs_waveform_usage_progress.styleSheet()
-
-    set_ramp(40_966.0)
-    window._refresh_qcs_waveform_capacity()
-    assert panel.qcs_waveform_usage_progress.value() == 98_304
-    assert "98,320 / 98,304 samples (100.02%)" == (
+    assert "98,336 / 98,304 samples (100.03%)" == (
         panel.qcs_waveform_usage_progress.format()
     )
     assert "#b33a3a" in panel.qcs_waveform_usage_progress.styleSheet()
     assert "run is blocked" in panel.qcs_waveform_usage_detail.text()
-    with pytest.raises(ValueError, match=r"98,320 / 98,304 samples"):
+    with pytest.raises(ValueError, match=r"98,336 / 98,304 samples"):
         window._qcs_experiment_run_arguments()
 
     panel.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
@@ -2939,17 +2939,17 @@ def test_qcs_no_sweep_capacity_bar_counts_each_outputs_ramps_only():
     app.processEvents()
 
     panel = window._experiment_panel
-    assert panel.qcs_waveform_usage_progress.value() == 72_000
+    assert panel.qcs_waveform_usage_progress.value() == 72_032
     assert panel.qcs_waveform_usage_progress.format() == (
-        "72,000 / 98,304 samples (73.24%)"
+        "72,032 / 98,304 samples (73.27%)"
     )
-    assert "30.000000 / 40.960000 us" in (
+    assert "30.013333 / 40.960000 us" in (
         panel.qcs_waveform_usage_summary.text()
     )
-    assert "awg_0 -> dc_ch_1: 72,000 samples (30.000000 us)" in (
+    assert "awg_0 -> dc_ch_1: 72,032 samples (30.013333 us)" in (
         panel.qcs_waveform_usage_detail.text()
     )
-    assert "awg_1 -> dc_ch_2: 72,000 samples (30.000000 us)" in (
+    assert "awg_1 -> dc_ch_2: 72,032 samples (30.013333 us)" in (
         panel.qcs_waveform_usage_detail.text()
     )
     assert "outputs are not added together" in (
@@ -2989,7 +2989,7 @@ def test_qcs_constant_second_output_uses_waveform_not_channel_offset():
     )
     detail = panel.qcs_waveform_usage_detail.text()
     assert "awg_0 -> dc_ch_1: 48,000 samples (20.000000 us)" in detail
-    assert "awg_1 -> dc_ch_2: 2,400 samples (1.000000 us)" in detail
+    assert "awg_1 -> dc_ch_2: 2,432 samples (1.013333 us)" in detail
     assert "mapped physical-channel offsets are not used" in detail
     assert panel.qcs_sweep_execution_mode_label.text().endswith("No sweep")
     assert "physical channel offsets are disabled" in (

@@ -749,7 +749,12 @@ def test_compile_converts_gui_millivolts_to_qcs_relative_amplitude():
     dc_waveform = dc_operations[0]
     # 0.5 of the GUI's 800 mV scale is 400 mV, or 0.16 of 2.5 V.
     assert dc_waveform.kwargs["amplitude"] == pytest.approx(0.16)
-    assert [type(operation) for operation in dc_operations] == [_Waveform]
+    assert [type(operation) for operation in dc_operations] == [
+        _Waveform,
+        _Waveform,
+        _Delay,
+    ]
+    assert dc_operations[-2].kwargs["amplitude"] == pytest.approx(0.16)
     assert compiled.program.waveforms[0][2]["new_layer"] is True
     assert compiled.program.shots == 2
     assert compiled.program.acquisitions[0]["pre_delay"] == 0.0
@@ -785,16 +790,18 @@ def test_compile_lowers_awg_set_ramp_set_to_real_dc_waveforms():
         _Delay,
         _Waveform,
         _Hold,
+        _Waveform,
+        _Delay,
     ]
     durations = [operation.kwargs["duration"] for operation in operations]
     np.testing.assert_allclose(
         durations,
-        [100e-6, 10e-6, 10e-6],
+        [100e-6, 10e-6, 10e-6, 4 / 300e6, 4 / 300e6],
         rtol=0.0,
         atol=1e-15,
     )
-    assert sum(durations) == pytest.approx(120e-6)
-    assert compiled.duration_s == pytest.approx(120e-6)
+    assert sum(durations) == pytest.approx(120e-6 + 8 / 300e6)
+    assert compiled.duration_s == pytest.approx(120e-6 + 8 / 300e6)
 
     # 0.0 -> 0.4 of the GUI's 800 mV scale becomes 0.0 -> 0.128
     # relative to the configured 2.5 V QCS full scale. The following SET is
@@ -890,12 +897,14 @@ def test_compile_preserves_instantaneous_set_before_next_hold():
         _Hold,
         _Waveform,
         _Hold,
+        _Waveform,
+        _Delay,
     ]
     assert operations[0].kwargs["amplitude"] == pytest.approx(0.032)
     assert operations[2].kwargs["amplitude"] == pytest.approx(0.064)
     assert sum(
         operation.kwargs["duration"] for operation in operations
-    ) == pytest.approx(20e-6)
+    ) == pytest.approx(20e-6 + 8 / 300e6)
 
 
 def test_compile_emits_explicit_terminal_dc_reset_for_compensation():
@@ -936,7 +945,7 @@ def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
     exact_limit = (
         FineTuneSequence(("gate",))
         .add_set("initial", [0.0], 4)
-        .add_ramp("ramp", 12_288)
+        .add_ramp("ramp", 12_284)
         .add_set("final", [0.002], 30_000)
     )
     compiled = compile_qcs_point(
@@ -965,7 +974,7 @@ def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
     over_limit = (
         FineTuneSequence(("gate",))
         .add_set("initial", [0.0], 4)
-        .add_ramp("ramp", 12_290)
+        .add_ramp("ramp", 12_286)
         .add_set("final", [0.002], 30_000)
     )
     with pytest.raises(
@@ -1002,10 +1011,10 @@ def test_m5301_capacity_is_per_output_and_zero_delays_use_no_samples():
     report = backend.qcs_m5301_waveform_capacity_report(two_outputs)
 
     assert [channel.rendered_samples for channel in report.channels] == [
-        48_000,
-        24_000,
+        48_032,
+        24_032,
     ]
-    assert report.usage_fraction == pytest.approx(48_000 / 98_304)
+    assert report.usage_fraction == pytest.approx(48_032 / 98_304)
     assert report.exceeds_capacity is False
 
     long_zero_delay = FineTuneSequence(("gate",)).add_set(
@@ -1029,14 +1038,14 @@ def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
     assert [channel.rendered_fabric_cycles for channel in report.channels] == [
-        9_000,
-        9_000,
+        9_004,
+        9_004,
     ]
     assert [channel.rendered_samples for channel in report.channels] == [
-        72_000,
-        72_000,
+        72_032,
+        72_032,
     ]
-    assert report.usage_fraction == pytest.approx(72_000 / 98_304)
+    assert report.usage_fraction == pytest.approx(72_032 / 98_304)
     assert report.exceeds_capacity is False
 
     compiled = compile_qcs_point(
@@ -1070,27 +1079,27 @@ def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
             if type(operation) is _Waveform
         ]
         # awg_1's second ramp crosses zero and is safely split into two
-        # waveforms, but their combined rendered duration is still 15 us.
-        assert len(rendered) == (2 if output_index == 0 else 3)
+        # waveforms. Each lane also ends with the minimum zero ramp.
+        assert len(rendered) == (3 if output_index == 0 else 4)
         assert sum(
             operation.kwargs["duration"] for operation in rendered
-        ) == pytest.approx(30e-6)
+        ) == pytest.approx(30e-6 + 4 / 300e6)
         assert sum(
             operation.kwargs["duration"] for operation in operations
-        ) == pytest.approx(140.4e-6)
-    assert compiled.duration_s == pytest.approx(140.4e-6)
+        ) == pytest.approx(140.4e-6 + 8 / 300e6)
+    assert compiled.duration_s == pytest.approx(140.4e-6 + 8 / 300e6)
 
 
 def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
     sequence = _two_output_nonzero_initial_hold_sequence()
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
     assert [channel.rendered_fabric_cycles for channel in report.channels] == [
-        6_300,
-        6_300,
+        6_304,
+        6_304,
     ]
     assert [channel.rendered_samples for channel in report.channels] == [
-        50_400,
-        50_400,
+        50_432,
+        50_432,
     ]
 
     connection = _connection(
@@ -1161,7 +1170,7 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
             )
             assert sum(
                 operation.kwargs["duration"] for operation in operations
-            ) == pytest.approx(320.4e-6)
+            ) == pytest.approx(320.4e-6 + 8 / 300e6)
 
         rf_entry = next(
             entry for entry in compiled.program.waveforms if entry[1].name == "rf_drive"
@@ -1171,7 +1180,7 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
         assert compiled.program.acquisitions[0]["pre_delay"] == pytest.approx(
             10e-6
         )
-        assert compiled.duration_s == pytest.approx(320.4e-6)
+        assert compiled.duration_s == pytest.approx(320.4e-6 + 8 / 300e6)
 
 
 def test_real_qcs_255_constant_seed_hold_renders_requested_voltage():
@@ -1221,7 +1230,7 @@ def test_no_sweep_globally_constant_output_uses_waveform_and_zero_offset():
     )
     assert [channel.rendered_samples for channel in report.channels] == [
         48_000,
-        2_400,
+        2_432,
     ]
 
     preview = backend.qcs_sweep_execution_preview(
@@ -1304,8 +1313,8 @@ def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
     )
 
     report = backend.qcs_m5301_waveform_capacity_report(sequence)
-    assert report.worst_channel.rendered_fabric_cycles == 300
-    assert report.worst_channel.rendered_samples == 2_400
+    assert report.worst_channel.rendered_fabric_cycles == 304
+    assert report.worst_channel.rendered_samples == 2_432
 
     compiled = compile_qcs_point(
         sequence,
@@ -1319,11 +1328,13 @@ def test_independent_nonzero_plateau_consumes_only_minimum_seed_capacity():
     assert [type(operation) for operation in operations] == [
         _Waveform,
         _Hold,
+        _Waveform,
+        _Delay,
     ]
     assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
     assert sum(
         operation.kwargs["duration"] for operation in operations
-    ) == pytest.approx(20e-6)
+    ) == pytest.approx(20e-6 + 8 / 300e6)
 
 
 def test_m5301_capacity_preview_legacy_offset_flag_has_no_effect():
@@ -1341,7 +1352,7 @@ def test_m5301_capacity_preview_legacy_offset_flag_has_no_effect():
         amplitude_scale=0.8 / 2.5,
     )
     assert conservative.exceeds_capacity is False
-    assert conservative.worst_channel.rendered_fabric_cycles == 2_300
+    assert conservative.worst_channel.rendered_fabric_cycles == 2_304
 
     legacy_flag_report = backend.validate_qcs_m5301_waveform_capacity(
         sequence,
@@ -1351,8 +1362,8 @@ def test_m5301_capacity_preview_legacy_offset_flag_has_no_effect():
         dc_full_scale_v=2.5,
     )
     assert legacy_flag_report.exceeds_capacity is False
-    assert legacy_flag_report.worst_channel.rendered_fabric_cycles == 2_300
-    assert legacy_flag_report.worst_channel.rendered_samples == 18_400
+    assert legacy_flag_report.worst_channel.rendered_fabric_cycles == 2_304
+    assert legacy_flag_report.worst_channel.rendered_samples == 18_432
     assert legacy_flag_report.dc_channel_offsets_v == (0.0,)
 
 
@@ -1581,7 +1592,7 @@ def test_m5301_capacity_counts_only_nonzero_terminal_waveform():
         @staticmethod
         def compensated_waveform_vertices(_point_index):
             return (
-                np.asarray([0.0, 12_284.0, 12_284.0]),
+                    np.asarray([0.0, 12_280.0, 12_280.0]),
                 {
                     "active": np.asarray([0.0, 0.1, 0.2]),
                     "zero": np.asarray([0.0, 0.0, 0.0]),
@@ -2070,7 +2081,7 @@ def test_duration_swept_plateau_capacity_models_fixed_outer_slice_hold():
     # The duration is fixed within each Python-loop coordinate, so the
     # synchronized inner program renders only the ramp and retains its final
     # value with Hold for either 100 or 110 us plateau duration.
-    assert report.worst_channel.rendered_fabric_cycles == 3_000
+    assert report.worst_channel.rendered_fabric_cycles == 3_004
 
 
 def test_nonzero_baseline_plateau_preview_reports_software_mode():
@@ -2823,12 +2834,16 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
         _Waveform,
         _Hold,
         _Delay,
+        _Delay,
+        _Delay,
     ]
     assert operations[0].kwargs["duration"] == pytest.approx(300 / 300e6)
     assert operations[1].kwargs["duration"] == pytest.approx(34 / 300e6)
     assert operations[2].kwargs["duration"] == pytest.approx(300 / 300e6)
     assert operations[3].kwargs["duration"] == pytest.approx(2 / 300e6)
     assert operations[4].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[5].kwargs["duration"] == pytest.approx(4 / 300e6)
+    assert operations[6].kwargs["duration"] == pytest.approx(4 / 300e6)
     arrays, variables = compiled.program.sweeps[0]
     by_name = {
         variable.name: array.value
@@ -3469,7 +3484,7 @@ def test_mixed_capacity_preflights_every_outer_slice_before_hardware():
 
     with pytest.raises(
         QcsUnsupportedFeatureError,
-        match=r"120,000 / 98,304 samples",
+        match=r"120,032 / 98,304 samples",
     ):
         execute_qcs_sequence(
             connection_config=_connection(dc_full_scale_v=2.5),
@@ -5306,7 +5321,9 @@ def test_real_qcs_255_builds_program_offline():
     assert rendered_program.layers[0].duration().value == pytest.approx(2e-6)
     rendered_dc_operations = rendered_program.layers[0].operations[dc]
     assert isinstance(rendered_dc_operations[-1], qcs.Delay)
-    assert rendered_dc_operations[-1].duration.value == pytest.approx(1e-6)
+    assert rendered_dc_operations[-1].duration.value == pytest.approx(
+        1e-6 - 4 / 300e6
+    )
 
     two_output_sequence = FineTuneSequence(
         ("gate", "second")
@@ -5368,6 +5385,7 @@ def test_real_qcs_255_builds_program_offline():
 
 def test_real_qcs_255_acquisition_shares_selected_middle_set_layer():
     qcs = pytest.importorskip("keysight.qcs")
+    from keysight.qcs.channels.render import render as render_qcs_channel
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("set_0", [0.0], 30_000)
@@ -5424,7 +5442,9 @@ def test_real_qcs_255_acquisition_shares_selected_middle_set_layer():
         assert digitizer in selected_layer.operations
         dc_operations = selected_layer.operations[dc]
         assert isinstance(dc_operations[0], qcs.DCWaveform)
-        assert isinstance(dc_operations[-1], qcs.Hold)
+        assert isinstance(dc_operations[-3], qcs.Hold)
+        assert isinstance(dc_operations[-2], qcs.DCWaveform)
+        assert isinstance(dc_operations[-1], qcs.Delay)
         digitizer_operations = selected_layer.operations[digitizer]
         assert isinstance(digitizer_operations[0], qcs.Delay)
         assert digitizer_operations[0].duration.value == pytest.approx(12e-6)
@@ -5435,8 +5455,16 @@ def test_real_qcs_255_acquisition_shares_selected_middle_set_layer():
                 isinstance(amplitude, qcs.Scalar)
                 for amplitude in dc_operations[0].amplitudes
             )
+            assert (
+                dc_operations[-2].amplitudes[0].name
+                == dc_operations[0].amplitudes[0].name
+            )
+            assert compiled.sweep_variable_count == 1
             figure = compiled.program.render(mapper=mapper, sweep_index=0)
             assert figure.data
+
+        rendered_dc, _phasor = render_qcs_channel(dc_operations, 2.4e9)
+        np.testing.assert_array_equal(rendered_dc[-32:], 0.0)
 
         rendered, _layer_map = qcs.SequenceBuilder(
             channel_map=mapper

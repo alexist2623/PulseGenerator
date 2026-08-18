@@ -210,6 +210,15 @@ QCS_STABILITY_DC_RAMP_S = (
 QCS_STABILITY_DC_EDGE_PADDING_S = (
     QCS_STABILITY_DC_EDGE_PADDING_FABRIC_CYCLES / QCS_FABRIC_CLOCK_HZ
 )
+# AWG Tuning returns every M5301 lane to zero after the final SET plateau.
+# One minimum falling ramp is followed by one minimum explicit-zero interval
+# so the following sweep point never inherits the preceding point's Hold.
+QCS_AWG_TUNING_ZERO_RAMP_FABRIC_CYCLES = (
+    QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES
+)
+QCS_AWG_TUNING_ZERO_SETTLE_FABRIC_CYCLES = (
+    QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES
+)
 # QCS 2.5.5 documents ``BasebandAWGChannelSettings.offset`` as a fraction of
 # full scale, but the connected M5301A loopback measured approximately one
 # output volt per Scalar unit. Keep this conversion separate from the 2.5 V
@@ -1926,6 +1935,25 @@ def _qcs_join_grouped_dc_intervals(
     return operations[0] if len(operations) == 1 else operations
 
 
+def _qcs_append_sequential_operations(
+    operation: Any,
+    additions: Sequence[Any],
+) -> Any:
+    """Append operations while preserving QCS's scalar-or-list convention."""
+
+    operations = (
+        list(operation)
+        if isinstance(operation, (list, tuple))
+        else [operation]
+    )
+    for addition in additions:
+        if isinstance(addition, (list, tuple)):
+            operations.extend(addition)
+        else:
+            operations.append(addition)
+    return operations[0] if len(operations) == 1 else operations
+
+
 def _qcs_envelope(qcs: Any, name: str) -> Any:
     if name == "gaussian":
         return qcs.GaussianEnvelope()
@@ -1985,6 +2013,53 @@ def _qcs_sweep_parameter(
         )
     )
     return variable
+
+
+def _qcs_reused_sweep_parameter(
+    qcs: Any,
+    *,
+    name: str,
+    values: Sequence[float],
+    targets: list[_QcsSweepTarget],
+    hardware_supported: bool,
+    channel_name: str,
+    description: str,
+) -> Any:
+    """Reuse an equal direct Scalar so ramp-up and ramp-down stay paired."""
+
+    point_values = np.asarray(values, dtype=float)
+    if point_values.ndim != 1 or point_values.size < 1:
+        raise ValueError(f"QCS {description} values must be a nonempty 1D array")
+    if not np.all(np.isfinite(point_values)):
+        raise ValueError(f"QCS {description} values must be finite")
+    if np.allclose(
+        point_values,
+        point_values[0],
+        rtol=0.0,
+        atol=1e-15,
+    ):
+        return float(point_values[0])
+    for target in targets:
+        if (
+            target.channel_name == str(channel_name)
+            and target.values.shape == point_values.shape
+            and np.allclose(
+                target.values,
+                point_values,
+                rtol=0.0,
+                atol=1e-15,
+            )
+        ):
+            return target.variable
+    return _qcs_sweep_parameter(
+        qcs,
+        name=name,
+        values=point_values,
+        targets=targets,
+        hardware_supported=hardware_supported,
+        channel_name=channel_name,
+        description=description,
+    )
 
 
 def _qcs_parameterized_dc_interval(
@@ -2390,6 +2465,57 @@ def _qcs_constant_dc_interval(
     ]
 
 
+def _qcs_awg_tuning_zero_shutdown(
+    qcs: Any,
+    *,
+    amplitude: Any,
+    name: str,
+    fabric_hz: float,
+) -> list[Any]:
+    """Ramp the final AWG Tuning level down and terminate at explicit zero."""
+
+    ramp_cycles = QCS_AWG_TUNING_ZERO_RAMP_FABRIC_CYCLES
+    ramp_duration_s = ramp_cycles / float(fabric_hz)
+    ramp_samples = ramp_cycles * QCS_M5301_SAMPLES_PER_FABRIC_CYCLE
+    endpoint_sample_offset = 0.5 / ramp_samples
+    numeric_zero = bool(
+        isinstance(amplitude, (int, float, np.number))
+        and np.isclose(float(amplitude), 0.0, rtol=0.0, atol=1e-15)
+    )
+    if numeric_zero:
+        ramp_down = qcs.Delay(
+            duration=ramp_duration_s,
+            name=f"{name}_ramp_down_zero",
+        )
+    else:
+        ramp_down = qcs.DCWaveform(
+            duration=ramp_duration_s,
+            envelope=qcs.ArbitraryEnvelope(
+                [0.0, endpoint_sample_offset, 1.0],
+                [1.0, 1.0, 0.0],
+            ),
+            amplitude=amplitude,
+            name=f"{name}_ramp_down",
+        )
+    terminal_zero = qcs.Delay(
+        duration=(
+            QCS_AWG_TUNING_ZERO_SETTLE_FABRIC_CYCLES
+            / float(fabric_hz)
+        ),
+        name=f"{name}_terminal_zero",
+    )
+    return [ramp_down, terminal_zero]
+
+
+def _qcs_awg_tuning_zero_shutdown_duration_s(fabric_hz: float) -> float:
+    """Return the fixed duration added after the final AWG Tuning plateau."""
+
+    return (
+        QCS_AWG_TUNING_ZERO_RAMP_FABRIC_CYCLES
+        + QCS_AWG_TUNING_ZERO_SETTLE_FABRIC_CYCLES
+    ) / float(fabric_hz)
+
+
 def _qcs_stability_measurement_interval(
     qcs: Any,
     *,
@@ -2628,6 +2754,7 @@ def _qcs_m5301_rendered_fabric_cycles(
     amplitudes: np.ndarray,
     name: str,
     append_terminal_value: bool = False,
+    append_zero_shutdown: bool = False,
     allow_continuous_ramp_holds: bool = False,
 ) -> int:
     """Return rendered M5301 cycles using the selected lowering rules."""
@@ -2730,6 +2857,10 @@ def _qcs_m5301_rendered_fabric_cycles(
         terminal_value = float(values[group_stops[-1] - 1])
         if not np.isclose(terminal_value, 0.0, rtol=0.0, atol=1e-15):
             rendered_cycles += QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES
+    if append_zero_shutdown:
+        terminal_value = float(values[group_stops[-1] - 1])
+        if not np.isclose(terminal_value, 0.0, rtol=0.0, atol=1e-15):
+            rendered_cycles += QCS_AWG_TUNING_ZERO_RAMP_FABRIC_CYCLES
     return int(rendered_cycles)
 
 
@@ -2895,6 +3026,7 @@ def qcs_m5301_waveform_capacity_report(
                 amplitudes=source_waveforms[output_name],
                 name=f"{output_name}_point_{point_index}",
                 append_terminal_value=append_terminal_value,
+                append_zero_shutdown=True,
                 # A plateau that directly continues the preceding ramp can
                 # retain that endpoint with QCS Hold in every execution mode.
                 # This is independent of Bias-T compensation. Independently
@@ -2961,6 +3093,7 @@ def _qcs_dc_waveform_operations(
     name: str,
     fabric_hz: float,
     append_terminal_value: bool = False,
+    append_zero_shutdown: bool = False,
     allow_continuous_ramp_holds: bool = False,
     grouped: bool = False,
 ) -> Any:
@@ -2981,6 +3114,7 @@ def _qcs_dc_waveform_operations(
         amplitudes=amplitudes,
         name=name,
         append_terminal_value=append_terminal_value,
+        append_zero_shutdown=append_zero_shutdown,
         allow_continuous_ramp_holds=allow_continuous_ramp_holds,
     )
     if rendered_cycles > QCS_M5301_MAX_RENDERED_FABRIC_CYCLES:
@@ -3090,6 +3224,18 @@ def _qcs_dc_waveform_operations(
                 name=f"{name}_terminal_set",
             )
         interval_operations.append(terminal)
+
+    if append_zero_shutdown:
+        terminal_amplitude = float(values[group_stops[-1] - 1])
+        interval_operations[-1] = _qcs_append_sequential_operations(
+            interval_operations[-1],
+            _qcs_awg_tuning_zero_shutdown(
+                qcs,
+                amplitude=terminal_amplitude,
+                name=f"{name}_shutdown",
+                fabric_hz=fabric_hz,
+            ),
+        )
 
     if grouped:
         return interval_operations
@@ -3474,6 +3620,7 @@ def compile_qcs_point(
             name=f"{output_name}_point_{point_index}",
             fabric_hz=fabric_hz,
             append_terminal_value=append_terminal_value,
+            append_zero_shutdown=True,
             # Match the synchronized/hardware-sweep lowering: once a ramp
             # establishes a voltage, a directly continuous plateau can use
             # Hold without consuming additional rendered-waveform samples.
@@ -3763,6 +3910,16 @@ def compile_qcs_point(
             for operation in acquisition_operations:
                 program.add_acquisition(**operation)
 
+    duration_s = max(
+        duration_s,
+        float(times_cycles[-1]) * seconds_per_cycle
+        + (
+            QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES * seconds_per_cycle
+            if append_terminal_value
+            else 0.0
+        )
+        + _qcs_awg_tuning_zero_shutdown_duration_s(fabric_hz),
+    )
     program.n_shots(repetitions)
     return QcsCompiledPoint(
         point_index=point_index,
@@ -5252,6 +5409,13 @@ def compile_qcs_synchronized_sweep(
                     )
                 else:
                     fixed_graph_cycles += int(np.max(interval_durations))
+        if not np.allclose(
+            end_table[:, -1, output_index],
+            0.0,
+            rtol=0.0,
+            atol=1e-15,
+        ):
+            fixed_graph_cycles += QCS_AWG_TUNING_ZERO_RAMP_FABRIC_CYCLES
         if fixed_graph_cycles > QCS_M5301_MAX_RENDERED_FABRIC_CYCLES:
             _raise_qcs_m5301_capacity_error(
                 output_name=output_name,
@@ -5281,6 +5445,36 @@ def compile_qcs_synchronized_sweep(
         for operations in dc_interval_operations
     ):
         raise ValueError("QCS DC outputs produced different interval layers")
+    if any(
+        not np.isclose(value, 0.0, rtol=0.0, atol=1e-15)
+        for value in normalized_offset_values
+    ):
+        raise QcsUnsupportedFeatureError(
+            "QCS synchronized AWG Tuning zero shutdown requires zero "
+            "physical M5301 offsets; use fixed numeric point programs"
+        )
+    dc_shutdown_operations = []
+    for output_index, channel_name in enumerate(
+        connection_config.dc_channel_names
+    ):
+        final_values = end_table[:, -1, output_index]
+        terminal_amplitude = _qcs_reused_sweep_parameter(
+            qcs,
+            name=f"awg_dc_{output_index}_terminal_amplitude",
+            values=final_values,
+            targets=targets,
+            hardware_supported=True,
+            channel_name=channel_name,
+            description=f"{channel_name} terminal amplitude",
+        )
+        dc_shutdown_operations.append(
+            _qcs_awg_tuning_zero_shutdown(
+                qcs,
+                amplitude=terminal_amplitude,
+                name=f"awg_dc_{output_index}_shutdown",
+                fabric_hz=fabric_hz,
+            )
+        )
     (
         interval_groups,
         segment_layer_indices,
@@ -5614,8 +5808,17 @@ def compile_qcs_synchronized_sweep(
         for output_index, (channel, intervals) in enumerate(
             zip(dc_channels, dc_interval_operations)
         ):
+            dc_operations = _qcs_join_grouped_dc_intervals(
+                intervals,
+                interval_group,
+            )
+            if layer_index == layer_count - 1:
+                dc_operations = _qcs_append_sequential_operations(
+                    dc_operations,
+                    dc_shutdown_operations[output_index],
+                )
             program.add_waveform(
-                _qcs_join_grouped_dc_intervals(intervals, interval_group),
+                dc_operations,
                 channel,
                 new_layer=output_index == 0,
             )
@@ -5697,7 +5900,11 @@ def compile_qcs_synchronized_sweep(
         program=program,
         acquisition_channels=acquisition_channels,
         duration_s=float(
-            max(max(total_duration_values), max(acquisition_stop_values))
+            max(
+                max(total_duration_values)
+                + _qcs_awg_tuning_zero_shutdown_duration_s(fabric_hz),
+                max(acquisition_stop_values),
+            )
         ),
         acquisition_duration_s=acquisition_duration_s,
         acquisition_sample_rate_hz=acquisition_sample_rate_hz,
