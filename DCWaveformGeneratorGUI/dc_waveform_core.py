@@ -1477,14 +1477,30 @@ def generate_qcs_program_code(
             raise ValueError("acquisition_frequency_hz must be finite")
         if not np.isfinite(acquisition_phase_rad):
             raise ValueError("acquisition_phase_rad must be finite")
+        segment_names = tuple(pulses[0].segment_names)
         try:
-            acquisition_segment_index = tuple(
-                pulses[0].segment_names
-            ).index(acquisition_segment_name)
+            acquisition_segment_index = segment_names.index(
+                acquisition_segment_name
+            )
+        except ValueError:
+            indexed_name = re.fullmatch(
+                r"set_(\d+)",
+                acquisition_segment_name,
+            )
+            if indexed_name is None:
+                acquisition_segment_index = None
+            else:
+                acquisition_segment_index = int(indexed_name.group(1))
+        try:
+            if acquisition_segment_index is None:
+                raise IndexError
+            acquisition_segment_name = segment_names[
+                acquisition_segment_index
+            ]
             acquisition_flat_start, acquisition_flat_stop = (
                 pulses[0].flat_segments()[acquisition_segment_index]
             )
-        except (ValueError, IndexError) as exc:
+        except (IndexError, ValueError) as exc:
             raise ValueError(
                 "unknown QCS acquisition segment "
                 f"{acquisition_segment_name!r}"

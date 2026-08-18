@@ -4025,6 +4025,30 @@ def test_awg_tuning_rf_and_acquisition_show_user_segment_names():
     window.close()
 
 
+def test_show_qcs_program_resolves_user_named_acquisition_segment():
+    app = _application()
+    window = gui.MainWindow()
+    pulse = window._pulse[0]
+    pulse.add_flat_ramp(5_000.0, 20_000.0, 100.0)
+    pulse.rename_segment(1, "M")
+    window._refresh_rf_editor()
+
+    experiment = window._experiment_panel
+    experiment.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    experiment.qcs_acquisition_channel_name.setText("digitizer")
+    acquisition = window._rf_readout_panel
+    acquisition.setChecked(True)
+    acquisition.segment.setCurrentIndex(acquisition.segment.findData("set_1"))
+    app.processEvents()
+
+    code = window._generate_qcs_code()
+
+    assert "selected SET segment 'M'" in code
+    assert "program.add_acquisition(" in code
+    window.close()
+    app.processEvents()
+
+
 def test_settings_without_tproc_clock_use_300_mhz_default():
     app = _application()
     window = gui.MainWindow()

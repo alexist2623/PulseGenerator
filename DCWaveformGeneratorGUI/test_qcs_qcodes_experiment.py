@@ -5722,6 +5722,34 @@ def test_generated_qcs_code_places_acquisition_in_synchronized_dc_layer():
     assert gate in program.layers[2].operations
 
 
+def test_generated_qcs_code_resolves_internal_acquisition_segment_name():
+    qcs = pytest.importorskip("keysight.qcs")
+    pulse = PulseSequence(0.0, 10_000.0)
+    pulse.add_flat_ramp(5_000.0, 20_000.0, 100.0)
+    pulse.rename_segment(1, "M")
+
+    code = generate_qcs_program_code(
+        (pulse,),
+        channel_names=("gate",),
+        acquisition_channel_name="digitizer",
+        acquisition_segment_name="set_1",
+        acquisition_duration_s=3.0e-6,
+        acquisition_hardware_demodulation=True,
+    )
+
+    assert "selected SET segment 'M'" in code
+    namespace = {}
+    exec(code, namespace)
+    gate = qcs.Channels(0, "gate")
+    digitizer = qcs.Channels(0, "digitizer", absolute_phase=True)
+    program = namespace["generate_dc_waveforms"](
+        qcs.Program(),
+        gate,
+        digitizer,
+    )
+    assert digitizer in program.layers[2].operations
+
+
 def test_generated_qcs_code_uses_delay_for_long_zero_interval():
     qcs = pytest.importorskip("keysight.qcs")
     pulse = PulseSequence(0.0, 50_000.0)
