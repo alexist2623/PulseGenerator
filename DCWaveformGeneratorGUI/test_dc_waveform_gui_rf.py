@@ -3651,7 +3651,7 @@ def test_show_program_snapshot_allows_disabled_readout():
     window.close()
 
 
-def test_show_qcs_program_is_offline_source_only(monkeypatch):
+def test_show_qcs_program_source_choice_stays_offline(monkeypatch):
     app = _application()
     window = gui.MainWindow()
     window._experiment_panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
@@ -3661,6 +3661,11 @@ def test_show_qcs_program_is_offline_source_only(monkeypatch):
         window,
         "_generate_qcs_code",
         lambda: "# offline QCS source\n",
+    )
+    monkeypatch.setattr(
+        window,
+        "_choose_qcs_program_preview_mode",
+        lambda: "source",
     )
 
     class FakeDialog:
@@ -3686,6 +3691,36 @@ def test_show_qcs_program_is_offline_source_only(monkeypatch):
     app.processEvents()
 
     assert shown == [("# offline QCS source\n", True), "exec"]
+    assert window._experiment_thread is None
+    window.close()
+
+
+def test_show_qcs_program_render_choice_uses_compiled_program(monkeypatch):
+    app = _application()
+    window = gui.MainWindow()
+    window._experiment_panel.set_execution_backend(gui.EXECUTION_BACKEND_QCS)
+    calls = []
+
+    monkeypatch.setattr(
+        window,
+        "_choose_qcs_program_preview_mode",
+        lambda: "render",
+    )
+    monkeypatch.setattr(
+        window,
+        "_render_qcs_program",
+        lambda: calls.append("render"),
+    )
+    monkeypatch.setattr(
+        window,
+        "_generate_qcs_code",
+        lambda: pytest.fail("source generation was selected unexpectedly"),
+    )
+
+    window._show_program()
+    app.processEvents()
+
+    assert calls == ["render"]
     assert window._experiment_thread is None
     window.close()
 

@@ -1289,7 +1289,17 @@ def _qcs_channel_samples_code(
         ):
             kind = "zero_delay"
         elif is_flat and duration_ns > _QCS_DC_HOLD_SEED_NS + 1.0e-9:
-            kind = "seed_hold"
+            retains_previous_endpoint = bool(
+                interval_plans
+                and interval_plans[-1][0] != "zero_delay"
+                and np.isclose(
+                    interval_plans[-1][3],
+                    start_mv,
+                    rtol=0.0,
+                    atol=1.0e-12,
+                )
+            )
+            kind = "hold" if retains_previous_endpoint else "seed_hold"
         else:
             kind = "waveform"
         interval_plans.append(
@@ -1299,7 +1309,7 @@ def _qcs_channel_samples_code(
     rendered_duration_ns = sum(
         (
             0.0
-            if kind == "zero_delay"
+            if kind in {"zero_delay", "hold"}
             else min(duration_ns, _QCS_DC_HOLD_SEED_NS)
             if kind == "seed_hold"
             else duration_ns
@@ -1339,6 +1349,16 @@ def _qcs_channel_samples_code(
                 [
                     f"    {waveform_name} = qcs.Delay(",
                     f"        duration={duration_name},",
+                    "    )",
+                    "",
+                ]
+            )
+        elif kind == "hold":
+            lines.extend(
+                [
+                    f"    {waveform_name} = qcs.Hold(",
+                    f"        duration={duration_name},",
+                    f"        name={waveform_name!r} + '_hold',",
                     "    )",
                     "",
                 ]
@@ -1597,7 +1617,7 @@ def generate_qcs_program_code(
                 "could not map QCS acquisition segment "
                 f"{acquisition_segment_name!r} to one DC interval layer"
             )
-        acquisition_layer_index = int(matching_layers[0])
+        acquisition_interval_index = int(matching_layers[0])
         acquisition_crosses_segment = (
             acquisition_pre_delay_s + acquisition_duration_s
             > acquisition_segment_duration_s + 1.0e-15
@@ -1624,6 +1644,16 @@ def generate_qcs_program_code(
         f"QCS_FULL_SCALE_V = {full_scale_v:.12g}",
         f"CROSS_CAPACITANCE = {matrix!r}",
         "mV = 1.0 / (QCS_FULL_SCALE_V * 1000.0)",
+        "",
+        "",
+        "def _join_qcs_operations(*intervals):",
+        "    operations = []",
+        "    for interval in intervals:",
+        "        if isinstance(interval, (list, tuple)):",
+        "            operations.extend(interval)",
+        "        else:",
+        "            operations.append(interval)",
+        "    return operations[0] if len(operations) == 1 else operations",
         "",
         "",
         "def generate_dc_waveforms(",
@@ -1655,7 +1685,9 @@ def generate_qcs_program_code(
                 ),
             ).rstrip()
         )
-    lines.append("    # Each synchronized DC interval is one sequential QCS layer.")
+    lines.append(
+        "    # Each incoming RAMP and destination SET Hold share one QCS layer."
+    )
     lines.append(
         "    # Acquisition is inserted while its selected SET layer is current."
     )
@@ -1664,11 +1696,79 @@ def generate_qcs_program_code(
         if interval_starts_mv is not None
         else len(common_time_ns) - 1
     )
+    interval_groups = []
+    claimed_intervals = set()
+    flat_segments = tuple(pulses[0].flat_segments())
+    for segment_index, (flat_start, _flat_stop) in enumerate(flat_segments):
+        plateau_start_ns = float(pulses[0].t[flat_start])
+        plateau_matches = np.flatnonzero(
+            np.isclose(
+                interval_start_times_ns,
+                plateau_start_ns,
+                rtol=0.0,
+                atol=1.0e-6,
+            )
+        )
+        if plateau_matches.size != 1:
+            raise ValueError(
+                f"could not map SET segment {segment_index} to one QCS interval"
+            )
+        plateau_interval = int(plateau_matches[0])
+        group_start = plateau_interval
+        if segment_index > 0:
+            previous_flat_stop = flat_segments[segment_index - 1][1]
+            ramp_start_ns = float(pulses[0].t[previous_flat_stop])
+            ramp_matches = np.flatnonzero(
+                np.isclose(
+                    interval_start_times_ns,
+                    ramp_start_ns,
+                    rtol=0.0,
+                    atol=1.0e-6,
+                )
+            )
+            if ramp_matches.size != 1:
+                raise ValueError(
+                    f"could not map incoming RAMP for SET segment "
+                    f"{segment_index} to one QCS interval"
+                )
+            group_start = int(ramp_matches[0])
+        group = tuple(range(group_start, plateau_interval + 1))
+        if any(index in claimed_intervals for index in group):
+            raise ValueError("QCS generated source has overlapping DC layers")
+        interval_groups.append(group)
+        claimed_intervals.update(group)
+    for interval_index in range(interval_count):
+        if interval_index not in claimed_intervals:
+            interval_groups.append((interval_index,))
+    interval_groups.sort(key=lambda group: group[0])
+    if tuple(
+        index for group in interval_groups for index in group
+    ) != tuple(range(interval_count)):
+        raise ValueError("QCS generated source has an invalid DC layer layout")
+    interval_to_layer = {
+        interval_index: layer_index
+        for layer_index, group in enumerate(interval_groups)
+        for interval_index in group
+    }
+    if acquisition_enabled:
+        acquisition_layer_index = interval_to_layer[
+            acquisition_interval_index
+        ]
+        acquisition_layer_start_ns = float(
+            interval_start_times_ns[
+                interval_groups[acquisition_layer_index][0]
+            ]
+        )
+        acquisition_layer_pre_delay_s = (
+            (acquisition_segment_start_ns - acquisition_layer_start_ns)
+            * 1.0e-9
+            + acquisition_pre_delay_s
+        )
     if (
         acquisition_enabled
         and not acquisition_hardware_demodulation
         and acquisition_crosses_segment
-        and acquisition_layer_index < interval_count - 1
+        and acquisition_layer_index < len(interval_groups) - 1
     ):
         raise ValueError(
             "raw QCS acquisition cannot cross segment "
@@ -1700,15 +1800,20 @@ def generate_qcs_program_code(
             )
         else:
             lines.append("    acquisition_filter = acquisition_duration")
-    for interval_index in range(interval_count):
+    for layer_index, interval_group in enumerate(interval_groups):
         lines.append("")
-        lines.append(f"    # Synchronized DC interval layer {interval_index}")
+        lines.append(f"    # Synchronized DC layer {layer_index}")
         for channel_index, name in enumerate(channel_names):
+            operation_names = ", ".join(
+                f"{name}_dc_segment_{interval_index}"
+                for interval_index in interval_group
+            )
             lines.append(
-                f"    program.add_waveform({name}_dc_segment_{interval_index}, "
+                f"    program.add_waveform(_join_qcs_operations("
+                f"{operation_names}), "
                 f"{name}, new_layer={channel_index == 0})"
             )
-        if acquisition_enabled and interval_index == acquisition_layer_index:
+        if acquisition_enabled and layer_index == acquisition_layer_index:
             lines.extend(
                 [
                     (
@@ -1719,7 +1824,7 @@ def generate_qcs_program_code(
                     "        integration_filter=acquisition_filter,",
                     "        channels=acquisition_channel,",
                     "        new_layer=False,",
-                    f"        pre_delay={acquisition_pre_delay_s:.12g},",
+                    f"        pre_delay={acquisition_layer_pre_delay_s:.12g},",
                     "    )",
                     (
                         "    # Mapper virtual channel: "

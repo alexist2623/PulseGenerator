@@ -239,6 +239,10 @@ try:
         QcsRfPowerCalibrationConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
+        QcsUnsupportedFeatureError,
+        compile_qcs_point,
+        compile_qcs_synchronized_sweep,
+        load_qcs_channel_mapper,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
@@ -270,6 +274,10 @@ except ImportError:
         QcsRfPowerCalibrationConfig,
         QcsRfPulseConfig,
         QcsSweepExecutionPreview,
+        QcsUnsupportedFeatureError,
+        compile_qcs_point,
+        compile_qcs_synchronized_sweep,
+        load_qcs_channel_mapper,
         qcs_m5301_capacity_preview_point_indices,
         qcs_m5301_waveform_capacity_report,
         qcs_sweep_execution_preview,
@@ -8025,8 +8033,8 @@ class ExperimentPanel(QtWidgets.QWidget):
             "Compile the current settings and show the tProcessor assembly"
             if is_qick
             else (
-                "Show an offline QCS Python source preview without loading a "
-                "mapper, compiling a Program, or contacting hardware"
+                "Choose between rendering the compiled QCS Program and "
+                "showing the generated Python source"
             )
         )
         self.show_program_button.setText(
@@ -15114,9 +15122,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "progress": False,
         }
 
-    def _qcs_experiment_run_arguments(self) -> dict:
+    def _qcs_experiment_run_arguments(
+        self,
+        *,
+        require_run_config: bool = True,
+    ) -> dict:
         qick_arguments = self._experiment_run_arguments(
             require_readout=False,
+            require_run_config=require_run_config,
             validate_qick_hardware=False,
             validate_qcs_hardware=False,
             for_qcs=True,
@@ -17221,7 +17234,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._show_qick_program()
 
     def _show_qcs_program(self) -> None:
-        """Show a pure source snapshot without importing or invoking QCS."""
+        """Render the compiled Program or show its generated source."""
 
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -17230,9 +17243,21 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "Wait for the current QCS task to finish.",
             )
             return
+        preview_mode = self._choose_qcs_program_preview_mode()
+        if preview_mode is None:
+            return
         try:
+            if preview_mode == "render":
+                self._render_qcs_program()
+                return
             code = self._generate_qcs_code()
-        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+        except (
+            ImportError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Cannot show QCS program",
@@ -17244,6 +17269,83 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog = QcsProgramCodeDialog(code, self)
         dialog.exec_()
+
+    def _choose_qcs_program_preview_mode(self) -> Optional[str]:
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("Show QCS Program")
+        message.setIcon(QtWidgets.QMessageBox.Question)
+        message.setText("Choose how to inspect the current QCS Program.")
+        message.setInformativeText(
+            "Render compiles with the configured ChannelMapper and calls "
+            "qcs.Program.render(). Source shows the generated Python code "
+            "without loading QCS or the mapper."
+        )
+        render_button = message.addButton(
+            "Render compiled Program",
+            QtWidgets.QMessageBox.AcceptRole,
+        )
+        source_button = message.addButton(
+            "Show generated code",
+            QtWidgets.QMessageBox.ActionRole,
+        )
+        message.addButton(QtWidgets.QMessageBox.Cancel)
+        message.setDefaultButton(render_button)
+        message.exec_()
+        clicked = message.clickedButton()
+        if clicked is render_button:
+            return "render"
+        if clicked is source_button:
+            return "source"
+        return None
+
+    def _render_qcs_program(self) -> None:
+        """Compile locally and open the first rendered sweep coordinate."""
+
+        from keysight import qcs
+
+        arguments = self._qcs_experiment_run_arguments(
+            require_run_config=False
+        )
+        mapper = load_qcs_channel_mapper(
+            arguments["connection_config"],
+            qcs_module=qcs,
+        )
+        compile_arguments = {
+            "sequence": arguments["sequence"],
+            "connection_config": arguments["connection_config"],
+            "mapper": mapper,
+            "repetitions_per_sweep": arguments["repetitions_per_sweep"],
+            "fabric_mhz": arguments["fabric_mhz"],
+            "source_full_scale_mv": arguments["source_full_scale_mv"],
+            "rf_pulses": arguments["rf_pulses"],
+            "acquisition": arguments["acquisition"],
+            "qcs_module": qcs,
+        }
+        try:
+            compiled = compile_qcs_synchronized_sweep(**compile_arguments)
+            program = compiled.program
+            preview_description = (
+                "synchronized hardware sweep"
+                if compiled.hardware_sweep
+                else "QCS-managed software sweep"
+            )
+        except QcsUnsupportedFeatureError:
+            compiled = compile_qcs_point(
+                point_index=0,
+                **compile_arguments,
+            )
+            program = compiled.program
+            preview_description = "fixed numeric point 1"
+
+        render_arguments = {"mapper": mapper}
+        if int(arguments["sequence"].sweep_point_count) > 1:
+            render_arguments["sweep_index"] = 0
+        figure = program.render(**render_arguments)
+        figure.show()
+        self.statusBar().showMessage(
+            "Rendered compiled QCS Program locally "
+            f"({preview_description}); no hardware submission was performed"
+        )
 
     def _show_qick_program(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():

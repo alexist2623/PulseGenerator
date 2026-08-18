@@ -1166,9 +1166,10 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
         rf_entry = next(
             entry for entry in compiled.program.waveforms if entry[1].name == "rf_drive"
         )
-        assert rf_entry[2]["pre_delay"] == pytest.approx(0.0)
+        # set_1 shares one QCS layer with its 10 us incoming ramp.
+        assert rf_entry[2]["pre_delay"] == pytest.approx(10e-6)
         assert compiled.program.acquisitions[0]["pre_delay"] == pytest.approx(
-            0.0
+            10e-6
         )
         assert compiled.duration_s == pytest.approx(320.4e-6)
 
@@ -5416,12 +5417,26 @@ def test_real_qcs_255_acquisition_shares_selected_middle_set_layer():
     assert compiled_programs[1].sweep_shape == (3,)
 
     for compiled in compiled_programs:
-        assert len(compiled.program.layers) == 3
+        assert len(compiled.program.layers) == 2
         assert digitizer not in compiled.program.layers[0].operations
-        assert digitizer not in compiled.program.layers[1].operations
-        selected_layer = compiled.program.layers[2]
+        selected_layer = compiled.program.layers[1]
         assert dc in selected_layer.operations
         assert digitizer in selected_layer.operations
+        dc_operations = selected_layer.operations[dc]
+        assert isinstance(dc_operations[0], qcs.DCWaveform)
+        assert isinstance(dc_operations[-1], qcs.Hold)
+        digitizer_operations = selected_layer.operations[digitizer]
+        assert isinstance(digitizer_operations[0], qcs.Delay)
+        assert digitizer_operations[0].duration.value == pytest.approx(12e-6)
+        assert isinstance(digitizer_operations[1], qcs.Acquisition)
+
+        if compiled is compiled_programs[1]:
+            assert any(
+                isinstance(amplitude, qcs.Scalar)
+                for amplitude in dc_operations[0].amplitudes
+            )
+            figure = compiled.program.render(mapper=mapper, sweep_index=0)
+            assert figure.data
 
         rendered, _layer_map = qcs.SequenceBuilder(
             channel_map=mapper
@@ -5671,9 +5686,9 @@ def test_generated_qcs_code_aligns_outputs_in_parallel_layers():
     interval_count = len(np.unique(np.concatenate((gate_a.t, gate_b.t)))) - 1
     assert isinstance(program, qcs.Program)
     assert interval_count > 1
-    assert code.count("new_layer=True") == interval_count
-    assert code.count("new_layer=False") == interval_count
-    assert len(program.layers) == interval_count
+    assert code.count("new_layer=True") == len(program.layers)
+    assert code.count("new_layer=False") == len(program.layers)
+    assert len(program.layers) < interval_count
     for layer in program.layers:
         assert {channel.name for channel in layer.operations} == {
             "gate_a",
@@ -5699,10 +5714,13 @@ def test_generated_qcs_code_places_acquisition_in_synchronized_dc_layer():
 
     compile(code, "<generated_qcs_program>", "exec")
     assert "acquisition_channel: qcs.Channels" in code
-    assert "program.add_waveform(gate_dc_segment_2" in code
+    assert (
+        "_join_qcs_operations(gate_dc_segment_1, gate_dc_segment_2)"
+        in code
+    )
     assert "program.add_acquisition(" in code
     assert "new_layer=False" in code
-    assert "pre_delay=2e-06" in code
+    assert "pre_delay=7e-06" in code
     assert "rf_frequency=25000000" in code
     assert "# Mapper virtual channel: digitizer" in code
 
@@ -5715,11 +5733,17 @@ def test_generated_qcs_code_places_acquisition_in_synchronized_dc_layer():
         gate,
         digitizer,
     )
-    assert len(program.layers) == 3
+    assert len(program.layers) == 2
     assert digitizer not in program.layers[0].operations
-    assert digitizer not in program.layers[1].operations
-    assert digitizer in program.layers[2].operations
-    assert gate in program.layers[2].operations
+    assert digitizer in program.layers[1].operations
+    assert gate in program.layers[1].operations
+    gate_operations = program.layers[1].operations[gate]
+    assert isinstance(gate_operations[0], qcs.DCWaveform)
+    assert isinstance(gate_operations[-1], qcs.Hold)
+    digitizer_operations = program.layers[1].operations[digitizer]
+    assert isinstance(digitizer_operations[0], qcs.Delay)
+    assert digitizer_operations[0].duration.value == pytest.approx(7e-6)
+    assert isinstance(digitizer_operations[1], qcs.Acquisition)
 
 
 def test_generated_qcs_code_resolves_internal_acquisition_segment_name():
@@ -5747,7 +5771,7 @@ def test_generated_qcs_code_resolves_internal_acquisition_segment_name():
         gate,
         digitizer,
     )
-    assert digitizer in program.layers[2].operations
+    assert digitizer in program.layers[1].operations
 
 
 def test_generated_qcs_code_uses_delay_for_long_zero_interval():

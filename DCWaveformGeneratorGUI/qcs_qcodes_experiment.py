@@ -1793,6 +1793,139 @@ def _qcs_swept_segment_layer_index(
     return int(layer_index)
 
 
+def _qcs_segment_grouped_layer_layout(
+    sequence: Any,
+    *,
+    duration_table_s: np.ndarray,
+    boundary_rows: Sequence[Mapping[str, Tuple[float, float]]],
+) -> tuple[
+    tuple[tuple[int, ...], ...],
+    Mapping[str, int],
+    Mapping[str, np.ndarray],
+]:
+    """Group each incoming RAMP with its destination SET plateau.
+
+    QCS operations on one virtual channel are sequential within a layer, while
+    different virtual channels run in parallel. Keeping an incoming ramp and
+    the following SET plateau in one layer therefore lets RF and acquisition
+    start after the ramp, but still share the exact layer that establishes the
+    swept SET voltage.
+    """
+
+    durations = np.asarray(duration_table_s, dtype=float)
+    if durations.ndim != 2 or durations.shape[0] != len(boundary_rows):
+        raise ValueError(
+            "QCS grouped layer layout requires one duration row per point"
+        )
+    if durations.shape[1] < 1 or not np.all(np.isfinite(durations)):
+        raise ValueError("QCS grouped layer durations must be finite")
+    if np.any(durations <= 0.0):
+        raise ValueError("QCS grouped layer durations must be positive")
+
+    segments = tuple(sequence.segments)
+    segment_interval_indices = {
+        str(segment.name): _qcs_swept_segment_layer_index(
+            durations,
+            boundary_rows,
+            str(segment.name),
+        )
+        for segment in segments
+    }
+
+    claimed: set[int] = set()
+    groups: list[tuple[int, ...]] = []
+    for segment_index, segment in enumerate(segments):
+        if str(segment.kind) != "set":
+            continue
+        plateau_index = segment_interval_indices[str(segment.name)]
+        group = (plateau_index,)
+        if (
+            segment_index > 0
+            and str(segments[segment_index - 1].kind) == "ramp"
+        ):
+            ramp = segments[segment_index - 1]
+            ramp_index = segment_interval_indices[str(ramp.name)]
+            if plateau_index != ramp_index + 1:
+                raise QcsUnsupportedFeatureError(
+                    f"QCS RAMP {ramp.name!r} and destination SET "
+                    f"{segment.name!r} are not consecutive DC intervals"
+                )
+            group = (ramp_index, plateau_index)
+        if any(interval_index in claimed for interval_index in group):
+            raise QcsUnsupportedFeatureError(
+                "QCS logical segments overlap while constructing grouped "
+                "DC layers"
+            )
+        groups.append(group)
+        claimed.update(group)
+
+    for interval_index in range(durations.shape[1]):
+        if interval_index not in claimed:
+            groups.append((interval_index,))
+    groups.sort(key=lambda value: value[0])
+    flattened = tuple(index for group in groups for index in group)
+    if flattened != tuple(range(durations.shape[1])):
+        raise QcsUnsupportedFeatureError(
+            "QCS grouped DC layers do not form an ordered interval partition"
+        )
+
+    interval_to_layer = {
+        interval_index: layer_index
+        for layer_index, group in enumerate(groups)
+        for interval_index in group
+    }
+    layer_start_times = np.c_[
+        np.zeros(durations.shape[0], dtype=float),
+        np.cumsum(durations[:, :-1], axis=1),
+    ]
+    segment_layer_indices: dict[str, int] = {}
+    segment_layer_offsets: dict[str, np.ndarray] = {}
+    for segment in segments:
+        name = str(segment.name)
+        interval_index = segment_interval_indices[name]
+        layer_index = interval_to_layer[interval_index]
+        group_start_index = groups[layer_index][0]
+        offsets = np.asarray(
+            [
+                float(boundaries[name][0])
+                - float(layer_start_times[point_index, group_start_index])
+                for point_index, boundaries in enumerate(boundary_rows)
+            ],
+            dtype=float,
+        )
+        if np.any(offsets < -1e-15) or not np.all(np.isfinite(offsets)):
+            raise QcsUnsupportedFeatureError(
+                f"QCS segment {name!r} has an invalid grouped-layer offset"
+            )
+        offsets[np.isclose(offsets, 0.0, rtol=0.0, atol=1e-15)] = 0.0
+        segment_layer_indices[name] = layer_index
+        segment_layer_offsets[name] = offsets
+
+    return (
+        tuple(groups),
+        segment_layer_indices,
+        segment_layer_offsets,
+    )
+
+
+def _qcs_join_grouped_dc_intervals(
+    interval_operations: Sequence[Any],
+    interval_group: Sequence[int],
+) -> Any:
+    """Return the sequential QCS operations for one grouped DC layer."""
+
+    operations = []
+    for interval_index in interval_group:
+        current = interval_operations[int(interval_index)]
+        if isinstance(current, (list, tuple)):
+            operations.extend(current)
+        else:
+            operations.append(current)
+    if not operations:
+        raise ValueError("QCS grouped DC layer has no operations")
+    return operations[0] if len(operations) == 1 else operations
+
+
 def _qcs_envelope(qcs: Any, name: str) -> Any:
     if name == "gaussian":
         return qcs.GaussianEnvelope()
@@ -3355,6 +3488,24 @@ def compile_qcs_point(
         for operations in dc_interval_operations
     ):
         raise ValueError("QCS DC outputs produced different interval layers")
+    interval_duration_values_s = (
+        np.diff(unique_times).astype(float) * seconds_per_cycle
+    )
+    if append_terminal_value:
+        interval_duration_values_s = np.r_[
+            interval_duration_values_s,
+            QCS_M5301_MIN_WAVEFORM_FABRIC_CYCLES * seconds_per_cycle,
+        ]
+    (
+        interval_groups,
+        segment_layer_indices,
+        segment_layer_offsets,
+    ) = _qcs_segment_grouped_layer_layout(
+        sequence,
+        duration_table_s=interval_duration_values_s[np.newaxis, :],
+        boundary_rows=(boundary_seconds,),
+    )
+    layer_count = len(interval_groups)
 
     rf_operations_by_layer: dict[int, list[dict[str, Any]]] = {}
 
@@ -3367,15 +3518,15 @@ def compile_qcs_point(
         segment_start_s, segment_stop_s = boundary_seconds[
             current.at_segment
         ]
-        layer_index = _qcs_segment_layer_index(
-            interval_start_times_s,
-            segment_start_s,
-            segment_name=current.at_segment,
+        layer_index = segment_layer_indices[current.at_segment]
+        local_pre_delay_s = current.delay_s
+        pre_delay_s = (
+            float(segment_layer_offsets[current.at_segment][0])
+            + local_pre_delay_s
         )
-        pre_delay_s = current.delay_s
         if (
             current.require_within_segment
-            and segment_start_s + pre_delay_s + current.duration_s
+            and segment_start_s + local_pre_delay_s + current.duration_s
             > segment_stop_s + 1e-15
         ):
             raise ValueError(
@@ -3393,9 +3544,9 @@ def compile_qcs_point(
             name=f"rf_{current.gen_ch}_point_{point_index}",
         )
         if (
-            segment_start_s + pre_delay_s + current.duration_s
+            segment_start_s + local_pre_delay_s + current.duration_s
             > segment_stop_s + 1e-15
-            and layer_index < interval_count - 1
+            and layer_index < layer_count - 1
         ):
             raise ValueError(
                 f"QCS RF pulse on gen_ch {current.gen_ch} cannot cross "
@@ -3425,12 +3576,14 @@ def compile_qcs_point(
         segment_start_s, segment_stop_s = boundary_seconds[
             acquisition.at_segment
         ]
-        acquisition_layer_index = _qcs_segment_layer_index(
-            interval_start_times_s,
-            segment_start_s,
-            segment_name=acquisition.at_segment,
+        acquisition_layer_index = segment_layer_indices[
+            acquisition.at_segment
+        ]
+        local_acquisition_pre_delay_s = acquisition.pre_delay_s
+        pre_delay_s = (
+            float(segment_layer_offsets[acquisition.at_segment][0])
+            + local_acquisition_pre_delay_s
         )
-        pre_delay_s = acquisition.pre_delay_s
         acquisition_channels = _resolve_mapper_channel(
             mapper, connection_config.acquisition_channel_name
         )
@@ -3467,7 +3620,9 @@ def compile_qcs_point(
             integration_segment_sample_counts = (acquisition_sample_count,)
             acquisition_elapsed_duration_s = acquisition_duration_s
         acquisition_stop_s = (
-            segment_start_s + pre_delay_s + acquisition_elapsed_duration_s
+            segment_start_s
+            + local_acquisition_pre_delay_s
+            + acquisition_elapsed_duration_s
         )
         if (
             connection_config.hw_demod
@@ -3480,7 +3635,7 @@ def compile_qcs_point(
         if (
             not connection_config.hw_demod
             and acquisition_stop_s > segment_stop_s + 1e-15
-            and acquisition_layer_index < interval_count - 1
+            and acquisition_layer_index < layer_count - 1
         ):
             raise ValueError(
                 "raw QCS acquisition cannot cross segment "
@@ -3588,12 +3743,12 @@ def compile_qcs_point(
 
     # Make the selected SET layer current, add all parallel DC lanes, then
     # insert RF/acquisition before opening the next sequential DC layer.
-    for layer_index in range(interval_count):
+    for layer_index, interval_group in enumerate(interval_groups):
         for output_index, (channel, intervals) in enumerate(
             zip(dc_channels, dc_interval_operations)
         ):
             program.add_waveform(
-                intervals[layer_index],
+                _qcs_join_grouped_dc_intervals(intervals, interval_group),
                 channel,
                 new_layer=output_index == 0,
             )
@@ -5126,14 +5281,20 @@ def compile_qcs_synchronized_sweep(
         for operations in dc_interval_operations
     ):
         raise ValueError("QCS DC outputs produced different interval layers")
+    (
+        interval_groups,
+        segment_layer_indices,
+        segment_layer_offsets,
+    ) = _qcs_segment_grouped_layer_layout(
+        sequence,
+        duration_table_s=duration_table,
+        boundary_rows=boundary_rows,
+    )
+    layer_count = len(interval_groups)
 
     prepared_rf_pulses = []
     for pulse_index, pulse in enumerate(rf_pulses):
-        layer_index = _qcs_swept_segment_layer_index(
-            duration_table,
-            boundary_rows,
-            pulse.at_segment,
-        )
+        layer_index = segment_layer_indices[pulse.at_segment]
         channel_name = connection_config.rf_channel_names[pulse.gen_ch]
         channel = _resolve_mapper_channel(mapper, channel_name)
         _validate_mapped_hardware_role(
@@ -5186,14 +5347,22 @@ def compile_qcs_synchronized_sweep(
             if (
                 absolute_start_cycles + duration_cycles
                 > segment_stop_cycles
-                and layer_index < interval_count - 1
+                and layer_index < layer_count - 1
             ):
                 raise ValueError(
                     f"QCS RF pulse on gen_ch {current.gen_ch} cannot cross "
                     f"segment {current.at_segment!r} while later DC segment "
                     f"layers remain at sweep point {point_index + 1}"
                 )
-            start_cycle_values.append(delay_cycles)
+            layer_offset_cycles = int(
+                round(
+                    float(
+                        segment_layer_offsets[current.at_segment][point_index]
+                    )
+                    * fabric_hz
+                )
+            )
+            start_cycle_values.append(layer_offset_cycles + delay_cycles)
             duration_cycle_values.append(duration_cycles)
             frequency_values.append(current.frequency_hz)
         prepared_rf_pulses.append(
@@ -5326,11 +5495,7 @@ def compile_qcs_synchronized_sweep(
             }
         )
 
-    acquisition_layer_index = _qcs_swept_segment_layer_index(
-        duration_table,
-        boundary_rows,
-        acquisition.at_segment,
-    )
+    acquisition_layer_index = segment_layer_indices[acquisition.at_segment]
     acquisition_pre_delay_values = []
     acquisition_stop_values = []
     for point_index, boundaries in enumerate(boundary_rows):
@@ -5345,9 +5510,16 @@ def compile_qcs_synchronized_sweep(
             fabric_hz=fabric_hz,
             label="QCS acquisition pre-delay",
         )
-        pre_delay_s = acquisition_delay_s
+        pre_delay_s = (
+            float(
+                segment_layer_offsets[acquisition.at_segment][point_index]
+            )
+            + acquisition_delay_s
+        )
         acquisition_stop_s = (
-            segment_start_s + pre_delay_s + acquisition_elapsed_duration_s
+            segment_start_s
+            + acquisition_delay_s
+            + acquisition_elapsed_duration_s
         )
         if (
             connection_config.hw_demod
@@ -5360,7 +5532,7 @@ def compile_qcs_synchronized_sweep(
         if (
             not connection_config.hw_demod
             and acquisition_stop_s > segment_stop_s + 1e-15
-            and acquisition_layer_index < interval_count - 1
+            and acquisition_layer_index < layer_count - 1
         ):
             raise ValueError(
                 "raw QCS acquisition cannot cross segment "
@@ -5435,16 +5607,15 @@ def compile_qcs_synchronized_sweep(
             }
         )
 
-    # Open each synchronized DC interval as its own sequential layer. RF and
-    # acquisition are appended before opening the following layer, so they
-    # physically share the selected SET segment instead of using an absolute
-    # delay in a global layer.
-    for layer_index in range(interval_count):
+    # Keep every incoming ramp and its destination SET plateau in one layer.
+    # RF and acquisition are delayed past the ramp on their own channels, so
+    # all three operations share the layer that contains the swept voltage.
+    for layer_index, interval_group in enumerate(interval_groups):
         for output_index, (channel, intervals) in enumerate(
             zip(dc_channels, dc_interval_operations)
         ):
             program.add_waveform(
-                intervals[layer_index],
+                _qcs_join_grouped_dc_intervals(intervals, interval_group),
                 channel,
                 new_layer=output_index == 0,
             )
