@@ -318,6 +318,14 @@ def _program_waveform_operations(entry):
     return pulse if isinstance(pulse, list) else [pulse]
 
 
+def _program_channel_waveform_operations(program, channel_name):
+    operations = []
+    for entry in program.waveforms:
+        if entry[1].name == channel_name:
+            operations.extend(_program_waveform_operations(entry))
+    return operations
+
+
 @pytest.mark.parametrize(
     ("requested_s", "expected_s", "expected_samples"),
     (
@@ -769,8 +777,9 @@ def test_compile_lowers_awg_set_ramp_set_to_real_dc_waveforms():
         qcs_module=_FakeQcs,
     )
 
-    operations = _program_waveform_operations(
-        compiled.program.waveforms[0]
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
     )
     assert [type(operation) for operation in operations] == [
         _Delay,
@@ -872,8 +881,9 @@ def test_compile_preserves_instantaneous_set_before_next_hold():
         qcs_module=_FakeQcs,
     )
 
-    operations = _program_waveform_operations(
-        compiled.program.waveforms[0]
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
     )
     assert [type(operation) for operation in operations] == [
         _Waveform,
@@ -937,8 +947,9 @@ def test_awg_ramp_preflight_matches_measured_98304_sample_hcl_budget():
         repetitions_per_sweep=1,
         qcs_module=_FakeQcs,
     )
-    operations = _program_waveform_operations(
-        compiled.program.waveforms[0]
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
     )
     rendered_cycles = sum(
         round(operation.kwargs["duration"] * 300e6)
@@ -1038,8 +1049,11 @@ def test_no_sweep_capacity_counts_ramps_but_not_continuous_plateaus():
         repetitions_per_sweep=1,
         qcs_module=_FakeQcs,
     )
-    for output_index, entry in enumerate(compiled.program.waveforms):
-        operations = _program_waveform_operations(entry)
+    for output_index, channel_name in enumerate(("dc_0", "dc_1")):
+        operations = _program_channel_waveform_operations(
+            compiled.program,
+            channel_name,
+        )
         assert type(operations[0]) is _Delay
         holds = [
             operation for operation in operations if type(operation) is _Hold
@@ -1120,8 +1134,11 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
     )
 
     for compiled in compiled_programs:
-        for dc_entry in compiled.program.waveforms[:2]:
-            operations = _program_waveform_operations(dc_entry)
+        for channel_name in ("dc_0", "dc_1"):
+            operations = _program_channel_waveform_operations(
+                compiled.program,
+                channel_name,
+            )
             seed = next(
                 operation
                 for operation in operations
@@ -1149,9 +1166,9 @@ def test_nonzero_initial_hold_uses_seed_and_preserves_rf_acquisition_timing():
         rf_entry = next(
             entry for entry in compiled.program.waveforms if entry[1].name == "rf_drive"
         )
-        assert rf_entry[2]["pre_delay"] == pytest.approx(110e-6)
+        assert rf_entry[2]["pre_delay"] == pytest.approx(0.0)
         assert compiled.program.acquisitions[0]["pre_delay"] == pytest.approx(
-            110e-6
+            0.0
         )
         assert compiled.duration_s == pytest.approx(320.4e-6)
 
@@ -1399,8 +1416,11 @@ def test_two_output_fixed_voltage_bias_t_compiles_with_ramp_to_hold():
         qcs_module=_FakeQcs,
     )
 
-    for entry in compiled.program.waveforms:
-        operations = _program_waveform_operations(entry)
+    for channel_name in ("dc_0", "dc_1"):
+        operations = _program_channel_waveform_operations(
+            compiled.program,
+            channel_name,
+        )
         by_name = {
             operation.kwargs.get("name"): operation
             for operation in operations
@@ -1471,7 +1491,10 @@ def test_short_fixed_voltage_bias_t_tail_uses_legal_minimum_hold():
         ),
         qcs_module=_FakeQcs,
     )
-    operations = _program_waveform_operations(compiled.program.waveforms[0])
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
+    )
     generated_durations = [
         round(operation.kwargs["duration"] * 300e6)
         for operation in operations
@@ -2205,7 +2228,10 @@ def test_zero_offset_ramp_to_long_plateau_uses_hold_in_direct_compiler():
 
     assert compiled.hardware_sweep is True
     assert compiled.dc_channel_offsets_v == pytest.approx((0.0,))
-    operations = _program_waveform_operations(compiled.program.waveforms[0])
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
+    )
     assert any(isinstance(operation, _Hold) for operation in operations)
 
 
@@ -2786,8 +2812,9 @@ def test_fixed_time_bias_t_zero_area_point_keeps_one_hardware_program():
 
     assert compiled.hardware_sweep is True
     assert compiled.program.repetition_calls == ["sweep", "shots"]
-    operations = _program_waveform_operations(
-        compiled.program.waveforms[0]
+    operations = _program_channel_waveform_operations(
+        compiled.program,
+        "dc_gate",
     )
     assert [type(operation) for operation in operations] == [
         _Waveform,
@@ -3459,7 +3486,7 @@ def test_mixed_capacity_preflights_every_outer_slice_before_hardware():
     assert measurement_programs == []
 
 
-def test_same_rf_channel_uses_relative_gap_after_previous_pulse():
+def test_same_rf_channel_uses_segment_local_delays_in_separate_layers():
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("prep", [0.5], 300)
@@ -3505,12 +3532,12 @@ def test_same_rf_channel_uses_relative_gap_after_previous_pulse():
     ]
     assert [entry[2]["new_layer"] for entry in rf_entries] == [False, False]
     assert rf_entries[0][2]["pre_delay"] == pytest.approx(100e-9)
-    # The late pulse starts at 1.2 us. The first pulse ends at 0.2 us,
-    # therefore QCS needs a 1.0 us relative gap, not another 1.2 us delay.
-    assert rf_entries[1][2]["pre_delay"] == pytest.approx(1.0e-6)
+    # The pulses live in different DC segment layers, so each pre-delay is
+    # relative to its own segment instead of the full waveform timeline.
+    assert rf_entries[1][2]["pre_delay"] == pytest.approx(200e-9)
 
 
-def test_different_rf_channels_keep_independent_absolute_pre_delays():
+def test_different_rf_channels_keep_independent_segment_local_pre_delays():
     sequence = (
         FineTuneSequence(("gate",))
         .add_set("prep", [0.5], 300)
@@ -3550,7 +3577,7 @@ def test_different_rf_channels_keep_independent_absolute_pre_delays():
         for entry in compiled.program.waveforms
         if entry[1].name in {"rf_late", "rf_early"}
     }
-    assert delays_by_channel["rf_late"] == pytest.approx(1.2e-6)
+    assert delays_by_channel["rf_late"] == pytest.approx(200e-9)
     assert delays_by_channel["rf_early"] == pytest.approx(100e-9)
 
 
@@ -5312,7 +5339,11 @@ def test_real_qcs_255_builds_program_offline():
         acquisition=_acquisition(at_segment="set_2"),
         qcs_module=qcs,
     )
-    bias_t_operations = bias_t_compiled.program.layers[0].operations[dc]
+    bias_t_operations = [
+        operation
+        for layer in bias_t_compiled.program.layers
+        for operation in layer.operations.get(dc, ())
+    ]
     assert any(isinstance(operation, qcs.Hold) for operation in bias_t_operations)
     assert any(
         isinstance(operation, qcs.Delay)
@@ -5320,10 +5351,86 @@ def test_real_qcs_255_builds_program_offline():
         and operation.duration.value == pytest.approx(66 / 300e6)
         for operation in bias_t_operations
     )
+    acquisition_layers = [
+        layer
+        for layer in bias_t_compiled.program.layers
+        if digitizer in layer.operations
+    ]
+    assert len(acquisition_layers) == 1
+    assert dc in acquisition_layers[0].operations
+    assert dc_second in acquisition_layers[0].operations
     rendered_bias_t_program, _layer_map = qcs.SequenceBuilder(
         channel_map=mapper
     ).build(bias_t_compiled.program)
     assert len(rendered_bias_t_program.layers) == 1
+
+
+def test_real_qcs_255_acquisition_shares_selected_middle_set_layer():
+    qcs = pytest.importorskip("keysight.qcs")
+    sequence = (
+        FineTuneSequence(("gate",))
+        .add_set("set_0", [0.0], 30_000)
+        .add_ramp("ramp_0", 3_000)
+        .add_set("set_1", [-0.125], 60_000)
+        .add_amplitude_sweep("set_1", "gate", -0.125, -0.3125, 3)
+    )
+    dc = qcs.Channels(0, "dc_gate")
+    digitizer = qcs.Channels(0, "digitizer", absolute_phase=True)
+    mapper = qcs.ChannelMapper()
+    mapper.add_channel_mapping(
+        dc, [(1, 2, 1)], qcs.InstrumentEnum.M5301AWG
+    )
+    mapper.add_channel_mapping(
+        digitizer,
+        [(1, 4, 1)],
+        qcs.InstrumentEnum.M5200Digitizer,
+    )
+    connection = _connection()
+    acquisition = _acquisition(
+        at_segment="set_1",
+        duration_s=3.2e-6,
+        pre_delay_s=2e-6,
+    )
+    compiled_programs = (
+        compile_qcs_point(
+            sequence,
+            0,
+            connection_config=connection,
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=acquisition,
+            qcs_module=qcs,
+        ),
+        backend.compile_qcs_synchronized_sweep(
+            sequence,
+            connection_config=connection,
+            mapper=mapper,
+            repetitions_per_sweep=1,
+            source_full_scale_mv=800.0,
+            acquisition=acquisition,
+            qcs_module=qcs,
+        ),
+    )
+    assert compiled_programs[1].hardware_sweep is True
+    assert compiled_programs[1].sweep_shape == (3,)
+
+    for compiled in compiled_programs:
+        assert len(compiled.program.layers) == 3
+        assert digitizer not in compiled.program.layers[0].operations
+        assert digitizer not in compiled.program.layers[1].operations
+        selected_layer = compiled.program.layers[2]
+        assert dc in selected_layer.operations
+        assert digitizer in selected_layer.operations
+
+        rendered, _layer_map = qcs.SequenceBuilder(
+            channel_map=mapper
+        ).build(compiled.program)
+        digitizer_operations = rendered.layers[0].operations[digitizer]
+        assert isinstance(digitizer_operations[0], qcs.Delay)
+        # set_0 (100 us) + ramp_0 (10 us) + local acquisition delay (2 us)
+        assert digitizer_operations[0].duration.value == pytest.approx(112e-6)
+        assert isinstance(digitizer_operations[1], qcs.Acquisition)
 
 
 def test_real_qcs_255_builds_native_two_axis_stability_hardware_sweep():
@@ -5563,8 +5670,56 @@ def test_generated_qcs_code_aligns_outputs_in_parallel_layers():
 
     interval_count = len(np.unique(np.concatenate((gate_a.t, gate_b.t)))) - 1
     assert isinstance(program, qcs.Program)
+    assert interval_count > 1
     assert code.count("new_layer=True") == interval_count
     assert code.count("new_layer=False") == interval_count
+    assert len(program.layers) == interval_count
+    for layer in program.layers:
+        assert {channel.name for channel in layer.operations} == {
+            "gate_a",
+            "gate_b",
+        }
+
+
+def test_generated_qcs_code_places_acquisition_in_synchronized_dc_layer():
+    qcs = pytest.importorskip("keysight.qcs")
+    pulse = PulseSequence(0.0, 10_000.0)
+    pulse.add_flat_ramp(5_000.0, 20_000.0, 100.0)
+
+    code = generate_qcs_program_code(
+        (pulse,),
+        channel_names=("gate",),
+        acquisition_channel_name="digitizer",
+        acquisition_segment_name="set_1",
+        acquisition_duration_s=3.0e-6,
+        acquisition_pre_delay_s=2.0e-6,
+        acquisition_hardware_demodulation=True,
+        acquisition_frequency_hz=25.0e6,
+    )
+
+    compile(code, "<generated_qcs_program>", "exec")
+    assert "acquisition_channel: qcs.Channels" in code
+    assert "program.add_waveform(gate_dc_segment_2" in code
+    assert "program.add_acquisition(" in code
+    assert "new_layer=False" in code
+    assert "pre_delay=2e-06" in code
+    assert "rf_frequency=25000000" in code
+    assert "# Mapper virtual channel: digitizer" in code
+
+    namespace = {}
+    exec(code, namespace)
+    gate = qcs.Channels(0, "gate")
+    digitizer = qcs.Channels(0, "digitizer", absolute_phase=True)
+    program = namespace["generate_dc_waveforms"](
+        qcs.Program(),
+        gate,
+        digitizer,
+    )
+    assert len(program.layers) == 3
+    assert digitizer not in program.layers[0].operations
+    assert digitizer not in program.layers[1].operations
+    assert digitizer in program.layers[2].operations
+    assert gate in program.layers[2].operations
 
 
 def test_generated_qcs_code_uses_delay_for_long_zero_interval():

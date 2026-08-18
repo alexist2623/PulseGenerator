@@ -234,6 +234,13 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     sequence.add_set("start", (0.0, 0.25), 10)
     sequence.set_amplitude_sweep("start", "awg_0", -0.5, 0.5, 2)
     gui_metadata = _gui_metadata()
+    gui_metadata["awg"].update({
+        "output_names": ["Left gate", "Right gate"],
+        "output_name_mapping": [
+            {"original_name": "awg_0", "display_name": "Left gate"},
+            {"original_name": "awg_1", "display_name": "Right gate"},
+        ],
+    })
     gui_metadata["awg_waveform_vertices"] = build_awg_vertex_metadata(
         sequence,
         fabric_mhz=300.0,
@@ -430,6 +437,8 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
     assert layout["sample_index_parameter"] == SAMPLE_INDEX_PARAMETER
     assert layout["time_reconstruction"].startswith(SAMPLE_INDEX_PARAMETER)
     assert layout["sweep_axes"][0]["parameter"] == sweep_parameter
+    assert layout["sweep_axes"][0]["output_name"] == "awg_0"
+    assert layout["sweep_axes"][0]["output_display_name"] == "Left gate"
     assert layout["sweep_axes"][0]["voltage_start_mv"] == -50.0
     assert layout["sweep_axes"][0]["voltage_stop_mv"] == 50.0
     assert "point_index" not in layout["setpoint_meanings"]
@@ -450,6 +459,24 @@ def test_store_qick_result_writes_iq_and_awg_vertices_as_data(
             "vertex_count": 2,
         },
     }
+    assert metadata["awg_output_name_mapping"] == [
+        {"original_name": "awg_0", "display_name": "Left gate"},
+        {"original_name": "awg_1", "display_name": "Right gate"},
+    ]
+    assert json.loads(
+        dataset.get_metadata("awg_output_name_mapping_json")
+    ) == metadata["awg_output_name_mapping"]
+    parameter_labels = {
+        parameter.name: parameter.label
+        for parameter in dataset.get_parameters()
+    }
+    assert parameter_labels[sweep_parameter].startswith("Left gate / set_1")
+    assert parameter_labels["awg_0_virtual_vertices_mv"].startswith(
+        "Left gate virtual"
+    )
+    assert parameter_labels["awg_1_virtual_vertices_mv"].startswith(
+        "Right gate virtual"
+    )
     assert json.loads(dataset.get_metadata("cross_capacitance_json")) == [[1.0]]
     assert progress_updates[0][0] == 65
     assert progress_updates[-1][0] == 99

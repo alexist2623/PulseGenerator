@@ -116,21 +116,31 @@ def sweep_axis_key(axis: Any) -> SweepAxisKey:
     return str(axis.output_name), str(axis.segment_name)
 
 
-def sweep_axis_label(axis: Any) -> str:
+def sweep_axis_label(
+    axis: Any,
+    output_name_mapping: Optional[Mapping[str, str]] = None,
+) -> str:
     """Return the compact user-facing name for one sweep variable."""
     output_name, segment_name = sweep_axis_key(axis)
+    display_output_name = str(
+        getattr(axis, "output_display_name", "") or output_name
+    )
+    if output_name_mapping is not None:
+        display_output_name = str(
+            output_name_mapping.get(output_name, display_output_name)
+        )
     axis_kind = getattr(axis, "axis_kind", "amplitude")
     if axis_kind == "rf_duration":
-        return f"{output_name} / {segment_name} RF duration"
+        return f"{display_output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
-        return f"{output_name} / {segment_name} RF frequency"
+        return f"{display_output_name} / {segment_name} RF frequency"
     if axis_kind == "rf_power":
-        return f"{output_name} / {segment_name} RF power"
+        return f"{display_output_name} / {segment_name} RF power"
     if axis_kind == "ramp_duration":
         return f"{segment_name} RAMP duration (rate derived)"
     if axis_kind == "hold_duration":
         return f"{segment_name} SET hold duration"
-    return f"{output_name} / {segment_name}"
+    return f"{display_output_name} / {segment_name}"
 
 
 def _axis_display_values(
@@ -166,6 +176,7 @@ class AwgSweepMapSource:
     source_label: str = ""
     database_path: str = ""
     run_id: int = 0
+    output_name_mapping: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -265,18 +276,21 @@ def _stored_axis_key(axis: Mapping[str, Any]) -> SweepAxisKey:
 
 def _stored_axis_label(axis: Mapping[str, Any]) -> str:
     output_name, segment_name = _stored_axis_key(axis)
+    display_output_name = str(
+        axis.get("output_display_name", output_name)
+    )
     axis_kind = str(axis.get("axis_kind", "amplitude"))
     if axis_kind == "rf_duration":
-        return f"{output_name} / {segment_name} RF duration"
+        return f"{display_output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
-        return f"{output_name} / {segment_name} RF frequency"
+        return f"{display_output_name} / {segment_name} RF frequency"
     if axis_kind == "rf_power":
-        return f"{output_name} / {segment_name} RF power"
+        return f"{display_output_name} / {segment_name} RF power"
     if axis_kind == "ramp_duration":
         return f"{segment_name} RAMP duration (rate derived)"
     if axis_kind == "hold_duration":
         return f"{segment_name} SET hold duration"
-    return f"{output_name} / {segment_name}"
+    return f"{display_output_name} / {segment_name}"
 
 
 def _stored_selected_axes(
@@ -530,6 +544,12 @@ def awg_sweep_result_from_stored_arrays(
         axis_objects.append(
             SimpleNamespace(
                 output_name=str(axis.get("output_name", "")),
+                output_display_name=str(
+                    axis.get(
+                        "output_display_name",
+                        axis.get("output_name", ""),
+                    )
+                ),
                 segment_name=str(axis.get("segment_name", "")),
                 axis_kind=str(axis.get("axis_kind", "amplitude")),
                 start=float(np.min(native_values)),
@@ -796,6 +816,7 @@ def reduce_awg_sweep_map(
     measurement_mode: str = "raw_iq",
     fixed_axis_values: Optional[Mapping[SweepAxisKey, float]] = None,
     source: Optional[AwgSweepMapSource] = None,
+    output_name_mapping: Optional[Mapping[str, str]] = None,
 ) -> AwgSweepMapResult:
     """Reduce one Cartesian FIR acquisition to a selected two-axis map.
 
@@ -807,6 +828,16 @@ def reduce_awg_sweep_map(
     full_scale_mv = float(full_scale_mv)
     if not np.isfinite(full_scale_mv) or full_scale_mv <= 0.0:
         raise ValueError("AWG full scale must be positive and finite")
+    if output_name_mapping is None and source is not None:
+        output_name_mapping = dict(source.output_name_mapping)
+    if output_name_mapping is None:
+        output_name_mapping = {}
+    elif not isinstance(output_name_mapping, Mapping):
+        raise TypeError("output_name_mapping must be a mapping")
+    output_name_mapping = {
+        str(original): str(display)
+        for original, display in output_name_mapping.items()
+    }
 
     axes = tuple(ddr_result.sweep_axes)
     if len(axes) < 2:
@@ -867,6 +898,7 @@ def reduce_awg_sweep_map(
             sample_rate_hz=float(
                 getattr(ddr_result, "sample_rate_hz", 1_000_000.0)
             ),
+            output_name_mapping=tuple(output_name_mapping.items()),
         )
 
     point_iq = iq.astype(np.float64, copy=False).mean(axis=(1, 2))
@@ -935,7 +967,7 @@ def reduce_awg_sweep_map(
     magnitude = np.hypot(i_mean, q_mean)
     angle_deg = np.degrees(np.arctan2(q_mean, i_mean))
     averaged_axis_labels = tuple(
-        sweep_axis_label(axis)
+        sweep_axis_label(axis, output_name_mapping)
         for index, axis in enumerate(axes)
         if (
             index not in (x_column, y_column)
@@ -956,7 +988,7 @@ def reduce_awg_sweep_map(
             full_scale_mv,
         )
         fixed_axis_labels.append(
-            f"{sweep_axis_label(axes[index])} = "
+            f"{sweep_axis_label(axes[index], output_name_mapping)} = "
             f"{float(display_value[0]):.9g} {unit}"
         )
 
@@ -969,8 +1001,8 @@ def reduce_awg_sweep_map(
         angle_deg=angle_deg,
         x_axis_key=x_axis_key,
         y_axis_key=y_axis_key,
-        x_axis_label=sweep_axis_label(axes[x_column]),
-        y_axis_label=sweep_axis_label(axes[y_column]),
+        x_axis_label=sweep_axis_label(axes[x_column], output_name_mapping),
+        y_axis_label=sweep_axis_label(axes[y_column], output_name_mapping),
         x_unit=x_unit,
         y_unit=y_unit,
         value_unit=display_scale.unit,
@@ -1014,6 +1046,7 @@ def reduce_awg_sweep_source(
         measurement_mode=source.measurement_mode,
         fixed_axis_values=fixed_axis_values,
         source=source,
+        output_name_mapping=dict(source.output_name_mapping),
     )
     return replace(
         result,

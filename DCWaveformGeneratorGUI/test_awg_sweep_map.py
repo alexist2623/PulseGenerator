@@ -166,6 +166,36 @@ def test_reduce_two_axis_awg_map_and_axis_swap():
     np.testing.assert_allclose(swapped.q_mean, expected_q.T)
 
 
+def test_awg_map_uses_display_names_without_changing_axis_keys():
+    result = awg_map.reduce_awg_sweep_map(
+        _two_axis_result(),
+        x_axis_key=("awg_0", "set_1"),
+        y_axis_key=("awg_1", "set_2"),
+        full_scale_mv=800.0,
+        output_name_mapping={
+            "awg_0": "Left gate",
+            "awg_1": "Right gate",
+        },
+    )
+
+    assert result.x_axis_key == ("awg_0", "set_1")
+    assert result.y_axis_key == ("awg_1", "set_2")
+    assert result.x_axis_label == "Left gate / set_1"
+    assert result.y_axis_label == "Right gate / set_2"
+    assert dict(result.source.output_name_mapping) == {
+        "awg_0": "Left gate",
+        "awg_1": "Right gate",
+    }
+
+    swapped = awg_map.reduce_awg_sweep_source(
+        result.source,
+        x_axis_key=("awg_1", "set_2"),
+        y_axis_key=("awg_0", "set_1"),
+    )
+    assert swapped.x_axis_label == "Right gate / set_2"
+    assert swapped.y_axis_label == "Left gate / set_1"
+
+
 def test_reduce_map_preserves_rf_duration_axis_in_microseconds():
     voltage_points = (-0.5, 0.5)
     duration_points = (1.0, 2.0, 3.0)

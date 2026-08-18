@@ -228,6 +228,7 @@ class TracePlotWidget(pg.PlotWidget):
             Tuple[float, float, float, float]
         ] = None
         self._default_title = "Select X/Y outputs"
+        self._output_names: Tuple[str, ...] = ()
 
     @property
     def has_selection(self) -> bool:
@@ -247,6 +248,19 @@ class TracePlotWidget(pg.PlotWidget):
         self._time_unit = unit
         if self._pulses:
             self.refresh_trace(self._pulses)
+
+    def set_output_names(self, names: Sequence[str]) -> None:
+        names = tuple(str(name) for name in names)
+        if self._pulses and len(names) != len(self._pulses):
+            raise ValueError("trace output-name count must match pulse count")
+        self._output_names = names
+        if self._pulses:
+            self.refresh_trace(self._pulses)
+
+    def _output_label(self, index: int) -> str:
+        if index < len(self._output_names):
+            return self._output_names[index]
+        return f"awg_{index}"
 
     def _point_timing_text(self, record: dict) -> str:
         return (
@@ -701,8 +715,8 @@ class TracePlotWidget(pg.PlotWidget):
         self._trace_shadow.setData(voltage_x, voltage_y)
         self._curve.setData(voltage_x, voltage_y)
         self._refresh_point_items(pulse_x, pulse_y)
-        self.setLabel("bottom", f"Pulse {self.x_idx + 1}", units="mV")
-        self.setLabel("left", f"Pulse {self.y_idx + 1}", units="mV")
+        self.setLabel("bottom", self._output_label(self.x_idx), units="mV")
+        self.setLabel("left", self._output_label(self.y_idx), units="mV")
         self._refresh_stability_overlay()
 
     def fit_view(self) -> None:
@@ -991,6 +1005,8 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._line: List[pg.PlotDataItem] = []
         self._physical_line: List[pg.PlotDataItem] = []
         self._orig_colors: List[QtGui.QColor] = []
+        self._output_names: List[str] = ["awg_0"]
+        self._legend = self.getPlotItem().addLegend(offset=(8, 8))
         self._selected_port_idx = 0
         self._default_width = 1.5
         self._highlight_width = 2.8
@@ -1048,6 +1064,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._annotation.hide()
 
         self._append_curve(pulse)
+        self._refresh_legend()
         self.set_physical_waveforms(pulse.t, np.asarray([pulse.v]))
         # QAbstractScrollArea delivers pointer events through its viewport.
         # Filtering it makes drag editing deterministic across Qt/PyQtGraph
@@ -1195,6 +1212,18 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._physical_line.append(physical_curve)
         self._line.append(curve)
         self._orig_colors.append(color)
+
+    def set_output_names(self, names: Sequence[str]) -> None:
+        names = [str(name) for name in names]
+        if len(names) != len(self._pulses):
+            raise ValueError("waveform output-name count must match pulse count")
+        self._output_names = names
+        self._refresh_legend()
+
+    def _refresh_legend(self) -> None:
+        self._legend.clear()
+        for curve, name in zip(self._line, self._output_names):
+            self._legend.addItem(curve, name)
 
     def line_color(self, index: int) -> QtGui.QColor:
         return QtGui.QColor(self._orig_colors[index])

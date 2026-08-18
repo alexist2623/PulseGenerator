@@ -165,6 +165,63 @@ def test_gui_defaults_and_time_unit_round_trip():
     window.close()
 
 
+def test_awg_output_display_names_are_shared_plotted_and_round_trip():
+    app = _application()
+    window = gui.MainWindow()
+    window._add_port()
+
+    first_control, second_control = window._multi_ctrl._ctrl_pannels
+    first_control.output_name.setText("Left gate")
+    first_control.output_name.editingFinished.emit()
+    app.processEvents()
+
+    assert window._awg_output_display_names == ["Left gate", "awg_1"]
+    assert window._stability_panel.x_axis.output_display_name.text() == "Left gate"
+    assert "Left gate" in window._stability_panel.x_axis.output.currentText()
+
+    window._stability_panel.y_axis.output_display_name.setText("Right gate")
+    window._stability_panel.y_axis.output_display_name.editingFinished.emit()
+    app.processEvents()
+
+    assert window._awg_output_display_names == ["Left gate", "Right gate"]
+    assert second_control.output_name.text() == "Right gate"
+    assert "Right gate" in window._multi_ctrl.panel_table.item(1, 0).text()
+    assert "awg_1" in window._multi_ctrl.panel_table.item(1, 0).toolTip()
+
+    trace = window._ensure_trace_widget()
+    trace.x_idx = 0
+    trace.y_idx = 1
+    trace.refresh_trace(window._pulse)
+    if gui._USE_PYQTGRAPH:
+        assert trace.getPlotItem().getAxis("bottom").labelText == "Left gate"
+        assert trace.getPlotItem().getAxis("left").labelText == "Right gate"
+        legend_names = [label.text for _sample, label in window._plot._legend.items]
+        assert legend_names == ["Left gate", "Right gate"]
+    else:
+        assert trace.ax.get_xlabel() == "Left gate [mV]"
+        assert trace.ax.get_ylabel() == "Right gate [mV]"
+        assert [line.get_label() for line in window._plot._line] == [
+            "Left gate",
+            "Right gate",
+        ]
+
+    document = window._settings_to_dict()
+    assert document["awg"]["output_names"] == ["Left gate", "Right gate"]
+    assert document["awg"]["output_name_mapping"] == [
+        {"original_name": "awg_0", "display_name": "Left gate"},
+        {"original_name": "awg_1", "display_name": "Right gate"},
+    ]
+
+    restored = gui.MainWindow()
+    restored._apply_decoded_settings(restored._decode_settings(document))
+    assert restored._awg_output_display_names == ["Left gate", "Right gate"]
+    assert restored._multi_ctrl._ctrl_pannels[0].output_name.text() == "Left gate"
+    assert restored._stability_panel.y_axis.output_display_name.text() == "Right gate"
+
+    restored.close()
+    window.close()
+
+
 def test_shared_qick_setup_replaces_duplicate_tab_controls():
     app = _application()
     window = gui.MainWindow()
@@ -3933,6 +3990,41 @@ def test_segment_names_survive_insert_delete_copy_and_json():
     assert restored_legacy.segment_names == ["set_0", "set_1"]
 
 
+def test_awg_tuning_rf_and_acquisition_show_user_segment_names():
+    app = _application()
+    window = gui.MainWindow()
+    pulse = window._pulse[0]
+    pulse.rename_segment(0, "Reset")
+    pulse.add_flat_ramp(100.0, 500.0, 125.0)
+    pulse.rename_segment(1, "Readout")
+
+    window._refresh_rf_editor()
+    app.processEvents()
+
+    rf_panel = window._rf_ports_panel._panels[0]
+    acquisition_panel = window._rf_readout_panel
+    for selector in (rf_panel.segment, acquisition_panel.segment):
+        assert [
+            selector.itemText(index) for index in range(selector.count())
+        ] == ["Reset", "Readout"]
+        assert [
+            selector.itemData(index) for index in range(selector.count())
+        ] == ["set_0", "set_1"]
+        selector.setCurrentIndex(selector.findData("set_1"))
+
+    assert rf_panel.configured_spec().segment_name == "set_1"
+    assert acquisition_panel.configured_spec().segment_name == "set_1"
+
+    pulse.rename_segment(1, "Measurement")
+    window._on_segment_name_changed(0, 1)
+    app.processEvents()
+    assert rf_panel.segment.currentText() == "Measurement"
+    assert acquisition_panel.segment.currentText() == "Measurement"
+    assert rf_panel.segment.currentData() == "set_1"
+    assert acquisition_panel.segment.currentData() == "set_1"
+    window.close()
+
+
 def test_settings_without_tproc_clock_use_300_mhz_default():
     app = _application()
     window = gui.MainWindow()
@@ -3969,7 +4061,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_init_time_us.setValue(0.25)
 
     document = source._settings_to_dict()
-    assert document["version"] == 42
+    assert document["version"] == 43
     assert document["experiment"]["execution_backend"] == "qcs"
     assert document["experiment"]["iq_repetition_policy"] == (
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
@@ -4733,7 +4825,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 42
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 43
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
     assert upgraded["display"]["selected_control_tab"] == 0

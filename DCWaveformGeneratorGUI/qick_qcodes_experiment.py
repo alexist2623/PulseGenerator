@@ -1248,6 +1248,37 @@ def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
     return value
 
 
+def _awg_output_name_mapping(
+    gui_settings: Mapping[str, Any],
+) -> Tuple[Tuple[str, str], ...]:
+    """Return canonical/display AWG names stored by settings schema v43+."""
+    awg_settings = gui_settings.get("awg", {})
+    if not isinstance(awg_settings, Mapping):
+        return ()
+    raw_mapping = awg_settings.get("output_name_mapping", ())
+    mapping = []
+    if isinstance(raw_mapping, Sequence) and not isinstance(
+        raw_mapping,
+        (str, bytes),
+    ):
+        for entry in raw_mapping:
+            if not isinstance(entry, Mapping):
+                continue
+            original = str(entry.get("original_name", "")).strip()
+            display = str(entry.get("display_name", "")).strip()
+            if original and display:
+                mapping.append((original, display))
+    if mapping:
+        return tuple(mapping)
+    raw_names = awg_settings.get("output_names", ())
+    if isinstance(raw_names, Sequence) and not isinstance(raw_names, (str, bytes)):
+        return tuple(
+            (f"awg_{index}", str(name).strip() or f"awg_{index}")
+            for index, name in enumerate(raw_names)
+        )
+    return ()
+
+
 def _qcodes_staging_root() -> Path:
     configured = os.environ.get(QCODES_STAGING_ENV)
     if configured:
@@ -1590,6 +1621,8 @@ def store_qick_result(
     )
     connection_metadata = _connection_config_metadata(connection_config)
     stored_gui_settings = dict(gui_settings)
+    output_name_mapping = _awg_output_name_mapping(stored_gui_settings)
+    output_display_names = dict(output_name_mapping)
     awg_vertices = stored_gui_settings.pop("awg_waveform_vertices", {})
     awg_recipe = stored_gui_settings.get("awg_waveform_recipe", {})
     vertex_data = _coerce_awg_vertex_data(
@@ -1638,7 +1671,10 @@ def store_qick_result(
         )
         parameter = Parameter(
             parameter_name,
-            label=f"{axis.output_name} / {axis.segment_name} {quantity}",
+            label=(
+                f"{output_display_names.get(axis.output_name, axis.output_name)} "
+                f"/ {axis.segment_name} {quantity}"
+            ),
             unit=unit,
         )
         sweep_parameters.append(parameter)
@@ -1671,6 +1707,10 @@ def store_qick_result(
         output_names, vertex_time_us, _virtual_mv, _physical_mv = vertex_data
         used_prefixes = set()
         for output_index, output_name in enumerate(output_names):
+            output_display_name = output_display_names.get(
+                output_name,
+                output_name,
+            )
             base_prefix = _qcodes_identifier(output_name)
             prefix = base_prefix
             suffix = 2
@@ -1680,7 +1720,7 @@ def store_qick_result(
             used_prefixes.add(prefix)
             time_parameter = Parameter(
                 f"{prefix}_vertex_time_us",
-                label=f"{output_name} AWG vertex time",
+                label=f"{output_display_name} AWG vertex time",
                 unit="us",
             )
             measurement.register_parameter(
@@ -1691,12 +1731,16 @@ def store_qick_result(
             vertex_setpoints = (*sweep_parameters, time_parameter)
             virtual_parameter = Parameter(
                 f"{prefix}_virtual_vertices_mv",
-                label=f"{output_name} virtual AWG waveform vertices",
+                label=(
+                    f"{output_display_name} virtual AWG waveform vertices"
+                ),
                 unit="mV",
             )
             physical_parameter = Parameter(
                 f"{prefix}_physical_vertices_mv",
-                label=f"{output_name} physical AWG waveform vertices",
+                label=(
+                    f"{output_display_name} physical AWG waveform vertices"
+                ),
                 unit="mV",
             )
             for parameter in (virtual_parameter, physical_parameter):
@@ -1708,6 +1752,7 @@ def store_qick_result(
             vertex_parameters.append({
                 "output_index": output_index,
                 "output_name": output_name,
+                "output_display_name": output_display_name,
                 "time": time_parameter,
                 "virtual": virtual_parameter,
                 "physical": physical_parameter,
@@ -1723,6 +1768,10 @@ def store_qick_result(
         axis_metadata = {
             "parameter": parameter.name,
             "output_name": axis.output_name,
+            "output_display_name": output_display_names.get(
+                axis.output_name,
+                axis.output_name,
+            ),
             "segment_name": axis.segment_name,
             "axis_kind": getattr(axis, "axis_kind", "amplitude"),
             "quantity": quantity,
@@ -1799,6 +1848,13 @@ def store_qick_result(
             "write_mode": "local_staging_then_sqlite_backup",
         },
         "gui_settings": stored_gui_settings,
+        "awg_output_name_mapping": [
+            {
+                "original_name": original_name,
+                "display_name": display_name,
+            }
+            for original_name, display_name in output_name_mapping
+        ],
         "awg_waveform_metadata": {
             "mode": normalize_awg_metadata_mode(
                 stored_gui_settings.get("qick", {}).get(
@@ -1920,6 +1976,10 @@ def store_qick_result(
             _json_text(
                 stored_gui_settings.get("awg", {}).get("cross_capacitance", [])
             ),
+        )
+        dataset.add_metadata(
+            "awg_output_name_mapping_json",
+            _json_text(metadata["awg_output_name_mapping"]),
         )
         if awg_recipe:
             dataset.add_metadata(

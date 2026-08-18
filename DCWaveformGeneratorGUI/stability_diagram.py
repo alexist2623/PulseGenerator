@@ -538,6 +538,8 @@ class StabilityDiagramResult:
     source_label: str = ""
     database_path: str = ""
     run_id: int = 0
+    x_axis_display_label: str = ""
+    y_axis_display_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -712,10 +714,16 @@ def list_stability_runs(database_path: Any) -> Tuple[StabilityRunSummary, ...]:
                             metadata.get("created_at_utc", "")
                         ),
                         x_axis_label=str(
-                            x_axis.get("output_name", "X")
+                            x_axis.get(
+                                "output_display_name",
+                                x_axis.get("output_name", "X"),
+                            )
                         ),
                         y_axis_label=str(
-                            y_axis.get("output_name", "Y")
+                            y_axis.get(
+                                "output_display_name",
+                                y_axis.get("output_name", "Y"),
+                            )
                         ),
                         x_points=int(x_axis.get("count", 0)),
                         y_points=int(y_axis.get("count", 0)),
@@ -946,6 +954,18 @@ def stability_result_from_stored_arrays(
         source_label=f"QCoDeS Run {int(run_id)}",
         database_path=str(path),
         run_id=int(run_id),
+        x_axis_display_label=str(
+            x_axis.get(
+                "output_display_name",
+                x_axis.get("output_name", "X"),
+            )
+        ),
+        y_axis_display_label=str(
+            y_axis.get(
+                "output_display_name",
+                y_axis.get("output_name", "Y"),
+            )
+        ),
     )
 
 
@@ -2473,6 +2493,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     """Compact editor for one voltage axis."""
 
     front_panel_requested = QtCore.pyqtSignal(object)
+    output_name_changed = QtCore.pyqtSignal(str, str)
 
     def __init__(self, title: str, parent=None):
         super().__init__(title, parent)
@@ -2482,6 +2503,12 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         self.output.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Fixed,
+        )
+        self.output_display_name = QtWidgets.QLineEdit(self)
+        self.output_display_name.setMaxLength(128)
+        self.output_display_name.setToolTip(
+            "Shared display name for this AWG output. The original awg_N "
+            "identifier is retained in saved data."
         )
         self._front_panel_configuration = None
         self._qcs_front_panel_configuration = None
@@ -2526,10 +2553,14 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         form.addRow("Electrode SMA:", front_panel_row)
         form.addRow(self.front_panel_preview)
         form.addRow("AWG electrode:", self.output)
+        form.addRow("Output name:", self.output_display_name)
         form.addRow("Start:", self.start_mv)
         form.addRow("Stop:", self.stop_mv)
         form.addRow("Points:", self.points)
-        self.output.currentIndexChanged.connect(self._sync_front_panel_status)
+        self.output.currentIndexChanged.connect(self._on_output_changed)
+        self.output_display_name.editingFinished.connect(
+            self._emit_output_name_changed
+        )
 
     @staticmethod
     def _voltage_spin(value: float) -> QtWidgets.QDoubleSpinBox:
@@ -2542,19 +2573,29 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
     def refresh_targets(
         self,
-        outputs: Sequence[Tuple[str, int]],
+        outputs: Sequence[Tuple[str, int, str]],
         *,
         preferred_output_index: int,
     ) -> None:
         previous_output = self.output.currentData()
         with QtCore.QSignalBlocker(self.output):
             self.output.clear()
-            for output_name, gen_ch in outputs:
-                self.output.addItem(f"{output_name} (gen {gen_ch})", output_name)
+            for output_name, gen_ch, display_name in outputs:
+                label = (
+                    f"{display_name} ({output_name}, gen {gen_ch})"
+                    if display_name != output_name
+                    else f"{output_name} (gen {gen_ch})"
+                )
+                self.output.addItem(label, output_name)
                 self.output.setItemData(
                     self.output.count() - 1,
                     int(gen_ch),
                     QtCore.Qt.UserRole + 1,
+                )
+                self.output.setItemData(
+                    self.output.count() - 1,
+                    display_name,
+                    QtCore.Qt.UserRole + 2,
                 )
             output_index = self.output.findData(previous_output)
             if output_index < 0 and self.output.count():
@@ -2564,7 +2605,21 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
                     else -1
                 )
             self.output.setCurrentIndex(output_index)
+        self._on_output_changed()
+
+    def _on_output_changed(self, *_args) -> None:
+        display_name = self.output.currentData(QtCore.Qt.UserRole + 2)
+        with QtCore.QSignalBlocker(self.output_display_name):
+            self.output_display_name.setText(str(display_name or ""))
         self._sync_front_panel_status()
+
+    def _emit_output_name_changed(self) -> None:
+        original_name = self.output.currentData()
+        if original_name is not None:
+            self.output_name_changed.emit(
+                str(original_name),
+                self.output_display_name.text(),
+            )
 
     def current_gen_ch(self) -> int:
         value = self.output.currentData(QtCore.Qt.UserRole + 1)
@@ -3134,9 +3189,11 @@ if pg is not None:
                 f"Magnitude [{result.value_unit}]"
             )
             self.plots["phase"].setTitle("Angle [deg]")
+            x_label = result.x_axis_display_label or result.x_axis_label
+            y_label = result.y_axis_display_label or result.y_axis_label
             for plot in self.plots.values():
-                plot.setLabel("bottom", result.x_axis_label, units="mV")
-                plot.setLabel("left", result.y_axis_label, units="mV")
+                plot.setLabel("bottom", x_label, units="mV")
+                plot.setLabel("left", y_label, units="mV")
             x_low, x_high = self._axis_edges(result.x_voltage_mv)
             y_low, y_high = self._axis_edges(result.y_voltage_mv)
             rect = QtCore.QRectF(
@@ -3212,9 +3269,9 @@ if pg is not None:
                 np.argmin(np.abs(self._result.y_voltage_mv - point.y()))
             )
             self.hover_status.setText(
-                f"{self._result.x_axis_label} "
+                f"{self._result.x_axis_display_label or self._result.x_axis_label} "
                 f"{self._result.x_voltage_mv[x_index]:.6g} mV | "
-                f"{self._result.y_axis_label} "
+                f"{self._result.y_axis_display_label or self._result.y_axis_label} "
                 f"{self._result.y_voltage_mv[y_index]:.6g} mV | "
                 f"I {self._result.i_mean[y_index, x_index]:.6g} "
                 f"{self._result.value_unit} | "
@@ -3276,6 +3333,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
     electrode_front_panel_requested = QtCore.pyqtSignal(object)
+    awg_output_name_changed = QtCore.pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3320,6 +3378,12 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         self.y_axis.front_panel_requested.connect(
             self.electrode_front_panel_requested.emit
+        )
+        self.x_axis.output_name_changed.connect(
+            self.awg_output_name_changed.emit
+        )
+        self.y_axis.output_name_changed.connect(
+            self.awg_output_name_changed.emit
         )
         controls.addWidget(self.x_axis)
         controls.addWidget(self.y_axis)
@@ -4631,10 +4695,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         output_names: Sequence[str],
         awg_channels: Sequence[int],
         segment_names: Sequence[str] = (),
+        display_names: Optional[Sequence[str]] = None,
     ) -> None:
         # ``segment_names`` remains accepted for compatibility with older GUI
         # callers. Stability scans always use their own internal SET segment.
-        outputs = tuple(zip(output_names, awg_channels))
+        if display_names is None:
+            display_names = output_names
+        outputs = tuple(zip(output_names, awg_channels, display_names))
+        if len(outputs) != len(tuple(output_names)):
+            raise ValueError("AWG output display-name count must match outputs")
         self.x_axis.refresh_targets(outputs, preferred_output_index=0)
         self.y_axis.refresh_targets(outputs, preferred_output_index=1)
         self._enforce_independent_axis_outputs()
@@ -4695,8 +4764,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                     with QtCore.QSignalBlocker(self.y_axis.output):
                         self.y_axis.output.setCurrentIndex(-1)
 
-            self.x_axis._sync_front_panel_status()
-            self.y_axis._sync_front_panel_status()
+            self.x_axis._on_output_changed()
+            self.y_axis._on_output_changed()
             x_name = self._axis_output_name(self.x_axis)
             y_name = self._axis_output_name(self.y_axis)
             self._previous_axis_output_names = {

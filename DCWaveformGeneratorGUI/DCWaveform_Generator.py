@@ -483,7 +483,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 42
+SETTINGS_VERSION = 43
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 EXECUTION_BACKEND_QICK = "qick"
@@ -763,6 +763,7 @@ class _MatplotlibTracePlotWidget(Canvas):
             Tuple[float, float, float, float]
         ] = None
         self._trace_edit_targets = {}
+        self._output_names: Tuple[str, ...] = ()
 
         self.mpl_connect("motion_notify_event",  self._on_move)
         self.mpl_connect("button_press_event",   self._on_press)
@@ -788,6 +789,19 @@ class _MatplotlibTracePlotWidget(Canvas):
         self._time_unit = unit
         if self._pulse:
             self.refresh_trace(self._pulse)
+
+    def set_output_names(self, names: Sequence[str]) -> None:
+        names = tuple(str(name) for name in names)
+        if self._pulse and len(names) != len(self._pulse):
+            raise ValueError("trace output-name count must match pulse count")
+        self._output_names = names
+        if self._pulse:
+            self.refresh_trace(self._pulse)
+
+    def _output_label(self, index: int) -> str:
+        if index < len(self._output_names):
+            return self._output_names[index]
+        return f"awg_{index}"
 
     def set_stability_overlay(self, result, quantity: str = "magnitude") -> None:
         if quantity not in {"i", "q", "magnitude", "phase"}:
@@ -978,8 +992,8 @@ class _MatplotlibTracePlotWidget(Canvas):
         prev_y_lim = self.ax.get_ylim()
         self.ax.cla()
         self._trace_edit_targets.clear()
-        self.ax.set_xlabel(f"Pulse {self.x_idx+1} [mV]")
-        self.ax.set_ylabel(f"Pulse {self.y_idx+1} [mV]")
+        self.ax.set_xlabel(f"{self._output_label(self.x_idx)} [mV]")
+        self.ax.set_ylabel(f"{self._output_label(self.y_idx)} [mV]")
         self.ax.grid(True)
         self._draw_stability_overlay()
         self.ax.plot(vx, vy, "-o", color="black", zorder=2)
@@ -1101,9 +1115,16 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
         self._default_lw      = 1.5
         self._highlight_lw    = 2.5
         self._orig_colors     = []
+        self._output_names: List[str] = ["awg_0"]
 
         self.ax             = fig.add_subplot(111)
-        self._line,         = [self.ax.plot(self._pulse[0].t, self._pulse[0].v, "-o", picker=5)]
+        self._line,         = [self.ax.plot(
+            self._pulse[0].t,
+            self._pulse[0].v,
+            "-o",
+            picker=5,
+            label=self._output_names[0],
+        )]
         self._orig_colors.append(self._line[0].get_color())
         physical_line, = self.ax.plot(
             self._pulse[0].t,
@@ -1124,6 +1145,7 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
         self.ax.set_ylabel("voltage [mV]")
         self.ax.grid(True)
         self.ax.set_autoscale_on(False)
+        self.ax.legend(loc="upper right")
 
         # Dragging and panning settings
         self._drag_flat: Optional[Tuple[int, int]]      = None
@@ -1170,6 +1192,16 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
         self.ax.xaxis.set_major_formatter(
             FuncFormatter(lambda value, _position: f"{value * scale:.6g}")
         )
+        self.draw_idle()
+
+    def set_output_names(self, names: Sequence[str]) -> None:
+        names = [str(name) for name in names]
+        if len(names) != len(self._pulse):
+            raise ValueError("waveform output-name count must match pulse count")
+        self._output_names = names
+        for line, name in zip(self._line, names):
+            line.set_label(name)
+        self.ax.legend(loc="upper right")
         self.draw_idle()
 
     @staticmethod
@@ -1773,6 +1805,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     segment_name_changed = QtCore.pyqtSignal(int, int)
     segment_structure_changed = QtCore.pyqtSignal(int, str, int)
     hardware_output_edit_requested = QtCore.pyqtSignal(int)
+    output_name_changed = QtCore.pyqtSignal(int, str)
     port_idx: int       = 0
 
     def __init__(
@@ -1796,6 +1829,18 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         layout              = QtWidgets.QVBoxLayout(self)
 
         form                = QtWidgets.QFormLayout()
+        self.output_name = QtWidgets.QLineEdit(f"awg_{self.idx}")
+        self.output_name.setMaxLength(128)
+        self.output_name.setToolTip(
+            "Shared display name for this AWG output. The original awg_N "
+            "identifier is retained in saved data."
+        )
+        self.output_name.editingFinished.connect(
+            lambda: self.output_name_changed.emit(
+                self.idx,
+                self.output_name.text(),
+            )
+        )
         self.edit_ramp = QtWidgets.QLineEdit(
             f"{_time_from_ns(DEFAULT_GUI_RAMP_NS, self._time_unit):.6g}"
         )
@@ -1809,6 +1854,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
 
         self._ramp_label = QtWidgets.QLabel()
         self._flat_label = QtWidgets.QLabel()
+        form.addRow("Output name:", self.output_name)
         form.addRow(self._ramp_label, self.edit_ramp)
         form.addRow(self._flat_label, self.edit_flat)
         form.addRow("Virtual V [mV]:", self.edit_v)
@@ -1854,6 +1900,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         self.refresh_table()
 
         layout.setStretch(0, 1)
+
+    def set_output_name(self, name: str) -> None:
+        with QtCore.QSignalBlocker(self.output_name):
+            self.output_name.setText(str(name))
 
     def _on_table_menu(self, pos: QtCore.QPoint) -> None:
         row = self.table.rowAt(pos.y())
@@ -2252,6 +2302,9 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         self._time_unit = time_unit
         self._selected_index = 0
         self._awg_channels = tuple(int(channel) for channel in awg_channels)
+        self._output_display_names = tuple(
+            f"awg_{index}" for index in range(len(self._awg_channels))
+        )
         self._front_panel_configuration = None
         self._qcs_front_panel_configuration = None
         self._qcs_dc_channel_names: Tuple[str, ...] = ()
@@ -2318,7 +2371,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         # Control Panels list
         self.panel_table                        = QtWidgets.QTableWidget(0, 5)
         self.panel_table.setHorizontalHeaderLabels(
-            ["#", "Color", "QCS channel", "set_x", "set_y"]
+            ["AWG output", "Color", "QCS channel", "set_x", "set_y"]
         )
         self.panel_table.verticalHeader().setVisible(False)
         self.panel_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -2365,6 +2418,15 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             raise ValueError("AWG channels must be unique")
         self._awg_channels = channels
         self._selected_index = min(self._selected_index, len(channels) - 1)
+        self._refresh_mapping_summary()
+
+    def set_output_display_names(self, names: Sequence[str]) -> None:
+        names = tuple(str(name) for name in names)
+        if len(names) != len(self._ctrl_pannels):
+            raise ValueError("AWG output display-name count must match outputs")
+        self._output_display_names = names
+        for control, name in zip(self._ctrl_pannels, names):
+            control.set_output_name(name)
         self._refresh_mapping_summary()
 
     def set_selected_port(self, index: int) -> None:
@@ -2444,13 +2506,24 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
         )
 
     def _refresh_mapping_summary(self) -> None:
+        canonical_name = f"awg_{self._selected_index}"
+        display_name = (
+            self._output_display_names[self._selected_index]
+            if self._selected_index < len(self._output_display_names)
+            else canonical_name
+        )
+        output_label = (
+            f"{display_name} ({canonical_name})"
+            if display_name != canonical_name
+            else canonical_name
+        )
         if self._hardware_backend == EXECUTION_BACKEND_QCS:
             if self._selected_index < len(self._qcs_dc_channel_names):
                 name = self._qcs_dc_channel_names[self._selected_index]
-                details = f"awg_{self._selected_index} | QCS {name}"
+                details = f"{output_label} | QCS {name}"
             else:
                 details = (
-                    f"awg_{self._selected_index} | "
+                    f"{output_label} | "
                     "QCS DC channel not mapped"
                 )
             self.mapping_summary.setText(details)
@@ -2463,7 +2536,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             self.mapping_summary.setText("No AWG output mapping")
             return
         channel = self._awg_channels[self._selected_index]
-        details = f"awg_{self._selected_index} | QICK generator {channel}"
+        details = f"{output_label} | QICK generator {channel}"
         if self._front_panel_configuration is not None:
             port_index = QickFrontPanelControl._find_port_for_channel(
                 self._front_panel_configuration.outputs,
@@ -3025,11 +3098,15 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         self.segment.clear()
         durations = []
         for index, (start, end) in enumerate(self._pulse.flat_segments()):
-            name = f"set_{index}"
+            internal_name = f"set_{index}"
+            display_name = self._pulse.segment_name(index)
             start_us = float(self._pulse.t[start]) / 1000.0
             end_us = float(self._pulse.t[end]) / 1000.0
             durations.append(end_us - start_us)
-            self.segment.addItem(f"{name}  [{start_us:.6g}, {end_us:.6g}] us", name)
+            self.segment.addItem(
+                f"{display_name}  [{start_us:.6g}, {end_us:.6g}] us",
+                internal_name,
+            )
         if previous is not None:
             match = self.segment.findData(previous)
             if match >= 0:
@@ -4655,9 +4732,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         previous = self.segment.currentData()
         with QtCore.QSignalBlocker(self.segment):
             self.segment.clear()
-            for index, (start, end) in enumerate(self._pulse.flat_segments()):
-                name = f"set_{index}"
-                self.segment.addItem(name, name)
+            for index, _segment in enumerate(self._pulse.flat_segments()):
+                self.segment.addItem(
+                    self._pulse.segment_name(index),
+                    f"set_{index}",
+                )
             match = self.segment.findData(previous)
             if match >= 0:
                 self.segment.setCurrentIndex(match)
@@ -6305,8 +6384,10 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         with QtCore.QSignalBlocker(self.segment):
             self.segment.clear()
             for index, _segment in enumerate(self._pulse.flat_segments()):
-                name = f"set_{index}"
-                self.segment.addItem(name, name)
+                self.segment.addItem(
+                    self._pulse.segment_name(index),
+                    f"set_{index}",
+                )
             match = self.segment.findData(previous)
             if match >= 0:
                 self.segment.setCurrentIndex(match)
@@ -10794,6 +10875,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 initial_duration_ns=DEFAULT_GUI_DURATION_NS,
             )
         ]
+        self._awg_output_display_names: List[str] = ["awg_0"]
         self._awg_voltage_scale_mv = float(
             DEFAULT_QCS_FULL_SCALE_V * 1000.0
         )
@@ -11075,6 +11157,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._stability_panel.electrode_front_panel_requested.connect(
             self._show_stability_electrode_front_panel
+        )
+        self._stability_panel.awg_output_name_changed.connect(
+            self._set_awg_output_display_name
         )
         self._sparameter_panel.run_requested.connect(
             self._run_sparameter_sweep
@@ -11370,6 +11455,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             visible=self._grid_visible,
         )
         self._set_time_unit(self._time_unit)
+        self._sync_awg_output_display_names()
         self._refresh_sweep_overlay()
 
     def _wire_control_panel(self, control: ControlPanel) -> None:
@@ -11398,6 +11484,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._on_segment_name_changed
         )
         control.segment_structure_changed.connect(self._on_segment_structure_changed)
+        control.output_name_changed.connect(
+            lambda index, name: self._set_awg_output_display_name(
+                f"awg_{index}",
+                name,
+            )
+        )
 
     def _on_port_menu(self, pos: QtCore.QPoint) -> None:
         row = self._multi_ctrl.panel_table.rowAt(pos.y())
@@ -11427,6 +11519,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ]
         self._plot.remove_pulse(idx)
         self._pulse.pop(idx)
+        self._awg_output_display_names.pop(idx)
         self._qick_awg_channels = tuple(
             channel
             for channel_index, channel in enumerate(self._qick_awg_channels)
@@ -11453,6 +11546,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         for i, ctrl in enumerate(self._multi_ctrl._ctrl_pannels):
             ctrl.idx = i
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
+        self._sync_awg_output_display_names()
         self._multi_ctrl.update_port_strip_geometry()
         pending_preserved = False
         if not self._suspend_qcs_output_sync:
@@ -15256,6 +15350,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._stability_panel.refresh_targets(
                 self._qick_output_names(),
                 tuple(range(len(self._pulse))),
+                display_names=self._awg_output_display_names,
             )
             connection, mapper_configuration = (
                 self._qcs_stability_connection_values()
@@ -16865,6 +16960,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_overlay_worker = None
 
     def _on_stability_scan_ready(self, result) -> None:
+        result = MainWindow._stability_result_with_display_names(self, result)
         self._last_stability_result = result
         self._stability_panel.show_result(result)
         if not getattr(self, "_trace_overlay_pinned", False):
@@ -16877,6 +16973,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _on_stability_single_finished(self, stored) -> None:
+        diagram = MainWindow._stability_result_with_display_names(
+            self,
+            stored.diagram,
+        )
+        if diagram is not stored.diagram:
+            try:
+                stored = replace(stored, diagram=diagram)
+            except TypeError:
+                # Preserve the callback's long-standing duck-typed contract
+                # for external workers and lightweight integrations.
+                stored.diagram = diagram
         self._last_stability_result = stored.diagram
         self._stability_panel.show_saved_result(stored)
         self._experiment_panel.set_running(
@@ -17402,6 +17509,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 iq_values=iq_values,
                 value_unit=unit,
                 measurement_mode=mode,
+                output_name_mapping=self._awg_output_display_name_map(),
             )
             run_id = int(getattr(result, "run_id", 0) or 0)
             database_path = str(getattr(result, "database_path", "") or "")
@@ -17721,6 +17829,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             if hasattr(self._trace, "set_time_unit"):
                 self._trace.set_time_unit(self._time_unit)
+            if hasattr(self._trace, "set_output_names"):
+                self._trace.set_output_names(
+                    self._awg_output_display_names
+                )
             if hasattr(self._trace, "set_stability_overlay"):
                 self._trace.set_stability_overlay(
                     self._active_trace_stability_result(),
@@ -17991,6 +18103,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
             "awg": {
                 "outputs": [pulse.to_dict() for pulse in self._pulse],
+                "output_names": list(self._awg_output_display_names),
+                "output_name_mapping": list(
+                    self._awg_output_name_mapping()
+                ),
                 "cross_capacitance": self._cross_capacitance.tolist(),
                 "voltage_coordinate_full_scale_mv": (
                     self._awg_voltage_scale_mv
@@ -18482,6 +18598,31 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if not isinstance(raw_outputs, list) or not 1 <= len(raw_outputs) <= 8:
             raise ValueError("AWG outputs must contain between one and eight waveforms")
         pulses = tuple(PulseSequence.from_dict(entry) for entry in raw_outputs)
+        raw_output_names = awg.get(
+            "output_names",
+            [f"awg_{index}" for index in range(len(pulses))],
+        )
+        if (
+            not isinstance(raw_output_names, list)
+            or len(raw_output_names) != len(pulses)
+        ):
+            raise ValueError(
+                "AWG output_names must contain one name per waveform output"
+            )
+        awg_output_names = tuple(
+            str(name).strip() for name in raw_output_names
+        )
+        if any(not name for name in awg_output_names):
+            raise ValueError("AWG output names must not be empty")
+        if any(len(name) > 128 for name in awg_output_names):
+            raise ValueError("AWG output names must not exceed 128 characters")
+        if any(
+            any(ord(character) < 32 for character in name)
+            for name in awg_output_names
+        ):
+            raise ValueError("AWG output names must not contain control characters")
+        if len(set(awg_output_names)) != len(awg_output_names):
+            raise ValueError("AWG output names must be unique")
         selected_output = self._json_int(
             display.get("selected_awg_output", 0),
             "selected AWG output",
@@ -19904,6 +20045,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "tproc_mhz": tproc_mhz,
             "full_scale_mv": full_scale_mv,
             "sweep_voltage_scale_mv": sweep_voltage_scale_mv,
+            "awg_output_names": awg_output_names,
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "iq_repetition_policy": iq_repetition_policy,
@@ -19957,6 +20099,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._add_port()
         finally:
             self._suspend_qcs_output_sync = False
+        self._awg_output_display_names = list(settings["awg_output_names"])
+        self._sync_awg_output_display_names()
         for target, source in zip(self._pulse, pulses):
             target.t = source.t.copy()
             target.v = source.v.copy()
@@ -20196,6 +20340,38 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _generate_qcs_code(self) -> str:
         """Generate QCS code locally from the current AWG Tuning settings."""
+        readout_spec = self._rf_readout_panel.spec()
+        acquisition_arguments = {}
+        if readout_spec is not None:
+            acquisition_channel_name = (
+                self._experiment_panel.qcs_acquisition_channel_name.text().strip()
+            )
+            if not acquisition_channel_name:
+                raise ValueError(
+                    "set a QCS acquisition virtual channel before generating "
+                    "a program with QCS Acquisition enabled"
+                )
+            sample_rate_hz = self._experiment_panel.qcs_sample_rate_hz.value()
+            hardware_demodulation = (
+                self._experiment_panel.qcs_hw_demod.isChecked()
+            )
+            acquisition_arguments = {
+                "acquisition_channel_name": acquisition_channel_name,
+                "acquisition_segment_name": str(readout_spec.segment_name),
+                "acquisition_duration_s": (
+                    int(readout_spec.samples_per_trigger) / sample_rate_hz
+                ),
+                "acquisition_pre_delay_s": (
+                    float(readout_spec.delay_us) * 1.0e-6
+                ),
+                "acquisition_hardware_demodulation": hardware_demodulation,
+                "acquisition_frequency_hz": (
+                    float(readout_spec.readout_frequency_mhz) * 1.0e6
+                    if hardware_demodulation
+                    else 0.0
+                ),
+                "acquisition_phase_rad": 0.0,
+            }
         return generate_qcs_program_code(
             self._pulse,
             channel_names=(
@@ -20226,10 +20402,140 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_filter_tau_us=(
                 self._experiment_panel.bias_t_filter_tau_us.value()
             ),
+            **acquisition_arguments,
         )
 
     def _qick_output_names(self) -> Tuple[str, ...]:
         return tuple(f"awg_{index}" for index in range(len(self._pulse)))
+
+    def _awg_output_name_mapping(self) -> Tuple[dict, ...]:
+        return tuple(
+            {
+                "original_name": original_name,
+                "display_name": display_name,
+            }
+            for original_name, display_name in zip(
+                self._qick_output_names(),
+                self._awg_output_display_names,
+            )
+        )
+
+    def _awg_output_display_name_map(self) -> dict:
+        return {
+            entry["original_name"]: entry["display_name"]
+            for entry in self._awg_output_name_mapping()
+        }
+
+    def _stability_result_with_display_names(self, result):
+        display_names = tuple(
+            getattr(self, "_awg_output_display_names", ())
+        )
+        if not display_names:
+            return result
+        name_map = {
+            f"awg_{index}": name
+            for index, name in enumerate(display_names)
+        }
+        x_display_name = name_map.get(
+            str(result.x_axis_label),
+            str(result.x_axis_label),
+        )
+        y_display_name = name_map.get(
+            str(result.y_axis_label),
+            str(result.y_axis_label),
+        )
+        if (
+            x_display_name == str(result.x_axis_label)
+            and y_display_name == str(result.y_axis_label)
+            and not result.x_axis_display_label
+            and not result.y_axis_display_label
+        ):
+            return result
+        return replace(
+            result,
+            x_axis_display_label=x_display_name,
+            y_axis_display_label=y_display_name,
+        )
+
+    def _set_awg_output_display_name(
+        self,
+        original_name: str,
+        requested_name: str,
+    ) -> None:
+        original_names = self._qick_output_names()
+        try:
+            index = original_names.index(str(original_name))
+        except ValueError:
+            return
+        name = str(requested_name).strip()
+        invalid_reason = ""
+        if not name:
+            invalid_reason = "AWG output name must not be empty."
+        elif any(ord(character) < 32 for character in name):
+            invalid_reason = "AWG output name must not contain control characters."
+        elif any(
+            other_index != index and other_name == name
+            for other_index, other_name in enumerate(
+                self._awg_output_display_names
+            )
+        ):
+            invalid_reason = f"AWG output name {name!r} is already in use."
+        if invalid_reason:
+            self._sync_awg_output_display_names()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid AWG output name",
+                invalid_reason,
+            )
+            return
+        if self._awg_output_display_names[index] == name:
+            self._sync_awg_output_display_names()
+            return
+        self._awg_output_display_names[index] = name
+        self._sync_awg_output_display_names()
+        self._refresh_awg_sweep_map_from_last_result(report_error=False)
+        self.statusBar().showMessage(
+            f"{original_name} display name changed to {name!r}",
+            8000,
+        )
+
+    def _sync_awg_output_display_names(self) -> None:
+        names = tuple(self._awg_output_display_names)
+        if len(names) != len(self._pulse):
+            return
+        if hasattr(self, "_multi_ctrl"):
+            self._multi_ctrl.set_output_display_names(names)
+        if hasattr(self, "_plot") and hasattr(self._plot, "set_output_names"):
+            self._plot.set_output_names(names)
+        if self._trace is not None and hasattr(self._trace, "set_output_names"):
+            self._trace.set_output_names(names)
+            self._trace.refresh_trace(self._pulse)
+        self._refresh_stability_targets()
+        stability_result = getattr(self, "_last_stability_result", None)
+        if stability_result is not None:
+            stability_result = MainWindow._stability_result_with_display_names(
+                self,
+                stability_result,
+            )
+            self._last_stability_result = stability_result
+            self._stability_panel.plot.set_result(stability_result)
+            if not getattr(self, "_trace_overlay_pinned", False):
+                MainWindow._apply_trace_stability_overlay(self, fit=False)
+        panel_table = getattr(getattr(self, "_multi_ctrl", None), "panel_table", None)
+        if panel_table is not None:
+            for index, (original_name, display_name) in enumerate(
+                zip(self._qick_output_names(), names)
+            ):
+                item = panel_table.item(index, 0)
+                if item is not None:
+                    item.setText(
+                        display_name
+                        if display_name == original_name
+                        else f"{display_name}\n({original_name})"
+                    )
+                    item.setToolTip(
+                        f"Display name: {display_name}\nOriginal name: {original_name}"
+                    )
 
     def _next_qick_awg_channel(self) -> int:
         used = set(self._qick_awg_channels)
@@ -20568,6 +20874,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._share_segment_name(source_port, segment_index)
         self._multi_ctrl.refresh_table()
         self._refresh_trace_if_needed(force=True)
+        self._refresh_rf_editor()
         self.statusBar().showMessage(
             f"Segment {int(segment_index) + 1} renamed to {name!r} "
             "across AWG outputs"
@@ -20615,6 +20922,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._multi_ctrl._color_map.append(color)
         self._pulse.append(new_pulse)
+        self._awg_output_display_names.append(
+            f"awg_{len(self._pulse) - 1}"
+        )
         self._qick_awg_channels = (
             *self._qick_awg_channels,
             self._next_qick_awg_channel(),
@@ -20636,6 +20946,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._multi_ctrl._ctrl_pannels.append(new_ctrl)
         self._multi_ctrl.splitter.insertWidget(len(self._multi_ctrl._ctrl_pannels) - 1, new_ctrl)
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
+        self._sync_awg_output_display_names()
         self._multi_ctrl.update_port_strip_geometry()
         pending_preserved = False
         if not self._suspend_qcs_output_sync:
@@ -20738,8 +21049,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
         self._multi_ctrl.panel_table.setRowCount(len(self._multi_ctrl._ctrl_pannels))
         for idx, _ in enumerate(self._multi_ctrl._ctrl_pannels):
-            item_idx = QtWidgets.QTableWidgetItem(str(idx + 1))
+            original_name = f"awg_{idx}"
+            display_name = self._awg_output_display_names[idx]
+            item_idx = QtWidgets.QTableWidgetItem(
+                display_name
+                if display_name == original_name
+                else f"{display_name}\n({original_name})"
+            )
             item_idx.setTextAlignment(QtCore.Qt.AlignCenter)
+            item_idx.setToolTip(
+                f"Display name: {display_name}\nOriginal name: {original_name}"
+            )
             self._multi_ctrl.panel_table.setItem(idx, 0, item_idx)
 
             color = self._multi_ctrl._color_map[idx]
@@ -20801,6 +21121,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._stability_panel.refresh_targets(
             self._qick_output_names(),
             channels,
+            display_names=self._awg_output_display_names,
         )
 
     def _set_x(self, idx):

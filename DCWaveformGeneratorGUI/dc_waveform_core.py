@@ -1418,6 +1418,13 @@ def generate_qcs_program_code(
     bias_t_compensation_mode: str = "fixed_voltage",
     bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
     bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
+    acquisition_channel_name: Optional[str] = None,
+    acquisition_segment_name: Optional[str] = None,
+    acquisition_duration_s: Optional[Real] = None,
+    acquisition_pre_delay_s: Real = 0.0,
+    acquisition_hardware_demodulation: bool = True,
+    acquisition_frequency_hz: Real = 0.0,
+    acquisition_phase_rad: Real = 0.0,
 ) -> str:
     """Generate an offline Keysight QCS source preview.
 
@@ -1434,6 +1441,83 @@ def generate_qcs_program_code(
     channel_names = _unique_names(tuple(channel_names), "dc_ch")
     if len(channel_names) != len(pulses):
         raise ValueError("channel_names length must match the pulse count")
+    acquisition_enabled = acquisition_channel_name is not None
+    if acquisition_enabled:
+        acquisition_channel_name = str(acquisition_channel_name).strip()
+        if not acquisition_channel_name:
+            raise ValueError("acquisition_channel_name must not be empty")
+        if acquisition_segment_name is None:
+            raise ValueError(
+                "acquisition_segment_name is required when acquisition is enabled"
+            )
+        acquisition_segment_name = str(acquisition_segment_name).strip()
+        if acquisition_duration_s is None:
+            raise ValueError(
+                "acquisition_duration_s is required when acquisition is enabled"
+            )
+        acquisition_duration_s = _positive_real(
+            acquisition_duration_s,
+            "acquisition_duration_s",
+        )
+        acquisition_pre_delay_s = float(acquisition_pre_delay_s)
+        if (
+            not np.isfinite(acquisition_pre_delay_s)
+            or acquisition_pre_delay_s < 0.0
+        ):
+            raise ValueError(
+                "acquisition_pre_delay_s must be finite and nonnegative"
+            )
+        if not isinstance(acquisition_hardware_demodulation, (bool, np.bool_)):
+            raise TypeError(
+                "acquisition_hardware_demodulation must be boolean"
+            )
+        acquisition_frequency_hz = float(acquisition_frequency_hz)
+        acquisition_phase_rad = float(acquisition_phase_rad)
+        if not np.isfinite(acquisition_frequency_hz):
+            raise ValueError("acquisition_frequency_hz must be finite")
+        if not np.isfinite(acquisition_phase_rad):
+            raise ValueError("acquisition_phase_rad must be finite")
+        try:
+            acquisition_segment_index = tuple(
+                pulses[0].segment_names
+            ).index(acquisition_segment_name)
+            acquisition_flat_start, acquisition_flat_stop = (
+                pulses[0].flat_segments()[acquisition_segment_index]
+            )
+        except (ValueError, IndexError) as exc:
+            raise ValueError(
+                "unknown QCS acquisition segment "
+                f"{acquisition_segment_name!r}"
+            ) from exc
+        acquisition_segment_start_ns = float(
+            pulses[0].t[acquisition_flat_start]
+        )
+        acquisition_segment_stop_s = (
+            float(pulses[0].t[acquisition_flat_stop]) * 1.0e-9
+        )
+        acquisition_segment_duration_s = (
+            acquisition_segment_stop_s
+            - acquisition_segment_start_ns * 1.0e-9
+        )
+        if (
+            acquisition_hardware_demodulation
+            and acquisition_pre_delay_s + acquisition_duration_s
+            > acquisition_segment_duration_s + 1.0e-15
+        ):
+            raise ValueError(
+                "QCS acquisition exceeds segment "
+                f"{acquisition_segment_name!r}"
+            )
+    elif any(
+        value is not None
+        for value in (
+            acquisition_segment_name,
+            acquisition_duration_s,
+        )
+    ):
+        raise ValueError(
+            "acquisition_channel_name is required when acquisition timing is set"
+        )
     matrix = _coerce_cross_capacitance(cross_capacitance, len(pulses))
     if bias_t_compensation_enabled:
         preview_output_names = tuple(
@@ -1472,6 +1556,7 @@ def generate_qcs_program_code(
         group_stops = np.r_[group_starts[1:], raw_time_ns.size]
         unique_time_ns = raw_time_ns[group_starts]
         common_time_ns = np.diff(unique_time_ns)
+        interval_start_times_ns = unique_time_ns[:-1]
         interval_starts_mv = physical_mv[:, group_stops[:-1] - 1]
         interval_ends_mv = physical_mv[:, group_starts[1:]]
     else:
@@ -1479,8 +1564,28 @@ def generate_qcs_program_code(
             pulses,
             matrix,
         )
+        interval_start_times_ns = np.asarray(common_time_ns[:-1], dtype=float)
         interval_starts_mv = None
         interval_ends_mv = None
+    if acquisition_enabled:
+        matching_layers = np.flatnonzero(
+            np.isclose(
+                interval_start_times_ns,
+                acquisition_segment_start_ns,
+                rtol=0.0,
+                atol=1.0e-6,
+            )
+        )
+        if matching_layers.size != 1:
+            raise ValueError(
+                "could not map QCS acquisition segment "
+                f"{acquisition_segment_name!r} to one DC interval layer"
+            )
+        acquisition_layer_index = int(matching_layers[0])
+        acquisition_crosses_segment = (
+            acquisition_pre_delay_s + acquisition_duration_s
+            > acquisition_segment_duration_s + 1.0e-15
+        )
     traces = tuple(
         (common_time_ns, physical_mv[index]) for index in range(len(pulses))
     )
@@ -1510,6 +1615,8 @@ def generate_qcs_program_code(
     ]
     for name in channel_names:
         lines.append(f"    {name}: qcs.Channels,")
+    if acquisition_enabled:
+        lines.append("    acquisition_channel: qcs.Channels,")
     lines.extend([") -> qcs.Program:", "    # RAMP envelopes are unit-normalized; amplitude carries physical scale."])
     for output_index, ((trace_time_ns, voltage_mv), name) in enumerate(
         zip(traces, channel_names)
@@ -1532,18 +1639,77 @@ def generate_qcs_program_code(
                 ),
             ).rstrip()
         )
-    lines.append("    # All outputs for one interval share a QCS layer.")
+    lines.append("    # Each synchronized DC interval is one sequential QCS layer.")
+    lines.append(
+        "    # Acquisition is inserted while its selected SET layer is current."
+    )
     interval_count = (
         len(common_time_ns)
         if interval_starts_mv is not None
         else len(common_time_ns) - 1
     )
+    if (
+        acquisition_enabled
+        and not acquisition_hardware_demodulation
+        and acquisition_crosses_segment
+        and acquisition_layer_index < interval_count - 1
+    ):
+        raise ValueError(
+            "raw QCS acquisition cannot cross segment "
+            f"{acquisition_segment_name!r} while later DC segment layers remain"
+        )
+    if acquisition_enabled:
+        lines.extend(
+            [
+                "",
+                "    # Build the filter before adding it to the selected SET layer.",
+                (
+                    "    acquisition_duration = "
+                    f"{acquisition_duration_s:.12g}"
+                ),
+            ]
+        )
+        if acquisition_hardware_demodulation:
+            lines.extend(
+                [
+                    "    acquisition_filter = qcs.RFWaveform(",
+                    "        duration=acquisition_duration,",
+                    "        envelope=qcs.ConstantEnvelope(),",
+                    "        amplitude=1.0,",
+                    f"        rf_frequency={acquisition_frequency_hz:.12g},",
+                    f"        instantaneous_phase={acquisition_phase_rad:.12g},",
+                    "        name='awg_tuning_acquisition_filter',",
+                    "    )",
+                ]
+            )
+        else:
+            lines.append("    acquisition_filter = acquisition_duration")
     for interval_index in range(interval_count):
+        lines.append("")
+        lines.append(f"    # Synchronized DC interval layer {interval_index}")
         for channel_index, name in enumerate(channel_names):
             lines.append(
-                f"    program.add_waveform("
-                f"{name}_dc_segment_{interval_index}, {name}, "
-                f"new_layer={channel_index == 0})"
+                f"    program.add_waveform({name}_dc_segment_{interval_index}, "
+                f"{name}, new_layer={channel_index == 0})"
+            )
+        if acquisition_enabled and interval_index == acquisition_layer_index:
+            lines.extend(
+                [
+                    (
+                        "    # Acquisition shares the selected SET segment "
+                        f"{acquisition_segment_name!r}."
+                    ),
+                    "    program.add_acquisition(",
+                    "        integration_filter=acquisition_filter,",
+                    "        channels=acquisition_channel,",
+                    "        new_layer=False,",
+                    f"        pre_delay={acquisition_pre_delay_s:.12g},",
+                    "    )",
+                    (
+                        "    # Mapper virtual channel: "
+                        f"{acquisition_channel_name}"
+                    ),
+                ]
             )
     lines.append("")
     lines.extend(["    return program", ""])
