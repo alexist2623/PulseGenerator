@@ -634,6 +634,7 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert panel.delay.isHidden() is False
     assert panel.samples.isHidden() is True
     assert panel.qcs_acquisition_duration.isHidden() is False
+    assert panel.qcs_input_range_v.isHidden() is False
     assert panel.frequency_mhz.isHidden() is False
     assert panel.qcs_acquisition_mode_widget.isHidden() is False
     assert panel.qcs_single_iq_radio.isChecked() is True
@@ -706,12 +707,14 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     app.processEvents()
     assert panel.qcs_acquisition_mode_widget.isEnabled() is False
     assert panel.qcs_acquisition_duration.isEnabled() is False
+    assert panel.qcs_input_range_v.isEnabled() is False
     panel.qcs_trace_radio.click()
     assert panel.qcs_single_iq_radio.isChecked() is True
     experiment.set_running(False, "Test run complete")
     app.processEvents()
     assert panel.qcs_acquisition_mode_widget.isEnabled() is True
     assert panel.qcs_acquisition_duration.isEnabled() is True
+    assert panel.qcs_input_range_v.isEnabled() is True
 
     experiment.set_execution_backend(gui.EXECUTION_BACKEND_QICK)
     app.processEvents()
@@ -728,6 +731,7 @@ def test_qcs_acquisition_hides_qick_fir_ddr_rows_and_uses_qcs_terms():
     assert panel.qcs_acquisition_note.isHidden() is True
     assert panel.qcs_acquisition_mode_widget.isHidden() is True
     assert panel.qcs_acquisition_duration.isHidden() is True
+    assert panel.qcs_input_range_v.isHidden() is True
     assert panel.samples.isHidden() is False
     assert panel.segment_label.text() == "Anchor SET:"
     assert panel._delay_label.text() == "Trigger delay [us]:"
@@ -3318,6 +3322,7 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     readout.setChecked(True)
     readout.delay.setValue(0.5)
     readout.qcs_acquisition_duration.setValue(32 / 4.8e9 * 1.0e6)
+    readout.qcs_input_range_v.setValue(1.8)
     readout.frequency_mhz.setValue(42.0)
     readout.margin_samples.setValue(9876)
     readout.override_fpga_trigger_delay.setChecked(True)
@@ -3356,6 +3361,7 @@ def test_qcs_experiment_arguments_convert_rf_and_acquisition(tmp_path):
     assert acquisition.sample_count == 32
     assert acquisition.duration_s == pytest.approx(32 / 4.8e9)
     assert acquisition.frequency_hz == pytest.approx(42.0e6)
+    assert acquisition.input_range_v == pytest.approx(1.8)
     assert arguments["gui_settings"]["experiment"]["execution_backend"] == "qcs"
 
     readout.qcs_trace_radio.click()
@@ -4110,6 +4116,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     panel.qcs_acquisition_channel_name.setText("digitizer")
     source._rf_readout_panel.samples.setValue(777)
     source._rf_readout_panel.qcs_acquisition_duration.setValue(0.0101)
+    source._rf_readout_panel.qcs_input_range_v.setValue(1.8)
     panel.set_iq_repetition_policy(
         gui.IQ_REPETITION_POLICY_COHERENT_AVERAGE
     )
@@ -4143,6 +4150,7 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert document["rf_readout"][
         "qcs_acquisition_duration_s"
     ] == pytest.approx(10.1e-9)
+    assert document["rf_readout"]["qcs_input_range_v"] == pytest.approx(1.8)
 
     restored = gui.MainWindow()
     restored._apply_decoded_settings(restored._decode_settings(document))
@@ -4166,6 +4174,9 @@ def test_qcs_backend_settings_round_trip_and_old_files_default_to_qick(tmp_path)
     assert restored._rf_readout_panel.samples.value() == 777
     assert restored._rf_readout_panel.qcs_acquisition_duration.value() == (
         pytest.approx(0.0101)
+    )
+    assert restored._rf_readout_panel.qcs_input_range_v.value() == pytest.approx(
+        1.8
     )
     assert restored_panel.qcs_sample_rate_hz.value() == pytest.approx(4.8e9)
     assert restored_panel.qcs_init_time_us.value() == pytest.approx(0.25)

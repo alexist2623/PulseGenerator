@@ -43,6 +43,12 @@ try:
         acquire_qcs_noise_trace,
         quantize_qcs_raw_trace_duration,
     )
+    from .qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
+        normalize_qcs_m5200_input_range_v,
+    )
 except ImportError:
     from qick_qcodes_experiment import load_qick_iq_arrays
     from dc_voltage_calibration import load_dc_voltage_calibration
@@ -57,6 +63,12 @@ except ImportError:
         QcsNoiseTraceConfig,
         acquire_qcs_noise_trace,
         quantize_qcs_raw_trace_duration,
+    )
+    from qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
+        normalize_qcs_m5200_input_range_v,
     )
 
 
@@ -83,6 +95,7 @@ DEFAULT_NOISE_ANALYSIS_SETTINGS = {
     "acquisition_force_overwrite": True,
     "acquisition_post_run_read_delay_seconds": 0.1,
     "qcs_acquisition_duration_us": DEFAULT_QCS_NOISE_DURATION_US,
+    "qcs_input_range_v": DEFAULT_QCS_M5200_INPUT_RANGE_V,
     "database_path": str(Path.home() / "qick_experiments.db"),
     "run_id": 0,
     "point_index": 0,
@@ -109,6 +122,7 @@ class NoiseAcquisitionRequest:
     backend: str
     qick_config: Optional[NoiseAcquisitionConfig] = None
     duration_s: Optional[float] = None
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V
 
     def __post_init__(self) -> None:
         backend = str(self.backend).strip().lower()
@@ -123,7 +137,11 @@ class NoiseAcquisitionRequest:
             if self.qick_config is not None:
                 raise ValueError("QCS noise acquisition must not set a QICK config")
             _finite_positive(self.duration_s, "QCS noise acquisition duration")
+        input_range_v = normalize_qcs_m5200_input_range_v(
+            self.input_range_v
+        )
         object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "input_range_v", input_range_v)
 
 
 def _finite_positive(value: Any, name: str) -> float:
@@ -218,6 +236,9 @@ def normalize_noise_analysis_settings(
     settings["qcs_acquisition_duration_us"] = _finite_positive(
         settings["qcs_acquisition_duration_us"],
         "qcs_acquisition_duration_us",
+    )
+    settings["qcs_input_range_v"] = normalize_qcs_m5200_input_range_v(
+        settings["qcs_input_range_v"]
     )
     _effective_duration_s, qcs_sample_count = (
         quantize_qcs_raw_trace_duration(
@@ -860,6 +881,21 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             "averaging option used by Single-I/Q experiments does not apply "
             "here because Noise Analysis must preserve every trace sample."
         )
+        self.qcs_input_range_v = QtWidgets.QDoubleSpinBox(acquisition_group)
+        self.qcs_input_range_v.setRange(
+            QCS_M5200_MIN_INPUT_RANGE_V,
+            QCS_M5200_MAX_INPUT_RANGE_V,
+        )
+        self.qcs_input_range_v.setDecimals(6)
+        self.qcs_input_range_v.setSingleStep(0.05)
+        self.qcs_input_range_v.setValue(
+            DEFAULT_QCS_M5200_INPUT_RANGE_V
+        )
+        self.qcs_input_range_v.setSuffix(" V")
+        self.qcs_input_range_v.setToolTip(
+            "Physical M5200 full-scale input range applied to the mapped "
+            "digitizer connector before raw-trace acquisition."
+        )
         self.qcs_duration_note = QtWidgets.QLabel(acquisition_group)
         self.qcs_duration_note.setWordWrap(True)
         qcs_duration_row = QtWidgets.QVBoxLayout()
@@ -967,6 +1003,10 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         acquisition_form.addRow("Input:", input_row)
         acquisition_form.addRow("Stored FIR samples:", samples_row)
         acquisition_form.addRow("Measurement duration:", qcs_duration_row)
+        acquisition_form.addRow(
+            "M5200 input range:",
+            self.qcs_input_range_v,
+        )
         acquisition_form.addRow("Readout/DDC frequency:", self.readout_frequency)
         acquisition_form.addRow("Input board setting:", board_setting_row)
         acquisition_form.addRow("Input filter:", filter_row)
@@ -988,7 +1028,10 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             fpga_delay_row,
             self.fir_profile_status,
         )
-        self._qcs_acquisition_rows = (qcs_duration_row,)
+        self._qcs_acquisition_rows = (
+            qcs_duration_row,
+            self.qcs_input_range_v,
+        )
         outer.addWidget(acquisition_group)
 
         source_group = QtWidgets.QGroupBox("Saved I Trace (Optional)", self)
@@ -1247,6 +1290,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
                 # Keep the requested duration intact. The backend records it
                 # separately and performs the authoritative upward rounding.
                 duration_s=self.qcs_duration_us.value() * 1.0e-6,
+                input_range_v=self.qcs_input_range_v.value(),
             )
         return NoiseAcquisitionRequest(
             backend="qick",
@@ -1711,6 +1755,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
             "acquisition_force_overwrite": self.force_overwrite.isChecked(),
             "acquisition_post_run_read_delay_seconds": self.post_read_delay.value(),
             "qcs_acquisition_duration_us": self.qcs_duration_us.value(),
+            "qcs_input_range_v": self.qcs_input_range_v.value(),
             "database_path": self.database_path.text().strip(),
             "run_id": self.run_id.value(),
             "point_index": self.point_index.value(),
@@ -1786,6 +1831,7 @@ class NoiseAnalysisPanel(QtWidgets.QWidget):
         self.qcs_duration_us.setValue(
             settings["qcs_acquisition_duration_us"]
         )
+        self.qcs_input_range_v.setValue(settings["qcs_input_range_v"])
         self.database_path.setText(settings["database_path"])
         self.run_id.setValue(settings["run_id"])
         self.point_index.setValue(settings["point_index"])

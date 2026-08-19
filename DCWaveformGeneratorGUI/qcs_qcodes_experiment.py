@@ -61,6 +61,13 @@ try:
         normalize_iq_repetition_policy,
         store_experiment_result,
     )
+    from .qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
+        apply_qcs_m5200_input_range,
+        normalize_qcs_m5200_input_range_v,
+    )
 except ImportError:
     from dc_waveform_core import (
         DEFAULT_QCS_FULL_SCALE_V,
@@ -85,6 +92,13 @@ except ImportError:
         normalize_awg_metadata_mode,
         normalize_iq_repetition_policy,
         store_experiment_result,
+    )
+    from qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
+        apply_qcs_m5200_input_range,
+        normalize_qcs_m5200_input_range_v,
     )
 
 
@@ -1038,6 +1052,7 @@ class QcsAcquisitionConfig:
     frequency_hz: float = 0.0
     phase_rad: float = 0.0
     envelope: str = "constant"
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V
 
     def __post_init__(self) -> None:
         at_segment = _channel_name(
@@ -1073,6 +1088,9 @@ class QcsAcquisitionConfig:
             raise ValueError(
                 "QCS acquisition envelope must be 'constant' or 'gaussian'"
             )
+        input_range_v = normalize_qcs_m5200_input_range_v(
+            self.input_range_v
+        )
         object.__setattr__(self, "at_segment", at_segment)
         object.__setattr__(self, "duration_s", duration_s)
         object.__setattr__(self, "pre_delay_s", pre_delay_s)
@@ -1081,6 +1099,7 @@ class QcsAcquisitionConfig:
         object.__setattr__(self, "frequency_hz", frequency_hz)
         object.__setattr__(self, "phase_rad", phase_rad)
         object.__setattr__(self, "envelope", envelope)
+        object.__setattr__(self, "input_range_v", input_range_v)
 
 
 @dataclass(frozen=True)
@@ -1095,6 +1114,7 @@ class QcsNoiseTraceConfig:
     connection_config: QcsConnectionConfig
     duration_s: float
     repetitions: int = 1
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V
 
     def __post_init__(self) -> None:
         if not isinstance(self.connection_config, QcsConnectionConfig):
@@ -1121,9 +1141,13 @@ class QcsNoiseTraceConfig:
         repetitions = int(self.repetitions)
         if repetitions < 1 or repetitions != self.repetitions:
             raise ValueError("QCS noise repetitions must be a positive integer")
+        input_range_v = normalize_qcs_m5200_input_range_v(
+            self.input_range_v
+        )
         object.__setattr__(self, "connection_config", connection)
         object.__setattr__(self, "duration_s", duration_s)
         object.__setattr__(self, "repetitions", repetitions)
+        object.__setattr__(self, "input_range_v", input_range_v)
 
 
 @dataclass(frozen=True)
@@ -1321,6 +1345,7 @@ class QcsNoiseTraceResult:
     sample_count: int
     program: Any
     raw_result: Any
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V
 
     def __post_init__(self) -> None:
         traces = np.asarray(self.i_traces, dtype=np.float64)
@@ -1347,6 +1372,9 @@ class QcsNoiseTraceResult:
         sample_rate_hz = _positive_finite(
             self.sample_rate_hz, "QCS noise M5200 sample rate"
         )
+        input_range_v = normalize_qcs_m5200_input_range_v(
+            self.input_range_v
+        )
         if not np.isclose(
             duration_s * sample_rate_hz,
             sample_count,
@@ -1362,6 +1390,7 @@ class QcsNoiseTraceResult:
         )
         object.__setattr__(self, "duration_s", duration_s)
         object.__setattr__(self, "sample_rate_hz", sample_rate_hz)
+        object.__setattr__(self, "input_range_v", input_range_v)
         object.__setattr__(self, "sample_count", sample_count)
 
 
@@ -6243,6 +6272,7 @@ def _execute_qcs_mixed_sweep(
             "frequency_hz": acquisition.frequency_hz,
             "duration_s": None,
             "requested_sample_count": requested_acquisition.sample_count,
+            "input_range_v": requested_acquisition.input_range_v,
         },
     }
 
@@ -6310,6 +6340,7 @@ def _execute_qcs_mixed_sweep(
                 averaging_plan.quantized_total_duration_s
             ),
             "requested_sample_count": requested_acquisition.sample_count,
+            "input_range_v": requested_acquisition.input_range_v,
             "requested_total_integration_duration_s": (
                 averaging_plan.requested_total_duration_s
             ),
@@ -7181,6 +7212,11 @@ def acquire_qcs_noise_trace(
         role="noise acquisition",
         expected_instruments=("M5200Digitizer",),
     )
+    apply_qcs_m5200_input_range(
+        mapper,
+        acquisition_channels,
+        config.input_range_v,
+    )
     sample_rate_hz = _mapped_channel_sample_rate(
         mapper, acquisition_channels
     )
@@ -7254,6 +7290,7 @@ def acquire_qcs_noise_trace(
         sample_count=sample_count,
         program=program,
         raw_result=raw_result,
+        input_range_v=config.input_range_v,
     )
     progress(100, "QCS raw noise trace acquired")
     return result
@@ -9233,6 +9270,15 @@ def execute_qcs_stability_hardware_sweep(
             connection_config,
             qcs_module=qcs,
         )
+    acquisition_channels = _resolve_mapper_channel(
+        mapper,
+        connection_config.acquisition_channel_name,
+    )
+    apply_qcs_m5200_input_range(
+        mapper,
+        acquisition_channels,
+        acquisition.input_range_v,
+    )
     if cancellation is not None:
         cancellation.bind(qcs, mapper)
         cancellation.raise_if_requested("QCS Stability setup")
@@ -9493,6 +9539,7 @@ def execute_qcs_stability_hardware_sweep(
             float(compiled.duration_s) + inter_iteration_delay_s
         ),
         "requested_sample_count": acquisition.sample_count,
+        "input_range_v": acquisition.input_range_v,
         "bias_t_compensation_applied": (
             compiled.bias_t_compensation_applied
         ),
@@ -9572,6 +9619,7 @@ def execute_qcs_stability_hardware_sweep(
             "point_program_duration_s": float(compiled.duration_s),
             "inter_iteration_delay_s": inter_iteration_delay_s,
             "requested_sample_count": acquisition.sample_count,
+            "input_range_v": acquisition.input_range_v,
             # "adc" denotes the GUI's uncalibrated numeric representation;
             # the QCS payload itself is integrated I/Q, not a raw ADC trace.
             "measurement_representation": "adc",
@@ -9728,8 +9776,13 @@ def execute_qcs_sequence(
         _resolve_mapper_channel(mapper, name)
     for name in connection_config.rf_channel_names.values():
         _resolve_mapper_channel(mapper, name)
-    _resolve_mapper_channel(
+    acquisition_channel = _resolve_mapper_channel(
         mapper, connection_config.acquisition_channel_name
+    )
+    apply_qcs_m5200_input_range(
+        mapper,
+        acquisition_channel,
+        acquisition.input_range_v,
     )
     requested_acquisition = acquisition
     iq_averaging_plan: Optional[QcsIqAveragingPlan] = None
@@ -10632,6 +10685,7 @@ def execute_qcs_sequence(
             else iq_averaging_plan.quantized_total_duration_s
         ),
         "requested_sample_count": requested_acquisition.sample_count,
+        "input_range_v": requested_acquisition.input_range_v,
         "requested_total_integration_duration_s": (
             None
             if iq_averaging_plan is None
@@ -10676,6 +10730,7 @@ def execute_qcs_sequence(
                 else iq_averaging_plan.quantized_total_duration_s
             ),
             "requested_sample_count": requested_acquisition.sample_count,
+            "input_range_v": requested_acquisition.input_range_v,
             "iq_averaging_pass_count": len(averaging_pass_counts),
             "per_pass_integration_duration_s": (
                 effective_acquisition_duration_s
@@ -10949,6 +11004,7 @@ def run_qcs_qcodes_experiment(
 
 __all__ = [
     "DEFAULT_QCS_INIT_TIME_S",
+    "DEFAULT_QCS_M5200_INPUT_RANGE_V",
     "MAX_QCS_HARDWARE_SWEEP_ARRAYS_PER_CHANNEL",
     "MAX_QCS_HARDWARE_SWEEP_ARRAY_VALUES",
     "MAX_QCS_STABILITY_GRID_POINTS",
@@ -10956,6 +11012,8 @@ __all__ = [
     "MAX_QCS_SOFTWARE_SWEEP_POINTS",
     "QCS_FABRIC_CLOCK_HZ",
     "QCS_M5200_INTEGRATION_BLOCK_SAMPLES",
+    "QCS_M5200_MAX_INPUT_RANGE_V",
+    "QCS_M5200_MIN_INPUT_RANGE_V",
     "QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S",
     "QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES",
     "QCS_M5200_SAMPLE_RATE_HZ",
@@ -10999,6 +11057,7 @@ __all__ = [
     "QcsUnsupportedFeatureError",
     "StoredQcsExperiment",
     "acquire_qcs_noise_trace",
+    "apply_qcs_m5200_input_range",
     "build_qcs_executor",
     "compile_qcs_point",
     "compile_qcs_sequence",
@@ -11011,6 +11070,7 @@ __all__ = [
     "extract_qcs_acquisition",
     "load_qcs_channel_mapper",
     "normalize_qcs_hardware_sweep_iq",
+    "normalize_qcs_m5200_input_range_v",
     "normalize_qcs_iq",
     "normalize_qcs_synchronized_trace",
     "plan_qcs_total_iq_averaging",

@@ -62,6 +62,11 @@ try:
         QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S,
         run_m5300_power_calibration,
     )
+    from .qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
+    )
 except ImportError:
     from power_calibration import INPUT_BOARD_TYPES, OUTPUT_BOARD_TYPES
     from qick_power_calibration import (
@@ -90,6 +95,11 @@ except ImportError:
         QCS_M5200_VOLTAGE_50OHM,
         QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S,
         run_m5300_power_calibration,
+    )
+    from qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
     )
 
 
@@ -1612,6 +1622,21 @@ class CalibrationPanel(QtWidgets.QWidget):
             "Passes are separate QCS executions, so this is total integrated "
             "time rather than one continuous acquisition window."
         )
+        self.qcs_rf_input_range_v = QtWidgets.QDoubleSpinBox()
+        self.qcs_rf_input_range_v.setRange(
+            QCS_M5200_MIN_INPUT_RANGE_V,
+            QCS_M5200_MAX_INPUT_RANGE_V,
+        )
+        self.qcs_rf_input_range_v.setDecimals(6)
+        self.qcs_rf_input_range_v.setSingleStep(0.05)
+        self.qcs_rf_input_range_v.setValue(
+            DEFAULT_QCS_M5200_INPUT_RANGE_V
+        )
+        self.qcs_rf_input_range_v.setSuffix(" V")
+        self.qcs_rf_input_range_v.setToolTip(
+            "Physical M5200 full-scale input range applied to the selected "
+            "digitizer connector before calibration."
+        )
         self.qcs_rf_repetitions = QtWidgets.QSpinBox()
         self.qcs_rf_repetitions.setRange(1, 1_000_000)
         self.qcs_rf_repetitions.setValue(100)
@@ -1626,6 +1651,7 @@ class CalibrationPanel(QtWidgets.QWidget):
                 "Total integrated I/Q averaging time:",
                 self.qcs_rf_integration_us,
             ),
+            ("M5200 input range:", self.qcs_rf_input_range_v),
             ("Repetitions / grid point:", self.qcs_rf_repetitions),
         ):
             form.addRow(label, widget)
@@ -1716,6 +1742,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             integration_duration_s=(
                 self.qcs_rf_integration_us.value() * 1.0e-6
             ),
+            input_range_v=self.qcs_rf_input_range_v.value(),
             repetitions=self.qcs_rf_repetitions.value(),
             init_time_s=float(init_time_s),
             expected_lo_frequency_hz=float(lo_frequency_hz),
@@ -2409,6 +2436,7 @@ class CalibrationPanel(QtWidgets.QWidget):
                 "amplitude_end": self.qcs_rf_amplitude_end.value(),
                 "amplitude_points": self.qcs_rf_amplitude_points.value(),
                 "integration_duration_us": self.qcs_rf_integration_us.value(),
+                "input_range_v": self.qcs_rf_input_range_v.value(),
                 "repetitions": self.qcs_rf_repetitions.value(),
             },
             "qcs_dc_output": {
@@ -2556,6 +2584,11 @@ class CalibrationPanel(QtWidgets.QWidget):
             (self.qcs_rf_amplitude_end, "amplitude_end", 1.0),
             (self.qcs_rf_amplitude_points, "amplitude_points", 10),
             (self.qcs_rf_integration_us, "integration_duration_us", 1.0),
+            (
+                self.qcs_rf_input_range_v,
+                "input_range_v",
+                DEFAULT_QCS_M5200_INPUT_RANGE_V,
+            ),
             (self.qcs_rf_repetitions, "repetitions", 100),
         )
         for widget, key, default in qcs_rf_assignments:
@@ -2908,6 +2941,7 @@ def default_calibration_settings() -> Mapping[str, Any]:
             "amplitude_end": 1.0,
             "amplitude_points": 10,
             "integration_duration_us": 1.0,
+            "input_range_v": DEFAULT_QCS_M5200_INPUT_RANGE_V,
             "repetitions": 100,
         },
         "qcs_dc_output": {

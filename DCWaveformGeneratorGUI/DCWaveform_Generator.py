@@ -220,6 +220,9 @@ except ImportError:
 try:
     from .qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
@@ -249,12 +252,16 @@ try:
         qcs_stability_integration_segment_sample_counts,
         plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
+        normalize_qcs_m5200_input_range_v,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
     )
 except ImportError:
     from qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
         QCS_M5200_INTEGRATION_BLOCK_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
         QCS_M5301_MAX_RENDERED_SAMPLES,
@@ -284,6 +291,7 @@ except ImportError:
         qcs_stability_integration_segment_sample_counts,
         plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
+        normalize_qcs_m5200_input_range_v,
         run_qcs_qcodes_experiment,
         validate_qcs_m5301_waveform_capacity,
     )
@@ -585,6 +593,7 @@ DEFAULT_RF_READOUT_SETTINGS = {
     "delay_us": 0.0,
     "samples_per_trigger": 64,
     "qcs_acquisition_duration_s": 64 / QCS_M5200_SAMPLE_RATE_HZ,
+    "qcs_input_range_v": DEFAULT_QCS_M5200_INPUT_RANGE_V,
     "readout_frequency_mhz": 50.0,
     "margin_input_samples": 1024,
     "fpga_trigger_delay_us": None,
@@ -5518,6 +5527,21 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "whole M5200 sample, or to a 16-sample block for Single I/Q, so "
             "the programmed acquisition is never shorter than requested."
         )
+        self.qcs_input_range_v = QtWidgets.QDoubleSpinBox()
+        self.qcs_input_range_v.setRange(
+            QCS_M5200_MIN_INPUT_RANGE_V,
+            QCS_M5200_MAX_INPUT_RANGE_V,
+        )
+        self.qcs_input_range_v.setDecimals(6)
+        self.qcs_input_range_v.setSingleStep(0.05)
+        self.qcs_input_range_v.setValue(
+            DEFAULT_QCS_M5200_INPUT_RANGE_V
+        )
+        self.qcs_input_range_v.setSuffix(" V")
+        self.qcs_input_range_v.setToolTip(
+            "Physical M5200 full-scale input range applied to the mapped "
+            "digitizer connector before QCS execution."
+        )
         self.qcs_single_iq_radio = QtWidgets.QRadioButton(
             "Single I/Q value"
         )
@@ -5711,6 +5735,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.qcs_acquisition_duration_label,
             self.qcs_acquisition_duration,
         )
+        form.addRow("M5200 input range:", self.qcs_input_range_v)
         self.frequency_label = QtWidgets.QLabel(
             "Readout/DDC frequency:"
         )
@@ -5772,6 +5797,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.segment,
             self.delay,
             self.samples,
+            self.qcs_input_range_v,
             self.frequency_mhz,
             self.attenuation_db,
             self.dc_gain_db,
@@ -5988,6 +6014,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.qcs_acquisition_duration,
             not is_qick,
         )
+        self._set_form_row_visible(self.qcs_input_range_v, not is_qick)
         self._set_form_row_visible(
             self.frequency_mhz,
             is_qick or self._qcs_hardware_demodulation,
@@ -6056,6 +6083,9 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self._qcs_acquisition_mode_editing_enabled
         )
         self.qcs_acquisition_duration.setEnabled(
+            self._qcs_acquisition_mode_editing_enabled
+        )
+        self.qcs_input_range_v.setEnabled(
             self._qcs_acquisition_mode_editing_enabled
         )
 
@@ -6559,6 +6589,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "qcs_acquisition_duration_s": (
                 self._qcs_acquisition_duration_seconds()
             ),
+            "qcs_input_range_v": self.qcs_input_range_v.value(),
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
             "fpga_trigger_delay_us": spec.fpga_trigger_delay_us,
@@ -6671,6 +6702,12 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         )
         if not np.isfinite(qcs_duration_s) or qcs_duration_s <= 0.0:
             raise ValueError("QCS acquisition duration must be positive and finite")
+        qcs_input_range_v = normalize_qcs_m5200_input_range_v(
+            data.get(
+                "qcs_input_range_v",
+                DEFAULT_QCS_M5200_INPUT_RANGE_V,
+            )
+        )
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
             raise ValueError(f"unknown RF readout anchor {spec.segment_name!r}")
@@ -6688,6 +6725,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 self.qcs_acquisition_duration.setValue(
                     _time_from_ns(qcs_duration_s * 1.0e9, self._time_unit)
                 )
+            self.qcs_input_range_v.setValue(qcs_input_range_v)
             self.frequency_mhz.setValue(spec.readout_frequency_mhz)
             self.input_board_type.setCurrentText(spec.input_board_type)
             self.margin_samples.setValue(spec.margin_input_samples)
@@ -15275,6 +15313,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 ),
                 phase_rad=0.0,
                 envelope="constant",
+                input_range_v=(
+                    self._rf_readout_panel.qcs_input_range_v.value()
+                ),
             )
 
         return {
@@ -15650,6 +15691,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
             phase_rad=0.0,
             envelope="constant",
+            input_range_v=(
+                self._stability_panel.qcs_input_range_v.value()
+            ),
         )
         gui_settings = None
         if save:
@@ -16374,6 +16418,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 config = QcsNoiseTraceConfig(
                     connection_config=connection,
                     duration_s=duration_s,
+                    input_range_v=float(request.input_range_v),
                 )
             except (AttributeError, OSError, TypeError, ValueError) as exc:
                 QtWidgets.QMessageBox.warning(
@@ -20004,6 +20049,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 / QCS_M5200_SAMPLE_RATE_HZ
             )
         )
+        qcs_input_range_v = normalize_qcs_m5200_input_range_v(
+            raw_readout.get(
+                "qcs_input_range_v",
+                DEFAULT_QCS_M5200_INPUT_RANGE_V,
+            )
+        )
         rf_readout = {
             "enabled": readout_enabled,
             "ro_ch": readout_spec.ro_ch,
@@ -20011,6 +20062,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "delay_us": readout_spec.delay_us,
             "samples_per_trigger": readout_spec.samples_per_trigger,
             "qcs_acquisition_duration_s": qcs_acquisition_duration_s,
+            "qcs_input_range_v": qcs_input_range_v,
             "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
             "margin_input_samples": readout_spec.margin_input_samples,
             "fpga_trigger_delay_us": readout_spec.fpga_trigger_delay_us,

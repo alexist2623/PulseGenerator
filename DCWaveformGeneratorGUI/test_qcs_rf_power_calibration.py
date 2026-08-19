@@ -531,7 +531,9 @@ class _Mapper:
             "digitizer": SimpleNamespace(
                 address=_Address(1, 1, 18, 1),
                 instrument="InstrumentEnum.M5200Digitizer",
-                settings=SimpleNamespace(),
+                settings=SimpleNamespace(
+                    range=SimpleNamespace(value=0.9)
+                ),
             ),
         }
 
@@ -620,17 +622,22 @@ def test_injected_runner_uses_flat_cartesian_grid_and_stores_result(tmp_path):
         frequencies_hz=(1.0e9, 2.0e9),
         relative_amplitudes=(0.5, 1.0),
         input_reference=_reference(),
+        input_range_v=1.8,
         repetitions=7,
         expected_lo_frequency_hz=1.2e9,
     )
     progress = []
+    mapper = _Mapper()
     stored = run_m5300_power_calibration(
         config,
-        mapper=_Mapper(),
+        mapper=mapper,
         measurement_runner=measurement_runner,
         progress_callback=lambda value, message: progress.append(
             (value, message)
         ),
+    )
+    assert mapper._physical["digitizer"].settings.range.value == pytest.approx(
+        1.8
     )
     assert len(calls) == 1
     assert calls[0]["frequencies_hz"] == pytest.approx(
@@ -642,6 +649,10 @@ def test_injected_runner_uses_flat_cartesian_grid_and_stores_result(tmp_path):
     assert stored.point_count == 4
     assert stored.calibration.output_identity == OUTPUT
     assert stored.calibration.input_identity == INPUT
+    config_metadata = json.loads(
+        stored.dataset.get_metadata(QCS_RF_CALIBRATION_CONFIG_METADATA)
+    )
+    assert config_metadata["input_range_v"] == pytest.approx(1.8)
     assert progress[-1][0] == 100
     assert progress[-1][1] == (
         f"Stored QCoDeS Run {stored.qcodes_run_id} "
@@ -932,6 +943,7 @@ def test_qcs_rf_calibration_gui_exposes_100ms_total_average():
     ]
     assert "Total integrated I/Q averaging time:" in labels
     assert "separate QCS executions" in panel.qcs_rf_integration_us.toolTip()
+    panel.qcs_rf_input_range_v.setValue(1.8)
 
     assert not hasattr(panel, "qcs_rf_reference_mode")
     assert not hasattr(panel, "qcs_rf_reference_slope")
@@ -945,11 +957,16 @@ def test_qcs_rf_calibration_gui_exposes_100ms_total_average():
     )
 
     saved_reference = panel.settings_dict()["qcs_rf_output"]
+    assert saved_reference["input_range_v"] == pytest.approx(1.8)
     assert "reference_mode" not in saved_reference
     assert "reference_slope" not in saved_reference
     assert "reference_intercept_dbm" not in saved_reference
     assert "nominal_volts_per_iq_unit" not in saved_reference
     assert "path_loss_db" not in saved_reference
+
+    restored = CalibrationPanel()
+    restored.load_settings(panel.settings_dict())
+    assert restored.qcs_rf_input_range_v.value() == pytest.approx(1.8)
 
     # Older settings remain loadable, but their manual conversion fields are
     # intentionally discarded. Only the useful cable/path correction remains.
@@ -968,5 +985,7 @@ def test_qcs_rf_calibration_gui_exposes_100ms_total_average():
     assert "path_loss_db" not in normalized_reference
 
     panel.close()
+    restored.close()
     panel.deleteLater()
+    restored.deleteLater()
     app.processEvents()

@@ -46,6 +46,19 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from .qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        apply_qcs_m5200_input_range,
+        normalize_qcs_m5200_input_range_v,
+    )
+except ImportError:
+    from qcs_digitizer_settings import (
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
+        apply_qcs_m5200_input_range,
+        normalize_qcs_m5200_input_range_v,
+    )
+
 
 QCS_RF_POWER_CALIBRATION_SCHEMA = (
     "pulse-generator-qcs-m5300-m5200-power-calibration-v1"
@@ -321,6 +334,7 @@ class M5300PowerCalibrationConfig:
     relative_amplitudes: Tuple[float, ...]
     input_reference: M5200PowerReference
     integration_duration_s: float = 1.0e-6
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V
     repetitions: int = 100
     init_time_s: float = 100.0e-6
     expected_lo_frequency_hz: Optional[float] = None
@@ -376,6 +390,9 @@ class M5300PowerCalibrationConfig:
                 f"{QCS_RF_CALIBRATION_MAX_TOTAL_INTEGRATION_DURATION_S * 1e3:g} "
                 "ms"
             )
+        input_range_v = normalize_qcs_m5200_input_range_v(
+            self.input_range_v
+        )
         repetitions = _integer(self.repetitions, "repetitions", 1)
         init_time = _finite(self.init_time_s, "init_time_s")
         if init_time < 0.0:
@@ -397,6 +414,7 @@ class M5300PowerCalibrationConfig:
         object.__setattr__(self, "frequencies_hz", frequencies)
         object.__setattr__(self, "relative_amplitudes", amplitudes)
         object.__setattr__(self, "integration_duration_s", integration)
+        object.__setattr__(self, "input_range_v", input_range_v)
         object.__setattr__(self, "repetitions", repetitions)
         object.__setattr__(self, "init_time_s", init_time)
         object.__setattr__(self, "expected_lo_frequency_hz", lo_frequency)
@@ -886,6 +904,7 @@ def _write_qcodes_calibration_dataset(
     termination_ohm: float,
     input_reference: M5200PowerReference,
     integration_duration_s: float,
+    input_range_v: float,
     repetitions: int,
     columns: Tuple[np.ndarray, ...],
     notes: str,
@@ -974,6 +993,7 @@ def _write_qcodes_calibration_dataset(
         "calibration_quality": input_reference.mode,
         "input_reference": asdict(input_reference),
         "integration_duration_s": float(integration_duration_s),
+        "input_range_v": float(input_range_v),
         "repetitions": int(repetitions),
         "grid": {
             "shape": [
@@ -1060,6 +1080,7 @@ def store_m5300_power_calibration(
     integration_duration_s: float,
     repetitions: int,
     input_reference: M5200PowerReference,
+    input_range_v: float = DEFAULT_QCS_M5200_INPUT_RANGE_V,
     iq_magnitude: Optional[Any] = None,
     power_dbm: Optional[Any] = None,
     termination_ohm: float = 50.0,
@@ -1086,6 +1107,7 @@ def store_m5300_power_calibration(
         "integration_duration_s",
         positive=True,
     )
+    input_range = normalize_qcs_m5200_input_range_v(input_range_v)
     repetitions = _integer(repetitions, "repetitions", 1)
     termination = _finite(termination_ohm, "termination_ohm", positive=True)
     if not np.isclose(termination, 50.0):
@@ -1188,6 +1210,7 @@ def store_m5300_power_calibration(
             termination_ohm=termination,
             input_reference=input_reference,
             integration_duration_s=integration,
+            input_range_v=input_range,
             repetitions=repetitions,
             columns=columns,
             notes=str(notes).strip(),
@@ -1508,6 +1531,7 @@ def migrate_m5300_power_calibrations_to_qcodes(
                 termination_ohm=calibration.termination_ohm,
                 input_reference=calibration.input_reference,
                 integration_duration_s=calibration.integration_duration_s,
+                input_range_v=DEFAULT_QCS_M5200_INPUT_RANGE_V,
                 repetitions=calibration.repetitions,
                 columns=columns,
                 notes=calibration.notes,
@@ -2014,6 +2038,11 @@ def run_m5300_power_calibration(
     input_channels = _resolve_mapper_channel(
         mapper, config.acquisition_channel_name
     )
+    apply_qcs_m5200_input_range(
+        mapper,
+        input_channels,
+        config.input_range_v,
+    )
     output_identity, input_identity, lo_frequency_hz = (
         resolve_m5300_m5200_identities(
             mapper,
@@ -2141,6 +2170,7 @@ def run_m5300_power_calibration(
         integration_duration_s=actual_duration_s,
         repetitions=config.repetitions,
         input_reference=config.input_reference,
+        input_range_v=config.input_range_v,
         notes=config.notes,
     )
     progress(

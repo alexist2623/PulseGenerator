@@ -60,22 +60,27 @@ try:
     )
     from .qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
         QCS_FABRIC_CLOCK_HZ,
         QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
         QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
         QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
         QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
         QCS_STABILITY_INTEGRATION_QUANTUM_S,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
         QcsCancellationController,
         QcsExperimentCancelled,
         StoredQcsExperiment,
+        apply_qcs_m5200_input_range,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        normalize_qcs_m5200_input_range_v,
         plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         quantize_qcs_stability_integration_duration,
@@ -121,22 +126,27 @@ except ImportError:
     )
     from qcs_qcodes_experiment import (
         DEFAULT_QCS_INIT_TIME_S,
+        DEFAULT_QCS_M5200_INPUT_RANGE_V,
         QCS_FABRIC_CLOCK_HZ,
         QCS_MAX_TOTAL_IQ_AVERAGING_DURATION_S,
         QCS_MAX_TOTAL_IQ_AVERAGING_SAMPLES,
         QCS_M5200_MAX_SINGLE_INTEGRATION_DURATION_S,
         QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES,
         QCS_M5200_SAMPLE_RATE_HZ,
+        QCS_M5200_MAX_INPUT_RANGE_V,
+        QCS_M5200_MIN_INPUT_RANGE_V,
         QCS_STABILITY_INTEGRATION_QUANTUM_S,
         QCS_STABILITY_DC_EDGE_PADDING_S,
         QCS_STABILITY_DC_RAMP_S,
         QcsCancellationController,
         QcsExperimentCancelled,
         StoredQcsExperiment,
+        apply_qcs_m5200_input_range,
         build_qcs_executor,
         compile_qcs_stability_hardware_sweep,
         execute_qcs_stability_hardware_sweep,
         load_qcs_channel_mapper,
+        normalize_qcs_m5200_input_range_v,
         plan_qcs_total_iq_averaging,
         quantize_qcs_inter_iteration_delay,
         quantize_qcs_stability_integration_duration,
@@ -1231,6 +1241,7 @@ def default_stability_settings(
         "qcs_integration_duration_s": (
             DEFAULT_QCS_STABILITY_INTEGRATION_DURATION_S
         ),
+        "qcs_input_range_v": DEFAULT_QCS_M5200_INPUT_RANGE_V,
         "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
         "fpga_trigger_delay_us": None,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
@@ -1356,6 +1367,14 @@ def normalize_stability_settings(
     )
     if normalized["qcs_integration_duration_s"] <= 0.0:
         raise ValueError("stability QCS integration time must be positive")
+    normalized["qcs_input_range_v"] = (
+        normalize_qcs_m5200_input_range_v(
+            settings.get(
+                "qcs_input_range_v",
+                defaults["qcs_input_range_v"],
+            )
+        )
+    )
     normalized["settle_time_us"] = _finite_float(
         settings.get("settle_time_us", defaults["settle_time_us"]),
         "stability settle time",
@@ -2273,6 +2292,17 @@ class QcsStabilityDiagramWorker(QtCore.QObject):
                 rf_pulses=rf_pulses,
                 acquisition=pass_acquisition,
                 qcs_module=qcs_module,
+            )
+        compiled_acquisition_channels = getattr(
+            compiled,
+            "acquisition_channels",
+            None,
+        )
+        if compiled_acquisition_channels is not None:
+            apply_qcs_m5200_input_range(
+                mapper,
+                compiled_acquisition_channels,
+                acquisition.input_range_v,
             )
         if executor is None:
             executor = build_qcs_executor(
@@ -3445,6 +3475,23 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             f"{QCS_M5200_MAX_SINGLE_INTEGRATION_SAMPLES:,} samples "
             "and Stop is checked between bounded passes."
         )
+        self.qcs_input_range_v = QtWidgets.QDoubleSpinBox(
+            self.acquisition_group
+        )
+        self.qcs_input_range_v.setRange(
+            QCS_M5200_MIN_INPUT_RANGE_V,
+            QCS_M5200_MAX_INPUT_RANGE_V,
+        )
+        self.qcs_input_range_v.setDecimals(6)
+        self.qcs_input_range_v.setSingleStep(0.05)
+        self.qcs_input_range_v.setValue(
+            DEFAULT_QCS_M5200_INPUT_RANGE_V
+        )
+        self.qcs_input_range_v.setSuffix(" V")
+        self.qcs_input_range_v.setToolTip(
+            "Physical M5200 full-scale input range applied to the mapped "
+            "digitizer connector before the stability sweep."
+        )
         self._qcs_integration_requested_us = (
             self.qcs_integration_duration_us.value()
         )
@@ -3660,6 +3707,13 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.qcs_integration_duration_label,
             self.qcs_integration_duration_us,
         )
+        self.qcs_input_range_label = QtWidgets.QLabel(
+            "M5200 input range:"
+        )
+        acquisition_form.addRow(
+            self.qcs_input_range_label,
+            self.qcs_input_range_v,
+        )
         acquisition_form.addRow(self.qcs_integration_note)
         acquisition_form.addRow(self.settle_time_label, self.settle_time_us)
         self.fpga_delay_label = QtWidgets.QLabel(
@@ -3711,6 +3765,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.repetitions_label,
             self.trace_samples_label,
             self.qcs_integration_duration_label,
+            self.qcs_input_range_label,
             self.settle_time_label,
             self.fpga_delay_label,
             self.modulation_frequency_label,
@@ -4471,6 +4526,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.qcs_integration_duration_us,
             is_qcs,
         )
+        self._set_acquisition_row_visible(self.qcs_input_range_v, is_qcs)
         self.qcs_integration_note.setVisible(is_qcs)
         self.qcs_point_timing_note.setVisible(False)
         self._set_acquisition_row_visible(
@@ -5166,6 +5222,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "repetitions_per_point": self.repetitions.value(),
             "trace_samples_per_point": self.trace_samples.value(),
             "qcs_integration_duration_s": qcs_integration_duration_s,
+            "qcs_input_range_v": self.qcs_input_range_v.value(),
             "settle_time_us": self.settle_time_us.value(),
             "fpga_trigger_delay_us": (
                 self.fpga_trigger_delay_us.value()
@@ -5268,6 +5325,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             self.qcs_integration_duration_us.value()
         )
         self._commit_qcs_integration_duration()
+        self.qcs_input_range_v.setValue(
+            normalize_qcs_m5200_input_range_v(
+                settings.get(
+                    "qcs_input_range_v",
+                    DEFAULT_QCS_M5200_INPUT_RANGE_V,
+                )
+            )
+        )
         self.settle_time_us.setValue(
             float(settings.get("settle_time_us", DEFAULT_STABILITY_SETTLE_US))
         )
@@ -5450,6 +5515,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.repetitions.setEnabled(not running)
         self.trace_samples.setEnabled(not running)
         self.qcs_integration_duration_us.setEnabled(not running)
+        self.qcs_input_range_v.setEnabled(not running)
         self.settle_time_us.setEnabled(not running)
         self.override_fpga_trigger_delay.setEnabled(
             not running and self._fir_uses_fpga_trigger_delay is not False

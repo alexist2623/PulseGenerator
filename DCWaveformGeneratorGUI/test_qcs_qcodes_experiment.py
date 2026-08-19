@@ -43,6 +43,7 @@ class _Mapper:
 class _PhysicalSettings:
     def __init__(self, name):
         self.offset = _Scalar(f"{name}_offset", value=0.0, dtype=float)
+        self.range = _Scalar(f"{name}_range", value=0.9, dtype=float)
 
 
 class _PhysicalChannel:
@@ -79,6 +80,12 @@ class _PhysicalMapper(_Mapper):
             channel for channel in self.channels if channel.name == name
         )
         return self._physical[channel].settings.offset
+
+    def input_range_scalar(self, name="digitizer"):
+        channel = next(
+            channel for channel in self.channels if channel.name == name
+        )
+        return self._physical[channel].settings.range
 
 
 class _Envelope:
@@ -1705,6 +1712,7 @@ def test_qcs_noise_acquires_one_raw_program_and_preserves_repetitions():
         connection_config=_connection(hw_demod=True),
         duration_s=5.25 / rate_hz,
         repetitions=2,
+        input_range_v=1.8,
     )
     mapper = _PhysicalMapper("digitizer")
     # QCS trace frames are sample-first with the shot axis last.
@@ -1746,6 +1754,7 @@ def test_qcs_noise_acquires_one_raw_program_and_preserves_repetitions():
         ),
     )
 
+    assert mapper.input_range_scalar().value == pytest.approx(1.8)
     assert len(executor.programs) == 1
     program = executor.programs[0]
     assert program.shots == 2

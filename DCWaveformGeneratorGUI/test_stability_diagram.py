@@ -1325,6 +1325,8 @@ def test_stability_qcs_rf_path_uses_modules_and_restores_qick_settings():
     assert panel.dc_calibration_group.isVisible() is False
     assert panel.trace_samples.isVisible() is False
     assert panel.qcs_integration_duration_us.isVisible() is True
+    assert panel.qcs_input_range_v.isVisible() is True
+    assert panel.qcs_input_range_v.value() == pytest.approx(0.9)
     assert (
         panel.qcs_integration_duration_label.text()
         == "Total I/Q averaging time:"
@@ -1699,6 +1701,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     panel.y_axis.points.setValue(7)
     panel.repetitions.setValue(4)
     panel.trace_samples.setValue(321)
+    panel.qcs_input_range_v.setValue(1.8)
     panel.settle_time_us.setValue(75.5)
     panel.modulation_frequency_mhz.setValue(12.5)
     panel.modulation_gain.setValue(12345)
@@ -1744,6 +1747,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     assert panel.layout().indexOf(panel.controls_scroll) >= 0
 
     saved = panel.settings_dict()
+    assert saved["qcs_input_range_v"] == pytest.approx(1.8)
     restored = stability.StabilityDiagramPanel()
     restored.refresh_targets(
         ("awg_0", "awg_1", "awg_2"),
@@ -1752,6 +1756,7 @@ def test_stability_panel_controls_and_settings_round_trip(tmp_path):
     )
     restored.load_settings(saved)
     assert restored.settings_dict() == saved
+    assert restored.qcs_input_range_v.value() == pytest.approx(1.8)
     assert restored.bias_t_group.isChecked() is True
     assert restored.bias_t_mode.currentData() == "fixed_time"
     assert restored.bias_t_duration_us.value() == 2.5
