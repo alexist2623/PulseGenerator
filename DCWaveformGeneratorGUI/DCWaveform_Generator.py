@@ -9630,6 +9630,12 @@ class QickExportDialog(QtWidgets.QDialog):
         super().accept()
 
 
+try:
+    from .qick_square_wave import SquareWavePanel, SquareWaveWorker, normalize_square_wave_settings
+except ImportError:
+    from qick_square_wave import SquareWavePanel, SquareWaveWorker, normalize_square_wave_settings
+
+
 class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-methods
     """Main window for the DCWaveform generator application."""
 
@@ -9756,6 +9762,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             default_database_path=DEFAULT_QCODES_DB_PATH,
         )
         self._bias_panel = BiasControlPanel(self)
+        self._square_wave_panel = SquareWavePanel(
+            self, calibration_path_provider=lambda: self._calibration_panel.database_path.text())
+        self._calibration_panel.database_path.textChanged.connect(
+            self._square_wave_panel.shared_database_changed)
+        self._square_wave_panel.start_requested.connect(self._start_square_wave)
+        self._square_wave_panel.stop_requested.connect(self._stop_square_wave)
+        self._square_wave_close_pending = False
         self._qick_configuration = None
         self._qick_front_panel_target = None
         self._qick_front_panel_dialog = QtWidgets.QDialog(self)
@@ -9928,6 +9941,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
         self._control_tabs.addTab(self._noise_panel, "Noise Analysis")
         self._control_tabs.addTab(self._bias_panel, "Bias")
+        self._control_tabs.addTab(self._square_wave_panel, "QICK Square Wave")
         self._control_tabs.setCurrentWidget(self._awg_tuning_page)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
@@ -12595,6 +12609,68 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _start_square_wave(self, config) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            self._square_wave_panel.status.setText("Stop the current hardware task before starting a square wave.")
+            return
+        try:
+            worker = SquareWaveWorker(self._shared_qick_connection(), config,
+                                      tproc_mhz=self._qick_tproc_mhz)
+        except (TypeError, ValueError) as exc:
+            self._square_wave_panel.status.setText(str(exc))
+            return
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.started.connect(self._on_square_wave_started)
+        worker.finished.connect(self._on_square_wave_finished)
+        worker.failed.connect(self._on_square_wave_failed)
+        worker.stop_failed.connect(self._on_square_wave_stop_failed)
+        for signal in (worker.finished, worker.failed):
+            signal.connect(thread.quit)
+            signal.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        thread.finished.connect(self._finish_square_wave_close)
+        self._experiment_thread, self._experiment_worker = thread, worker
+        self._square_wave_panel.set_running(True, "Connecting and preparing continuous output...")
+        thread.start()
+
+    def _stop_square_wave(self) -> None:
+        if isinstance(self._experiment_worker, SquareWaveWorker):
+            self._square_wave_panel.status.setText("Stopping tProcessor...")
+            self._experiment_worker.request_stop()
+
+    def _on_square_wave_started(self, result) -> None:
+        calibration = result.get("calibration", {})
+        calibration_label = (
+            f" DC_Out calibration Run {calibration['run_id']}." if calibration else ""
+        )
+        self._square_wave_panel.status.setText(
+            f"Running: {result['actual_frequency_hz']:.9g} Hz, "
+            f"duty {result['actual_duty_percent']:.6g}%; "
+            f"DAC high/low codes {result['high_code']} / {result['low_code']} "
+            f"({result['tproc_mhz']:g} MHz tProcessor).{calibration_label}"
+        )
+
+    def _on_square_wave_finished(self, message) -> None:
+        self._square_wave_panel.set_running(False, message)
+
+    def _on_square_wave_failed(self, details) -> None:
+        self._square_wave_panel.set_running(False, "Failed: " + str(details).strip().splitlines()[-1])
+
+    def _on_square_wave_stop_failed(self, details) -> None:
+        self._square_wave_close_pending = False
+        self._square_wave_panel.status.setText(
+            "Stop failed; output state is unknown. Restore the connection and press Stop to retry.\n"
+            + str(details).strip().splitlines()[-1]
+        )
+
+    def _finish_square_wave_close(self) -> None:
+        if self._square_wave_close_pending:
+            self._square_wave_close_pending = False
+            QtCore.QTimer.singleShot(0, self.close)
+
     def _run_noise_acquisition(self, config) -> None:
         """Run the Noise tab's self-contained FIR-DDR acquisition."""
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -14013,6 +14089,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "calibration": dict(self._calibration_panel.settings_dict()),
             "noise_analysis": dict(self._noise_panel.settings_dict()),
             "bias": self._bias_panel.settings_dict(),
+            "square_wave": self._square_wave_panel.settings_dict(),
         }
 
     @staticmethod
@@ -14818,6 +14895,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     f"{axis_name} stability sweep exceeds +/-{full_scale_mv:g} mV "
                     "AWG full scale"
                 )
+        square_wave_settings = normalize_square_wave_settings(data.get("square_wave"))
         raw_bias_t = qick.get("bias_t_compensation", {})
         if raw_bias_t is None:
             raw_bias_t = {}
@@ -15686,6 +15764,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "setpoints_v": tuple(bias_setpoints_v),
                 "measurements": bias_measurements,
             },
+            "square_wave": square_wave_settings,
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -15793,6 +15872,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._calibration_panel.load_settings(settings["calibration"])
         self._noise_panel.load_settings(settings["noise_analysis"])
         self._bias_panel.load_settings(settings["bias"])
+        self._square_wave_panel.load_settings(settings["square_wave"])
         self._sync_shared_qick_controls()
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()
@@ -16419,6 +16499,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         trace.fit_view()
 
     def closeEvent(self, event) -> None:
+        if isinstance(self._experiment_worker, SquareWaveWorker):
+            self._square_wave_close_pending = True
+            self._stop_square_wave()
+            event.ignore()
+            return
         if (
             self._awg_sweep_load_thread is not None
             and self._awg_sweep_load_thread.isRunning()

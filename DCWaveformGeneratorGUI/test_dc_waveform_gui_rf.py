@@ -400,6 +400,7 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
         "Calibration",
         "Noise Analysis",
         "Bias",
+        "QICK Square Wave",
     ]
     assert [
         window._awg_tuning_tabs.tabText(i)

@@ -678,7 +678,6 @@ class SParameterSweepResult:
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
-    iq_scale_log2: int = 0
     reserved_physical_words: Optional[int] = None
     output_power_dbm: Optional[float] = None
     nominal_gain_code: Optional[int] = None
@@ -688,6 +687,7 @@ class SParameterSweepResult:
     acquisition_source: str = "fir_ddr"
     integration_time_us: Optional[float] = None
     accumulation_repetitions: int = 1
+    iq_scale_log2: int = 0
 
     @classmethod
     def from_iq(
@@ -864,7 +864,6 @@ class SParameterPowerSweepResult:
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
-    iq_scale_log2: int = 0
     reserved_physical_words: Tuple[Optional[int], ...] = ()
     output_powers_dbm: Optional[np.ndarray] = None
     frequency_gain_codes: Optional[np.ndarray] = None
@@ -873,6 +872,7 @@ class SParameterPowerSweepResult:
     acquisition_source: str = "fir_ddr"
     integration_time_us: Optional[float] = None
     accumulation_repetitions: int = 1
+    iq_scale_log2: int = 0
 
     @classmethod
     def from_iq(
@@ -2508,11 +2508,13 @@ class _SParameterPowerRunWriter:
         connection_config: Any,
         run_config: Any,
         rf_settings: Mapping[str, Any],
+        iq_scale_log2: int = 0,
     ):
         self.config = config
         self.connection_config = connection_config
         self.run_config = run_config
         self.rf_settings = rf_settings
+        self.iq_scale_log2 = int(iq_scale_log2)
         self.calibrated = bool(config.power_calibration_enabled)
         self.planned_power_gains = tuple(
             int(value) for value in ([] if self.calibrated else config.power_gains)
@@ -2626,8 +2628,9 @@ class _SParameterPowerRunWriter:
             label="S-parameter unwrapped phase",
             unit="deg",
         )
-        i_trace = Parameter(I_TRACE_PARAMETER, label="Raw I trace", unit="stored codes")
-        q_trace = Parameter(Q_TRACE_PARAMETER, label="Raw Q trace", unit="stored codes")
+        trace_unit = "stored int64 codes" if self.iq_scale_log2 else "ADC units"
+        i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=trace_unit)
+        q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=trace_unit)
         measurement.register_parameter(power_axis)
         measurement.register_parameter(frequency)
         measurement.register_parameter(sample_index, paramtype="array")
@@ -3231,11 +3234,18 @@ def run_sparameter_sweep(
             )
         else:
             power_coordinates = tuple(int(value) for value in sweep_config.power_gains)
+        # Use advertised format metadata for labels. Acquisition programs
+        # validate the full firmware configuration before capture.
+        configuration = getattr(soccfg, "_cfg", soccfg)
+        ddr_metadata = (configuration.get("ddr4_buf", {})
+                        if isinstance(configuration, Mapping) else {})
         writer = _SParameterPowerRunWriter(
             config=sweep_config,
             connection_config=connection_config,
             run_config=run_config,
             rf_settings=rf_settings,
+            iq_scale_log2=(0 if sweep_config.uses_avg_buffer
+                           else int(ddr_metadata.get("iq_scale_log2", 0))),
         )
         programs = []
         combined_result = None

@@ -66,6 +66,34 @@ def test_sparameter_scaling_and_power_stack():
     np.testing.assert_array_equal(stacked.mean_i,[[3],[3]])
 
 
+@pytest.mark.parametrize('power_sweep', [False, True])
+def test_legacy_sparameter_positional_constructor_keeps_argument_order(power_sweep):
+    # Call using the positional argument order published before IQ64 support.
+    trace = np.array([[[3, 4]]], dtype=np.int16)
+    single = SParameterSweepResult.from_iq([190], [190], trace,
+        reserved_physical_words=128, acquisition_source='avg_buffer',
+        integration_time_us=2.5, accumulation_repetitions=7)
+    common = ('requested_frequencies_mhz', 'frequencies_mhz', 'iq_traces',
+              'mean_i', 'mean_q', 'adc_magnitude_db', 'magnitude_db',
+              'phase_unwrapped_deg', 'sample_rate_hz', 'reserved_physical_words')
+    suffix = ('frequency_gain_codes', 'actual_output_powers_dbm',
+              'input_powers_dbm', 'acquisition_source', 'integration_time_us',
+              'accumulation_repetitions')
+    if power_sweep:
+        source = SParameterPowerSweepResult.from_sweeps([100], [single])
+        names = ('power_gains',) + common + ('output_powers_dbm',) + suffix
+    else:
+        source = single
+        names = common + ('output_power_dbm', 'nominal_gain_code') + suffix
+    restored = type(source)(*(getattr(source, name) for name in names))
+    assert restored.reserved_physical_words == source.reserved_physical_words
+    assert restored.acquisition_source == 'avg_buffer'
+    assert restored.integration_time_us == 2.5
+    assert restored.accumulation_repetitions == 7
+    assert restored.iq_scale_log2 == 0
+    np.testing.assert_array_equal(restored.iq_traces, source.iq_traces)
+
+
 @pytest.mark.parametrize('storage_mode', ['full_traces', 'mean_iq'])
 @pytest.mark.parametrize('swept', [False, True])
 def test_qcodes_roundtrip_preserves_low_bits_even_when_averaging(tmp_path, monkeypatch, storage_mode, swept):
@@ -109,6 +137,46 @@ def test_sparameter_int64_database_roundtrip(tmp_path, monkeypatch):
     assert loaded.iq_scale_log2==46
     np.testing.assert_array_equal(loaded.iq_traces,raw)
     np.testing.assert_array_equal(loaded.mean_i,result.mean_i)
+
+
+@pytest.mark.parametrize('scale', [0, 46])
+def test_live_power_sweep_preserves_integer_data_and_legacy_units(tmp_path, monkeypatch, scale):
+    import qick_sparameter_sweep as module
+    from test_qick_sparameter_sweep import _config
+    from qick_qcodes_experiment import QcodesRunConfig, QickConnectionConfig, QCODES_STAGING_ENV
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path/'staging'))
+    config = _config(frequency_points=2, scan_time_us=4, power_sweep_enabled=True,
+                     power_start_gain=100, power_end_gain=200, power_points=2,
+                     settle_seconds=0)
+    expected = []
+    class FakeProgram:
+        def __init__(self, point_config):
+            self.config = point_config
+        def acquire_iq(self, soc, counter_progress=None):
+            raw = np.arange(16, dtype=np.int64).reshape(2, 4, 2) + self.config.gain
+            if scale:
+                raw += 2**62 + 3
+            else:
+                raw = raw.astype(np.int16)
+            raw[..., 1] *= -1
+            expected.append(raw)
+            return SParameterSweepResult.from_iq(
+                self.config.requested_frequencies_mhz, self.config.requested_frequencies_mhz,
+                raw, iq_scale_log2=scale)
+        def summary(self):
+            return {'gain': self.config.gain}
+    monkeypatch.setattr(module, 'configure_sparameter_rf_board', lambda *a: {'output': {}, 'readout': {}})
+    monkeypatch.setattr(module, 'build_sparameter_program', lambda cfg, point, **k: FakeProgram(point))
+    path = tmp_path/'power.db'
+    stored = module.run_sparameter_sweep(connection_config=QickConnectionConfig('192.0.2.1'),
+        run_config=QcodesRunConfig(str(path)), sweep_config=config,
+        connector=lambda **k: (object(), {'ddr4_buf': {'iq_scale_log2': scale}}))
+    loaded = module.load_sparameter_run(path, stored.run_id).result
+    assert loaded.iq_scale_log2 == scale
+    np.testing.assert_array_equal(loaded.iq_traces, np.stack(expected))
+    from qcodes import load_by_id
+    dataset = load_by_id(stored.run_id)
+    assert dataset.paramspecs['i_trace'].unit == ('stored int64 codes' if scale else 'ADC units')
 
 
 def test_sparameter_acquisition_detects_iq64_and_byte_address(monkeypatch):
