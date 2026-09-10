@@ -522,6 +522,7 @@ class SParameterSweepResult:
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
+    iq_scale_log2: int = 0
     reserved_physical_words: Optional[int] = None
     output_power_dbm: Optional[float] = None
     nominal_gain_code: Optional[int] = None
@@ -538,6 +539,7 @@ class SParameterSweepResult:
         iq_traces: Any,
         *,
         sample_rate_hz: float = 1_000_000.0,
+        iq_scale_log2: int = 0,
         reserved_physical_words: Optional[int] = None,
         output_power_dbm: Optional[float] = None,
         nominal_gain_code: Optional[int] = None,
@@ -549,13 +551,15 @@ class SParameterSweepResult:
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
         iq = np.asarray(iq_traces)
+        if iq_scale_log2 not in (0, 46) or (iq_scale_log2 and iq.dtype != np.dtype("int64")):
+            raise ValueError("Unsupported IQ integer format or lost raw int64 dtype")
         if iq.ndim != 3 or iq.shape[-1] != 2:
             raise ValueError("S-parameter IQ must have shape (frequency, sample, 2)")
         if iq.shape[0] != frequencies.size or requested.size != frequencies.size:
             raise ValueError("frequency and IQ point counts do not match")
         if iq.shape[1] < 1:
             raise ValueError("every frequency must contain at least one IQ sample")
-        mean = iq.astype(np.float64).mean(axis=1)
+        mean = np.ldexp(iq.astype(np.float64), -iq_scale_log2).mean(axis=1)
         mean_i = mean[:, 0]
         mean_q = mean[:, 1]
         magnitude = np.hypot(mean_i, mean_q)
@@ -625,6 +629,7 @@ class SParameterSweepResult:
             requested_frequencies_mhz=requested,
             frequencies_mhz=frequencies,
             iq_traces=np.ascontiguousarray(iq),
+            iq_scale_log2=int(iq_scale_log2),
             mean_i=np.ascontiguousarray(mean_i),
             mean_q=np.ascontiguousarray(mean_q),
             adc_magnitude_db=np.ascontiguousarray(adc_magnitude_db),
@@ -688,6 +693,7 @@ class SParameterPowerSweepResult:
     magnitude_db: np.ndarray
     phase_unwrapped_deg: np.ndarray
     sample_rate_hz: float
+    iq_scale_log2: int = 0
     reserved_physical_words: Tuple[Optional[int], ...] = ()
     output_powers_dbm: Optional[np.ndarray] = None
     frequency_gain_codes: Optional[np.ndarray] = None
@@ -703,6 +709,7 @@ class SParameterPowerSweepResult:
         iq_traces: Any,
         *,
         sample_rate_hz: float = 1_000_000.0,
+        iq_scale_log2: int = 0,
         reserved_physical_words: Sequence[Optional[int]] = (),
         output_powers_dbm: Optional[Any] = None,
         frequency_gain_codes: Optional[Any] = None,
@@ -713,6 +720,8 @@ class SParameterPowerSweepResult:
         requested = np.asarray(requested_frequencies_mhz, dtype=float).reshape(-1)
         frequencies = np.asarray(frequencies_mhz, dtype=float).reshape(-1)
         iq = np.asarray(iq_traces)
+        if iq_scale_log2 not in (0, 46) or (iq_scale_log2 and iq.dtype != np.dtype("int64")):
+            raise ValueError("Unsupported IQ integer format or lost raw int64 dtype")
         if iq.ndim != 4 or iq.shape[-1] != 2:
             raise ValueError(
                 "power-sweep IQ must have shape (power, frequency, sample, 2)"
@@ -723,7 +732,7 @@ class SParameterPowerSweepResult:
             raise ValueError("requested and actual frequency counts do not match")
         if iq.shape[2] < 1:
             raise ValueError("every power/frequency point needs at least one sample")
-        mean = iq.astype(np.float64).mean(axis=2)
+        mean = np.ldexp(iq.astype(np.float64), -iq_scale_log2).mean(axis=2)
         mean_i = mean[:, :, 0]
         mean_q = mean[:, :, 1]
         magnitude = np.hypot(mean_i, mean_q)
@@ -773,6 +782,7 @@ class SParameterPowerSweepResult:
             requested_frequencies_mhz=np.ascontiguousarray(requested),
             frequencies_mhz=np.ascontiguousarray(frequencies),
             iq_traces=np.ascontiguousarray(iq),
+            iq_scale_log2=int(iq_scale_log2),
             mean_i=np.ascontiguousarray(mean_i),
             mean_q=np.ascontiguousarray(mean_q),
             adc_magnitude_db=np.ascontiguousarray(adc_magnitude_db),
@@ -820,6 +830,8 @@ class SParameterPowerSweepResult:
                 raise ValueError("all power points must share one frequency axis")
             if result.iq_traces.shape != reference.iq_traces.shape:
                 raise ValueError("all power points must share one IQ trace shape")
+            if result.iq_scale_log2 != reference.iq_scale_log2:
+                raise ValueError("all power points must share one integer format")
             if result.sample_rate_hz != reference.sample_rate_hz:
                 raise ValueError("all power points must share one sample rate")
         return cls.from_iq(
@@ -828,6 +840,7 @@ class SParameterPowerSweepResult:
             reference.frequencies_mhz,
             np.stack([result.iq_traces for result in sweeps], axis=0),
             sample_rate_hz=reference.sample_rate_hz,
+            iq_scale_log2=reference.iq_scale_log2,
             reserved_physical_words=[
                 result.reserved_physical_words for result in sweeps
             ],
@@ -939,6 +952,7 @@ def apply_power_calibration(
         result.frequencies_mhz,
         result.iq_traces,
         sample_rate_hz=result.sample_rate_hz,
+        iq_scale_log2=result.iq_scale_log2,
         reserved_physical_words=result.reserved_physical_words,
         output_power_dbm=result.output_power_dbm,
         nominal_gain_code=result.nominal_gain_code,
@@ -1523,7 +1537,7 @@ class SParameterSweepProgram(RAveragerProgram):
             soc.get_ddr4_fir_samples(
                 n_samples=self.scan_samples,
                 n_triggers=n_triggers,
-                start=self.sweep.address,
+                start=self.sweep.address // 4,
                 stride_bytes=self.sweep.stride_bytes,
             )
         )
@@ -1537,6 +1551,7 @@ class SParameterSweepProgram(RAveragerProgram):
             self.frequencies_mhz,
             raw.reshape(n_triggers, self.scan_samples, 2),
             sample_rate_hz=self.fir_output_rate_msps * 1_000_000.0,
+            iq_scale_log2=self._fir_profile.iq_scale_log2,
             reserved_physical_words=reserved,
             output_power_dbm=self.sweep.calibrated_output_power_dbm,
             nominal_gain_code=self.sweep.calibrated_nominal_gain_code,
@@ -1958,6 +1973,8 @@ def _power_result_payload(
         "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
         "sample_rate_hz": result.sample_rate_hz,
         "iq_shape": list(result.iq_traces.shape),
+        "iq_scale_log2": result.iq_scale_log2,
+        "iq_dtype": str(result.iq_traces.dtype),
         "physical_power_calibrated": result.physical_power_calibrated,
     }
     if result.calibrated:
@@ -2118,8 +2135,8 @@ class _SParameterPowerRunWriter:
             label="S-parameter unwrapped phase",
             unit="deg",
         )
-        i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit="ADC units")
-        q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit="ADC units")
+        i_trace = Parameter(I_TRACE_PARAMETER, label="Raw I trace", unit="stored codes")
+        q_trace = Parameter(Q_TRACE_PARAMETER, label="Raw Q trace", unit="stored codes")
         measurement.register_parameter(power_axis)
         measurement.register_parameter(frequency)
         measurement.register_parameter(sample_index, paramtype="array")
@@ -2450,8 +2467,9 @@ def store_sparameter_result(
         ),
         unit="deg",
     )
-    i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=signal_unit)
-    q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=signal_unit)
+    trace_unit = "stored int64 codes" if result.iq_scale_log2 else signal_unit
+    i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=trace_unit)
+    q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=trace_unit)
     measurement.register_parameter(frequency)
     measurement.register_parameter(sample_index, paramtype="array")
     calibrated_gain = None
@@ -2515,6 +2533,8 @@ def store_sparameter_result(
             "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
             "sample_rate_hz": result.sample_rate_hz,
             "iq_shape": list(result.iq_traces.shape),
+            "iq_scale_log2": result.iq_scale_log2,
+            "iq_dtype": str(result.iq_traces.dtype),
             "output_power_dbm": result.output_power_dbm,
             "nominal_gain_code": result.nominal_gain_code,
             "frequency_gain_codes": (
@@ -3043,6 +3063,7 @@ def load_sparameter_run(
             frequencies,
             iq,
             sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+            iq_scale_log2=int(payload.get("iq_scale_log2", 0)),
             output_powers_dbm=payload.get("output_powers_dbm"),
             frequency_gain_codes=payload.get("frequency_gain_codes"),
             actual_output_powers_dbm=payload.get("actual_output_powers_dbm"),
@@ -3057,6 +3078,7 @@ def load_sparameter_run(
             frequencies,
             iq,
             sample_rate_hz=float(payload.get("sample_rate_hz", 1_000_000.0)),
+            iq_scale_log2=int(payload.get("iq_scale_log2", 0)),
             output_power_dbm=payload.get("output_power_dbm"),
             nominal_gain_code=payload.get(
                 "nominal_gain_code",

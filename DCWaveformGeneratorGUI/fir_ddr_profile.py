@@ -36,6 +36,22 @@ class FirDdrProfile:
     config: Mapping[str, Any]
     trigger_delay_units: str = "valid_input_samples"
 
+    @property
+    def iq_component_bits(self) -> int:
+        return int(self.config.get("iq_component_bits", 16))
+
+    @property
+    def iq_scale_log2(self) -> int:
+        return int(self.config.get("iq_scale_log2", 0))
+
+    @property
+    def iq_sample_bytes(self) -> int:
+        return self.iq_component_bits // 4
+
+    @property
+    def format_label(self) -> str:
+        return f"signed int{self.iq_component_bits} I/Q"
+
     def trigger_delay_us_for(self, value: int) -> float:
         """Convert a trigger-delay register value to microseconds."""
 
@@ -149,7 +165,7 @@ class FirDdrProfile:
         else:
             delay = ", tProcessor FIR warm-up compensation"
         return (
-            f"{self.rate_label} ({self.sample_period_us:g} us/sample{delay})"
+            f"{self.rate_label}, {self.format_label} ({self.sample_period_us:g} us/sample{delay})"
         )
 
 
@@ -254,7 +270,19 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
     if not isfinite(group_delay) or group_delay < 0.0:
         raise RuntimeError("HWH fir_group_delay_input_samples must be nonnegative")
 
-    uses_fpga_trigger_delay = profile_name == "50_ksps"
+    component_bits = int(ddr_cfg.get("iq_component_bits", 16))
+    scale_log2 = int(ddr_cfg.get("iq_scale_log2", 0))
+    stream_bits = int(ddr_cfg.get("s_axis_data_width", component_bits*2))
+    version = int(ddr_cfg.get("iq_format_version", 0))
+    if (component_bits, scale_log2, version) not in ((16, 0, 0), (64, 46, 1)) or stream_bits != component_bits*2:
+        raise RuntimeError("Unsupported or inconsistent FIR DDR integer format; update the QICK driver and use matching BIT/HWH files")
+    if int(ddr_cfg.get("iq_sample_bytes", component_bits//4)) != component_bits//4:
+        raise RuntimeError("HWH IQ byte width conflicts with component width")
+    uses_fpga_trigger_delay = profile_name == "50_ksps" or bool(
+        ddr_cfg.get("supports_trigger_delay", False)
+        and ddr_cfg.get("decimation_phase_continuous", False)
+        and not ddr_cfg.get("fir_decimation_phase_reset_on_trigger", False)
+    )
     trigger_delay_samples = 0
     trigger_delay_units = "none"
     if uses_fpga_trigger_delay:
@@ -283,7 +311,8 @@ def resolve_fir_ddr_profile(soccfg: Any, *, context: str = "FIR DDR") -> FirDdrP
         if trigger_delay_samples < 0:
             raise RuntimeError(f"HWH {default_key} must be nonnegative")
         if (
-            trigger_delay_units == "s_axis_aclk_cycles"
+            profile_name == "50_ksps"
+            and trigger_delay_units == "s_axis_aclk_cycles"
             and trigger_delay_samples
             == _LEGACY_400_MHZ_TRIGGER_DELAY_CYCLES
             and abs(input_rate_mhz - 300.0) <= 1.0e-9
@@ -315,4 +344,21 @@ __all__ = [
     "FirDdrProfile",
     "format_sample_rate_hz",
     "resolve_fir_ddr_profile",
+    "iq_in_input_units",
+    "result_iq_in_input_units",
 ]
+
+
+def iq_in_input_units(iq: Any, scale_log2: int = 0):
+    """Return a floating display/analysis copy; never modify raw integer data."""
+    import numpy as np
+    raw = np.asarray(iq)
+    if scale_log2 and (raw.dtype.kind != 'i' or raw.dtype.itemsize != 8):
+        raise RuntimeError("IQ64 firmware must return raw signed-int64 data")
+    return np.ldexp(raw.astype(np.float64), -int(scale_log2))
+
+
+def result_iq_in_input_units(result: Any):
+    import numpy as np
+    scale = int(getattr(result, "iq_scale_log2", 0))
+    return iq_in_input_units(result.iq, scale) if scale else np.asarray(result.iq)

@@ -20,6 +20,10 @@ import tempfile
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    from .fir_ddr_profile import result_iq_in_input_units
+except ImportError:
+    from fir_ddr_profile import result_iq_in_input_units
 
 
 ProgressCallback = Callable[[int, str], None]
@@ -1455,6 +1459,25 @@ def load_qick_iq_arrays(
     }
 
 
+def load_qick_raw_int64_arrays(dataset, *, shape=None):
+    """Load exact IQ64 arrays, including all pre-average repetitions.
+
+    Pass the ``raw_iq_shape`` from the run's acquisition metadata to restore
+    the original (point, repetition, sample, IQ) shape. Without it the result
+    is a flat (sample, IQ) array. No floating conversion is performed.
+    """
+    lanes = []
+    for name in ("i_raw_int64", "q_raw_int64"):
+        values = np.asarray(dataset.get_parameter_data(name)[name][name])
+        if values.dtype == object:
+            values = np.concatenate([np.asarray(row).reshape(-1) for row in values])
+        if values.dtype != np.dtype("int64"):
+            raise RuntimeError("Stored raw IQ is not signed int64")
+        lanes.append(values.reshape(-1))
+    result = np.stack(lanes, axis=-1)
+    return result if shape is None else result.reshape(tuple(shape))
+
+
 def _measurement_iq_values(
     iq: Any,
     rf_settings: Mapping[str, Any],
@@ -1584,8 +1607,12 @@ def store_qick_result(
         ) from exc
 
     raw_iq = np.asarray(ddr_result.iq)
+    raw_scale_log2 = int(getattr(ddr_result, "iq_scale_log2", 0))
+    store_raw_int64 = raw_scale_log2 != 0
+    if store_raw_int64 and raw_iq.dtype != np.dtype("int64"):
+        raise RuntimeError("IQ64 capture must retain signed-int64 raw data")
     iq, iq_unit, measurement_mode, measurement_conversion = (
-        _measurement_iq_values(raw_iq, rf_settings)
+        _measurement_iq_values(result_iq_in_input_units(ddr_result), rf_settings)
     )
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError("DDR IQ must have shape (point, repetition, sample, 2)")
@@ -1701,6 +1728,13 @@ def store_qick_result(
             setpoints=(*setpoint_parameters, sample_index),
             paramtype="array",
         )
+
+    raw_parameters = []
+    if store_raw_int64:
+        for lane in ("i", "q"):
+            parameter = Parameter(f"{lane}_raw_int64", label=f"Raw {lane.upper()} integer", unit="integer codes")
+            measurement.register_parameter(parameter, setpoints=tuple(setpoint_parameters), paramtype="array")
+            raw_parameters.append(parameter)
 
     vertex_parameters = []
     if vertex_data is not None:
@@ -1890,6 +1924,10 @@ def store_qick_result(
                 "q": str(iq[..., 1].dtype),
             },
             "raw_iq_dtype": str(raw_iq.dtype),
+            "raw_iq_scale_log2": raw_scale_log2,
+            "raw_iq_shape": list(raw_iq.shape),
+            "raw_iq_parameters": [p.name for p in raw_parameters],
+            "raw_iq_storage": "exact_int64_arrays" if store_raw_int64 else "legacy",
             "iq_unit": iq_unit,
             "measurement_mode": measurement_mode,
             "measurement_conversion": dict(measurement_conversion),
@@ -2059,10 +2097,20 @@ def store_qick_result(
                 for axis_index, parameter in enumerate(sweep_parameters)
             ]
             for repetition in range(repetition_count):
+                raw_results = []
+                if store_raw_int64:
+                    # Even when display/storage policy averages repetitions,
+                    # preserve every original integer in a separate array.
+                    raw_trace = (raw_iq[point_index].reshape(-1, 2)
+                                 if iq_repetition_policy == IQ_REPETITION_POLICY_COHERENT_AVERAGE
+                                 else raw_iq[point_index, repetition])
+                    raw_results = [(parameter, np.ascontiguousarray(raw_trace[:, lane]))
+                                   for lane, parameter in enumerate(raw_parameters)]
                 datasaver.add_result(
                     *coordinate_results,
                     (repetition_index, repetition),
                     (sample_index, sample_index_values),
+                    *raw_results,
                     (
                         i_trace,
                         np.ascontiguousarray(
@@ -2368,6 +2416,7 @@ __all__ = [
     "describe_rf_output",
     "execute_qick_sequence",
     "load_qick_iq_arrays",
+    "load_qick_raw_int64_arrays",
     "measurement_iq_values",
     "normalize_awg_metadata_mode",
     "normalize_compile_validation_mode",

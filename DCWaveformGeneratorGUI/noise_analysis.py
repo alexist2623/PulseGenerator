@@ -21,6 +21,10 @@ import traceback
 from typing import Any, Mapping, Optional
 
 import numpy as np
+try:
+    from .fir_ddr_profile import result_iq_in_input_units
+except ImportError:
+    from fir_ddr_profile import result_iq_in_input_units
 from PyQt5 import QtCore, QtWidgets
 
 try:
@@ -389,6 +393,8 @@ class NoiseTraceCollection:
     source: str = ""
     database_path: str = ""
     run_id: int = 0
+    raw_iq: np.ndarray | None = None
+    iq_scale_log2: int = 0
 
     def __post_init__(self) -> None:
         traces = np.asarray(self.i_traces)
@@ -598,12 +604,14 @@ class NoiseAcquisitionWorker(QtCore.QObject):
                 progress_callback=self.progress_changed.emit,
             )
             collection = NoiseTraceCollection(
-                i_traces=np.asarray(result.iq[:, 0], dtype=np.float64).reshape(
+                i_traces=result_iq_in_input_units(result)[:, 0].astype(np.float64, copy=False).reshape(
                     1, 1, -1
                 ),
                 sample_rate_hz=result.sample_rate_hz,
                 unit="ADC units",
                 source=result.source,
+                raw_iq=result.iq,
+                iq_scale_log2=int(getattr(result, "iq_scale_log2", 0)),
             )
         except Exception:
             self.failed.emit(traceback.format_exc())
