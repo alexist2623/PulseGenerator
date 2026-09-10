@@ -19,6 +19,10 @@ import traceback
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    from .fir_ddr_profile import result_iq_in_input_units
+except ImportError:
+    from fir_ddr_profile import result_iq_in_input_units
 from PyQt5 import QtCore, QtWidgets
 
 try:
@@ -1623,7 +1627,7 @@ def reduce_fir_stability_result(
     Magnitude and phase are then derived from that complex mean.
     """
     config.validate_full_scale(full_scale_mv)
-    iq = np.asarray(ddr_result.iq)
+    iq = result_iq_in_input_units(ddr_result)
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError(
             "stability I/Q must have shape "

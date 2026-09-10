@@ -160,6 +160,8 @@ class NoiseAcquisitionResult:
     reserved_physical_words: Optional[int]
     capture_seconds: float
     source: str
+    iq_scale_log2: int = 0
+    iq_component_bits: int = 16
 
     def __post_init__(self) -> None:
         iq = np.asarray(self.iq)
@@ -322,10 +324,12 @@ def acquire_noise_fir_trace(
     raw = np.asarray(soc.get_ddr4_fir_samples(
         n_samples=config.fir_samples,
         n_triggers=1,
-        start=config.address,
+        start=config.address // 4,
         stride_bytes=None,
     ))
     expected_shape = (config.fir_samples, 2)
+    if profile.iq_component_bits == 64 and raw.dtype != np.dtype("int64"):
+        raise RuntimeError("IQ64 firmware did not return raw signed-int64 samples")
     if raw.shape != expected_shape:
         raise RuntimeError(
             f"unexpected FIR DDR shape {raw.shape}; expected {expected_shape}"
@@ -333,6 +337,8 @@ def acquire_noise_fir_trace(
     progress(100, "Noise trace acquired")
     return NoiseAcquisitionResult(
         iq=raw,
+        iq_scale_log2=profile.iq_scale_log2,
+        iq_component_bits=profile.iq_component_bits,
         sample_rate_hz=output_rate_hz,
         reserved_physical_words=(
             None if reserved is None else int(reserved)
