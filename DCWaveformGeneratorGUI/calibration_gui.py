@@ -40,6 +40,7 @@ try:
         InputPowerCalibrationConfig,
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
+        prepare_input_power_plan,
         run_input_power_calibration,
         run_output_power_calibration,
     )
@@ -57,6 +58,7 @@ except ImportError:
         InputPowerCalibrationConfig,
         OscilloscopeConfig,
         OutputPowerCalibrationConfig,
+        prepare_input_power_plan,
         run_input_power_calibration,
         run_output_power_calibration,
     )
@@ -500,6 +502,121 @@ class InputCalibrationPlotWidget(QtWidgets.QWidget):
             self.canvas.draw_idle()
 
 
+class OutputGainPlotWidget(QtWidgets.QWidget):
+    """Compare scope measurements, the power model, and selected DAC gains."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plan = None
+        self.displayed_series = []
+        layout = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QHBoxLayout()
+        self.frequency_selector = QtWidgets.QComboBox()
+        self.x_scale = InputCalibrationPlotWidget._scale_combo("Log")
+        controls.addWidget(QtWidgets.QLabel("Frequency:"))
+        controls.addWidget(self.frequency_selector, 1)
+        controls.addWidget(QtWidgets.QLabel("Gain axis:"))
+        controls.addWidget(self.x_scale)
+        layout.addLayout(controls)
+        if _USE_PYQTGRAPH:
+            self.graph = pg.PlotWidget(self)
+            self.graph.setBackground("w")
+            self.plot_item = self.graph.getPlotItem()
+            self.legend = self.plot_item.addLegend()
+            layout.addWidget(self.graph)
+        else:
+            self.figure = Figure(tight_layout=True)
+            self.canvas = Canvas(self.figure)
+            self.plot_item = self.figure.subplots()
+            layout.addWidget(self.canvas)
+        self.details = QtWidgets.QLabel("Check output power to load measured gain/power curves")
+        self.details.setWordWrap(True)
+        self.details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.details)
+        self.setMinimumHeight(380)
+        self.frequency_selector.currentIndexChanged.connect(self._render)
+        self.x_scale.currentIndexChanged.connect(self._render)
+
+    def set_plan(self, plan):
+        self.plan = plan
+        self.setEnabled(True)
+        self.frequency_selector.blockSignals(True)
+        self.frequency_selector.clear()
+        for index, frequency in enumerate(plan["frequencies_mhz"]):
+            self.frequency_selector.addItem(f"{frequency:.9g} MHz", index)
+        self.frequency_selector.blockSignals(False)
+        self._render()
+
+    def _render(self, *_args):
+        if self.plan is None:
+            return
+        plan = self.plan
+        index = int(self.frequency_selector.currentData())
+        frequency = plan["frequencies_mhz"][index]
+        calibration = plan["calibration"]
+        model = plan["regression"] or calibration
+        reference = calibration.summary
+        att_delta = (sum(plan["attenuation"].values())
+                     - reference.calibration_att1_db - reference.calibration_att2_db)
+        measured_frequencies = calibration.frequencies_mhz
+        nearest = int(np.clip(np.searchsorted(measured_frequencies, frequency), 0, measured_frequencies.size - 1))
+        indices = [nearest]
+        if nearest > 0 and not np.isclose(frequency, measured_frequencies[nearest], atol=1e-5, rtol=0):
+            indices.insert(0, nearest - 1)
+        series = []
+        for measured_index in indices:
+            measured_frequency = measured_frequencies[measured_index]
+            gains, powers = calibration._curves[float(measured_frequency)]
+            valid = np.isfinite(gains) & np.isfinite(powers) & (gains > 0)
+            series.append((gains[valid], powers[valid] - att_delta,
+                           f"Measured {measured_frequency:g} MHz (ATT adjusted)", "measured"))
+        curve_gains = np.geomspace(1, MAX_RF_OUTPUT_GAIN, 400)
+        curve_power = model.output_power_dbm(frequency, curve_gains, **plan["attenuation"])
+        series.append((curve_gains, curve_power,
+                       "Gain regression estimate" if plan["regression"] else "Linear amplitude estimate", "fit"))
+        selected_gains = plan["gain_codes"][:, index]
+        selected_powers = plan["output_power_dbm"][:, index]
+        series.append((selected_gains, selected_powers, "Selected calibration points", "selected"))
+        self.displayed_series = series
+        self.plot_item.clear()
+        if _USE_PYQTGRAPH:
+            self.legend.clear()
+        for gains, powers, label, kind in series:
+            color = {"measured": "#4778ad", "fit": "#c38310", "selected": "#c62828"}[kind]
+            if _USE_PYQTGRAPH:
+                self.plot_item.plot(gains, powers, name=label,
+                    pen=pg.mkPen(color, width=2, style=QtCore.Qt.DashLine) if kind == "fit" else None,
+                    symbol=None if kind == "fit" else ("x" if kind == "selected" else "o"),
+                    symbolPen=color, symbolBrush=color, symbolSize=9)
+            else:
+                self.plot_item.plot(gains, powers,
+                    "--" if kind == "fit" else ("x" if kind == "selected" else "o"),
+                    label=label, color=color)
+        if _USE_PYQTGRAPH:
+            self.plot_item.setLabel("bottom", "DAC gain")
+            self.plot_item.setLabel("left", "Output power", units="dBm")
+            self.plot_item.setLogMode(x=self.x_scale.currentData() == "log", y=False)
+            self.plot_item.showGrid(x=True, y=True, alpha=0.25)
+            self.plot_item.autoRange()
+        else:
+            self.plot_item.set_xlabel("DAC gain")
+            self.plot_item.set_ylabel("Output power [dBm]")
+            self.plot_item.set_xscale(self.x_scale.currentData())
+            self.plot_item.grid(True, alpha=0.25)
+            self.plot_item.legend(fontsize=8)
+            self.canvas.draw_idle()
+        details = (f"Output Run {reference.run_id} | selected gain {selected_gains.min()}..{selected_gains.max()} | "
+                   f"estimated output {selected_powers.min():.5g}..{selected_powers.max():.5g} dBm")
+        if plan["regression"]:
+            details += "\n" + "; ".join(
+                f"{plan['regression'].fits[i]['frequency_mhz']:g} MHz: "
+                f"slope {plan['regression'].fits[i]['slope']:.4g}, "
+                f"R² {plan['regression'].fits[i]['r_squared']:.5f}, "
+                f"RMSE {plan['regression'].fits[i]['rmse_db']:.4g} dB"
+                for i in indices)
+        self.details.setText(details)
+
+
 class DcVoltageCalibrationPlotWidget(QtWidgets.QWidget):
     """Plot measured zero-frequency ADC-I against commanded DC voltage."""
 
@@ -913,6 +1030,23 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_gain_end = self._gain(MAX_RF_OUTPUT_GAIN)
         self.input_gain_points = self._points(16)
         self.input_gain_scale = self._scale_combo()
+        self.input_sweep_mode = QtWidgets.QComboBox()
+        self.input_sweep_mode.addItem("DAC gain", False)
+        self.input_sweep_mode.addItem("Output power (dBm, gain regression)", True)
+        self.input_power_start = QtWidgets.QDoubleSpinBox()
+        self.input_power_end = QtWidgets.QDoubleSpinBox()
+        for widget, value in ((self.input_power_start, -40.0), (self.input_power_end, -20.0)):
+            widget.setRange(-200.0, 100.0)
+            widget.setDecimals(6)
+            widget.setValue(value)
+            widget.setSuffix(" dBm")
+            widget.setToolTip("Power at the DAC output connector; external path loss is subtracted for ADC input power.")
+        self.input_power_points = self._points(16)
+        self.input_gain_regression = QtWidgets.QCheckBox("Use measured gain/power regression")
+        self.input_gain_regression.setToolTip(
+            "Fit dBm = a*20*log10(gain/32767) + b at each measured frequency. "
+            "Gain extrapolation shows a warning and remains usable."
+        )
         self.input_acquisition_source = QtWidgets.QComboBox()
         input_acquisition_labels = {
             "fir_ddr": "FIR DDR trace mean",
@@ -990,6 +1124,11 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("End gain:", self.input_gain_end),
             ("Gain points:", self.input_gain_points),
             ("Gain spacing:", self.input_gain_scale),
+            ("Sweep by:", self.input_sweep_mode),
+            ("Start output power:", self.input_power_start),
+            ("End output power:", self.input_power_end),
+            ("Power points:", self.input_power_points),
+            ("Output power model:", self.input_gain_regression),
             ("I/Q acquisition:", self.input_acquisition_source),
             ("Integration time per point:", self.input_scan_time),
             ("External path loss:", self.input_path_loss),
@@ -1000,7 +1139,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         ):
             form.addRow(label, widget)
         form.insertRow(
-            9,
+            14,
             "FPGA trigger-to-store delay:",
             input_fpga_delay_row,
         )
@@ -1022,17 +1161,78 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         self.run_input_button.clicked.connect(self.input_requested.emit)
         vertical.insertWidget(1, self.run_input_button)
+        output_group = QtWidgets.QGroupBox("DAC Gain / Output Power")
+        output_layout = QtWidgets.QVBoxLayout(output_group)
+        self.check_input_output_power = QtWidgets.QPushButton("Check output power / Update plot")
+        self.check_input_output_power.clicked.connect(self._check_input_output_power)
+        self.input_output_power_status = QtWidgets.QLabel("Check output power before selecting calibration powers")
+        self.input_output_power_status.setWordWrap(True)
+        self.input_output_power_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.input_output_power_plot = OutputGainPlotWidget(output_group)
+        output_layout.addWidget(self.check_input_output_power)
+        output_layout.addWidget(self.input_output_power_status)
+        output_layout.addWidget(self.input_output_power_plot)
+        vertical.insertWidget(2, output_group)
+        self.input_sweep_mode.currentIndexChanged.connect(self._update_input_power_controls)
+        self._update_input_power_controls()
+        for widget in (
+            self.database_path, self.input_frequency_start, self.input_frequency_end,
+            self.input_frequency_points, self.input_gain_start, self.input_gain_end,
+            self.input_gain_points, self.input_gain_scale, self.input_sweep_mode,
+            self.input_power_start, self.input_power_end, self.input_power_points,
+            self.input_gain_regression, self.input_output_board, self.input_output_att1,
+            self.input_output_att2, self.input_output_filter, self.input_output_cutoff,
+            self.input_output_bandwidth,
+        ):
+            signal = (widget.textChanged if isinstance(widget, QtWidgets.QLineEdit) else
+                      widget.currentIndexChanged if isinstance(widget, QtWidgets.QComboBox) else
+                      widget.toggled if isinstance(widget, QtWidgets.QCheckBox) else widget.valueChanged)
+            signal.connect(self._mark_input_output_power_stale)
         plot_group = QtWidgets.QGroupBox("Input Power / ADC Response")
         plot_layout = QtWidgets.QVBoxLayout(plot_group)
         self.input_response_plot = InputCalibrationPlotWidget(plot_group)
         plot_layout.addWidget(self.input_response_plot)
-        vertical.insertWidget(2, plot_group)
+        vertical.insertWidget(3, plot_group)
         self.input_output_board.currentTextChanged.connect(self._update_board_controls)
         self.input_board.currentTextChanged.connect(self._update_board_controls)
         self._update_board_controls()
         self.input_path_diagram = self._new_path_diagram("input")
+        self.input_path_diagram.settings_applied.connect(self._mark_input_output_power_stale)
         vertical.insertWidget(0, self.input_path_diagram)
         return scroll
+
+    def _update_input_power_controls(self, *_args):
+        power_mode = bool(self.input_sweep_mode.currentData())
+        for widget in (self.input_gain_start, self.input_gain_end, self.input_gain_points, self.input_gain_scale):
+            widget.setEnabled(not power_mode)
+        for widget in (self.input_power_start, self.input_power_end, self.input_power_points):
+            widget.setEnabled(power_mode)
+        self.input_gain_regression.setEnabled(not power_mode)
+        if power_mode:
+            self.input_gain_regression.setChecked(True)
+
+    def _mark_input_output_power_stale(self, *_args):
+        self.input_output_power_plot.setEnabled(False)
+        self.input_output_power_status.setStyleSheet("")
+        self.input_output_power_status.setText("Settings changed: check output power to update the plot. The run uses current settings.")
+
+    def prepare_input_output_power(self):
+        plan = prepare_input_power_plan(self.input_config())
+        self.input_output_power_plot.set_plan(plan)
+        warnings = plan["warnings"]
+        self.input_output_power_status.setStyleSheet("color: #996000;" if warnings else "")
+        self.input_output_power_status.setText(
+            "Warning: " + " ".join(warnings) if warnings else "Output power model loaded; calibration can proceed."
+        )
+        return plan
+
+    def _check_input_output_power(self):
+        try:
+            self.prepare_input_output_power()
+        except (OSError, LookupError, RuntimeError, TypeError, ValueError) as exc:
+            self.input_output_power_plot.setEnabled(False)
+            self.input_output_power_status.setStyleSheet("color: #b71c1c;")
+            self.input_output_power_status.setText(str(exc))
 
     def _build_dc_voltage_tab(self) -> QtWidgets.QWidget:
         scroll, form, vertical = self._scroll_form(
@@ -1348,6 +1548,11 @@ class CalibrationPanel(QtWidgets.QWidget):
             gain_end=self.input_gain_end.value(),
             gain_points=self.input_gain_points.value(),
             gain_scale=str(self.input_gain_scale.currentData()),
+            power_sweep_enabled=bool(self.input_sweep_mode.currentData()),
+            power_start_dbm=self.input_power_start.value(),
+            power_end_dbm=self.input_power_end.value(),
+            power_points=self.input_power_points.value(),
+            use_gain_regression=self.input_gain_regression.isChecked(),
             acquisition_source=str(self.input_acquisition_source.currentData()),
             scan_time_us=self.input_scan_time.value(),
             output_att1_db=(
@@ -1742,6 +1947,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             (self.input_gain_start, input_config.gain_start),
             (self.input_gain_end, input_config.gain_end),
             (self.input_gain_points, input_config.gain_points),
+            (self.input_power_start, input_config.power_start_dbm),
+            (self.input_power_end, input_config.power_end_dbm),
+            (self.input_power_points, input_config.power_points),
             (self.input_scan_time, input_config.scan_time_us),
             (self.input_output_att1, input_config.output_att1_db),
             (self.input_output_att2, input_config.output_att2_db),
@@ -1795,6 +2003,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.input_gain_scale.setCurrentIndex(
             self.input_gain_scale.findData(input_config.gain_scale)
         )
+        self.input_sweep_mode.setCurrentIndex(
+            self.input_sweep_mode.findData(input_config.power_sweep_enabled)
+        )
+        self.input_gain_regression.setChecked(
+            input_config.use_gain_regression or input_config.power_sweep_enabled
+        )
+        self._update_input_power_controls()
         self.input_acquisition_source.setCurrentIndex(
             self.input_acquisition_source.findData(
                 input_config.acquisition_source
@@ -1832,6 +2047,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.browse_database.setEnabled(not running)
         for widget in (
             self.input_acquisition_source,
+            self.input_sweep_mode,
+            self.input_gain_regression,
+            self.input_gain_start, self.input_gain_end, self.input_gain_points,
+            self.input_gain_scale, self.input_power_start, self.input_power_end,
+            self.input_power_points, self.check_input_output_power,
             self.input_override_fpga_trigger_delay,
             self.input_fpga_trigger_delay_us,
             self.dc_voltage_override_fpga_trigger_delay,
@@ -1839,6 +2059,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         ):
             widget.setEnabled(not running)
         if not running:
+            self._update_input_power_controls()
             self._update_input_acquisition_source_state()
         for diagram in self._path_diagrams.values():
             diagram.setEnabled(not running)

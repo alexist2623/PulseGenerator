@@ -30,6 +30,7 @@ try:
         AVG_SWEEP_MODES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
+        MAGNITUDE_DISPLAY_MODES,
         MAX_RF_OUTPUT_GAIN,
         POWER_SCALES,
         SParameterSweepConfig,
@@ -49,6 +50,7 @@ except ImportError:
         AVG_SWEEP_MODES,
         FILTER_TYPES,
         INPUT_CALIBRATION_SELECTIONS,
+        MAGNITUDE_DISPLAY_MODES,
         MAX_RF_OUTPUT_GAIN,
         POWER_SCALES,
         SParameterSweepConfig,
@@ -539,6 +541,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
     """Controls for an RF-only generator/readout hardware frequency sweep."""
 
     run_requested = QtCore.pyqtSignal()
+    phase_display_changed = QtCore.pyqtSignal(str)
+    magnitude_display_changed = QtCore.pyqtSignal(str)
     load_requested = QtCore.pyqtSignal(int)
     path_settings_applied = QtCore.pyqtSignal(object)
     front_panel_requested = QtCore.pyqtSignal()
@@ -873,8 +877,41 @@ class SParameterSweepPanel(QtWidgets.QWidget):
             self._update_fir_profile_status
         )
 
+        display_group = QtWidgets.QGroupBox("Plot Display")
+        display_form = QtWidgets.QFormLayout(display_group)
+        self.phase_display = QtWidgets.QComboBox()
+        self.phase_display.addItem("Unwrapped", "unwrapped")
+        self.phase_display.addItem("Wrapped (-180 to 180 deg)", "wrapped")
+        self.phase_display.setToolTip("Wrapped phase uses atan2(mean Q, mean I), without unwrapping or phase-line subtraction.")
+        self.phase_display.currentIndexChanged.connect(
+            lambda: self.phase_display_changed.emit(str(self.phase_display.currentData()))
+        )
+        display_form.addRow("Phase:", self.phase_display)
+        self.magnitude_display = QtWidgets.QComboBox()
+        for label, mode in (
+            ("Response (dB, existing display)", "response_db"),
+            ("ADC units (linear axis)", "adc_linear"),
+            ("ADC units (log axis)", "adc_log"),
+            ("ADC magnitude (20 log10, dB)", "adc_db"),
+        ):
+            self.magnitude_display.addItem(label, mode)
+        self.magnitude_display.setToolTip(
+            "ADC magnitude is hypot(mean I, mean Q), before power calibration. "
+            "Log axis retains ADC-unit values; dB uses 20*log10(magnitude). "
+            "Zero is shown on the linear axis and omitted on logarithmic displays."
+        )
+        self.magnitude_display.currentIndexChanged.connect(
+            lambda: self.magnitude_display_changed.emit(str(self.magnitude_display.currentData()))
+        )
+        display_form.addRow("Magnitude:", self.magnitude_display)
+        content_layout.addWidget(display_group)
+
         storage_group = QtWidgets.QGroupBox("S-Parameter Database")
         storage_form = QtWidgets.QFormLayout(storage_group)
+        self.save_to_qcodes = QtWidgets.QCheckBox("Save measurement to QCoDeS DB")
+        self.save_to_qcodes.setChecked(True)
+        self.save_to_qcodes.setToolTip("Save I/Q, magnitude, wrapped phase and unwrapped phase. When off, results remain in memory only.")
+        storage_form.addRow(self.save_to_qcodes)
         self.database_path = QtWidgets.QLineEdit(DEFAULT_SPARAMETER_DB_PATH)
         self.browse_database = QtWidgets.QToolButton()
         self.browse_database.setIcon(
@@ -1358,12 +1395,16 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 None if self.stride_bytes.value() == 0 else self.stride_bytes.value()
             ),
             force_overwrite=self.force_overwrite.isChecked(),
+            phase_display=str(self.phase_display.currentData()),
+            magnitude_display=str(self.magnitude_display.currentData()),
+            save_to_qcodes=self.save_to_qcodes.isChecked(),
             **self._internal_settings,
         )
 
     def settings_dict(self) -> Mapping[str, Any]:
         return {
-            "database_path": self.database_path_value(),
+            "database_path": (self.database_path_value() if self.database_path.text().strip()
+                              or self.save_to_qcodes.isChecked() else ""),
             **asdict(self.config()),
         }
 
@@ -1378,9 +1419,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         database_path = str(
             values.pop("database_path", DEFAULT_SPARAMETER_DB_PATH)
         ).strip()
-        if not database_path:
-            raise ValueError("RF S-parameter database path must not be empty")
         config = SParameterSweepConfig(**values)
+        if not database_path and config.save_to_qcodes:
+            raise ValueError("RF S-parameter database path must not be empty")
         widgets = (
             (self.output_ch, config.output_ch),
             (self.readout_ch, config.readout_ch),
@@ -1448,6 +1489,9 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.path_diagram._update_board_controls()
         self.path_diagram.apply_settings(emit=False)
         self.database_path.setText(database_path)
+        self.save_to_qcodes.setChecked(config.save_to_qcodes)
+        self.phase_display.setCurrentIndex(self.phase_display.findData(config.phase_display))
+        self.magnitude_display.setCurrentIndex(self.magnitude_display.findData(config.magnitude_display))
         power_scale_index = self.power_scale.findData(config.power_scale)
         if power_scale_index < 0:
             raise ValueError(f"unsupported power scale {config.power_scale!r}")
@@ -1486,6 +1530,7 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self._update_acquisition_source_state()
 
     def set_running(self, running: bool, message: str) -> None:
+        self.save_to_qcodes.setEnabled(not running)
         self.run_button.setEnabled(not running)
         self.load_button.setEnabled(not running)
         self.database_path.setEnabled(not running)
@@ -1526,7 +1571,8 @@ class SParameterSweepPanel(QtWidgets.QWidget):
 
     def show_result(self, stored) -> None:
         result = stored.result
-        self.run_id.setValue(stored.run_id)
+        if stored.run_id is not None:
+            self.run_id.setValue(stored.run_id)
         power_count = int(getattr(result, "power_count", 1))
         sample_rate_hz = float(
             getattr(result, "sample_rate_hz", 1_000_000.0)
@@ -1547,19 +1593,21 @@ class SParameterSweepPanel(QtWidgets.QWidget):
         self.set_running(
             False,
             (
-                f"Run {stored.run_id}: {power_count} power point(s) x "
+                f"{'Not saved' if stored.run_id is None else f'Run {stored.run_id}'}: {power_count} power point(s) x "
                 f"{result.frequencies_mhz.size} frequency points, "
                 f"{acquisition_text}\n"
-                f"{stored.database_path}"
+                f"{stored.database_path if stored.run_id is not None else 'QCoDeS saving off; result is in memory only'}"
             ),
         )
 
     def show_partial_result(self, stored) -> None:
         result = stored.result
-        self.run_id.setValue(stored.run_id)
+        if stored.run_id is not None:
+            self.run_id.setValue(stored.run_id)
         power_count = int(getattr(result, "power_count", 1))
         self.status.setText(
-            f"Run {stored.run_id}: {power_count} power point(s) saved to DB"
+            (f"Run {stored.run_id}: {power_count} power point(s) saved to DB"
+             if stored.run_id is not None else f"{power_count} power point(s) acquired; QCoDeS saving off")
         )
 
 
@@ -1658,8 +1706,15 @@ class _SParameterPlotMixin:
     def _initialize_plot_tools(self) -> None:
         self._frequency = np.empty(0, dtype=float)
         self._magnitude_values = np.empty((0, 0), dtype=float)
+        self._magnitude_response_db = np.empty((0, 0), dtype=float)
+        self._adc_magnitude_units = np.empty((0, 0), dtype=float)
+        self._adc_magnitude_db = np.empty((0, 0), dtype=float)
+        self._magnitude_mode = "response_db"
         self._phase_original = np.empty((0, 0), dtype=float)
         self._phase_display = np.empty((0, 0), dtype=float)
+        self._phase_unwrapped = np.empty((0, 0), dtype=float)
+        self._phase_wrapped = np.empty((0, 0), dtype=float)
+        self._phase_mode = "unwrapped"
         self._curve_labels = []
         self._visible_curve_indices = np.empty(0, dtype=np.int64)
         self._physical_power_calibrated = False
@@ -1702,7 +1757,7 @@ class _SParameterPlotMixin:
         )
         self.phase_reset_button = QtWidgets.QToolButton(bar)
         self.phase_reset_button.setText("Reset phase")
-        self.phase_reset_button.setToolTip("Restore the measured unwrapped phase")
+        self.phase_reset_button.setToolTip("Restore the measured phase in the selected display mode")
         self.plot_status = QtWidgets.QLabel("No S-parameter result loaded", bar)
         self.plot_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
@@ -1732,9 +1787,93 @@ class _SParameterPlotMixin:
     def _set_data_controls_enabled(self, enabled: bool) -> None:
         self.marker_button.setEnabled(enabled)
         self.clear_markers_button.setEnabled(enabled)
-        self.phase_range_button.setEnabled(enabled)
-        self.phase_subtract_button.setEnabled(enabled)
+        self.phase_range_button.setEnabled(enabled and self._phase_mode == "unwrapped")
+        self.phase_subtract_button.setEnabled(enabled and self._phase_mode == "unwrapped")
         self.phase_reset_button.setEnabled(enabled)
+
+    def _set_phase_label(self) -> None:
+        label = "Unwrapped phase" if self._phase_mode == "unwrapped" else "Wrapped phase"
+        if hasattr(self.phase_plot, "setLabel"):
+            self.phase_plot.setLabel("left", label, units="deg")
+        else:
+            self.phase_plot.set_ylabel(f"{label} [deg]")
+
+    def _select_magnitude_values(self) -> None:
+        if self._magnitude_mode == "response_db":
+            values = self._magnitude_response_db
+        elif self._magnitude_mode == "adc_db":
+            values = self._adc_magnitude_db
+        else:
+            values = self._adc_magnitude_units
+        self._magnitude_values = np.array(values, dtype=float, copy=True)
+        if self._magnitude_mode == "adc_log":
+            self._magnitude_values[self._magnitude_values <= 0] = np.nan
+
+    def _set_magnitude_axis(self) -> None:
+        adc_units = self._magnitude_mode in ("adc_linear", "adc_log")
+        label = ("S21 (P input / P output)" if self._magnitude_mode == "response_db"
+                 and self._physical_power_calibrated else "ADC magnitude")
+        unit = "ADC units" if adc_units else "dB"
+        log_axis = self._magnitude_mode == "adc_log"
+        if _USE_PYQTGRAPH:
+            self.magnitude_plot.setLabel("left", label, units=unit)
+            self.magnitude_plot.setLogMode(x=False, y=log_axis)
+        else:
+            self.magnitude_plot.set_ylabel(f"{label} [{unit}]")
+            if log_axis and not np.any(np.isfinite(self._magnitude_values)):
+                self.magnitude_plot.set_ylim(0.1, 1.0)
+            self.magnitude_plot.set_yscale("log" if log_axis else "linear")
+
+    def set_magnitude_display(self, mode: str) -> None:
+        if mode not in MAGNITUDE_DISPLAY_MODES:
+            raise ValueError(f"magnitude display must be one of {MAGNITUDE_DISPLAY_MODES}")
+        if mode == self._magnitude_mode:
+            return
+        self._magnitude_mode = mode
+        self._select_magnitude_values()
+        if self._frequency.size:
+            self.clear_markers()
+            self._render_curves()
+            self._set_result_status()
+            self.fit_view()
+        else:
+            self._set_magnitude_axis()
+
+    def _nearest_plot_point(self, name, values, x, y, *, log_coordinates=False):
+        """Choose by displayed distance, but always return the actual unit value."""
+        shown = self._visible_values(values)
+        log_axis = name == "Magnitude" and self._magnitude_mode == "adc_log"
+        if log_axis:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                coordinates = np.log10(shown)
+                target_y = y if log_coordinates else (None if y is None else np.log10(y))
+        else:
+            coordinates, target_y = shown, y
+        curve, point, frequency, _value = nearest_sparameter_point(
+            self._frequency, coordinates, x, target_y
+        )
+        return self._original_curve_index(curve), point, frequency, float(shown[curve, point])
+
+    def _pyqtgraph_marker_y(self, name, value):
+        return np.log10(value) if name == "Magnitude" and self._magnitude_mode == "adc_log" else value
+
+    def set_phase_display(self, mode: str) -> None:
+        if mode not in ("unwrapped", "wrapped"):
+            raise ValueError("phase display must be unwrapped or wrapped")
+        if self._phase_mode == mode:
+            return
+        self._phase_mode = mode
+        self._phase_original = (self._phase_unwrapped if mode == "unwrapped" else self._phase_wrapped).copy()
+        self._phase_display = self._phase_original.copy()
+        self._phase_fit_applied = False
+        self._set_data_controls_enabled(self._frequency.size > 0)
+        if mode == "wrapped":
+            self.phase_range_button.setChecked(False)
+        self._set_phase_label()
+        if self._frequency.size:
+            self.clear_markers()
+            self._render_phase_values()
+            self._set_result_status()
 
     def _load_result_arrays(self, result) -> None:
         frequency = np.asarray(result.frequencies_mhz, dtype=float).reshape(-1)
@@ -1758,8 +1897,30 @@ class _SParameterPlotMixin:
         if magnitude.shape != phase.shape or magnitude.shape[1] != frequency.size:
             raise ValueError("S-parameter magnitude/phase shapes do not match")
         self._frequency = np.ascontiguousarray(frequency)
-        self._magnitude_values = np.ascontiguousarray(magnitude)
-        self._phase_original = np.ascontiguousarray(phase)
+        self._magnitude_response_db = np.ascontiguousarray(magnitude)
+        if hasattr(result, "mean_i") and hasattr(result, "mean_q"):
+            adc_units = np.hypot(np.asarray(result.mean_i, float), np.asarray(result.mean_q, float))
+        else:
+            adc_db = getattr(result, "adc_magnitude_db", None)
+            if adc_db is None and not getattr(result, "physical_power_calibrated", False):
+                adc_db = magnitude
+            # Legacy external result objects may lack I/Q. Never interpret S21 as ADC units.
+            adc_units = (np.full(magnitude.shape, np.nan) if adc_db is None else
+                         np.power(10.0, np.asarray(adc_db, float) / 20.0))
+        if adc_units.size != magnitude.size:
+            raise ValueError("ADC magnitude shape does not match the frequency/power axes")
+        self._adc_magnitude_units = np.asarray(adc_units, float).reshape(magnitude.shape).copy()
+        self._adc_magnitude_units[~np.isfinite(self._adc_magnitude_units)] = np.nan
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self._adc_magnitude_db = np.where(
+                self._adc_magnitude_units > 0, 20.0 * np.log10(self._adc_magnitude_units), np.nan
+            )
+        self._select_magnitude_values()
+        self._phase_unwrapped = np.ascontiguousarray(phase)
+        wrapped = getattr(result, "phase_wrapped_deg", (phase + 180.0) % 360.0 - 180.0)
+        self._phase_wrapped = np.ascontiguousarray(wrapped, dtype=float).reshape(phase.shape)
+        self._phase_original = (self._phase_unwrapped if self._phase_mode == "unwrapped"
+                                else self._phase_wrapped).copy()
         self._phase_display = self._phase_original.copy()
         self._curve_labels = labels
         self._physical_power_calibrated = bool(
@@ -1829,7 +1990,7 @@ class _SParameterPlotMixin:
         unavailable_text = (
             ""
             if unavailable == 0
-            else f" | {unavailable:,} point(s) have undefined zero-IQ response"
+            else f" | {unavailable:,} zero or unavailable point(s) cannot be shown in this scale"
         )
         self.plot_status.setText(
             f"{self._frequency.size:,} frequency points{power_text} | "
@@ -1853,7 +2014,7 @@ class _SParameterPlotMixin:
         frequency: float,
         value: float,
     ) -> str:
-        unit = "dB" if plot_name == "Magnitude" else "deg"
+        unit = ("ADC units" if self._magnitude_mode in ("adc_linear", "adc_log") else "dB") if plot_name == "Magnitude" else "deg"
         return (
             f"{self._curve_name(curve_index)} | {frequency:.9g} MHz | "
             f"{plot_name} {value:.9g} {unit}"
@@ -1865,7 +2026,7 @@ class _SParameterPlotMixin:
             self._hide_hover_markers()
 
     def subtract_phase_fit(self) -> None:
-        if self._frequency.size == 0:
+        if self._frequency.size == 0 or self._phase_mode == "wrapped":
             return
         try:
             start, stop = self._phase_fit_bounds()
@@ -1899,7 +2060,7 @@ class _SParameterPlotMixin:
         self._phase_display = self._phase_original.copy()
         self._phase_fit_applied = False
         self._render_phase_values()
-        self.plot_status.setText("Measured unwrapped phase restored")
+        self.plot_status.setText(f"Measured {self._phase_mode} phase restored")
 
 
 if _USE_PYQTGRAPH:
@@ -1977,25 +2138,13 @@ if _USE_PYQTGRAPH:
                 if plot.sceneBoundingRect().contains(scene_position):
                     view_position = plot.vb.mapSceneToView(scene_position)
                     try:
-                        (
-                            visible_curve_index,
-                            point_index,
-                            frequency,
-                            value,
-                        ) = nearest_sparameter_point(
-                            self._frequency,
-                            self._visible_values(values),
-                            view_position.x(),
-                            view_position.y(),
+                        nearest = self._nearest_plot_point(
+                            name, values, view_position.x(), view_position.y(),
+                            log_coordinates=True,
                         )
                     except ValueError:
                         return None
-                    return name, plot, (
-                        self._original_curve_index(visible_curve_index),
-                        point_index,
-                        frequency,
-                        value,
-                    )
+                    return name, plot, nearest
             return None
 
         def _on_mouse_moved(self, event) -> None:
@@ -2012,7 +2161,8 @@ if _USE_PYQTGRAPH:
                 marker.setVisible(visible)
                 label.setVisible(visible)
             marker, label = self._hover_items[name]
-            marker.setData([frequency], [value])
+            marker_y = self._pyqtgraph_marker_y(name, value)
+            marker.setData([frequency], [marker_y])
             text = self._marker_text(name, curve_index, frequency, value)
             label.setHtml(
                 "<div style='background-color:rgba(255,255,255,220);"
@@ -2020,7 +2170,7 @@ if _USE_PYQTGRAPH:
                 + text
                 + "</div>"
             )
-            label.setPos(frequency, value)
+            label.setPos(frequency, marker_y)
             self.plot_status.setText(text)
 
         def _on_mouse_clicked(self, event) -> None:
@@ -2034,9 +2184,10 @@ if _USE_PYQTGRAPH:
             if nearest is None:
                 return
             name, plot, (curve_index, _point_index, frequency, value) = nearest
+            marker_y = self._pyqtgraph_marker_y(name, value)
             marker = pg.ScatterPlotItem(
                 [frequency],
-                [value],
+                [marker_y],
                 size=10,
                 pen=pg.mkPen("#20252b", width=1.5),
                 brush=pg.mkBrush("#ff7043"),
@@ -2049,7 +2200,7 @@ if _USE_PYQTGRAPH:
                 + text
                 + "</div>"
             )
-            label.setPos(frequency, value)
+            label.setPos(frequency, marker_y)
             marker.setZValue(35)
             label.setZValue(36)
             plot.addItem(marker, ignoreBounds=True)
@@ -2096,15 +2247,7 @@ if _USE_PYQTGRAPH:
             self.phase_plot.autoRange()
 
         def _render_curves(self) -> None:
-            self.magnitude_plot.setLabel(
-                "left",
-                (
-                    "S21 (P input / P output)"
-                    if self._physical_power_calibrated
-                    else "ADC magnitude"
-                ),
-                units="dB",
-            )
+            self._set_magnitude_axis()
             for curve in self._magnitude_curves:
                 self.magnitude_plot.removeItem(curve)
             for curve in self._phase_curves:
@@ -2138,6 +2281,7 @@ if _USE_PYQTGRAPH:
             self._load_result_arrays(result)
             self.clear_markers()
             self._render_curves()
+            self._set_phase_label()
             self._phase_region.setRegion(self._phase_fit_region)
             self._set_phase_region_visible(self.phase_range_button.isChecked())
             self._set_result_status()
@@ -2223,25 +2367,10 @@ else:
             else:
                 return None
             try:
-                (
-                    visible_curve_index,
-                    point_index,
-                    frequency,
-                    value,
-                ) = nearest_sparameter_point(
-                    self._frequency,
-                    self._visible_values(values),
-                    event.xdata,
-                    event.ydata,
-                )
+                nearest = self._nearest_plot_point(name, values, event.xdata, event.ydata)
             except ValueError:
                 return None
-            return name, event.inaxes, (
-                self._original_curve_index(visible_curve_index),
-                point_index,
-                frequency,
-                value,
-            )
+            return name, event.inaxes, nearest
 
         def _on_mouse_moved(self, event) -> None:
             if not self._markers_enabled or self._frequency.size == 0:
@@ -2352,14 +2481,8 @@ else:
             ):
                 self.magnitude_plot.legend()
                 self.phase_plot.legend()
-            self.magnitude_plot.set_ylabel(
-                (
-                    "S21, P input - P output [dB]"
-                    if self._physical_power_calibrated
-                    else "ADC magnitude [dB]"
-                )
-            )
-            self.phase_plot.set_ylabel("Unwrapped phase [deg]")
+            self._set_magnitude_axis()
+            self._set_phase_label()
             self.phase_plot.set_xlabel("RF frequency [MHz]")
             self._hover_artists = {
                 "Magnitude": (

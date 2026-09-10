@@ -10044,6 +10044,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_awg_sweep.setWidget(self._awg_sweep_container)
 
         self._sparameter_plot = SParameterPlotWidget(self)
+        self._sparameter_panel.phase_display_changed.connect(self._sparameter_plot.set_phase_display)
+        self._sparameter_panel.magnitude_display_changed.connect(self._sparameter_plot.set_magnitude_display)
         self._dock_sparameter = QtWidgets.QDockWidget(
             "RF S-Parameter", self
         )
@@ -11947,13 +11949,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         }
 
     def _sparameter_run_arguments(self) -> dict:
+        config = self._sparameter_panel.config()
         connection, run = self._experiment_panel.connection_values(
-            database_path=self._sparameter_panel.database_path_value()
+            database_path=(self._sparameter_panel.database_path_value() if config.save_to_qcodes else None),
+            require_run_config=config.save_to_qcodes,
         )
         return {
             "connection_config": connection,
             "run_config": run,
-            "sweep_config": self._sparameter_panel.config(),
+            "sweep_config": config,
             "tproc_mhz": self._experiment_panel.tproc_mhz.value(),
         }
 
@@ -12587,7 +12591,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_sparameter.raise_()
         power_count = int(getattr(stored.result, "power_count", 1))
         self.statusBar().showMessage(
-            f"RF sweep run {stored.run_id}: {power_count} power point(s) saved"
+            (f"RF sweep run {stored.run_id}: {power_count} power point(s) saved"
+             if stored.run_id is not None else f"RF sweep: {power_count} power point(s) acquired; not saved")
         )
 
     def _on_sparameter_finished(self, stored) -> None:
@@ -12596,7 +12601,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._dock_sparameter.show()
         self._dock_sparameter.raise_()
         self.statusBar().showMessage(
-            f"RF S-parameter run {stored.run_id} loaded from {stored.database_path}"
+            (f"RF S-parameter run {stored.run_id} loaded from {stored.database_path}"
+             if stored.run_id is not None else "RF S-parameter sweep complete; QCoDeS saving off")
         )
 
     def _on_sparameter_failed(self, details: str) -> None:
@@ -12814,7 +12820,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 calibration_config.oscilloscope.visa_resource.strip()
             ):
                 raise ValueError("Oscilloscope VISA resource must not be empty")
-        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            if mode == "input":
+                self._calibration_panel.prepare_input_output_power()
+        except (ImportError, OSError, LookupError, RuntimeError, TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Cannot run calibration",
@@ -15083,9 +15091,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         sparameter_database_path = str(
             sparameter_settings.pop("database_path")
         ).strip()
-        if not sparameter_database_path:
-            raise ValueError("RF S-parameter database path must not be empty")
         sparameter_config = SParameterSweepConfig(**sparameter_settings)
+        if not sparameter_database_path and sparameter_config.save_to_qcodes:
+            raise ValueError("RF S-parameter database path must not be empty")
 
         raw_calibration = data.get("calibration", {})
         if raw_calibration is None:

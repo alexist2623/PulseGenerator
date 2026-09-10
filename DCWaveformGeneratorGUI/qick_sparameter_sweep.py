@@ -89,6 +89,9 @@ ADC_MAGNITUDE_DB_PARAMETER = "adc_magnitude_db"
 ACTUAL_OUTPUT_POWER_PARAMETER = "actual_output_power_dbm"
 ACTUAL_INPUT_POWER_PARAMETER = "actual_input_power_dbm"
 PHASE_DEG_PARAMETER = "s_parameter_phase_unwrapped_deg"
+PHASE_WRAPPED_DEG_PARAMETER = "s_parameter_phase_wrapped_deg"
+PHASE_DISPLAY_MODES = ("unwrapped", "wrapped")
+MAGNITUDE_DISPLAY_MODES = ("response_db", "adc_linear", "adc_log", "adc_db")
 
 ProgressCallback = Callable[[int, str], None]
 WarningCallback = Callable[[str], None]
@@ -257,6 +260,16 @@ def _iq_response_metrics(
     return magnitude_db, phase
 
 
+def wrapped_phase_degrees(mean_i: Any, mean_q: Any) -> np.ndarray:
+    """Return atan2(Q, I) in degrees; zero/nonfinite I/Q has undefined phase."""
+    i_values, q_values = np.broadcast_arrays(
+        np.asarray(mean_i, dtype=np.float64), np.asarray(mean_q, dtype=np.float64)
+    )
+    valid = (np.isfinite(i_values) & np.isfinite(q_values)
+             & ((i_values != 0.0) | (q_values != 0.0)))
+    return np.where(valid, np.degrees(np.arctan2(q_values, i_values)), np.nan)
+
+
 @dataclass(frozen=True)
 class SParameterSweepConfig:
     """Independent RF output/readout configuration for one hardware sweep."""
@@ -324,8 +337,17 @@ class SParameterSweepConfig:
     calibration_input_run_id: int = 0
     calibration_output_sample_name: str = ""
     calibration_input_sample_name: str = ""
+    phase_display: str = "unwrapped"
+    save_to_qcodes: bool = True
+    magnitude_display: str = "response_db"
 
     def __post_init__(self) -> None:
+        if self.magnitude_display not in MAGNITUDE_DISPLAY_MODES:
+            raise ValueError(f"magnitude_display must be one of {MAGNITUDE_DISPLAY_MODES}")
+        if self.phase_display not in PHASE_DISPLAY_MODES:
+            raise ValueError(f"phase_display must be one of {PHASE_DISPLAY_MODES}")
+        if not isinstance(self.save_to_qcodes, bool):
+            raise TypeError("save_to_qcodes must be a boolean")
         _require_int(self.output_ch, "output_ch")
         _require_int(self.readout_ch, "readout_ch")
         start = _require_finite(self.frequency_start_mhz, "frequency_start_mhz")
@@ -689,6 +711,10 @@ class SParameterSweepResult:
     accumulation_repetitions: int = 1
     iq_scale_log2: int = 0
 
+    @property
+    def phase_wrapped_deg(self) -> np.ndarray:
+        return wrapped_phase_degrees(self.mean_i, self.mean_q)
+
     @classmethod
     def from_iq(
         cls,
@@ -873,6 +899,10 @@ class SParameterPowerSweepResult:
     integration_time_us: Optional[float] = None
     accumulation_repetitions: int = 1
     iq_scale_log2: int = 0
+
+    @property
+    def phase_wrapped_deg(self) -> np.ndarray:
+        return wrapped_phase_degrees(self.mean_i, self.mean_q)
 
     @classmethod
     def from_iq(
@@ -2388,9 +2418,9 @@ def _build_calibrated_program(
 
 @dataclass
 class StoredSParameterSweep:
-    run_id: int
+    run_id: Optional[int]
     guid: str
-    database_path: Path
+    database_path: Optional[Path]
     row_count: int
     result: SParameterSweepResult
     dataset: Any = None
@@ -2458,6 +2488,7 @@ def _power_result_payload(
         "adc_magnitude_db": result.adc_magnitude_db.tolist(),
         "magnitude_db": result.magnitude_db.tolist(),
         "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
+        "phase_wrapped_deg": result.phase_wrapped_deg.tolist(),
         "sample_rate_hz": result.sample_rate_hz,
         "iq_shape": list(result.iq_traces.shape),
         "acquisition_source": result.acquisition_source,
@@ -2628,6 +2659,11 @@ class _SParameterPowerRunWriter:
             label="S-parameter unwrapped phase",
             unit="deg",
         )
+        phase_wrapped_deg = Parameter(
+            PHASE_WRAPPED_DEG_PARAMETER,
+            label="S-parameter wrapped phase",
+            unit="deg",
+        )
         trace_unit = "stored int64 codes" if self.iq_scale_log2 else "ADC units"
         i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=trace_unit)
         q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=trace_unit)
@@ -2671,6 +2707,7 @@ class _SParameterPowerRunWriter:
             adc_magnitude_db,
             magnitude_db,
             phase_deg,
+            phase_wrapped_deg,
         ):
             measurement.register_parameter(
                 parameter,
@@ -2692,6 +2729,7 @@ class _SParameterPowerRunWriter:
             "adc_magnitude_db": adc_magnitude_db,
             "magnitude_db": magnitude_db,
             "phase_deg": phase_deg,
+            "phase_wrapped_deg": phase_wrapped_deg,
             "actual_output_power": actual_output_power,
             "actual_input_power": actual_input_power,
             "i_trace": i_trace,
@@ -2735,6 +2773,7 @@ class _SParameterPowerRunWriter:
                     if result.physical_power_calibrated
                     else "adc_magnitude_db"
                 ),
+                "phase_wrapped_deg": "degrees(atan2(mean_q, mean_i))",
                 "phase_unwrapped_deg": (
                     "degrees(unwrap(angle(mean_i + 1j*mean_q), frequency))"
                 ),
@@ -2776,6 +2815,7 @@ class _SParameterPowerRunWriter:
             if nominal_gain not in self.planned_power_gains:
                 raise ValueError(f"unexpected power gain {nominal_gain}")
         sample_values = np.arange(result.sample_count, dtype=np.int32)
+        wrapped_phase = result.phase_wrapped_deg
         parameters = self._parameters
         for index, frequency_mhz in enumerate(result.frequencies_mhz):
             values = [
@@ -2795,6 +2835,7 @@ class _SParameterPowerRunWriter:
                     parameters["phase_deg"],
                     float(result.phase_unwrapped_deg[index]),
                 ),
+                (parameters["phase_wrapped_deg"], float(wrapped_phase[index])),
                 (parameters["sample_index"], sample_values),
                 (
                     parameters["i_trace"],
@@ -2951,6 +2992,11 @@ def store_sparameter_result(
         label="S-parameter unwrapped phase",
         unit="deg",
     )
+    phase_wrapped_deg = Parameter(
+        PHASE_WRAPPED_DEG_PARAMETER,
+        label="S-parameter wrapped phase",
+        unit="deg",
+    )
     trace_unit = "stored int64 codes" if result.iq_scale_log2 else "ADC units"
     i_trace = Parameter(I_TRACE_PARAMETER, label="I trace", unit=trace_unit)
     q_trace = Parameter(Q_TRACE_PARAMETER, label="Q trace", unit=trace_unit)
@@ -2984,6 +3030,7 @@ def store_sparameter_result(
         adc_magnitude_db,
         magnitude_db,
         phase_deg,
+        phase_wrapped_deg,
     ):
         measurement.register_parameter(parameter, setpoints=(frequency,))
     for parameter in (i_trace, q_trace):
@@ -3013,6 +3060,7 @@ def store_sparameter_result(
             "adc_magnitude_db": result.adc_magnitude_db.tolist(),
             "magnitude_db": result.magnitude_db.tolist(),
             "phase_unwrapped_deg": result.phase_unwrapped_deg.tolist(),
+            "phase_wrapped_deg": result.phase_wrapped_deg.tolist(),
             "sample_rate_hz": result.sample_rate_hz,
             "iq_shape": list(result.iq_traces.shape),
             "acquisition_source": result.acquisition_source,
@@ -3050,6 +3098,7 @@ def store_sparameter_result(
                 else "adc_magnitude_db"
             ),
             "phase_unwrapped_deg": ("degrees(unwrap(angle(mean_i + 1j*mean_q)))"),
+            "phase_wrapped_deg": "degrees(atan2(mean_q, mean_i))",
             "frequency_gain": (
                 "nominal_gain * 10**((weakest_response_db - "
                 "response_db(frequency))/20)"
@@ -3060,6 +3109,7 @@ def store_sparameter_result(
 
     _emit_progress(progress_callback, 65, "Preparing S-parameter QCoDeS run")
     sample_values = np.arange(result.sample_count, dtype=np.int32)
+    wrapped_phase = result.phase_wrapped_deg
     with measurement.run(
         write_in_background=False,
         in_memory_cache=False,
@@ -3080,6 +3130,7 @@ def store_sparameter_result(
                 (adc_magnitude_db, float(result.adc_magnitude_db[index])),
                 (magnitude_db, float(result.magnitude_db[index])),
                 (phase_deg, float(result.phase_unwrapped_deg[index])),
+                (phase_wrapped_deg, float(wrapped_phase[index])),
                 (sample_index, sample_values),
                 (i_trace, np.ascontiguousarray(result.iq_traces[index, :, 0])),
                 (q_trace, np.ascontiguousarray(result.iq_traces[index, :, 1])),
@@ -3132,7 +3183,7 @@ def store_sparameter_result(
 def run_sparameter_sweep(
     *,
     connection_config: Any,
-    run_config: Any,
+    run_config: Any = None,
     sweep_config: SParameterSweepConfig,
     tproc_mhz: Optional[float] = None,
     connector: Optional[Callable[..., Tuple[Any, Any]]] = None,
@@ -3140,7 +3191,9 @@ def run_sparameter_sweep(
     partial_callback: Optional[Callable[[StoredSParameterSweep], None]] = None,
     warning_callback: Optional[WarningCallback] = None,
 ) -> StoredSParameterSweep:
-    """Run a frequency sweep, optionally inside a software gain sweep."""
+    """Run a sweep; save_to_qcodes=False keeps results only in memory."""
+    if sweep_config.save_to_qcodes and run_config is None:
+        raise ValueError("QCoDeS run settings are required when saving is enabled")
     connect_qick, *_helpers = _qcodes_helpers()
     _emit_progress(progress_callback, 0, "Starting independent RF S-parameter sweep")
     _emit_progress(progress_callback, 2, "Connecting to QICK")
@@ -3246,15 +3299,19 @@ def run_sparameter_sweep(
             rf_settings=rf_settings,
             iq_scale_log2=(0 if sweep_config.uses_avg_buffer
                            else int(ddr_metadata.get("iq_scale_log2", 0))),
-        )
+        ) if sweep_config.save_to_qcodes else None
         programs = []
+        memory_results = []
+        memory_gains = []
         combined_result = None
         _emit_progress(
             progress_callback,
             7,
-            f"Preparing live DB run for {len(power_coordinates)} power points",
+            (f"Preparing live DB run for {len(power_coordinates)} power points"
+             if writer is not None else f"Preparing {len(power_coordinates)} power points; DB saving off"),
         )
-        writer.open()
+        if writer is not None:
+            writer.open()
         try:
             for power_index, power_coordinate in enumerate(power_coordinates):
                 if sweep_config.power_calibration_enabled:
@@ -3341,20 +3398,22 @@ def run_sparameter_sweep(
                     progress_callback,
                     8 + round(87 * (power_index + 0.9) / len(power_coordinates)),
                     (
-                        f"Saving power {power_index + 1}/"
+                        f"Processing power {power_index + 1}/"
                         f"{len(power_coordinates)} {power_label}"
                     ),
                 )
-                combined_result = writer.append(
-                    power_coordinate,
-                    result,
-                    program.summary(),
-                )
+                if writer is not None:
+                    combined_result = writer.append(power_coordinate, result, program.summary())
+                else:
+                    memory_results.append(result)
+                    memory_gains.append(int(result.nominal_gain_code) if sweep_config.power_calibration_enabled
+                                        else int(power_coordinate))
+                    combined_result = SParameterPowerSweepResult.from_sweeps(memory_gains, memory_results)
                 partial = StoredSParameterSweep(
-                    run_id=int(writer.dataset.run_id),
-                    guid=str(writer.dataset.guid),
-                    database_path=writer.database_path,
-                    row_count=writer.row_count,
+                    run_id=int(writer.dataset.run_id) if writer is not None else None,
+                    guid=str(writer.dataset.guid) if writer is not None else "",
+                    database_path=writer.database_path if writer is not None else None,
+                    row_count=writer.row_count if writer is not None else 0,
                     result=combined_result,
                     program=program,
                     rf_settings=rf_settings,
@@ -3364,21 +3423,22 @@ def run_sparameter_sweep(
                 _emit_progress(
                     progress_callback,
                     8 + round(87 * (power_index + 1) / len(power_coordinates)),
-                    (
-                        f"Power {power_index + 1}/{len(power_coordinates)} saved; "
-                        "live database updated"
-                    ),
+                    (f"Power {power_index + 1}/{len(power_coordinates)} saved; live database updated"
+                     if writer is not None else
+                     f"Power {power_index + 1}/{len(power_coordinates)} acquired; DB saving off"),
                 )
-            dataset = writer.close()
+            dataset = writer.close() if writer is not None else None
         except BaseException as exc:
-            writer.abort(exc)
+            if writer is not None:
+                writer.abort(exc)
             raise
-        _emit_progress(progress_callback, 100, "RF power sweep saved")
+        _emit_progress(progress_callback, 100,
+                       "RF power sweep saved" if writer is not None else "RF power sweep complete; DB saving off")
         return StoredSParameterSweep(
-            run_id=int(dataset.run_id),
-            guid=str(dataset.guid),
-            database_path=writer.database_path,
-            row_count=writer.row_count,
+            run_id=int(dataset.run_id) if dataset is not None else None,
+            guid=str(dataset.guid) if dataset is not None else "",
+            database_path=writer.database_path if writer is not None else None,
+            row_count=writer.row_count if writer is not None else 0,
             result=combined_result,
             dataset=dataset,
             program=tuple(programs),
@@ -3443,6 +3503,12 @@ def run_sparameter_sweep(
         context="RF S-parameter sweep",
     )
     _emit_progress(progress_callback, 62, "Reducing captured I/Q values")
+    if not sweep_config.save_to_qcodes:
+        _emit_progress(progress_callback, 100, "RF S-parameter sweep complete; DB saving off")
+        return StoredSParameterSweep(
+            run_id=None, guid="", database_path=None, row_count=0,
+            result=result, program=program, rf_settings=rf_settings,
+        )
     dataset, row_count = store_sparameter_result(
         result,
         config=sweep_config,
@@ -3607,11 +3673,15 @@ __all__ = [
     "I_TRACE_PARAMETER",
     "INPUT_CALIBRATION_SELECTIONS",
     "MAGNITUDE_DB_PARAMETER",
+    "MAGNITUDE_DISPLAY_MODES",
     "MAX_RF_OUTPUT_GAIN",
     "MEAN_I_PARAMETER",
     "MEAN_Q_PARAMETER",
     "OUTPUT_POWER_PARAMETER",
     "PHASE_DEG_PARAMETER",
+    "PHASE_WRAPPED_DEG_PARAMETER",
+    "PHASE_DISPLAY_MODES",
+    "wrapped_phase_degrees",
     "POWER_GAIN_PARAMETER",
     "POWER_SCALES",
     "Q_TRACE_PARAMETER",

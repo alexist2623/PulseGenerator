@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping, Optional, Tuple
 import numpy as np
 
 try:
+    from .input_power_estimate import OutputGainRegression
     from .power_calibration import (
         CalibrationDatabase,
         INPUT_BOARD_TYPES,
@@ -49,6 +50,7 @@ try:
         configure_sparameter_rf_board,
     )
 except ImportError:
+    from input_power_estimate import OutputGainRegression
     from power_calibration import (
         CalibrationDatabase,
         INPUT_BOARD_TYPES,
@@ -341,6 +343,11 @@ class InputPowerCalibrationConfig:
     experiment_name: str = "QICK ADC input power calibration"
     sample_name: str = ""
     notes: str = ""
+    power_sweep_enabled: bool = False
+    power_start_dbm: float = -40.0
+    power_end_dbm: float = -20.0
+    power_points: int = 16
+    use_gain_regression: bool = False
 
     def __post_init__(self) -> None:
         if not str(self.database_path).strip():
@@ -352,7 +359,11 @@ class InputPowerCalibrationConfig:
         _integer(self.output_ch, "output_ch")
         _integer(self.readout_ch, "readout_ch")
         self.frequencies_mhz
-        gains = self.gains
+        gains = self.target_powers_dbm if self.power_sweep_enabled else self.gains
+        for name in ("power_sweep_enabled", "use_gain_regression"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be boolean")
+        self.target_powers_dbm
         if self.acquisition_source not in ACQUISITION_SOURCES:
             raise ValueError(
                 "acquisition_source must be one of "
@@ -411,6 +422,15 @@ class InputPowerCalibrationConfig:
             self.frequency_end_mhz,
             self.frequency_points,
         )
+
+    @property
+    def target_powers_dbm(self) -> np.ndarray:
+        start = _finite(self.power_start_dbm, "power_start_dbm")
+        stop = _finite(self.power_end_dbm, "power_end_dbm")
+        points = _integer(self.power_points, "power_points", 2)
+        if start == stop:
+            raise ValueError("start and end output power must differ")
+        return np.linspace(start, stop, points)
 
     @property
     def gains(self) -> np.ndarray:
@@ -935,6 +955,7 @@ def _store_input_calibration(
     output_run_id: int,
     rf_settings: Mapping[str, Any],
     acquisition_details: Mapping[str, Any],
+    power_plan: Optional[Mapping[str, Any]] = None,
 ) -> StoredCalibrationRun:
     try:
         from qcodes import (
@@ -996,6 +1017,15 @@ def _store_input_calibration(
             intercept_parameter,
             setpoints=(frequency_parameter,),
         )
+        gain_codes = (np.broadcast_to(gains[:, None], adc_magnitude_db.shape)
+                      if power_plan is None else power_plan["gain_codes"])
+        power_estimation = ({} if power_plan is None else {
+            **power_plan["model_metadata"],
+            "warnings": power_plan["warnings"],
+            "gain_codes": gain_codes.tolist(),
+            "output_power_dbm": power_plan["output_power_dbm"].tolist(),
+            "requested_output_powers_dbm": config.target_powers_dbm.tolist() if config.power_sweep_enabled else None,
+        })
         result_metadata = {
             "freq": frequencies_mhz.tolist(),
             "att1": float(config.output_att1_db),
@@ -1029,6 +1059,7 @@ def _store_input_calibration(
             ),
             "configuration": asdict(config),
             "rf_settings_actual": dict(rf_settings),
+            "output_power_estimation": power_estimation,
         }
         with measurement.run(
             write_in_background=False,
@@ -1051,7 +1082,7 @@ def _store_input_calibration(
             for gain_index, gain in enumerate(gains):
                 for frequency_index, frequency in enumerate(frequencies_mhz):
                     datasaver.add_result(
-                        (gain_parameter, int(gain)),
+                        (gain_parameter, int(gain_codes[gain_index, frequency_index])),
                         (frequency_parameter, float(frequency)),
                         (
                             measured_parameter,
@@ -1086,6 +1117,8 @@ def _store_input_calibration(
             result={
                 "frequencies_mhz": frequencies_mhz.tolist(),
                 "gains": gains.tolist(),
+                "gain_codes": gain_codes.tolist(),
+                "output_power_estimation": power_estimation,
                 "adc_magnitude_db": adc_magnitude_db.tolist(),
                 "input_power_dbm": input_power_dbm.tolist(),
                 "slopes": slopes.tolist(),
@@ -1097,6 +1130,48 @@ def _store_input_calibration(
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def prepare_input_power_plan(config, frequencies_mhz=None, *, calibration=None,
+                             output_att1_db=None, output_att2_db=None):
+    """Resolve the same output powers and integer gains for preview and acquisition."""
+    frequencies = np.asarray(
+        config.frequencies_mhz if frequencies_mhz is None else frequencies_mhz, float
+    )
+    if calibration is None:
+        calibration = CalibrationDatabase(config.database_path).output_calibration(
+            config.output_board_type, frequencies, nqz=config.nqz,
+            output_filter_type=config.output_filter_type,
+            output_filter_cutoff_ghz=config.output_filter_cutoff_ghz,
+            output_filter_bandwidth_ghz=config.output_filter_bandwidth_ghz,
+        )
+    attenuation = {
+        "output_att1_db": (config.output_att1_db if output_att1_db is None else output_att1_db)
+        if config.output_board_type == "RF_Out" else 0.0,
+        "output_att2_db": (config.output_att2_db if output_att2_db is None else output_att2_db)
+        if config.output_board_type == "RF_Out" else 0.0,
+    }
+    regression = OutputGainRegression(calibration) if (
+        config.use_gain_regression or config.power_sweep_enabled
+    ) else None
+    model = regression or calibration
+    if config.power_sweep_enabled:
+        gains = regression.gains_for_power(
+            frequencies[None, :], config.target_powers_dbm[:, None], **attenuation
+        )
+        if any(np.unique(column).size != gains.shape[0] for column in gains.T):
+            raise ValueError("Selected powers collapse to duplicate integer DAC gains; use fewer or more widely spaced powers")
+    else:
+        gains = np.broadcast_to(config.gains[:, None], (config.gains.size, frequencies.size)).copy()
+    powers = model.output_power_dbm(frequencies[None, :], gains, **attenuation)
+    warnings = regression.warnings(frequencies[None, :], gains) if regression else []
+    return {
+        "calibration": calibration, "regression": regression,
+        "frequencies_mhz": frequencies, "gain_codes": gains,
+        "output_power_dbm": powers, "attenuation": attenuation,
+        "warnings": warnings,
+        "model_metadata": regression.metadata() if regression else {"model": "legacy_linear_amplitude"},
+    }
 
 
 def run_input_power_calibration(
@@ -1115,22 +1190,42 @@ def run_input_power_calibration(
     _emit_progress(progress_callback, 0, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
     _check_cancel(cancel_check)
-    gains = calibration_config.gains
+    gains = (np.ones(calibration_config.power_points, dtype=np.int64)
+             if calibration_config.power_sweep_enabled else calibration_config.gains)
+    power_plan = None
     program_factory = program_factory or build_sparameter_program
 
     def make_program(gain_index: int) -> Any:
         _check_cancel(cancel_check)
         _emit_progress(
             progress_callback,
-            1 if gain_index == 0 else 7 + round(76 * gain_index / gains.size),
+            (1 if power_plan is None else 6) if gain_index == 0 else 7 + round(76 * gain_index / gains.size),
             (
                 f"Preparing ADC calibration gain {gain_index + 1}/"
                 f"{gains.size}: {int(gains[gain_index])}"
             ),
         )
+        sweep = calibration_config.sweep_config(int(gains[gain_index]))
+        if calibration_config.power_sweep_enabled and power_plan is not None:
+            codes = power_plan["gain_codes"][gain_index]
+            relative_db = 20.0 * np.log10(codes / float(np.max(codes)))
+            sweep = replace(
+                sweep, gain=int(codes[0]),
+                calibrated_gain_table=tuple(int(code) for code in codes),
+                calibrated_frequency_point_count=int(codes.size),
+                calibrated_output_power_dbm=float(calibration_config.target_powers_dbm[gain_index]),
+                calibrated_nominal_gain_code=int(np.max(codes)),
+                calibrated_reference_response_dbm=float(np.min(
+                    power_plan["regression"].output_power_dbm(frequencies, MAX_QICK_GAIN, **power_plan["attenuation"])
+                )),
+                calibrated_correction_min_db=float(np.min(relative_db)),
+                calibrated_correction_max_db=float(np.max(relative_db)),
+                calibration_output_run_id=int(power_plan["calibration"].summary.run_id),
+                calibration_output_sample_name=power_plan["calibration"].summary.sample_name,
+            )
         return program_factory(
             soccfg,
-            calibration_config.sweep_config(int(gains[gain_index])),
+            sweep,
             tproc_mhz=tproc_mhz,
         )
 
@@ -1141,18 +1236,8 @@ def run_input_power_calibration(
     _check_cancel(cancel_check)
     frequencies = np.asarray(first_program.frequencies_mhz, dtype=float)
     _emit_progress(progress_callback, 3, "Selecting matching output calibration")
-    output_calibration = CalibrationDatabase(
-        calibration_config.database_path
-    ).output_calibration(
-        calibration_config.output_board_type,
-        frequencies,
-        nqz=calibration_config.nqz,
-        output_filter_type=calibration_config.output_filter_type,
-        output_filter_cutoff_ghz=calibration_config.output_filter_cutoff_ghz,
-        output_filter_bandwidth_ghz=(
-            calibration_config.output_filter_bandwidth_ghz
-        ),
-    )
+    power_plan = prepare_input_power_plan(calibration_config, frequencies)
+    output_calibration = power_plan["calibration"]
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF output and input chains")
     rf_settings = configure_sparameter_rf_board(
@@ -1187,8 +1272,17 @@ def run_input_power_calibration(
             ),
         )
     )
+    power_plan = prepare_input_power_plan(
+        calibration_config, frequencies, calibration=output_calibration,
+        output_att1_db=output_att1, output_att2_db=output_att2,
+    )
+    gains = power_plan["gain_codes"][:, 0]
+    if calibration_config.power_sweep_enabled:
+        first_program = make_program(0)
+    for warning in power_plan["warnings"]:
+        _emit_progress(progress_callback, 6, "Warning: " + warning)
     measured_db = np.empty((gains.size, frequencies.size), dtype=float)
-    known_input_dbm = np.empty_like(measured_db)
+    known_input_dbm = power_plan["output_power_dbm"] - float(calibration_config.path_loss_db)
     acquisition_details: dict[str, Any] = {}
     start_action = (
         "Arming FIR DDR"
@@ -1297,12 +1391,6 @@ def run_input_power_calibration(
         if not np.array_equal(result.frequencies_mhz, frequencies):
             raise RuntimeError("acquired input-calibration frequency grid changed")
         measured_db[gain_index] = np.asarray(result.magnitude_db, dtype=float)
-        known_input_dbm[gain_index] = output_calibration.output_power_dbm(
-            frequencies,
-            int(gain),
-            output_att1_db=output_att1,
-            output_att2_db=output_att2,
-        ) - float(calibration_config.path_loss_db)
         _emit_progress(
             progress_callback,
             progress_stop,
@@ -1348,6 +1436,7 @@ def run_input_power_calibration(
         output_run_id=output_calibration.summary.run_id,
         rf_settings=rf_settings,
         acquisition_details=acquisition_details,
+        power_plan=power_plan,
     )
     _emit_progress(
         progress_callback, 100, f"Input calibration Run {stored.run_id} saved"
