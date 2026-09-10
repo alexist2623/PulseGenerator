@@ -68,7 +68,6 @@ class QickFrontPanelConfiguration:
     fir_rate_label: str = "FIR DDR rate unavailable"
     ddr_capacity_words_32b: Optional[int] = None
     ddr_samples_per_axi_word: int = 8
-    ddr_iq_sample_bytes: int = 4
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -250,7 +249,6 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             ddr_values["ddr_capacity_words_32b"] = capacity_words
         if samples_per_axi_word > 0:
             ddr_values["ddr_samples_per_axi_word"] = samples_per_axi_word
-            ddr_values["ddr_iq_sample_bytes"] = int(ddr_config.get("iq_sample_bytes", 4))
     return QickFrontPanelConfiguration(
         board=board,
         firmware_timestamp=str(config.get("fw_timestamp", "unknown")),

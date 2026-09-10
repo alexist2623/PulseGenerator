@@ -803,18 +803,11 @@ class FineTuneDdrResult:
     cross_capacitance: Optional[np.ndarray] = None
     sample_rate_hz: float = 1_000_000.0
     fir_rate_profile: str = "1_msps"
-    iq_scale_log2: int = 0
-    iq_component_bits: int = 16
-
-    @property
-    def analysis_iq(self) -> np.ndarray:
-        """Input-code units for plots/calibration; ``iq`` stays raw integer."""
-        return np.ldexp(self.iq.astype(np.float64), -self.iq_scale_log2)
 
     @property
     def mean_iq(self) -> np.ndarray:
         """Average the N repetitions while preserving sample and I/Q axes."""
-        return self.analysis_iq.mean(axis=1)
+        return self.iq.astype(np.float64).mean(axis=1)
 
     @property
     def i(self) -> np.ndarray:
@@ -832,7 +825,7 @@ class FineTuneDdrResult:
     @property
     def mean_iq_grid(self) -> np.ndarray:
         """Repetition-averaged IQ retaining all Cartesian sweep axes."""
-        return np.ldexp(self.iq_grid.astype(np.float64), -self.iq_scale_log2).mean(axis=len(self.sweep_shape))
+        return self.iq_grid.astype(np.float64).mean(axis=len(self.sweep_shape))
 
 
 @dataclass(frozen=True)
@@ -4669,8 +4662,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             trigger_delay_samples
         )
         self._fir_cfg = {
-            "iq_scale_log2": profile.iq_scale_log2,
-            "iq_component_bits": profile.iq_component_bits,
             "rate_profile": profile.name,
             "decimation": profile.decimation,
             "group_delay_input_samples": int(ceil(profile.group_delay_input_samples)),
@@ -6854,8 +6845,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 chunk_trigger_count * ddr.samples_per_trigger,
                 2,
             )
-            if self._fir_cfg["iq_component_bits"] == 64 and chunk.dtype != np.dtype("int64"):
-                raise RuntimeError("IQ64 firmware did not return raw signed-int64 samples")
             if chunk.shape != expected_chunk_shape:
                 raise RuntimeError(
                     f"unexpected DDR IQ chunk shape {chunk.shape}; expected "
@@ -6901,8 +6890,6 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             cross_capacitance=self.sequence.cross_capacitance.copy(),
             sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
             fir_rate_profile=self._fir_cfg["rate_profile"],
-            iq_scale_log2=self._fir_cfg["iq_scale_log2"],
-            iq_component_bits=self._fir_cfg["iq_component_bits"],
         )
 
     def summary(self):

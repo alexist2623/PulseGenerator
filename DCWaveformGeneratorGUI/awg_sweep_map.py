@@ -20,10 +20,6 @@ import traceback
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-try:
-    from .fir_ddr_profile import result_iq_in_input_units
-except ImportError:
-    from fir_ddr_profile import result_iq_in_input_units
 from PyQt5 import QtCore, QtWidgets
 
 try:
@@ -859,7 +855,7 @@ def reduce_awg_sweep_map(
             "selected AWG map axes are not present in the acquired sweep"
         ) from exc
 
-    iq = np.asarray(result_iq_in_input_units(ddr_result) if iq_values is None else iq_values)
+    iq = np.asarray(ddr_result.iq if iq_values is None else iq_values)
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError(
             "AWG sweep FIR IQ must have shape "

@@ -26,10 +26,6 @@ import sqlite3
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 import numpy as np
-try:
-    from .fir_ddr_profile import result_iq_in_input_units
-except ImportError:
-    from fir_ddr_profile import result_iq_in_input_units
 
 
 ProgressCallback = Callable[[int, str], None]
@@ -552,7 +548,7 @@ def run_dc_voltage_calibration(
         if acquisition_callback is not None
         else program.acquire_fir_ddr(soc)
     )
-    iq = result_iq_in_input_units(result).astype(np.float64, copy=False)
+    iq = np.asarray(result.iq, dtype=np.float64)
     expected_shape = (
         int(adjusted_config.voltage_points),
         int(adjusted_config.repetitions_per_point),

@@ -15,10 +15,6 @@ import sys
 import traceback
 from typing import Tuple, Optional, List, Callable, Mapping, Sequence
 import numpy as np
-try:
-    from .fir_ddr_profile import result_iq_in_input_units
-except ImportError:
-    from fir_ddr_profile import result_iq_in_input_units
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -7136,7 +7132,6 @@ class ExperimentPanel(QtWidgets.QWidget):
         self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
         self._ddr_capacity_words_32b: Optional[int] = None
         self._ddr_samples_per_axi_word = 8
-        self._ddr_iq_sample_bytes = 4
 
         self.ddr_usage_group = QtWidgets.QGroupBox("PL DDR capture memory")
         ddr_usage_layout = QtWidgets.QVBoxLayout(self.ddr_usage_group)
@@ -7691,7 +7686,6 @@ class ExperimentPanel(QtWidgets.QWidget):
         self._ddr_samples_per_axi_word = int(
             getattr(configuration, "ddr_samples_per_axi_word", 8)
         )
-        self._ddr_iq_sample_bytes = int(getattr(configuration, "ddr_iq_sample_bytes", 4))
         self._refresh_ddr_usage()
 
     def _set_ddr_usage_style(self, state: str) -> None:
@@ -7740,7 +7734,6 @@ class ExperimentPanel(QtWidgets.QWidget):
             start_address_bytes=int(spec.address),
             capacity_words_32b=self._ddr_capacity_words_32b,
             samples_per_axi_word=self._ddr_samples_per_axi_word,
-            iq_sample_bytes=self._ddr_iq_sample_bytes,
             force_overwrite=bool(spec.force_overwrite),
         )
         self.ddr_usage_summary.setText(
@@ -17652,7 +17645,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
             )
             iq_values, unit, mode, _metadata = measurement_iq_values(
-                result_iq_in_input_units(result.ddr_result),
+                result.ddr_result.iq,
                 result.rf_settings,
             )
             map_result = reduce_awg_sweep_map(

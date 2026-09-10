@@ -55,14 +55,13 @@ def calculate_ddr_capture_memory_usage(
     start_address_bytes: int = 0,
     capacity_words_32b: Optional[int] = None,
     samples_per_axi_word: int = 8,
-    iq_sample_bytes: int = 4,
     force_overwrite: bool = False,
 ) -> DdrCaptureMemoryUsage:
     """Match ``AxisBufferDdrSampleV1.arm_samples`` allocation semantics.
 
-    A legacy IQ sample is 4 bytes; V3 IQ64 is 16 bytes. Each trigger is padded
-    to 256-bit AXI words (eight legacy samples or two IQ64 samples). Physical
-    word counts and capacity are always expressed in uint32 words.
+    Each FIR I/Q sample is one physical 32-bit word. The current DDR writer
+    emits 256-bit AXI words, so every trigger is independently padded to eight
+    32-bit samples. The GUI uses the same per-trigger padding as the driver.
     """
 
     for name, value, minimum in (
@@ -71,7 +70,6 @@ def calculate_ddr_capture_memory_usage(
         ("samples_per_trigger", samples_per_trigger, 1),
         ("start_address_bytes", start_address_bytes, 0),
         ("samples_per_axi_word", samples_per_axi_word, 1),
-        ("iq_sample_bytes", iq_sample_bytes, 4),
     ):
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{name} must be an integer")
@@ -87,16 +85,13 @@ def calculate_ddr_capture_memory_usage(
         if capacity_words_32b <= 0:
             raise ValueError("capacity_words_32b must be positive")
 
-    if iq_sample_bytes not in (4, 16) or samples_per_axi_word * iq_sample_bytes != 32:
-        raise ValueError("IQ format must pack exactly one 256-bit AXI word")
     trigger_count = sweep_points * repetitions
     physical_words_per_trigger = (
         (samples_per_trigger + samples_per_axi_word - 1)
         // samples_per_axi_word
         * samples_per_axi_word
-        * (iq_sample_bytes // 4)
     )
-    valid_data_bytes = trigger_count * samples_per_trigger * iq_sample_bytes
+    valid_data_bytes = trigger_count * samples_per_trigger * 4
     reserved_bytes = trigger_count * physical_words_per_trigger * 4
     padding_bytes = reserved_bytes - valid_data_bytes
     end_address_bytes = start_address_bytes + reserved_bytes
