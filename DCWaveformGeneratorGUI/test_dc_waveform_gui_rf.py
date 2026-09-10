@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 import numpy as np
 import pytest
 
@@ -861,6 +861,60 @@ def test_composite_embedded_editor_focus_selects_the_row_to_remove():
     assert panel.configured_spec().pulse_events[1].duration_us == 0.1
 
     window.close()
+
+
+@pytest.mark.parametrize("template", ["cpmg", "udd", "custom"])
+@pytest.mark.parametrize("parameter_kind", ["duration", "frequency"])
+def test_composite_parameter_click_and_typing_keep_editor_focus(
+    template, parameter_kind,
+):
+    app = _application()
+    window = gui.MainWindow()
+    try:
+        panel = window._rf_ports_panel._panels[0]
+        panel.setChecked(True)
+        panel.composite_mode.setChecked(True)
+        panel.require_within.setChecked(False)
+        getattr(panel, f"_add_{parameter_kind}_parameter")()
+        panel.predefined_template.setCurrentIndex(
+            panel.predefined_template.findData(template)
+        )
+        window._awg_tuning_tabs.setCurrentWidget(window._rf_ports_panel)
+        window.show()
+        app.processEvents()
+
+        table = getattr(panel, f"{parameter_kind}_parameter_table")
+        value = "0.25" if parameter_kind == "duration" else "190.5"
+        # A shown window and real mouse events reproduce the native focus
+        # recursion that setValue() and synthetic FocusIn alone do not catch.
+        for row in (0, 1, 0):
+            editor = table.cellWidget(row, 1)
+            for target in (editor, editor.lineEdit()):
+                QtTest.QTest.mouseClick(target, QtCore.Qt.LeftButton)
+                app.processEvents()
+                assert editor.hasFocus()
+                assert table.currentRow() == row
+                assert table.currentColumn() == 1
+                assert [
+                    index.row()
+                    for index in table.selectionModel().selectedRows()
+                ] == [row]
+            editor.selectAll()
+            QtTest.QTest.keyClicks(editor, value)
+            QtTest.QTest.keyClick(editor, QtCore.Qt.Key_Tab)
+            app.processEvents()
+            assert editor.value() == float(value)
+
+        spec = panel.configured_spec()
+        parameters = getattr(spec, f"{parameter_kind}_parameters")
+        field = "duration_us" if parameter_kind == "duration" else "frequency_mhz"
+        assert [getattr(parameter, field) for parameter in parameters] == [
+            float(value), float(value),
+        ]
+        assert all(getattr(event, field) == float(value) for event in spec.pulse_events)
+    finally:
+        window.close()
+        app.processEvents()
 
 
 def test_composite_predefined_transitions_replace_every_generated_row():

@@ -4092,7 +4092,22 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 for table in tables:
                     row = self._table_widget_row(table, candidate)
                     if row >= 0:
-                        table.selectRow(row)
+                        # selectRow() moves focus to the first cell and can
+                        # re-enter this filter indefinitely from a cell editor.
+                        # Keep the current index on the clicked editor instead.
+                        column = next(
+                            column
+                            for column in range(table.columnCount())
+                            if table.cellWidget(row, column) is candidate
+                        )
+                        index = table.model().index(row, column)
+                        selection = table.selectionModel()
+                        if selection.currentIndex() != index:
+                            selection.setCurrentIndex(
+                                index,
+                                QtCore.QItemSelectionModel.ClearAndSelect
+                                | QtCore.QItemSelectionModel.Rows,
+                            )
                         return super().eventFilter(watched, event)
                 candidate = candidate.parentWidget()
         return super().eventFilter(watched, event)
