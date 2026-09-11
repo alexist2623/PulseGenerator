@@ -1,7 +1,5 @@
-"""Calibrated DAC levels, infinite edge timing, and GUI start/stop lifecycle."""
+"""Full-scale DAC levels, infinite edge timing, and GUI start/stop lifecycle."""
 import os
-import sqlite3
-from math import log10
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from dataclasses import replace
@@ -27,86 +25,59 @@ def soccfg():
         readouts=[]))
 
 
-def calibration_database(path, *, slope=80.0):
-    # Use the same gain/freq/pwr tables as the existing calibration notebooks.
-    with sqlite3.connect(path) as conn:
-        conn.executescript("""
-            CREATE TABLE experiments (exp_id INTEGER PRIMARY KEY, sample_name TEXT);
-            CREATE TABLE runs (run_id INTEGER PRIMARY KEY, exp_id INTEGER,
-                              result_table_name TEXT, is_completed INTEGER);
-        """)
-        for run_id, board, gain_scale, frequencies in (
-                (1, "DC_Out_legacy", slope, (.001, 1.0)),
-                (2, "DC_Out_higher_response", slope/2, (.001, 1.0)),
-                (3, "RF_Out", 20, (.001, 1.0)),
-                (4, "DC_Out_high_frequency", 1, (400, 500))):
-            conn.execute("INSERT INTO experiments VALUES (?, ?)", (run_id, board))
-            conn.execute("INSERT INTO runs VALUES (?, ?, ?, 1)", (run_id, run_id, f"data_{run_id}"))
-            conn.execute(f"CREATE TABLE data_{run_id} (gain REAL, freq REAL, pwr REAL)")
-            for frequency in frequencies:
-                for gain in (1000, 4000, 8000, 16000, 32764):
-                    peak_v = gain/gain_scale/1000
-                    power_dbm = 10*log10(peak_v**2/(2*50)/.001)
-                    conn.execute(f"INSERT INTO data_{run_id} VALUES (?, ?, ?)", (gain, frequency, power_dbm))
-    return path
-
-
 @pytest.fixture
-def calibrated_config(tmp_path):
-    path = calibration_database(tmp_path / "gain_pwr_calb.db")
-    return square.SquareWaveConfig(gen_ch=0, calibration_database_path=str(path), calibration_run_id=1)
+def square_config():
+    return square.SquareWaveConfig(gen_ch=0)
 
 
-def test_measured_calibration_and_integer_quantization(calibrated_config, tmp_path):
+def test_full_scale_and_integer_quantization(square_config):
     cfg = soccfg()
-    config = calibrated_config
-    resolved = square.resolve_square_wave_calibration(config)
-    assert resolved["codes_per_mv"] == pytest.approx(80)
-    assert config.codes(cfg["gens"][0], resolved) == (1920, 320)
+    assert square_config.full_scale_mv == square.DEFAULT_QICK_FULL_SCALE_MV == 800
+    assert square_config.codes(cfg["gens"][0]) == (1528, 712)
     # A fractional multiplication is rounded to the actual DAC quantum.
-    path = calibration_database(tmp_path / "fractional.db", slope=80.1234)
-    config = replace(config, calibration_database_path=str(path), offset_mv=0.17, zero_code=1121.3)
-    high, low = config.codes(cfg["gens"][0], square.resolve_square_wave_calibration(config))
+    config = replace(square_config, full_scale_mv=750, offset_mv=0.17, zero_code=1121.3)
+    high, low = config.codes(cfg["gens"][0])
     for code, voltage in zip((high, low), (10.17, -9.83)):
         assert type(code) is int and code % 4 == 0
-        assert abs(code - (voltage * 80.1234 + 1121.3)) <= 2
+        assert abs(code - (voltage / 750 * 32768 + 1121.3)) <= 2
 
 
-def test_database_selection_is_dc_output_only_and_never_extrapolates(calibrated_config):
-    config = replace(calibrated_config, calibration_run_id=0)
-    result = square.resolve_square_wave_calibration(config)
-    assert result["run_id"] == 2
-    assert result["codes_per_mv"] == pytest.approx(40)
-    for bad in (replace(config, calibration_run_id=3),
-                replace(config, calibration_run_id=4),
-                replace(config, frequency_hz=10e6)):
-        with pytest.raises(LookupError):
-            square.resolve_square_wave_calibration(bad)
-    with pytest.raises(ValueError, match="Select a DAC calibration database"):
-        square.resolve_square_wave_calibration(square.SquareWaveConfig())
+@pytest.mark.parametrize("amplitude,expected", [(400, (16384, -16384)), (800, (32764, -32768))])
+def test_zero_offset_matches_awg_tuning_full_scale(square_config, amplitude, expected):
+    config = replace(square_config, amplitude_mv=amplitude, zero_code=0)
+    assert config.codes(soccfg()["gens"][0]) == expected
 
 
-def test_program_reloads_measured_gain_and_reference_impedance(calibrated_config):
-    program = square.build_square_wave_program(soccfg(), replace(calibrated_config, calibration_run_id=2))
-    assert program.summary["high_code"] == 1520
-    assert program.summary["low_code"] == 720
-    assert program.summary["calibration"]["run_id"] == 2
-    result = square.resolve_square_wave_calibration(replace(calibrated_config, calibration_reference_ohm=200))
-    assert result["codes_per_mv"] == pytest.approx(40)
-    # A legacy manual slope cannot override measured calibration after reload.
-    values = square.normalize_square_wave_settings({"codes_per_mv": 123})
-    assert "codes_per_mv" not in values
+def test_program_uses_selected_full_scale_without_calibration(square_config):
+    for frequency in (40000, 12345):
+        program = square.build_square_wave_program(soccfg(), replace(
+            square_config, full_scale_mv=400, frequency_hz=frequency))
+        assert program.summary["high_code"] == 1940
+        assert program.summary["low_code"] == 300
+        assert program.summary["full_scale_mv"] == 400
+        assert "calibration" not in program.summary
 
 
-@pytest.mark.parametrize("kwargs", [dict(amplitude_mv=1000), dict(amplitude_mv=1e-8)])
-def test_out_of_range_and_unresolvable_levels_are_rejected(kwargs, calibrated_config):
+def test_legacy_settings_drop_calibration_and_preserve_waveform():
+    values = square.normalize_square_wave_settings(dict(
+        calibration_database_path="missing.db", calibration_run_id=112,
+        calibration_reference_ohm=50, codes_per_mv=80, frequency_hz=25000,
+        amplitude_mv=12.5, offset_mv=1.5, zero_code=1104))
+    assert values == dict(gen_ch=1, frequency_hz=25000, amplitude_mv=12.5,
+                         offset_mv=1.5, duty_percent=50, zero_code=1104, full_scale_mv=800)
+
+
+@pytest.mark.parametrize("kwargs", [dict(amplitude_mv=1000), dict(amplitude_mv=1e-8),
+    dict(amplitude_mv=790, offset_mv=20), dict(amplitude_mv=800),
+    dict(zero_code=32768), dict(zero_code=-32768)])
+def test_out_of_range_and_unresolvable_levels_are_rejected(kwargs, square_config):
     with pytest.raises(ValueError):
-        square.build_square_wave_program(soccfg(), replace(calibrated_config, **kwargs))
+        square.build_square_wave_program(soccfg(), replace(square_config, **kwargs))
 
 
 @pytest.mark.parametrize("kwargs", [dict(frequency_hz=0), dict(amplitude_mv=-1),
-    dict(duty_percent=100), dict(calibration_reference_ohm=0), dict(zero_code=float("nan")),
-    dict(gen_ch=True), dict(calibration_run_id=1.5), dict(calibration_database_path=None)])
+    dict(duty_percent=100), dict(full_scale_mv=0), dict(zero_code=float("nan")),
+    dict(gen_ch=True), dict(full_scale_mv=None), dict(full_scale_mv=float("inf"))])
 def test_invalid_inputs_are_rejected(kwargs):
     with pytest.raises(ValueError):
         square.SquareWaveConfig(**kwargs)
@@ -124,8 +95,8 @@ class ReferenceTimeInterpreter(TProcV1Sim):
 
 
 @pytest.mark.parametrize("frequency,duty", [(40000, 50), (12345, 37), (500000, 95)])
-def test_compiled_infinite_loop_preserves_edges_without_readout(frequency, duty, calibrated_config):
-    config = replace(calibrated_config, frequency_hz=frequency, duty_percent=duty)
+def test_compiled_infinite_loop_preserves_edges_without_readout(frequency, duty, square_config):
+    config = replace(square_config, frequency_hz=frequency, duty_percent=duty)
     program = square.build_square_wave_program(soccfg(), config)
     model = ReferenceTimeInterpreter()
     with pytest.raises(RuntimeError, match="exceeded max_steps"):
@@ -136,7 +107,7 @@ def test_compiled_infinite_loop_preserves_edges_without_readout(frequency, duty,
     period = round(300e6/frequency)
     high_ticks = round(period*duty/100)
     codes = [e.word & 0xffffffff for e in events]
-    assert codes == [1920 if i % 2 == 0 else 320 for i in range(len(events))]
+    assert codes == [1528 if i % 2 == 0 else 712 for i in range(len(events))]
     for i in range(len(events)-1):
         assert events[i+1].cycle-events[i].cycle == (high_ticks if i % 2 == 0 else period-high_ticks)
     assert all(e.tproc_ch == 0 for e in events)
@@ -146,10 +117,10 @@ def test_compiled_infinite_loop_preserves_edges_without_readout(frequency, duty,
     assert program.binprog
 
 
-def test_clock_override_and_firmware_validation(calibrated_config):
+def test_clock_override_and_firmware_validation(square_config):
     cfg = soccfg()
     cfg["tprocs"][0]["f_time"] = 400.0
-    program = square.build_square_wave_program(cfg, calibrated_config, tproc_mhz=300)
+    program = square.build_square_wave_program(cfg, square_config, tproc_mhz=300)
     assert program.summary["period_cycles"] == 7500
     assert cfg["tprocs"][0]["f_time"] == 400.0
     for config in (square.SquareWaveConfig(gen_ch=2),
@@ -189,7 +160,7 @@ class FakeSoc:
 
 def fake_factory(cfg, config, **kwargs):
     return SimpleNamespace(summary=dict(actual_frequency_hz=40000, actual_duty_percent=50,
-        high_code=1920, low_code=320, tproc_mhz=300),
+        high_code=1528, low_code=712, tproc_mhz=300, full_scale_mv=config.full_scale_mv),
         config_all=lambda soc, reset: soc.calls.append(("load", reset)))
 
 
@@ -256,7 +227,7 @@ def qt_until(predicate):
     assert predicate()
 
 
-def test_gui_tab_settings_start_stop_and_close(monkeypatch, calibrated_config):
+def test_gui_tab_settings_start_stop_and_close(monkeypatch):
     import DCWaveform_Generator as gui
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     soc = FakeSoc()
@@ -267,25 +238,26 @@ def test_gui_tab_settings_start_stop_and_close(monkeypatch, calibrated_config):
     try:
         assert window._control_tabs.tabText(window._control_tabs.indexOf(panel)) == "QICK Square Wave"
         assert not hasattr(panel, "codes_per_mv")
-        window._calibration_panel.database_path.setText(calibrated_config.calibration_database_path)
-        assert panel.calibration_database_path.text() == ""
-        panel.refresh_calibration.click()
-        assert "Loaded DC_Out Run 2" in panel.status.text()
-        assert panel.calibration_run.findData(3) == -1
-        panel.calibration_run.setCurrentIndex(panel.calibration_run.findData(1))
-        assert "Loaded DC_Out Run 1" in panel.status.text()
+        assert not hasattr(panel, "calibration_database_path")
+        assert not hasattr(panel, "calibration_run")
+        assert panel.full_scale_mv.value() == 800
+        panel.full_scale_mv.setValue(400)
+        window._calibration_panel.database_path.setText("missing.db")
+        assert panel.full_scale_mv.value() == 400
+        assert window._experiment_panel.full_scale_mv.value() == 800
         panel.amplitude_mv.setValue(12.5)
         panel.zero_code.setValue(1104)
         payload = window._settings_to_dict()
         decoded = window._decode_settings(payload)
         assert decoded["square_wave"]["amplitude_mv"] == 12.5
         assert decoded["square_wave"]["zero_code"] == 1104
-        assert decoded["square_wave"]["calibration_run_id"] == 1
+        assert decoded["square_wave"]["full_scale_mv"] == 400
         panel.load_settings(decoded["square_wave"])
         del payload["square_wave"]
         assert window._decode_settings(payload)["square_wave"] == square.normalize_square_wave_settings()
         panel.start_button.click()
         qt_until(lambda: "Running:" in panel.status.text())
+        assert "maximum output +/-400 mV" in panel.status.text()
         assert not panel.start_button.isEnabled() and panel.stop_button.isEnabled()
         assert window._experiment_thread.isRunning()
         running_worker = window._experiment_worker
@@ -320,12 +292,13 @@ def test_gui_tab_settings_start_stop_and_close(monkeypatch, calibrated_config):
         app.processEvents()
 
 
-def test_invalid_database_prevents_hardware_configuration():
+def test_invalid_output_range_prevents_hardware_configuration():
     soc = FakeSoc()
     worker = worker_for(soc)
     worker.program_factory = square.build_square_wave_program
+    worker.config = replace(worker.config, amplitude_mv=801)
     errors = []
     worker.failed.connect(errors.append, QtCore.Qt.DirectConnection)
     worker.run()
     assert soc.calls == []
-    assert "Select a DAC calibration database" in errors[0]
+    assert "output full scale" in errors[0]

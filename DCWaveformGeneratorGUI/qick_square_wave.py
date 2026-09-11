@@ -1,13 +1,8 @@
-"""Continuous QICK AWG square waves with connector-voltage calibration.
-
-The existing QICK DC_Out gain/frequency/power database supplies the amplitude
-scale. Its sine-tone power is converted to peak voltage, using the calibration
-dBm reference impedance. The original DAC offset compensation remains separate.
-"""
+"""Continuous QICK AWG square waves using a configured output voltage range."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from math import isfinite, sqrt
+from dataclasses import asdict, dataclass
+from math import isfinite
 from threading import Event
 import traceback
 
@@ -16,10 +11,12 @@ import pyqtgraph as pg
 
 try:
     from .qick_qcodes_experiment import connect_qick
-    from .power_calibration import CalibrationDatabase
+    from .dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
+    from .qick_fine_tune_sweep import normalized_to_dac
 except ImportError:
     from qick_qcodes_experiment import connect_qick
-    from power_calibration import CalibrationDatabase
+    from dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
+    from qick_fine_tune_sweep import normalized_to_dac
 
 
 @dataclass(frozen=True)
@@ -29,41 +26,38 @@ class SquareWaveConfig:
     amplitude_mv: float = 10.0
     offset_mv: float = 0.0
     duty_percent: float = 50.0
-    calibration_database_path: str = ""
-    calibration_run_id: int = 0
-    calibration_reference_ohm: float = 50.0
+    full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV
     zero_code: float = 1120.0
 
     def __post_init__(self):
         if isinstance(self.gen_ch, bool) or not isinstance(self.gen_ch, int) or self.gen_ch < 0:
             raise ValueError("Generator channel must be a nonnegative integer")
         for name, value in asdict(self).items():
-            if name == "calibration_database_path":
-                if not isinstance(value, str):
-                    raise ValueError("Calibration database path must be text")
-                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
         if self.frequency_hz <= 0 or self.amplitude_mv <= 0:
             raise ValueError("Frequency and peak amplitude must be positive")
         if not 0 < self.duty_percent < 100:
             raise ValueError("Duty cycle must be between 0 and 100 percent")
-        if not isinstance(self.calibration_run_id, int) or self.calibration_run_id < 0:
-            raise ValueError("Calibration run ID must be a nonnegative integer")
-        if self.calibration_reference_ohm <= 0:
-            raise ValueError("Calibration dBm reference impedance must be positive")
+        if self.full_scale_mv <= 0:
+            raise ValueError("Output full scale must be positive")
 
-    def codes(self, gen_cfg, calibration):
-        quantum = 1 << int(gen_cfg.get("dac_invalid_lsb", 0))
+    def codes(self, gen_cfg):
+        invalid_lsb = int(gen_cfg.get("dac_invalid_lsb", 0))
+        quantum = 1 << invalid_lsb
+        min_code, max_code = int(gen_cfg["minv"]), int(gen_cfg["maxv"])
+        full_scale_code = max(abs(min_code), max_code + quantum)
         result = []
         for label, voltage in (("High", self.offset_mv + self.amplitude_mv),
                                ("Low", self.offset_mv - self.amplitude_mv)):
-            value = voltage * calibration["codes_per_mv"] + self.zero_code
-            if not isfinite(value):
-                raise ValueError(f"{label} calibrated DAC code is not finite")
-            code = int(round(value / quantum)) * quantum
-            if not int(gen_cfg["minv"]) <= code <= int(gen_cfg["maxv"]):
-                raise ValueError(f"{label} calibrated DAC code {code} exceeds the channel range")
+            if abs(voltage) > self.full_scale_mv:
+                raise ValueError(f"{label} voltage exceeds +/-{self.full_scale_mv:g} mV output full scale")
+            # Use the AWG Tuning conversion, adding offset before quantization.
+            amplitude = voltage / self.full_scale_mv + self.zero_code / full_scale_code
+            if not isfinite(amplitude) or not -1.0 <= amplitude <= 1.0:
+                raise ValueError(f"{label} DAC level including offset compensation exceeds the channel range")
+            code = normalized_to_dac(amplitude, min_code=min_code,
+                                     max_code=max_code, invalid_lsb=invalid_lsb)
             result.append(code)
         if result[0] == result[1]:
             raise ValueError("The two levels quantize to the same DAC code; increase amplitude")
@@ -74,33 +68,12 @@ def normalize_square_wave_settings(settings=None):
     if settings is not None and not isinstance(settings, dict):
         raise TypeError("Square-wave settings must be a JSON object")
     values = dict(settings or {})
-    # Discard the obsolete manual slope; loading old settings must not silently
-    # bypass the required measured calibration.
-    values.pop("codes_per_mv", None)
+    # Older square-wave settings used measured power or a manual slope.
+    # Preserve waveform values while migrating to the explicit output range.
+    for obsolete in ("codes_per_mv", "calibration_database_path",
+                     "calibration_run_id", "calibration_reference_ohm"):
+        values.pop(obsolete, None)
     return asdict(SquareWaveConfig(**values))
-
-
-def resolve_square_wave_calibration(config, *, frequency_hz=None):
-    """Use the same measured DC_Out run loader as the other QICK GUI tabs."""
-    if not config.calibration_database_path.strip():
-        raise ValueError("Select a DAC calibration database in this tab or the Calibration tab")
-    frequency = config.frequency_hz if frequency_hz is None else float(frequency_hz)
-    calibration = CalibrationDatabase(config.calibration_database_path).output_calibration(
-        "DC_Out", [frequency / 1e6], run_id=config.calibration_run_id or None)
-    # This is the power of the measured calibration SINE, not square-wave RMS
-    # power. Convert sine RMS to peak voltage before mapping the SET levels.
-    response_dbm = float(calibration.output_power_dbm(
-        frequency / 1e6, calibration.reference_gain))
-    reference_peak_mv = 1000 * sqrt(
-        2 * config.calibration_reference_ohm * 10**((response_dbm - 30) / 10))
-    if not isfinite(reference_peak_mv) or reference_peak_mv <= 0:
-        raise ValueError("DAC calibration returned an invalid voltage response")
-    return dict(database_path=str(calibration.summary.database_path),
-                run_id=calibration.summary.run_id, board_type="DC_Out",
-                sample_name=calibration.summary.sample_name,
-                frequency_hz=frequency, reference_impedance_ohm=config.calibration_reference_ohm,
-                response_dbm=response_dbm,
-                codes_per_mv=calibration.reference_gain / reference_peak_mv)
 
 
 def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
@@ -127,8 +100,7 @@ def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
     fabric_mhz = float(gen_cfg["f_fabric"])
     if min(high_ticks, period - high_ticks) * fabric_mhz / clock < 16:
         raise ValueError("Each level must last at least 16 DAC fabric clocks")
-    calibration = resolve_square_wave_calibration(config, frequency_hz=clock * 1e6 / period)
-    high_code, low_code = config.codes(gen_cfg, calibration)
+    high_code, low_code = config.codes(gen_cfg)
 
     class SquareWaveProgram(QickProgram):
         def __init__(self):
@@ -164,7 +136,7 @@ def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
                                 low_cycles=period-high_ticks, tproc_mhz=clock,
                                 high_code=high_code, low_code=low_code,
                                 actual_duty_percent=100.0*high_ticks/period,
-                                calibration=calibration)
+                                full_scale_mv=config.full_scale_mv)
 
     program = SquareWaveProgram()
     program.compile()
@@ -236,9 +208,8 @@ class SquareWavePanel(QtWidgets.QWidget):
     start_requested = QtCore.pyqtSignal(object)
     stop_requested = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None, *, calibration_path_provider=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._calibration_path_provider = calibration_path_provider or (lambda: "")
         layout = QtWidgets.QVBoxLayout(self)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -261,7 +232,7 @@ class SquareWavePanel(QtWidgets.QWidget):
                        ("offset_mv", "Waveform offset (mV)", -1e5, 1e5, 6),
                        ("duty_percent", "High-level duty (%)", 0.001, 99.999, 3),
                        ("zero_code", "DAC offset compensation (codes)", -1e9, 1e9, 6),
-                       ("calibration_reference_ohm", "Calibration dBm reference (ohm)", 0.001, 1e7, 3))
+                       ("full_scale_mv", "Maximum output (+/- mV)", 1.0, 1e6, 6))
         for name, label, minimum, maximum, decimals in definitions:
             widget = QtWidgets.QDoubleSpinBox()
             widget.setRange(minimum, maximum)
@@ -269,31 +240,14 @@ class SquareWavePanel(QtWidgets.QWidget):
             widget.setKeyboardTracking(False)
             setattr(self, name, widget)
             form.addRow(label, widget)
-        self.calibration_database_path = QtWidgets.QLineEdit()
-        self.calibration_database_path.setPlaceholderText("Use database from the Calibration tab")
-        self.browse_calibration = QtWidgets.QPushButton("Browse...")
-        path_row = QtWidgets.QHBoxLayout()
-        path_row.addWidget(self.calibration_database_path, 1)
-        path_row.addWidget(self.browse_calibration)
-        form.addRow("DAC calibration DB", path_row)
-        self.calibration_run = QtWidgets.QComboBox()
-        self.calibration_run.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.calibration_run.setMinimumContentsLength(14)
-        self.calibration_run.addItem("Auto: latest DC_Out run covering frequency", 0)
-        self.refresh_calibration = QtWidgets.QPushButton("Load / refresh")
-        run_row = QtWidgets.QHBoxLayout()
-        run_row.addWidget(self.calibration_run, 1)
-        run_row.addWidget(self.refresh_calibration)
-        form.addRow("Measured DAC run", run_row)
         editor.addWidget(self.controls)
-        self.calibration_note = QtWidgets.QLabel(
-            "Amplitude calibration is loaded from the measured QICK DC_Out data. "
-            "Peak amplitude is half the peak-to-peak voltage. The original +1120-code "
-            "offset compensation is separate: power measurements do not determine DC offset. "
-            "The dBm reference and output load must match the calibration measurement. "
-            "Sine-tone gain calibration does not correct square-wave harmonics or settling.")
-        self.calibration_note.setWordWrap(True)
-        editor.addWidget(self.calibration_note)
+        self.output_note = QtWidgets.QLabel(
+            "Maximum output sets the +/- voltage range, as in AWG Tuning. "
+            "Peak amplitude is half the peak-to-peak voltage; High/Low = waveform "
+            "offset +/- peak amplitude. DAC offset compensation is added separately. "
+            "This tab uses its own maximum output setting.")
+        self.output_note.setWordWrap(True)
+        editor.addWidget(self.output_note)
         self.plot = pg.PlotWidget()
         self.plot.setLabel("bottom", "Time", units="us")
         self.plot.setLabel("left", "Requested voltage", units="mV")
@@ -316,13 +270,8 @@ class SquareWavePanel(QtWidgets.QWidget):
         layout.addWidget(stop_note)
         self.load_settings({})
         for name in ("gen_ch", "frequency_hz", "amplitude_mv", "offset_mv", "duty_percent",
-                     "zero_code", "calibration_reference_ohm"):
+                     "zero_code", "full_scale_mv"):
             getattr(self, name).valueChanged.connect(self.update_preview)
-            getattr(self, name).valueChanged.connect(self._mark_calibration_stale)
-        self.calibration_database_path.textChanged.connect(self._database_changed)
-        self.calibration_run.currentIndexChanged.connect(self._apply_calibration)
-        self.browse_calibration.clicked.connect(self._browse_calibration)
-        self.refresh_calibration.clicked.connect(self._refresh_calibration)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self.stop_requested.emit)
         self.set_running(False)
@@ -330,20 +279,14 @@ class SquareWavePanel(QtWidgets.QWidget):
     def settings_dict(self):
         values = {name: getattr(self, name).value() for name in
                   ("gen_ch", "frequency_hz", "amplitude_mv", "offset_mv", "duty_percent",
-                   "zero_code", "calibration_reference_ohm")}
-        values.update(calibration_database_path=self.calibration_database_path.text().strip(),
-                      calibration_run_id=int(self.calibration_run.currentData() or 0))
+                   "zero_code", "full_scale_mv")}
         return normalize_square_wave_settings(values)
 
     def resolved_config(self):
-        config = SquareWaveConfig(**self.settings_dict())
-        return replace(config, calibration_database_path=(config.calibration_database_path
-                       or str(self._calibration_path_provider()).strip()))
+        return SquareWaveConfig(**self.settings_dict())
 
     def load_settings(self, settings):
         values = normalize_square_wave_settings(settings)
-        path = values.pop("calibration_database_path")
-        run_id = values.pop("calibration_run_id")
         for name, value in values.items():
             widget = getattr(self, name)
             if not widget.minimum() <= value <= widget.maximum():
@@ -352,76 +295,7 @@ class SquareWavePanel(QtWidgets.QWidget):
             widget = getattr(self, name)
             with QtCore.QSignalBlocker(widget):
                 widget.setValue(value)
-        with QtCore.QSignalBlocker(self.calibration_database_path):
-            self.calibration_database_path.setText(path)
-        with QtCore.QSignalBlocker(self.calibration_run):
-            self.calibration_run.clear()
-            self.calibration_run.addItem("Auto: latest DC_Out run covering frequency", 0)
-            if run_id:
-                self.calibration_run.addItem(f"Run {run_id} (load to inspect)", run_id)
-                self.calibration_run.setCurrentIndex(1)
         self.update_preview()
-        self._mark_calibration_stale()
-
-    def _mark_calibration_stale(self, *_args):
-        if self.controls.isEnabled():
-            self.status.setText("Calibration will be reloaded and validated before output starts.")
-
-    def shared_database_changed(self, *_args):
-        if not self.calibration_database_path.text().strip():
-            self._database_changed()
-
-    def _database_changed(self):
-        with QtCore.QSignalBlocker(self.calibration_run):
-            self.calibration_run.clear()
-            self.calibration_run.addItem("Auto: latest DC_Out run covering frequency", 0)
-        self._mark_calibration_stale()
-
-    def _browse_calibration(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Choose DAC measurement calibration database",
-            self.resolved_config().calibration_database_path,
-            "Calibration databases (*.db *.sqlite *.sqlite3);;All files (*)")
-        if path:
-            self.calibration_database_path.setText(path)
-            self._refresh_calibration()
-
-    def _refresh_calibration(self):
-        try:
-            config = self.resolved_config()
-            candidates = CalibrationDatabase(config.calibration_database_path).output_calibration_candidates(
-                "DC_Out", [config.frequency_hz / 1e6])
-            with QtCore.QSignalBlocker(self.calibration_run):
-                self.calibration_run.clear()
-                self.calibration_run.addItem("Auto: latest DC_Out run covering frequency", 0)
-                for candidate in candidates:
-                    record = candidate.summary
-                    if record.board_type != "DC_Out":
-                        continue
-                    label = (f"Run {record.run_id} | {record.sample_name} | "
-                             f"{record.frequency_min_mhz:g}..{record.frequency_max_mhz:g} MHz")
-                    if not candidate.full_frequency_coverage:
-                        label += " | outside frequency range"
-                    self.calibration_run.addItem(label, record.run_id)
-                    self.calibration_run.setItemData(self.calibration_run.count()-1, label, QtCore.Qt.ToolTipRole)
-                index = self.calibration_run.findData(config.calibration_run_id)
-                if index < 0:
-                    self.calibration_run.addItem(f"Run {config.calibration_run_id} (not a DAC run in this DB)",
-                                                 config.calibration_run_id)
-                    index = self.calibration_run.count()-1
-                self.calibration_run.setCurrentIndex(index)
-            self._apply_calibration()
-        except Exception as exc:
-            self.status.setText(f"Cannot load DAC calibration: {exc}")
-
-    def _apply_calibration(self, *_args):
-        try:
-            result = resolve_square_wave_calibration(self.resolved_config())
-            self.status.setText(f"Loaded DC_Out Run {result['run_id']}: "
-                                f"{result['codes_per_mv']:.9g} codes/mV at "
-                                f"{result['frequency_hz']:g} Hz (from measured data).")
-        except Exception as exc:
-            self.status.setText(f"Cannot load DAC calibration: {exc}")
 
     def update_preview(self):
         period = 1e6 / self.frequency_hz.value()
@@ -431,6 +305,12 @@ class SquareWavePanel(QtWidgets.QWidget):
         self.curve.setData([0, high_time, high_time, period, period,
                             period+high_time, period+high_time, 2*period],
                            [high, high, low, low, high, high, low, low])
+        if self.controls.isEnabled():
+            full_scale = self.full_scale_mv.value()
+            if max(abs(high), abs(low)) > full_scale:
+                self.status.setText(f"High/Low voltage exceeds +/-{full_scale:g} mV maximum output.")
+            else:
+                self.status.setText(f"Ready: maximum output +/-{full_scale:g} mV; High/Low {high:g} / {low:g} mV.")
 
     def _start(self):
         try:

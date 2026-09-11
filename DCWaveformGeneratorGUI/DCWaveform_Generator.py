@@ -9777,10 +9777,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             default_database_path=DEFAULT_QCODES_DB_PATH,
         )
         self._bias_panel = BiasControlPanel(self)
-        self._square_wave_panel = SquareWavePanel(
-            self, calibration_path_provider=lambda: self._calibration_panel.database_path.text())
-        self._calibration_panel.database_path.textChanged.connect(
-            self._square_wave_panel.shared_database_changed)
+        self._square_wave_panel = SquareWavePanel(self)
         self._square_wave_panel.start_requested.connect(self._start_square_wave)
         self._square_wave_panel.stop_requested.connect(self._stop_square_wave)
         self._square_wave_close_pending = False
@@ -12663,15 +12660,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._experiment_worker.request_stop()
 
     def _on_square_wave_started(self, result) -> None:
-        calibration = result.get("calibration", {})
-        calibration_label = (
-            f" DC_Out calibration Run {calibration['run_id']}." if calibration else ""
-        )
         self._square_wave_panel.status.setText(
             f"Running: {result['actual_frequency_hz']:.9g} Hz, "
             f"duty {result['actual_duty_percent']:.6g}%; "
             f"DAC high/low codes {result['high_code']} / {result['low_code']} "
-            f"({result['tproc_mhz']:g} MHz tProcessor).{calibration_label}"
+            f"({result['tproc_mhz']:g} MHz tProcessor); "
+            f"maximum output +/-{result['full_scale_mv']:g} mV."
         )
 
     def _on_square_wave_finished(self, message) -> None:
