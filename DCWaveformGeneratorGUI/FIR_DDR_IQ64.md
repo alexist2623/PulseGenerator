@@ -26,10 +26,14 @@ normalized I trace used for analysis.
 
 QCoDeS AWG/experiment runs keep the selected existing storage mode:
 `i_trace`/`q_trace` for full traces or `i_mean`/`q_mean` for mean I/Q.
-Both modes additionally save exact V3 arrays in `i_raw_int64`/`q_raw_int64`.
-The acquisition metadata records `raw_iq_shape` and `raw_iq_scale_log2`.
+Full-trace mode additionally saves exact V3 arrays in `i_raw_int64`/`q_raw_int64`.
+Mean-only mode saves one I/Q pair per sweep point after averaging repetitions
+and samples; it does not register or save raw trace arrays. Its metadata marks
+`raw_iq_storage` as `omitted_mean_iq` and `raw_iq_parameters` as an empty list.
+The acquisition metadata still records the source `raw_iq_shape` and
+`raw_iq_scale_log2`. For runs containing raw arrays,
 `load_qick_raw_int64_arrays(dataset, shape=raw_iq_shape)` restores all original
-integer values, including when the selected analysis policy averages shots.
+integer values. Older mean-mode runs that also contain raw arrays remain readable.
 S-parameter databases retain integer I/Q traces and store `iq_scale_log2` with
 the result. `load_sparameter_run()` restores that scale before recalculating
 the response.

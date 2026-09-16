@@ -2088,11 +2088,14 @@ def store_qick_result(
         ) from exc
 
     _check_cancel(cancel_check)
+    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
     raw_iq = np.asarray(ddr_result.iq)
     raw_scale_log2 = int(getattr(ddr_result, "iq_scale_log2", 0))
-    store_raw_int64 = raw_scale_log2 != 0
-    if store_raw_int64 and raw_iq.dtype != np.dtype("int64"):
+    is_iq64 = raw_scale_log2 != 0
+    if is_iq64 and raw_iq.dtype != np.dtype("int64"):
         raise RuntimeError("IQ64 capture must retain signed-int64 raw data")
+    # Mean-only storage must not persist the pre-average IQ64 traces either.
+    store_raw_int64 = is_iq64 and iq_storage_mode == IQ_STORAGE_FULL_TRACES
     iq, iq_unit, measurement_mode, measurement_conversion = (
         _measurement_iq_values(result_iq_in_input_units(ddr_result), rf_settings)
     )
@@ -2102,7 +2105,6 @@ def store_qick_result(
     if isinstance(batch_rows, bool) or int(batch_rows) < 1:
         raise ValueError("batch_rows must be a positive integer")
     batch_rows = int(batch_rows)
-    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
     progress_start = int(progress_start)
     progress_end = int(progress_end)
     if not 0 <= progress_start <= progress_end <= 100:
@@ -2431,7 +2433,10 @@ def store_qick_result(
         "raw_iq_scale_log2": raw_scale_log2,
         "raw_iq_shape": list(raw_iq.shape),
         "raw_iq_parameters": [p.name for p in raw_parameters],
-        "raw_iq_storage": "exact_int64_arrays" if store_raw_int64 else "legacy",
+        "raw_iq_storage": (
+            "omitted_mean_iq" if iq_storage_mode == IQ_STORAGE_MEAN_IQ
+            else "exact_int64_arrays" if store_raw_int64 else "legacy"
+        ),
         "iq_unit": iq_unit,
         "measurement_mode": measurement_mode,
         "measurement_conversion": dict(measurement_conversion),
@@ -2677,15 +2682,8 @@ def store_qick_result(
                     )
                     for axis_index, parameter in enumerate(sweep_parameters)
                 ]
-                # Preserve every acquired integer even when the selected
-                # analysis layout stores only one mean I/Q pair per point.
-                raw_results = [
-                    (parameter, np.ascontiguousarray(raw_iq[point_index, ..., lane].reshape(-1)))
-                    for lane, parameter in enumerate(raw_parameters)
-                ]
                 datasaver.add_result(
                     *coordinate_results,
-                    *raw_results,
                     (i_mean, float(mean_iq_values[point_index, 0])),
                     (q_mean, float(mean_iq_values[point_index, 1])),
                 )

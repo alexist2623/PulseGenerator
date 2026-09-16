@@ -96,7 +96,7 @@ def test_legacy_sparameter_positional_constructor_keeps_argument_order(power_swe
 
 @pytest.mark.parametrize('storage_mode', ['full_traces', 'mean_iq'])
 @pytest.mark.parametrize('swept', [False, True])
-def test_qcodes_roundtrip_preserves_low_bits_even_when_averaging(tmp_path, monkeypatch, storage_mode, swept):
+def test_qcodes_roundtrip_honors_mean_only_and_preserves_full_trace_low_bits(tmp_path, monkeypatch, storage_mode, swept):
     from qick_qcodes_experiment import (store_qick_result, QcodesRunConfig,
         QickConnectionConfig, load_qick_raw_int64_arrays, load_qick_iq_arrays,
         QCODES_STAGING_ENV)
@@ -110,11 +110,26 @@ def test_qcodes_roundtrip_preserves_low_bits_even_when_averaging(tmp_path, monke
         raw = np.arange(template.iq.size, dtype=np.int64).reshape(template.iq.shape) + 2**62 + 3
         raw[..., 1] *= -1
         result = replace(template, iq=raw, iq_scale_log2=46, iq_component_bits=64)
-    dataset,_=store_qick_result(result,run_config=QcodesRunConfig(str(tmp_path/'iq64.db')),
+    dataset,row_count=store_qick_result(result,run_config=QcodesRunConfig(str(tmp_path/'iq64.db')),
         connection_config=QickConnectionConfig('192.0.2.1',8888,'mock'),
         program_summary={},gui_settings={},rf_settings={},iq_storage_mode=storage_mode)
-    np.testing.assert_array_equal(load_qick_raw_int64_arrays(dataset,shape=raw.shape),raw)
     loaded=load_qick_iq_arrays(dataset)
+    layout = loaded['metadata']['measurement_layout']
+    parameters = set(dataset.paramspecs)
+    if storage_mode == 'mean_iq':
+        assert {'i_mean', 'q_mean'} <= parameters
+        assert not parameters.intersection({
+            'i_trace', 'q_trace', 'i_raw_int64', 'q_raw_int64',
+            'sample_index', 'repetition_index',
+        })
+        assert row_count == raw.shape[0]
+        assert dataset.number_of_results == 2 * raw.shape[0]
+        assert layout['raw_iq_parameters'] == []
+        assert layout['raw_iq_storage'] == 'omitted_mean_iq'
+    else:
+        assert {'i_trace', 'q_trace', 'i_raw_int64', 'q_raw_int64'} <= parameters
+        assert layout['raw_iq_storage'] == 'exact_int64_arrays'
+        np.testing.assert_array_equal(load_qick_raw_int64_arrays(dataset,shape=raw.shape),raw)
     # Normalized traces remain on the established calibration scale.
     assert np.max(np.abs(loaded['iq'])) < 65537
     expected = np.ldexp(raw.astype(np.float64), -46)
