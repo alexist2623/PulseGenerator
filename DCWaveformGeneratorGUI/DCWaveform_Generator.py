@@ -22,6 +22,10 @@ except ImportError:
     from fir_ddr_profile import result_iq_in_input_units
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from .qick_square_dds_panel import SquarePulsePanel, TriggeringPanel
+except ImportError:
+    from qick_square_dds_panel import SquarePulsePanel, TriggeringPanel
 
 
 class _ValueInputWheelGuard(QtCore.QObject):
@@ -7203,7 +7207,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         content = QtWidgets.QWidget(scroll)
         form = QtWidgets.QFormLayout(content)
         scroll.setWidget(content)
-        outer.addWidget(scroll)
+        self.measurement_tabs = QtWidgets.QTabWidget(self)
+        self.triggering_panel = TriggeringPanel(self)
+        self.measurement_tabs.addTab(scroll, "Measurement")
+        self.measurement_tabs.addTab(self.triggering_panel, "Triggering")
+        outer.addWidget(self.measurement_tabs)
 
         self.qick_host = QtWidgets.QLineEdit(DEFAULT_QICK_HOST)
         self.ns_port = QtWidgets.QSpinBox()
@@ -7846,6 +7854,8 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     def _sweep_axis_label(self, spec) -> str:
         axis_kind = getattr(spec, "axis_kind", "amplitude")
+        if axis_kind.startswith("square_"):
+            return f"SquarePulse gen {spec.gen_ch} / {spec.parameter}: {spec.start:.6g} to {spec.stop:.6g} {spec.coordinate_unit} | {spec.count} points"
         if axis_kind == "rf_template_n":
             return (
                 f"RF gen {spec.gen_ch} / {spec.segment_name} template N "
@@ -7911,6 +7921,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         spec,
     ) -> Tuple[str, str, float, float, str]:
         axis_kind = str(getattr(spec, "axis_kind", "amplitude"))
+        if axis_kind.startswith("square_"):
+            return ("SquarePulse " + spec.parameter, f"Gen {spec.gen_ch}", float(spec.start), float(spec.stop), spec.coordinate_unit)
         if axis_kind == "rf_duration":
             return (
                 "RF duration",
@@ -9940,6 +9952,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._awg_tuning_tabs.addTab(self._rf_ports_panel, "RF Outputs")
         self._awg_tuning_tabs.addTab(self._rf_readout_panel, "RF Readout")
         self._awg_tuning_tabs.addTab(self._experiment_panel, "Experiment")
+        self._square_dds_panel = SquarePulsePanel(self)
+        self._square_dds_scroll = QtWidgets.QScrollArea(self)
+        self._square_dds_scroll.setWidgetResizable(True)
+        self._square_dds_scroll.setWidget(self._square_dds_panel)
+        self._awg_tuning_tabs.addTab(self._square_dds_scroll, "SquarePulse")
+        self._square_dds_panel.changed.connect(self._notify_sweep_state_changed)
         self._awg_tuning_tabs.setCurrentWidget(self._multi_ctrl)
         awg_tuning_layout.addWidget(self._awg_tuning_tabs)
 
@@ -11349,7 +11367,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             axis
             for spec in getattr(self, "_rf_pulse_specs", ())
             for axis in (*spec.sweep_axes, *spec.software_sweep_axes)
-        )
+        ) + (self._square_dds_panel.sweep_specs() if hasattr(self, "_square_dds_panel") else ())
 
     @staticmethod
     def _set_composite_rf_parameter_sweep(
@@ -11409,6 +11427,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         key = ExperimentPanel._sweep_parameter_key(spec)
         axis_kind = key[0]
         try:
+            if axis_kind.startswith("square_"):
+                row = self._square_dds_panel.rows[spec.parameter]
+                row["start"].setValue(float(start))
+                row["stop"].setValue(float(stop))
+                row["count"].setValue(int(count))
+                self._notify_sweep_state_changed()
+                return
             if axis_kind in {
                 "rf_duration",
                 "rf_frequency",
@@ -11574,6 +11599,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _remove_sweep_parameter(self, spec) -> None:
         key = ExperimentPanel._sweep_parameter_key(spec)
+        if key[0].startswith("square_"):
+            self._square_dds_panel.rows[spec.parameter]["sweep"].setChecked(False)
+            return
         if key[0] in {
             "rf_duration",
             "rf_frequency",
@@ -11783,6 +11811,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_compensation_mode=self._bias_t_compensation_mode,
             bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+        )
+        self._square_dds_panel.attach_to_sequence(
+            sequence, self._qick_full_scale_mv,
+            self._experiment_panel.triggering_panel.config(),
         )
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
@@ -12092,6 +12124,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_qick_configuration_identified(self, configuration) -> None:
         self._qick_configuration = configuration
+        self._square_dds_panel.set_configuration(configuration)
+        self._experiment_panel.triggering_panel.set_configuration(configuration)
         self._experiment_panel.set_ddr_memory_configuration(configuration)
         self._qick_front_panel.set_configuration(configuration)
         self._multi_ctrl.set_front_panel_configuration(configuration)
@@ -14107,6 +14141,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "noise_analysis": dict(self._noise_panel.settings_dict()),
             "bias": self._bias_panel.settings_dict(),
             "square_wave": self._square_wave_panel.settings_dict(),
+            "square_pulse": self._square_dds_panel.settings_dict(),
+            "output_trigger": self._experiment_panel.triggering_panel.settings_dict(),
         }
 
     @staticmethod
@@ -14913,6 +14949,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "AWG full scale"
                 )
         square_wave_settings = normalize_square_wave_settings(data.get("square_wave"))
+        from qick_square_dds import decode_square_settings, OutputTriggerConfig
+        _square_config, square_axes = decode_square_settings(
+            data.get("square_pulse"), data.get("qick", {}).get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
+        )
+        OutputTriggerConfig(**data.get("output_trigger", {}))
         raw_bias_t = qick.get("bias_t_compensation", {})
         if raw_bias_t is None:
             raw_bias_t = {}
@@ -15503,7 +15544,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             (axis.output_name, axis.segment_name)
             for spec in active_rf_output_specs
             for axis in (*spec.sweep_axes, *spec.software_sweep_axes)
-        )
+        ) + tuple((axis.output_name, axis.segment_name) for axis in square_axes)
         sweep_map_axes, sweep_map_slices = decode_sweep_map_settings(
             available_sweep_axes
         )
@@ -15782,6 +15823,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "measurements": bias_measurements,
             },
             "square_wave": square_wave_settings,
+            "square_pulse": data.get("square_pulse", {}),
+            "output_trigger": data.get("output_trigger", {}),
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -15855,6 +15898,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_readout_panel.load_settings(settings["rf_readout"])
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
+        self._square_dds_panel.load_settings(settings.get("square_pulse", {}))
         self._experiment_panel.set_sweep_specs(
             self._active_map_sweep_specs(),
             selected_keys=settings["sweep_map_axes"],
@@ -15890,6 +15934,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._noise_panel.load_settings(settings["noise_analysis"])
         self._bias_panel.load_settings(settings["bias"])
         self._square_wave_panel.load_settings(settings["square_wave"])
+        self._experiment_panel.triggering_panel.load_settings(settings.get("output_trigger", {}))
         self._sync_shared_qick_controls()
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()
@@ -16171,6 +16216,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             code_str = generate_qick_program_code(
                 self._pulse,
                 output_names=self._qick_output_names(),
+                square_pulse_settings=self._square_dds_panel.settings_dict(),
+                output_trigger_settings=self._experiment_panel.triggering_panel.settings_dict(),
                 **settings,
             )
         except (TypeError, ValueError) as exc:

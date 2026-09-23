@@ -124,6 +124,8 @@ def sweep_axis_label(axis: Any) -> str:
     """Return the compact user-facing name for one sweep variable."""
     output_name, segment_name = sweep_axis_key(axis)
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind.startswith("square_"):
+        return f"{output_name} / {segment_name} SquarePulse"
     if axis_kind == "rf_template_n":
         return f"{output_name} / {segment_name} template N"
     if axis_kind == "rf_template_tau":
@@ -147,6 +149,8 @@ def _axis_display_values(
     full_scale_mv: float,
 ) -> Tuple[np.ndarray, str]:
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind.startswith("square_"):
+        return np.asarray(coordinates, dtype=np.float64), {"square_frequency":"MHz", "square_amplitude":"mV", "square_phase":"deg"}[axis_kind]
     if axis_kind == "rf_template_n":
         return np.asarray(coordinates, dtype=np.float64), "count"
     if axis_kind in {
@@ -277,6 +281,8 @@ def _stored_axis_key(axis: Mapping[str, Any]) -> SweepAxisKey:
 def _stored_axis_label(axis: Mapping[str, Any]) -> str:
     output_name, segment_name = _stored_axis_key(axis)
     axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind.startswith("square_"):
+        return f"{output_name} / {segment_name} SquarePulse"
     if axis_kind == "rf_template_n":
         return f"{output_name} / {segment_name} template N"
     if axis_kind == "rf_template_tau":
@@ -467,7 +473,7 @@ def _stored_axis_native_values(
                 f"unsupported stored AWG duration unit {axis.get('unit')!r}"
             ) from exc
 
-    if axis_kind == "rf_frequency":
+    if axis_kind in {"rf_frequency", "square_frequency"}:
         frequency_scales_to_mhz = {
             "": 1.0,
             "mhz": 1.0,
@@ -489,6 +495,13 @@ def _stored_axis_native_values(
             f"unsupported stored RF power unit {axis.get('unit')!r}"
         )
 
+    if axis_kind == "square_amplitude":
+        if unit == "mv": return coordinates
+        if unit == "v": return coordinates * 1000
+        raise ValueError("unsupported stored SquarePulse amplitude unit")
+    if axis_kind == "square_phase":
+        if unit in {"deg", "degree", "degrees"}: return coordinates
+        raise ValueError("unsupported stored SquarePulse phase unit")
     if unit == "mv":
         return coordinates / full_scale_mv
     if unit == "v":

@@ -1259,17 +1259,28 @@ def _execute_qick_sequence_once(
     }
     if cancel_check is not None:
         acquire_kwargs["cancel_check"] = cancel_check
-    if acquisition_source == "fir_ddr":
-        acquire_kwargs["readback_progress"] = (
-            readback_progress if progress_callback is not None else None
-        )
-        if event_callback is not None:
-            acquire_kwargs["phase_callback"] = event_callback
-        ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
-        completion_message = "FIR DDR acquisition and readback completed"
-    else:
-        ddr_result = program.acquire_avg_buffer(soc, **acquire_kwargs)
-        completion_message = "AVG-buffer hardware accumulation completed"
+    square = getattr(sequence, "square_pulse_config", None)
+    if square is not None:
+        if not hasattr(soc, "stop_square_pulse"):
+            raise RuntimeError("Update the board QSTL_QICK library: stop_square_pulse is required")
+        soc.rfb_set_gen_dc(square.gen_ch)
+    try:
+        if acquisition_source == "fir_ddr":
+            acquire_kwargs["readback_progress"] = (
+                readback_progress if progress_callback is not None else None
+            )
+            if event_callback is not None:
+                acquire_kwargs["phase_callback"] = event_callback
+            ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
+            completion_message = "FIR DDR acquisition and readback completed"
+        else:
+            ddr_result = program.acquire_avg_buffer(soc, **acquire_kwargs)
+            completion_message = "AVG-buffer hardware accumulation completed"
+    finally:
+        # The DDS continues even when the tProcessor is stopped. Always mute
+        # through AXI-Lite on completion, cancellation, and acquisition error.
+        if square is not None:
+            soc.stop_square_pulse(square.gen_ch)
     _check_cancel(cancel_check)
     _emit_progress(
         progress_callback,
@@ -1615,6 +1626,9 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
             "rf_duration": "duration_us",
             "rf_frequency": "frequency_mhz",
             "rf_power": "output_power_dbm",
+            "square_frequency": "frequency_mhz",
+            "square_amplitude": "amplitude_mv",
+            "square_phase": "phase_deg",
             "ramp_duration": "ramp_duration_us",
             "hold_duration": "hold_duration_us",
         }.get(axis_kind, "voltage_mv")
@@ -1634,6 +1648,8 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
 
 def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, float]:
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind.startswith("square_"):
+        return "SquarePulse " + axis.parameter, axis.coordinate_unit, 1.0
     if axis_kind == "rf_template_n":
         return "predefined RF pulse count N", "", 1.0
     if axis_kind == "rf_template_tau":
@@ -1654,6 +1670,8 @@ def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, floa
 def _sweep_axis_meaning(axis: Any) -> str:
     """Describe one stored Cartesian coordinate without nested UI logic."""
     axis_kind = getattr(axis, "axis_kind", "amplitude")
+    if axis_kind.startswith("square_"):
+        return f"SquarePulse generator {axis.gen_ch} {axis.parameter}; tProcessor hardware sweep."
     if axis_kind == "rf_template_n":
         meaning = (
             f"Predefined composite RF pulse count N for {axis.output_name}/"
@@ -2303,7 +2321,10 @@ def store_qick_result(
             "count": int(axis.count),
         }
         axis_kind = getattr(axis, "axis_kind", "amplitude")
-        if axis_kind in {"rf_template_n", "rf_template_tau"}:
+        if axis_kind.startswith("square_"):
+            axis_metadata.update({"gen_ch": int(axis.gen_ch), "square_parameter": axis.parameter,
+                                  "execution": "tProcessor hardware sweep with exact DMEM words"})
+        elif axis_kind in {"rf_template_n", "rf_template_tau"}:
             axis_metadata.update({
                 "parameter_name": str(axis.parameter_name),
                 "execution": (

@@ -2096,6 +2096,8 @@ def generate_qick_program_code(
     bias_t_compensation_mode: str = "fixed_voltage",
     bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
     bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
+    square_pulse_settings=None,
+    output_trigger_settings=None,
 ) -> str:
     """Generate a QICK builder/execution module.
 
@@ -2520,6 +2522,15 @@ def generate_qick_program_code(
                     "    )",
                 ]
             )
+    if square_pulse_settings is not None or output_trigger_settings is not None:
+        from qick_square_dds import decode_square_settings, OutputTriggerConfig
+        decode_square_settings(square_pulse_settings, float(full_scale_mv))
+        OutputTriggerConfig(**(output_trigger_settings or {}))
+        lines.extend([
+            "    from qick_square_dds import decode_square_settings, OutputTriggerConfig, attach_square_settings",
+            f"    square_config, square_axes = decode_square_settings({square_pulse_settings!r}, {float(full_scale_mv)!r})",
+            f"    attach_square_settings(sequence, square_config, square_axes, OutputTriggerConfig(**{output_trigger_settings or {}!r}))",
+        ])
     lines.extend(
         [
             "    return sequence",
@@ -2633,13 +2644,20 @@ def generate_qick_program_code(
             "    actual_outputs = configure_rf_chain(soc) if configure_rf else None",
             "    actual_input = configure_readout_chain(soc) if configure_rf else None",
             "    program = build_program(soccfg)",
-            "    if FIR_DDR_CONFIG is not None:",
-            "        ddr_result = program.acquire_fir_ddr(",
-            "            soc, progress=progress, **run_kwargs",
-            "        )",
-            "    else:",
-            "        program.run_rounds(soc, progress=progress, **run_kwargs)",
-            "        ddr_result = None",
+            "    square = getattr(program, 'square_pulse_config', None)",
+            "    if square is not None and configure_rf:",
+            "        soc.rfb_set_gen_dc(square.gen_ch)",
+            "    try:",
+            "        if FIR_DDR_CONFIG is not None:",
+            "            ddr_result = program.acquire_fir_ddr(",
+            "                soc, progress=progress, **run_kwargs",
+            "            )",
+            "        else:",
+            "            program.run_rounds(soc, progress=progress, **run_kwargs)",
+            "            ddr_result = None",
+            "    finally:",
+            "        if square is not None:",
+            "            soc.stop_square_pulse(square.gen_ch)",
             "    rf_settings = {'outputs': actual_outputs, 'readout': actual_input}",
             "    return program, ddr_result, rf_settings",
             "",

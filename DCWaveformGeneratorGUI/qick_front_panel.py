@@ -69,6 +69,8 @@ class QickFrontPanelConfiguration:
     ddr_capacity_words_32b: Optional[int] = None
     ddr_samples_per_axi_word: int = 8
     ddr_iq_sample_bytes: int = 4
+    square_pulse_channels: Tuple[int, ...] = ()
+    output_trigger_pins: Tuple[str, ...] = ()
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -256,6 +258,9 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         firmware_timestamp=str(config.get("fw_timestamp", "unknown")),
         outputs=outputs,
         inputs=inputs,
+        square_pulse_channels=tuple(i for i,gen in enumerate(config.get("gens",()))
+                                   if gen.get("type")=="axis_square_pulse_v1"),
+        output_trigger_pins=tuple(str(pin[-1]) for pin in (config.get("tprocs") or [{}])[0].get("output_pins",())),
         **fir_values,
         **ddr_values,
     )

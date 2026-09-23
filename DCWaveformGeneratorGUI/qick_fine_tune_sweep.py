@@ -47,8 +47,12 @@ from qick.averager_program import RAveragerProgram
 
 try:
     from .fir_ddr_profile import resolve_fir_ddr_profile
+    from .qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
+    from .qick_output_triggers import OutputTriggerProgramMixin
 except ImportError:
     from fir_ddr_profile import resolve_fir_ddr_profile
+    from qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
+    from qick_output_triggers import OutputTriggerProgramMixin
 
 
 MAX_OUTPUTS = 8
@@ -2743,7 +2747,7 @@ def compile_sequence(
     return channels, tuple(compiled_points)
 
 
-class FineTuneAmplitudeSweepProgram(RAveragerProgram):
+class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgramMixin, RAveragerProgram):
     """ASM v1 program generated from :class:`FineTuneSequence`.
 
     Sweep points and repetitions are both hardware loops.  Variable SET
@@ -2950,6 +2954,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         self.aux_timing = {}
         self._rf_runtime = {}
         self._declared_rf_channels = set()
+        self._configure_square_pulse()
+        self._configure_output_trigger()
         self._validate_rf_sweeps()
         for rf_index, rf_config in enumerate(self.rf_pulse_configs):
             self._configure_rf_pulse(rf_index, rf_config)
@@ -4286,6 +4292,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             if not model.get("timing_only")
         )
         rf_point_tables = self._build_rf_point_table_models(sweep_axes)
+        rf_point_tables.extend(self._square_point_table_models(sweep_axes))
 
         occupied = {page: {0} for page in range(8)}
         for register_map in (self._gen_regmap, self._ro_regmap):
@@ -4293,6 +4300,13 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 occupied[int(page)].add(int(register))
         # These are used below for the shot count and repetition loop.
         occupied[0].update((13, 15))
+        if self._marker is not None:
+            occupied[0].update((16, 17, 18, 19, 20))
+        if self._marker is not None or self.square_pulse_config is not None:
+            occupied[0].add(14)
+            # The inherited trigger() helper writes page-zero register 16.
+            # Keep new sweep state out of it even without an external marker.
+            occupied[0].add(16)
         for field in fields:
             page = int(field["page"])
             allocations = (
@@ -6493,6 +6507,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         )
 
     def _emit_point(self):
+        self._emit_unshared_start_marker()
         # Timed-output queues are FIFO ordered. Generators behind the same TMUX
         # therefore must be enqueued in timestamp order, even when their
         # commands target different downstream IPs.
@@ -6554,6 +6569,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         point_end_barrier = int(
             getattr(self, "_dynamic_point_end", point_end)
         )
+        if self._marker_start_enabled():
+            point_end_barrier = max(point_end_barrier, self._marker_start_time() + self._marker["width"] + 1)
         bias_t_static_end = point_end_barrier
         if isinstance(
             self.sequence.bias_t_compensation,
@@ -6638,13 +6655,20 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 rf_index, rf_config = payload
                 self._emit_rf_stop(rf_index, rf_config, event_time)
             elif kind == "ddr_trigger":
-                self._emit_ddr_trigger(payload, event_time)
+                cfg = self.soccfg["ddr4_buf"]
+                self._emit_marker_readout_trigger(
+                    lambda: self._emit_ddr_trigger(payload, event_time),
+                    t=event_time, width=payload.trigger_width_tproc_cycles,
+                    port=cfg["trigger_port"], bit=cfg["trigger_bit"],
+                    field_key=("event_time", "ddr_trigger"),
+                )
             elif kind == "adc_trigger":
-                self.trigger(
-                    adcs=[payload.ro_ch],
-                    adc_trig_offset=event_time,
-                    t=0,
-                    width=payload.trigger_width_tproc_cycles,
+                cfg = self.soccfg["readouts"][payload.ro_ch]
+                self._emit_marker_readout_trigger(
+                    lambda: self.trigger(adcs=[payload.ro_ch], adc_trig_offset=event_time,
+                                         t=0, width=payload.trigger_width_tproc_cycles),
+                    t=event_time, width=payload.trigger_width_tproc_cycles,
+                    port=cfg["trigger_port"], bit=cfg["trigger_bit"], ro_ch=payload.ro_ch,
                 )
             else:
                 raise RuntimeError(f"unknown scheduled event kind {kind!r}")
@@ -6953,6 +6977,9 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
         rrep = 15
         self.initialize()
         self.regwi(0, rcount, 0)
+        extended_epilogue = self._marker is not None or self.square_pulse_config is not None
+        if extended_epilogue:
+            self.safe_regwi(0, 14, self.cfg["expts"] * self.cfg["reps"], "final acquisition count")
         for field in self._sweep_fields:
             page = int(field["page"])
             if field.get("storage") == "dmem":
@@ -6995,13 +7022,26 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
             )
         if self.command_lead_tproc_cycles:
             self.synci(self.command_lead_tproc_cycles)
+        self.square_marker_startup_lead = (
+            128 * int(self.square_pulse_config is not None)
+            + 128 * int(self._marker is not None)
+        )
+        if self.square_marker_startup_lead:
+            self.synci(self.square_marker_startup_lead,
+                       "initial lookahead for SquarePulse and external markers")
 
         self.label("FINE_TUNE_POINT")
         self.regwi(0, rrep, self.cfg["reps"] - 1)
         self.label("FINE_TUNE_REP")
+        self._emit_square_update()
         self._emit_point()
+        self._emit_end_marker("loop")
         self.mathi(0, rcount, rcount, "+", 1)
+        if extended_epilogue:
+            self.condj(0, rcount, "==", 14, "DEFER_FINAL_ACQUISITION_COUNT")
         self.memwi(0, rcount, self.COUNTER_ADDR)
+        if extended_epilogue:
+            self.label("DEFER_FINAL_ACQUISITION_COUNT")
         self.loopnz(0, rrep, "FINE_TUNE_REP")
 
         # The last axis varies fastest. A finished inner loop is reset before
@@ -7020,6 +7060,11 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                     f"reload sweep axis {axis_index} counter",
                 )
                 self._emit_axis_adds(axis_index, reset=True)
+        self._emit_square_update(stop=True)
+        self._emit_end_marker("experiment")
+        if extended_epilogue:
+            self.waiti(0, 0, "wait for experiment epilogue")
+            self.memwi(0, rcount, self.COUNTER_ADDR)
         self.end()
 
         for axis_index in active_axes:
@@ -7476,6 +7521,8 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 field.get("storage") == "dmem" for field in self._sweep_fields
             ),
             "sweep_uses_point_table": bool(self._rf_point_tables),
+            **self._square_settings_metadata(),
+            **self._trigger_settings_metadata(),
             "rf_point_table_count": len(self._rf_point_tables),
             "rf_point_table_words": self._rf_runtime_table_word_count,
             "rf_frequency_sweeps": sum(
@@ -7536,6 +7583,7 @@ class FineTuneAmplitudeSweepProgram(RAveragerProgram):
                 self._bias_t_max_duration_dmem_addr
             ),
             "startup_lead_tproc_cycles_once": self.command_lead_tproc_cycles,
+            "square_marker_startup_lead_tproc_cycles_once": self.square_marker_startup_lead,
             "tproc_mhz": self.tproc_mhz,
             "hwh_tproc_mhz": self.hwh_tproc_mhz,
             "tproc_clock_is_manual": self.tproc_clock_is_manual,
