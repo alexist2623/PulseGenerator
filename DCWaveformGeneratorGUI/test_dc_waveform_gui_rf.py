@@ -2980,6 +2980,9 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert window._rf_readout_panel.attenuation_db.value() == 5.0
     assert window._rf_readout_panel.dc_measure_mode.isChecked() is False
 
+    with pytest.raises(ValueError, match='compensation time is too short'):
+        window._stability_run_arguments(save=False)
+    window._stability_panel.bias_t_duration_us.setValue(500.0)
     arguments = window._stability_run_arguments(save=False)
 
     assert arguments["run_config"] is None
@@ -2994,7 +2997,7 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
     assert arguments["sequence"].sweep_point_count == 15
     assert arguments["sequence"].bias_t_compensation.compensation_type == "dc"
     assert arguments["sequence"].bias_t_compensation.mode == "fixed_time"
-    assert arguments["sequence"].bias_t_compensation.fixed_duration_cycles == 750
+    assert arguments["sequence"].bias_t_compensation.fixed_duration_cycles == 150000
     assert arguments["readout_spec"].samples_per_trigger == 96
     assert window._rf_readout_panel.samples.value() == 16
     assert arguments["stability_config"].trace_samples_per_point == 96
@@ -3013,10 +3016,15 @@ def test_stability_tab_builds_two_axis_hardware_sweep_without_database():
         window._stability_panel.bias_t_type.findData("filter")
     )
     window._stability_panel.bias_t_filter_tau_us.setValue(25.0)
+    # The long stability hold requires -1376 mV with this tau, beyond the
+    # configured +/-800 mV range. Reject it before connecting or acquiring.
+    with pytest.raises(ValueError, match="RC-compensated DAC output exceeds range"):
+        window._stability_run_arguments(save=False)
+    window._stability_panel.bias_t_filter_tau_us.setValue(250.0)
     filter_arguments = window._stability_run_arguments(save=False)
-    filter_compensation = filter_arguments["sequence"].bias_t_compensation
-    assert filter_compensation.compensation_type == "filter"
-    assert filter_compensation.tau_cycles == 7_500.0
+    filter_compensation = filter_arguments["sequence"].rc_compensation
+    assert filter_compensation.tau_us == 250.0
+    assert filter_arguments["sequence"].bias_t_compensation is None
     window.close()
 
 
@@ -3708,7 +3716,7 @@ def test_bias_t_gui_fixed_time_disables_voltage_and_adjusts_preview_level():
     window.close()
 
 
-def test_bias_t_gui_filter_mode_enables_tau_and_slopes_flat_segment(tmp_path):
+def test_bias_t_gui_rc_mode_enables_tau_and_preserves_nominal_segments(tmp_path):
     app = _application()
     window = gui.MainWindow()
     panel = window._experiment_panel
@@ -3724,14 +3732,14 @@ def test_bias_t_gui_filter_mode_enables_tau_and_slopes_flat_segment(tmp_path):
     assert window._bias_t_compensation_type == "filter"
     assert window._bias_t_filter_tau_us == 50.0
     assert window._plot._physical_values_mv[0, 0] == pytest.approx(100.0)
-    assert window._plot._physical_values_mv[0, -1] == pytest.approx(102.0)
+    assert window._plot._physical_values_mv[0, -1] == pytest.approx(100.0)
 
     sequence = window._experiment_run_arguments(
         require_readout=False,
         require_run_config=False,
     )["sequence"]
-    assert sequence.bias_t_compensation.compensation_type == "filter"
-    assert sequence.bias_t_compensation.tau_cycles == 15_000.0
+    assert sequence.bias_t_compensation is None
+    assert sequence.rc_compensation.tau_us == 50.0
 
     settings_path = window._save_settings_json(tmp_path / "filter_compensation")
     restored = gui.MainWindow()
@@ -3766,9 +3774,8 @@ def test_generated_qick_filter_compensation_preserves_tau_configuration():
     assert namespace["BIAS_T_COMPENSATION_TYPE"] == "filter"
     assert namespace["BIAS_T_FILTER_TAU_US"] == 50.0
     assert namespace["BIAS_T_FILTER_TAU_CYCLES"] == 15_000.0
-    config = namespace["build_sequence"]().bias_t_compensation
-    assert config.compensation_type == "filter"
-    assert config.tau_cycles == 15_000.0
+    config = namespace["build_sequence"]().rc_compensation
+    assert config.tau_us == 50.0
 
 
 def test_partial_legacy_rf_settings_fill_nested_defaults():

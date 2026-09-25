@@ -5,6 +5,10 @@
 Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 """
 
+try:
+    from .qick_compensation_controls import CompensationGroup, CompensationSelector
+except ImportError:
+    from qick_compensation_controls import CompensationGroup, CompensationSelector
 import json
 from dataclasses import asdict, replace
 from math import prod
@@ -405,6 +409,8 @@ try:
         QickFrontPanelControl,
         QickFrontPanelPreview,
         identify_qick_front_panel,
+        square_pulse_output_channels,
+        validate_awg_output_channels,
     )
     from .ddr_memory_usage import (
         calculate_ddr_capture_memory_usage,
@@ -416,6 +422,8 @@ except ImportError:
         QickFrontPanelControl,
         QickFrontPanelPreview,
         identify_qick_front_panel,
+        square_pulse_output_channels,
+        validate_awg_output_channels,
     )
     from ddr_memory_usage import (
         calculate_ddr_capture_memory_usage,
@@ -2396,6 +2404,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
 
     def apply_front_panel_settings(self, values: Mapping[str, object]) -> None:
         channel = int(values["output_ch"])
+        validate_awg_output_channels(self._front_panel_configuration, (channel,))
         if self._front_panel_configuration is not None:
             port_index = QickFrontPanelControl._find_port_for_channel(
                 self._front_panel_configuration.outputs,
@@ -2988,7 +2997,8 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
             start_us = float(self._pulse.t[start]) / 1000.0
             end_us = float(self._pulse.t[end]) / 1000.0
             durations.append(end_us - start_us)
-            self.segment.addItem(f"{name}  [{start_us:.6g}, {end_us:.6g}] us", name)
+            label = self._pulse.segment_name(index)
+            self.segment.addItem(f"{label}  [{start_us:.6g}, {end_us:.6g}] us", name)
         if previous is not None:
             match = self.segment.findData(previous)
             if match >= 0:
@@ -5715,7 +5725,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.segment.clear()
             for index, (start, end) in enumerate(self._pulse.flat_segments()):
                 name = f"set_{index}"
-                self.segment.addItem(name, name)
+                self.segment.addItem(self._pulse.segment_name(index), name)
             match = self.segment.findData(previous)
             if match >= 0:
                 self.segment.setCurrentIndex(match)
@@ -6399,6 +6409,11 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.samples = QtWidgets.QSpinBox()
         self.samples.setRange(1, 10_000_000)
         self.samples.setValue(64)
+        self.samples.setToolTip(
+            "Capture continues for this many FIR samples, including subsequent "
+            "segments if necessary. The next repetition waits for the complete "
+            "capture window; the selected segment is not extended."
+        )
         self.frequency_mhz = QtWidgets.QDoubleSpinBox()
         self.frequency_mhz.setRange(-10000.0, 10000.0)
         self.frequency_mhz.setDecimals(6)
@@ -6815,7 +6830,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.segment.clear()
             for index, _segment in enumerate(self._pulse.flat_segments()):
                 name = f"set_{index}"
-                self.segment.addItem(name, name)
+                self.segment.addItem(self._pulse.segment_name(index), name)
             match = self.segment.findData(previous)
             if match >= 0:
                 self.segment.setCurrentIndex(match)
@@ -7249,6 +7264,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.setDecimals(6)
         self.full_scale_mv.setSuffix(" mV")
         self.awg_channels = QtWidgets.QLineEdit()
+        self._awg_front_panel_configuration = None
+        self.awg_channels.textChanged.connect(self._update_awg_channel_warning)
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
         self.iq_storage_mode = QtWidgets.QComboBox()
@@ -7468,13 +7485,13 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.sweep_map_y.currentIndexChanged.connect(
             self._on_sweep_axis_changed
         )
-        self.bias_t_group = QtWidgets.QGroupBox("Bias-T compensation")
+        self.bias_t_group = CompensationGroup("Bias-T compensation")
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
-        self.bias_t_type = QtWidgets.QComboBox()
+        self.bias_t_type = CompensationSelector(self.bias_t_group)
         self.bias_t_type.addItem("DC compensation", "dc")
-        self.bias_t_type.addItem("Filter compensation", "filter")
+        self.bias_t_type.addItem("RC compensation", "filter")
         type_index = self.bias_t_type.findData(str(bias_t_compensation_type))
         if type_index < 0:
             raise ValueError(
@@ -7508,15 +7525,15 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(bias_t_duration_us))
         self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()
-        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setRange(10.0, 1_000_000.0)
         self.bias_t_filter_tau_us.setDecimals(6)
         self.bias_t_filter_tau_us.setSuffix(" us")
         self.bias_t_filter_tau_us.setValue(float(bias_t_filter_tau_us))
-        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow(self.bias_t_type)
         bias_t_form.addRow("DC control mode:", self.bias_t_mode)
         bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
         bias_t_form.addRow("DC time:", self.bias_t_duration_us)
-        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
+        bias_t_form.addRow("RC time constant (tau):", self.bias_t_filter_tau_us)
         self.set_qick_values(
             fabric_mhz=fabric_mhz,
             tproc_mhz=tproc_mhz,
@@ -7528,7 +7545,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow("QCoDeS DB file:", database_row)
         form.addRow("Experiment name:", self.experiment_name)
         form.addRow("Sample name:", self.sample_name)
-        form.addRow("AWG full scale (+/-):", self.full_scale_mv)
+        self.full_scale_mv.hide()
+        form.addRow("DAC voltage range:", QtWidgets.QLabel("Per-channel current in the shared Front Panel"))
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow("QCoDeS I/Q storage:", self.iq_storage_mode)
         form.addRow(self.ddr_usage_group)
@@ -7808,7 +7826,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.ddr_usage_detail.setText(detail + address_detail + warning)
 
     def _update_bias_t_range(self, full_scale_mv: float) -> None:
-        self.bias_t_compensation_mv.setMaximum(max(0.001, float(full_scale_mv)))
+        self.bias_t_compensation_mv.setMaximum(max(0.001, float(full_scale_mv), self.bias_t_compensation_mv.value()))
 
     def _emit_bias_t_changed(self, *_args) -> None:
         self.bias_t_changed.emit(
@@ -7826,7 +7844,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.bias_t_mode.setEnabled(not filter_mode)
         self.bias_t_compensation_mv.setEnabled(not filter_mode and not fixed_time)
         self.bias_t_duration_us.setEnabled(not filter_mode and fixed_time)
-        self.bias_t_filter_tau_us.setEnabled(filter_mode)
+        self.bias_t_filter_tau_us.setEnabled(self.bias_t_group.isChecked() and self.bias_t_type.currentData() in ("filter", "dc_rc"))
 
     def _on_bias_t_mode_changed(self, *_args) -> None:
         self._update_bias_t_mode_controls()
@@ -8242,6 +8260,24 @@ class ExperimentPanel(QtWidgets.QWidget):
             f"repetitions and FIR samples.{suffix}"
         )
 
+    def set_awg_front_panel_configuration(self, configuration) -> None:
+        self._awg_front_panel_configuration = configuration
+        self._update_awg_channel_warning()
+
+    def _update_awg_channel_warning(self, *_args) -> None:
+        message = ""
+        try:
+            channels = tuple(int(field.strip()) for field in self.awg_channels.text().split(","))
+        except ValueError:
+            pass  # The normal parser reports incomplete or malformed input.
+        else:
+            try:
+                validate_awg_output_channels(self._awg_front_panel_configuration, channels)
+            except ValueError as exc:
+                message = str(exc)
+        self.awg_channels.setToolTip(message)
+        self.awg_channels.setStyleSheet("border: 1px solid #c62828;" if message else "")
+
     def _parse_awg_channels(self, output_count: int) -> Tuple[int, ...]:
         fields = [field.strip() for field in self.awg_channels.text().split(",")]
         if any(not field for field in fields):
@@ -8256,6 +8292,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             )
         if any(channel < 0 for channel in channels) or len(set(channels)) != len(channels):
             raise ValueError("AWG generator indices must be unique and nonnegative")
+        validate_awg_output_channels(self._awg_front_panel_configuration, channels)
         return channels
 
     def values(
@@ -8756,15 +8793,21 @@ class QickConfigurationWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, connection_config, parent=None):
+    def __init__(self, connection_config, parent=None, current_change=None):
         super().__init__(parent)
         self._connection_config = connection_config
+        self._current_change = current_change
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            _soc, soccfg = connect_qick(self._connection_config)
-            configuration = identify_qick_front_panel(soccfg)
+            soc, soccfg = connect_qick(self._connection_config)
+            from qick_dac_current import read_current_settings
+            if self._current_change is None:
+                currents = read_current_settings(soc)
+            else:
+                currents = soc.set_dac_current(*self._current_change)
+            configuration = replace(identify_qick_front_panel(soccfg), dac_current_settings=currents)
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
@@ -9200,9 +9243,11 @@ class QickExportDialog(QtWidgets.QDialog):
         initial_bias_t_mode: str = "fixed_voltage",
         initial_bias_t_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
         initial_bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US,
+        front_panel_configuration=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("QICK export settings")
+        self._front_panel_configuration = front_panel_configuration
         self.resize(660, 780)
         self._pulse_count = pulse_count
         if initial_rf_spec is not None and initial_rf_specs is not None:
@@ -9279,13 +9324,13 @@ class QickExportDialog(QtWidgets.QDialog):
         self.repetitions = QtWidgets.QSpinBox()
         self.repetitions.setRange(1, 1_000_000)
         self.repetitions.setValue(int(initial_repetitions))
-        self.bias_t_group = QtWidgets.QGroupBox("Bias-T compensation")
+        self.bias_t_group = CompensationGroup("Bias-T compensation")
         self.bias_t_group.setCheckable(True)
         self.bias_t_group.setChecked(bool(initial_bias_t_enabled))
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
-        self.bias_t_type = QtWidgets.QComboBox()
+        self.bias_t_type = CompensationSelector(self.bias_t_group)
         self.bias_t_type.addItem("DC compensation", "dc")
-        self.bias_t_type.addItem("Filter compensation", "filter")
+        self.bias_t_type.addItem("RC compensation", "filter")
         type_index = self.bias_t_type.findData(
             str(initial_bias_t_compensation_type)
         )
@@ -9319,15 +9364,15 @@ class QickExportDialog(QtWidgets.QDialog):
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(initial_bias_t_duration_us))
         self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()
-        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setRange(10.0, 1_000_000.0)
         self.bias_t_filter_tau_us.setDecimals(6)
         self.bias_t_filter_tau_us.setSuffix(" us")
         self.bias_t_filter_tau_us.setValue(float(initial_bias_t_filter_tau_us))
-        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow(self.bias_t_type)
         bias_t_form.addRow("DC control mode:", self.bias_t_mode)
         bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
         bias_t_form.addRow("DC time:", self.bias_t_duration_us)
-        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
+        bias_t_form.addRow("RC time constant (tau):", self.bias_t_filter_tau_us)
         self.full_scale_mv.valueChanged.connect(
             lambda value: self.bias_t_compensation_mv.setMaximum(
                 max(0.001, float(value))
@@ -9343,7 +9388,8 @@ class QickExportDialog(QtWidgets.QDialog):
 
         form.addRow("AWG fabric clock:", self.fabric_mhz)
         form.addRow("tProcessor clock:", self.tproc_mhz)
-        form.addRow("QICK full scale (+/-):", self.full_scale_mv)
+        self.full_scale_mv.hide()
+        form.addRow("DAC voltage range:", QtWidgets.QLabel("Per-channel current in the shared Front Panel"))
         form.addRow("AWG generator indices:", self.awg_channels)
         form.addRow("Repetitions per sweep point:", self.repetitions)
         form.addRow(self.bias_t_group)
@@ -9456,7 +9502,7 @@ class QickExportDialog(QtWidgets.QDialog):
         self.bias_t_mode.setEnabled(not filter_mode)
         self.bias_t_compensation_mv.setEnabled(not filter_mode and not fixed_time)
         self.bias_t_duration_us.setEnabled(not filter_mode and fixed_time)
-        self.bias_t_filter_tau_us.setEnabled(filter_mode)
+        self.bias_t_filter_tau_us.setEnabled(self.bias_t_group.isChecked() and self.bias_t_type.currentData() in ("filter", "dc_rc"))
 
     def _rescale_sweep_voltage_controls(self, value: float) -> None:
         new_scale_mv = float(value)
@@ -9611,6 +9657,7 @@ class QickExportDialog(QtWidgets.QDialog):
             raise ValueError(f"exactly {self._pulse_count} AWG generator indices are required")
         if len(set(channels)) != len(channels) or any(channel < 0 for channel in channels):
             raise ValueError("AWG generator indices must be unique and nonnegative")
+        validate_awg_output_channels(self._front_panel_configuration, channels)
         return channels
 
     def values(self) -> dict:
@@ -9710,6 +9757,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._cross_capacitance = np.eye(1, dtype=float)
         self._qick_fabric_mhz = float(DEFAULT_QICK_FABRIC_MHZ)
         self._qick_tproc_mhz = float(DEFAULT_QICK_TPROC_MHZ)
+        from qick_dac_current import DacCurrentState
+        self._dac_current_state = DacCurrentState(self)
         self._qick_full_scale_mv = float(DEFAULT_QICK_FULL_SCALE_MV)
         self._qick_awg_channels = (DEFAULT_QSTL_AWG_CHANNELS[0],)
         self._qick_repetitions_per_sweep = 1
@@ -9792,6 +9841,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._square_wave_panel = SquareWavePanel(self)
         self._square_wave_panel.start_requested.connect(self._start_square_wave)
         self._square_wave_panel.stop_requested.connect(self._stop_square_wave)
+        self._square_wave_panel.front_panel_requested.connect(
+            lambda target: self._show_qick_front_panel("output", target))
         self._square_wave_close_pending = False
         self._qick_configuration = None
         self._qick_front_panel_target = None
@@ -9931,6 +9982,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel.identify_requested.connect(
             self._identify_qick_configuration
         )
+        self._qick_front_panel.set_current_state(self._dac_current_state)
+        self._qick_front_panel.current_requested.connect(self._apply_dac_current)
+        self._dac_current_state.changed.connect(self._on_dac_currents_changed)
+        self._square_wave_panel.set_current_state(self._dac_current_state)
         self._qick_front_panel.settings_applied.connect(
             self._apply_front_panel_settings
         )
@@ -9953,6 +10008,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._awg_tuning_tabs.addTab(self._rf_readout_panel, "RF Readout")
         self._awg_tuning_tabs.addTab(self._experiment_panel, "Experiment")
         self._square_dds_panel = SquarePulsePanel(self)
+        self._square_dds_panel.front_panel_requested.connect(
+            lambda target: self._show_qick_front_panel("output", target))
         self._square_dds_scroll = QtWidgets.QScrollArea(self)
         self._square_dds_scroll.setWidgetResizable(True)
         self._square_dds_scroll.setWidget(self._square_dds_panel)
@@ -10330,6 +10387,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise IndexError("AWG output index is out of range")
         if channel < 0:
             raise ValueError("AWG generator channel must be nonnegative")
+        validate_awg_output_channels(self._qick_configuration, (channel,))
         channels = list(self._qick_awg_channels)
         previous = channels[output_index]
         if channel in channels and channels.index(channel) != output_index:
@@ -10547,38 +10605,45 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _refresh_physical_waveforms(self, *, fit_view: bool = False) -> None:
-        if self._bias_t_compensation_enabled:
-            sequence = build_qick_sequence(
-                self._pulse,
-                output_names=self._qick_output_names(),
-                fabric_mhz=self._qick_fabric_mhz,
-                full_scale_mv=self._qick_full_scale_mv,
-                sweep=(self._sweep_specs[0] if len(self._sweep_specs) == 1 else None),
-                sweeps=(tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None),
-                cross_capacitance=self._cross_capacitance,
-                bias_t_compensation_enabled=True,
-                bias_t_compensation_type=self._bias_t_compensation_type,
-                bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
-                bias_t_compensation_mode=self._bias_t_compensation_mode,
-                bias_t_compensation_duration_us=(
-                    self._bias_t_compensation_duration_us
-                ),
-                bias_t_filter_tau_us=self._bias_t_filter_tau_us,
-            )
-            cycles, waveforms, _boundaries = (
-                sequence.compensated_waveform_vertices(0)
-            )
-            time_ns = np.asarray(cycles, dtype=float) * 1000.0 / self._qick_fabric_mhz
-            physical_mv = np.vstack([
-                np.asarray(waveforms[name], dtype=float)
-                * self._qick_full_scale_mv
-                for name in self._qick_output_names()
-            ])
-        else:
+        try:
+            if self._bias_t_compensation_enabled:
+                sequence = build_qick_sequence(
+                    self._pulse,
+                    output_names=self._qick_output_names(),
+                    fabric_mhz=self._qick_fabric_mhz,
+                    full_scale_mv=self._qick_full_scale_mv,
+                    **self._dac_scale_arguments(self._qick_awg_channels),
+                    sweep=(self._sweep_specs[0] if len(self._sweep_specs) == 1 else None),
+                    sweeps=(tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None),
+                    cross_capacitance=self._cross_capacitance,
+                    bias_t_compensation_enabled=True,
+                    bias_t_compensation_type=self._bias_t_compensation_type,
+                    bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
+                    bias_t_compensation_mode=self._bias_t_compensation_mode,
+                    bias_t_compensation_duration_us=(
+                        self._bias_t_compensation_duration_us
+                    ),
+                    bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+                )
+                cycles, waveforms, _boundaries = (
+                    sequence.compensated_waveform_vertices(0)
+                )
+                time_ns = np.asarray(cycles, dtype=float) * 1000.0 / self._qick_fabric_mhz
+                physical_mv = np.vstack([
+                    np.asarray(waveforms[name], dtype=float)
+                    * sequence.output_full_scales_mv[sequence.output_names.index(name)]
+                    for name in self._qick_output_names()
+                ])
+            else:
+                time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
+                    self._pulse,
+                    self._cross_capacitance,
+                )
+        except (ValueError, RuntimeError) as exc:
+            # Invalid range must not escape a Qt edit/refresh callback.
+            self.statusBar().showMessage(f'Output range check: {exc}')
             time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
-                self._pulse,
-                self._cross_capacitance,
-            )
+                self._pulse, self._cross_capacitance)
         self._plot.set_physical_waveforms(time_ns, physical_mv)
         if fit_view:
             self._plot.fit_view()
@@ -11736,8 +11801,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if enabled:
             if compensation_type == "filter":
                 self.statusBar().showMessage(
-                    "Bias-T filter compensation enabled; flat-segment slew is "
-                    f"target/tau with tau={filter_tau_us:.6g} us"
+                    "FPGA RC compensation enabled; "
+                    f"tau={filter_tau_us:.6g} us"
                 )
             elif mode == "fixed_time":
                 self.statusBar().showMessage(
@@ -11801,6 +11866,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             output_names=self._qick_output_names(),
             fabric_mhz=self._qick_fabric_mhz,
             full_scale_mv=self._qick_full_scale_mv,
+            **self._dac_scale_arguments(self._qick_awg_channels),
             sweep=sweep,
             sweeps=sweeps,
             rf_pulse_specs=rf_specs,
@@ -11813,9 +11879,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         self._square_dds_panel.attach_to_sequence(
-            sequence, self._qick_full_scale_mv,
+            sequence, self._dac_current_state.scale(self._square_dds_panel.channel.value()),
             self._experiment_panel.triggering_panel.config(),
         )
+        if getattr(sequence, 'square_pulse_config', None) is not None:
+            sequence.dac_current_settings.update(self._dac_current_state.snapshot((sequence.square_pulse_config.gen_ch,)))
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
             "connection_config": values["connection"],
@@ -11848,6 +11916,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         stability_config = self._stability_panel.config(
             full_scale_mv=self._qick_full_scale_mv
         )
+        output_names, awg_channels = self._stability_panel.run_output_mapping()
+        cross_capacitance = np.eye(len(output_names))
+        original_names = self._qick_output_names()
+        for row, row_name in enumerate(output_names):
+            for col, col_name in enumerate(output_names):
+                if row_name in original_names and col_name in original_names:
+                    cross_capacitance[row, col] = self._cross_capacitance[
+                        original_names.index(row_name), original_names.index(col_name)
+                    ]
         path = dict(self._stability_panel.front_panel_values())
         resolved_modulation_gain = int(stability_config.modulation_gain)
         resolved_modulation_calibration_run_id = int(
@@ -11959,7 +12036,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             ),
         )
         overlap = {spec.gen_ch for spec in rf_specs}.intersection(
-            self._qick_awg_channels
+            awg_channels
         )
         if overlap:
             raise ValueError(
@@ -11969,10 +12046,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         sequence = build_stability_hold_sequence(
             stability_config,
-            output_names=self._qick_output_names(),
+            output_names=output_names,
             fabric_mhz=self._qick_fabric_mhz,
             full_scale_mv=self._qick_full_scale_mv,
-            cross_capacitance=self._cross_capacitance.copy(),
+            **self._dac_scale_arguments(awg_channels),
+            cross_capacitance=cross_capacitance,
             sample_period_us=identified_sample_period_us,
         )
         return {
@@ -11983,7 +12061,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "stability_fabric_mhz": self._qick_fabric_mhz,
             "full_scale_mv": self._qick_full_scale_mv,
             "sequence": sequence,
-            "awg_channels": self._qick_awg_channels,
+            "awg_channels": awg_channels,
             "repetitions_per_sweep": stability_config.repetitions_per_point,
             "iq_storage_mode": self._stability_panel.iq_storage_mode_value(),
             "tproc_mhz": self._qick_tproc_mhz,
@@ -12009,13 +12087,22 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         """Open the live front-panel selector for the requesting editor."""
         self._qick_front_panel_target = target
         self._qick_front_panel.set_scope(scope)
+        square_editor = isinstance(target, (SquarePulsePanel, SquareWavePanel))
+        self._qick_front_panel.set_output_channel_filter(
+            target.allowed_output_channels(self._qick_configuration) if square_editor else None)
+        self._qick_front_panel.set_awg_output_mode(
+            scope == "output" and not isinstance(target, RfPulsePortPanel) and not square_editor
+        )
         titles = {
             "path": "QICK Front Panel - RF Measurement Path",
             "output": "QICK Front Panel - RF Output",
             "input": "QICK Front Panel - RF Readout",
         }
         self._qick_front_panel_dialog.setWindowTitle(titles[scope])
-        if scope == "output" and isinstance(target, MultiControlPanel):
+        if scope == "output" and square_editor:
+            self._qick_front_panel_dialog.setWindowTitle("QICK Front Panel - SquarePulse Output")
+            self._qick_front_panel.apply_button.setText("Update SquarePulse Output")
+        elif scope == "output" and isinstance(target, MultiControlPanel):
             self._qick_front_panel_dialog.setWindowTitle(
                 "QICK Front Panel - AWG Output"
             )
@@ -12072,7 +12159,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         ):
             QtCore.QTimer.singleShot(0, self._identify_qick_configuration)
 
-    def _identify_qick_configuration(self) -> None:
+    def _identify_qick_configuration(self, *, current_change=None) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
@@ -12102,7 +12189,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self.statusBar().showMessage("Identifying QICK front-panel configuration")
         thread = QtCore.QThread(self)
-        worker = QickConfigurationWorker(connection)
+        worker = QickConfigurationWorker(connection, current_change=current_change)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_qick_configuration_identified)
@@ -12122,15 +12209,45 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel_target = None
         self._identify_qick_configuration()
 
+    def _apply_dac_current(self, dac, current_ua):
+        self._identify_qick_configuration(current_change=(dac, current_ua))
+
+    def _dac_scale_arguments(self, channels):
+        return dict(output_full_scales_mv=tuple(self._dac_current_state.scale(ch) for ch in channels),
+                    dac_current_settings=self._dac_current_state.snapshot(channels))
+
+    def _on_dac_currents_changed(self):
+        # Keep user-entered millivolts and sweep endpoints invariant.
+        previous = self._qick_full_scale_mv
+        reference = max([800.] + [self._dac_current_state.scale(ch)
+                        for r in self._dac_current_state.records.values() for ch in r.get('channels', ())])
+        if reference != previous:
+            self._sweep_specs = [replace(axis, start=axis.start*previous/reference,
+                                        stop=axis.stop*previous/reference)
+                                 if isinstance(axis, QickSweepSpec) else axis for axis in self._sweep_specs]
+            self._qick_full_scale_mv = reference
+            with QtCore.QSignalBlocker(self._experiment_panel.full_scale_mv):
+                self._experiment_panel.full_scale_mv.setValue(reference)
+            self._experiment_panel._update_bias_t_range(reference)
+        self._notify_sweep_state_changed(rf_changed=True)
+
     def _on_qick_configuration_identified(self, configuration) -> None:
+        if configuration.dac_current_settings is not None:
+            self._dac_current_state.update(configuration.dac_current_settings)
         self._qick_configuration = configuration
+        self._experiment_panel.set_awg_front_panel_configuration(configuration)
         self._square_dds_panel.set_configuration(configuration)
+        self._square_wave_panel.set_configuration(configuration)
         self._experiment_panel.triggering_panel.set_configuration(configuration)
+        target = self._qick_front_panel_target
+        if isinstance(target, (SquarePulsePanel, SquareWavePanel)):
+            self._qick_front_panel.set_output_channel_filter(target.allowed_output_channels(configuration))
         self._experiment_panel.set_ddr_memory_configuration(configuration)
         self._qick_front_panel.set_configuration(configuration)
         self._multi_ctrl.set_front_panel_configuration(configuration)
         self._sparameter_panel.set_front_panel_configuration(configuration)
         self._stability_panel.set_front_panel_configuration(configuration)
+        self._refresh_stability_targets()
         self._rf_ports_panel.set_front_panel_configuration(configuration)
         self._rf_readout_panel.set_front_panel_configuration(configuration)
         self._calibration_panel.set_front_panel_configuration(configuration)
@@ -12213,7 +12330,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 else (
                     f"AWG output {target._selected_index + 1}"
                     if isinstance(target, MultiControlPanel)
-                    else "Stability electrode"
+                    else ("SquarePulse output" if isinstance(target, (SquarePulsePanel, SquareWavePanel))
+                          else "Stability electrode")
                 )
             )
             self.statusBar().showMessage(
@@ -12661,13 +12779,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
-    def _start_square_wave(self, config) -> None:
+    def _start_square_wave(self, config, *, mute_only=False) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             self._square_wave_panel.status.setText("Stop the current hardware task before starting a square wave.")
             return
         try:
             worker = SquareWaveWorker(self._shared_qick_connection(), config,
-                                      tproc_mhz=self._qick_tproc_mhz)
+                                      tproc_mhz=self._qick_tproc_mhz, mute_only=mute_only,
+                                      current_settings=self._dac_current_state.snapshot((config.gen_ch,)))
         except (TypeError, ValueError) as exc:
             self._square_wave_panel.status.setText(str(exc))
             return
@@ -12690,8 +12809,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _stop_square_wave(self) -> None:
         if isinstance(self._experiment_worker, SquareWaveWorker):
-            self._square_wave_panel.status.setText("Stopping tProcessor...")
+            self._square_wave_panel.status.setText("Stopping selected square-wave output...")
             self._experiment_worker.request_stop()
+        elif self._experiment_thread is None or not self._experiment_thread.isRunning():
+            try:
+                config = self._square_wave_panel.resolved_config()
+            except (TypeError, ValueError) as exc:
+                self._square_wave_panel.status.setText(str(exc))
+                return
+            self._start_square_wave(config, mute_only=True)
+        else:
+            self._square_wave_panel.status.setText("Stop the current hardware task before muting this output.")
 
     def _on_square_wave_started(self, result) -> None:
         self._square_wave_panel.status.setText(
@@ -12703,7 +12831,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _on_square_wave_finished(self, message) -> None:
-        self._square_wave_panel.set_running(False, message)
+        self._square_wave_panel.set_running(
+            False, None if message == "SquarePulse output enabled" else message)
 
     def _on_square_wave_failed(self, details) -> None:
         self._square_wave_panel.set_running(False, "Failed: " + str(details).strip().splitlines()[-1])
@@ -14108,6 +14237,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "tproc_mhz": self._qick_tproc_mhz,
                 "full_scale_mv": self._qick_full_scale_mv,
                 "awg_channels": list(self._qick_awg_channels),
+                "dac_current_settings": self._dac_current_state.records,
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
                 "iq_storage_mode": experiment_values["iq_storage_mode"],
                 "awg_metadata_mode": experiment_values["awg_metadata_mode"],
@@ -15000,6 +15130,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "QICK Bias-T filter_tau_us",
             positive=True,
         )
+        if bias_t_enabled and bias_t_type in ("filter", "dc_rc") and not 10 <= bias_t_filter_tau_us <= 1_000_000:
+            raise ValueError("RC tau must be between 10 us and 1000 ms")
         repetitions = self._json_int(
             qick.get("repetitions_per_sweep", 1),
             "QICK repetitions_per_sweep",
@@ -15015,6 +15147,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         if len(set(awg_channels)) != len(awg_channels):
             raise ValueError("QICK AWG channels must be unique")
+        validate_awg_output_channels(self._qick_configuration, awg_channels)
 
         experiment = data.get("experiment", {})
         if not isinstance(experiment, dict):
@@ -15787,6 +15920,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "fabric_mhz": fabric_mhz,
             "tproc_mhz": tproc_mhz,
             "full_scale_mv": full_scale_mv,
+            "dac_current_settings": dict(qick.get("dac_current_settings", {})),
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "awg_metadata_mode": awg_metadata_mode,
@@ -15829,6 +15963,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _apply_decoded_settings(self, settings: dict) -> None:
         """Apply a fully validated settings object to all GUI panels."""
+        validate_awg_output_channels(self._qick_configuration, settings["awg_channels"])
         self._bias_panel.prepare_for_settings_load()
         pulses = settings["pulses"]
         self._sweep_specs = []
@@ -15959,6 +16094,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._restore_trace_stability_overlay_settings(
             settings["trace_stability_overlay"]
         )
+        self._dac_current_state.update(settings.get('dac_current_settings', {}))
+        self._square_wave_panel._refresh_current_scale()
+
 
     def _apply_legacy_settings(self, data: dict) -> None:
         """Read the original single-waveform JSON format."""
@@ -16074,11 +16212,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _next_qick_awg_channel(self) -> int:
         used = set(self._qick_awg_channels)
+        excluded = square_pulse_output_channels(self._qick_configuration)
         for channel in DEFAULT_QSTL_AWG_CHANNELS:
-            if channel not in used:
+            if channel not in used and channel not in excluded:
                 return channel
         channel = 0
-        while channel in used:
+        while channel in used or channel in excluded:
             channel += 1
         return channel
 
@@ -16154,6 +16293,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             initial_bias_t_mode=self._bias_t_compensation_mode,
             initial_bias_t_duration_us=self._bias_t_compensation_duration_us,
             initial_bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+            front_panel_configuration=self._qick_configuration,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
@@ -16217,8 +16357,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse,
                 output_names=self._qick_output_names(),
                 square_pulse_settings=self._square_dds_panel.settings_dict(),
+                square_full_scale_mv=self._dac_current_state.scale(self._square_dds_panel.channel.value()),
+                square_current_settings=self._dac_current_state.snapshot((self._square_dds_panel.channel.value(),)),
                 output_trigger_settings=self._experiment_panel.triggering_panel.settings_dict(),
                 **settings,
+                **self._dac_scale_arguments(settings["awg_channels"]),
             )
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.critical(self, "QICK export failed", str(exc))
@@ -16259,6 +16402,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse,
                 output_names=self._qick_output_names(),
                 **sequence_settings,
+                **self._dac_scale_arguments(settings["awg_channels"]),
             )
             # FineTuneSequence defaults to first/middle/last sweep points,
             # keeping preview cost bounded for large sweeps.
@@ -16410,6 +16554,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         name = self._pulse[int(source_port)].segment_name(int(segment_index))
         self._share_segment_name(source_port, segment_index)
         self._multi_ctrl.refresh_table()
+        self._refresh_rf_editor()
         self._refresh_trace_if_needed(force=True)
         self.statusBar().showMessage(
             f"Segment {int(segment_index) + 1} renamed to {name!r} "

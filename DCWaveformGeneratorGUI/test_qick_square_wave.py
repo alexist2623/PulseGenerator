@@ -25,6 +25,15 @@ def soccfg():
         readouts=[]))
 
 
+def square_soccfg():
+    cfg = soccfg()
+    cfg['gens'][0].update(type='axis_square_pulse_v1', gen_type='square_pulse',
+                          has_dds=True, f_dds=4800., command_latency_cycles=4)
+    cfg['board'] = 'ZCU216'
+    cfg['extra_description'] = ['DAC slot 0: DC Out card has ports [0, 1, 2, 3]']
+    return cfg
+
+
 @pytest.fixture
 def square_config():
     return square.SquareWaveConfig(gen_ch=0)
@@ -64,7 +73,8 @@ def test_legacy_settings_drop_calibration_and_preserve_waveform():
         calibration_reference_ohm=50, codes_per_mv=80, frequency_hz=25000,
         amplitude_mv=12.5, offset_mv=1.5, zero_code=1104))
     assert values == dict(gen_ch=1, frequency_hz=25000, amplitude_mv=12.5,
-                         offset_mv=1.5, duty_percent=50, zero_code=1104, full_scale_mv=800)
+                         offset_mv=1.5, duty_percent=50, zero_code=1104, full_scale_mv=800,
+                         phase_deg=0., rc_enabled=False, rc_tau_us=1000.0)
 
 
 @pytest.mark.parametrize("kwargs", [dict(amplitude_mv=1000), dict(amplitude_mv=1e-8),
@@ -151,8 +161,8 @@ class FakeSoc:
         if self.start_error:
             raise RuntimeError("start transport error")
 
-    def stop_tproc(self):
-        self.calls.append(("stop",))
+    def stop_square_pulse(self, ch):
+        self.calls.append(("mute", ch))
         if self.stop_failures:
             self.stop_failures -= 1
             raise RuntimeError("stop transport error")
@@ -165,30 +175,29 @@ def fake_factory(cfg, config, **kwargs):
 
 
 def worker_for(soc):
-    return square.SquareWaveWorker(None, square.SquareWaveConfig(gen_ch=0), tproc_mhz=300,
-        connector=lambda connection: (soc, soccfg()), program_factory=fake_factory)
+    return square.SquareWaveWorker(None, square.SquareWaveConfig(gen_ch=0, zero_code=0), tproc_mhz=300,
+        connector=lambda connection: (soc, square_soccfg()), program_factory=fake_factory)
 
 
-def test_worker_runs_until_stop_and_retries_failed_stop():
+def test_worker_retries_failed_cleanup_after_start_error():
     soc = FakeSoc()
     soc.stop_failures = 1
+    soc.start_error = True
     worker = worker_for(soc)
     started, stop_failed, finished = Event(), Event(), Event()
     worker.started.connect(lambda _: started.set(), QtCore.Qt.DirectConnection)
     worker.stop_failed.connect(lambda _: stop_failed.set(), QtCore.Qt.DirectConnection)
     worker.finished.connect(lambda _: finished.set(), QtCore.Qt.DirectConnection)
+    worker.failed.connect(lambda _: finished.set(), QtCore.Qt.DirectConnection)
     thread = Thread(target=worker.run, daemon=True)
     thread.start()
     try:
-        assert started.wait(3)
-        assert thread.is_alive() and not finished.is_set()
-        worker.request_stop()
         assert stop_failed.wait(3)
         assert thread.is_alive() and not finished.is_set()
         worker.request_stop()
         assert finished.wait(3)
         thread.join(3)
-        assert soc.calls == [("load", True), ("dc", 0), ("source", "internal"), ("start",), ("stop",), ("stop",)]
+        assert soc.calls == [("load", True), ("dc", 0), ("source", "internal"), ("start",), ("mute", 0), ("mute", 0)]
     finally:
         worker.request_stop()
         thread.join(3)
@@ -205,7 +214,7 @@ def test_cancel_before_start_and_cleanup_after_start_error():
     errors = []
     worker.failed.connect(errors.append, QtCore.Qt.DirectConnection)
     worker.run()
-    assert soc.calls[-1] == ("stop",)
+    assert soc.calls[-1] == ("mute", 0)
     assert "start transport error" in errors[0]
 
 
@@ -216,7 +225,7 @@ def test_cancel_during_program_load_does_not_start_output():
         config_all=lambda *a, **k: worker.request_stop())
     worker.run()
     assert ("start",) not in soc.calls
-    assert soc.calls[-1] == ("stop",)
+    assert soc.calls[-1] == ("mute", 0)
 
 
 def qt_until(predicate):
@@ -231,59 +240,58 @@ def test_gui_tab_settings_start_stop_and_close(monkeypatch):
     import DCWaveform_Generator as gui
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     soc = FakeSoc()
-    monkeypatch.setattr(square, "connect_qick", lambda _: (soc, soccfg()))
+    monkeypatch.setattr(square, "connect_qick", lambda _: (soc, square_soccfg()))
     monkeypatch.setattr(square, "build_square_wave_program", fake_factory)
     window = gui.MainWindow()
     panel = window._square_wave_panel
+    from qick_front_panel import identify_qick_front_panel
+    window._on_qick_configuration_identified(identify_qick_front_panel(square_soccfg()))
     try:
         assert window._control_tabs.tabText(window._control_tabs.indexOf(panel)) == "QICK Square Wave"
         assert not hasattr(panel, "codes_per_mv")
         assert not hasattr(panel, "calibration_database_path")
         assert not hasattr(panel, "calibration_run")
         assert panel.full_scale_mv.value() == 800
-        panel.full_scale_mv.setValue(400)
+        current_records = {'00': dict(converter_id='00', channels=[0],
+                                     dc_output=True, current_ua=10000,
+                                     adjustable=True, reason='')}
+        monkeypatch.setattr(soc, 'get_dac_current_settings', lambda: current_records, raising=False)
+        window._dac_current_state.update(current_records)
         window._calibration_panel.database_path.setText("missing.db")
         assert panel.full_scale_mv.value() == 400
         assert window._experiment_panel.full_scale_mv.value() == 800
         panel.amplitude_mv.setValue(12.5)
-        panel.zero_code.setValue(1104)
+        panel.phase_deg.setValue(45)
         payload = window._settings_to_dict()
         decoded = window._decode_settings(payload)
         assert decoded["square_wave"]["amplitude_mv"] == 12.5
-        assert decoded["square_wave"]["zero_code"] == 1104
+        assert decoded["square_wave"]["zero_code"] == 0
+        assert decoded["square_wave"]["phase_deg"] == 45
         assert decoded["square_wave"]["full_scale_mv"] == 400
         panel.load_settings(decoded["square_wave"])
         del payload["square_wave"]
         assert window._decode_settings(payload)["square_wave"] == square.normalize_square_wave_settings()
         panel.start_button.click()
         qt_until(lambda: "Running:" in panel.status.text())
+        qt_until(lambda: window._experiment_thread is None)
         assert "maximum output +/-400 mV" in panel.status.text()
-        assert not panel.start_button.isEnabled() and panel.stop_button.isEnabled()
-        assert window._experiment_thread.isRunning()
-        running_worker = window._experiment_worker
-        running_thread = window._experiment_thread
-        blocked = []
-        monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *args: blocked.append(args[2]))
-        window._configure_qick_setup()
-        window._identify_qick_configuration()
-        window._start_bias_hardware_operation("read", {})
-        window._run_sparameter_sweep()
-        window._run_noise_acquisition(None)
-        window._run_power_calibration("output")
-        window._run_qick_experiment()
-        assert len(blocked) == 7
-        assert window._experiment_worker is running_worker
-        assert window._experiment_thread is running_thread
+        assert panel.start_button.isEnabled() and panel.stop_button.isEnabled()
+        assert not any(call[0]=='mute' for call in soc.calls)
         assert soc.calls.count(("start",)) == 1
         panel.stop_button.click()
         qt_until(lambda: window._experiment_thread is None)
-        assert panel.start_button.isEnabled() and not panel.stop_button.isEnabled()
-        assert soc.calls[-1] == ("stop",)
+        assert panel.start_button.isEnabled() and panel.stop_button.isEnabled()
+        assert soc.calls[-1] == ("mute", 0)
+        # Stop also mutes output left enabled by a different completed program.
+        panel.stop_button.click()
+        qt_until(lambda: window._experiment_thread is None)
+        assert soc.calls[-1] == ("mute", 0)
         panel.start_button.click()
         qt_until(lambda: "Running:" in panel.status.text())
-        window.close()
         qt_until(lambda: window._experiment_thread is None)
-        assert soc.calls[-1] == ("stop",)
+        panel.stop_button.click()
+        qt_until(lambda: window._experiment_thread is None)
+        assert soc.calls[-1] == ("mute", 0)
     finally:
         if window._experiment_worker is not None:
             window._experiment_worker.request_stop()
@@ -301,4 +309,33 @@ def test_invalid_output_range_prevents_hardware_configuration():
     worker.failed.connect(errors.append, QtCore.Qt.DirectConnection)
     worker.run()
     assert soc.calls == []
-    assert "output full scale" in errors[0]
+    assert "SquarePulse amplitude" in errors[0]
+
+
+def test_worker_rechecks_ip_identity_before_touching_hardware():
+    soc = FakeSoc()
+    worker = worker_for(soc)
+    worker.connector = lambda _: (soc, soccfg())
+    errors = []
+    worker.failed.connect(errors.append, QtCore.Qt.DirectConnection)
+    worker.run()
+    assert soc.calls == []
+    assert 'dedicated SquarePulse IP' in errors[0]
+
+
+def test_dedicated_program_reaches_end_without_mute():
+    from qick.awg_tuning import TProcV1BehaviorModel
+    from qick.square_pulse import frequency_word, phase_word
+    cfg = square_soccfg()
+    config = square.SquareWaveConfig(gen_ch=0, zero_code=0, frequency_hz=2000,
+                                    amplitude_mv=20, phase_deg=45)
+    program = square.build_square_wave_program(cfg, config)
+    model = TProcV1BehaviorModel(strict=True)
+    model.run(program)
+    assert len(model.output_events) == 1
+    word = model.output_events[0].word
+    assert word & 0xffffffff == frequency_word(.002, 4800)
+    assert word >> 32 & 0xffffffff == phase_word(45)
+    assert word >> 64 & 0xffffffff == 820
+    assert word >> 128 & 3 == 1
+    assert program.prog_list[-1]['name'] == 'end'

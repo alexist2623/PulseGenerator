@@ -17,9 +17,10 @@ def configuration():
     return cfg
 
 
-def test_cartesian_words_from_hardware_loops():
+@pytest.mark.parametrize('mute', [False, True])
+def test_cartesian_words_from_hardware_loops(mute):
     cfg=configuration()
-    config=SquarePulseConfig(1)
+    config=SquarePulseConfig(1,mute_on_finish=mute)
     axes=(SquarePulseSweep('frequency',0.04,190,3,1),
           SquarePulseSweep('amplitude',0,800,3,1),
           SquarePulseSweep('phase',-180,360,4,1))
@@ -37,9 +38,12 @@ def test_cartesian_words_from_hardware_loops():
                            config.word('phase',p,cfg['gens'][1]),
                            config.word('amplitude',a,cfg['gens'][1]),tmux_ch=2)
         expected.extend([sum(w<<(32*i) for i,w in enumerate(words))]*2)
-    assert [ev.word for ev in events[:-1]]==expected
-    assert events[-1].word & (1<<128)==0
-    assert events[-1].word == events[-2].word & ~(1<<128)
+    assert [ev.word for ev in (events[:-1] if mute else events)]==expected
+    if mute:
+        assert events[-1].word & (1<<128)==0
+        assert events[-1].word == events[-2].word & ~(1<<128)
+    else:
+        assert events[-1].word == expected[-1]
     assert not any(ev.word & (1<<129) for ev in events)
     assert len(prog._runtime_dmem_words)==10
     assert prog.cfg['expts']==36

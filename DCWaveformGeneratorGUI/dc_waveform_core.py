@@ -34,7 +34,7 @@ DEFAULT_BIAS_T_COMPENSATION_FRACTION = 0.1
 DEFAULT_BIAS_T_COMPENSATION_DURATION_US = 1.0
 DEFAULT_BIAS_T_FILTER_TAU_US = 100.0
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
-BIAS_T_COMPENSATION_TYPES = ("dc", "filter")
+BIAS_T_COMPENSATION_TYPES = ("dc", "filter", "dc_rc")
 RF_SEGMENT_LENGTH_MODES = ("fixed", "extend_by_rf_duration")
 RF_PREDEFINED_COMPOSITE_TEMPLATES = ("custom", "cpmg", "udd")
 MAX_QICK_OUTPUTS = 8
@@ -1778,6 +1778,8 @@ def build_qick_sequence(
     output_names: Optional[Sequence[str]] = None,
     fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ,
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
+    output_full_scales_mv=None,
+    dac_current_settings=None,
     sweep: Optional[QickSweepAxisSpec] = None,
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
@@ -1804,6 +1806,9 @@ def build_qick_sequence(
     from qick_fine_tune_sweep import FineTuneSequence
 
     sequence = FineTuneSequence(output_names)
+    if output_full_scales_mv is not None:
+        sequence.set_voltage_scales(full_scale_mv, output_full_scales_mv)
+    sequence.dac_current_settings = dict(dac_current_settings or {})
     sequence.set_cross_capacitance(
         _coerce_cross_capacitance(cross_capacitance, len(output_names))
     )
@@ -1840,22 +1845,16 @@ def build_qick_sequence(
         bias_t_filter_tau_us,
         "bias_t_filter_tau_us",
     )
-    if bias_t_compensation_type == "filter":
-        sequence.set_bias_t_filter_compensation(
-            filter_tau_us * fabric_mhz,
-            enabled=bool(bias_t_compensation_enabled),
-        )
-    else:
-        sequence.set_bias_t_compensation(
-            compensation_mv / full_scale_mv,
-            enabled=bool(bias_t_compensation_enabled),
-            mode=bias_t_compensation_mode,
-            fixed_duration_cycles=(
-                compensation_duration_cycles
-                if bias_t_compensation_mode == "fixed_time"
-                else None
-            ),
-        )
+    sequence.set_rc_compensation(
+        filter_tau_us,
+        enabled=bool(bias_t_compensation_enabled and bias_t_compensation_type in ("filter", "dc_rc")),
+    )
+    sequence.set_bias_t_compensation(
+        compensation_mv / full_scale_mv,
+        enabled=bool(bias_t_compensation_enabled and bias_t_compensation_type in ("dc", "dc_rc")),
+        mode=bias_t_compensation_mode,
+        fixed_duration_cycles=compensation_duration_cycles if bias_t_compensation_mode == "fixed_time" else None,
+    )
     for spec in specs:
         if spec.kind == "set":
             sequence.add_set(spec.name, spec.amplitudes, spec.duration_cycles)
@@ -1944,6 +1943,11 @@ def build_qick_sequence(
                 count=rf_spec.power_sweep_count,
             )
     sequence._validate()
+    from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges
+    validate_channel_voltage_ranges(sequence)
+    sequence.output_full_scale_mv = float(full_scale_mv)
+    sequence.rc_output_range_preview = validate_sequence_rc_range(
+        sequence, float(fabric_mhz), float(full_scale_mv))
     return sequence
 
 
@@ -2083,6 +2087,10 @@ def generate_qick_program_code(
     fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ,
     tproc_mhz: Real = DEFAULT_QICK_TPROC_MHZ,
     full_scale_mv: Real = DEFAULT_QICK_FULL_SCALE_MV,
+    output_full_scales_mv=None,
+    dac_current_settings=None,
+    square_full_scale_mv=None,
+    square_current_settings=None,
     repetitions_per_sweep: Integral = 1,
     sweep: Optional[QickSweepAxisSpec] = None,
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
@@ -2120,6 +2128,10 @@ def generate_qick_program_code(
         raise ValueError("AWG channels must be unique nonnegative integers")
     tproc_mhz = _positive_real(tproc_mhz, "tproc_mhz")
     full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
+    square_full_scale_mv = float(full_scale_mv if square_full_scale_mv is None else square_full_scale_mv)
+    dac_current_settings = dict(dac_current_settings or {})
+    if square_pulse_settings and square_pulse_settings.get('enabled'):
+        dac_current_settings.update(square_current_settings or {})
     if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
         raise TypeError("bias_t_compensation_enabled must be boolean")
     if bias_t_compensation_type not in BIAS_T_COMPENSATION_TYPES:
@@ -2370,6 +2382,8 @@ def generate_qick_program_code(
         f"FABRIC_MHZ = {float(fabric_mhz)!r}",
         f"TPROC_MHZ = {tproc_mhz!r}",
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
+        f"OUTPUT_FULL_SCALES_MV = {output_full_scales_mv!r}",
+        f"DAC_CURRENT_SETTINGS = {dict(dac_current_settings or {})!r}",
         f"BIAS_T_COMPENSATION_ENABLED = {bool(bias_t_compensation_enabled)!r}",
         f"BIAS_T_COMPENSATION_TYPE = {bias_t_compensation_type!r}",
         f"BIAS_T_COMPENSATION_VOLTAGE_MV = {float(bias_t_compensation_voltage_mv)!r}",
@@ -2388,23 +2402,24 @@ def generate_qick_program_code(
         "",
         "def build_sequence() -> FineTuneSequence:",
         "    sequence = FineTuneSequence(OUTPUT_NAMES)",
+        "    sequence.output_full_scale_mv = FULL_SCALE_MV",
+        "    if OUTPUT_FULL_SCALES_MV is not None:",
+        "        sequence.set_voltage_scales(FULL_SCALE_MV, OUTPUT_FULL_SCALES_MV)",
+        "    sequence.dac_current_settings = DAC_CURRENT_SETTINGS",
         "    sequence.set_cross_capacitance(CROSS_CAPACITANCE)",
-        "    if BIAS_T_COMPENSATION_TYPE == 'filter':",
-        "        sequence.set_bias_t_filter_compensation(",
-        "            BIAS_T_FILTER_TAU_CYCLES,",
-        "            enabled=BIAS_T_COMPENSATION_ENABLED,",
-        "        )",
-        "    else:",
-        "        sequence.set_bias_t_compensation(",
-        "            BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
-        "            enabled=BIAS_T_COMPENSATION_ENABLED,",
-        "            mode=BIAS_T_COMPENSATION_MODE,",
-        "            fixed_duration_cycles=(",
-        "                BIAS_T_COMPENSATION_DURATION_CYCLES",
-        "                if BIAS_T_COMPENSATION_MODE == 'fixed_time'",
-        "                else None",
-        "            ),",
-        "        )",
+        "    sequence.set_rc_compensation(",
+        "        BIAS_T_FILTER_TAU_US,",
+        "        enabled=BIAS_T_COMPENSATION_ENABLED and BIAS_T_COMPENSATION_TYPE in ('filter', 'dc_rc'),",
+        "    )",
+        "    sequence.set_bias_t_compensation(",
+        "        BIAS_T_COMPENSATION_VOLTAGE_MV / FULL_SCALE_MV,",
+        "        enabled=BIAS_T_COMPENSATION_ENABLED and BIAS_T_COMPENSATION_TYPE in ('dc', 'dc_rc'),",
+        "        mode=BIAS_T_COMPENSATION_MODE,",
+        "        fixed_duration_cycles=(",
+        "            BIAS_T_COMPENSATION_DURATION_CYCLES",
+        "            if BIAS_T_COMPENSATION_MODE == 'fixed_time' else None",
+        "        ),",
+        "    )",
     ]
     for spec in specs:
         if spec.kind == "set":
@@ -2524,15 +2539,18 @@ def generate_qick_program_code(
             )
     if square_pulse_settings is not None or output_trigger_settings is not None:
         from qick_square_dds import decode_square_settings, OutputTriggerConfig
-        decode_square_settings(square_pulse_settings, float(full_scale_mv))
+        decode_square_settings(square_pulse_settings, square_full_scale_mv)
         OutputTriggerConfig(**(output_trigger_settings or {}))
         lines.extend([
             "    from qick_square_dds import decode_square_settings, OutputTriggerConfig, attach_square_settings",
-            f"    square_config, square_axes = decode_square_settings({square_pulse_settings!r}, {float(full_scale_mv)!r})",
+            f"    square_config, square_axes = decode_square_settings({square_pulse_settings!r}, {square_full_scale_mv!r})",
             f"    attach_square_settings(sequence, square_config, square_axes, OutputTriggerConfig(**{output_trigger_settings or {}!r}))",
         ])
     lines.extend(
         [
+            "    from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges",
+            "    validate_channel_voltage_ranges(sequence)",
+            "    sequence.rc_output_range_preview = validate_sequence_rc_range(sequence, FABRIC_MHZ, FULL_SCALE_MV)",
             "    return sequence",
             "",
             "",
@@ -2647,6 +2665,7 @@ def generate_qick_program_code(
             "    square = getattr(program, 'square_pulse_config', None)",
             "    if square is not None and configure_rf:",
             "        soc.rfb_set_gen_dc(square.gen_ch)",
+            "    completed = False",
             "    try:",
             "        if FIR_DDR_CONFIG is not None:",
             "            ddr_result = program.acquire_fir_ddr(",
@@ -2655,8 +2674,9 @@ def generate_qick_program_code(
             "        else:",
             "            program.run_rounds(soc, progress=progress, **run_kwargs)",
             "            ddr_result = None",
+            "        completed = True",
             "    finally:",
-            "        if square is not None:",
+            "        if square is not None and (not completed or square.mute_on_finish):",
             "            soc.stop_square_pulse(square.gen_ch)",
             "    rf_settings = {'outputs': actual_outputs, 'readout': actual_input}",
             "    return program, ddr_result, rf_settings",

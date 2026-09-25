@@ -2,6 +2,10 @@
 from dataclasses import asdict
 from PyQt5 import QtCore, QtWidgets
 try:
+    from .qick_square_output import SquareOutputSelector
+except ImportError:
+    from qick_square_output import SquareOutputSelector
+try:
     from .qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings
 except ImportError:
     from qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings
@@ -17,6 +21,7 @@ def spin(value, suffix, minimum=0, maximum=1e6, decimals=6):
 
 class SquarePulsePanel(QtWidgets.QWidget):
     changed=QtCore.pyqtSignal()
+    front_panel_requested=QtCore.pyqtSignal(object)
 
     def __init__(self,parent=None):
         super().__init__(parent)
@@ -25,12 +30,28 @@ class SquarePulsePanel(QtWidgets.QWidget):
         self.status=QtWidgets.QLabel("Identify QICK to discover SquarePulse outputs.")
         self.status.setWordWrap(True)
         layout.addWidget(self.enabled); layout.addWidget(self.status)
-        form=QtWidgets.QFormLayout(); layout.addLayout(form)
-        self.channel=QtWidgets.QSpinBox(); self.channel.setRange(0,255); self.channel.setValue(7)
-        form.addRow("QICK generator",self.channel)
-        note=QtWidgets.QLabel("Continuous 50% duty output, ±amplitude. Output full scale comes from Experiment. "
+        self.output_selector=SquareOutputSelector(self, channel=7)
+        self.channel=self.output_selector.channel
+        self.output_selector.requested.connect(lambda: self.front_panel_requested.emit(self))
+        layout.addWidget(self.output_selector)
+        self.mute_on_finish=QtWidgets.QCheckBox("Mute SquarePulse when experiment finishes")
+        self.mute_on_finish.setChecked(True)
+        self.mute_on_finish.setToolTip("Unchecked: keep the final frequency, amplitude and phase running after successful completion. Stop/cancel and errors still mute output.")
+        self.mute_on_finish.toggled.connect(self.changed)
+        layout.addWidget(self.mute_on_finish)
+        self.rc_enabled=QtWidgets.QCheckBox("RC compensation")
+        self.rc_tau_us=spin(1000.0, " us", 10.0, 1_000_000.0)
+        self.rc_tau_us.setEnabled(False)
+        self.rc_enabled.toggled.connect(self.rc_tau_us.setEnabled)
+        self.rc_enabled.toggled.connect(self.changed)
+        self.rc_tau_us.valueChanged.connect(self.changed)
+        layout.addWidget(self.rc_enabled)
+        rc_form=QtWidgets.QFormLayout()
+        rc_form.addRow("RC time constant (tau)", self.rc_tau_us)
+        layout.addLayout(rc_form)
+        note=QtWidgets.QLabel("Continuous 50% duty output, ±amplitude. Output full scale follows this DAC current in the shared Front Panel. "
             "Frequency and amplitude updates preserve accumulated phase. Phase sets an offset. "
-            "Sweeps run in tProcessor hardware loops. The output is muted when the experiment finishes.")
+            "Sweeps run in tProcessor hardware loops. Uncheck mute to keep output running after completion.")
         note.setWordWrap(True); layout.addWidget(note)
         self.rows={}
         for name,label,value,suffix,minimum in (
@@ -60,6 +81,7 @@ class SquarePulsePanel(QtWidgets.QWidget):
         for item in items[1:]: item.setEnabled(checked)
 
     def set_configuration(self,configuration):
+        self.output_selector.set_configuration(configuration)
         channels=tuple(getattr(configuration,'square_pulse_channels',()))
         self._available_channels=channels
         self.enabled.setEnabled(bool(channels))
@@ -72,12 +94,17 @@ class SquarePulsePanel(QtWidgets.QWidget):
 
     def settings_dict(self):
         return dict(enabled=self.enabled.isChecked(),gen_ch=self.channel.value(),
+                    mute_on_finish=self.mute_on_finish.isChecked(),
+                    rc_enabled=self.rc_enabled.isChecked(), rc_tau_us=self.rc_tau_us.value(),
                     parameters={name:{key:(widget.isChecked() if key=='sweep' else widget.value())
                                       for key,widget in row.items()} for name,row in self.rows.items()})
 
     def load_settings(self,settings):
         settings=settings or {}
-        self.channel.setValue(int(settings.get('gen_ch',7)))
+        self.output_selector.load_channel(int(settings.get('gen_ch',7)), explicit=bool(settings))
+        self.mute_on_finish.setChecked(settings.get('mute_on_finish',True))
+        self.rc_enabled.setChecked(settings.get('rc_enabled',False))
+        self.rc_tau_us.setValue(settings.get('rc_tau_us',1000.0))
         supported = self._available_channels is None or bool(self._available_channels)
         self.enabled.setChecked(bool(settings.get('enabled',False)) and supported)
         for name,row in self.rows.items():
@@ -93,7 +120,8 @@ class SquarePulsePanel(QtWidgets.QWidget):
         if self._available_channels is not None and ch not in self._available_channels:
             raise ValueError("Select a SquarePulse generator from the identified firmware")
         value=lambda key:self.rows[key]['start' if self.rows[key]['sweep'].isChecked() else 'value'].value()
-        config=SquarePulseConfig(ch,value('frequency'),value('amplitude'),value('phase'),full_scale_mv)
+        config=SquarePulseConfig(ch,value('frequency'),value('amplitude'),value('phase'),
+                                 full_scale_mv,self.mute_on_finish.isChecked(), self.rc_enabled.isChecked(), self.rc_tau_us.value())
         axes=self.sweep_specs()
         return attach_square_settings(sequence,config,axes,trigger)
 
@@ -103,6 +131,15 @@ class SquarePulsePanel(QtWidgets.QWidget):
         return tuple(SquarePulseSweep(name,row['start'].value(),row['stop'].value(),row['count'].value(),ch,
                                    output_name=f"square{ch}",segment_name=name)
                    for name,row in self.rows.items() if row['sweep'].isChecked())
+
+    def allowed_output_channels(self, configuration):
+        return self.output_selector.allowed_channels(configuration)
+
+    def front_panel_values(self):
+        return dict(output_ch=self.channel.value(), output_nqz=1)
+
+    def apply_front_panel_settings(self, values):
+        self.output_selector.apply(values)
 
 
 class TriggeringPanel(QtWidgets.QWidget):

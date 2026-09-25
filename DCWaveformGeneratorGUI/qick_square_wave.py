@@ -1,4 +1,4 @@
-"""Continuous QICK AWG square waves using a configured output voltage range."""
+"""Autonomous SquarePulse output controls and legacy waveform configuration."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -13,10 +13,14 @@ try:
     from .qick_qcodes_experiment import connect_qick
     from .dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
     from .qick_fine_tune_sweep import normalized_to_dac
+    from .qick_square_dds import SquarePulseConfig
+    from .qick_square_output import SquareOutputSelector
 except ImportError:
     from qick_qcodes_experiment import connect_qick
     from dc_waveform_core import DEFAULT_QICK_FULL_SCALE_MV
     from qick_fine_tune_sweep import normalized_to_dac
+    from qick_square_dds import SquarePulseConfig
+    from qick_square_output import SquareOutputSelector
 
 
 @dataclass(frozen=True)
@@ -28,11 +32,20 @@ class SquareWaveConfig:
     duty_percent: float = 50.0
     full_scale_mv: float = DEFAULT_QICK_FULL_SCALE_MV
     zero_code: float = 1120.0
+    phase_deg: float = 0.0
+    rc_enabled: bool = False
+    rc_tau_us: float = 1000.0
 
     def __post_init__(self):
         if isinstance(self.gen_ch, bool) or not isinstance(self.gen_ch, int) or self.gen_ch < 0:
             raise ValueError("Generator channel must be a nonnegative integer")
+        if not isinstance(self.rc_enabled, bool):
+            raise ValueError("RC enabled must be boolean")
+        if not 10 <= self.rc_tau_us <= 1_000_000:
+            raise ValueError("RC tau must be between 10 us and 1000 ms")
         for name, value in asdict(self).items():
+            if name == "rc_enabled":
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
         if self.frequency_hz <= 0 or self.amplitude_mv <= 0:
@@ -85,6 +98,8 @@ def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
     if config.gen_ch >= len(soccfg["gens"]):
         raise ValueError("Selected generator is absent from the loaded firmware")
     gen_cfg = soccfg["gens"][config.gen_ch]
+    if gen_cfg.get("type") == "axis_square_pulse_v1":
+        return build_square_dds_program(soccfg, config, tproc_mhz=tproc_mhz)
     if gen_cfg.get("type") != "axis_awg_tuning_v1":
         raise ValueError("Select an axis_awg_tuning_v1 DAC generator")
     clock = float(soccfg["tprocs"][0]["f_time"] if tproc_mhz is None else tproc_mhz)
@@ -143,20 +158,58 @@ def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
     return program
 
 
+def build_square_dds_program(soccfg, config, *, tproc_mhz=None):
+    """Enable the autonomous IP once, then let tProcessor reach END."""
+    from qick.asm_v1 import QickProgram
+    if config.duty_percent != 50 or config.offset_mv != 0 or config.zero_code != 0:
+        raise ValueError("SquarePulse IP uses 50% duty and symmetric +/- amplitude without DC offset")
+    gen = soccfg['gens'][config.gen_ch]
+    clock = float(soccfg['tprocs'][0]['f_time'] if tproc_mhz is None else tproc_mhz)
+    if not isfinite(clock) or clock <= 0:
+        raise ValueError("tProcessor clock must be positive and finite")
+    settings = SquarePulseConfig(config.gen_ch, config.frequency_hz / 1e6,
+                                 config.amplitude_mv, config.phase_deg, config.full_scale_mv,
+                                 mute_on_finish=False, rc_enabled=config.rc_enabled, rc_tau_us=config.rc_tau_us)
+    freq = settings.word('frequency', settings.frequency_mhz, gen)
+    phase = settings.word('phase', settings.phase_deg, gen)
+    gain = settings.word('amplitude', settings.amplitude_mv, gen)
+    if freq == 0 or gain == 0:
+        raise ValueError("Frequency or amplitude rounds to zero for this SquarePulse IP")
+    program = QickProgram(soccfg)
+    program.tproccfg = dict(program.tproccfg, f_time=clock)
+    program.declare_gen(ch=config.gen_ch, nqz=1)
+    program.synci(128)
+    rc_params = {} if not config.rc_enabled else dict(rc_enable=True, rc_increment=settings.rc_step(gain, gen))
+    program.set_pulse_registers(ch=config.gen_ch, style='square', freq=freq, phase=phase,
+                                gain=gain, enable=True, reset_phase=False, **rc_params)
+    program.pulse(ch=config.gen_ch, t=0)
+    program.waiti(int(gen['tproc_ch']), 32)
+    program.end()
+    program.compile()
+    program.summary = dict(output_type='square_pulse', requested_frequency_hz=config.frequency_hz,
+                           actual_frequency_hz=freq*float(gen['f_dds'])*1e6/2**32,
+                           actual_duty_percent=50., high_code=gain, low_code=-gain,
+                           tproc_mhz=clock, full_scale_mv=config.full_scale_mv,
+                           phase_deg=phase*360/2**32, rc_enabled=config.rc_enabled, rc_tau_us=config.rc_tau_us)
+    return program
+
+
 class SquareWaveWorker(QtCore.QObject):
-    """Own the Pyro connection on one thread until a confirmed stop."""
+    """Configure autonomous output without occupying the next experiment's worker."""
     started = QtCore.pyqtSignal(object)
     finished = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
     stop_failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, connection, config, *, tproc_mhz, connector=None, program_factory=None):
+    def __init__(self, connection, config, *, tproc_mhz, connector=None, program_factory=None, mute_only=False, current_settings=None):
         super().__init__()
         self.connection, self.config = connection, config
         self.tproc_mhz = tproc_mhz
         self.connector = connector or connect_qick
         self.program_factory = program_factory or build_square_wave_program
         self._stop = Event()
+        self.mute_only = mute_only
+        self.current_settings = dict(current_settings or {})
 
     def request_stop(self):
         # Called directly by the GUI: no queued slot while run() is waiting.
@@ -166,12 +219,25 @@ class SquareWaveWorker(QtCore.QObject):
     def run(self):
         soc = None
         touched_hardware = False
+        square_ip = False
         error = None
         try:
             if self._stop.is_set():
                 self.finished.emit("Start cancelled")
                 return
             soc, soccfg = self.connector(self.connection)
+            if (self.config.gen_ch >= len(soccfg['gens'])
+                    or soccfg['gens'][self.config.gen_ch].get('type') != 'axis_square_pulse_v1'):
+                raise ValueError("This tab requires a dedicated SquarePulse IP output")
+            square_ip = True
+            if not callable(getattr(soc, 'stop_square_pulse', None)):
+                raise RuntimeError("Update the board QSTL_QICK library: stop_square_pulse is required")
+            if self.mute_only:
+                soc.stop_square_pulse(self.config.gen_ch)
+                self.finished.emit("Muted: SquarePulse output is zero")
+                return
+            from qick_dac_current import verify_current_settings
+            verify_current_settings(soc, self.current_settings)
             program = self.program_factory(soccfg, self.config, tproc_mhz=self.tproc_mhz)
             if self._stop.is_set():
                 self.finished.emit("Start cancelled")
@@ -185,7 +251,9 @@ class SquareWaveWorker(QtCore.QObject):
                 soc.start_src("internal")
                 soc.start_tproc()
                 self.started.emit(program.summary)
-            self._stop.wait()
+                if not self._stop.is_set():
+                    self.finished.emit("SquarePulse output enabled")
+                    return
         except Exception:
             error = traceback.format_exc()
         if touched_hardware:
@@ -193,7 +261,10 @@ class SquareWaveWorker(QtCore.QObject):
                 self._stop.clear()
                 try:
                     # lazy=True is a no-op for tProcessor v1 and must not be used.
-                    soc.stop_tproc()
+                    if square_ip:
+                        soc.stop_square_pulse(self.config.gen_ch)
+                    else:
+                        soc.stop_tproc()
                     break
                 except Exception:
                     self.stop_failed.emit(traceback.format_exc())
@@ -201,12 +272,14 @@ class SquareWaveWorker(QtCore.QObject):
         if error:
             self.failed.emit(error)
         else:
-            self.finished.emit("Stopped: soc.stop_tproc() completed")
+            self.finished.emit("Muted: SquarePulse output is zero" if square_ip
+                               else "Stopped: soc.stop_tproc() completed")
 
 
 class SquareWavePanel(QtWidgets.QWidget):
     start_requested = QtCore.pyqtSignal(object)
     stop_requested = QtCore.pyqtSignal()
+    front_panel_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -222,17 +295,20 @@ class SquareWavePanel(QtWidgets.QWidget):
         note = QtWidgets.QLabel("Continuous QICK DAC output. Uses the QICK connection and tProcessor clock in Setup.")
         note.setWordWrap(True)
         editor.addWidget(note)
+        self.output_selector = SquareOutputSelector(self, channel=0)
+        self.output_selector.requested.connect(lambda: self.front_panel_requested.emit(self))
+        self.gen_ch = self.output_selector.channel
+        editor.addWidget(self.output_selector)
         self.controls = QtWidgets.QGroupBox("Square wave")
         form = QtWidgets.QFormLayout(self.controls)
-        self.gen_ch = QtWidgets.QSpinBox()
-        self.gen_ch.setRange(0, 255)
-        form.addRow("QICK generator channel", self.gen_ch)
-        definitions = (("frequency_hz", "Frequency (Hz)", 0.2, 1e7, 6),
+        definitions = (("frequency_hz", "Frequency (Hz)", 0.2, 1e10, 6),
                        ("amplitude_mv", "Peak amplitude (mV)", 0.000001, 1e5, 6),
                        ("offset_mv", "Waveform offset (mV)", -1e5, 1e5, 6),
                        ("duty_percent", "High-level duty (%)", 0.001, 99.999, 3),
                        ("zero_code", "DAC offset compensation (codes)", -1e9, 1e9, 6),
-                       ("full_scale_mv", "Maximum output (+/- mV)", 1.0, 1e6, 6))
+                       ("full_scale_mv", "Maximum output (+/- mV)", 1.0, 1e6, 6),
+                       ("phase_deg", "Phase offset (deg)", -1e6, 1e6, 6),
+                       ("rc_tau_us", "RC time constant (us)", 10.0, 1_000_000.0, 6))
         for name, label, minimum, maximum, decimals in definitions:
             widget = QtWidgets.QDoubleSpinBox()
             widget.setRange(minimum, maximum)
@@ -240,6 +316,12 @@ class SquareWavePanel(QtWidgets.QWidget):
             widget.setKeyboardTracking(False)
             setattr(self, name, widget)
             form.addRow(label, widget)
+            if name in ('offset_mv', 'zero_code', 'full_scale_mv'):
+                form.labelForField(widget).hide()
+                widget.hide()
+        self.rc_enabled = QtWidgets.QCheckBox("RC compensation")
+        form.addRow(self.rc_enabled)
+        self.rc_enabled.toggled.connect(self.rc_tau_us.setEnabled)
         editor.addWidget(self.controls)
         self.output_note = QtWidgets.QLabel(
             "Maximum output sets the +/- voltage range, as in AWG Tuning. "
@@ -265,36 +347,95 @@ class SquareWavePanel(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
-        stop_note = QtWidgets.QLabel("Stop halts the tProcessor. The DAC may retain its last level after queued commands finish; it is not a zero-voltage command.")
-        stop_note.setWordWrap(True)
-        layout.addWidget(stop_note)
+        self.stop_note = QtWidgets.QLabel()
+        self.stop_note.setWordWrap(True)
+        layout.addWidget(self.stop_note)
         self.load_settings({})
         for name in ("gen_ch", "frequency_hz", "amplitude_mv", "offset_mv", "duty_percent",
-                     "zero_code", "full_scale_mv"):
+                     "zero_code", "full_scale_mv", "phase_deg"):
             getattr(self, name).valueChanged.connect(self.update_preview)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self.stop_requested.emit)
         self.set_running(False)
+        self.gen_ch.valueChanged.connect(self._sync_output_mode)
+        self._sync_output_mode()
+
+    def set_current_state(self, state):
+        self._current_state = state
+        state.changed.connect(self._refresh_current_scale)
+        self.gen_ch.valueChanged.connect(self._refresh_current_scale)
+        self._refresh_current_scale()
+
+    def _refresh_current_scale(self, *_args):
+        if hasattr(self, '_current_state'):
+            self.full_scale_mv.setValue(self._current_state.scale(self.gen_ch.value()))
 
     def settings_dict(self):
         values = {name: getattr(self, name).value() for name in
                   ("gen_ch", "frequency_hz", "amplitude_mv", "offset_mv", "duty_percent",
-                   "zero_code", "full_scale_mv")}
+                   "zero_code", "full_scale_mv", "phase_deg", "rc_tau_us")}
+        values["rc_enabled"] = self.rc_enabled.isChecked()
         return normalize_square_wave_settings(values)
 
     def resolved_config(self):
+        self._refresh_current_scale()
+        if self.output_selector.configuration is None:
+            raise ValueError("Identify QICK and select the physical SquarePulse output first")
+        self.output_selector.validate()
         return SquareWaveConfig(**self.settings_dict())
 
     def load_settings(self, settings):
         values = normalize_square_wave_settings(settings)
         for name, value in values.items():
             widget = getattr(self, name)
+            if name == "rc_enabled":
+                continue
             if not widget.minimum() <= value <= widget.maximum():
                 raise ValueError(f"{name} is outside the square-wave control range")
         for name, value in values.items():
             widget = getattr(self, name)
             with QtCore.QSignalBlocker(widget):
+                if name == "rc_enabled":
+                    widget.setChecked(value)
+                else:
+                    widget.setValue(value)
+        self.rc_tau_us.setEnabled(self.rc_enabled.isChecked())
+        self.output_selector.load_channel(values['gen_ch'], explicit=bool(settings))
+        self._sync_output_mode()
+        self._refresh_current_scale()
+        self.update_preview()
+
+    def allowed_output_channels(self, configuration):
+        return self.output_selector.allowed_channels(configuration)
+
+    def front_panel_values(self):
+        return dict(output_ch=self.gen_ch.value(), output_nqz=1)
+
+    def apply_front_panel_settings(self, values):
+        if not self.controls.isEnabled():
+            raise ValueError("Stop continuous output before changing its port")
+        self.output_selector.apply(values)
+        self._sync_output_mode()
+
+    def set_configuration(self, configuration):
+        self.output_selector.set_configuration(configuration)
+        self._sync_output_mode()
+
+    def _sync_output_mode(self):
+        fields = ('offset_mv', 'zero_code', 'duty_percent')
+        for name, value in zip(fields, (0., 0., 50.)):
+            widget = getattr(self, name)
+            with QtCore.QSignalBlocker(widget):
                 widget.setValue(value)
+            widget.setEnabled(False)
+        self.phase_deg.setEnabled(True)
+        self.output_note.setText(
+            "SquarePulse IP: continuous 50% duty, +/- peak amplitude. Phase is an offset; "
+            "starting updates the parameters without resetting accumulated phase. "
+            "Maximum output sets this tab's voltage range.")
+        self.stop_note.setText("Stop mutes the selected SquarePulse IP to zero, including output left running by an AWG experiment.")
+        if self.controls.isEnabled():
+            self.set_running(False)
         self.update_preview()
 
     def update_preview(self):
@@ -302,9 +443,15 @@ class SquareWavePanel(QtWidgets.QWidget):
         high_time = period * self.duty_percent.value() / 100
         high = self.offset_mv.value() + self.amplitude_mv.value()
         low = self.offset_mv.value() - self.amplitude_mv.value()
-        self.curve.setData([0, high_time, high_time, period, period,
-                            period+high_time, period+high_time, 2*period],
-                           [high, high, low, low, high, high, low, low])
+        if self.phase_deg.isEnabled():
+            import numpy as np
+            x = np.linspace(0, 2*period, 2001)
+            y = np.where((x/period+self.phase_deg.value()/360) % 1 < .5, high, low)
+            self.curve.setData(x, y)
+        else:
+            self.curve.setData([0, high_time, high_time, period, period,
+                                period+high_time, period+high_time, 2*period],
+                               [high, high, low, low, high, high, low, low])
         if self.controls.isEnabled():
             full_scale = self.full_scale_mv.value()
             if max(abs(high), abs(low)) > full_scale:
@@ -320,7 +467,11 @@ class SquareWavePanel(QtWidgets.QWidget):
 
     def set_running(self, running, message=None):
         self.controls.setEnabled(not running)
-        self.start_button.setEnabled(not running)
-        self.stop_button.setEnabled(running)
+        self.output_selector.setEnabled(not running)
+        configuration = self.output_selector.configuration
+        selected = (configuration is not None and self.gen_ch.value()
+                    in self.output_selector.allowed_channels(configuration))
+        self.start_button.setEnabled(not running and selected)
+        self.stop_button.setEnabled(running or selected)
         if message is not None:
             self.status.setText(message)

@@ -21,6 +21,26 @@ OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 INPUT_BOARD_TYPES = ("RF_In", "DC_In")
 
 
+def square_pulse_output_channels(configuration) -> frozenset:
+    """Use firmware identity, never a fixed DAC or generator number."""
+    channels = set(getattr(configuration, "square_pulse_channels", ()))
+    for port in getattr(configuration, "outputs", ()):
+        channels.update(
+            channel for channel, path in zip(port.qick_channels, port.block_paths)
+            if "axis_square_pulse_v1" in path.lower()
+        )
+    return frozenset(channels)
+
+
+def validate_awg_output_channels(configuration, channels) -> None:
+    invalid = sorted(set(channels) & square_pulse_output_channels(configuration))
+    if invalid:
+        raise ValueError(
+            "SquarePulse generator(s) " + ", ".join(map(str, invalid))
+            + " cannot be used as AWG outputs. Use the SquarePulse tab."
+        )
+
+
 @dataclass(frozen=True)
 class QickFrontPanelPort:
     """One physical front-panel SMA and its HWH/runtime channel mapping."""
@@ -71,6 +91,8 @@ class QickFrontPanelConfiguration:
     ddr_iq_sample_bytes: int = 4
     square_pulse_channels: Tuple[int, ...] = ()
     output_trigger_pins: Tuple[str, ...] = ()
+    awg_tuning_channels: Tuple[int, ...] = ()
+    dac_current_settings: Optional[dict] = None
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -259,7 +281,13 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         outputs=outputs,
         inputs=inputs,
         square_pulse_channels=tuple(i for i,gen in enumerate(config.get("gens",()))
-                                   if gen.get("type")=="axis_square_pulse_v1"),
+                                   if gen.get("type")=="axis_square_pulse_v1"
+                                   or gen.get("gen_type")=="square_pulse"),
+        awg_tuning_channels=tuple(
+            i for i, gen in enumerate(config.get("gens", ()))
+            if str(gen.get("type", "")).startswith("axis_awg_tuning")
+            or gen.get("gen_type") == "awg_tuning"
+        ),
         output_trigger_pins=tuple(str(pin[-1]) for pin in (config.get("tprocs") or [{}])[0].get("output_pins",())),
         **fir_values,
         **ddr_values,
@@ -339,6 +367,10 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         self._configuration = configuration
         self.update()
 
+    def set_disabled_outputs(self, ports: Sequence[int]) -> None:
+        self._disabled_outputs = frozenset(ports)
+        self.update()
+
     def set_scope(self, scope: str) -> None:
         """Show and activate only the connector direction being edited."""
         if scope not in self.SCOPE_RECTS:
@@ -371,6 +403,8 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         if direction not in ("output", "input", "bias"):
             raise ValueError("direction must be output, input, or bias")
         if not self._direction_is_visible(direction):
+            return
+        if direction == "output" and panel_index in getattr(self, "_disabled_outputs", ()):
             return
         self.port_clicked.emit(direction, int(panel_index))
 
@@ -408,7 +442,10 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             hit = self._hit_test(event.pos())
-            if hit is not None:
+            if hit is not None and not (
+                hit[0] == "output"
+                and hit[1] in getattr(self, "_disabled_outputs", ())
+            ):
                 self.port_clicked.emit(*hit)
                 event.accept()
                 return
@@ -435,6 +472,9 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                     self.setToolTip(
                         f"{port.label} | {port.board_label} | "
                         f"{port.channel_label} | RFDC {port.converter_id}"
+                        + (" | Unavailable for this output selection"
+                           if hover[0] == "output"
+                           and hover[1] in getattr(self, "_disabled_outputs", ()) else "")
                     )
             self.update()
         super().mouseMoveEvent(event)
@@ -473,6 +513,8 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
             else None
         )
         mapped = direction in ("bias", "io") or bool(port and port.qick_channels)
+        if direction == "output" and index in getattr(self, "_disabled_outputs", ()):
+            mapped = False
         selected = (
             index == self._selected_output
             if direction == "output"
@@ -797,6 +839,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
 
     identify_requested = QtCore.pyqtSignal()
     settings_applied = QtCore.pyqtSignal(object)
+    current_requested = QtCore.pyqtSignal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -806,6 +849,9 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self._preferred_output_ch = 0
         self._preferred_input_ch = 0
         self._scope = "path"
+        self._awg_output_mode = False
+        self._allowed_output_channels = None
+        self._current_state = None
 
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
@@ -849,6 +895,22 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         output_form.addRow("Front-panel connector:", self.output_sma)
         output_form.addRow("QICK generator channel:", self.output_channel)
         output_form.addRow("Detected board:", self.output_board)
+        self.output_current_ma = QtWidgets.QDoubleSpinBox()
+        self.output_current_ma.setRange(6.425, 32.0)
+        self.output_current_ma.setDecimals(3)
+        self.output_current_ma.setSuffix(" mA")
+        self.output_current_ma.setKeyboardTracking(False)
+        self.output_current_ma.setValue(20.0)
+        self.output_current_apply = QtWidgets.QPushButton("Apply DAC current")
+        self.output_current_apply.clicked.connect(self._request_current)
+        self.output_full_scale = QtWidgets.QLabel("Identify QICK to read DAC current")
+        self.output_full_scale.setWordWrap(True)
+        self.output_current_ma.valueChanged.connect(self._preview_current)
+        output_form.addRow("DAC full-scale current:", self.output_current_ma)
+        output_form.addRow("Estimated full scale (+/-):", self.output_full_scale)
+        output_form.addRow(self.output_current_apply)
+        self.output_current_ma.setEnabled(False)
+        self.output_current_apply.setEnabled(False)
         output_form.addRow("DAC Nyquist zone:", self.output_nqz)
         output_form.addRow("ATT1:", self.output_att1_db)
         output_form.addRow("ATT2:", self.output_att2_db)
@@ -920,6 +982,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         layout.addLayout(action_row)
 
         self.output_channel.currentIndexChanged.connect(self._update_summary)
+        self.output_channel.currentIndexChanged.connect(self._refresh_current)
         self.input_channel.currentIndexChanged.connect(self._update_summary)
         self.output_nqz.valueChanged.connect(self._update_summary)
         self.input_nqz.valueChanged.connect(self._update_summary)
@@ -934,6 +997,50 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_filter_cutoff_ghz.valueChanged.connect(self._update_summary)
         self.input_filter_bandwidth_ghz.valueChanged.connect(self._update_summary)
         self.set_scope("path")
+
+    def set_current_state(self, state):
+        self._current_state = state
+        state.changed.connect(self._refresh_current)
+        self._refresh_current()
+
+    def _refresh_current(self, *_args):
+        channel = self.output_channel.currentData()
+        record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
+        allowed = bool(record and record.get('adjustable'))
+        self.output_current_ma.setEnabled(allowed)
+        self.output_current_apply.setEnabled(allowed)
+        if record and record.get('current_ua') is not None:
+            with QtCore.QSignalBlocker(self.output_current_ma):
+                # A read-only RF channel can have a wider current range.
+                self.output_current_ma.setRange(min(6.425, record['current_ua']/1000),
+                                                max(32., record['current_ua']/1000))
+                self.output_current_ma.setValue(record['current_ua']/1000)
+            self._preview_current()
+        else:
+            self.output_full_scale.setText('Current unavailable; legacy +/-800 mV reference')
+        reason = record.get('reason', '') if record else 'Update board QSTL_QICK and identify QICK'
+        self.output_current_ma.setToolTip(reason)
+        self.output_current_apply.setToolTip(reason)
+
+    def _preview_current(self, *_args):
+        from qick_dac_current import full_scale_mv
+        channel = self.output_channel.currentData()
+        record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
+        if record and not record.get('dc_output'):
+            self.output_full_scale.setText('RF IP: current read-only; RF power calibration applies')
+            return
+        actual = None if not record else record.get('current_ua')
+        requested = int(round(self.output_current_ma.value()*1000))
+        prefix = 'Pending: ' if actual != requested else ''
+        self.output_full_scale.setText(f'{prefix}+/-{full_scale_mv(requested):g} mV '
+                                      '(20 mA = 800 mV reference)')
+
+    def _request_current(self):
+        channel = self.output_channel.currentData()
+        record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
+        if record and record.get('adjustable'):
+            self._preferred_output_ch = int(channel)
+            self.current_requested.emit(record['converter_id'], int(round(self.output_current_ma.value()*1000)))
 
     @staticmethod
     def _attenuation_spin(value: float) -> QtWidgets.QDoubleSpinBox:
@@ -994,9 +1101,37 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.identify_status.setText(message)
         self.apply_button.setEnabled(not identifying and self._selection_is_valid())
 
+    def set_awg_output_mode(self, enabled: bool) -> None:
+        self._awg_output_mode = bool(enabled)
+        self._update_awg_output_filter()
+        if self._configuration is not None and self._selected_output is not None:
+            self._select_port("output", self._selected_output)
+
+    def _update_awg_output_filter(self) -> None:
+        excluded = (square_pulse_output_channels(self._configuration)
+                    if self._awg_output_mode else frozenset())
+        if self._allowed_output_channels is not None:
+            excluded = excluded | frozenset(
+                channel for port in getattr(self._configuration, "outputs", ())
+                for channel in port.qick_channels
+                if channel not in self._allowed_output_channels
+            )
+        self.canvas.set_disabled_outputs(
+            port.panel_index for port in getattr(self._configuration, "outputs", ())
+            if port.qick_channels and set(port.qick_channels) <= excluded
+        )
+
+    def set_output_channel_filter(self, channels=None) -> None:
+        """Restrict the shared selector for a particular output editor."""
+        self._allowed_output_channels = None if channels is None else frozenset(channels)
+        self._update_awg_output_filter()
+        if self._configuration is not None and self._selected_output is not None:
+            self._select_port("output", self._selected_output)
+
     def set_configuration(self, configuration: QickFrontPanelConfiguration) -> None:
         self._configuration = configuration
         self.canvas.set_configuration(configuration)
+        self._update_awg_output_filter()
         self.device_label.setText(
             f"{configuration.board} | HWH {configuration.firmware_timestamp}"
         )
@@ -1044,6 +1179,12 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(channel_combo):
             channel_combo.clear()
             for channel, path in zip(port.qick_channels, port.block_paths):
+                if (direction == "output" and self._allowed_output_channels is not None
+                        and channel not in self._allowed_output_channels):
+                    continue
+                if (direction == "output" and self._awg_output_mode
+                        and channel in square_pulse_output_channels(self._configuration)):
+                    continue
                 channel_combo.addItem(f"{channel}  |  {path}", channel)
             match = channel_combo.findData(preferred)
             if match >= 0:
@@ -1052,7 +1193,14 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self._selected_output = int(panel_index)
             self.output_sma.setText(port.label)
             self.output_board.setText(port.board_label)
-            rf_output = port.board_type == "RF_Out"
+            self.output_channel.setToolTip(
+                "SquarePulse outputs cannot be used as AWG outputs."
+                if self._awg_output_mode and not channel_combo.count()
+                and set(port.qick_channels) & square_pulse_output_channels(self._configuration)
+                else ""
+            )
+            self.output_nqz.setEnabled(self._allowed_output_channels is None)
+            rf_output = port.board_type == "RF_Out" and self._allowed_output_channels is None
             self.output_att1_db.setEnabled(rf_output)
             self.output_att2_db.setEnabled(rf_output)
             self.output_filter_type.setEnabled(rf_output)
@@ -1076,6 +1224,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self.input_filter_cutoff_ghz.setEnabled(rf_input)
             self.input_filter_bandwidth_ghz.setEnabled(rf_input)
         self.canvas.set_selected(direction, int(panel_index))
+        if direction == 'output':
+            self._refresh_current()
         self.apply_button.setEnabled(self._selection_is_valid())
         self._update_summary()
 
@@ -1088,6 +1238,10 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             output_valid = bool(
                 output.board_type in OUTPUT_BOARD_TYPES
                 and self.output_channel.currentData() is not None
+                and (self._allowed_output_channels is None
+                     or self.output_channel.currentData() in self._allowed_output_channels)
+                and not (self._awg_output_mode and self.output_channel.currentData()
+                         in square_pulse_output_channels(self._configuration))
             )
         input_valid = False
         if self._selected_input is not None:

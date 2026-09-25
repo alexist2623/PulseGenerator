@@ -343,6 +343,7 @@ def build_awg_waveform_recipe(
         "point_count": point_count,
         "fabric_mhz": fabric_mhz,
         "full_scale_mv": full_scale_mv,
+        "output_full_scales_mv": getattr(sequence, "output_full_scales_mv", None),
         "time_reference": "start of each pulse sequence repetition",
         "vertex_rule": (
             "Connect adjacent vertices in order; equal adjacent times encode "
@@ -411,7 +412,9 @@ def build_awg_vertex_record(
         },
         "physical_values_mv": {
             name: (
-                np.asarray(physical_values[name], dtype=float) * float(full_scale_mv)
+                np.asarray(physical_values[name], dtype=float) * (
+                    sequence.output_full_scales_mv[output_names.index(name)]
+                    if sequence.output_full_scales_mv else float(full_scale_mv))
             ).tolist()
             for name in output_names
         },
@@ -459,7 +462,8 @@ def build_awg_vertex_metadata(
         )
         physical_points.append(
             np.vstack([physical_values[name] for name in output_names])
-            * full_scale_mv
+            * (np.asarray(sequence.output_full_scales_mv)[:, None]
+               if sequence.output_full_scales_mv else full_scale_mv)
         )
         coordinates.append(sequence.sweep_coordinate(point_index))
 
@@ -490,6 +494,7 @@ def build_awg_vertex_metadata(
         "time_reference": "start of each pulse sequence repetition",
         "amplitude_unit": "mV",
         "full_scale_mv": full_scale_mv,
+        "output_full_scales_mv": getattr(sequence, "output_full_scales_mv", None),
         "vertex_rule": (
             "Connect adjacent vertices in order; equal adjacent times encode "
             "an instantaneous SET transition."
@@ -1264,6 +1269,7 @@ def _execute_qick_sequence_once(
         if not hasattr(soc, "stop_square_pulse"):
             raise RuntimeError("Update the board QSTL_QICK library: stop_square_pulse is required")
         soc.rfb_set_gen_dc(square.gen_ch)
+    completed = False
     try:
         if acquisition_source == "fir_ddr":
             acquire_kwargs["readback_progress"] = (
@@ -1276,10 +1282,12 @@ def _execute_qick_sequence_once(
         else:
             ddr_result = program.acquire_avg_buffer(soc, **acquire_kwargs)
             completion_message = "AVG-buffer hardware accumulation completed"
+        _check_cancel(cancel_check)
+        completed = True
     finally:
-        # The DDS continues even when the tProcessor is stopped. Always mute
-        # through AXI-Lite on completion, cancellation, and acquisition error.
-        if square is not None:
+        # Keep autonomous output only after a successful run when requested.
+        # Cancellation and acquisition errors still stop the selected output.
+        if square is not None and (not completed or square.mute_on_finish):
             soc.stop_square_pulse(square.gen_ch)
     _check_cancel(cancel_check)
     _emit_progress(

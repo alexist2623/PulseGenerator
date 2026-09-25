@@ -7,6 +7,14 @@ desktop and board/server. The new project is
 DAC order, DAC7 / RFDC `s13_axis`, normally QICK generator 7. Identify the loaded
 firmware instead of assuming a generator number on another design.
 
+After identification, SquarePulse generators are disabled in the ordinary AWG
+front-panel selector, omitted from Stability Diagram electrode choices, and
+skipped when adding AWG outputs. Manual AWG indices, export settings, and saved
+settings are checked against the same firmware identity. An existing mapping
+to a SquarePulse generator is flagged and must be corrected; it is never
+silently moved to another DAC. Before identification, offline settings retain
+the legacy channel map. Older firmware can still use generator 7 as an AWG.
+
 Use GUI branch `codex/square-pulse-dds-gui` together with the firmware/library
 on `QSTL_QICK` branch `codex/1msps-square-pulse-dds`. The matching BIT and HWH
 are in that firmware project directory and are extracted from the same XSA.
@@ -14,7 +22,8 @@ are in that firmware project directory and are extracted from the same XSA.
 ## Measurement setup
 
 1. Identify QICK and open **AWG Tuning > SquarePulse**.
-2. Enable SquarePulse and select its detected generator.
+2. Enable SquarePulse and select its physical DAC with the same front-panel
+   picker used by AWG Tuning. Only dedicated SquarePulse IP ports are selectable.
 3. Enter frequency in MHz, peak amplitude in mV, and phase offset in degrees.
    Voltage conversion uses the existing Experiment output-full-scale setting.
    Amplitude is symmetric +/-peak, with a nominal 50% duty cycle.
@@ -23,15 +32,37 @@ are in that firmware project directory and are extracted from the same XSA.
    AWG/RF sweeps. SquarePulse axes follow existing axes in frequency, amplitude,
    phase order; the last enabled axis varies fastest. Plot-axis selection does
    not change hardware loop nesting.
-5. Configure the normal AWG sequence and readout, then run the Experiment.
+5. Choose **Mute SquarePulse when experiment finishes** (checked by default).
+   Uncheck it to leave the final frequency, amplitude and phase running after
+   successful completion. The choice is saved in JSON and generated Python.
+6. Configure the normal AWG sequence and readout, then run the Experiment.
 
 The tProcessor loads exact frequency/phase/amplitude words from DMEM and advances
 them in nested hardware loops. Increasing point count increases the data table,
 not a list of unrolled pulse instructions or a host-side measurement loop.
 The DDS continues during the AWG/readout sequence and between repetitions;
-updates preserve its accumulated phase. It is muted at the end and also through
-the board's AXI-Lite stop method on cancellation or an acquisition exception.
-This does not replace the older standalone **QICK Square Wave** tab.
+updates preserve its accumulated phase. Both the tProcessor epilogue and the
+Python completion handler honor the mute checkbox. Cancellation and acquisition
+exceptions still mute through the board's AXI-Lite stop method. Old settings
+without `mute_on_finish` keep the previous behavior (mute on completion).
+
+## Standalone output
+
+**QICK Square Wave** now uses the dedicated SquarePulse IP. Identify QICK, click
+the physical front-panel preview or Select Output button, and choose the DAC.
+Ordinary AWG/RF generators are unavailable; Start and Stop are disabled when
+the loaded firmware has no compatible output. The worker checks IP identity
+again against the connected firmware before writing hardware.
+
+Enter frequency in Hz, peak amplitude in mV, phase offset in degrees and this
+tab's maximum output voltage. Duty is fixed at 50%; offset and the old AWG DAC
+offset-compensation controls do not apply to this IP. Start sends one command
+and the tProcessor reaches END; the DDS continues independently. The connection
+worker then finishes so another experiment can run. Start again updates the
+parameters without clearing accumulated phase. Stop explicitly mutes the
+selected IP to zero with `soc.stop_square_pulse()`, including output left running
+by an AWG experiment with mute disabled. Closing an idle GUI is not a mute
+command. An ordinary tProcessor END or stop alone does not stop this IP.
 
 Frequency is quantized to a 32-bit increment at the actual scalar sample rate.
 At 4.8 GSPS the step is approximately 1.1176 Hz. Phase is a 32-bit offset, not a
@@ -41,14 +72,16 @@ the hardware executes the corresponding quantized words. A frequency of zero
 holds the present phase-dependent DC sign. GUI sweep updates never clear phase.
 
 The SquarePulse command is a short prelude before the first AWG timestamp in
-each repetition. Its four-clock IP pipeline plus command transport is allowed
-to settle before the AWG sequence begins. It does not reserve a physical AWG
+each repetition. The firmware-reported IP pipeline plus command transport is
+allowed to settle before the AWG sequence begins: four clocks on the original
+firmware, fifteen clocks on RC-capable firmware, including RC bypass. It does not reserve a physical AWG
 output in the voltage matrix; assigning that same generator as an AWG or RF
 output is rejected during compilation.
 
 The program adds one initial 128-cycle command lookahead for each enabled new
 feature (SquarePulse and external markers). The per-repetition SquarePulse
-prelude advances the timeline by at least eight fabric cycles. Marker endpoints
+prelude advances the timeline by at least the reported IP latency plus four
+fabric clocks. Marker endpoints
 advance the timeline without adding a blocking wait to every loop; the final
 epilogue waits before reporting completion. These are scheduling allowances,
 separate from FIR capture-delay correction.
@@ -63,7 +96,7 @@ Start refers to the first AWG sequence timestamp, including any existing FIR
 warm-up shift. It is a simultaneous digital event, not a pulse that must finish
 before waveform generation. End follows readout, compensation and recovery.
 The final acquisition counter is published only after the requested final
-marker and SquarePulse mute have completed. A full-experiment marker applies
+marker and any enabled SquarePulse mute have completed. A full-experiment marker applies
 to one compiled hardware acquisition; separately compiled software-sweep
 programs each have their own experiment boundary.
 
@@ -90,3 +123,8 @@ library does not support them.
 Digital RTL and Python/GUI tests are documented with the firmware project's
 validation results. Physical DAC voltage, analog edge shape, and board-level
 marker alignment require an oscilloscope measurement on the loaded hardware.
+
+RC-capable firmware adds a separate RC checkbox and tau setting. The packed
+amplitude and corresponding linear compensation increment update together
+during hardware sweeps. See [DC and RC compensation](RC_PRECOMPENSATION.md)
+for the continuous-history behavior, supported tau range and GUI migration.

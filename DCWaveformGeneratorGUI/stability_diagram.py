@@ -9,6 +9,10 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
+try:
+    from .qick_compensation_controls import CompensationGroup, CompensationSelector
+except ImportError:
+    from qick_compensation_controls import CompensationGroup, CompensationSelector
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import json
@@ -65,6 +69,7 @@ try:
         store_qick_result,
     )
     from .sparameter_gui import RfPathCorrectionWidget
+    from .qick_front_panel import square_pulse_output_channels, validate_awg_output_channels
 except ImportError:
     from dc_waveform_core import (
         BIAS_T_COMPENSATION_MODES,
@@ -100,6 +105,7 @@ except ImportError:
         store_qick_result,
     )
     from sparameter_gui import RfPathCorrectionWidget
+    from qick_front_panel import square_pulse_output_channels, validate_awg_output_channels
 
 
 DEFAULT_STABILITY_START_MV = -100.0
@@ -449,7 +455,7 @@ class StabilityDiagramConfig:
                 )
         if (
             self.bias_t_compensation_enabled
-            and self.bias_t_compensation_type == "dc"
+            and self.bias_t_compensation_type in ("dc", "dc_rc")
             and self.bias_t_compensation_mode == "fixed_voltage"
             and self.bias_t_compensation_voltage_mv > full_scale_mv
         ):
@@ -1118,7 +1124,12 @@ def normalize_stability_settings(
         if not isinstance(raw_axis, Mapping):
             raise TypeError(f"stability {label} axis must be a JSON object")
         output_name = str(raw_axis.get("output_name", defaults[key]["output_name"]))
-        if output_name not in outputs:
+        gen_ch = raw_axis.get("gen_ch")
+        if gen_ch is not None:
+            gen_ch = _integer(gen_ch, f"stability {label} generator", 0)
+            if gen_ch > 255 or not output_name:
+                raise ValueError(f"invalid stability {label} electrode")
+        if output_name not in outputs and gen_ch is None:
             raise ValueError(
                 f"stability {label} output {output_name!r} is not present"
             )
@@ -1138,6 +1149,8 @@ def normalize_stability_settings(
                 2,
             ),
         }
+        if gen_ch is not None:
+            normalized[key]["gen_ch"] = gen_ch
     normalized["repetitions_per_point"] = _integer(
         settings.get(
             "repetitions_per_point",
@@ -1318,6 +1331,8 @@ def normalize_stability_settings(
         if value <= 0.0:
             raise ValueError(f"{label} must be positive")
         normalized_bias_t[key] = value
+    if bias_t_enabled and bias_t_type in ("filter", "dc_rc") and not 10 <= normalized_bias_t["filter_tau_us"] <= 1_000_000:
+        raise ValueError("RC tau must be between 10 us and 1000 ms")
     normalized["bias_t_compensation"] = normalized_bias_t
     raw_rf_path = settings.get("rf_path", defaults["rf_path"])
     if not isinstance(raw_rf_path, Mapping):
@@ -1457,6 +1472,8 @@ def build_stability_hold_sequence(
     fabric_mhz: float,
     full_scale_mv: float,
     cross_capacitance=None,
+    output_full_scales_mv=None,
+    dac_current_settings=None,
     sample_period_us: float = 1.0,
 ):
     """Build the dedicated SET-and-hold sequence for one Cartesian scan.
@@ -1510,6 +1527,8 @@ def build_stability_hold_sequence(
         output_names=names,
         fabric_mhz=fabric_mhz,
         full_scale_mv=full_scale_mv,
+        output_full_scales_mv=output_full_scales_mv,
+        dac_current_settings=dac_current_settings,
         sweeps=sweeps,
         cross_capacitance=cross_capacitance,
         bias_t_compensation_enabled=config.bias_t_compensation_enabled,
@@ -1517,7 +1536,7 @@ def build_stability_hold_sequence(
         bias_t_compensation_voltage_mv=(
             config.bias_t_compensation_voltage_mv
             if config.bias_t_compensation_enabled
-            and config.bias_t_compensation_type == "dc"
+            and config.bias_t_compensation_type in ("dc", "dc_rc")
             and config.bias_t_compensation_mode == "fixed_voltage"
             else None
         ),
@@ -1922,6 +1941,8 @@ class StabilityDiagramWorker(QtCore.QObject):
                 output_names=template_sequence.output_names,
                 fabric_mhz=stability_fabric_mhz,
                 full_scale_mv=full_scale_mv,
+                output_full_scales_mv=getattr(sequence, 'output_full_scales_mv', None),
+                dac_current_settings=getattr(sequence, 'dac_current_settings', None),
                 cross_capacitance=template_sequence.cross_capacitance,
                 sample_period_us=sample_period_us,
             )
@@ -2213,6 +2234,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
         preferred_output_index: int,
     ) -> None:
         previous_output = self.output.currentData()
+        previous_generator = self.current_gen_ch()
         with QtCore.QSignalBlocker(self.output):
             self.output.clear()
             for output_name, gen_ch in outputs:
@@ -2223,6 +2245,11 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
                     QtCore.Qt.UserRole + 1,
                 )
             output_index = self.output.findData(previous_output)
+            # Keep the selected physical DAC when AWG Tuning is remapped.
+            if previous_generator >= 0:
+                output_index = self.output.findData(
+                    previous_generator, QtCore.Qt.UserRole + 1,
+                )
             if output_index < 0 and self.output.count():
                 output_index = min(preferred_output_index, self.output.count() - 1)
             self.output.setCurrentIndex(output_index)
@@ -2246,6 +2273,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
     def apply_front_panel_settings(self, values: Mapping[str, Any]) -> None:
         generator = int(values["output_ch"])
+        validate_awg_output_channels(self._front_panel_configuration, (generator,))
         match = -1
         for index in range(self.output.count()):
             if int(self.output.itemData(index, QtCore.Qt.UserRole + 1)) == generator:
@@ -2253,7 +2281,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
                 break
         if match < 0:
             raise ValueError(
-                f"front-panel generator {generator} is not assigned to an AWG electrode"
+                f"generator {generator} is not an available AWG Tuning output"
             )
         self.output.setCurrentIndex(match)
         panel_port = values.get("output_panel_port")
@@ -2283,6 +2311,7 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
     def settings_dict(self) -> dict:
         return {
             "output_name": str(self.output.currentData() or ""),
+            "gen_ch": self.current_gen_ch(),
             "start_mv": self.start_mv.value(),
             "stop_mv": self.stop_mv.value(),
             "points": self.points.value(),
@@ -2290,6 +2319,15 @@ class _StabilityAxisEditor(QtWidgets.QGroupBox):
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         output_index = self.output.findData(str(settings["output_name"]))
+        if settings.get("gen_ch") is not None:
+            generator = _integer(settings["gen_ch"], "stability generator", 0)
+            validate_awg_output_channels(self._front_panel_configuration, (generator,))
+            output_index = self.output.findData(generator, QtCore.Qt.UserRole + 1)
+            if output_index < 0 and self._front_panel_configuration is None:
+                name = f"gen_{generator}"
+                self.output.addItem(f"{name} (gen {generator})", name)
+                output_index = self.output.count() - 1
+                self.output.setItemData(output_index, generator, QtCore.Qt.UserRole + 1)
         if output_index < 0:
             raise ValueError("saved stability electrode is not present")
         self.output.setCurrentIndex(output_index)
@@ -2871,6 +2909,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
+        self._front_panel_configuration = None
+        self._awg_targets = ((), ())
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
 
@@ -3147,7 +3187,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         controls.addWidget(self.modulation_power_calibration_group)
 
-        self.bias_t_group = QtWidgets.QGroupBox(
+        self.bias_t_group = CompensationGroup(
             "Bias-T compensation",
             controls_content,
         )
@@ -3158,9 +3198,9 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             "sweep shot"
         )
         bias_t_form = QtWidgets.QFormLayout(self.bias_t_group)
-        self.bias_t_type = QtWidgets.QComboBox(self.bias_t_group)
+        self.bias_t_type = CompensationSelector(self.bias_t_group)
         self.bias_t_type.addItem("DC compensation", "dc")
-        self.bias_t_type.addItem("Filter compensation", "filter")
+        self.bias_t_type.addItem("RC compensation", "filter")
         self.bias_t_mode = QtWidgets.QComboBox(self.bias_t_group)
         self.bias_t_mode.addItem("Fixed voltage (adjust time)", "fixed_voltage")
         self.bias_t_mode.addItem("Fixed time (adjust voltage)", "fixed_time")
@@ -3177,15 +3217,15 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(DEFAULT_BIAS_T_COMPENSATION_DURATION_US)
         self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox(self.bias_t_group)
-        self.bias_t_filter_tau_us.setRange(1.0e-6, 1.0e12)
+        self.bias_t_filter_tau_us.setRange(10.0, 1_000_000.0)
         self.bias_t_filter_tau_us.setDecimals(6)
         self.bias_t_filter_tau_us.setSuffix(" us")
         self.bias_t_filter_tau_us.setValue(DEFAULT_BIAS_T_FILTER_TAU_US)
-        bias_t_form.addRow("Compensation type:", self.bias_t_type)
+        bias_t_form.addRow(self.bias_t_type)
         bias_t_form.addRow("DC control mode:", self.bias_t_mode)
         bias_t_form.addRow("DC voltage:", self.bias_t_compensation_mv)
         bias_t_form.addRow("DC time:", self.bias_t_duration_us)
-        bias_t_form.addRow("Filter time constant (tau):", self.bias_t_filter_tau_us)
+        bias_t_form.addRow("RC time constant (tau):", self.bias_t_filter_tau_us)
         controls.addWidget(self.bias_t_group)
 
         self.dc_calibration_group = QtWidgets.QGroupBox(
@@ -3680,7 +3720,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         editable = not self._running and self.bias_t_group.isChecked()
         filter_mode = self.bias_t_type.currentData() == "filter"
         fixed_time = self.bias_t_mode.currentData() == "fixed_time"
-        self.bias_t_type.setEnabled(editable)
+        self.bias_t_type.setEnabled(not self._running)
         self.bias_t_mode.setEnabled(editable and not filter_mode)
         self.bias_t_compensation_mv.setEnabled(
             editable and not filter_mode and not fixed_time
@@ -3688,7 +3728,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         self.bias_t_duration_us.setEnabled(
             editable and not filter_mode and fixed_time
         )
-        self.bias_t_filter_tau_us.setEnabled(editable and filter_mode)
+        self.bias_t_filter_tau_us.setEnabled(editable and self.bias_t_type.currentData() in ("filter", "dc_rc"))
 
     def _emit_dc_measure_changed(self, *_args) -> None:
         self._update_dc_measure_controls()
@@ -3797,7 +3837,21 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     ) -> None:
         # ``segment_names`` remains accepted for compatibility with older GUI
         # callers. Stability scans always use their own internal SET segment.
-        outputs = tuple(zip(output_names, awg_channels))
+        self._awg_targets = (tuple(output_names), tuple(awg_channels))
+        excluded = square_pulse_output_channels(self._front_panel_configuration)
+        available = set(getattr(self._front_panel_configuration, "awg_tuning_channels", ()))
+        for port in getattr(self._front_panel_configuration, "outputs", ()):
+            available.update(channel for channel, path in zip(port.qick_channels, port.block_paths)
+                             if "axis_awg_tuning" in path.lower())
+        outputs = [(name, channel) for name, channel in zip(*self._awg_targets)
+                   if channel not in excluded and (not available or channel in available)]
+        if self._front_panel_configuration is None:
+            # Preserve independently selected DACs when loading a saved setup offline.
+            available.update(axis.current_gen_ch() for axis in (self.x_axis, self.y_axis)
+                             if axis.current_gen_ch() >= 0)
+        assigned = set(channel for _, channel in outputs)
+        outputs.extend((f"gen_{channel}", channel)
+                       for channel in sorted(available - assigned - excluded))
         self.x_axis.refresh_targets(outputs, preferred_output_index=0)
         self.y_axis.refresh_targets(outputs, preferred_output_index=1)
         if (
@@ -3813,8 +3867,26 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
                     break
         self._targets_available = len(outputs) >= 2
         if not self._targets_available:
-            self.status.setText("Add at least two AWG outputs to run a stability scan")
+            self.status.setText("Identify QICK to select two AWG DACs for a stability scan")
         self._set_idle_button_state()
+
+    def run_output_mapping(self):
+        """Retain the virtual-gate matrix and add only independently selected DACs."""
+        allowed = {self.x_axis.output.itemData(index, QtCore.Qt.UserRole + 1)
+                   for index in range(self.x_axis.output.count())}
+        outputs = {name: channel for name, channel in zip(*self._awg_targets)
+                   if channel in allowed}
+        for axis in (self.x_axis, self.y_axis):
+            name, channel = axis.output.currentData(), axis.current_gen_ch()
+            if not name or channel < 0:
+                raise ValueError("select both stability electrodes")
+            outputs[str(name)] = channel
+        if self.x_axis.current_gen_ch() == self.y_axis.current_gen_ch():
+            raise ValueError("X and Y stability axes must use different DACs")
+        validate_awg_output_channels(self._front_panel_configuration, outputs.values())
+        if len(set(outputs.values())) != len(outputs):
+            raise ValueError("stability electrodes contain duplicate DAC assignments")
+        return tuple(outputs), tuple(outputs.values())
 
     def _browse_database(self) -> None:
         path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
@@ -3937,9 +4009,11 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             )
 
     def set_front_panel_configuration(self, configuration) -> None:
+        self._front_panel_configuration = configuration
         self.path_diagram.set_front_panel_configuration(configuration)
         self.x_axis.set_front_panel_configuration(configuration)
         self.y_axis.set_front_panel_configuration(configuration)
+        self.refresh_targets(*self._awg_targets)
         self._fir_sample_rate_hz = getattr(
             configuration,
             "fir_sample_rate_hz",
@@ -4174,6 +4248,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
     def load_settings(self, settings: Mapping[str, Any]) -> None:
         self.x_axis.load_settings(settings["x_axis"])
         self.y_axis.load_settings(settings["y_axis"])
+        self.refresh_targets(*self._awg_targets)
         self.repetitions.setValue(int(settings["repetitions_per_point"]))
         self.trace_samples.setValue(
             int(
