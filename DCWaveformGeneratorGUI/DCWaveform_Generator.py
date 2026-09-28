@@ -2417,9 +2417,9 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             port = self._front_panel_configuration.port("output", port_index)
             channel_position = port.qick_channels.index(channel)
             block_path = port.block_paths[channel_position].lower()
-            if "axis_awg_tuning_v1" not in block_path:
+            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2")):
                 raise ValueError(
-                    f"generator {channel} is not an axis_awg_tuning_v1 channel"
+                    f"generator {channel} is not an AWG tuning channel"
                 )
         self.awg_channel_changed.emit(
             self._selected_index,
@@ -16226,7 +16226,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             QtWidgets.QMessageBox.warning(
                 self,
                 "QICK export unavailable",
-                "axis_awg_tuning_v1 supports at most eight outputs.",
+                "AWG tuning supports at most eight outputs.",
             )
             return None
         try:

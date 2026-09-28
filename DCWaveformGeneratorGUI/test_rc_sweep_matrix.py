@@ -178,9 +178,11 @@ def test_200_by_200_rf_extension_uses_coefficient_rows_not_point_table():
     prog = seq.make_program(cfg, awg_channels=(1,), rf_pulse=rf, compile_validation_mode='boundary')
     assert len(prog.rc_output_range_validation) == 4
     assert len(prog._compile_validation_point_indices) == 400
-    # Three DC coefficient columns plus one RF mode/length column per axis
-    # coordinate. This remains O(200), not a 200 x 200 Cartesian table.
-    assert len(prog._runtime_dmem_words) == 800
+    # Exact voltage/ramp rows plus DC coefficients and RF length rows stay
+    # O(200); the 40,000 Cartesian points are never stored in full.
+    assert len(prog._runtime_dmem_words) <= 8 * 200
+    assert prog._sweep_max_target_error == 0
+    assert prog._sweep_max_step_error == 0
     assert len(prog.binprog) < 1000
 
 

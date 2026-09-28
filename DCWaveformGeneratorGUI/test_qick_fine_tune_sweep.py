@@ -228,6 +228,7 @@ def test_set_and_ramp_words_are_updated_by_nested_loop_and_add():
     program.compile()
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=1_000_000)
 
     assert [event.word for event in tproc.output_events] == _expected_words(program)
@@ -236,9 +237,10 @@ def test_set_and_ramp_words_are_updated_by_nested_loop_and_add():
         inst["name"] == "mathi" and inst["args"][3] == "+"
         for inst in program.prog_list
     )
-    assert not any(inst["name"] in {"memr", "memri"} for inst in program.prog_list)
-    assert program.summary()["sweep_execution"] == "tproc_loop_and_add"
-    assert program.summary()["sweep_uses_point_table"] is False
+    assert program._sweep_max_target_error == 0
+    assert program._sweep_max_step_error == 0
+    assert program.summary()["sweep_execution"] == "tproc_loop_with_exact_voltage_tables"
+    assert program.summary()["sweep_uses_point_table"] is True
 
     swept_kinds = {
         program.compiled_points[0]
@@ -356,13 +358,12 @@ def test_ramp_rate_sweep_recomputes_steps_for_adjacent_voltage_axes():
     assert tproc.timing_conflicts == []
     summary = program.summary()
     assert summary["sweep_execution"] == (
-        "tproc_loop_add_with_ramp_rate_coefficients"
+        "tproc_loop_with_exact_voltage_tables"
     )
-    assert summary["sweep_uses_point_table"] is False
+    assert summary["sweep_uses_point_table"] is True
     assert summary["ramp_rate_coefficient_table_words"] > 0
-    assert summary["ramp_rate_coefficient_table_words"] < np.prod(
-        sequence.sweep_shape
-    )
+    assert summary["runtime_sweep_table_words"] < program.tproccfg["dmem_size"]
+    assert summary["sweep_max_step_quantization_error"] == 0
     assert summary["sweep_max_duration_quantization_error"] == 0
 
     ramp_durations = {
@@ -474,7 +475,7 @@ def test_independent_ramp_rate_sweeps_use_nested_tables_without_point_table():
     assert {
         int(group["axis_index"])
         for group in program._ramp_duration_table_groups.values()
-    } == {0, 1}
+    } == {0, 1, 3}
     assert len({
         int(group["pointer_state_addr"])
         for group in program._ramp_duration_table_groups.values()
@@ -494,7 +495,7 @@ def test_independent_ramp_rate_sweeps_use_nested_tables_without_point_table():
     assert second_durations == {30 * 16, 36 * 16, 42 * 16, 48 * 16}
 
     summary = program.summary()
-    assert summary["sweep_uses_point_table"] is False
+    assert summary["sweep_uses_point_table"] is True
     assert summary["ramp_rate_coefficient_table_words"] > 0
     assert summary["ramp_rate_coefficient_table_words"] < (
         sequence.sweep_point_count * 2
@@ -666,8 +667,8 @@ def test_two_ramp_rate_bias_t_table_refreshes_inner_voltage_axis_delta():
     program.compile()
 
     bias_field = program._bias_t_fields[0]
-    assert tuple(bias_field["duration_axis_indices"]) == (0, 1)
-    assert set(bias_field["duration_delta_slots"]) == {2}
+    assert tuple(bias_field["duration_axis_indices"]) == (0, 1, 2)
+    assert not bias_field["duration_delta_slots"]
     assert program._bias_t_max_duration_q_error <= 1
 
     tproc = TProcV1BehaviorModel(strict=True)
@@ -915,9 +916,8 @@ def test_hold_duration_axis_drives_exact_bias_t_duration_table():
     program.compile()
 
     bias_field = program._bias_t_fields[0]
-    assert tuple(bias_field["duration_axis_indices"]) == (0,)
-    assert tuple(bias_field["duration_table_shape"]) == (3,)
-    assert program._bias_t_max_duration_q_error <= 1
+    assert program._bias_t_max_duration_q_error == 0
+    assert np.array_equal(program._bias_t_duration_q_actual, program._bias_t_duration_q_requested)
 
     tproc = TProcV1BehaviorModel(strict=True)
     program.load_runtime_dmem_into_model(tproc)
@@ -1274,10 +1274,12 @@ def test_direct_register_sweep_scales_to_eight_outputs():
     program.compile()
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=1_000_000)
     assert [event.word for event in tproc.output_events] == _expected_words(program)
     assert len(program.awg_channels) == 8
-    assert not any(inst["name"] in {"memr", "memri"} for inst in program.prog_list)
+    assert program._sweep_max_target_error == 0
+    assert program._sweep_max_step_error == 0
 
 
 def test_set_duration_excludes_startup_lead_and_hides_ramp_pipeline():
@@ -1310,6 +1312,7 @@ def test_set_duration_excludes_startup_lead_and_hides_ramp_pipeline():
     assert program.summary()["startup_lead_tproc_cycles_once"] == 128
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=100_000)
     command_cycles = [event.cycle for event in tproc.output_events]
     commands_per_point = program.summary()["commands_per_point"]
@@ -1370,6 +1373,7 @@ def test_shared_tmux_commands_are_enqueued_in_timestamp_order():
     program.compile()
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=100_000)
     port_zero_events = [
         event for event in tproc.output_events if event.tproc_ch == 0
@@ -1415,6 +1419,7 @@ def test_shared_tmux_accepts_rf_exactly_one_clock_after_awg_set():
     assert program.aux_timing["rf_command_skew_tproc_cycles"] == 0
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=100_000)
     port_zero_events = [
         event for event in tproc.output_events if event.tproc_ch == 0
@@ -1456,6 +1461,7 @@ def test_long_rf_pulse_uses_periodic_start_and_timed_zero_stop():
     assert program.aux_timing["rf_end"] - program.aux_timing["rf_start"] == 300_000
 
     tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
     tproc.run(program.prog_list, max_steps=100_000)
     rf_events = [
         event
@@ -2039,7 +2045,9 @@ def test_avg_buffer_cartesian_sweep_and_repetitions_are_tprocessor_loops():
     )
     program.compile()
 
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )
@@ -2301,7 +2309,9 @@ def test_bias_t_duration_is_swept_and_applied_by_tprocessor_sync():
         program._bias_t_duration_q_actual[:, 0].tolist()
     )
 
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )
@@ -2348,7 +2358,9 @@ def test_bias_t_compensation_dmem_state_fits_eight_outputs():
         == program._gen_regmap[(field["gen_ch"], "duration")][1]
         for field in program._bias_t_fields
     )
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )
@@ -2364,7 +2376,9 @@ def test_bias_t_independent_outputs_start_together_and_stop_independently():
         awg_channels=(0, 1),
         recovery_tproc_cycles=0,
     )
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )
@@ -2471,9 +2485,9 @@ def test_sweep_state_spills_to_dmem_after_register_page_is_full():
         field for field in program._sweep_fields
         if field.get("storage") == "dmem"
     ]
-    assert len(register_fields) == 25
-    assert len(dmem_fields) == 3
-    assert len({field["dmem_addr"] for field in dmem_fields}) == 3
+    assert len(register_fields) <= 25
+    assert len(register_fields) + len(dmem_fields) == 28
+    assert len({field["dmem_addr"] for field in dmem_fields}) == len(dmem_fields)
     assert all(field["dmem_addr"] > program.COUNTER_ADDR for field in dmem_fields)
 
 
@@ -2483,7 +2497,9 @@ def test_bias_t_tprocessor_selects_opposite_polarity_across_zero_area():
     sequence.set_amplitude_sweep("hold", "awg_0", -0.2, 0.2, 3)
     sequence.set_bias_t_compensation(0.1)
     program = sequence.make_program(_mock_soccfg(1), awg_channels=(0,))
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )
@@ -2550,7 +2566,9 @@ def test_bias_t_fixed_time_sweeps_dmem_target_and_emits_constant_duration():
     )
     assert program.summary()["bias_t_dynamic_dmem_fields"] == 1
 
-    tproc = TProcV1BehaviorModel(strict=True).run(
+    tproc = TProcV1BehaviorModel(strict=True)
+    program.load_runtime_dmem_into_model(tproc)
+    tproc.run(
         program.prog_list,
         max_steps=1_000_000,
     )

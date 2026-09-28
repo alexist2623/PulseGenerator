@@ -1314,12 +1314,12 @@ class SParameterSweepProgram(RAveragerProgram):
         gen_cfg = self.soccfg["gens"][sweep.output_ch]
         ro_cfg = self.soccfg["readouts"][sweep.readout_ch]
         if (
-            gen_cfg.get("type") == "axis_awg_tuning_v1"
+            gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2")
             or gen_cfg.get("gen_type") == "awg_tuning"
         ):
             raise ValueError(
                 "RF S-parameter output requires a normal DDS signal generator, "
-                "not axis_awg_tuning_v1"
+                "not an AWG tuning generator"
             )
         if not gen_cfg.get("has_dds", True):
             raise ValueError("selected RF output channel does not have a DDS")

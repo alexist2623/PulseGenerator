@@ -100,8 +100,8 @@ def build_square_wave_program(soccfg, config, *, tproc_mhz=None):
     gen_cfg = soccfg["gens"][config.gen_ch]
     if gen_cfg.get("type") == "axis_square_pulse_v1":
         return build_square_dds_program(soccfg, config, tproc_mhz=tproc_mhz)
-    if gen_cfg.get("type") != "axis_awg_tuning_v1":
-        raise ValueError("Select an axis_awg_tuning_v1 DAC generator")
+    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2"):
+        raise ValueError("Select an AWG tuning DAC generator")
     clock = float(soccfg["tprocs"][0]["f_time"] if tproc_mhz is None else tproc_mhz)
     if not isfinite(clock) or clock <= 0:
         raise ValueError("tProcessor clock must be positive and finite")

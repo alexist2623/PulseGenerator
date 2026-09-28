@@ -855,7 +855,7 @@ def test_long_scan_uses_periodic_start_and_timed_zero_stop(scan_time_us):
 
 
 def test_program_rejects_awg_tuning_as_rf_sweep_output():
-    with pytest.raises(ValueError, match="not axis_awg_tuning_v1"):
+    with pytest.raises(ValueError, match="not an AWG tuning generator"):
         SParameterSweepProgram(
             _mock_soccfg(generator_type="axis_awg_tuning_v1"),
             _config(),
