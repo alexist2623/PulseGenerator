@@ -10076,6 +10076,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel.current_requested.connect(self._apply_dac_current)
         self._dac_current_state.changed.connect(self._on_dac_currents_changed)
         self._square_wave_panel.set_current_state(self._dac_current_state)
+        self._calibration_panel.set_current_state(self._dac_current_state)
         self._qick_front_panel.settings_applied.connect(
             self._apply_front_panel_settings
         )
@@ -10190,6 +10191,19 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             waveform_options.addWidget(checkbox)
         waveform_options.addStretch(1)
         waveform_layout.addLayout(waveform_options)
+        point_options = QtWidgets.QHBoxLayout()
+        point_options.addWidget(QtWidgets.QLabel("Sweep point (0-based):"))
+        self._waveform_point_index = QtWidgets.QSpinBox()
+        self._waveform_point_index.setRange(0, 0)
+        self._waveform_point_index.setToolTip(
+            "One common point for virtual, physical and RC curves. "
+            "During a sweep, edit the base waveform in AWG Outputs; this preview does not change it.")
+        self._waveform_point_index.valueChanged.connect(
+            lambda _value: self._refresh_physical_waveforms())
+        point_options.addWidget(self._waveform_point_index)
+        self._waveform_point_label = QtWidgets.QLabel("1 point")
+        point_options.addWidget(self._waveform_point_label, 1)
+        waveform_layout.addLayout(point_options)
         self._waveform_scale_label = QtWidgets.QLabel()
         self._waveform_scale_label.setWordWrap(True)
         waveform_layout.addWidget(self._waveform_scale_label)
@@ -10197,7 +10211,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Solid: virtual target | Dashed: physical target | Dash-dot: RC-corrected DAC estimate")
         self._waveform_preview_note.setWordWrap(True)
         self._waveform_preview_note.setToolTip(
-            "Ideal first sweep point, one repetition with zero initial RC state. "
+            "Selected sweep point, one repetition with zero initial RC state. "
             "Includes DC pulse area; hiding DC does not remove it from the RC calculation. "
             "DAC quantization, pipeline latency and readout waits are not shown. "
             "Use Show QICK Program > FIR / DC timing for compiled event times.")
@@ -10725,78 +10739,87 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         rc_times = np.asarray([], dtype=float)
         rc_mv = np.empty((len(self._pulse), 0))
         preview_note = ""
+        point_index = 0
         try:
-            if self._bias_t_compensation_enabled:
-                sequence = build_qick_sequence(
-                    self._pulse,
-                    output_names=self._qick_output_names(),
-                    fabric_mhz=self._qick_fabric_mhz,
-                    full_scale_mv=self._qick_full_scale_mv,
-                    **self._dac_scale_arguments(self._qick_awg_channels),
-                    sweep=(self._sweep_specs[0] if len(self._sweep_specs) == 1 else None),
-                    sweeps=(tuple(self._sweep_specs) if len(self._sweep_specs) > 1 else None),
-                    cross_capacitance=self._cross_capacitance,
-                    bias_t_compensation_enabled=True,
-                    bias_t_compensation_type=self._bias_t_compensation_type,
-                    bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
-                    bias_t_compensation_mode=self._bias_t_compensation_mode,
-                    bias_t_compensation_duration_us=(
-                        self._bias_t_compensation_duration_us
-                    ),
-                    bias_t_filter_tau_us=self._bias_t_filter_tau_us,
-                    validate_rc_range=False,
-                )
-                cycles, waveforms, _boundaries = (
-                    sequence.compensated_waveform_vertices(0)
-                )
-                time_ns = np.asarray(cycles, dtype=float) * 1000.0 / self._qick_fabric_mhz
-                physical_mv = np.vstack([
-                    np.asarray(waveforms[name], dtype=float)
-                    * sequence.output_full_scales_mv[sequence.output_names.index(name)]
-                    for name in self._qick_output_names()
-                ])
-                # RC sees the complete physical waveform, including the DC
-                # epilogue, regardless of either display checkbox.
-                if sequence.rc_compensation is not None:
-                    from qick_waveform_preview import rc_precompensated_vertices
-                    from qick_rc_validation import validate_sequence_rc_range
-                    rc_input_times, rc_input_mv = time_ns, physical_mv
-                    if np.any(physical_mv[:, -1]):
-                        rc_input_times = np.append(time_ns, time_ns[-1])
-                        rc_input_mv = np.column_stack((physical_mv, np.zeros(len(self._pulse))))
-                    if self._show_rc_compensation.isChecked():
-                        rc_times, rc_mv = rc_precompensated_vertices(
-                            rc_input_times, rc_input_mv, self._bias_t_filter_tau_us)
-                    try:
-                        validate_sequence_rc_range(sequence, self._qick_fabric_mhz,
-                                                   self._qick_full_scale_mv)
-                    except ValueError as exc:
-                        preview_note = str(exc)
-                if not self._show_dc_compensation.isChecked():
-                    cycles, waveforms, _ = sequence.waveform_vertices(0, space="physical")
-                    time_ns = np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz
-                    physical_mv = np.vstack([
-                        np.asarray(waveforms[name]) * sequence.output_full_scales_mv[i]
-                        for i, name in enumerate(sequence.output_names)])
+            sequence = build_qick_sequence(
+                self._pulse,
+                output_names=self._qick_output_names(),
+                fabric_mhz=self._qick_fabric_mhz,
+                full_scale_mv=self._qick_full_scale_mv,
+                **self._dac_scale_arguments(self._qick_awg_channels),
+                sweeps=tuple(self._sweep_specs),
+                rf_pulse_specs=tuple(self._rf_pulse_specs),
+                cross_capacitance=self._cross_capacitance,
+                bias_t_compensation_enabled=self._bias_t_compensation_enabled,
+                bias_t_compensation_type=self._bias_t_compensation_type,
+                bias_t_compensation_voltage_mv=self._bias_t_compensation_voltage_mv,
+                bias_t_compensation_mode=self._bias_t_compensation_mode,
+                bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
+                bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+                validate_rc_range=False,
+            )
+            if hasattr(self, "_square_dds_panel"):
+                self._square_dds_panel.attach_to_sequence(
+                    sequence, self._dac_current_state.scale, None)
+            if hasattr(self, "_waveform_point_index"):
+                count = sequence.sweep_point_count
+                with QtCore.QSignalBlocker(self._waveform_point_index):
+                    self._waveform_point_index.setRange(0, min(count - 1, 2_147_483_647))
+                    self._waveform_point_index.setEnabled(count > 1)
+                point_index = self._waveform_point_index.value()
+                coordinates = tuple(int(i) for i in np.unravel_index(point_index, sequence.sweep_shape))
+                self._waveform_point_label.setText(
+                    f"{count:,} points | axis indices {coordinates} | virtual / physical / RC")
+            self._waveform_preview_sequence = sequence
+            if sequence.sweep_axes:
+                cycles, virtual, _ = sequence.waveform_vertices(point_index, space="virtual")
+                self._plot.set_virtual_preview(
+                    np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz,
+                    np.vstack([virtual[name] for name in sequence.output_names]) * self._qick_full_scale_mv)
             else:
-                time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
-                    self._pulse,
-                    self._cross_capacitance,
-                )
-        except (ValueError, RuntimeError) as exc:
-            # Invalid range must not escape a Qt edit/refresh callback.
+                self._plot.set_virtual_preview()
+            cycles, waveforms, _ = sequence.compensated_waveform_vertices(point_index)
+            time_ns = np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz
+            physical_mv = np.vstack([
+                np.asarray(waveforms[name]) * sequence.output_full_scales_mv[i]
+                for i, name in enumerate(sequence.output_names)])
+            # Integrate the complete selected physical waveform even when
+            # the DC epilogue is hidden by the display-only checkbox.
+            if sequence.rc_compensation is not None:
+                from qick_waveform_preview import rc_precompensated_vertices
+                from qick_rc_validation import validate_sequence_rc_range
+                rc_input_times, rc_input_mv = time_ns, physical_mv
+                if np.any(physical_mv[:, -1]):
+                    rc_input_times = np.append(time_ns, time_ns[-1])
+                    rc_input_mv = np.column_stack((physical_mv, np.zeros(len(self._pulse))))
+                if self._show_rc_compensation.isChecked():
+                    rc_times, rc_mv = rc_precompensated_vertices(
+                        rc_input_times, rc_input_mv, self._bias_t_filter_tau_us)
+                try:
+                    validate_sequence_rc_range(sequence, self._qick_fabric_mhz, self._qick_full_scale_mv)
+                except ValueError as exc:
+                    preview_note = str(exc)
+            if not self._show_dc_compensation.isChecked():
+                cycles, waveforms, _ = sequence.waveform_vertices(point_index, space="physical")
+                time_ns = np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz
+                physical_mv = np.vstack([
+                    np.asarray(waveforms[name]) * sequence.output_full_scales_mv[i]
+                    for i, name in enumerate(sequence.output_names)])
+        except (ValueError, RuntimeError, IndexError, KeyError) as exc:
             self.statusBar().showMessage(f'Output range check: {exc}')
-            preview_note = f"Compensation preview unavailable: {exc}"
+            preview_note = f"Sweep / compensation preview unavailable: {exc}"
             rc_times = np.asarray([], dtype=float)
             rc_mv = np.empty((len(self._pulse), 0))
+            self._plot.set_virtual_preview()
+            self._waveform_preview_sequence = None
             time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
                 self._pulse, self._cross_capacitance)
         self._plot.set_physical_waveforms(time_ns, physical_mv)
         self._plot.set_rc_waveforms(rc_times, rc_mv)
         if hasattr(self, "_waveform_preview_note"):
             self._waveform_preview_note.setText(preview_note or
-                "Solid: virtual target | Dashed: physical target | Dash-dot: RC-corrected DAC estimate "
-                "(first sweep point; ideal timing)")
+                f"Point {point_index}: solid virtual | dashed physical | dash-dot RC DAC estimate. "
+                "Ideal timing / requested voltages; hardware quantization is not included.")
             self._waveform_preview_note.setStyleSheet("color: #b03020;" if preview_note else "")
         if fit_view:
             self._plot.fit_view()
@@ -14387,6 +14410,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "voltage_view": self._plot.voltage_view,
                 "show_dc_compensation": self._show_dc_compensation.isChecked(),
                 "show_rc_compensation": self._show_rc_compensation.isChecked(),
+                "waveform_point_index": self._waveform_point_index.value(),
                 "selected_awg_output": self._selected_port_idx,
                 "selected_control_tab": self._control_tabs.currentIndex(),
                 "selected_awg_tuning_tab": self._awg_tuning_tabs.currentIndex(),
@@ -15531,6 +15555,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             },
         )
         dc_voltage_calibration = DcVoltageCalibrationConfig(
+            validate_output_range=False,
             database_path=calibration_database_path,
             **{
                 **calibration_defaults["dc_voltage"],
@@ -16091,6 +16116,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "time_unit": time_unit,
             "voltage_view": voltage_view,
             **compensation_visibility,
+            "waveform_point_index": self._json_int(
+                display.get("waveform_point_index", 0), "waveform point index", minimum=0),
             "selected_output": selected_output,
             "selected_tab": selected_tab,
             "selected_awg_tuning_tab": selected_awg_tuning_tab,
@@ -16291,6 +16318,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                                ("show_rc_compensation", self._show_rc_compensation)):
             with QtCore.QSignalBlocker(checkbox):
                 checkbox.setChecked(settings.get(name, True))
+        with QtCore.QSignalBlocker(self._waveform_point_index):
+            restored_point = min(settings.get("waveform_point_index", 0), 2_147_483_647)
+            self._waveform_point_index.setMaximum(max(self._waveform_point_index.maximum(), restored_point))
+            self._waveform_point_index.setValue(restored_point)
 
         self._plot.refresh()
         self._multi_ctrl.refresh_table()

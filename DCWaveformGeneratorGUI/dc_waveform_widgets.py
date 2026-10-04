@@ -1057,7 +1057,6 @@ class WaveformPlotWidget(pg.PlotWidget):
 
     flat_moved = QtCore.pyqtSignal(int, int, float)
     point_moved = QtCore.pyqtSignal(int, int, float)
-    MAX_VISIBLE_GRID_LINES = 80
 
     def __init__(self, pulse: PulseSequence, parent=None):
         super().__init__(parent=parent)
@@ -1087,6 +1086,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._time_unit = "ns"
         self._physical_time_ns = np.asarray([], dtype=float)
         self._physical_values_mv = np.empty((0, 0), dtype=float)
+        self._virtual_preview = None
         self._drag_flat: Optional[Tuple[int, int]] = None
         self._drag_point: Optional[Tuple[int, int]] = None
         self._grid_time_ns = 10.0
@@ -1176,7 +1176,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         snap_enabled: bool,
         visible: bool,
     ) -> None:
-        """Set fixed plot spacing and drag snapping for the editable waveform."""
+        """Set drag snapping and grid visibility independently of axis ticks."""
         if not np.isfinite(time_step_ns) or time_step_ns <= 0.0:
             raise ValueError("time grid spacing must be a positive finite value")
         if not np.isfinite(voltage_step_mv) or voltage_step_mv <= 0.0:
@@ -1188,40 +1188,14 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._refresh_grid_tick_spacing()
         self.showGrid(x=self._grid_visible, y=self._grid_visible, alpha=0.25)
 
-    @classmethod
-    def _display_grid_step(cls, base_step: float, visible_span: float) -> float:
-        """Return a grid-aligned display step capped to a practical line count."""
-        required_multiple = max(
-            1,
-            int(np.ceil(visible_span / (base_step * cls.MAX_VISIBLE_GRID_LINES))),
-        )
-        if required_multiple <= 1:
-            nice_multiple = 1
-        else:
-            magnitude = 10 ** int(np.floor(np.log10(required_multiple)))
-            normalized = required_multiple / magnitude
-            if normalized <= 2:
-                nice_multiple = 2 * magnitude
-            elif normalized <= 5:
-                nice_multiple = 5 * magnitude
-            else:
-                nice_multiple = 10 * magnitude
-        return float(base_step * nice_multiple)
-
     def _refresh_grid_tick_spacing(self, *_args) -> None:
-        view_range = self.getPlotItem().vb.viewRange()
-        x_span = max(0.0, float(view_range[0][1] - view_range[0][0]))
-        y_span = max(0.0, float(view_range[1][1] - view_range[1][0]))
-        time_display_step = self._display_grid_step(self._grid_time_ns, x_span)
-        voltage_display_step = self._display_grid_step(self._grid_voltage_mv, y_span)
-        self._display_time_grid_ns = time_display_step
-        self._display_voltage_grid_mv = voltage_display_step
-        self.getPlotItem().getAxis("bottom").setTickSpacing(
-            levels=[(time_display_step, 0.0)],
-        )
-        self.getPlotItem().getAxis("left").setTickSpacing(
-            levels=[(voltage_display_step, 0.0)],
-        )
+        # AxisItem chooses ticks from the visible range and display scale.
+        # Snapping remains anchored to the user grid, independently of zoom.
+        # In particular, time ticks must not treat internal ns as displayed us.
+        for name in ("bottom", "left"):
+            axis = self.getPlotItem().getAxis(name)
+            axis.enableAutoSIPrefix(False)
+            axis.setTickSpacing()
 
     @property
     def grid_settings(self) -> Tuple[float, float, bool, bool]:
@@ -1309,6 +1283,21 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._physical_values_mv = waveform_values.copy()
         for index, curve in enumerate(self._physical_line):
             curve.setData(time_values, waveform_values[index])
+
+    def set_virtual_preview(self, time_ns=None, waveforms_mv=None) -> None:
+        """Show a sweep point without changing the editable base waveform."""
+        self._drag_flat = self._drag_point = None
+        if time_ns is None:
+            self._virtual_preview = None
+        else:
+            times = np.asarray(time_ns, dtype=float)
+            values = np.asarray(waveforms_mv, dtype=float)
+            if times.ndim != 1 or values.shape != (len(self._pulses), times.size):
+                raise ValueError("virtual preview must match the output count and time grid")
+            self._virtual_preview = (times.copy(), values.copy())
+        for curve in self._line:
+            curve.setSymbol("o" if self._virtual_preview is None else None)
+        self.refresh()
 
     def set_voltage_view(self, mode: str) -> None:
         """Select virtual, physical, or simultaneous voltage rendering."""
@@ -1475,8 +1464,12 @@ class WaveformPlotWidget(pg.PlotWidget):
         x_values = []
         y_values = []
         if self._voltage_view in {"both", "virtual"}:
-            x_values.extend(pulse.t for pulse in self._pulses)
-            y_values.extend(pulse.v for pulse in self._pulses)
+            if self._virtual_preview is None:
+                x_values.extend(pulse.t for pulse in self._pulses)
+                y_values.extend(pulse.v for pulse in self._pulses)
+            else:
+                x_values.append(self._virtual_preview[0])
+                y_values.extend(self._virtual_preview[1])
         if (
             self._voltage_view in {"both", "physical"}
             and self._physical_time_ns.size
@@ -1508,9 +1501,14 @@ class WaveformPlotWidget(pg.PlotWidget):
         indices = range(len(self._pulses)) if index is None else (index,)
         for pulse_index in indices:
             pulse = self._pulses[pulse_index]
-            self._line[pulse_index].setData(pulse.t, pulse.v)
+            if self._virtual_preview is None:
+                self._line[pulse_index].setData(pulse.t, pulse.v)
+            else:
+                times, values = self._virtual_preview
+                self._line[pulse_index].setData(times, values[pulse_index])
 
     def add_pulse(self, pulse: PulseSequence) -> None:
+        self.set_virtual_preview()
         self._pulses.append(pulse)
         self._append_curve(pulse)
         self._selected_port_idx = len(self._pulses) - 1
@@ -1529,6 +1527,7 @@ class WaveformPlotWidget(pg.PlotWidget):
     def remove_pulse(self, index: int) -> None:
         if index < 0 or index >= len(self._pulses):
             raise IndexError("pulse index is out of range")
+        self.set_virtual_preview()
         curve = self._line.pop(index)
         self.removeItem(curve)
         physical_curve = self._physical_line.pop(index)
@@ -1580,7 +1579,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         return None
 
     def eventFilter(self, watched, event):
-        if self._voltage_view == "physical":
+        if self._voltage_view == "physical" or self._virtual_preview is not None:
             return super().eventFilter(watched, event)
         if watched is self.viewport():
             if event.type() == QtCore.QEvent.MouseButtonPress:
@@ -1606,7 +1605,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event) -> None:
-        if self._voltage_view == "physical":
+        if self._voltage_view == "physical" or self._virtual_preview is not None:
             super().mousePressEvent(event)
             return
         if event.button() == QtCore.Qt.LeftButton:

@@ -206,6 +206,65 @@ def test_dc_scalar_adc_fit_recovers_voltage_and_ignores_q():
     assert calibration.r_squared > 0.999999999
 
 
+def test_calibration_fits_executed_incremental_dac_voltages(tmp_path):
+    # The hardware sweep deliberately retains one rounded increment.
+    # A fit against the ideal grid would therefore report a wrong gain.
+    config = DcVoltageCalibrationConfig(
+        database_path=str(tmp_path / 'cal.db'), output_ch=0, readout_ch=0,
+        voltage_start_mv=5, voltage_stop_mv=15, voltage_points=200,
+        samples_per_point=2, repetitions_per_point=1)
+    program = build_dc_voltage_calibration_program(_dc_soccfg(), config)
+    actual = program.dc_calibration_voltages_mv
+    assert actual[-1] == pytest.approx(24.4140625)
+    np.testing.assert_allclose(np.diff(actual), .09765625)
+    adc = 50 + 4000 * actual / 1000
+    fit = DcVoltageCalibration.fit(actual, adc)
+    assert fit.response_adc_per_v == pytest.approx(4000)
+    np.testing.assert_allclose(fit.convert_adc(adc)*1000, actual, atol=1e-12)
+    wrong = DcVoltageCalibration.fit(config.voltages_mv, adc)
+    assert wrong.response_adc_per_v != pytest.approx(4000)
+
+
+@pytest.mark.parametrize('count', [5, 33, 200])
+@pytest.mark.parametrize('reverse', [False, True])
+def test_full_scale_calibration_keeps_constant_step_inside_dac_rails(count, reverse):
+    start, stop = ((800, -800) if reverse else (-800, 800))
+    config = DcVoltageCalibrationConfig(database_path='unused.db', output_ch=0,
+        voltage_start_mv=start, voltage_stop_mv=stop, voltage_points=count,
+        samples_per_point=2, repetitions_per_point=1)
+    program = build_dc_voltage_calibration_program(_dc_soccfg(), config)
+    actual = program.dc_calibration_voltages_mv
+    assert np.min(actual) >= -800
+    assert np.max(actual) <= 32764*800/32768
+    np.testing.assert_allclose(np.diff(actual), actual[1]-actual[0])
+    assert actual[-1] < actual[0] if reverse else actual[-1] > actual[0]
+
+
+def test_acquisition_persists_actual_calibration_reference(tmp_path, monkeypatch):
+    monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / 'staging'))
+    config = DcVoltageCalibrationConfig(
+        database_path=str(tmp_path / 'cal.db'), output_ch=0, readout_ch=0,
+        voltage_start_mv=5, voltage_stop_mv=15, voltage_points=200,
+        samples_per_point=2, repetitions_per_point=1)
+    soc = SimpleNamespace(rfb_set_gen_dc=lambda ch: None, rfb_set_ro_dc=lambda ch, gain: gain)
+    def acquire(_soc, program):
+        iq = np.zeros((200, 1, 2, 2))
+        iq[..., 0] = (50 + 4000*program.dc_calibration_voltages_mv/1000)[:, None, None]
+        return SimpleNamespace(iq=iq)
+    stored = run_dc_voltage_calibration(
+        connection_config=QickConnectionConfig(host='127.0.0.1'),
+        calibration_config=config, connector=lambda **kwargs: (soc, _dc_soccfg()),
+        acquisition_callback=acquire)
+    assert stored.result['voltages_mv'][-1] == pytest.approx(24.4140625)
+    assert stored.result['calibration']['response_adc_per_v'] == pytest.approx(4000)
+    import json
+    metadata = json.loads(stored.dataset.get_metadata('DC_Voltage_Calibration_Config'))
+    assert metadata['voltage_reference'] == 'compiled_set_codes'
+    assert metadata['requested_voltages_mv'][-1] == 15
+    assert metadata['fit_voltages_mv'][-1] == pytest.approx(24.4140625)
+    stored.dataset.conn.close()
+
+
 def test_dc_voltage_calibration_run_and_qcodes_round_trip(tmp_path, monkeypatch):
     monkeypatch.setenv(QCODES_STAGING_ENV, str(tmp_path / "staging"))
     database_path = tmp_path / "gain_pwr_calb.db"

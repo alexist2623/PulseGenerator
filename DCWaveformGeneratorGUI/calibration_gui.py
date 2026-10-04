@@ -736,6 +736,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._dac_current_state = None
         self._fir_sample_rate_hz = None
         self._fir_trigger_delay_us = 0.0
         self._fir_uses_fpga_trigger_delay = None
@@ -1294,6 +1295,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_full_scale_mv.setDecimals(6)
         self.dc_voltage_full_scale_mv.setValue(800.0)
         self.dc_voltage_full_scale_mv.setSuffix(" mV")
+        self.dc_voltage_output_ch.valueChanged.connect(self._refresh_dc_output_scale)
         self.dc_voltage_samples = QtWidgets.QSpinBox()
         self.dc_voltage_samples.setRange(
             1,
@@ -1599,7 +1601,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             sample_name=self.input_sample_name.text().strip(),
         )
 
-    def dc_voltage_config(self) -> DcVoltageCalibrationConfig:
+    def dc_voltage_config(self, *, validate_output_range: bool = True) -> DcVoltageCalibrationConfig:
         path = self._front_panel_values_for("dc_voltage")
         output_ch = int(path["output_ch"])
         readout_ch = int(path["readout_ch"])
@@ -1608,7 +1610,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.dc_voltage_readout_ch.setValue(readout_ch)
         self.dc_voltage_input_gain.setValue(input_gain_db)
         self._update_dc_voltage_path_note()
+        self._refresh_dc_output_scale()
         return DcVoltageCalibrationConfig(
+            validate_output_range=validate_output_range,
             database_path=self.database_path_value(),
             output_ch=output_ch,
             readout_ch=readout_ch,
@@ -1616,6 +1620,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             voltage_stop_mv=self.dc_voltage_stop_mv.value(),
             voltage_points=self.dc_voltage_points.value(),
             output_full_scale_mv=self.dc_voltage_full_scale_mv.value(),
+            dac_current_settings=(self._dac_current_state.snapshot((output_ch,))
+                                  if self._dac_current_state is not None and validate_output_range else None),
             samples_per_point=self.dc_voltage_samples.value(),
             repetitions_per_point=self.dc_voltage_repetitions.value(),
             input_dc_gain_db=input_gain_db,
@@ -1711,6 +1717,23 @@ class CalibrationPanel(QtWidgets.QWidget):
         else:
             raise ValueError(f"unknown calibration path mode {mode!r}")
         self._update_board_controls()
+
+    def set_current_state(self, state) -> None:
+        if self._dac_current_state is not None:
+            self._dac_current_state.changed.disconnect(self._refresh_dc_output_scale)
+        self._dac_current_state = state
+        state.changed.connect(self._refresh_dc_output_scale)
+        self.dc_voltage_full_scale_mv.setReadOnly(True)
+        self.dc_voltage_full_scale_mv.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.dc_voltage_full_scale_mv.setToolTip(
+            "Shared with the selected generator's DAC current in the front panel. "
+            "This is the configured output scale, not a separate measured voltage reference.")
+        self._refresh_dc_output_scale()
+
+    def _refresh_dc_output_scale(self, *_args) -> None:
+        if self._dac_current_state is not None:
+            self.dc_voltage_full_scale_mv.setValue(
+                self._dac_current_state.scale(self.dc_voltage_output_ch.value()))
 
     def _update_dc_voltage_path_note(self) -> None:
         if not hasattr(self, "dc_voltage_path_note"):
@@ -1874,7 +1897,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         output.pop("database_path")
         input_config = asdict(self.input_config())
         input_config.pop("database_path")
-        dc_voltage = asdict(self.dc_voltage_config())
+        dc_voltage = asdict(self.dc_voltage_config(validate_output_range=False))
         dc_voltage.pop("database_path")
         dc_application = self.dc_application_selection()
         return {
@@ -1913,6 +1936,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         dc_voltage = DcVoltageCalibrationConfig(
             database_path=database_path,
+            validate_output_range=False,
             **dc_voltage_values,
         )
         path_values = normalize_calibration_paths(

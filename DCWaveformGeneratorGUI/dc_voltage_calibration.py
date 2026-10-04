@@ -15,7 +15,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import InitVar, asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 from math import ceil, isfinite
@@ -110,8 +110,10 @@ class DcVoltageCalibrationConfig:
     experiment_name: str = "QICK DC input voltage calibration"
     sample_name: str = ""
     notes: str = ""
+    dac_current_settings: Optional[Mapping[str, Any]] = None
+    validate_output_range: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, validate_output_range: bool) -> None:
         if not str(self.database_path).strip():
             raise ValueError("calibration database path must not be empty")
         _integer(self.output_ch, "output_ch")
@@ -126,7 +128,7 @@ class DcVoltageCalibrationConfig:
             "output_full_scale_mv",
             positive=True,
         )
-        if max(abs(start), abs(stop)) > full_scale:
+        if validate_output_range and max(abs(start), abs(stop)) > full_scale:
             raise ValueError(
                 "DC calibration endpoints must fit inside the configured "
                 "+/- output full scale"
@@ -293,11 +295,15 @@ def build_dc_voltage_calibration_program(
     tproc_mhz: Optional[float] = None,
 ) -> Any:
     """Build the hardware amplitude sweep used for DC voltage calibration."""
+    # Saved GUI settings may retain endpoints outside a newly reduced DAC
+    # range. They remain editable, but may never be sent to the hardware.
+    if max(abs(config.voltage_start_mv), abs(config.voltage_stop_mv)) > config.output_full_scale_mv:
+        raise ValueError("DC calibration endpoints must fit inside the configured +/- output full scale")
     try:
-        from .qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence
+        from .qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence, normalized_to_dac
         from .fir_ddr_profile import resolve_fir_ddr_profile
     except ImportError:
-        from qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence
+        from qick_fine_tune_sweep import DdrFirReadoutConfig, FineTuneSequence, normalized_to_dac
         from fir_ddr_profile import resolve_fir_ddr_profile
 
     effective_tproc_mhz = (
@@ -337,14 +343,30 @@ def build_dc_voltage_calibration_program(
         )
 
     sequence = FineTuneSequence(("dc_cal_out",))
+    sequence.dac_current_settings = dict(config.dac_current_settings or {})
     sequence.add_set("dc_calibration", (0.0,), hold_fabric_cycles)
     sequence.add_set("return_zero", (0.0,), 1)
     amplitudes = config.normalized_amplitudes
+    start_code, stop_code = (normalized_to_dac(float(value)) for value in (amplitudes[0], amplitudes[-1]))
+    quantum = 1 << int(gen_cfg.get("dac_invalid_lsb", 2))
+    divisor = (int(amplitudes.size) - 1) * quantum
+    span = stop_code - start_code
+    direction = 1 if span >= 0 else -1
+    step = direction * ((abs(span) + divisor // 2) // divisor) * quantum
+    last_code = start_code + step * (int(amplitudes.size) - 1)
+    start, stop = float(amplitudes[0]), float(amplitudes[-1])
+    if not int(gen_cfg.get("minv", -32768)) <= last_code <= int(gen_cfg.get("maxv", 32764)):
+        # A full-scale endpoint can round one step past the positive rail.
+        # Keep a constant hardware increment, one quantum smaller, and use
+        # its actual voltages for both the fit and stored setpoints.
+        step = direction * (abs(span) // divisor) * quantum
+        start = start_code / 32768.0
+        stop = (start_code + step * (int(amplitudes.size) - 1)) / 32768.0
     sequence.add_amplitude_sweep(
         "dc_calibration",
         "dc_cal_out",
-        float(amplitudes[0]),
-        float(amplitudes[-1]),
+        start,
+        stop,
         int(amplitudes.size),
     )
     ddr = DdrFirReadoutConfig(
@@ -362,13 +384,22 @@ def build_dc_voltage_calibration_program(
         ),
         force_overwrite=bool(config.force_overwrite),
     )
-    return sequence.make_program(
+    program = sequence.make_program(
         soccfg,
         awg_channels=(int(config.output_ch),),
         tproc_mhz=effective_tproc_mhz,
         repetitions_per_sweep=int(config.repetitions_per_point),
         ddr_readout=ddr,
     )
+    # Fit against the SET words actually sent by the hardware loop. Its
+    # constant integer increment need not land on the requested linspace.
+    model = program._sweep_models[(0, 0, 0, "target")]
+    codes = np.asarray([
+        program._sweep_model_value(model, point)
+        for point in range(sequence.sweep_point_count)
+    ], dtype=np.int64)
+    program.dc_calibration_voltages_mv = codes * float(config.output_full_scale_mv) / 32768.0
+    return program
 
 
 def _runtime_storage_helpers():
@@ -403,6 +434,8 @@ def _store_dc_voltage_calibration(
     mean_adc: np.ndarray,
     std_adc: np.ndarray,
     calibration: DcVoltageCalibration,
+    *,
+    voltage_reference: str = "requested_grid",
 ) -> StoredDcVoltageCalibrationRun:
     try:
         from qcodes import (
@@ -467,6 +500,9 @@ def _store_dc_voltage_calibration(
             "readout_ch": int(config.readout_ch),
             "input_dc_gain_db": float(config.input_dc_gain_db),
             "configuration": asdict(config),
+            "voltage_reference": voltage_reference,
+            "requested_voltages_mv": config.voltages_mv.tolist(),
+            "fit_voltages_mv": voltages_mv.tolist(),
         }
         with measurement.run(
             write_in_background=False,
@@ -577,7 +613,10 @@ def run_dc_voltage_calibration(
     flattened = iq.reshape(iq.shape[0], -1, 2)
     mean_adc = flattened[..., 0].mean(axis=1)
     std_adc = flattened[..., 0].std(axis=1)
-    voltages_mv = adjusted_config.voltages_mv
+    voltage_reference = "compiled_set_codes" if hasattr(program, "dc_calibration_voltages_mv") else "requested_grid"
+    voltages_mv = np.asarray(getattr(program, "dc_calibration_voltages_mv", adjusted_config.voltages_mv), dtype=float)
+    if voltages_mv.shape != mean_adc.shape or not np.all(np.isfinite(voltages_mv)):
+        raise RuntimeError("DC calibration voltage reference does not match acquired points")
     calibration = DcVoltageCalibration.fit(
         voltages_mv,
         mean_adc,
@@ -608,6 +647,7 @@ def run_dc_voltage_calibration(
         mean_adc,
         std_adc,
         calibration,
+        voltage_reference=voltage_reference,
     )
     _emit_progress(
         progress_callback,
