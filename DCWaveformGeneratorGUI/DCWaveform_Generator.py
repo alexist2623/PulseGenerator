@@ -16967,11 +16967,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         super().closeEvent(event)
 
 def main():
+    import gc
+    from PyQt5 import sip
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
     win.resize(1500, 650)
     win.show()
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    # Restored editors and plot callbacks can form Python reference cycles.
+    # Destroy Qt children and collect those wrappers before QApplication dies.
+    win.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    app.processEvents()
+    del win
+    gc.collect()
+    # The application is owned by this entry point. Do not leave native Qt
+    # teardown to interpreter finalization after module globals disappear.
+    sip.delete(app)
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

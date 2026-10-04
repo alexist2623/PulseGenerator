@@ -42,7 +42,8 @@ def make_case(kind, dc_mode='fixed_voltage', descending=False):
                      sweep_gain_shape=(3, 2), power_calibration_run_id=77)
     seq.set_rc_compensation(10.)
     if dc_mode is not None:
-        seq.set_bias_t_compensation(.1, mode=dc_mode,
+        # Small areas need a lower voltage to last >= 3 tProcessor clocks.
+        seq.set_bias_t_compensation(.01, mode=dc_mode,
                                    fixed_duration_cycles=600 if dc_mode == 'fixed_time' else None)
     return cfg, seq, rf
 
@@ -175,14 +176,13 @@ def test_200_by_200_rf_extension_uses_coefficient_rows_not_point_table():
     seq.add_rf_duration_sweep('gate', 0, .4, 40.2, 200,
         segment_length_mode='extend_by_rf_duration', sequence_fabric_mhz=300.)
     seq.set_rc_compensation(300.)
+    seq.set_bias_t_compensation(.1/800, mode='fixed_voltage')
     prog = seq.make_program(cfg, awg_channels=(1,), rf_pulse=rf, compile_validation_mode='boundary')
     assert len(prog.rc_output_range_validation) == 4
     assert len(prog._compile_validation_point_indices) == 400
-    # Exact voltage/ramp rows plus DC coefficients and RF length rows stay
-    # O(200); the 40,000 Cartesian points are never stored in full.
-    assert len(prog._runtime_dmem_words) <= 8 * 200
-    assert prog._sweep_max_target_error == 0
-    assert prog._sweep_max_step_error == 0
+    # Three DC coefficient columns plus one RF mode/length column per axis
+    # coordinate. This remains O(200), not a 200 x 200 Cartesian table.
+    assert len(prog._runtime_dmem_words) == 800
     assert len(prog.binprog) < 1000
 
 

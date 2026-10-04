@@ -49,6 +49,21 @@ def _application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def _dispose_test_windows():
+    """Release restored editors before this test's QApplication can disappear."""
+    import gc
+    app = _application()
+    yield
+    app.processEvents()
+    for window in app.topLevelWidgets():
+        if isinstance(window, gui.MainWindow):
+            window.close()
+            window.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    gc.collect()
+
+
 def _send_wheel(widget, delta=120):
     local_position = QtCore.QPointF(widget.rect().center())
     global_position = QtCore.QPointF(

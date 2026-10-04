@@ -91,7 +91,7 @@ def test_gui_v2_port_selection_in_awg_and_stability(window):
 
 @pytest.mark.parametrize('count', [20, 200])
 @pytest.mark.parametrize('version', [1, 2])
-def test_exact_voltage_grid_dc_and_ramp_with_independent_dac_scales(count, version):
+def test_incremental_voltage_grid_dc_and_ramp_with_independent_dac_scales(count, version):
     import numpy as np
     from fractions import Fraction
     from test_qick_fine_tune_sweep import _independent_awg_soccfg
@@ -111,31 +111,42 @@ def test_exact_voltage_grid_dc_and_ramp_with_independent_dac_scales(count, versi
     seq.set_rc_compensation(300.)
     program = seq.make_program(cfg, awg_channels=(0, 1), compile_validation_mode='boundary')
     assert len(program._compile_validation_point_indices) == 4
-    assert len(program._requested_points_cache) <= 2 * count + 4
-    assert len(program._runtime_dmem_words) <= 6 * count
-    assert program._sweep_max_target_error == program._sweep_max_step_error == 0
-    assert program._bias_t_max_target_code_error == 0
+    assert len(program._requested_points_cache) == 4
+    assert not program._runtime_dmem_words
+    assert program.summary()['voltage_grid_policy'] == 'constant_quantized_increment'
     axes = (np.linspace(5., 15., count), np.linspace(15., 5., count))
     for output, full_scale in enumerate((800., 400.)):
+        def rounded(value, quantum=1):
+            units = Fraction(value) / quantum
+            return (1 if units >= 0 else -1) * int(abs(units) + Fraction(1, 2)) * quantum
+        endpoints = [int(round(v * 32768 / full_scale / 4)) * 4
+                     for v in (axes[output][0], axes[output][-1])]
+        delta = rounded(Fraction(endpoints[1] - endpoints[0], count-1), 4)
+        steps = [int(Fraction(-v * (1 << (18 if version == 2 else 16)), 30*16-1))
+                 for v in endpoints]
+        step_delta = rounded(Fraction(steps[1]-steps[0], count-1))
+        comp_base = rounded(Fraction(-endpoints[0]*315, 600), 4)
+        comp_end = rounded(Fraction(-(endpoints[0]+delta*(count-1))*315, 600), 4)
+        comp_delta = rounded(Fraction(comp_end-comp_base, count-1), 4)
         for coordinate, requested_mv in enumerate(axes[output]):
-            expected_code = int(round(requested_mv * 32768 / full_scale / 4)) * 4
-            expected_step = int(Fraction(-expected_code * (1 << (18 if version == 2 else 16)), 30*16-1))
-            # Gate area = level*300; return ramp area = level*30/2.
-            comp_units = Fraction(-expected_code * 315, 600 * 4)
-            expected_comp = (1 if comp_units >= 0 else -1) * int(abs(comp_units) + Fraction(1, 2)) * 4
+            expected_code = endpoints[0] + coordinate*delta
+            expected_step = steps[0] + coordinate*step_delta
+            expected_comp = comp_base + coordinate*comp_delta
             for other in (0, count//2, count-1):
                 point = coordinate * count + other if output == 0 else other * count + coordinate
                 assert program._sweep_model_value(program._sweep_models[(0, output, 0, 'target')], point) == expected_code
                 assert program._sweep_model_value(program._sweep_models[(1, output, 0, 'step')], point) == expected_step
                 assert program._sweep_model_value(program._bias_t_fields[output], point) == expected_comp
-            assert abs(expected_code * full_scale / 32768 - requested_mv) <= full_scale / 16384
+            # Constant DAC-code increments can drift; v2 changes ramp precision,
+            # not SET-code resolution. Bound and expose, rather than hide, drift.
+            assert abs(expected_code * full_scale / 32768 - requested_mv) <= (count+1)*full_scale/16384
 
 
-def test_200_by_200_voltage_loop_reads_each_exact_target_after_axis_rewind():
+def test_200_by_200_voltage_loop_adds_and_rewinds_constant_increments():
     """Execute every loop iteration in the tProcessor instruction model.
 
     This is a software check; the separate production RTL grid is 20 by 20.
-    Expected levels come directly from requested volts and each DAC scale.
+    Expected levels use a once-rounded increment and each DAC scale.
     """
     import numpy as np
     from test_qick_fine_tune_sweep import _independent_awg_soccfg
@@ -159,15 +170,16 @@ def test_200_by_200_voltage_loop_reads_each_exact_target_after_axis_rewind():
     model.run(program, max_steps=12000000)
     assert not model.timing_conflicts
     actual = ([], [])
-    for event in model.output_events:
-        word = int(event.word)
-        target = word & 0xffffffff
-        if target >= (1 << 31):
-            target -= 1 << 32
-        if ((word >> 144) & 3) == 1 and target > 0:
-            actual[(word >> 152) & 0xff].append(target)
-    x_codes = np.rint(np.linspace(5., 15., 200) * 32768 / 800 / 4).astype(int) * 4
-    y_codes = np.rint(np.linspace(15., 5., 200) * 32768 / 400 / 4).astype(int) * 4
+    for output in range(2):
+        words = [int(e.word) for e in model.output_events if (e.word >> 152) & 255 == output]
+        resets = [i for i,w in enumerate(words) if w & (1 << 149)]
+        assert len(resets)==80001
+        for start,stop in zip(resets,resets[1:]):
+            word = next(w for w in words[start+1:stop] if (w >> 144) & 3 == 1)
+            target = word & 0xffffffff
+            actual[output].append(target if target < (1 << 31) else target-(1 << 32))
+    x_codes = 204 + np.arange(200)*4
+    y_codes = 1228 - np.arange(200)*4
     assert actual[0] == np.repeat(x_codes, 200 * 2).tolist()
     assert actual[1] == np.tile(np.repeat(y_codes, 2), 200).tolist()
-    assert len(program._runtime_dmem_words) <= 4 * 200
+    assert not program._runtime_dmem_words

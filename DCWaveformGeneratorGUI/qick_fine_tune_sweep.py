@@ -70,6 +70,7 @@ COMMAND_REGISTER_NAMES = (
 )
 DEFAULT_BIAS_T_DURATION_FRAC_BITS = 8
 BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT = 32
+TPROC_V1_MIN_SET_INTERVAL = 3
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter", "dc_rc")
 DEFAULT_DDR_READBACK_TRIGGER_CHUNK = 100_000
@@ -3160,17 +3161,6 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         metadata,
     ):
         """Represent a linear per-output Bias-T state with sweep-axis adds."""
-        if any(isinstance(axis, AmplitudeSweep) and axis.count > 1 for axis in sweep_axes):
-            models = []
-            for output_index in range(self.sequence.n_outputs):
-                model = dict(key=("bias_t", output_index, register_name),
-                    register_name=register_name, output_index=output_index,
-                    gen_ch=self.awg_channels[output_index], **metadata[output_index])
-                models.append(self._exact_voltage_field_model(
-                    model, lambda point, output=output_index: int(requested_array[point, output])))
-            actual = np.asarray([[self._sweep_model_value(model, point)
-                for model in models] for point in range(len(requested_array))], dtype=np.int64)
-            return tuple(models), actual, int(np.max(np.abs(actual - requested_array)))
         duration_axis_indices = self._bias_t_conditioning_axis_indices(sweep_axes)
         models = []
         actual = np.empty_like(requested_array)
@@ -3431,17 +3421,6 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         actual = np.empty_like(requested)
         models = []
         max_error = 0
-
-        if any(isinstance(axis, AmplitudeSweep) and axis.count > 1 for axis in sweep_axes):
-            for output_index in range(self.sequence.n_outputs):
-                model = dict(key=("bias_t", output_index, register_name),
-                    register_name=register_name, output_index=output_index,
-                    gen_ch=self.awg_channels[output_index], **metadata[output_index])
-                models.append(self._exact_voltage_field_model(
-                    model, lambda point, output=output_index: int(value_at(point, output))))
-            actual = np.asarray([[self._sweep_model_value(model, point)
-                for model in models] for point in validation_indices], dtype=np.int64)
-            return tuple(models), requested, actual, int(np.max(np.abs(actual - requested)))
 
         for output_index in range(self.sequence.n_outputs):
             quantum = int(metadata[output_index].get("quantum", 1))
@@ -3921,101 +3900,82 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         return int(model['duration_table_bases'][row]) + sum(
             int(indices[a]) * int(d[row]) for a, d in model['duration_table_axis_deltas'].items())
 
-    def _exact_voltage_field_model(self, original, value_at):
-        """Store only axes on which this integer command field depends.
+    def _validate_bias_t_set_spacing(self, model):
+        """Reject pulse widths the v1 timed-output FIFO cannot emit exactly.
 
-        Repeated rounded increments drift away from the requested linspace.
-        Exact per-axis payloads prevent that drift and also keep the ramp step
-        and DC pulse consistent with the rounded DAC levels. Independent X/Y
-        DACs use O(Nx + Ny) data; coupled fields retain their joint dependency.
-        The existing hardware table-pointer loops load these values.
+        READ -> WAIT -> SET takes at least three clocks between SETs. Check
+        affine coefficient rows, including interior zero crossings, without
+        compiling every sweep point or adding a Cartesian hardware table.
         """
-        axes = self.sequence.sweep_axes
-        shape = tuple(int(axis.count) for axis in axes)
-        corners = tuple(product(*((0,) if count <= 1 else (0, count - 1) for count in shape)))
-
-        def point(indices):
-            return int(np.ravel_multi_index(tuple(indices), shape, order="C")) if shape else 0
-
-        corner_values = {indices: int(value_at(point(indices))) for indices in corners}
-        dependent = []
-        for axis_index, axis in enumerate(axes):
-            if axis.count <= 1:
-                continue
-            for indices in corners:
-                if indices[axis_index] != 0:
-                    continue
-                other = list(indices)
-                other[axis_index] = axis.count - 1
-                if corner_values[indices] != corner_values[tuple(other)]:
-                    dependent.append(axis_index)
-                    break
-        # Remove old rounded-increment or conditioned approximations.
-        old_keys = {"duration_table_bases", "duration_table_axis_deltas", "duration_axis_index",
-                    "duration_axis_indices", "duration_table_shape", "axis_deltas", "base"}
-        model = {key: value for key, value in original.items() if key not in old_keys}
-        base = int(value_at(0))
-        model.update(base=base, axis_deltas=tuple(0 for _ in axes))
-        if not dependent:
-            return model
-        table_shape = tuple(shape[index] for index in dependent)
-        rows = int(np.prod(table_shape, dtype=np.int64))
-        if rows > int(self.tproccfg.get("dmem_size", 0)) - 16:
-            # Keep large voltage-outer/duration-inner DC grids factored. Every
-            # voltage row uses the exact DAC level. Only the fractional time
-            # coefficient is rounded, with a bound below half a fabric clock.
-            # Never fall back to a rounded voltage increment.
-            conditioned = self._bias_t_conditioning_axis_indices(axes)
-            remaining = tuple(a for a in dependent if a not in conditioned)
-            if (model.get('register_name') == 'bias_t_duration_q' and conditioned
-                    and remaining and all(not isinstance(axes[a], AmplitudeSweep) for a in remaining)
-                    and sum(axes[a].count - 1 for a in remaining) + 1 < (1 << int(model['duration_frac_bits']))):
-                bases = []
-                deltas = {a: [] for a in remaining}
-                conditioned_shape = tuple(shape[a] for a in conditioned)
-                for coordinates in np.ndindex(conditioned_shape):
-                    indices = [0] * len(axes)
-                    for a, coordinate in zip(conditioned, coordinates):
-                        indices[a] = int(coordinate)
-                    row_base = int(value_at(point(indices)))
-                    bases.append(row_base)
-                    for a in remaining:
-                        endpoint = list(indices)
-                        endpoint[a] = shape[a] - 1
-                        deltas[a].append(_round_div_nearest(
-                            int(value_at(point(endpoint))) - row_base, shape[a] - 1))
-                model.update(duration_table_bases=tuple(bases),
-                    duration_table_axis_deltas={a: tuple(v) for a, v in deltas.items()},
-                    duration_axis_index=conditioned[0], duration_axis_indices=conditioned,
-                    duration_table_shape=conditioned_shape)
-                return model
-            raise RuntimeError(
-                f"exact voltage sweep field {model['key']} requires {rows} dependent rows; "
-                "tProcessor DMEM cannot hold this coupled voltage/duration grid")
-        values = []
-        for coordinates in np.ndindex(table_shape):
-            self._check_cancel()
-            indices = [0] * len(axes)
-            for index, coordinate in zip(dependent, coordinates):
-                indices[index] = int(coordinate)
-            values.append(int(value_at(point(indices))))
-        array = np.asarray(values, dtype=np.int64).reshape(table_shape)
-        deltas = [0] * len(axes)
-        for position, axis_index in enumerate(dependent):
-            adjacent = [0] * len(dependent)
-            adjacent[position] = 1
-            deltas[axis_index] = int(array[tuple(adjacent)]) - base
-        # Preserve the compact register-add path when it is already exact.
-        affine = all(value == base + sum(int(i) * deltas[a] for a, i in zip(dependent, coordinates))
-                     for coordinates, value in zip(np.ndindex(table_shape), values))
-        if affine:
-            model['axis_deltas'] = tuple(deltas)
+        if model["register_name"] != "bias_t_duration_q":
+            duration = int(model["fixed_duration_tproc_cycles"])
+            values = self._bias_t_target_code_actual[:, int(model["output_index"])]
+            bad = 0 if duration < TPROC_V1_MIN_SET_INTERVAL and np.any(values) else None
         else:
-            model.update(duration_table_bases=tuple(values),
-                duration_table_axis_deltas={}, duration_axis_index=dependent[0],
-                duration_axis_indices=tuple(dependent), duration_table_shape=table_shape,
-                exact_voltage_table=True)
-        return model
+            shape = tuple(axis.count for axis in self.sequence.sweep_axes)
+            scale = 1 << int(model["duration_frac_bits"])
+            # Sub-cycle durations round to zero and are already skipped.
+            lo = scale // 2
+            hi = TPROC_V1_MIN_SET_INTERVAL * scale - lo - 1
+            bands = ((lo, hi), (-hi, -lo))
+            if "duration_table_bases" in model:
+                duration_axes = tuple(model["duration_axis_indices"])
+                rows = enumerate(model["duration_table_bases"])
+            else:
+                duration_axes = ()
+                rows = ((0, model["base"]),)
+            bad = None
+            for row, base in rows:
+                self._check_cancel()
+                coordinates = [0] * len(shape)
+                if duration_axes:
+                    for axis, index in zip(duration_axes, np.unravel_index(row, model["duration_table_shape"])):
+                        coordinates[axis] = int(index)
+                    deltas = {int(axis): int(ds[row]) for axis, ds in model["duration_table_axis_deltas"].items()}
+                else:
+                    deltas = dict(enumerate(map(int, model["axis_deltas"])))
+                active = [a for a, delta in deltas.items() if delta and shape[a] > 1]
+                solve_axis = max(active, key=lambda a: shape[a]) if active else None
+                others = [a for a in active if a != solve_axis]
+                for indices in product(*(range(shape[a]) for a in others)):
+                    origin = int(base)
+                    for axis, index in zip(others, indices):
+                        coordinates[axis] = index
+                        origin += index * deltas[axis]
+                    for lower, upper in bands:
+                        if solve_axis is None:
+                            found = lower <= origin <= upper
+                            value = origin
+                        else:
+                            delta = deltas[solve_axis]
+                            # Solve lower <= origin + i*delta <= upper in integers.
+                            if delta > 0:
+                                first = -((origin - lower) // delta)
+                                last = (upper - origin) // delta
+                            else:
+                                first = -((upper - origin) // (-delta))
+                                last = (origin - lower) // (-delta)
+                            index = max(0, first)
+                            found = index <= min(shape[solve_axis] - 1, last)
+                            value = origin + index * delta
+                            coordinates[solve_axis] = index
+                        if found:
+                            bad = int(np.ravel_multi_index(tuple(coordinates), shape)) if shape else 0
+                            duration = (abs(value) + lo) // scale
+                            break
+                    if bad is not None:
+                        break
+                if bad is not None:
+                    break
+        if bad is not None:
+            output = self.sequence.output_names[int(model["output_index"])]
+            raise ValueError(
+                f"Bias-T compensation on {output} at sweep point {bad} requires {duration} "
+                f"tProcessor clocks, below the {TPROC_V1_MIN_SET_INTERVAL}-clock SET interval "
+                f"({TPROC_V1_MIN_SET_INTERVAL / self.tproc_mhz * 1000:g} ns). "
+                "Use a lower fixed compensation voltage or a longer fixed compensation time. "
+                "The compensation voltage and duration have not been changed automatically."
+            )
 
     def _build_sweep_register_plan(self):
         """Map Cartesian sweep axes to tProcessor register increments."""
@@ -4200,23 +4160,10 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     "axis_deltas": tuple(axis_deltas),
                 }
 
-        if any(isinstance(axis, AmplitudeSweep) and axis.count > 1 for axis in sweep_axes):
-            exact_command_maps = dict(command_maps)
-
-            def exact_command(point_index, key):
-                if point_index not in exact_command_maps:
-                    point = self._requested_awg_point_at(point_index)
-                    exact_command_maps[point_index] = {
-                        self._command_key(command): command
-                        for commands in point.segment_commands for command in commands}
-                return exact_command_maps[point_index][key]
-
-            for key, model in tuple(models.items()):
-                attribute = {"target": "target_code", "step": "step", "duration": "duration_samples"}[model['register_name']]
-                models[key] = self._exact_voltage_field_model(
-                    model, lambda point, command_key=model['command_key'], attr=attribute:
-                        int(getattr(exact_command(point, command_key), attr)))
-
+        # Keep constant per-axis increments and rewind them at axis boundaries.
+        # Coupled virtual gates must not allocate a Cartesian voltage table.
+        # Target-code quantization is independent of the AWG v2 ramp-step width;
+        # report the resulting grid error instead of claiming per-point rounding.
         requested_points = self.compiled_points
         actual_points = []
         actual_point_indices = []
@@ -4290,6 +4237,14 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                         else model_value(duration_model, indices)
                     )
                     gen_cfg = self.soccfg["gens"][command.gen_ch]
+                    minimum = int(gen_cfg.get("minv", -32768))
+                    maximum = int(gen_cfg.get("maxv", 32764))
+                    if not minimum <= target <= maximum:
+                        raise ValueError(
+                            f"incremental voltage sweep exceeds DAC range at point {point_index}, "
+                            f"gen {command.gen_ch}: code {target}, allowed [{minimum}, {maximum}]; "
+                            "reduce the range or change the sweep increment"
+                        )
                     opcode = OP_SET if command.kind == "set" else OP_RAMP
                     words = _pack_command_words(
                         gen_cfg,
@@ -4344,6 +4299,25 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 sweep_axes,
                 sweep_shape,
             )
+        # Check accumulated compensation endpoints as well as their ideal
+        # requests. Rounded increments can overshoot even when RC is disabled.
+        for model in bias_t_models:
+            output = int(model['output_index'])
+            if model['register_name'] == 'bias_t_target_code':
+                values = self._bias_t_target_code_actual[:, output]
+                gen = self.soccfg['gens'][model['gen_ch']]
+                low, high = int(gen.get('minv', -32768)), int(gen.get('maxv', 32764))
+            else:
+                values = self._bias_t_duration_q_actual[:, output]
+                high = (1 << 31) - 1 - (1 << (int(model['duration_frac_bits']) - 1))
+                low = -high
+            if np.any(values < low) or np.any(values > high):
+                raise ValueError(
+                    f"incremental Bias-T compensation exceeds range for "
+                    f"{self.sequence.output_names[output]}: {int(np.min(values))}.."
+                    f"{int(np.max(values))}, allowed [{low}, {high}]"
+                )
+            self._validate_bias_t_set_spacing(model)
         event_timing_models = self._build_event_timing_models()
 
         fields = []
@@ -7678,9 +7652,6 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 len(commands) for commands in self.compiled_points[0].segment_commands
             ),
             "sweep_execution": (
-                "tproc_loop_with_exact_voltage_tables"
-                if any(field.get("exact_voltage_table") for field in self._sweep_fields)
-                else
                 "tproc_loop_add_with_ramp_rate_coefficients"
                 if self._runtime_dmem_words
                 else "tproc_loop_and_add"
@@ -7691,9 +7662,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             "sweep_dynamic_dmem_fields": sum(
                 field.get("storage") == "dmem" for field in self._sweep_fields
             ),
-            "sweep_uses_point_table": bool(self._rf_point_tables) or any(
-                field.get("exact_voltage_table") for field in self._sweep_fields),
-            "voltage_grid_policy": "nearest_dac_code_per_point",
+            "sweep_uses_point_table": bool(self._rf_point_tables),
+            "voltage_grid_policy": "constant_quantized_increment",
             "sweep_table_layout": "dependent_axes",
             **self._square_settings_metadata(),
             **self._trigger_settings_metadata(),

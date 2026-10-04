@@ -239,4 +239,7 @@ def test_main_window_settings_file_roundtrip(tmp_path):
     assert panel.configured_spec().dc_compensation_timing=='overlap_readout'
     assert window._settings_to_dict()['rf_readout']['dc_compensation_timing']=='overlap_readout'
     window.close()
+    window.deleteLater()
+    from PyQt5 import QtCore
+    app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     app.processEvents()
