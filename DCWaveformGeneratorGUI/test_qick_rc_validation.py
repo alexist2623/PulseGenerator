@@ -84,10 +84,21 @@ def test_200_by_200_checks_only_four_corners(monkeypatch):
 
 def test_hardware_rounded_sweep_stop_rechecked():
     seq = FineTuneSequence(('x',)).add_set('a', .79, 600)
-    # 199 increments round up to a larger endpoint than the requested stop.
+    # Exact point tables replaced cumulative integer-step drift. This sweep
+    # used to overflow after 199 rounded increments; it must now remain valid.
     seq.add_amplitude_sweep('a', 'x', .79, .831, 200)
     seq.set_rc_compensation(10)
     validate_sequence_rc_range(seq, 300, 800)  # Ideal maximum = .9972 FS.
+    prog = seq.make_program(upgraded(_independent_awg_soccfg(1)), awg_channels=(0,),
+                            compile_validation_mode='boundary')
+    assert max(r['maximum_normalized'] for r in prog.rc_output_range_validation) < 1
+
+    # A smaller remaining margin still fails the compiler's quantization check,
+    # even though the ideal preview is just inside full scale.
+    seq = FineTuneSequence(('x',)).add_set('a', .79, 600)
+    seq.add_amplitude_sweep('a', 'x', .79, .8333, 200)
+    seq.set_rc_compensation(10)
+    validate_sequence_rc_range(seq, 300, 800)
     with pytest.raises(ValueError, match='sweep corner 199'):
         seq.make_program(upgraded(_independent_awg_soccfg(1)), awg_channels=(0,),
                          compile_validation_mode='boundary')

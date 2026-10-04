@@ -137,7 +137,10 @@ def test_ddr_trigger_anchor_includes_bypass_or_rc_output_latency():
 
 def test_rc_does_not_rewrite_ramps_or_scale_program_memory_with_sweep_count():
     sizes=[]
-    for count in (3, 5001):
+    # Exact voltage tables now occupy DMEM, while instructions remain looped.
+    # Compare two non-affine tables inside the mock firmware's DMEM capacity;
+    # a three-point affine sweep uses a different, smaller instruction path.
+    for count in (201, 1001):
         seq=FineTuneSequence(('x',)).add_set('a', -.02, 300)
         seq.add_ramp('ramp', 50).add_set('b', .02, 300)
         seq.set_amplitude_sweep('b','x', .01,.03,count)
@@ -149,6 +152,9 @@ def test_rc_does_not_rewrite_ramps_or_scale_program_memory_with_sweep_count():
         sizes.append(len(compensated.prog_list))
         assert len(compensated.prog_list)<4096
     assert abs(sizes[0]-sizes[1])<=4
+    seq.set_amplitude_sweep('b', 'x', .01, .03, 5001)
+    with pytest.raises(RuntimeError, match='DMEM cannot hold'):
+        seq.make_program(cfg, awg_channels=(0,))
 
 
 def test_square_rc_amplitude_and_frequency_cartesian_words():

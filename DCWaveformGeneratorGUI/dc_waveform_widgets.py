@@ -1075,6 +1075,9 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._pulse = self._pulses
         self._line: List[pg.PlotDataItem] = []
         self._physical_line: List[pg.PlotDataItem] = []
+        self._rc_line: List[pg.PlotDataItem] = []
+        self._rc_time_ns = np.asarray([], dtype=float)
+        self._rc_values_mv = np.empty((0, 0), dtype=float)
         self._orig_colors: List[QtGui.QColor] = []
         self._selected_port_idx = 0
         self._default_width = 1.5
@@ -1318,6 +1321,8 @@ class WaveformPlotWidget(pg.PlotWidget):
             curve.setVisible(mode in {"both", "virtual"})
         for curve in self._physical_line:
             curve.setVisible(mode in {"both", "physical"})
+        for curve in self._rc_line:
+            curve.setVisible(bool(self._rc_time_ns.size) and mode in {"both", "physical"})
         for graphics in self._sweep_graphics.values():
             visible = mode in {"both", "physical"}
             graphics["lower_curve"].setVisible(visible)
@@ -1325,6 +1330,23 @@ class WaveformPlotWidget(pg.PlotWidget):
             graphics["fill"].setVisible(visible)
         self._update_highlight()
         self.fit_view()
+
+    def set_rc_waveforms(self, time_ns, waveforms_mv) -> None:
+        """Overlay the estimated RC-corrected DAC drive in each port's color."""
+        self._rc_time_ns = np.asarray(time_ns, dtype=float)
+        self._rc_values_mv = np.asarray(waveforms_mv, dtype=float)
+        while len(self._rc_line) > len(self._pulses):
+            self.removeItem(self._rc_line.pop())
+        while len(self._rc_line) < len(self._pulses):
+            self._rc_line.append(self.plot([], []))
+        for index, curve in enumerate(self._rc_line):
+            curve.setPen(pg.mkPen(self.line_color(index), width=2.2,
+                                 style=QtCore.Qt.DashDotLine))
+            curve.setZValue(index + 1.2)
+            curve.setData(self._rc_time_ns,
+                          self._rc_values_mv[index] if self._rc_time_ns.size else [])
+            curve.setVisible(bool(self._rc_time_ns.size)
+                             and self._voltage_view in {"both", "physical"})
 
     def set_sweep_envelope(
         self,
@@ -1462,6 +1484,9 @@ class WaveformPlotWidget(pg.PlotWidget):
         ):
             x_values.append(self._physical_time_ns)
             y_values.extend(self._physical_values_mv)
+        if self._voltage_view in {"both", "physical"} and self._rc_time_ns.size:
+            x_values.append(self._rc_time_ns)
+            y_values.extend(self._rc_values_mv)
         if not x_values or not y_values:
             return
         x_min = min(float(np.min(values)) for values in x_values)

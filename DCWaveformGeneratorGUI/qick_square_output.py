@@ -10,7 +10,7 @@ class SquareOutputSelector(QtWidgets.QWidget):
     requested = QtCore.pyqtSignal()
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None, *, channel=0):
+    def __init__(self, parent=None, *, channel=0, compact=False):
         super().__init__(parent)
         self.configuration = None
         self._explicit_channel = False
@@ -23,7 +23,9 @@ class SquareOutputSelector(QtWidgets.QWidget):
         self.description = QtWidgets.QLabel("Identify QICK and select a SquarePulse output.")
         self.description.setWordWrap(True)
         layout.addWidget(self.description)
-        row = QtWidgets.QHBoxLayout()
+        self.controls = QtWidgets.QWidget(self)
+        row = QtWidgets.QHBoxLayout(self.controls)
+        row.setContentsMargins(0, 0, 0, 0)
         self.button = QtWidgets.QPushButton("Select output on QICK front panel")
         self.button.clicked.connect(self.requested)
         row.addWidget(self.button)
@@ -34,7 +36,9 @@ class SquareOutputSelector(QtWidgets.QWidget):
         self.channel.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         row.addWidget(QtWidgets.QLabel("Generator"))
         row.addWidget(self.channel)
-        layout.addLayout(row)
+        layout.addWidget(self.controls)
+        self.description.setVisible(not compact)
+        self.controls.setVisible(not compact)
         self.channel.valueChanged.connect(self._refresh)
         self.channel.valueChanged.connect(self.changed)
 

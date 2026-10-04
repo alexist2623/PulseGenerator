@@ -45,7 +45,7 @@ class CompensationSelector(QtWidgets.QWidget):
         self.rc_checkbox = QtWidgets.QCheckBox("RC compensation", self)
         self.rc_checkbox.setToolTip(
             "Continuous FPGA compensation; requires RC-capable firmware. "
-            "Waveform previews show the target after the RC circuit. "
+            "Waveform Plot can show the target and the RC-corrected DAC estimate. "
             "The compensated DAC voltage must stay within the output range.")
         layout.addWidget(self.dc_checkbox)
         layout.addWidget(self.rc_checkbox)

@@ -409,8 +409,8 @@ def test_awg_tuning_tab_groups_awg_rf_and_experiment_controls():
         "AWG Outputs",
         "RF Outputs",
         "RF Readout",
-        "Experiment",
         "SquarePulse",
+        "Experiment",
     ]
     window._show_rf_editor()
     assert window._control_tabs.currentWidget() is window._awg_tuning_page

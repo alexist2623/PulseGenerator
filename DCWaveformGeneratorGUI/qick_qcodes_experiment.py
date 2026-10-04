@@ -1265,11 +1265,13 @@ def _execute_qick_sequence_once(
     }
     if cancel_check is not None:
         acquire_kwargs["cancel_check"] = cancel_check
-    square = getattr(sequence, "square_pulse_config", None)
-    if square is not None:
+    from qick_square_dds import get_square_configs
+    squares = get_square_configs(sequence)
+    if squares:
         if not hasattr(soc, "stop_square_pulse"):
             raise RuntimeError("Update the board QSTL_QICK library: stop_square_pulse is required")
-        soc.rfb_set_gen_dc(square.gen_ch)
+        for square in squares:
+            soc.rfb_set_gen_dc(square.gen_ch)
     completed = False
     try:
         if acquisition_source == "fir_ddr":
@@ -1288,8 +1290,9 @@ def _execute_qick_sequence_once(
     finally:
         # Keep autonomous output only after a successful run when requested.
         # Cancellation and acquisition errors still stop the selected output.
-        if square is not None and (not completed or square.mute_on_finish):
-            soc.stop_square_pulse(square.gen_ch)
+        for square in squares:
+            if not completed or square.mute_on_finish:
+                soc.stop_square_pulse(square.gen_ch)
     _check_cancel(cancel_check)
     _emit_progress(
         progress_callback,

@@ -1793,6 +1793,7 @@ def build_qick_sequence(
     bias_t_compensation_mode: str = "fixed_voltage",
     bias_t_compensation_duration_us: Real = DEFAULT_BIAS_T_COMPENSATION_DURATION_US,
     bias_t_filter_tau_us: Real = DEFAULT_BIAS_T_FILTER_TAU_US,
+    validate_rc_range: bool = True,
 ):
     """Build a real qick_fine_tune_sweep.FineTuneSequence instance."""
     pulses = tuple(pulses)
@@ -1949,8 +1950,10 @@ def build_qick_sequence(
     from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges
     validate_channel_voltage_ranges(sequence)
     sequence.output_full_scale_mv = float(full_scale_mv)
-    sequence.rc_output_range_preview = validate_sequence_rc_range(
-        sequence, float(fabric_mhz), float(full_scale_mv))
+    # The display may show an out-of-range RC curve; execution/export retain
+    # the default preflight and the compiler also checks actual DAC words.
+    sequence.rc_output_range_preview = (validate_sequence_rc_range(
+        sequence, float(fabric_mhz), float(full_scale_mv)) if validate_rc_range else ())
     return sequence
 
 
@@ -2131,9 +2134,11 @@ def generate_qick_program_code(
         raise ValueError("AWG channels must be unique nonnegative integers")
     tproc_mhz = _positive_real(tproc_mhz, "tproc_mhz")
     full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
-    square_full_scale_mv = float(full_scale_mv if square_full_scale_mv is None else square_full_scale_mv)
+    square_full_scale_mv = full_scale_mv if square_full_scale_mv is None else square_full_scale_mv
     dac_current_settings = dict(dac_current_settings or {})
-    if square_pulse_settings and square_pulse_settings.get('enabled'):
+    from qick_square_dds import decode_square_outputs
+    square_configs, _ = decode_square_outputs(square_pulse_settings, square_full_scale_mv)
+    if square_configs:
         dac_current_settings.update(square_current_settings or {})
     if not isinstance(bias_t_compensation_enabled, (bool, np.bool_)):
         raise TypeError("bias_t_compensation_enabled must be boolean")
@@ -2544,13 +2549,12 @@ def generate_qick_program_code(
                 ]
             )
     if square_pulse_settings is not None or output_trigger_settings is not None:
-        from qick_square_dds import decode_square_settings, OutputTriggerConfig
-        decode_square_settings(square_pulse_settings, square_full_scale_mv)
+        from qick_square_dds import OutputTriggerConfig
         OutputTriggerConfig(**(output_trigger_settings or {}))
         lines.extend([
-            "    from qick_square_dds import decode_square_settings, OutputTriggerConfig, attach_square_settings",
-            f"    square_config, square_axes = decode_square_settings({square_pulse_settings!r}, {square_full_scale_mv!r})",
-            f"    attach_square_settings(sequence, square_config, square_axes, OutputTriggerConfig(**{output_trigger_settings or {}!r}))",
+            "    from qick_square_dds import decode_square_outputs, OutputTriggerConfig, attach_square_settings",
+            f"    square_config, square_axes = decode_square_outputs({square_pulse_settings!r}, {square_full_scale_mv!r})",
+            f"    attach_square_settings(sequence, square_config, square_axes, OutputTriggerConfig(**{output_trigger_settings or {}!r}), follow_experiment_rc=True)",
         ])
     lines.extend(
         [
@@ -2675,9 +2679,11 @@ def generate_qick_program_code(
             "    actual_outputs = configure_rf_chain(soc) if configure_rf else None",
             "    actual_input = configure_readout_chain(soc) if configure_rf else None",
             "    program = build_program(soccfg)",
-            "    square = getattr(program, 'square_pulse_config', None)",
-            "    if square is not None and configure_rf:",
-            "        soc.rfb_set_gen_dc(square.gen_ch)",
+            "    from qick_square_dds import get_square_configs",
+            "    squares = get_square_configs(program)",
+            "    if configure_rf:",
+            "        for square in squares:",
+            "            soc.rfb_set_gen_dc(square.gen_ch)",
             "    completed = False",
             "    try:",
             "        if FIR_DDR_CONFIG is not None:",
@@ -2689,8 +2695,9 @@ def generate_qick_program_code(
             "            ddr_result = None",
             "        completed = True",
             "    finally:",
-            "        if square is not None and (not completed or square.mute_on_finish):",
-            "            soc.stop_square_pulse(square.gen_ch)",
+            "        for square in squares:",
+            "            if not completed or square.mute_on_finish:",
+            "                soc.stop_square_pulse(square.gen_ch)",
             "    rf_settings = {'outputs': actual_outputs, 'readout': actual_input}",
             "    return program, ddr_result, rf_settings",
             "",

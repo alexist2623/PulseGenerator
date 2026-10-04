@@ -27,9 +27,9 @@ except ImportError:
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
-    from .qick_square_dds_panel import SquarePulsePanel, TriggeringPanel
+    from .qick_square_dds_panel import SquarePulsePanel, SquarePulsePortsPanel, TriggeringPanel
 except ImportError:
-    from qick_square_dds_panel import SquarePulsePanel, TriggeringPanel
+    from qick_square_dds_panel import SquarePulsePanel, SquarePulsePortsPanel, TriggeringPanel
 
 
 class _ValueInputWheelGuard(QtCore.QObject):
@@ -1142,6 +1142,9 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             zorder=0.5,
         )
         self._physical_line = [physical_line]
+        self._rc_line = []
+        self._rc_time_ns = np.asarray([], dtype=float)
+        self._rc_values_mv = np.empty((0, 0), dtype=float)
         self._physical_time_ns = self._pulse[0].t.copy()
         self._physical_values_mv = np.asarray([self._pulse[0].v.copy()])
         self._voltage_view = "both"
@@ -1266,9 +1269,25 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
             line.set_visible(mode in {"both", "virtual"})
         for line in self._physical_line:
             line.set_visible(mode in {"both", "physical"})
+        for line in self._rc_line:
+            line.set_visible(bool(self._rc_time_ns.size) and mode in {"both", "physical"})
         for artist in self._sweep_artists:
             artist.set_visible(mode in {"both", "physical"})
         self.fit_view()
+
+    def set_rc_waveforms(self, time_ns, waveforms_mv) -> None:
+        self._rc_time_ns = np.asarray(time_ns, dtype=float)
+        self._rc_values_mv = np.asarray(waveforms_mv, dtype=float)
+        for line in self._rc_line:
+            line.remove()
+        self._rc_line = []
+        if self._rc_time_ns.size:
+            for index, values in enumerate(self._rc_values_mv):
+                line, = self.ax.plot(self._rc_time_ns, values, '-.',
+                                    color=self._orig_colors[index], linewidth=2.2)
+                line.set_visible(self._voltage_view in {"both", "physical"})
+                self._rc_line.append(line)
+        self.draw_idle()
 
     def set_sweep_envelope(
         self,
@@ -1340,6 +1359,9 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
         ):
             x_values.append(self._physical_time_ns)
             y_values.extend(self._physical_values_mv)
+        if self._voltage_view in {"both", "physical"} and self._rc_time_ns.size:
+            x_values.append(self._rc_time_ns)
+            y_values.extend(self._rc_values_mv)
         if not x_values or not y_values:
             return
         x_min = min(float(np.min(values)) for values in x_values)
@@ -3343,6 +3365,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._build_composite_editor()
 
         self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.set_scope("output")
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
@@ -6537,6 +6560,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         calibration_path_row.addWidget(self.dc_voltage_calibration_browse)
 
         self.front_panel_preview = QickFrontPanelPreview(self)
+        self.front_panel_preview.set_scope("input")
         self.front_panel_preview.activated.connect(
             lambda: self.front_panel_requested.emit(self)
         )
@@ -10072,14 +10096,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._awg_tuning_tabs.addTab(self._multi_ctrl, "AWG Outputs")
         self._awg_tuning_tabs.addTab(self._rf_ports_panel, "RF Outputs")
         self._awg_tuning_tabs.addTab(self._rf_readout_panel, "RF Readout")
-        self._awg_tuning_tabs.addTab(self._experiment_panel, "Experiment")
-        self._square_dds_panel = SquarePulsePanel(self)
+        self._square_dds_panel = SquarePulsePortsPanel(self)
+        self._sync_square_rc_settings()
         self._square_dds_panel.front_panel_requested.connect(
             lambda target: self._show_qick_front_panel("output", target))
-        self._square_dds_scroll = QtWidgets.QScrollArea(self)
-        self._square_dds_scroll.setWidgetResizable(True)
-        self._square_dds_scroll.setWidget(self._square_dds_panel)
-        self._awg_tuning_tabs.addTab(self._square_dds_scroll, "SquarePulse")
+        self._awg_tuning_tabs.addTab(self._square_dds_panel, "SquarePulse")
+        self._awg_tuning_tabs.addTab(self._experiment_panel, "Experiment")
         self._square_dds_panel.changed.connect(self._notify_sweep_state_changed)
         self._awg_tuning_tabs.setCurrentWidget(self._multi_ctrl)
         awg_tuning_layout.addWidget(self._awg_tuning_tabs)
@@ -10154,7 +10176,34 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Waveform Plot - Virtual (solid) / Physical (dashed)",
             self,
         )
-        self._dock_plot.setWidget(self._waveform_splitter)
+        self._waveform_container = QtWidgets.QWidget(self)
+        waveform_layout = QtWidgets.QVBoxLayout(self._waveform_container)
+        waveform_layout.setContentsMargins(2, 2, 2, 2)
+        waveform_options = QtWidgets.QHBoxLayout()
+        waveform_options.addWidget(QtWidgets.QLabel("Show:"))
+        self._show_dc_compensation = QtWidgets.QCheckBox("DC compensation")
+        self._show_rc_compensation = QtWidgets.QCheckBox("RC compensation (DAC estimate)")
+        for checkbox in (self._show_dc_compensation, self._show_rc_compensation):
+            checkbox.setChecked(True)
+            checkbox.setToolTip("Display only; does not enable or disable compensation in the experiment.")
+            checkbox.toggled.connect(self._on_compensation_visibility_changed)
+            waveform_options.addWidget(checkbox)
+        waveform_options.addStretch(1)
+        waveform_layout.addLayout(waveform_options)
+        self._waveform_scale_label = QtWidgets.QLabel()
+        self._waveform_scale_label.setWordWrap(True)
+        waveform_layout.addWidget(self._waveform_scale_label)
+        self._waveform_preview_note = QtWidgets.QLabel(
+            "Solid: virtual target | Dashed: physical target | Dash-dot: RC-corrected DAC estimate")
+        self._waveform_preview_note.setWordWrap(True)
+        self._waveform_preview_note.setToolTip(
+            "Ideal first sweep point, one repetition with zero initial RC state. "
+            "Includes DC pulse area; hiding DC does not remove it from the RC calculation. "
+            "DAC quantization, pipeline latency and readout waits are not shown. "
+            "Use Show QICK Program > FIR / DC timing for compiled event times.")
+        waveform_layout.addWidget(self._waveform_preview_note)
+        waveform_layout.addWidget(self._waveform_splitter, 1)
+        self._dock_plot.setWidget(self._waveform_container)
 
         self._dock_trace = QtWidgets.QDockWidget("Trace Plot", self)
         self._dock_trace.setWidget(self._trace_container)
@@ -10471,6 +10520,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self.refresh_panel_table()
         self._refresh_stability_targets()
+        self._refresh_sweep_overlay()
 
     def _build_menu(self):
         mb          = self.menuBar()
@@ -10671,6 +10721,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
 
     def _refresh_physical_waveforms(self, *, fit_view: bool = False) -> None:
+        self._sync_awg_voltage_bounds()
+        rc_times = np.asarray([], dtype=float)
+        rc_mv = np.empty((len(self._pulse), 0))
+        preview_note = ""
         try:
             if self._bias_t_compensation_enabled:
                 sequence = build_qick_sequence(
@@ -10690,6 +10744,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         self._bias_t_compensation_duration_us
                     ),
                     bias_t_filter_tau_us=self._bias_t_filter_tau_us,
+                    validate_rc_range=False,
                 )
                 cycles, waveforms, _boundaries = (
                     sequence.compensated_waveform_vertices(0)
@@ -10700,6 +10755,29 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     * sequence.output_full_scales_mv[sequence.output_names.index(name)]
                     for name in self._qick_output_names()
                 ])
+                # RC sees the complete physical waveform, including the DC
+                # epilogue, regardless of either display checkbox.
+                if sequence.rc_compensation is not None:
+                    from qick_waveform_preview import rc_precompensated_vertices
+                    from qick_rc_validation import validate_sequence_rc_range
+                    rc_input_times, rc_input_mv = time_ns, physical_mv
+                    if np.any(physical_mv[:, -1]):
+                        rc_input_times = np.append(time_ns, time_ns[-1])
+                        rc_input_mv = np.column_stack((physical_mv, np.zeros(len(self._pulse))))
+                    if self._show_rc_compensation.isChecked():
+                        rc_times, rc_mv = rc_precompensated_vertices(
+                            rc_input_times, rc_input_mv, self._bias_t_filter_tau_us)
+                    try:
+                        validate_sequence_rc_range(sequence, self._qick_fabric_mhz,
+                                                   self._qick_full_scale_mv)
+                    except ValueError as exc:
+                        preview_note = str(exc)
+                if not self._show_dc_compensation.isChecked():
+                    cycles, waveforms, _ = sequence.waveform_vertices(0, space="physical")
+                    time_ns = np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz
+                    physical_mv = np.vstack([
+                        np.asarray(waveforms[name]) * sequence.output_full_scales_mv[i]
+                        for i, name in enumerate(sequence.output_names)])
             else:
                 time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
                     self._pulse,
@@ -10708,11 +10786,24 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         except (ValueError, RuntimeError) as exc:
             # Invalid range must not escape a Qt edit/refresh callback.
             self.statusBar().showMessage(f'Output range check: {exc}')
+            preview_note = f"Compensation preview unavailable: {exc}"
+            rc_times = np.asarray([], dtype=float)
+            rc_mv = np.empty((len(self._pulse), 0))
             time_ns, _virtual_mv, physical_mv = transform_virtual_waveforms(
                 self._pulse, self._cross_capacitance)
         self._plot.set_physical_waveforms(time_ns, physical_mv)
+        self._plot.set_rc_waveforms(rc_times, rc_mv)
+        if hasattr(self, "_waveform_preview_note"):
+            self._waveform_preview_note.setText(preview_note or
+                "Solid: virtual target | Dashed: physical target | Dash-dot: RC-corrected DAC estimate "
+                "(first sweep point; ideal timing)")
+            self._waveform_preview_note.setStyleSheet("color: #b03020;" if preview_note else "")
         if fit_view:
             self._plot.fit_view()
+
+    @QtCore.pyqtSlot(bool)
+    def _on_compensation_visibility_changed(self, _checked):
+        self._refresh_physical_waveforms(fit_view=True)
 
     def _sweep_target_indices(
         self,
@@ -11559,7 +11650,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         axis_kind = key[0]
         try:
             if axis_kind.startswith("square_"):
-                row = self._square_dds_panel.rows[spec.parameter]
+                row = self._square_dds_panel.panel_for_channel(spec.gen_ch).rows[spec.parameter]
                 row["start"].setValue(float(start))
                 row["stop"].setValue(float(stop))
                 row["count"].setValue(int(count))
@@ -11731,7 +11822,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _remove_sweep_parameter(self, spec) -> None:
         key = ExperimentPanel._sweep_parameter_key(spec)
         if key[0].startswith("square_"):
-            self._square_dds_panel.rows[spec.parameter]["sweep"].setChecked(False)
+            self._square_dds_panel.panel_for_channel(spec.gen_ch).rows[spec.parameter]["sweep"].setChecked(False)
             return
         if key[0] in {
             "rf_duration",
@@ -11844,6 +11935,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"{spec.samples_per_trigger} stored FIR samples"
             )
 
+    def _sync_square_rc_settings(self):
+        if hasattr(self, "_square_dds_panel"):
+            self._square_dds_panel.set_rc_compensation(
+                self._bias_t_compensation_enabled and self._bias_t_compensation_type in ("filter", "dc_rc"),
+                self._bias_t_filter_tau_us)
+
     def _on_bias_t_changed(
         self,
         enabled: bool,
@@ -11859,6 +11956,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_t_compensation_mode = str(mode)
         self._bias_t_compensation_duration_us = float(duration_us)
         self._bias_t_filter_tau_us = float(filter_tau_us)
+        self._sync_square_rc_settings()
         try:
             self._refresh_physical_waveforms(fit_view=False)
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
@@ -11945,11 +12043,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
         self._square_dds_panel.attach_to_sequence(
-            sequence, self._dac_current_state.scale(self._square_dds_panel.channel.value()),
+            sequence, self._dac_current_state.scale,
             self._experiment_panel.triggering_panel.config(),
         )
-        if getattr(sequence, 'square_pulse_config', None) is not None:
-            sequence.dac_current_settings.update(self._dac_current_state.snapshot((sequence.square_pulse_config.gen_ch,)))
+        sequence.dac_current_settings.update(self._dac_current_state.snapshot(
+            config.gen_ch for config in sequence.square_pulse_configs))
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
             "connection_config": values["connection"],
@@ -12151,6 +12249,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _show_qick_front_panel(self, scope: str, target=None) -> None:
         """Open the live front-panel selector for the requesting editor."""
+        if isinstance(target, SquarePulsePortsPanel):
+            if not target._panels:
+                return
+            target = target._panels[0]
         self._qick_front_panel_target = target
         self._qick_front_panel.set_scope(scope)
         square_editor = isinstance(target, (SquarePulsePanel, SquareWavePanel))
@@ -12296,6 +12398,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._experiment_panel.full_scale_mv.setValue(reference)
             self._experiment_panel._update_bias_t_range(reference)
         self._notify_sweep_state_changed(rf_changed=True)
+
+    def _sync_awg_voltage_bounds(self):
+        """Use live per-channel limits for edits without rewriting saved volts."""
+        labels = []
+        for index, (pulse, channel) in enumerate(zip(self._pulse, self._qick_awg_channels)):
+            scale = self._dac_current_state.scale(channel)
+            pulse.v_bounds = (-scale, scale)
+            labels.append(f"AWG {index + 1} / gen {channel}: +/-{scale:g} mV")
+            if hasattr(self, "_multi_ctrl") and index < len(self._multi_ctrl._ctrl_pannels):
+                self._multi_ctrl._ctrl_pannels[index].edit_v.setToolTip(
+                    f"Front-panel DAC full scale: +/-{scale:g} mV. "
+                    "Physical outputs are checked after virtual-gate conversion.")
+        if hasattr(self, "_waveform_scale_label"):
+            self._waveform_scale_label.setText("DAC limits (front panel): " + " | ".join(labels))
 
     def _on_qick_configuration_identified(self, configuration) -> None:
         if configuration.dac_current_settings is not None:
@@ -14269,9 +14385,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "display": {
                 "time_unit": self._time_unit,
                 "voltage_view": self._plot.voltage_view,
+                "show_dc_compensation": self._show_dc_compensation.isChecked(),
+                "show_rc_compensation": self._show_rc_compensation.isChecked(),
                 "selected_awg_output": self._selected_port_idx,
                 "selected_control_tab": self._control_tabs.currentIndex(),
                 "selected_awg_tuning_tab": self._awg_tuning_tabs.currentIndex(),
+                "selected_awg_tuning_tab_name": self._awg_tuning_tabs.tabText(self._awg_tuning_tabs.currentIndex()),
                 "trace_stability_overlay": (
                     self._trace_stability_overlay_settings()
                 ),
@@ -14884,6 +15003,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         voltage_view = str(display.get("voltage_view", "both"))
         if voltage_view not in {"both", "virtual", "physical"}:
             raise ValueError(f"unsupported voltage view {voltage_view!r}")
+        compensation_visibility = {
+            name: self._json_bool(display.get(name, True), f"display {name}")
+            for name in ("show_dc_compensation", "show_rc_compensation")}
         raw_trace_overlay = display.get("trace_stability_overlay", {})
         if raw_trace_overlay is None:
             raw_trace_overlay = {}
@@ -14974,6 +15096,15 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
         if selected_tab >= self._control_tabs.count():
             raise ValueError("selected control tab is out of range")
+        # Restore the same view after moving Experiment behind SquarePulse.
+        tab_name = display.get("selected_awg_tuning_tab_name") if settings_version == SETTINGS_VERSION else None
+        if tab_name is not None:
+            names = [self._awg_tuning_tabs.tabText(i) for i in range(self._awg_tuning_tabs.count())]
+            if tab_name not in names:
+                raise ValueError("selected AWG Tuning tab name is unknown")
+            selected_awg_tuning_tab = names.index(tab_name)
+        else:
+            selected_awg_tuning_tab = {3: 4, 4: 3}.get(selected_awg_tuning_tab, selected_awg_tuning_tab)
         if selected_awg_tuning_tab >= self._awg_tuning_tabs.count():
             raise ValueError("selected AWG Tuning tab is out of range")
 
@@ -15147,8 +15278,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "AWG full scale"
                 )
         square_wave_settings = normalize_square_wave_settings(data.get("square_wave"))
-        from qick_square_dds import decode_square_settings, OutputTriggerConfig
-        _square_config, square_axes = decode_square_settings(
+        from qick_square_dds import decode_square_outputs, OutputTriggerConfig
+        _square_config, square_axes = decode_square_outputs(
             data.get("square_pulse"), data.get("qick", {}).get("full_scale_mv", DEFAULT_QICK_FULL_SCALE_MV)
         )
         OutputTriggerConfig(**data.get("output_trigger", {}))
@@ -15959,6 +16090,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "sweeps": sweeps,
             "time_unit": time_unit,
             "voltage_view": voltage_view,
+            **compensation_visibility,
             "selected_output": selected_output,
             "selected_tab": selected_tab,
             "selected_awg_tuning_tab": selected_awg_tuning_tab,
@@ -16104,6 +16236,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_pulse_specs = list(self._rf_ports_panel.specs())
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._square_dds_panel.load_settings(settings.get("square_pulse", {}))
+        self._sync_square_rc_settings()
         self._experiment_panel.set_sweep_specs(
             self._active_map_sweep_specs(),
             selected_keys=settings["sweep_map_axes"],
@@ -16154,6 +16287,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         with QtCore.QSignalBlocker(self._voltage_view_actions[settings["voltage_view"]]):
             self._voltage_view_actions[settings["voltage_view"]].setChecked(True)
         self._set_voltage_view(settings["voltage_view"])
+        for name, checkbox in (("show_dc_compensation", self._show_dc_compensation),
+                               ("show_rc_compensation", self._show_rc_compensation)):
+            with QtCore.QSignalBlocker(checkbox):
+                checkbox.setChecked(settings.get(name, True))
 
         self._plot.refresh()
         self._multi_ctrl.refresh_table()
@@ -16427,8 +16564,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse,
                 output_names=self._qick_output_names(),
                 square_pulse_settings=self._square_dds_panel.settings_dict(),
-                square_full_scale_mv=self._dac_current_state.scale(self._square_dds_panel.channel.value()),
-                square_current_settings=self._dac_current_state.snapshot((self._square_dds_panel.channel.value(),)),
+                square_full_scale_mv={ch: self._dac_current_state.scale(ch)
+                                      for ch in self._square_dds_panel.active_channels()},
+                square_current_settings=self._dac_current_state.snapshot(self._square_dds_panel.active_channels()),
                 output_trigger_settings=self._experiment_panel.triggering_panel.settings_dict(),
                 **settings,
                 **self._dac_scale_arguments(settings["awg_channels"]),

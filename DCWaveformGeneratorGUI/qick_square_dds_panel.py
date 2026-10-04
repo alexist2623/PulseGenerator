@@ -8,9 +8,9 @@ except ImportError:
     from qick_square_output import SquareOutputSelector
     from qick_front_panel import QickFrontPanelCanvas, digital_trigger_outputs
 try:
-    from .qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings
+    from .qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings, decode_square_outputs
 except ImportError:
-    from qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings
+    from qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings, decode_square_outputs
 
 
 def spin(value, suffix, minimum=0, maximum=1e6, decimals=6):
@@ -24,15 +24,24 @@ def spin(value, suffix, minimum=0, maximum=1e6, decimals=6):
 class SquarePulsePanel(QtWidgets.QWidget):
     changed=QtCore.pyqtSignal()
     front_panel_requested=QtCore.pyqtSignal(object)
+    remove_requested=QtCore.pyqtSignal(object)
 
     def __init__(self,parent=None):
         super().__init__(parent)
+        self.ports_panel = None
         layout=QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QHBoxLayout()
+        self.title = QtWidgets.QLabel("SquarePulse output")
+        self.title.setWordWrap(True)
+        self.remove_button = QtWidgets.QPushButton("Remove port")
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(self.title); header.addStretch(1); header.addWidget(self.remove_button)
+        layout.addLayout(header)
         self.enabled=QtWidgets.QCheckBox("Enable SquarePulse during AWG experiment")
         self.status=QtWidgets.QLabel("Identify QICK to discover SquarePulse outputs.")
         self.status.setWordWrap(True)
         layout.addWidget(self.enabled); layout.addWidget(self.status)
-        self.output_selector=SquareOutputSelector(self, channel=7)
+        self.output_selector=SquareOutputSelector(self, channel=7, compact=True)
         self.channel=self.output_selector.channel
         self.output_selector.requested.connect(lambda: self.front_panel_requested.emit(self))
         layout.addWidget(self.output_selector)
@@ -41,16 +50,6 @@ class SquarePulsePanel(QtWidgets.QWidget):
         self.mute_on_finish.setToolTip("Unchecked: keep the final frequency, amplitude and phase running after successful completion. Stop/cancel and errors still mute output.")
         self.mute_on_finish.toggled.connect(self.changed)
         layout.addWidget(self.mute_on_finish)
-        self.rc_enabled=QtWidgets.QCheckBox("RC compensation")
-        self.rc_tau_us=spin(1000.0, " us", 10.0, 1_000_000.0)
-        self.rc_tau_us.setEnabled(False)
-        self.rc_enabled.toggled.connect(self.rc_tau_us.setEnabled)
-        self.rc_enabled.toggled.connect(self.changed)
-        self.rc_tau_us.valueChanged.connect(self.changed)
-        layout.addWidget(self.rc_enabled)
-        rc_form=QtWidgets.QFormLayout()
-        rc_form.addRow("RC time constant (tau)", self.rc_tau_us)
-        layout.addLayout(rc_form)
         note=QtWidgets.QLabel("Continuous 50% duty output, ±amplitude. Output full scale follows this DAC current in the shared Front Panel. "
             "Frequency and amplitude updates preserve accumulated phase. Phase sets an offset. "
             "Sweeps run in tProcessor hardware loops. Uncheck mute to keep output running after completion.")
@@ -83,13 +82,19 @@ class SquarePulsePanel(QtWidgets.QWidget):
         for item in items[1:]: item.setEnabled(checked)
 
     def set_configuration(self,configuration):
+        selected = self.channel.value() if self.output_selector._explicit_channel else None
         self.output_selector.set_configuration(configuration)
+        if selected is not None:
+            self.output_selector.load_channel(selected)
         channels=tuple(getattr(configuration,'square_pulse_channels',()))
         self._available_channels=channels
-        self.enabled.setEnabled(bool(channels))
+        self.enabled.setEnabled(self.channel.value() in channels)
         if channels:
-            if self.channel.value() not in channels: self.channel.setValue(channels[0])
-            self.status.setText("SquarePulse firmware detected; generator(s): "+', '.join(map(str,channels)))
+            if self.channel.value() not in channels:
+                self.enabled.setChecked(False)
+                self.status.setText("Saved output is unavailable. Click the front panel to select a connected SquarePulse IP.")
+            else:
+                self.status.setText("Click the front panel to select a connected SquarePulse output.")
         else:
             self.enabled.setChecked(False)
             self.status.setText("This firmware has no SquarePulse IP. Existing AWG and RF features remain available.")
@@ -97,7 +102,6 @@ class SquarePulsePanel(QtWidgets.QWidget):
     def settings_dict(self):
         return dict(enabled=self.enabled.isChecked(),gen_ch=self.channel.value(),
                     mute_on_finish=self.mute_on_finish.isChecked(),
-                    rc_enabled=self.rc_enabled.isChecked(), rc_tau_us=self.rc_tau_us.value(),
                     parameters={name:{key:(widget.isChecked() if key=='sweep' else widget.value())
                                       for key,widget in row.items()} for name,row in self.rows.items()})
 
@@ -105,8 +109,6 @@ class SquarePulsePanel(QtWidgets.QWidget):
         settings=settings or {}
         self.output_selector.load_channel(int(settings.get('gen_ch',7)), explicit=bool(settings))
         self.mute_on_finish.setChecked(settings.get('mute_on_finish',True))
-        self.rc_enabled.setChecked(settings.get('rc_enabled',False))
-        self.rc_tau_us.setValue(settings.get('rc_tau_us',1000.0))
         supported = self._available_channels is None or bool(self._available_channels)
         self.enabled.setChecked(bool(settings.get('enabled',False)) and supported)
         for name,row in self.rows.items():
@@ -121,11 +123,8 @@ class SquarePulsePanel(QtWidgets.QWidget):
         ch=self.channel.value()
         if self._available_channels is not None and ch not in self._available_channels:
             raise ValueError("Select a SquarePulse generator from the identified firmware")
-        value=lambda key:self.rows[key]['start' if self.rows[key]['sweep'].isChecked() else 'value'].value()
-        config=SquarePulseConfig(ch,value('frequency'),value('amplitude'),value('phase'),
-                                 full_scale_mv,self.mute_on_finish.isChecked(), self.rc_enabled.isChecked(), self.rc_tau_us.value())
-        axes=self.sweep_specs()
-        return attach_square_settings(sequence,config,axes,trigger)
+        configs, axes = decode_square_outputs(self.settings_dict(), full_scale_mv)
+        return attach_square_settings(sequence,configs,axes,trigger,follow_experiment_rc=True)
 
     def sweep_specs(self):
         if not self.enabled.isChecked(): return ()
@@ -135,13 +134,182 @@ class SquarePulsePanel(QtWidgets.QWidget):
                    for name,row in self.rows.items() if row['sweep'].isChecked())
 
     def allowed_output_channels(self, configuration):
-        return self.output_selector.allowed_channels(configuration)
+        allowed = self.output_selector.allowed_channels(configuration)
+        if self.ports_panel is not None:
+            used = {panel.channel.value() for panel in self.ports_panel._panels if panel is not self}
+            allowed = allowed - used
+        return allowed
 
     def front_panel_values(self):
         return dict(output_ch=self.channel.value(), output_nqz=1)
 
     def apply_front_panel_settings(self, values):
+        if int(values["output_ch"]) not in self.allowed_output_channels(self.output_selector.configuration):
+            raise ValueError("Select a supported square-wave output not assigned to another port")
         self.output_selector.apply(values)
+        self.enabled.setEnabled(True)
+        self.status.setText("Click the front panel to select a connected SquarePulse output.")
+
+
+class SquarePulsePortsPanel(QtWidgets.QWidget):
+    """Independent output editors sharing the Experiment RC configuration."""
+    changed = QtCore.pyqtSignal()
+    front_panel_requested = QtCore.pyqtSignal(object)
+    MAX_PORTS = 16
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._panels = []
+        self._configuration = None
+        layout = QtWidgets.QVBoxLayout(self)
+        self.rc_status = QtWidgets.QLabel()
+        self.rc_status.setWordWrap(True)
+        layout.addWidget(self.rc_status)
+        self._scroll = QtWidgets.QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._content = QtWidgets.QWidget(self._scroll)
+        self._content_layout = QtWidgets.QVBoxLayout(self._content)
+        self._content_layout.addStretch(1)
+        self._scroll.setWidget(self._content)
+        layout.addWidget(self._scroll, 1)
+        self.add_button = QtWidgets.QPushButton("Add SquarePulse Port")
+        self.add_button.clicked.connect(lambda: self.add_port())
+        layout.addWidget(self.add_button)
+        self.availability = QtWidgets.QLabel()
+        self.availability.setWordWrap(True)
+        layout.addWidget(self.availability)
+        self.set_rc_compensation(False, 1000.0)
+        self.add_port()
+
+    # Preserve the single-output editor API for saved integrations.
+    @property
+    def enabled(self): return self._panels[0].enabled
+    @property
+    def channel(self): return self._panels[0].channel
+    @property
+    def rows(self): return self._panels[0].rows
+    @property
+    def mute_on_finish(self): return self._panels[0].mute_on_finish
+    @property
+    def output_selector(self): return self._panels[0].output_selector
+
+    def allowed_output_channels(self, configuration):
+        return self._panels[0].allowed_output_channels(configuration)
+
+    def front_panel_values(self): return self._panels[0].front_panel_values()
+    def apply_front_panel_settings(self, values): self._panels[0].apply_front_panel_settings(values)
+
+    def panel_for_channel(self, channel):
+        return next(panel for panel in self._panels if panel.channel.value() == channel)
+
+    def active_channels(self):
+        return tuple(panel.channel.value() for panel in self._panels if panel.enabled.isChecked())
+
+    def _unused_channels(self):
+        used = {panel.channel.value() for panel in self._panels}
+        return sorted(set(getattr(self._configuration, 'square_pulse_channels', ())) - used)
+
+    def add_port(self, *, settings=None):
+        if len(self._panels) >= self.MAX_PORTS:
+            return None
+        unused = self._unused_channels()
+        if settings is None and self._configuration is not None and not unused:
+            return None
+        panel = SquarePulsePanel(self)
+        panel.ports_panel = self
+        if settings is not None:
+            panel.load_settings(settings)
+        elif unused:
+            panel.output_selector.load_channel(unused[0])
+        elif self._panels:
+            panel.output_selector.load_channel(next(ch for ch in range(256)
+                if ch not in {item.channel.value() for item in self._panels}))
+        if self._configuration is not None:
+            panel.set_configuration(self._configuration)
+        self._panels.append(panel)
+        self._content_layout.insertWidget(self._content_layout.count() - 1, panel)
+        panel.changed.connect(self._ports_changed)
+        panel.remove_requested.connect(self.remove_port)
+        panel.front_panel_requested.connect(self.front_panel_requested.emit)
+        self._ports_changed()
+        return panel
+
+    def remove_port(self, panel):
+        if panel not in self._panels:
+            return
+        self._panels.remove(panel)
+        self._content_layout.removeWidget(panel)
+        panel.hide(); panel.deleteLater()
+        self._ports_changed()
+
+    def _ports_changed(self):
+        for index, panel in enumerate(self._panels):
+            config = self._configuration
+            port = next((port for port in getattr(config, 'outputs', ())
+                         if panel.channel.value() in port.qick_channels), None)
+            location = f"{port.label} | " if port is not None else ""
+            panel.title.setText(f"SquarePulse port {index + 1} | {location}Generator {panel.channel.value()}")
+            if config is not None and hasattr(config, 'outputs'):
+                allowed = panel.allowed_output_channels(config)
+                panel.output_selector.preview.set_disabled_outputs(
+                    port.panel_index for port in config.outputs if not set(port.qick_channels) & allowed)
+        known = self._configuration is not None
+        self.add_button.setEnabled(len(self._panels) < self.MAX_PORTS and known and bool(self._unused_channels()))
+        self.availability.setText(
+            "Identify QICK to add connected SquarePulse ports." if not known else
+            f"{len(getattr(self._configuration, 'square_pulse_channels', ()))} SquarePulse IP output(s) detected. "
+            "Only unused SquarePulse outputs can be added.")
+        self.changed.emit()
+
+    def set_configuration(self, configuration):
+        self._configuration = configuration
+        with QtCore.QSignalBlocker(self):
+            used = set()
+            channels = set(getattr(configuration, 'square_pulse_channels', ()))
+            for panel in self._panels:
+                if not panel.output_selector._explicit_channel and channels - used:
+                    panel.output_selector.load_channel(min(channels - used))
+                original = panel.channel.value()
+                panel.set_configuration(configuration)
+                # A saved missing output must never silently select another DAC.
+                panel.output_selector.load_channel(original)
+                if original not in channels or original in used:
+                    panel.enabled.setChecked(False)
+                panel.enabled.setEnabled(original in channels and original not in used)
+                used.add(original)
+        self._ports_changed()
+
+    def set_rc_compensation(self, enabled, tau_us):
+        self.rc_status.setText(
+            f"RC compensation: enabled, tau = {tau_us:g} us (shared with Experiment)."
+            if enabled else "RC compensation: disabled in Experiment.")
+
+    def settings_dict(self):
+        entries = [panel.settings_dict() for panel in self._panels]
+        return entries[0] if len(entries) == 1 else {"outputs": entries}
+
+    def load_settings(self, settings):
+        entries = (settings or {}).get("outputs", [settings or {}])
+        if not isinstance(entries, (list, tuple)) or len(entries) > self.MAX_PORTS:
+            raise ValueError("SquarePulse outputs must be a list of at most 16 ports")
+        with QtCore.QSignalBlocker(self):
+            for panel in tuple(self._panels):
+                self.remove_port(panel)
+            for entry in entries:
+                self.add_port(settings=entry)
+            if self._configuration is not None:
+                self.set_configuration(self._configuration)
+        self._ports_changed()
+
+    def sweep_specs(self):
+        return tuple(axis for panel in self._panels for axis in panel.sweep_specs())
+
+    def attach_to_sequence(self, sequence, full_scale_mv, trigger):
+        for panel in self._panels:
+            if panel.enabled.isChecked():
+                panel.output_selector.validate()
+        configs, axes = decode_square_outputs(self.settings_dict(), full_scale_mv)
+        return attach_square_settings(sequence, configs, axes, trigger, follow_experiment_rc=True)
 
 
 class TriggeringPanel(QtWidgets.QWidget):

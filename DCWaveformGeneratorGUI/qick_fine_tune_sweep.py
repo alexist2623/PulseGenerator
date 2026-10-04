@@ -7126,7 +7126,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         if self.command_lead_tproc_cycles:
             self.synci(self.command_lead_tproc_cycles)
         self.square_marker_startup_lead = (
-            128 * int(self.square_pulse_config is not None)
+            128 * len(self.square_pulse_configs)
             + 128 * int(self._marker is not None)
         )
         if self.square_marker_startup_lead:
@@ -7163,7 +7163,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     f"reload sweep axis {axis_index} counter",
                 )
                 self._emit_axis_adds(axis_index, reset=True)
-        if self.square_pulse_config is not None and self.square_pulse_config.mute_on_finish:
+        if any(config.mute_on_finish for config in self.square_pulse_configs):
             self._emit_square_update(stop=True)
         self._emit_end_marker("experiment")
         if extended_epilogue:

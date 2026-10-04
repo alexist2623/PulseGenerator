@@ -1,5 +1,6 @@
 """SquarePulse settings and exact-word tProcessor hardware sweeps."""
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
+from collections.abc import Mapping
 from math import isfinite, ceil
 from numbers import Integral
 import numpy as np
@@ -111,18 +112,36 @@ class OutputTriggerConfig:
             raise ValueError("output trigger pin must be a nonnegative integer")
 
 
-def attach_square_settings(sequence, config=None, sweeps=(), trigger=None):
+def get_square_configs(owner):
+    """Read multi-output settings, including programs saved with the old API."""
+    configs = getattr(owner, "square_pulse_configs", None)
+    if configs is not None:
+        return tuple(configs)
+    config = getattr(owner, "square_pulse_config", None)
+    return () if config is None else (config,)
+
+
+def attach_square_settings(sequence, config=None, sweeps=(), trigger=None, *, follow_experiment_rc=False):
     """Attach independent SquarePulse Cartesian axes to an AWG sequence."""
     sweeps = tuple(sweeps)
-    if sweeps and config is None:
+    configs = () if config is None else ((config,) if isinstance(config, SquarePulseConfig) else tuple(config))
+    if follow_experiment_rc:
+        rc = getattr(sequence, "rc_compensation", None)
+        configs = tuple(replace(item, rc_enabled=rc is not None,
+                               rc_tau_us=rc.tau_us if rc is not None else 1000.0) for item in configs)
+    channels = {item.gen_ch for item in configs}
+    if len(channels) != len(configs):
+        raise ValueError("enabled SquarePulse output ports must use unique generator indices")
+    if sweeps and not configs:
         raise ValueError("SquarePulse sweep requires an enabled generator")
-    if len({axis.parameter for axis in sweeps}) != len(sweeps):
-        raise ValueError("only one sweep per SquarePulse parameter is allowed")
-    if any(axis.gen_ch != config.gen_ch for axis in sweeps):
+    if len({(axis.gen_ch, axis.parameter) for axis in sweeps}) != len(sweeps):
+        raise ValueError("only one sweep per SquarePulse parameter per output is allowed")
+    if any(axis.gen_ch not in channels for axis in sweeps):
         raise ValueError("SquarePulse sweep generator differs from selected output")
     sequence.sweeps = [axis for axis in sequence.sweeps if not isinstance(axis, SquarePulseSweep)] + list(sweeps)
     sequence._sweep_coordinate_cache = None
-    sequence.square_pulse_config = config
+    sequence.square_pulse_configs = configs
+    sequence.square_pulse_config = configs[0] if configs else None
     sequence.output_trigger_config = trigger or OutputTriggerConfig()
     return sequence
 
@@ -158,16 +177,50 @@ def decode_square_settings(settings, full_scale_mv=800.0):
     return config, tuple(axes)
 
 
+def decode_square_outputs(settings, full_scale_mv=800.0):
+    """Decode every port; legacy single-port settings remain readable."""
+    settings = settings or {}
+    if not isinstance(settings, dict):
+        raise ValueError("SquarePulse settings must be a mapping")
+    entries = settings.get("outputs", [settings])
+    if not isinstance(entries, (list, tuple)) or len(entries) > 16:
+        raise ValueError("SquarePulse outputs must be a list of at most 16 ports")
+    configs, axes = [], []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("SquarePulse output settings must be a mapping")
+        ch = entry.get("gen_ch", 7)
+        if callable(full_scale_mv):
+            scale = full_scale_mv(ch)
+        elif isinstance(full_scale_mv, Mapping):
+            scale = full_scale_mv.get(ch, full_scale_mv.get(str(ch)))
+            if scale is None and entry.get("enabled", False):
+                raise ValueError(f"Missing full-scale voltage for SquarePulse generator {ch}")
+        else:
+            scale = full_scale_mv
+        config, port_axes = decode_square_settings(entry, scale)
+        if config is not None:
+            configs.append(config)
+            axes.extend(port_axes)
+    if len({config.gen_ch for config in configs}) != len(configs):
+        raise ValueError("enabled SquarePulse output ports must use unique generator indices")
+    return tuple(configs), tuple(axes)
+
+
 class SquarePulseProgramMixin:
     """Use the existing DMEM pointer and Cartesian-loop allocator."""
     def _configure_square_pulse(self):
-        config = getattr(self.sequence, "square_pulse_config", None)
-        self.square_pulse_config = config
+        self.square_pulse_configs = get_square_configs(self.sequence)
+        self.square_pulse_config = next(iter(self.square_pulse_configs), None)
         self._square_initial_words = {}
-        if config is None:
+        if not self.square_pulse_configs:
             if any(isinstance(axis, SquarePulseSweep) for axis in self.sequence.sweep_axes):
                 raise ValueError("SquarePulse axes require generator settings")
             return
+        for config in self.square_pulse_configs:
+            self._configure_square_output(config)
+
+    def _configure_square_output(self, config):
         if config.gen_ch >= len(self.soccfg["gens"]):
             raise ValueError("SquarePulse generator is absent from this firmware")
         gen = self.soccfg["gens"][config.gen_ch]
@@ -179,20 +232,19 @@ class SquarePulseProgramMixin:
         self.declare_gen(ch=config.gen_ch, nqz=1)
         defaults = dict(frequency=config.frequency_mhz, amplitude=config.amplitude_mv, phase=config.phase_deg)
         for axis in self.sequence.sweep_axes:
-            if isinstance(axis, SquarePulseSweep):
+            if isinstance(axis, SquarePulseSweep) and axis.gen_ch == config.gen_ch:
                 defaults[axis.parameter] = axis.start
-        self._square_initial_words = {
+        self._square_initial_words[config.gen_ch] = {
             name: config.word(name, value, gen) for name, value in defaults.items()
         }
 
     def _square_point_table_models(self, axes):
         tables=[]
-        config=self.square_pulse_config
-        if config is None:
-            return tables
+        configs = {config.gen_ch: config for config in self.square_pulse_configs}
         for index,axis in enumerate(axes):
             if not isinstance(axis,SquarePulseSweep) or axis.count <= 1:
                 continue
+            config = configs[axis.gen_ch]
             register={"frequency":"freq", "phase":"phase", "amplitude":"gain"}[axis.parameter]
             page,reg=self._gen_regmap[(config.gen_ch,register)]
             gen = self.soccfg["gens"][config.gen_ch]
@@ -212,10 +264,12 @@ class SquarePulseProgramMixin:
         return tables
 
     def _emit_square_update(self, *, stop=False, reset_phase=False):
-        config=self.square_pulse_config
-        if config is None:
-            return
-        words=self._square_initial_words
+        for config in self.square_pulse_configs:
+            if not stop or config.mute_on_finish:
+                self._emit_square_output_update(config, stop=stop, reset_phase=reset_phase)
+
+    def _emit_square_output_update(self, config, *, stop, reset_phase):
+        words=self._square_initial_words[config.gen_ch]
         if stop:
             # Keep the final point's frequency/phase/amplitude registers intact.
             # Only disable output; the accumulator continues at its last rate.
@@ -228,7 +282,7 @@ class SquarePulseProgramMixin:
             self.set_pulse_registers(ch=config.gen_ch,style="square",freq=words["frequency"],
                 phase=words["phase"],gain=words["amplitude"],enable=True,reset_phase=reset_phase, **rc_params)
             for table in self._rf_point_tables:
-                if table["key"][0]=="square_point_table":
+                if table["key"][0]=="square_point_table" and table["gen_ch"] == config.gen_ch:
                     self.memr(table["page"],table["command_register"],table["pointer_register"],"load SquarePulse hardware sweep word")
         self.pulse(ch=config.gen_ch,t=0)
         # Reserve the fixed command pipeline and transport settling before
@@ -239,7 +293,8 @@ class SquarePulseProgramMixin:
         self.reset_timestamps()
 
     def _square_settings_metadata(self):
-        config=self.square_pulse_config
-        return {} if config is None else dict(square_pulse={
-            **asdict(config),"phase_continuous":True,"command_latency_cycles":int(self.soccfg["gens"][config.gen_ch].get("command_latency_cycles", 4)),
-            "sweep_execution":"tProcessor Cartesian loops with exact DMEM words"})
+        items = [{**asdict(config), "phase_continuous": True,
+                  "command_latency_cycles": int(self.soccfg["gens"][config.gen_ch].get("command_latency_cycles", 4)),
+                  "sweep_execution": "tProcessor Cartesian loops with exact DMEM words"}
+                 for config in self.square_pulse_configs]
+        return {} if not items else dict(square_pulse=items[0], square_pulses=items)
