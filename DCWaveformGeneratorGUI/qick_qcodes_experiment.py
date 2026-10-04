@@ -866,6 +866,7 @@ def build_runtime_ddr_readout(
         address=spec.address,
         force_overwrite=spec.force_overwrite,
         settle_seconds=spec.post_run_read_delay_seconds,
+        dc_compensation_timing=spec.dc_compensation_timing,
     )
 
 

@@ -1287,9 +1287,12 @@ class QickDdrReadoutSpec:
     nqz: int = 1
     fpga_trigger_delay_samples: Optional[int] = None
     fpga_trigger_delay_us: Optional[float] = None
+    dc_compensation_timing: str = "after_readout"
 
     def __post_init__(self) -> None:
         _bounded_int(self.ro_ch, "DDR readout channel", 0, 1_000_000)
+        if self.dc_compensation_timing not in ("after_readout", "overlap_readout"):
+            raise ValueError("dc_compensation_timing must be after_readout or overlap_readout")
         if not str(self.segment_name):
             raise ValueError("DDR segment_name must not be empty")
         _nonnegative_real(self.delay_us, "DDR delay_us")
@@ -2338,6 +2341,9 @@ def generate_qick_program_code(
         "segment_name": str(ddr_readout_spec.segment_name),
         "delay_us": float(ddr_readout_spec.delay_us),
         "samples_per_trigger": int(ddr_readout_spec.samples_per_trigger),
+        "dc_compensation_timing": ddr_readout_spec.dc_compensation_timing,
+        "fpga_trigger_delay_samples": ddr_readout_spec.fpga_trigger_delay_samples,
+        "fpga_trigger_delay_us": ddr_readout_spec.fpga_trigger_delay_us,
         "readout_frequency_mhz": float(ddr_readout_spec.readout_frequency_mhz),
         "margin_input_samples": int(ddr_readout_spec.margin_input_samples),
         "address": int(ddr_readout_spec.address),
@@ -2574,10 +2580,17 @@ def generate_qick_program_code(
             "    if FIR_DDR_CONFIG is None:",
             "        return None",
             "    cfg = FIR_DDR_CONFIG",
+            "    fpga_delay = cfg.get('fpga_trigger_delay_samples')",
+            "    if cfg.get('fpga_trigger_delay_us') is not None:",
+            "        from fir_ddr_profile import resolve_fir_ddr_profile",
+            "        fpga_delay = resolve_fir_ddr_profile(soccfg).trigger_delay_value_for_us(cfg['fpga_trigger_delay_us'])",
             "    return DdrFirReadoutConfig(",
             "        ro_ch=cfg['ro_ch'],",
             "        samples_per_trigger=cfg['samples_per_trigger'],",
             "        at_segment=cfg['segment_name'],",
+            "        dc_compensation_timing=cfg.get('dc_compensation_timing', 'after_readout'),",
+            "        fpga_trigger_delay_samples=fpga_delay,",
+            "        settle_seconds=cfg['post_run_read_delay_seconds'],",
             "        readout_freq_mhz=cfg['readout_frequency_mhz'],",
             "        trigger_delay_tproc_cycles=_delay_cycles(",
             "            cfg['delay_us'], TPROC_MHZ",

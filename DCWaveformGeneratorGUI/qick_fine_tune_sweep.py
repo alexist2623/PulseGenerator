@@ -838,9 +838,12 @@ class DdrFirReadoutConfig:
     force_overwrite: bool = False
     settle_seconds: float = 0.05
     fpga_trigger_delay_samples: Optional[int] = None
+    dc_compensation_timing: str = "after_readout"
 
     def __post_init__(self):
         _require_int(self.ro_ch, "ro_ch", 0)
+        if self.dc_compensation_timing not in ("after_readout", "overlap_readout"):
+            raise ValueError("dc_compensation_timing must be after_readout or overlap_readout")
         _require_int(self.samples_per_trigger, "samples_per_trigger", 1)
         if self.fpga_trigger_delay_samples is not None:
             _require_int(
@@ -1031,7 +1034,8 @@ class FineTuneSequence:
         The supplied positive amplitude is in normalized physical-AWG units.
         ``fixed_time`` ignores it for output generation and calculates the
         required voltage for ``fixed_duration_cycles``. Compensation is
-        applied after the pulse/readout portion of each shot. Disabling the
+        applied after the user pulse; FIR readout settings choose whether to
+        wait for input measurement completion before compensation. Disabling the
         option restores the original sequence behavior exactly.
         """
         if not isinstance(enabled, (bool, np.bool_)):
@@ -4371,6 +4375,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             for model in event_timing_models
             if not model.get("timing_only")
         )
+        fields.extend(self._build_capture_compensation_models(event_timing_models))
         rf_point_tables = self._build_rf_point_table_models(sweep_axes)
         rf_point_tables.extend(self._square_point_table_models(sweep_axes))
 
@@ -4489,6 +4494,13 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             next_dmem_addr -= 1
         else:
             self._bias_t_max_duration_dmem_addr = None
+
+        self._bias_capture_wait_addr = None
+        if self._overlap_dc_readout():
+            if next_dmem_addr <= 1:
+                raise RuntimeError("tProcessor DMEM has no room for capture completion timing")
+            self._bias_capture_wait_addr = next_dmem_addr
+            next_dmem_addr -= 1
 
         dynamic_duration_fields = [
             field
@@ -6081,6 +6093,82 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             words=words,
         )
 
+    def _overlap_dc_readout(self):
+        return (self.ddr_readout_config is not None
+                and self.ddr_readout_config.dc_compensation_timing == "overlap_readout"
+                and self.sequence.bias_t_compensation is not None)
+
+    def _build_capture_compensation_models(self, event_models):
+        """Keep capture and output barriers separate, including duration sweeps."""
+        self._capture_compensation_models = ()
+        if not self._overlap_dc_readout():
+            return ()
+        axes = self.sequence.sweep_axes
+        zero_deltas = tuple(0 for _ in axes)
+        by_key = {model["key"]: model for model in event_models}
+        page, scratch = self._gen_regmap[(self.awg_channels[0], "duration")]
+        models = []
+
+        def add(name, base, deltas):
+            models.append(dict(key=("capture_compensation", name),
+                               register_name="capture_compensation_time",
+                               base=int(base), axis_deltas=tuple(deltas),
+                               page=int(page), command_register=int(scratch)))
+
+        add("wave_end", int(self.timing["segment_ends"][-1]) + max(self._channel_slots.values()),
+            self._extension_axis_deltas(len(self.sequence.segments) - 1, include_current=True))
+        for index, _rf in enumerate(self.rf_pulse_configs):
+            key = ("event_time", "rf_stop", index)
+            add(f"rf_end_{index}", self.aux_timing[f"rf_{index}_end"],
+                by_key.get(key, {}).get("axis_deltas", zero_deltas))
+        # The readout command may share a timed-output FIFO with generators.
+        add("readout_start", self.aux_timing["ddr_readout_start"],
+            by_key.get(("event_time", "ddr_readout"), {}).get("axis_deltas", zero_deltas))
+        if self._marker_start_enabled():
+            add("marker_end", self._marker_start_time() + self._marker["width"] + 1, zero_deltas)
+        add("capture_end", self.aux_timing["ddr_capture_end"],
+            by_key.get(("timing_only", "ddr_capture_end"), {}).get("axis_deltas", zero_deltas))
+        self._capture_compensation_models = tuple(models)
+        return tuple(dict(model) for model in models if any(model["axis_deltas"]))
+
+    def _emit_overlap_compensation_start(self):
+        """Advance to this point's output end; save the remaining capture time."""
+        ch = self.awg_channels[0]
+        page, start = self._gen_regmap[(ch, "target")]
+        _, scratch = self._gen_regmap[(ch, "duration")]
+        # Command registers are free scratch after all point commands are queued.
+        self.safe_regwi(page, start, 0, "start output completion barrier")
+        for index, model in enumerate(self._capture_compensation_models[:-1]):
+            self._write_swept_or_static_register(model["key"], page, scratch, model["base"],
+                                                 "DC overlap output end")
+            label = f"DC_OVERLAP_MAX_{index}"
+            self.condj(page, start, ">=", scratch, label, "retain latest output end")
+            self.mathi(page, start, scratch, "+", 0, "update latest output end")
+            self.label(label)
+            self.mathi(page, scratch, scratch, "+", 0)
+        capture = self._capture_compensation_models[-1]
+        self._write_swept_or_static_register(capture["key"], page, scratch, capture["base"],
+                                             "DC overlap capture end")
+        self.math(page, scratch, scratch, "-", start, "capture time remaining after output end")
+        guard = int(self.sequence.bias_t_compensation.inter_output_gap_cycles)
+        if guard:
+            self.mathi(page, scratch, scratch, "-", guard, "subtract common DC guard")
+        self.condj(page, scratch, ">=", 0, "DC_OVERLAP_REMAINING", "clamp completed capture to zero")
+        self.safe_regwi(page, scratch, 0)
+        self.label("DC_OVERLAP_REMAINING")
+        self.memwi(page, scratch, self._bias_capture_wait_addr, "save capture completion offset")
+        self.sync(page, start, "advance to output end while FIR capture continues")
+        self.reset_timestamps()
+
+    def _emit_capture_end_max(self, page, end_register):
+        """Extend compensation completion to capture completion, even at zero area."""
+        _, scratch = self._gen_regmap[(self.awg_channels[0], "step")]
+        self.memri(page, scratch, self._bias_capture_wait_addr, "load remaining FIR capture time")
+        self.condj(page, end_register, ">=", scratch, "DC_CAPTURE_DONE", "wait for DC and FIR capture")
+        self.mathi(page, end_register, scratch, "+", 0, "extend point through FIR capture")
+        self.label("DC_CAPTURE_DONE")
+        self.mathi(page, end_register, end_register, "+", 0)
+
     def _emit_bias_t_compensation(self):
         """Schedule simultaneous SET starts and per-channel SET-zero stops."""
         config = self.sequence.bias_t_compensation
@@ -6320,12 +6408,16 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             "include common Bias-T command lead",
         )
         # RTL sync is additive: advance once to the latest channel stop.
+        if self._overlap_dc_readout():
+            self.label(no_compensation_label)
+            self._emit_capture_end_max(final_page, final_register)
         self.sync(
             final_page,
             final_register,
             "advance to latest simultaneous Bias-T stop",
         )
-        self.label(no_compensation_label)
+        if not self._overlap_dc_readout():
+            self.label(no_compensation_label)
         self.mathi(
             final_page,
             final_register,
@@ -6488,12 +6580,16 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             final_offset,
             "fixed-time Bias-T latest stop offset",
         )
+        if self._overlap_dc_readout():
+            self.label(no_compensation_label)
+            self._emit_capture_end_max(final_page, final_register)
         self.sync(
             final_page,
             final_register,
             "advance to fixed-time Bias-T stop",
         )
-        self.label(no_compensation_label)
+        if not self._overlap_dc_readout():
+            self.label(no_compensation_label)
         self.mathi(
             final_page,
             final_register,
@@ -6684,7 +6780,10 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             # Move the reference beyond all statically timed AWG/RF/readout
             # events. Dynamic compensation uses one common start timestamp,
             # channel-specific stop timestamps, and one final max-duration sync.
-            self.sync_all(0)
+            if self._overlap_dc_readout():
+                self._emit_overlap_compensation_start()
+            else:
+                self.sync_all(0)
             if self.sequence.bias_t_compensation is not None:
                 if self.sequence.bias_t_compensation.inter_output_gap_cycles:
                     self.synci(
@@ -7466,6 +7565,65 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             accumulation_repetitions=repetitions,
         )
 
+    def fir_dc_timing_preview(self, point_index=0):
+        """Compiled per-point timing in microseconds, relative to its reference.
+
+        Input coverage is group-delay referenced, not the finite FIR impulse
+        response's support. DDR write bounds are nominal sample-grid bounds;
+        continuous decimation may move an edge by one stored-sample period.
+        """
+        if self.ddr_readout_config is None:
+            return None
+        point_index = _require_int(point_index, "point_index", 0)
+        if point_index >= self.sequence.sweep_point_count:
+            raise IndexError("sweep point is outside the configured grid")
+        models = {model["key"]: model for model in self._event_timing_models}
+        def event(key, base):
+            return self._sweep_model_value(models[key], point_index) if key in models else int(base)
+        wave_model = dict(base=int(self.timing["segment_ends"][-1]) + max(self._channel_slots.values()),
+                          axis_deltas=self._extension_axis_deltas(len(self.sequence.segments)-1, include_current=True))
+        wave_end = self._sweep_model_value(wave_model, point_index)
+        trigger = event(("event_time", "ddr_trigger"), self.aux_timing["ddr_trigger_time"])
+        capture_end = event(("timing_only", "ddr_capture_end"), self.aux_timing["ddr_capture_end"])
+        ratio = self.tproc_mhz / self._fir_cfg["input_fs_mhz"]
+        delay = self._fir_cfg["trigger_delay_input_cycles"] * ratio
+        group_delay = self._fir_cfg["group_delay_input_samples"] * ratio
+        span = self.ddr_readout_config.samples_per_trigger * self._fir_cfg["decimation"] * ratio
+        storage_start = trigger + delay
+        dc = []
+        if self.sequence.bias_t_compensation is not None:
+            if self._overlap_dc_readout():
+                barrier = max(self._sweep_model_value(model, point_index)
+                              for model in self._capture_compensation_models[:-1])
+            else:
+                barrier = int(self.aux_timing["bias_t_static_end"])
+            start = (barrier + self.sequence.bias_t_compensation.inter_output_gap_cycles
+                     + self.bias_t_simultaneous_start_lead_cycles)
+            for field in self._bias_t_fields:
+                value = self._sweep_model_value(field, point_index)
+                if self._bias_t_mode == "fixed_time":
+                    duration = int(field["fixed_duration_tproc_cycles"]) if value else 0
+                else:
+                    frac = int(field["duration_frac_bits"])
+                    duration = (abs(value) + (1 << (frac-1))) >> frac
+                latency = self.awg_output_latency_tproc
+                dc.append(dict(output=self.sequence.output_names[field["output_index"]],
+                               active=bool(duration),
+                               command_start_us=start/self.tproc_mhz if duration else None,
+                               dac_start_us=(start+latency)/self.tproc_mhz if duration else None,
+                               dac_end_us=(start+duration+latency)/self.tproc_mhz if duration else None))
+        return dict(point_index=point_index, policy=self.ddr_readout_config.dc_compensation_timing,
+                    stored_samples=self.ddr_readout_config.samples_per_trigger,
+                    user_pulse_end_us=wave_end/self.tproc_mhz,
+                    trigger_us=trigger/self.tproc_mhz,
+                    input_end_barrier_us=capture_end/self.tproc_mhz,
+                    storage_start_us=storage_start/self.tproc_mhz,
+                    storage_end_us=(storage_start+span)/self.tproc_mhz,
+                    group_delay_referenced_input_start_us=(storage_start-group_delay)/self.tproc_mhz,
+                    group_delay_referenced_input_end_us=(storage_start+span-group_delay)/self.tproc_mhz,
+                    stored_sample_period_us=self._fir_cfg["decimation"]/self._fir_cfg["input_fs_mhz"],
+                    dc_outputs=dc)
+
     def summary(self):
         dmem_addresses = {
             int(field["dmem_addr"])
@@ -7694,6 +7852,9 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 else 0
             ),
             "aux_timing": dict(self.aux_timing),
+            "dc_compensation_timing": (self.ddr_readout_config.dc_compensation_timing
+                                       if self.ddr_readout_config is not None else None),
+            "fir_dc_timing_first_point": self.fir_dc_timing_preview(0),
         }
 
 

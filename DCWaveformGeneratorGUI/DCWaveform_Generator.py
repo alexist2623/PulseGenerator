@@ -572,6 +572,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
 }
 
 DEFAULT_RF_READOUT_SETTINGS = {
+    "dc_compensation_timing": "after_readout",
     "enabled": False,
     "ro_ch": 0,
     "segment_name": "set_0",
@@ -6551,6 +6552,20 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self._delay_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
         form.addRow("Stored FIR samples:", self.samples)
+        self.dc_compensation_timing = QtWidgets.QComboBox()
+        self.dc_compensation_timing.addItem("Finish FIR measurement at 0, then compensate", "after_readout")
+        self.dc_compensation_timing.addItem("Include DC compensation in FIR measurement", "overlap_readout")
+        self.dc_compensation_timing.setToolTip(
+            "When FIR measurement extends beyond the AWG pulse: hold the AWG target at 0 "
+            "until measurement finishes, or start DC compensation while measuring. "
+            "Stored sample count is unchanged. Applies when DC compensation is enabled."
+        )
+        form.addRow("DC compensation timing:", self.dc_compensation_timing)
+        timing_note = QtWidgets.QLabel(
+            "FIR DDR + DC compensation only. 0 means the AWG target before RC correction.\n"
+            "Show QICK Program > FIR / DC timing previews each sweep point.")
+        timing_note.setWordWrap(True)
+        form.addRow(timing_note)
         form.addRow("Readout/DDC frequency:", self.frequency_mhz)
         self.input_condition_label = QtWidgets.QLabel("Input attenuation:")
         form.addRow(self.input_condition_label, self.input_condition_stack)
@@ -6597,6 +6612,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             self.filter_bandwidth,
             self.nqz,
             self.margin_samples,
+            self.dc_compensation_timing,
             self.override_fpga_trigger_delay,
             self.fpga_trigger_delay_us,
             self.post_run_read_delay,
@@ -6842,6 +6858,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             segment_name=str(self.segment.currentData()),
             delay_us=_time_to_ns(self.delay.value(), self._time_unit) / 1000.0,
             samples_per_trigger=self.samples.value(),
+            dc_compensation_timing=str(self.dc_compensation_timing.currentData()),
             readout_frequency_mhz=self.frequency_mhz.value(),
             margin_input_samples=self.margin_samples.value(),
             fpga_trigger_delay_us=(
@@ -6943,6 +6960,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             "segment_name": spec.segment_name,
             "delay_us": spec.delay_us,
             "samples_per_trigger": spec.samples_per_trigger,
+            "dc_compensation_timing": spec.dc_compensation_timing,
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
             "fpga_trigger_delay_us": spec.fpga_trigger_delay_us,
@@ -7011,6 +7029,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
             ),
             delay_us=float(data["delay_us"]),
             samples_per_trigger=int(data["samples_per_trigger"]),
+            dc_compensation_timing=data.get("dc_compensation_timing", "after_readout"),
             readout_frequency_mhz=float(data.get("readout_frequency_mhz", 0.0)),
             margin_input_samples=int(data.get("margin_input_samples", 1024)),
             fpga_trigger_delay_us=(
@@ -7060,6 +7079,8 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
                 _time_from_ns(spec.delay_us * 1000.0, self._time_unit)
             )
             self.samples.setValue(spec.samples_per_trigger)
+            self.dc_compensation_timing.setCurrentIndex(
+                self.dc_compensation_timing.findData(spec.dc_compensation_timing))
             self.frequency_mhz.setValue(spec.readout_frequency_mhz)
             self.input_board_type.setCurrentText(spec.input_board_type)
             self.margin_samples.setValue(spec.margin_input_samples)
@@ -8882,7 +8903,24 @@ class QickAssemblyDialog(QtWidgets.QDialog):
             QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         )
         self.assembly_text.setPlainText(self._assembly)
-        layout.addWidget(self.assembly_text, 1)
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.tabs.addTab(self.assembly_text, "Assembly")
+        program = result.get("program")
+        if program is not None and getattr(program, "ddr_readout_config", None) is not None:
+            self._timing_program = program
+            timing_page = QtWidgets.QWidget()
+            timing_layout = QtWidgets.QVBoxLayout(timing_page)
+            self.timing_point = QtWidgets.QSpinBox()
+            self.timing_point.setRange(0, program.sequence.sweep_point_count - 1)
+            self.timing_point.setPrefix("Sweep point (0-based): ")
+            timing_layout.addWidget(self.timing_point)
+            self.timing_text = QtWidgets.QPlainTextEdit()
+            self.timing_text.setReadOnly(True)
+            timing_layout.addWidget(self.timing_text)
+            self.timing_point.valueChanged.connect(self._update_fir_dc_timing)
+            self._update_fir_dc_timing(0)
+            self.tabs.addTab(timing_page, "FIR / DC timing")
+        layout.addWidget(self.tabs, 1)
 
         self.status_label = QtWidgets.QLabel(
             "Compiled from the current GUI settings and connected QICK HWH."
@@ -8900,6 +8938,34 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         self.save_button.clicked.connect(self._save_assembly)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_fir_dc_timing(self, point):
+        # A bound Qt slot avoids retaining this dialog through a closure cycle.
+        info = self._timing_program.fir_dc_timing_preview(point)
+        lines = [f"Policy: {info['policy']}", f"Stored FIR samples: {info['stored_samples']}",
+                 "Times in us, relative to this repetition's reference.", ""]
+        for key, label in (
+            ('user_pulse_end_us', 'User AWG pulse ends (DAC)'),
+            ('trigger_us', 'DDR trigger command'),
+            ('input_end_barrier_us', 'Input measurement barrier (includes margin)'),
+            ('storage_start_us', 'DDR storage starts (nominal)'),
+            ('storage_end_us', 'DDR storage ends (nominal)'),
+            ('group_delay_referenced_input_start_us', 'Input window starts (group-delay referenced)'),
+            ('group_delay_referenced_input_end_us', 'Input window ends (group-delay referenced)')):
+            lines.append(f"{label}: {info[key]:.6f}")
+        for output in info['dc_outputs']:
+            lines.append("")
+            if output['active']:
+                lines.append(f"{output['output']} DC compensation: "
+                             f"{output['dac_start_us']:.6f} to {output['dac_end_us']:.6f} us (DAC)")
+            else:
+                lines.append(f"{output['output']}: no DC pulse (zero quantized area)")
+        lines.extend(["", "DDR storage is delayed by the firmware capture delay.",
+                      "Continuous decimation can shift a storage edge by up to one sample period:",
+                      f"{info['stored_sample_period_us']:.6f} us. FIR response also spans adjacent input times.",
+                      "RC correction can leave a DAC offset while the nominal AWG target is zero.",
+                      "The waveform panel shows ideal segments; this view includes readout scheduling."])
+        self.timing_text.setPlainText("\n".join(lines))
 
     def _copy_assembly(self) -> None:
         QtWidgets.QApplication.clipboard().setText(self._assembly)
@@ -14619,6 +14685,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 f"{label} samples_per_trigger",
                 minimum=1,
             ),
+            dc_compensation_timing=entry.get("dc_compensation_timing", "after_readout"),
             readout_frequency_mhz=float(entry["readout_frequency_mhz"]),
             margin_input_samples=self._json_int(
                 entry["margin_input_samples"],
@@ -14679,6 +14746,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "segment_name": spec.segment_name,
             "delay_us": spec.delay_us,
             "samples_per_trigger": spec.samples_per_trigger,
+            "dc_compensation_timing": spec.dc_compensation_timing,
             "readout_frequency_mhz": spec.readout_frequency_mhz,
             "margin_input_samples": spec.margin_input_samples,
             "fpga_trigger_delay_us": spec.fpga_trigger_delay_us,
@@ -15726,6 +15794,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "RF readout samples_per_trigger",
                 minimum=1,
             ),
+            dc_compensation_timing=raw_readout.get("dc_compensation_timing", "after_readout"),
             readout_frequency_mhz=float(raw_readout["readout_frequency_mhz"]),
             margin_input_samples=self._json_int(
                 raw_readout["margin_input_samples"],
@@ -15785,6 +15854,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "segment_name": readout_spec.segment_name,
             "delay_us": readout_spec.delay_us,
             "samples_per_trigger": readout_spec.samples_per_trigger,
+            "dc_compensation_timing": readout_spec.dc_compensation_timing,
             "readout_frequency_mhz": readout_spec.readout_frequency_mhz,
             "margin_input_samples": readout_spec.margin_input_samples,
             "fpga_trigger_delay_us": readout_spec.fpga_trigger_delay_us,
