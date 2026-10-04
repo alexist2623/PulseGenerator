@@ -75,7 +75,14 @@ class SquarePulseConfig:
         try:
             from qick.square_pulse import frequency_word, phase_word
         except ImportError as exc:
-            raise RuntimeError("Update the QSTL_QICK Python library to use SquarePulse firmware") from exc
+            if isinstance(exc, ModuleNotFoundError) and exc.name in ("qick", "qick.square_pulse"):
+                raise RuntimeError(
+                    "The GUI's QSTL_QICK Python installation lacks SquarePulse support; "
+                    "update that installation and restart the GUI."
+                ) from exc
+            raise RuntimeError(
+                f"Cannot load SquarePulse helpers in the GUI Python environment: {exc}"
+            ) from exc
         if parameter == "frequency":
             return frequency_word(value, float(gencfg["f_dds"]))
         if parameter == "phase":

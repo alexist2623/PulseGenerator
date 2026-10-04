@@ -93,6 +93,7 @@ class QickFrontPanelConfiguration:
     output_trigger_pins: Tuple[str, ...] = ()
     awg_tuning_channels: Tuple[int, ...] = ()
     dac_current_settings: Optional[dict] = None
+    output_trigger_kinds: Tuple[str, ...] = ()
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -115,6 +116,30 @@ _CARD_RE = re.compile(
     r"(?:\s+card\s+has\s+ports\s+\[([^\]]*)\])?",
     re.IGNORECASE,
 )
+
+
+def digital_trigger_outputs(configuration) -> Dict[int, int]:
+    """Map ZCU216 DIGITAL I/O SMA numbers to QICK output_pins indices.
+
+    RF216 mainboard SPARE0..5 are the external digital SMA nets. The
+    output_pins list contains only HWH-traced tProcessor outputs, and its
+    list index is NOT the SMA number. Unknown nets are never guessed.
+    """
+    if configuration is None:
+        return {}
+    pins = getattr(configuration, "output_trigger_pins", ())
+    kinds = getattr(configuration, "output_trigger_kinds", ())
+    outputs = {}
+    ambiguous = set()
+    for pin_index, name in enumerate(pins):
+        match = re.fullmatch(r"SPARE([0-5])_1V8", str(name), re.IGNORECASE)
+        if match is None or (kinds and kinds[pin_index] not in ("output", "dport")):
+            continue
+        panel_index = int(match.group(1))
+        if panel_index in outputs:
+            ambiguous.add(panel_index)
+        outputs[panel_index] = pin_index
+    return {index: pin for index, pin in outputs.items() if index not in ambiguous}
 
 
 def _config_mapping(soccfg: Any) -> Mapping[str, Any]:
@@ -289,6 +314,7 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             or gen.get("gen_type") == "awg_tuning"
         ),
         output_trigger_pins=tuple(str(pin[-1]) for pin in (config.get("tprocs") or [{}])[0].get("output_pins",())),
+        output_trigger_kinds=tuple(str(pin[0]) for pin in (config.get("tprocs") or [{}])[0].get("output_pins",())),
         **fir_values,
         **ddr_values,
     )
@@ -305,6 +331,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         "path": QtCore.QRectF(0.0, 0.0, 1200.0, 410.0),
         "output": QtCore.QRectF(15.0, 0.0, 785.0, 230.0),
         "input": QtCore.QRectF(800.0, 0.0, 395.0, 230.0),
+        "io": QtCore.QRectF(815.0, 242.0, 330.0, 122.0),
     }
 
     def __init__(self, parent=None):
@@ -319,6 +346,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         self._selected_output: Optional[int] = None
         self._selected_input: Optional[int] = None
         self._selected_bias: Optional[int] = None
+        self._selected_io: Optional[int] = None
         self._hover: Optional[Tuple[str, int]] = None
         self._scope = "path"
         self._port_centers = self._build_port_centers()
@@ -352,15 +380,22 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                 55.0 + 40.0 * visual_index,
                 310.0,
             )
+            centers[("io", panel_index)] = QtCore.QPointF(
+                845.0 + 39.0 * visual_index, 310.0,
+            )
         return centers
 
     def sizeHint(self) -> QtCore.QSize:
+        if self._scope == "io":
+            return QtCore.QSize(540, 200)
         return QtCore.QSize(900, 308)
 
     def hasHeightForWidth(self) -> bool:
         return True
 
     def heightForWidth(self, width: int) -> int:
+        if self._scope == "io":
+            return max(120, round(width * 122 / 330))
         return max(164, round(width * self.LOGICAL_HEIGHT / self.LOGICAL_WIDTH))
 
     def set_configuration(self, configuration: QickFrontPanelConfiguration) -> None:
@@ -374,7 +409,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     def set_scope(self, scope: str) -> None:
         """Show and activate only the connector direction being edited."""
         if scope not in self.SCOPE_RECTS:
-            raise ValueError("front-panel scope must be path, output, or input")
+            raise ValueError("front-panel scope must be path, output, input, or io")
         self._scope = scope
         if self._hover is not None and not self._direction_is_visible(
             self._hover[0]
@@ -394,19 +429,27 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
             self._selected_input = panel_index
         elif direction == "bias":
             self._selected_bias = panel_index
+        elif direction == "io":
+            self._selected_io = panel_index
         else:
-            raise ValueError("direction must be output, input, or bias")
+            raise ValueError("direction must be output, input, bias, or io")
         self.update()
 
     def select_port(self, direction: str, panel_index: int) -> None:
         """Select a port programmatically; useful for keyboard flows and tests."""
-        if direction not in ("output", "input", "bias"):
-            raise ValueError("direction must be output, input, or bias")
-        if not self._direction_is_visible(direction):
-            return
-        if direction == "output" and panel_index in getattr(self, "_disabled_outputs", ()):
+        if direction not in ("output", "input", "bias", "io"):
+            raise ValueError("direction must be output, input, bias, or io")
+        if not self.is_port_selectable(direction, panel_index):
             return
         self.port_clicked.emit(direction, int(panel_index))
+
+    def is_port_selectable(self, direction: str, panel_index: int) -> bool:
+        if (direction, panel_index) not in self._port_centers or not self._direction_is_visible(direction):
+            return False
+        if direction == "io":
+            # Existing RF/bias editors must not receive digital-port clicks.
+            return self._scope == "io" and panel_index in digital_trigger_outputs(self._configuration)
+        return not (direction == "output" and panel_index in getattr(self, "_disabled_outputs", ()))
 
     def _display_transform(self) -> Tuple[float, float, float, float, float]:
         view = self.SCOPE_RECTS[self._scope]
@@ -442,10 +485,7 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             hit = self._hit_test(event.pos())
-            if hit is not None and not (
-                hit[0] == "output"
-                and hit[1] in getattr(self, "_disabled_outputs", ())
-            ):
+            if hit is not None and self.is_port_selectable(*hit):
                 self.port_clicked.emit(*hit)
                 event.accept()
                 return
@@ -455,7 +495,15 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         hover = self._hit_test(event.pos())
         if hover != self._hover:
             self._hover = hover
-            if hover is None or self._configuration is None:
+            if hover is not None and hover[0] == "io":
+                pin = digital_trigger_outputs(self._configuration).get(hover[1])
+                self.setToolTip(
+                    f"IO{hover[1]} | " + (
+                        f"{self._configuration.output_trigger_pins[pin]} | QICK output pin {pin}"
+                        if pin is not None else "No connected tProcessor trigger output in the identified firmware"
+                    )
+                )
+            elif hover is None or self._configuration is None:
                 if hover is not None and hover[0] == "bias":
                     self.setToolTip(
                         f"BIAS{hover[1]} | DAC11001 | -10 V to +10 V"
@@ -513,6 +561,8 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
             else None
         )
         mapped = direction in ("bias", "io") or bool(port and port.qick_channels)
+        if direction == "io":
+            mapped = index in digital_trigger_outputs(self._configuration)
         if direction == "output" and index in getattr(self, "_disabled_outputs", ()):
             mapped = False
         selected = (
@@ -522,9 +572,11 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
             if direction == "input"
             else index == self._selected_bias
             if direction == "bias"
+            else index == self._selected_io and mapped
+            if direction == "io"
             else False
         )
-        hovered = key == self._hover
+        hovered = key == self._hover and (direction != "io" or mapped)
         outline = QtGui.QColor(
             "#32b6d8"
             if direction == "output"
@@ -535,12 +587,13 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         if not (selected or hovered):
             outline = QtGui.QColor("#49362b" if mapped else "#756c67")
         painter.setPen(QtGui.QPen(outline, 4.0 if selected else 2.0))
-        painter.setBrush(QtGui.QColor("#d7a83d" if mapped else "#9d8a66"))
+        gray = direction == "io" and not mapped
+        painter.setBrush(QtGui.QColor("#888888" if gray else "#d7a83d" if mapped else "#9d8a66"))
         painter.drawEllipse(center, 16.0, 16.0)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#6d511e"), 1.5))
-        painter.setBrush(QtGui.QColor("#f3df9b"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#555555" if gray else "#6d511e"), 1.5))
+        painter.setBrush(QtGui.QColor("#bbbbbb" if gray else "#f3df9b"))
         painter.drawEllipse(center, 10.0, 10.0)
-        painter.setBrush(QtGui.QColor("#8b6d2c"))
+        painter.setBrush(QtGui.QColor("#666666" if gray else "#8b6d2c"))
         painter.drawEllipse(center, 4.0, 4.0)
 
     def _draw_card_group(
@@ -623,6 +676,10 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         body_font.setBold(False)
         body_font.setPointSizeF(8.0)
         painter.setFont(body_font)
+        if self._scope == "io":
+            self._draw_digital_io(painter)
+            painter.end()
+            return
         for visual_slot in range(4):
             if self._direction_is_visible("output"):
                 self._draw_card_group(
@@ -662,7 +719,6 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor("#f2d7a1"))
         painter.drawText(QtCore.QRectF(35.0, 250.0, 330.0, 20.0), QtCore.Qt.AlignCenter, "BIAS OUTPUTS")
         painter.drawText(QtCore.QRectF(495.0, 250.0, 310.0, 20.0), QtCore.Qt.AlignCenter, "STATUS LEDS")
-        painter.drawText(QtCore.QRectF(825.0, 250.0, 320.0, 20.0), QtCore.Qt.AlignCenter, "DIGITAL I/O")
 
         for visual_index in range(8):
             panel_index = 7 - visual_index
@@ -697,21 +753,25 @@ class QickFrontPanelCanvas(QtWidgets.QWidget):
                 f"LED{panel_index}",
             )
 
-        for visual_index in range(8):
-            panel_index = 7 - visual_index
-            center = QtCore.QPointF(845.0 + 39.0 * visual_index, 310.0)
-            self._draw_sma(painter, ("io", panel_index), center)
-            painter.setPen(QtGui.QColor("#f5e4c4"))
-            painter.drawText(
-                QtCore.QRectF(center.x() - 20.0, 332.0, 40.0, 18.0),
-                QtCore.Qt.AlignCenter,
-                f"IO{panel_index}",
-            )
+        self._draw_digital_io(painter)
 
         self._draw_indicator(painter, QtCore.QPointF(1166.0, 310.0), QtGui.QColor("#36b66a"))
         painter.setPen(QtGui.QColor("#f5e4c4"))
         painter.drawText(QtCore.QRectF(1138.0, 332.0, 56.0, 18.0), QtCore.Qt.AlignCenter, "POWER")
         painter.end()
+
+    def _draw_digital_io(self, painter: QtGui.QPainter) -> None:
+        painter.setPen(QtGui.QColor("#f2d7a1"))
+        painter.drawText(QtCore.QRectF(825.0, 250.0, 310.0, 20.0), QtCore.Qt.AlignCenter, "DIGITAL I/O")
+        for visual_index in range(8):
+            panel_index = 7 - visual_index
+            center = self._port_centers[("io", panel_index)]
+            self._draw_sma(painter, ("io", panel_index), center)
+            painter.setPen(QtGui.QColor("#f5e4c4"))
+            painter.drawText(
+                QtCore.QRectF(center.x() - 20.0, 332.0, 40.0, 18.0),
+                QtCore.Qt.AlignCenter, f"IO{panel_index}",
+            )
 
 
 class QickFrontPanelPreview(QickFrontPanelCanvas):

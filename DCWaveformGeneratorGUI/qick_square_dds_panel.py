@@ -3,8 +3,10 @@ from dataclasses import asdict
 from PyQt5 import QtCore, QtWidgets
 try:
     from .qick_square_output import SquareOutputSelector
+    from .qick_front_panel import QickFrontPanelCanvas, digital_trigger_outputs
 except ImportError:
     from qick_square_output import SquareOutputSelector
+    from qick_front_panel import QickFrontPanelCanvas, digital_trigger_outputs
 try:
     from .qick_square_dds import SquarePulseConfig, SquarePulseSweep, OutputTriggerConfig, attach_square_settings
 except ImportError:
@@ -145,36 +147,91 @@ class SquarePulsePanel(QtWidgets.QWidget):
 class TriggeringPanel(QtWidgets.QWidget):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self._available_pins=None
+        self._configuration = None
+        self._available_pins = None
+        self._io_to_pin = {}
+        self._saved_pin = 0
+        self._selected_name = None
         layout=QtWidgets.QFormLayout(self)
         self.enabled=QtWidgets.QCheckBox("Enable external output trigger")
-        self.pin=QtWidgets.QSpinBox(); self.pin.setRange(0,255)
+        self.enabled.setEnabled(False)
+        self.canvas = QickFrontPanelCanvas(self)
+        self.canvas.set_scope("io")
+        self.canvas.setMinimumSize(330, 122)
+        self.canvas.setMaximumHeight(200)
+        self.canvas.port_clicked.connect(self._select_sma)
+        self.pin = QtWidgets.QComboBox()
+        self.pin.setPlaceholderText("Identify QICK, then select a connected SMA")
+        self.pin.setEnabled(False)
+        self.pin.currentIndexChanged.connect(self._selection_changed)
         self.scope=QtWidgets.QComboBox()
         self.scope.addItem("Each repetition loop","loop"); self.scope.addItem("Entire experiment","experiment")
         self.edge=QtWidgets.QComboBox()
         for label,value in (("Start","start"),("End","end"),("Start and end","both")): self.edge.addItem(label,value)
         self.width=spin(1.0,' µs',0.001,1e6,6)
-        self.status=QtWidgets.QLabel("Output pin numbers follow the loaded firmware. Identify QICK to show available pins.")
+        self.status=QtWidgets.QLabel("Identify QICK to discover connected trigger outputs. Gray SMAs cannot be selected.")
         self.status.setWordWrap(True)
-        for label,widget in (("",self.enabled),("Output pin",self.pin),("Scope",self.scope),
+        for label,widget in (("",self.enabled),("",self.canvas),("Output SMA",self.pin),("Scope",self.scope),
                              ("Boundary",self.edge),("Width",self.width),("",self.status)):
             layout.addRow(label,widget)
 
     def config(self):
-        return OutputTriggerConfig(self.enabled.isChecked(),self.pin.value(),self.scope.currentData(),self.edge.currentData(),self.width.value())
+        pin = self.pin.currentData()
+        valid = self._available_pins is None or pin in self._io_to_pin.values()
+        return OutputTriggerConfig(self.enabled.isChecked() and valid,
+                                   self._saved_pin if pin is None else pin,
+                                   self.scope.currentData(),self.edge.currentData(),self.width.value())
 
     def settings_dict(self): return asdict(self.config())
 
     def load_settings(self,settings):
         config=OutputTriggerConfig(**(settings or {}))
-        supported=self._available_pins is None or bool(self._available_pins)
-        self.enabled.setChecked(config.enabled and supported); self.pin.setValue(config.pin)
+        self._saved_pin = config.pin
+        self._selected_name = None
+        self.pin.setCurrentIndex(self.pin.findData(config.pin))
+        self._selection_changed()
+        supported = self._available_pins is None or config.pin in self._io_to_pin.values()
+        self.enabled.setChecked(config.enabled and supported)
         self.scope.setCurrentIndex(self.scope.findData(config.scope)); self.edge.setCurrentIndex(self.edge.findData(config.edge))
         self.width.setValue(config.width_us)
 
     def set_configuration(self,configuration):
-        pins=tuple(getattr(configuration,'output_trigger_pins',()))
-        self._available_pins=pins
-        self.status.setText("Available outputs: "+', '.join(f"{i}: {pin}" for i,pin in enumerate(pins)) if pins else "No external trigger outputs in this firmware.")
-        self.enabled.setEnabled(bool(pins))
-        if not pins: self.enabled.setChecked(False)
+        self._configuration = configuration
+        self._available_pins = tuple(getattr(configuration, 'output_trigger_pins', ()))
+        self._io_to_pin = digital_trigger_outputs(configuration)
+        self.canvas.set_configuration(configuration)
+        preferred = self._saved_pin
+        if self._selected_name is not None:
+            # Keep the same physical output even if output_pins is reordered.
+            preferred = next((pin for pin in self._io_to_pin.values()
+                              if self._available_pins[pin] == self._selected_name), None)
+        blocker = QtCore.QSignalBlocker(self.pin)
+        self.pin.clear()
+        for sma, pin in sorted(self._io_to_pin.items()):
+            self.pin.addItem(f"IO{sma} — {self._available_pins[pin]} (QICK pin {pin})", pin)
+        self.pin.setCurrentIndex(self.pin.findData(preferred))
+        del blocker
+        self.pin.setEnabled(bool(self._io_to_pin))
+        self.pin.setPlaceholderText("Select a connected SMA" if self._io_to_pin else "No connected trigger SMA")
+        self._selection_changed()
+
+    def _select_sma(self, direction, sma):
+        if direction == "io" and sma in self._io_to_pin:
+            self.pin.setCurrentIndex(self.pin.findData(self._io_to_pin[sma]))
+
+    def _selection_changed(self, *_args):
+        pin = self.pin.currentData()
+        sma = next((sma for sma, index in self._io_to_pin.items() if index == pin), None)
+        self.canvas.set_selected("io", sma)
+        self.enabled.setEnabled(sma is not None)
+        if sma is not None:
+            self._saved_pin = pin
+            self._selected_name = self._available_pins[pin]
+            self.status.setText(f"Selected: IO{sma} → {self._selected_name}. "
+                                "Gray SMAs have no connected trigger output in this firmware.")
+        elif self._available_pins is not None:
+            self.enabled.setChecked(False)
+            self.status.setText(
+                "The saved output is unavailable. Select a connected DIGITAL I/O SMA."
+                if self._io_to_pin else "No DIGITAL I/O SMA is connected to a supported tProcessor trigger output in this firmware."
+            )
