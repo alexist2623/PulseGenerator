@@ -23,7 +23,7 @@ except ImportError:
 
 pg.setConfigOptions(antialias=False)
 
-TIME_UNIT_SCALE = {"ns": 1.0, "us": 1.0e-3, "ms": 1.0e-6}
+TIME_UNIT_SCALE = {"ns": 1.0, "us": 1.0e-3, "ms": 1.0e-6, "s": 1.0e-9}
 
 
 def _plot_color(index: int) -> QtGui.QColor:
@@ -1052,6 +1052,19 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         )
 
 
+class _WaveformTimeAxis(pg.AxisItem):
+    """Keep nearby timestamps distinct when zoomed into a late pulse."""
+
+    def tickStrings(self, values, scale, spacing):
+        if self.logMode:
+            return super().tickStrings(values, scale, spacing)
+        # AxisItem's default %g format only keeps six significant digits for
+        # large values, so separate ticks can all read e.g. '1e+09'. Precision
+        # must follow tick spacing even when the absolute timestamp is large.
+        places = max(0, int(np.ceil(-np.log10(spacing * scale))))
+        return [f"{value * scale:.{places}f}" for value in values]
+
+
 class WaveformPlotWidget(pg.PlotWidget):
     """Interactive multi-output waveform editor backed by PyQtGraph."""
 
@@ -1059,10 +1072,12 @@ class WaveformPlotWidget(pg.PlotWidget):
     point_moved = QtCore.pyqtSignal(int, int, float)
 
     def __init__(self, pulse: PulseSequence, parent=None):
-        super().__init__(parent=parent)
+        super().__init__(parent=parent, axisItems={
+            "bottom": _WaveformTimeAxis(orientation="bottom"),
+        })
         self.setBackground("w")
         self.showGrid(x=True, y=True, alpha=0.25)
-        self.setLabel("bottom", "time", units="ns")
+        self.setLabel("bottom", "time [ns]")
         self.setLabel("left", "voltage", units="mV")
         self.getPlotItem().hideButtons()
         self.getPlotItem().setMenuEnabled(False)
@@ -1151,14 +1166,33 @@ class WaveformPlotWidget(pg.PlotWidget):
         self.fit_view()
 
     def set_time_unit(self, unit: str) -> None:
-        """Change time-axis labels while preserving internal nanosecond data."""
+        """Refresh after an editor-unit change; this plot scales with its view.
+
+        MainWindow still sends the input controls' unit here. Keep the plot's
+        automatic display independent of that setting and of the stored ns data.
+        """
         if unit not in TIME_UNIT_SCALE:
             raise ValueError(f"unsupported time unit {unit!r}")
+        self._refresh_grid_tick_spacing()
+
+    def _refresh_time_axis_unit(self) -> None:
+        lower, upper = self.getPlotItem().vb.viewRange()[0]
+        span_ns = upper - lower
+        if not np.isfinite(span_ns) or span_ns <= 0:
+            return
+        # Use the visible span, not its absolute timestamp: zooming into a late
+        # pulse must expose small time differences just as it does near zero.
+        unit = "ns"
+        for candidate, scale in TIME_UNIT_SCALE.items():
+            if span_ns * scale >= 1.0:
+                unit = candidate
+        if unit == self._time_unit:
+            return
         self._time_unit = unit
         axis = self.getPlotItem().getAxis("bottom")
         axis.enableAutoSIPrefix(False)
         axis.setScale(TIME_UNIT_SCALE[unit])
-        axis.setLabel(f"time [{unit}]")
+        axis.setLabel(f"time [{unit}]", units="")
 
     @staticmethod
     def _nearest_grid_value(value: float, step: float) -> float:
@@ -1189,6 +1223,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         self.showGrid(x=self._grid_visible, y=self._grid_visible, alpha=0.25)
 
     def _refresh_grid_tick_spacing(self, *_args) -> None:
+        self._refresh_time_axis_unit()
         # AxisItem chooses ticks from the visible range and display scale.
         # Snapping remains anchored to the user grid, independently of zoom.
         # In particular, time ticks must not treat internal ns as displayed us.

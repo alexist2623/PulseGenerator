@@ -251,6 +251,76 @@ def test_zoom_ticks_follow_view_and_time_units_without_changing_snap(window):
     assert plot._snap_voltage(-194, window._pulse[0]) == -200
 
 
+@pytest.mark.parametrize('span_ns, unit, ns_per_unit', [
+    (500., 'ns', 1.),
+    (20000., 'us', 1000.),
+    (5000000., 'ms', 1000000.),
+    (2000000000., 's', 1000000000.),
+])
+def test_zoom_time_units_keep_all_waveforms_and_input_timing(window, span_ns, unit, ns_per_unit):
+    configure_compensated_pulse(window)
+    window._sweep_specs = [QickSweepSpec('set_0', 'awg_0', 50/800, 100/800, 3)]
+    window._refresh_sweep_overlay()
+    window._waveform_point_index.setValue(2)
+    plot = window._plot
+    plot.set_grid(time_step_ns=1000, voltage_step_mv=100, snap_enabled=True, visible=True)
+    curves = (plot._line + plot._physical_line + plot._rc_line +
+              [plot._sweep_lower_curve, plot._sweep_upper_curve])
+    before = [(curve.xData.copy(), curve.yData.copy()) for curve in curves]
+    pulse_times = window._pulse[0].t.copy()
+    sequence = window._waveform_preview_sequence
+    settings = plot.grid_settings
+
+    # A late absolute timestamp must not prevent selection of nanoseconds.
+    lower = 1000000000.
+    plot.setXRange(lower, lower + span_ns, padding=0)
+    axis = plot.getAxis('bottom')
+    assert plot._time_unit == unit
+    assert axis.labelText == f'time [{unit}]'
+    assert axis.labelUnits == ''
+    assert axis.scale == pytest.approx(1/ns_per_unit)
+    spacing, ticks = axis.tickValues(lower, lower + span_ns, 650)[0]
+    assert len(ticks) >= 2
+    labels = axis.tickStrings(ticks, axis.scale, spacing)
+    assert len(set(labels)) == len(labels)
+    np.testing.assert_allclose(np.array(labels, dtype=float) * ns_per_unit, ticks,
+                               rtol=0, atol=spacing/1000)
+
+    # Editor unit changes and settings notifications must not override zoom.
+    window._set_time_unit('ms' if unit != 'ms' else 'ns')
+    assert plot._time_unit == unit
+    np.testing.assert_array_equal(window._pulse[0].t, pulse_times)
+    assert window._waveform_preview_sequence is sequence
+    assert plot.grid_settings == settings
+    assert plot._snap_time(100123, window._pulse[0], 1) == 100000
+    for curve, (x, y) in zip(curves, before):
+        np.testing.assert_array_equal(curve.xData, x)
+        np.testing.assert_array_equal(curve.yData, y)
+
+    plot.fit_view()
+    assert plot._time_unit == 'us'
+    assert axis.labelText == 'time [us]'
+    limits = plot.viewRange()[0]
+    assert limits[0] <= min(x[0] for x, _ in before)
+    assert limits[1] >= max(x[-1] for x, _ in before)
+
+
+@pytest.mark.parametrize('boundary, smaller, larger', [
+    (1000., 'ns', 'us'), (1000000., 'us', 'ms'), (1000000000., 'ms', 's'),
+])
+def test_time_unit_boundaries_remain_stable_on_pan_y_zoom_and_refresh(window, boundary, smaller, larger):
+    plot = window._plot
+    for span, expected in [(boundary*.99, smaller), (boundary*1.01, larger),
+                           (boundary, larger), (boundary*.99, smaller)]:
+        for offset in [0., boundary*2, -boundary*3]:
+            plot.setXRange(offset, offset + span, padding=0)
+            for _ in range(3):
+                plot.setYRange(-200, 200, padding=0)
+                plot._refresh_grid_tick_spacing()
+                assert plot._time_unit == expected
+                assert plot.getAxis('bottom').labelText == f'time [{expected}]'
+
+
 def test_rf_duration_changes_same_virtual_physical_and_rc_time_grid(window):
     configure_compensated_pulse(window)
     window._sweep_specs = [QickSweepSpec('set_0', 'awg_0', 50/800, 100/800, 3)]
