@@ -27,6 +27,12 @@ except ImportError:
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
+    from .quantum_circuit_model import default_document, validate_document
+    from .quantum_circuit_widgets import QuantumCircuitPanel, QuantumCircuitView
+except ImportError:
+    from quantum_circuit_model import default_document, validate_document
+    from quantum_circuit_widgets import QuantumCircuitPanel, QuantumCircuitView
+try:
     from .qick_square_dds_panel import SquarePulsePanel, SquarePulsePortsPanel, TriggeringPanel
 except ImportError:
     from qick_square_dds_panel import SquarePulsePanel, SquarePulsePortsPanel, TriggeringPanel
@@ -469,7 +475,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 43
+SETTINGS_VERSION = 45
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -1670,6 +1676,7 @@ class _MatplotlibWaveformPlotWidget(Canvas): # pylint: disable=too-many-instance
 if _USE_PYQTGRAPH:
     try:
         from .dc_waveform_widgets import (
+            AcquisitionTimelineWidget,
             RfPulsePreviewWidget,
             RfPulseTimelineWidget,
             TracePlotWidget,
@@ -1677,6 +1684,7 @@ if _USE_PYQTGRAPH:
         )
     except ImportError:
         from dc_waveform_widgets import (
+            AcquisitionTimelineWidget,
             RfPulsePreviewWidget,
             RfPulseTimelineWidget,
             TracePlotWidget,
@@ -1688,6 +1696,7 @@ else:
     MatplotWidget = _MatplotlibWaveformPlotWidget
     RfPulsePreviewWidget = None
     RfPulseTimelineWidget = None
+    AcquisitionTimelineWidget = None
 
 
 def _trace_duration_spin(value_ns: float, unit: str) -> QtWidgets.QDoubleSpinBox:
@@ -2440,7 +2449,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             port = self._front_panel_configuration.port("output", port_index)
             channel_position = port.qick_channels.index(channel)
             block_path = port.block_paths[channel_position].lower()
-            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2")):
+            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3")):
                 raise ValueError(
                     f"generator {channel} is not an AWG tuning channel"
                 )
@@ -8801,6 +8810,31 @@ class QickExperimentWorker(QtCore.QObject):
         self.finished.emit(result)
 
 
+class QuantumCircuitWorker(QickExperimentWorker):
+    """Lower a saved circuit against live QICK metadata before running it."""
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            try:
+                from .quantum_circuit_execution import run_quantum_circuit_experiment
+            except ImportError:
+                from quantum_circuit_execution import run_quantum_circuit_experiment
+            kwargs = dict(self._kwargs)
+            kwargs["progress_callback"] = self.progress_changed.emit
+            kwargs["event_callback"] = self.event_changed.emit
+            kwargs["cancel_check"] = self._check_cancel
+            result = run_quantum_circuit_experiment(**kwargs)
+            result.detach_dataset()
+        except ExperimentCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+
 class QickProgramWorker(QtCore.QObject):
     """Compile a QICK program from live HWH metadata without running it."""
 
@@ -9929,6 +9963,29 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._bias_panel = BiasControlPanel(self)
         self._square_wave_panel = SquareWavePanel(self)
+        self._quantum_circuit_panel = QuantumCircuitPanel(self)
+        self._quantum_circuit_view = QuantumCircuitView(self)
+        self._quantum_circuit_panel.document_changed.connect(
+            self._quantum_circuit_view.set_document)
+        self._quantum_circuit_panel.preview_changed.connect(
+            self._quantum_circuit_view.set_document)
+        self._quantum_circuit_view.loop_edit_requested.connect(
+            self._quantum_circuit_panel.edit_loop)
+        self._quantum_circuit_view.loop_delete_requested.connect(
+            self._quantum_circuit_panel.delete_loop)
+        self._quantum_circuit_view.edit_requested.connect(
+            self._quantum_circuit_panel.edit_gate)
+        self._quantum_circuit_view.delete_requested.connect(
+            self._quantum_circuit_panel.delete_gate)
+        self._quantum_circuit_view.selection_changed.connect(
+            self._quantum_circuit_panel.select_gate)
+        self._quantum_circuit_view.set_document(
+            self._quantum_circuit_panel.document())
+        self._quantum_circuit_panel.run_requested.connect(self._run_quantum_circuit)
+        self._quantum_circuit_panel.stop_requested.connect(self._stop_quantum_circuit)
+        self._quantum_circuit_panel.execution_settings_requested.connect(
+            self._show_quantum_execution_settings)
+        self._last_circuit_result = None
         self._square_wave_panel.start_requested.connect(self._start_square_wave)
         self._square_wave_panel.stop_requested.connect(self._stop_square_wave)
         self._square_wave_panel.front_panel_requested.connect(
@@ -10117,7 +10174,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._control_tabs.addTab(self._calibration_panel, "Calibration")
         self._control_tabs.addTab(self._noise_panel, "Noise Analysis")
         self._control_tabs.addTab(self._bias_panel, "Bias")
-        self._control_tabs.addTab(self._square_wave_panel, "QICK Square Wave")
+        self._control_tabs.addTab(self._square_wave_panel, "Square Wave")
+        # Append to preserve the saved indices of existing control tabs.
+        self._control_tabs.addTab(self._quantum_circuit_panel, "Quantum Circuit")
         self._control_tabs.setCurrentWidget(self._awg_tuning_page)
         self._control_tabs.currentChanged.connect(self._on_control_tab_changed)
         control_container = QtWidgets.QWidget(self)
@@ -10170,6 +10229,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._waveform_splitter.setStretchFactor(1, 1)
             self._rf_timeline_container.hide()
 
+        self._acquisition_timeline = None
+        if AcquisitionTimelineWidget is not None:
+            self._acquisition_timeline = AcquisitionTimelineWidget(self)
+            self._acquisition_timeline.getPlotItem().vb.setXLink(self._plot.getPlotItem().vb)
+            self._waveform_splitter.addWidget(self._acquisition_timeline)
+            self._waveform_splitter.setStretchFactor(2, 1)
+            self._acquisition_timeline.hide()
+
         self._dock_ctrl  = QtWidgets.QDockWidget("Control Panel", self)
         self._dock_ctrl.setWidget(control_container)
 
@@ -10196,12 +10263,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._waveform_point_index = QtWidgets.QSpinBox()
         self._waveform_point_index.setRange(0, 0)
         self._waveform_point_index.setToolTip(
-            "One common point for virtual, physical and RC curves. "
+            "One common point for virtual, physical, RC, RF and acquisition previews. "
             "During a sweep, edit the base waveform in AWG Outputs; this preview does not change it.")
         self._waveform_point_index.valueChanged.connect(
             lambda _value: self._refresh_physical_waveforms())
         point_options.addWidget(self._waveform_point_index)
         self._waveform_point_label = QtWidgets.QLabel("1 point")
+        self._waveform_point_label.setWordWrap(True)
         point_options.addWidget(self._waveform_point_label, 1)
         waveform_layout.addLayout(point_options)
         self._waveform_scale_label = QtWidgets.QLabel()
@@ -10273,6 +10341,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._dock_noise.setWidget(self._noise_plot)
 
+        self._dock_quantum_circuit = QtWidgets.QDockWidget("Quantum Circuit", self)
+        self._dock_quantum_circuit.setWidget(self._quantum_circuit_view)
+
         for dock in (
             self._dock_ctrl,
             self._dock_plot,
@@ -10281,6 +10352,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._dock_awg_sweep,
             self._dock_sparameter,
             self._dock_noise,
+            self._dock_quantum_circuit,
         ):
             dock.setFeatures(
                 QtWidgets.QDockWidget.DockWidgetMovable |
@@ -10295,6 +10367,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self.tabifyDockWidget(self._dock_trace, self._dock_awg_sweep)
         self.tabifyDockWidget(self._dock_trace, self._dock_sparameter)
         self.tabifyDockWidget(self._dock_trace, self._dock_noise)
+        self.tabifyDockWidget(self._dock_trace, self._dock_quantum_circuit)
         self.resizeDocks(
             [self._dock_ctrl, self._dock_plot, self._dock_trace],
             [200, 400, 300],
@@ -10472,6 +10545,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             repetitions=self._qick_repetitions_per_sweep,
         )
         self._noise_panel.set_connection_values(connection)
+        self._refresh_physical_waveforms()
 
     def _configure_qick_setup(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
@@ -10662,6 +10736,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         for timeline in self._rf_timelines:
             if hasattr(timeline, "set_time_unit"):
                 timeline.set_time_unit(unit)
+        if self._acquisition_timeline is not None:
+            self._acquisition_timeline.set_time_unit(unit)
         self.statusBar().showMessage(f"Time display unit: {unit}")
 
     def _configure_grid(self) -> None:
@@ -10769,7 +10845,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 point_index = self._waveform_point_index.value()
                 coordinates = tuple(int(i) for i in np.unravel_index(point_index, sequence.sweep_shape))
                 self._waveform_point_label.setText(
-                    f"{count:,} points | axis indices {coordinates} | virtual / physical / RC")
+                    f"{count:,} points | axis indices {coordinates} | virtual / physical / RC / RF / acquisition")
             self._waveform_preview_sequence = sequence
             if sequence.sweep_axes:
                 cycles, virtual, _ = sequence.waveform_vertices(point_index, space="virtual")
@@ -10816,13 +10892,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse, self._cross_capacitance)
         self._plot.set_physical_waveforms(time_ns, physical_mv)
         self._plot.set_rc_waveforms(rc_times, rc_mv)
+        self._refresh_acquisition_timeline()
+        if hasattr(self, "_rf_timelines"):
+            self._refresh_rf_timeline()
         if hasattr(self, "_waveform_preview_note"):
             self._waveform_preview_note.setText(preview_note or
                 f"Point {point_index}: solid virtual | dashed physical | dash-dot RC DAC estimate. "
                 "Ideal timing / requested voltages; hardware quantization is not included.")
             self._waveform_preview_note.setStyleSheet("color: #b03020;" if preview_note else "")
         if fit_view:
-            self._plot.fit_view()
+            self._fit_waveform_view()
 
     @QtCore.pyqtSlot(bool)
     def _on_compensation_visibility_changed(self, _checked):
@@ -11542,26 +11621,30 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _fit_view(self):
         """Fit the view to the pulse data."""
-        self._plot.fit_view()
-        rf_ranges = []
-        for spec in self._rf_pulse_specs:
-            try:
-                start_us, end_us, _ = rf_pulse_absolute_times_us(self._pulse[0], spec)
-            except ValueError:
-                continue
-            rf_ranges.append((start_us * 1000.0, end_us * 1000.0))
-        if rf_ranges:
-            x_range = self._plot.getPlotItem().vb.viewRange()[0]
-            x_min = min(float(x_range[0]), *(start for start, _end in rf_ranges))
-            x_max = max(float(x_range[1]), *(end for _start, end in rf_ranges))
-            margin = max(1.0, 0.03 * max(1.0, x_max - x_min))
-            self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
+        self._fit_waveform_view()
         if self._trace is not None:
             self._trace.fit_view()
         self._stability_panel.plot.fit_view()
         self._awg_sweep_plot.fit_view()
         self._sparameter_plot.fit_view()
         self._noise_plot.fit_view()
+
+    def _fit_waveform_view(self):
+        """Include readout spillover and every visible timeline in waveform Fit."""
+        self._plot.fit_view()
+        rf_ranges = []
+        for timeline in self._rf_timelines:
+            if timeline.preview_mode != "empty":
+                rf_ranges.append((timeline.start_ns, timeline.end_ns))
+        acquisition = self._acquisition_timeline
+        if acquisition is not None and acquisition.window is not None:
+            rf_ranges.append((acquisition.start_ns, acquisition.end_ns))
+        if rf_ranges:
+            x_range = self._plot.getPlotItem().vb.viewRange()[0]
+            x_min = min(float(x_range[0]), *(start for start, _end in rf_ranges))
+            x_max = max(float(x_range[1]), *(end for _start, end in rf_ranges))
+            margin = max(1.0, 0.03 * max(1.0, x_max - x_min))
+            self._plot.setXRange(x_min - margin, x_max + margin, padding=0.0)
 
     def _show_rf_editor(self) -> None:
         """Compatibility helper: reveal the always-present RF Outputs tab."""
@@ -11572,7 +11655,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _on_control_tab_changed(self, _index: int) -> None:
         current = self._control_tabs.currentWidget()
-        if current is self._stability_panel:
+        # Select the relevant view without hiding the other right-hand tabs.
+        if current is self._quantum_circuit_panel:
+            self._dock_quantum_circuit.show()
+            self._dock_quantum_circuit.raise_()
+        elif current is self._stability_panel:
             self._dock_stability.show()
             self._dock_stability.raise_()
         elif current is self._sparameter_panel:
@@ -11928,6 +12015,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_readout_spec_changed(self, spec) -> None:
         self._ddr_readout_spec = spec
         self._experiment_panel.set_ddr_readout_spec(spec)
+        self._refresh_acquisition_timeline()
+        if getattr(self, "_acquisition_timeline", None) is not None:
+            self._fit_waveform_view()
         if spec is None:
             self.statusBar().showMessage("RF readout disabled")
         elif spec.effective_measurement_representation == "current":
@@ -12379,6 +12469,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "Connecting and reading HWH configuration...",
         )
         self.statusBar().showMessage("Identifying QICK front-panel configuration")
+        self._identifying_configuration_connection = connection
         thread = QtCore.QThread(self)
         worker = QickConfigurationWorker(connection, current_change=current_change)
         worker.moveToThread(thread)
@@ -12437,6 +12528,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._waveform_scale_label.setText("DAC limits (front panel): " + " | ".join(labels))
 
     def _on_qick_configuration_identified(self, configuration) -> None:
+        self._acquisition_profile_connection = getattr(
+            self, "_identifying_configuration_connection", self._shared_qick_connection())
         if configuration.dac_current_settings is not None:
             self._dac_current_state.update(configuration.dac_current_settings)
         self._qick_configuration = configuration
@@ -12455,6 +12548,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._refresh_stability_targets()
         self._rf_ports_panel.set_front_panel_configuration(configuration)
         self._rf_readout_panel.set_front_panel_configuration(configuration)
+        self._refresh_acquisition_timeline()
         self._calibration_panel.set_front_panel_configuration(configuration)
         self._noise_panel.set_front_panel_configuration(configuration)
         self._bias_panel.set_configuration(configuration)
@@ -13587,6 +13681,129 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         dialog.exec_()
 
+    def _show_quantum_execution_settings(self) -> None:
+        self._control_tabs.setCurrentWidget(self._awg_tuning_page)
+        self._awg_tuning_tabs.setCurrentWidget(self._experiment_panel)
+        self._dock_ctrl.show()
+        self._dock_ctrl.raise_()
+
+    def _quantum_circuit_run_arguments(self) -> dict:
+        """Snapshot circuit settings without replacing the AWG editor's state."""
+        document = validate_document(self._quantum_circuit_panel.document())
+        if not document["gates"]:
+            raise ValueError("Add and configure gates before running the circuit.")
+        connection, run = self._experiment_panel.connection_values()
+        readout = self._rf_readout_panel.spec()
+        if readout is None:
+            raise ValueError(
+                "Configure and enable AWG Tuning > RF Readout for the circuit's "
+                "Acquisition gate. Its input/calibration settings will be used; "
+                "the circuit supplies the measurement time and duration.")
+        panel = self._experiment_panel
+        circuit_rf_channels = {
+            DEFAULT_QSTL_RF_CHANNELS[pulse["channel"] - 1]
+            for gate in document["gates"] for pulse in gate["rf"]
+            if pulse["channel"] <= len(DEFAULT_QSTL_RF_CHANNELS)
+        }
+        compensation = {
+            "bias_t_compensation_enabled": panel.bias_t_group.isChecked(),
+            "bias_t_compensation_type": str(panel.bias_t_type.currentData()),
+            "bias_t_compensation_voltage_mv": panel.bias_t_compensation_mv.value(),
+            "bias_t_compensation_mode": str(panel.bias_t_mode.currentData()),
+            "bias_t_compensation_duration_us": panel.bias_t_duration_us.value(),
+            "bias_t_filter_tau_us": panel.bias_t_filter_tau_us.value(),
+        }
+        return {
+            "connection_config": connection,
+            "run_config": run,
+            "document": document,
+            "gui_settings": self._settings_to_dict(),
+            "readout_template": readout,
+            "output_full_scales_mv": {
+                channel: self._dac_current_state.scale(channel)
+                for channel in DEFAULT_QSTL_AWG_CHANNELS},
+            "dac_current_settings": self._dac_current_state.snapshot(
+                DEFAULT_QSTL_AWG_CHANNELS),
+            "awg_channel_map": DEFAULT_QSTL_AWG_CHANNELS,
+            "rf_channel_map": DEFAULT_QSTL_RF_CHANNELS,
+            "rf_templates": tuple(
+                editor.configured_spec() for editor in self._rf_ports_panel._panels
+                if editor.gen_ch.value() in circuit_rf_channels),
+            "compensation": compensation,
+            "iq_storage_mode": normalize_iq_storage_mode(panel.iq_storage_mode.currentData()),
+            "compile_validation_mode": str(panel.compile_validation_mode.currentData()),
+            "progress": False,
+        }
+
+    def _run_quantum_circuit(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "QICK busy", "Wait for the current QICK operation to finish.")
+            return
+        try:
+            arguments = self._quantum_circuit_run_arguments()
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            self._quantum_circuit_panel.set_status(str(exc))
+            QtWidgets.QMessageBox.warning(self, "Cannot run quantum circuit", str(exc))
+            return
+        self._quantum_circuit_panel.set_running(True)
+        self._quantum_circuit_panel.set_status("Connecting and validating circuit timing…")
+        self._experiment_panel.start_run_timeline("Quantum Circuit Run requested")
+        self._experiment_panel.set_running(True, "Preparing quantum circuit", can_cancel=True)
+        self.statusBar().showMessage("Quantum circuit running")
+        thread = QtCore.QThread(self)
+        worker = QuantumCircuitWorker(arguments)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_quantum_circuit_finished)
+        worker.failed.connect(self._on_quantum_circuit_failed)
+        worker.cancelled.connect(self._on_quantum_circuit_cancelled)
+        worker.progress_changed.connect(self._on_quantum_circuit_progress)
+        worker.event_changed.connect(self._on_experiment_event)
+        for signal in (worker.finished, worker.failed, worker.cancelled):
+            signal.connect(thread.quit)
+            signal.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
+    def _stop_quantum_circuit(self) -> None:
+        if isinstance(self._experiment_worker, QuantumCircuitWorker):
+            self._stop_qick_experiment()
+            self._quantum_circuit_panel.set_status("Stop requested; waiting for a safe stopping point…")
+
+    def _on_quantum_circuit_progress(self, percent: int, message: str) -> None:
+        self._on_experiment_progress(percent, message)
+        self._quantum_circuit_panel.set_status(f"{percent}% — {message}")
+
+    def _on_quantum_circuit_finished(self, result) -> None:
+        self._last_circuit_result = result
+        self._experiment_panel.show_result(result)
+        self._experiment_panel.finish_run_timeline(
+            f"Quantum Circuit QCoDeS Run {result.run_id} completed", success=True)
+        sweep = getattr(result, 'circuit_loop_sweep', None)
+        if sweep:
+            first, last = sweep['points'][0], sweep['points'][-1]
+            message = (f"Loop sweep completed: {len(sweep['points'])} points. "
+                       f"First n={first['n']} → Run {first['run_id']}; last n={last['n']} → Run {last['run_id']}.\n"
+                       f"Index: {sweep['manifest_path']}")
+            self._experiment_panel.finish_run_timeline('Loop sweep completed', success=True)
+        else:
+            message = f"Run {result.run_id} saved to {result.database_path}"
+        self._quantum_circuit_panel.set_status(message)
+        self.statusBar().showMessage(message)
+
+    def _on_quantum_circuit_failed(self, details: str) -> None:
+        lines = [line for line in details.rstrip().splitlines() if line.strip()]
+        self._quantum_circuit_panel.set_status(lines[-1] if lines else "Circuit execution failed")
+        self._on_experiment_failed(details)
+
+    def _on_quantum_circuit_cancelled(self, message: str) -> None:
+        self._quantum_circuit_panel.set_status(str(message))
+        self._on_experiment_cancelled(message)
+
     def _run_qick_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -13971,6 +14188,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _clear_experiment_thread(self) -> None:
         self._experiment_thread = None
         self._experiment_worker = None
+        self._quantum_circuit_panel.set_running(False)
+
+    def _refresh_acquisition_timeline(self) -> None:
+        timeline = getattr(self, "_acquisition_timeline", None)
+        if timeline is None:
+            return
+        if self._ddr_readout_spec is None:
+            timeline.set_window()
+            timeline.hide()
+            return
+        try:
+            try:
+                from .acquisition_preview import acquisition_window
+            except ImportError:
+                from acquisition_preview import acquisition_window
+            sequence = getattr(self, "_waveform_preview_sequence", None)
+            if sequence is None:
+                raise ValueError("acquisition preview needs a valid AWG waveform")
+            profile = getattr(self._qick_configuration, "fir_profile", None)
+            if getattr(self, "_acquisition_profile_connection", None) != self._shared_qick_connection():
+                profile = None
+            result = acquisition_window(
+                sequence, self._waveform_point_index.value(), self._ddr_readout_spec,
+                profile,
+                self._qick_fabric_mhz, self._experiment_panel.tproc_mhz.value())
+        except (ValueError, RuntimeError, IndexError, KeyError) as exc:
+            timeline.set_window(message=f"Acquisition: {exc}")
+        else:
+            timeline.set_window(result)
+        timeline.show()
 
     def _refresh_rf_timeline(self, *, fit_view: bool = False) -> None:
         if RfPulseTimelineWidget is None:
@@ -13978,7 +14225,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         valid_sequences = []
         for spec in self._rf_pulse_specs:
             try:
-                events = rf_pulse_event_absolute_times_us(self._pulse[0], spec)
+                sequence = getattr(self, "_waveform_preview_sequence", None)
+                if sequence is None:
+                    events = rf_pulse_event_absolute_times_us(self._pulse[0], spec)
+                else:
+                    try:
+                        from .acquisition_preview import selected_rf_events
+                    except ImportError:
+                        from acquisition_preview import selected_rf_events
+                    events = selected_rf_events(
+                        sequence, self._waveform_point_index.value(), spec,
+                        self._qick_fabric_mhz)
             except ValueError:
                 continue
             if events:
@@ -14023,7 +14280,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_timeline_container.show()
         total_height = max(360, self._waveform_splitter.height())
         rf_height = min(520, max(130, 130 * len(valid_sequences)))
-        self._waveform_splitter.setSizes([max(220, total_height - rf_height), rf_height])
+        acquisition_height = (165 if self._ddr_readout_spec is not None else 0)
+        self._waveform_splitter.setSizes([
+            max(220, total_height - rf_height - acquisition_height), rf_height,
+            acquisition_height])
         if fit_view:
             self._fit_view()
 
@@ -14482,6 +14742,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "square_wave": self._square_wave_panel.settings_dict(),
             "square_pulse": self._square_dds_panel.settings_dict(),
             "output_trigger": self._experiment_panel.triggering_panel.settings_dict(),
+            "quantum_circuit": self._quantum_circuit_panel.document(),
         }
 
     @staticmethod
@@ -15121,7 +15382,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if selected_tab >= self._control_tabs.count():
             raise ValueError("selected control tab is out of range")
         # Restore the same view after moving Experiment behind SquarePulse.
-        tab_name = display.get("selected_awg_tuning_tab_name") if settings_version == SETTINGS_VERSION else None
+        tab_name = display.get("selected_awg_tuning_tab_name") if settings_version >= 43 else None
         if tab_name is not None:
             names = [self._awg_tuning_tabs.tabText(i) for i in range(self._awg_tuning_tabs.count())]
             if tab_name not in names:
@@ -16188,6 +16449,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "square_wave": square_wave_settings,
             "square_pulse": data.get("square_pulse", {}),
             "output_trigger": data.get("output_trigger", {}),
+            "quantum_circuit": validate_document(data.get("quantum_circuit", default_document())),
         }
 
     def _apply_decoded_settings(self, settings: dict) -> None:
@@ -16300,6 +16562,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._bias_panel.load_settings(settings["bias"])
         self._square_wave_panel.load_settings(settings["square_wave"])
         self._experiment_panel.triggering_panel.load_settings(settings.get("output_trigger", {}))
+        self._quantum_circuit_panel.load_document(settings.get("quantum_circuit", default_document()))
         self._sync_shared_qick_controls()
         self._qick_front_panel.set_path_values(
             self._sparameter_panel.front_panel_values()

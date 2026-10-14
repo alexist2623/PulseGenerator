@@ -1065,6 +1065,73 @@ class _WaveformTimeAxis(pg.AxisItem):
         return [f"{value * scale:.{places}f}" for value in values]
 
 
+class AcquisitionTimelineWidget(pg.PlotWidget):
+    """FIR input measurement coverage on the AWG time axis."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent, axisItems={
+            "bottom": _WaveformTimeAxis(orientation="bottom")})
+        self.setBackground("w")
+        self.showGrid(x=True, y=False, alpha=0.2)
+        self.setMouseEnabled(x=True, y=False)
+        self.getPlotItem().hideButtons()
+        self.getPlotItem().setMenuEnabled(False)
+        self.getPlotItem().hideAxis("left")
+        self.setMinimumHeight(165)
+        self.setMaximumHeight(260)
+        self.window = None
+        self._time_unit = "us"
+        self._graphics = []
+        self.getPlotItem().vb.sigXRangeChanged.connect(self._refresh_units)
+        self.setYRange(.5, 1.5, padding=0)
+        self.setLabel("bottom", "sequence time [us]")
+
+    def set_time_unit(self, _unit):
+        self._refresh_units()
+
+    def set_window(self, window=None, *, message=""):
+        for item in self._graphics:
+            self.removeItem(item)
+        self._graphics.clear()
+        self.window = window
+        self.setTitle("Acquisition", color="#174f63", size="10pt")
+        if window is None:
+            self.start_ns = self.end_ns = 0.0
+            self.setToolTip(message)
+            return
+        self.start_ns = window["input_start_us"] * 1000
+        self.end_ns = window["input_end_us"] * 1000
+        bar = pg.BarGraphItem(
+            x0=[window["input_start_us"] * 1000],
+            x1=[window["input_end_us"] * 1000], y0=[.85], height=[.3],
+            brush=pg.mkBrush(20, 135, 165, 115), pen=pg.mkPen(20, 135, 165, width=1.4))
+        self.addItem(bar)
+        self._graphics.append(bar)
+        self.setYRange(.5, 1.5, padding=0)
+        self._refresh_units()
+
+    def _refresh_units(self, *_args):
+        bounds = self.getPlotItem().vb.viewRange()[0]
+        span = abs(bounds[1] - bounds[0])
+        self._time_unit = "ns"
+        for unit, scale in TIME_UNIT_SCALE.items():
+            if span * scale >= 1:
+                self._time_unit = unit
+        axis = self.getPlotItem().getAxis("bottom")
+        axis.enableAutoSIPrefix(False)
+        axis.setScale(TIME_UNIT_SCALE[self._time_unit])
+        axis.setLabel(f"sequence time [{self._time_unit}]", units="")
+        if self.window is not None:
+            data = self.window
+            scale = 1000 * TIME_UNIT_SCALE[self._time_unit]
+            tooltip = (
+                f"{data['input_start_us'] * scale:.6g}–{data['input_end_us'] * scale:.6g} "
+                f"{self._time_unit} ({data['duration_us'] * scale:.6g} {self._time_unit})")
+            self.setToolTip(tooltip)
+            for item in self._graphics:
+                item.setToolTip(tooltip)
+
+
 class WaveformPlotWidget(pg.PlotWidget):
     """Interactive multi-output waveform editor backed by PyQtGraph."""
 
@@ -1775,6 +1842,7 @@ class WaveformPlotWidget(pg.PlotWidget):
 
 
 __all__ = [
+    "AcquisitionTimelineWidget",
     "RfPulsePreviewWidget",
     "RfPulseTimelineWidget",
     "TracePlotWidget",

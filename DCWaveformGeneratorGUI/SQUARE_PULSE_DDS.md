@@ -48,7 +48,7 @@ without `mute_on_finish` keep the previous behavior (mute on completion).
 
 ## Standalone output
 
-**QICK Square Wave** now uses the dedicated SquarePulse IP. Identify QICK, click
+**Square Wave** now uses the dedicated SquarePulse IP. Identify QICK, click
 the physical front-panel preview or Select Output button, and choose the DAC.
 Ordinary AWG/RF generators are unavailable; Start and Stop are disabled when
 the loaded firmware has no compatible output. The worker checks IP identity

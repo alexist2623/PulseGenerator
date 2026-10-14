@@ -1314,7 +1314,7 @@ class SParameterSweepProgram(RAveragerProgram):
         gen_cfg = self.soccfg["gens"][sweep.output_ch]
         ro_cfg = self.soccfg["readouts"][sweep.readout_ch]
         if (
-            gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2")
+            gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3")
             or gen_cfg.get("gen_type") == "awg_tuning"
         ):
             raise ValueError(

@@ -140,7 +140,7 @@ def test_clock_override_and_firmware_validation(square_config):
         with pytest.raises(ValueError):
             square.build_square_wave_program(cfg, config)
     cfg["gens"][0]["type"] = "axis_signal_gen_v6"
-    with pytest.raises(ValueError, match="axis_awg_tuning_v1"):
+    with pytest.raises(ValueError, match="Select an AWG tuning DAC generator"):
         square.build_square_wave_program(cfg, square.SquareWaveConfig(gen_ch=0))
 
 
@@ -247,7 +247,7 @@ def test_gui_tab_settings_start_stop_and_close(monkeypatch):
     from qick_front_panel import identify_qick_front_panel
     window._on_qick_configuration_identified(identify_qick_front_panel(square_soccfg()))
     try:
-        assert window._control_tabs.tabText(window._control_tabs.indexOf(panel)) == "QICK Square Wave"
+        assert window._control_tabs.tabText(window._control_tabs.indexOf(panel)) == "Square Wave"
         assert not hasattr(panel, "codes_per_mv")
         assert not hasattr(panel, "calibration_database_path")
         assert not hasattr(panel, "calibration_run")

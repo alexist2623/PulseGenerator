@@ -1,5 +1,44 @@
 # DC and RC compensation
 
+## AWG Tuning v3: measured digital area
+
+Firmware `axis_awg_tuning_v3` reports `dc_area_version=1` and
+`dc_area_bits=48`. With the matching QSTL_QICK Python library, the same DC
+checkbox in AWG Tuning and Stability Diagram selects hardware compensation.
+The GUI does not need a second DC control. Older v1/v2 firmware keeps the
+software implementation described below.
+
+The IP sums every effective DAC sample of the actual SET/RAMP output **before
+the RC IIR**. Fixed-voltage mode emits the opposite voltage until the measured
+area is exhausted, with at most one smaller final scalar sample. Fixed-time
+mode uses two adjacent DAC codes over the requested number of fabric clocks
+to cancel the integer area exactly. No FPGA divider is used: Python supplies
+the fixed-time reciprocal. The engine sends the final zero edge through the
+IIR before clearing both histories at the end of each shot.
+
+This removes the legacy DC SET-to-SET minimum interval and the accumulation
+of rounded compensation increments. It does **not** change the existing
+constant integer voltage-sweep increment or eliminate its target-voltage
+drift. It also does not sum the extra DAC ramp/offset area after the IIR.
+
+Normal and bypass AWG output have 16 fabric clocks of latency (5 area-pipeline
+clocks plus 11 IIR clocks). Compensation begins 17 clocks after its command at
+the IIR input, and 28 clocks after that command at the DAC output. The compiler
+uses these different paths for segment, RF, DDR, and compensation timing.
+The FIR/DDR capture delay configured by the firmware remains unchanged.
+
+The compiler checks overflow, compensation voltage and RC headroom, reserves
+a conservative completion deadline, and waits for it before the next shot.
+FIR capture may finish before or after DC according to the existing
+`after_readout` / `overlap_readout` option. Both policies still wait for the
+capture before advancing the shot. The timing preview includes the hardware
+DC start/end. No per-point Cartesian voltage table is uploaded.
+
+The following sections describe the legacy v1/v2 compensation path unless
+explicitly stated otherwise. v3 still requires a validated matching BIT/HWH
+and board-side Python update; recognizing the IP in the GUI alone does not
+upgrade an installed bitstream.
+
 AWG Tuning and Stability Diagram each have two independent checkboxes:
 
 - **DC compensation** appends the existing opposite-area pulse, with the

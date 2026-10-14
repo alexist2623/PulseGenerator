@@ -111,6 +111,10 @@ def validate_program_rc_range(program):
         return ()
     from qick.precompensation import rc_coefficient
 
+    if getattr(program, '_hardware_dc_area', False) and sequence.bias_t_compensation is not None:
+        from qick_dc_area import validate_rc
+        return validate_rc(program)
+
     results = []
     rows = {index: row for row, index in enumerate(program._compile_validation_point_indices)}
     fields = {int(f['output_index']): f for f in program._bias_t_fields}

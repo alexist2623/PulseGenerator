@@ -21,7 +21,7 @@ the existing reference under unchanged load/output circuitry, not measured
 voltage calibration. Current changes do not improve the effective DAC bit depth.
 
 The former editable full-scale controls in Experiment, Python export and
-QICK Square Wave have been removed from the UI. Virtual voltage coordinates
+Square Wave have been removed from the UI. Virtual voltage coordinates
 remain in mV. Cross-capacitance is applied in voltage coordinates before each
 physical channel's DAC normalization. SET, RAMP, voltage/duration sweeps,
 fixed-voltage and fixed-time DC compensation, RC headroom checks, Stability,

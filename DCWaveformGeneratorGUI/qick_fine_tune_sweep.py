@@ -2,7 +2,7 @@
 
 Normalized amplitudes use the user-facing range [-1.0, 1.0].  They are
 converted to the 16-bit, 14-effective-bit DAC codes used by
-``axis_awg_tuning_v1`` and ``axis_awg_tuning_v2``. SET segments define levels for one to eight AWG
+``axis_awg_tuning_v1``, ``axis_awg_tuning_v2``, and ``axis_awg_tuning_v3``. SET segments define levels for one to eight AWG
 tuning outputs.  RAMP segments define only transition duration: each RAMP
 automatically targets the following SET level.  ``None`` on a SET means that
 an output holds its previous value.
@@ -2398,7 +2398,7 @@ def _resolve_awg_channels(sequence: FineTuneSequence, awg_channels) -> Tuple[int
 
 
 def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
-    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2") and gen_cfg.get("gen_type") != "awg_tuning":
+    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3") and gen_cfg.get("gen_type") != "awg_tuning":
         raise ValueError(f"generator channel {gen_ch} is not an AWG tuning generator")
     required = ("tproc_ch", "f_fabric", "n_pts", "frac")
     missing = [name for name in required if name not in gen_cfg]
@@ -2407,12 +2407,12 @@ def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
 
 
 def _awg_step_width(gen_cfg: Mapping) -> int:
-    expected = 32 if gen_cfg.get("type") == "axis_awg_tuning_v2" else 24
+    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3") else 24
     width = int(gen_cfg.get("step_width", expected))
     if width != expected:
         raise ValueError("AWG step width does not match the firmware IP version")
     if expected == 32 and int(gen_cfg["frac"]) != 18:
-        raise ValueError("axis_awg_tuning_v2 expects FRAC=18")
+        raise ValueError("axis_awg_tuning_v2/v3 expects FRAC=18")
     return width
 
 
@@ -2758,6 +2758,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         else:
             self._compile_boundary_points()
         self._check_cancel()
+        from qick_dc_area import supported
+        self._hardware_dc_area = supported(self)
         self._validate_bias_t_tproc_ports()
         self.bias_t_simultaneous_start_lead_cycles = (
             BIAS_T_INSTRUCTION_LEAD_PER_OUTPUT * len(self.awg_channels)
@@ -2795,6 +2797,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         if self.rf_pulse_configs or self.ddr_readout_config is not None:
             self._build_aux_timing()
         self._build_sweep_register_plan()
+        from qick_dc_area import prepare
+        prepare(self)
         from qick_rc_validation import validate_program_rc_range
         self.rc_output_range_validation = validate_program_rc_range(self)
         self._check_cancel()
@@ -2851,8 +2855,33 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         # Advance the time origin past configuration before any waveform.
         self.synci(100)
 
+    def _initialize_dc_area(self):
+        """Drain raw zero before ARM; DISABLE clears state from an earlier run."""
+        channels = [ch for ch in self.awg_channels
+                    if self.soccfg['gens'][ch].get('dc_area_version') == 1]
+        if not channels:
+            return
+        lead = max(100, 128 * len(channels))
+        self.synci(lead)
+        self.reset_timestamps()
+        for ch in channels:
+            self.set_pulse_registers(ch=ch, style='awg_set', value=0, duration=1)
+            self.pulse(ch=ch, t=4*int(self._channel_slots[ch]))
+        self.synci(lead)
+        self.reset_timestamps()
+        for ch in channels:
+            self.set_pulse_registers(ch=ch, style='awg_dc',
+                action='arm' if self.sequence.bias_t_compensation is not None else 'disable')
+            self.pulse(ch=ch, t=4*int(self._channel_slots[ch]))
+        self.synci(lead)
+        self.reset_timestamps()
+
     def _emit_rc_repeat_reset(self):
         """Clear AWG IIR history after every completed shot at nominal zero."""
+        if self._hardware_dc_area and self.sequence.bias_t_compensation is not None:
+            # The IP has already passed the final zero edge through the IIR,
+            # cleared both histories, and the completion barrier has drained it.
+            return
         rc = self.sequence.rc_compensation
         if rc is None:
             return
@@ -4289,7 +4318,10 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             }
             self.compiled_points = (self._compiled_point_by_index[0],)
 
-        if self.compile_validation_mode == COMPILE_VALIDATION_FULL:
+        if self._hardware_dc_area:
+            from qick_dc_area import empty_legacy_models
+            bias_t_models = empty_legacy_models(self)
+        elif self.compile_validation_mode == COMPILE_VALIDATION_FULL:
             bias_t_models = self._build_bias_t_models(
                 sweep_axes,
                 sweep_shape,
@@ -4918,7 +4950,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         if rf.gen_ch >= len(self.soccfg["gens"]):
             raise IndexError("RF generator channel is out of range")
         gen_cfg = self.soccfg["gens"][rf.gen_ch]
-        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2") or gen_cfg.get("gen_type") == "awg_tuning":
+        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3") or gen_cfg.get("gen_type") == "awg_tuning":
             raise ValueError("rf_pulse requires a normal QICK RF signal generator")
         self._segment_index(rf.at_segment, require_set=True)
 
@@ -6148,6 +6180,10 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         config = self.sequence.bias_t_compensation
         if config is None:
             return
+        if self._hardware_dc_area:
+            from qick_dc_area import emit
+            emit(self)
+            return
         if config.mode == "fixed_time":
             self._emit_bias_t_fixed_time()
             return
@@ -7050,10 +7086,12 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
         if any(self.soccfg["gens"][ch].get("rc_precomp_version", 0) for ch in self.awg_channels):
             self.synci(200)
             self._initialize_rc_compensation()
+        self._initialize_dc_area()
         self.regwi(0, rcount, 0)
         extended_epilogue = (
             self._marker is not None or self.square_pulse_config is not None
             or self.sequence.rc_compensation is not None
+            or (self._hardware_dc_area and self.sequence.bias_t_compensation is not None)
         )
         if extended_epilogue:
             self.safe_regwi(0, 14, self.cfg["expts"] * self.cfg["reps"], "final acquisition count")
@@ -7573,6 +7611,21 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 barrier = int(self.aux_timing["bias_t_static_end"])
             start = (barrier + self.sequence.bias_t_compensation.inter_output_gap_cycles
                      + self.bias_t_simultaneous_start_lead_cycles)
+            if self._hardware_dc_area:
+                from qick_dc_area import point_plan
+                from qick.dc_area import DC_START_CYCLES, AREA_PIPELINE_CYCLES
+                for output, ch in enumerate(self.awg_channels):
+                    plan = point_plan(self, point_index, output)
+                    # DC is injected at the area-engine output, so it skips
+                    # the normal raw-word pipeline and traverses only the IIR.
+                    latency = (DC_START_CYCLES + self.awg_output_latency_tproc
+                               - AREA_PIPELINE_CYCLES)
+                    dc.append(dict(output=self.sequence.output_names[output],
+                                   active=bool(plan['area']), hardware_area=True,
+                                   command_start_us=start/self.tproc_mhz,
+                                   dac_start_us=(start+latency)/self.tproc_mhz,
+                                   dac_end_us=(start+latency+plan['words'])/self.tproc_mhz,
+                                   duration_words=plan['words'], residual_area=plan['residual']))
             for field in self._bias_t_fields:
                 value = self._sweep_model_value(field, point_index)
                 if self._bias_t_mode == "fixed_time":
@@ -7692,6 +7745,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             ),
             "bias_t_compensation": self.sequence.bias_t_compensation is not None,
             "bias_t_compensation_type": compensation_type,
+            "hardware_dc_area": self._hardware_dc_area and compensation is not None,
+            "hardware_dc_validation": self.hardware_dc_validation,
             "rc_compensation": self.sequence.rc_compensation,
             "rc_reset_each_repeat": self.sequence.rc_compensation is not None,
             "rc_output_range_validation": self.rc_output_range_validation,
@@ -7702,6 +7757,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 None
                 if self.sequence.bias_t_compensation is None
                 else (
+                    "hardware_pre_iir_area"
+                    if self._hardware_dc_area else
                     "tproc_fixed_time_dynamic_voltage"
                     if self._bias_t_mode == "fixed_time"
                     else "tproc_simultaneous_set_and_max_sync"

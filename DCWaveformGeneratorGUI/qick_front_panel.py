@@ -94,6 +94,9 @@ class QickFrontPanelConfiguration:
     awg_tuning_channels: Tuple[int, ...] = ()
     dac_current_settings: Optional[dict] = None
     output_trigger_kinds: Tuple[str, ...] = ()
+    # Retain the already-resolved HWH timing for the display-only acquisition
+    # preview. Older callers/configurations can leave it unavailable.
+    fir_profile: Optional[Any] = None
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -281,6 +284,7 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             "fir_trigger_delay_units": fir_profile.trigger_delay_units,
             "fir_trigger_delay_us": fir_profile.trigger_delay_us,
             "fir_rate_label": fir_profile.timing_label,
+            "fir_profile": fir_profile,
         }
     ddr_values = {}
     ddr_config = config.get("ddr4_buf")

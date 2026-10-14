@@ -1,6 +1,6 @@
-# QICK Square Wave
+# Square Wave
 
-The additional **QICK Square Wave** tab continuously drives one
+The additional **Square Wave** tab continuously drives one
 `axis_awg_tuning_v1` generator on a QICK tProcessor v1 board. It uses the QICK
 connection and tProcessor clock configured in **Setup**. No readout, DDR
 capture, calibration database, or RF tone is needed.
