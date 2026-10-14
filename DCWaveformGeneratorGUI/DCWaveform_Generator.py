@@ -10582,6 +10582,45 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             break
 
+    def _configure_qick_update(self) -> None:
+        """Open maintenance controls without connecting or changing board files."""
+        def busy():
+            return self._experiment_thread is not None and self._experiment_thread.isRunning()
+
+        if busy():
+            QtWidgets.QMessageBox.information(
+                self, "QICK task running", "Wait for the current QICK task to finish before updating QICK."
+            )
+            return
+        try:
+            from .qick_update_dialog import QickUpdateDialog
+        except ImportError:
+            from qick_update_dialog import QickUpdateDialog
+        connection = self._shared_qick_connection()
+        dialog = QickUpdateDialog(
+            self, host=connection.host, ns_port=connection.ns_port,
+            proxy_name=connection.proxy_name, is_busy=busy,
+        )
+        dialog.board_changed.connect(self._qick_files_changed)
+        dialog.exec_()
+        dialog.deleteLater()
+
+    def _qick_files_changed(self, state: str) -> None:
+        """Require a fresh GUI process after driver replacement or uncertain recovery."""
+        self._qick_configuration = None
+        self._acquisition_profile_connection = None
+        self.centralWidget().setEnabled(False)
+        # Keep File (save settings/exit) available. The open update dialog can still
+        # verify/restore a transaction; other tools must not reuse cached drivers.
+        for action in self.menuBar().actions()[1:]:
+            action.setEnabled(False)
+        file_actions = self.menuBar().actions()[0].menu().actions()
+        for action in file_actions[1:-1]:
+            action.setEnabled(False)
+        self.statusBar().showMessage(
+            "QICK maintenance: " + state + ". Save settings if needed, then restart this GUI before using outputs."
+        )
+
     def _set_awg_output_channel(self, output_index: int, channel: int) -> None:
         """Apply one front-panel generator mapping without duplicate channels."""
         output_index = int(output_index)
@@ -10632,6 +10671,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_setup_action.triggered.connect(
             self._configure_qick_setup
         )
+        self._qick_update_action = m_setup.addAction("QICK Library and Firmware Update...")
+        self._qick_update_action.triggered.connect(self._configure_qick_update)
 
         # Pulse
         m_pulse     = mb.addMenu("&Pulse")

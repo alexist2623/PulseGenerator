@@ -52,6 +52,8 @@ class QickFrontPanelPort:
     board_type: Optional[str]
     qick_channels: Tuple[int, ...]
     block_paths: Tuple[str, ...]
+    baseband_only: bool = False
+    summed_output: bool = False
 
     @property
     def label(self) -> str:
@@ -216,6 +218,8 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
     cards = _detected_cards(config)
     output_channels: Dict[int, list] = {index: [] for index in range(16)}
     output_paths: Dict[int, list] = {index: [] for index in range(16)}
+    baseband_ports = set()
+    summed_ports = set()
     for channel, gen in enumerate(config.get("gens", ())):
         if not isinstance(gen, Mapping) or "dac" not in gen:
             continue
@@ -224,6 +228,10 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         if 0 <= panel_index < 16:
             output_channels[panel_index].append(channel)
             output_paths[panel_index].append(str(gen.get("fullpath", gen.get("type", ""))))
+            if gen.get("output_sum_version") == 1:
+                baseband_ports.add(panel_index)
+                if not gen.get("output_sum_bypass", True):
+                    summed_ports.add(panel_index)
 
     input_channels: Dict[int, list] = {index: [] for index in range(8)}
     input_paths: Dict[int, list] = {index: [] for index in range(8)}
@@ -252,6 +260,8 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
             board_type=cards["DAC"].get(index // 4),
             qick_channels=tuple(output_channels[index]),
             block_paths=tuple(output_paths[index]),
+            baseband_only=index in baseband_ports,
+            summed_output=index in summed_ports,
         )
         for index in range(16)
     )
@@ -1263,8 +1273,17 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 and set(port.qick_channels) & square_pulse_output_channels(self._configuration)
                 else ""
             )
-            self.output_nqz.setEnabled(self._allowed_output_channels is None)
-            rf_output = port.board_type == "RF_Out" and self._allowed_output_channels is None
+            self.output_nqz.setEnabled(self._allowed_output_channels is None and not port.baseband_only)
+            self.output_nqz.setToolTip(
+                "This AWG physical output requires Nyquist zone 1."
+                if port.baseband_only else "RFDC Nyquist zone; supported values are 1 and 2")
+            if port.baseband_only:
+                self.output_nqz.setValue(1)
+                self.output_att1_db.setValue(0.)
+                self.output_att2_db.setValue(0.)
+                self.output_filter_type.setCurrentText("bypass")
+            rf_output = (port.board_type == "RF_Out" and self._allowed_output_channels is None
+                         and not port.baseband_only)
             self.output_att1_db.setEnabled(rf_output)
             self.output_att2_db.setEnabled(rf_output)
             self.output_filter_type.setEnabled(rf_output)
@@ -1402,10 +1421,10 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 {
                     "output_ch": int(self.output_channel.currentData()),
                     "output_board_type": str(output.board_type),
-                    "output_nqz": self.output_nqz.value(),
-                    "output_att1_db": self.output_att1_db.value(),
-                    "output_att2_db": self.output_att2_db.value(),
-                    "output_filter_type": self.output_filter_type.currentText(),
+                    "output_nqz": 1 if output.baseband_only else self.output_nqz.value(),
+                    "output_att1_db": 0. if output.baseband_only else self.output_att1_db.value(),
+                    "output_att2_db": 0. if output.baseband_only else self.output_att2_db.value(),
+                    "output_filter_type": "bypass" if output.baseband_only else self.output_filter_type.currentText(),
                     "output_filter_cutoff_ghz": (
                         self.output_filter_cutoff_ghz.value()
                     ),
@@ -1482,6 +1501,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 f"{output.board_label} | NQZ {self.output_nqz.value()} | "
                 f"{output_condition} | {output_path}"
             )
+            if output.summed_output:
+                lines.append(f"AWG + RF sum on {output.label}: {output.channel_label}")
         if self._scope in {"path", "input"}:
             input_port = self._configuration.port("input", self._selected_input or 0)
             input_ch = self.input_channel.currentData()

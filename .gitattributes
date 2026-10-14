@@ -1,1 +1,14 @@
 *.pdf binary
+# Preserve the bytes recorded by the v4 validation and updater source hashes.
+DCWaveformGeneratorGUI/DCWaveform_Generator.py -text
+DCWaveformGeneratorGUI/qick_fine_tune_sweep.py -text
+DCWaveformGeneratorGUI/qick_front_panel.py -text
+DCWaveformGeneratorGUI/qick_qcodes_experiment.py -text
+DCWaveformGeneratorGUI/test_output_sum_v4.py -text
+DCWaveformGeneratorGUI/qick_update.py -text
+DCWaveformGeneratorGUI/qick_update_remote.py -text
+DCWaveformGeneratorGUI/qick_update_dialog.py -text
+DCWaveformGeneratorGUI/test_qick_update_transactions.py -text
+DCWaveformGeneratorGUI/test_qick_update_ui.py -text
+DCWaveformGeneratorGUI/requirements-updater.txt -text
+DCWaveformGeneratorGUI/QICK_UPDATE.md -text

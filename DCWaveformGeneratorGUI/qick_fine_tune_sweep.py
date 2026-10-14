@@ -5202,6 +5202,19 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
     def _build_aux_timing(self):
         f_time = self.tproc_mhz
 
+        # v4 sums RF samples into the AWG DAC. Schedule the existing DDS ahead
+        # of its requested physical boundary by its measured pipeline latency.
+        # Legacy bitstreams retain their original RF timestamp convention.
+        rf_latencies = [self._fabric_to_tproc(rf.gen_ch,
+            int(self.soccfg['gens'][rf.gen_ch]['output_latency_cycles']))
+            if self.soccfg['gens'][rf.gen_ch].get('output_sum_role') == 'rf' else 0
+            for rf in self.rf_pulse_configs]
+        earliest = min((self.timing['segment_starts'][self._segment_index(rf.at_segment, require_set=True)]
+                        + rf.delay_tproc_cycles - latency
+                        for rf, latency in zip(self.rf_pulse_configs, rf_latencies)), default=0)
+        if earliest < 0:
+            self._shift_timing(-earliest)
+
         if self.ddr_readout_config is not None:
             ddr = self.ddr_readout_config
             segment_index = self._segment_index(ddr.at_segment, require_set=True)
@@ -5310,7 +5323,11 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             )
             rf_port = int(self.soccfg["gens"][rf.gen_ch]["tproc_ch"])
             occupied = occupied_by_port.setdefault(rf_port, set())
-            rf_start = int(requested_start)
+            latency = rf_latencies[rf_index]
+            rf_start = int(requested_start) - latency
+            if latency and any(abs(rf_start - t) < 3 for t in occupied):
+                raise ValueError('The v4 RF command conflicts with another command on its shared '
+                                 'tProcessor port; adjust the RF delay or segment timing.')
             while rf_start in occupied:
                 rf_start += self.command_spacing_tproc_cycles
             occupied.add(rf_start)
@@ -5321,10 +5338,13 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             periodic = bool(self._rf_runtime[rf_index]["periodic"])
             rf_end = int(requested_end)
             if periodic:
+                if latency and any(abs(rf_end - t) < 3 for t in occupied):
+                    raise ValueError('The v4 RF stop conflicts with another command on its shared '
+                                     'tProcessor port; adjust the RF duration.')
                 while rf_end in occupied:
                     rf_end += self.command_spacing_tproc_cycles
                 occupied.add(rf_end)
-            if rf.require_within_segment and rf_end > self.timing["segment_ends"][segment_index]:
+            if rf.require_within_segment and rf_end + latency > self.timing["segment_ends"][segment_index]:
                 raise ValueError(
                     f"RF pulse ends at t={rf_end}, after SET segment {rf.at_segment!r} "
                     f"ends at t={self.timing['segment_ends'][segment_index]}"
@@ -5337,8 +5357,11 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 "requested_end": int(requested_end),
                 "end": int(rf_end),
                 "mode": "periodic_timed_stop" if periodic else "oneshot",
-                "command_skew_tproc_cycles": int(rf_start - requested_start),
+                "command_skew_tproc_cycles": int(rf_start + latency - requested_start),
                 "stop_skew_tproc_cycles": int(rf_end - requested_end),
+                "output_latency_tproc_cycles": latency,
+                "physical_start": int(rf_start + latency),
+                "physical_end": int(rf_end + latency),
             }
             rf_timings.append(timing)
             self.aux_timing.update({
@@ -5346,6 +5369,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 f"rf_{rf_index}_start": timing["start"],
                 f"rf_{rf_index}_end": timing["end"],
                 f"rf_{rf_index}_mode": timing["mode"],
+                f"rf_{rf_index}_output_latency": latency,
                 f"rf_{rf_index}_command_skew_tproc_cycles": (
                     timing["command_skew_tproc_cycles"]
                 ),
@@ -5353,7 +5377,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     timing["stop_skew_tproc_cycles"]
                 ),
             })
-            self.timing["point_end"] = max(self.timing["point_end"], rf_end)
+            self.timing["point_end"] = max(self.timing["point_end"], rf_end + latency)
         self.aux_timing["rf_pulses"] = tuple(rf_timings)
         if len(rf_timings) == 1:
             timing = rf_timings[0]
@@ -5609,6 +5633,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                 )
                 maximum_excess = (
                     int(self.aux_timing[f"rf_{rf_index}_end"])
+                    + int(self.aux_timing.get(f"rf_{rf_index}_output_latency", 0))
                     - int(self.timing["segment_ends"][segment_index])
                 )
                 for event_delta, segment_delta, axis in zip(
@@ -5736,6 +5761,29 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     ("event_time", "rf_stop", rf_index),
                 )
         events.sort(key=lambda event: event[:3])
+        # v4 alignment must not be achieved by letting timed SETs slip. Check
+        # every integer point analytically; affine differences attain their
+        # minimum at a box corner, including descending/nested sweeps.
+        v4_ports = {int(self.soccfg['gens'][rf.gen_ch]['tproc_ch'])
+                    for rf in self.rf_pulse_configs
+                    if self.soccfg['gens'][rf.gen_ch].get('output_sum_role') == 'rf'}
+        previous_v4 = {}
+        for event in events:
+            base, _, _, port, key = event
+            if port not in v4_ports:
+                continue
+            previous = previous_v4.get(port)
+            if previous is not None and (key[1].startswith('rf_') or previous[4][1].startswith('rf_')):
+                zero = (0,) * len(self.sequence.sweep_axes)
+                current_model = model_by_key.get(key, {'base':base, 'axis_deltas':zero})
+                prev_model = model_by_key.get(previous[4], {'base':previous[0], 'axis_deltas':zero})
+                minimum = int(current_model['base']) - int(prev_model['base']) + sum(
+                    min(0, (int(a)-int(b))*(axis.count-1))
+                    for a,b,axis in zip(current_model['axis_deltas'],prev_model['axis_deltas'],self.sequence.sweep_axes))
+                if minimum < 3:
+                    raise ValueError('The v4 RF/AWG sweep requires commands less than 3 tProcessor '
+                                     'clocks apart on a shared port; adjust the RF timing.')
+            previous_v4[port] = event
         shape = tuple(axis.count for axis in self.sequence.sweep_axes)
         point_indices = (
             range(self.sequence.sweep_point_count)
@@ -6125,7 +6173,8 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             self._extension_axis_deltas(len(self.sequence.segments) - 1, include_current=True))
         for index, _rf in enumerate(self.rf_pulse_configs):
             key = ("event_time", "rf_stop", index)
-            add(f"rf_end_{index}", self.aux_timing[f"rf_{index}_end"],
+            add(f"rf_end_{index}", self.aux_timing[f"rf_{index}_end"]
+                + self.aux_timing.get(f"rf_{index}_output_latency", 0),
                 by_key.get(key, {}).get("axis_deltas", zero_deltas))
         # The readout command may share a timed-output FIFO with generators.
         add("readout_start", self.aux_timing["ddr_readout_start"],

@@ -646,6 +646,20 @@ def connect_qick(
     )
 
 
+def _validate_summed_rf_spec(gen_cfg, spec):
+    """Prevent reuse of a dedicated RF connector's calibration on a v4 AWG DAC."""
+    if gen_cfg.get('output_sum_role') != 'rf':
+        return
+    if (spec.power_calibration_enabled or spec.power_sweep_enabled
+            or any(event.power_calibration_enabled for event in spec.pulse_events)):
+        raise ValueError('This v4 RF generator is summed into the AWG physical output. '
+                         'RF connector power calibration cannot be used on this path; '
+                         'disable power calibration and use raw DDS gain.')
+    if spec.att1_db or spec.att2_db or spec.filter_type != 'bypass':
+        raise ValueError('This v4 RF generator uses the AWG physical output, which has '
+                         'no RF attenuator/filter. Select zero attenuation and bypass.')
+
+
 def build_runtime_rf_pulses(
     soccfg,
     specs: Sequence[QickRfPulseSpec],
@@ -658,6 +672,7 @@ def build_runtime_rf_pulses(
     pulses = []
     for spec in specs:
         gen_cfg = soccfg["gens"][spec.gen_ch]
+        _validate_summed_rf_spec(gen_cfg, spec)
         parameter_by_name = {
             parameter.name: parameter
             for parameter in spec.frequency_parameters
@@ -988,6 +1003,11 @@ def configure_rf_output(
     spec: QickRfPulseSpec,
 ) -> Mapping[str, Any]:
     """Apply one RF-board output setting when the user commits it."""
+    config = soc.get_cfg() if hasattr(soc, 'get_cfg') else None
+    if config is not None and config['gens'][spec.gen_ch].get('output_sum_role') == 'rf':
+        _validate_summed_rf_spec(config['gens'][spec.gen_ch], spec)
+        soc.rfb_set_gen_dc(spec.gen_ch)
+        return _rf_output_details(replace(spec, output_board_type='DC_Out'), 0., 0.)
     if spec.output_board_type == "RF_Out":
         actual_attenuation = soc.rfb_set_gen_rf(
             spec.gen_ch, spec.att1_db, spec.att2_db
