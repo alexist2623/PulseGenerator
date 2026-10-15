@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import shlex
 import stat
@@ -95,6 +96,139 @@ def firmware_versions(repo):
     return versions
 
 
+def _v5_hardware_review(hwh, topology, hwh_digest):
+    """Validate the fixed v5 output route from XML, without loading QICK/FPGA."""
+    def fail(detail):
+        raise ValueError('Invalid v5 firmware hardware: ' + detail)
+
+    modules = {}
+    for module in hwh.iter('MODULE'):
+        name = module.get('INSTANCE')
+        if name in modules:
+            fail('duplicate HWH module ' + str(name))
+        modules[name] = module
+    if (sum(m.get('MODTYPE') == 'axis_output_sum_v2' for m in modules.values()) != 7
+            or any(m.get('MODTYPE') == 'axis_output_sum_v1' for m in modules.values())):
+        fail('expected seven v2 sum blocks and no v1 sum block')
+
+    def module(name, kind):
+        value = modules.get(name)
+        if value is None or value.get('MODTYPE') != kind:
+            fail('missing/wrong module ' + name)
+        return value
+
+    def parameter(value, name, expected):
+        entries = value.findall("./PARAMETERS/PARAMETER[@NAME='%s']" % name)
+        try:
+            raw = entries[0].get('VALUE') if len(entries) == 1 else None
+            actual = int(raw, 16 if raw.lower().startswith('0x') else 10)
+        except (AttributeError, TypeError, ValueError):
+            actual = None
+        if actual != expected:
+            fail(value.get('INSTANCE') + ' ' + name)
+
+    def port(value, name):
+        entries = value.findall("./PORTS/PORT[@NAME='%s']" % name)
+        if len(entries) != 1:
+            fail(value.get('INSTANCE') + ' missing/duplicate port ' + name)
+        return entries[0]
+
+    def link(value, source, target, destination):
+        connections = port(value, source).findall('./CONNECTIONS/CONNECTION')
+        if (len(connections) != 1 or connections[0].get('INSTANCE') != target
+                or connections[0].get('PORT') != destination):
+            fail(value.get('INSTANCE') + ' unexpected connection ' + source)
+
+    if (not isinstance(topology, dict) or topology.get('passed') is not True
+            or str(topology.get('sha256', '')).lower() != hwh_digest):
+        fail('validated topology must reference this HWH SHA256')
+    pairs = topology.get('pairs')
+    if not isinstance(pairs, list) or len(pairs) != 7:
+        fail('topology must contain seven AWG routes')
+    indexed = {}
+    for pair in pairs:
+        if not isinstance(pair, dict) or not isinstance(pair.get('awg'), str) or pair['awg'] in indexed:
+            fail('invalid/duplicate topology pair')
+        indexed[pair['awg']] = pair
+
+    rfdc = module('usp_rf_data_converter_0', 'usp_rf_data_converter')
+    zero = module('sum_zero_word', 'xlconstant')
+    parameter(zero, 'CONST_WIDTH', 256)
+    parameter(zero, 'CONST_VAL', 0)
+    routes = ((4, 8, 0, '10'), (5, 10, 1, '11'), (6, 11, 3, '12'),
+              (8, 13, None, '20'), (9, 14, None, '21'),
+              (10, 15, None, '22'), (11, 16, None, '23'))
+    for awg_id, slice_id, rf_id, dac in routes:
+        awg_name, sum_name = 'axis_awg_tuning_v3_%s' % awg_id, 'axis_output_sum_%s' % awg_id
+        slice_name = 'axis_register_slice_%s' % slice_id
+        rf_name = 'axis_signal_gen_v6_%s' % rf_id if rf_id is not None else None
+        awg = module(awg_name, 'axis_awg_tuning_v3')
+        output = module(sum_name, 'axis_output_sum_v2')
+        register = module(slice_name, 'axis_register_slice_nb')
+        for name, expected in (('N_PTS', 16), ('PIPELINE_CYCLES', 2),
+                               ('AWG_DELAY_CYCLES', 13), ('BYPASS', int(rf_id is None))):
+            parameter(output, name, expected)
+        parameter(awg, 'DC_AREA_BITS', 48)
+        clock_net = port(output, 'aclk').get('SIGNAME')
+        clocked = [output, awg, register]
+        if rf_name:
+            clocked.append(module(rf_name, 'axis_signal_gen_v6'))
+        for value in clocked:
+            clock = port(value, 'aclk')
+            if not clock_net or clock.get('CLKFREQUENCY') != '300000000' or clock.get('SIGNAME') != clock_net:
+                fail(value.get('INSTANCE') + ' requires the common 300 MHz clock')
+        link(output, 's0_axis_tdata', awg_name, 'm_axis_tdata')
+        link(awg, 'm_axis_tdata', sum_name, 's0_axis_tdata')
+        link(output, 's1_axis_tdata', rf_name or 'sum_zero_word', 'm_axis_tdata' if rf_name else 'dout')
+        if rf_name:
+            link(modules[rf_name], 'm_axis_tdata', sum_name, 's1_axis_tdata')
+        link(output, 'm_axis_tdata', slice_name, 's_axis_tdata')
+        link(register, 's_axis_tdata', sum_name, 'm_axis_tdata')
+        link(register, 'm_axis_tdata', 'usp_rf_data_converter_0', 's%s_axis_tdata' % dac)
+        link(rfdc, 's%s_axis_tdata' % dac, slice_name, 'm_axis_tdata')
+        pair = indexed.get(awg_name, {})
+        route = pair.get('route', {})
+        expected = {'output_sum_version': 2, 'output_sum_block': sum_name,
+                    'output_sum_role': 'awg', 'output_sum_bypass': rf_name is None,
+                    'output_sum_awg': awg_name, 'output_sum_rf': rf_name,
+                    'output_sum_awg_delay_cycles': 13,
+                    'post_output_latency_cycles': 2}
+        if (pair.get('rf') != rf_name or pair.get('dac') != dac or not isinstance(route, dict)
+                or any(route.get(k) != v for k, v in expected.items())
+                or type(route.get('output_sum_bypass')) is not bool):
+            fail('manifest topology differs from HWH route ' + awg_name)
+    return {'passed': True, 'output_sum_blocks': 7, 'output_sum_version': 2,
+            'awg_delay_cycles': 13, 'pipeline_cycles': 2, 'clock_hz': 300000000,
+            'dc_area_bits': 48, 'hwh_sha256': hwh_digest}
+
+
+def _v5_build_review(build, manifest_path):
+    """A build candidate is not a published deployment manifest."""
+    if (manifest_path.name != 'build_manifest.json' or manifest_path.is_symlink()
+            or not isinstance(build, dict) or not isinstance(build.get('artifacts'), list)):
+        raise ValueError('A validated v5 build_manifest.json is required; candidate_manifest.json is not a deployment manifest.')
+    timing = build.get('timing')
+    if not isinstance(timing, dict) or timing.get('timing_closed') != 'YES':
+        raise ValueError('The v5 build manifest must report timing closure.')
+    for key in ('setup_wns_ns', 'setup_tns_ns', 'hold_whs_ns', 'hold_ths_ns'):
+        try:
+            value = float(timing[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('Missing/invalid v5 timing metric: ' + key) from None
+        if not math.isfinite(value) or value < 0 or (key in ('setup_tns_ns', 'hold_ths_ns') and value != 0):
+            raise ValueError('Failed v5 timing metric: ' + key)
+    records = build['artifacts']
+    if any(not isinstance(v, dict) or not isinstance(v.get('path'), str) for v in records):
+        raise ValueError('Invalid v5 artifact records.')
+    names = [PureWindowsPath(v['path']).name for v in records]
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate v5 artifact records.')
+    members = build.get('xsa_members')
+    if (not isinstance(members, dict) or any(not isinstance(members.get(k), str)
+            or not members[k].endswith(suffix) for k, suffix in (('bit', '.bit'), ('hwh', '.hwh')))):
+        raise ValueError('The v5 build manifest must name its BIT/HWH XSA members.')
+
+
 def review_package(repo, manifest_path=None, *, active_firmware=None):
     """Read-only local review. Never invoke repository scripts or pip."""
     repo = repository_root(repo)
@@ -117,7 +251,12 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
     package = library / 'qick'
     if not (package / '__init__.py').is_file():
         raise ValueError('Select a QSTL_QICK repository containing qick/qick_lib/qick.')
-    build = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
+    hwh = ET.parse(hwh_path).getroot()
+    is_v5 = ('qstl_awg_v5' in relative.parts
+             or any(m.get('MODTYPE') == 'axis_output_sum_v2' for m in hwh.iter('MODULE')))
+    build = json.loads(manifest_path.read_text(encoding='utf-8-sig')) if manifest_path.is_file() else {}
+    if is_v5:
+        _v5_build_review(build, manifest_path)
     timing = build.get('timing', build.get('build_result', {}))
     if build and timing.get('timing_closed') != 'YES':
         raise ValueError('The firmware manifest does not report timing closure.')
@@ -128,22 +267,30 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
         records = {PureWindowsPath(v['path']).name: v for v in build['artifacts']}
         for p in (bit, hwh_path, bit.with_suffix('.xsa')):
             expected = records.get(p.name, {})
-            if not p.is_file() or p.stat().st_size != expected.get('bytes') or sha(p) != expected.get('sha256'):
+            if (not p.is_file() or (is_v5 and p.resolve() != p)
+                    or p.stat().st_size != expected.get('bytes')
+                    or sha(p) != str(expected.get('sha256', '')).lower()):
                 raise ValueError('Firmware does not match build_manifest.json: ' + p.name)
         with zipfile.ZipFile(bit.with_suffix('.xsa')) as z:
             for p in (bit, hwh_path):
                 matched = False
-                for member in z.namelist():
+                members = z.namelist()
+                if is_v5:
+                    selected = build['xsa_members']['bit' if p == bit else 'hwh']
+                    members = [name for name in members if name == selected]
+                    if len(members) != 1:
+                        raise ValueError('Missing/ambiguous v5 XSA member: ' + selected)
+                for member in members:
                     if not member.endswith(p.suffix):
                         continue
                     h = hashlib.sha256()
                     with z.open(member) as f:
                         for block in iter(lambda: f.read(1024 * 1024), b''):
                             h.update(block)
-                    matched = matched or h.hexdigest() == records[p.name]['sha256']
+                    matched = matched or h.hexdigest() == records[p.name]['sha256'].lower()
                 if not matched:
                     raise ValueError('BIT/HWH are not the pair from the recorded XSA.')
-    hwh = ET.parse(hwh_path).getroot()
+    v5_hardware = _v5_hardware_review(hwh, topology, sha(hwh_path)) if is_v5 else None
     timestamp = hwh.attrib.get('TIMESTAMP')
     if not timestamp:
         raise ValueError('HWH firmware timestamp is missing.')
@@ -192,6 +339,8 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
             'firmware_validation': 'build_manifest_and_xsa' if build else 'file_pair_only',
             'files': hashes,
             'library_source_hashes': local_sources}
+    if v5_hardware:
+        data['v5_hardware_validation'] = v5_hardware
     identity = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return {'repo': str(repo), 'manifest_path': str(manifest_path), 'identity': identity,
             'manifest': data, 'files': {k: str(v) for k, v in files.items()},

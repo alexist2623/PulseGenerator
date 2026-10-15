@@ -356,6 +356,7 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings(
     panel.output_att1_db.setValue(5.25)
     panel.output_att2_db.setValue(7.5)
     panel.output_filter_type.setCurrentText("lowpass")
+    panel.output_nqz.setValue(2)
     panel.apply_button.click()
     app.processEvents()
 
@@ -364,6 +365,15 @@ def test_output_preview_opens_scoped_dialog_and_applies_hwh_board_settings(
     assert output.att1_db.value() == 5.25
     assert output.att2_db.value() == 7.5
     assert output.filter_type.currentText() == "lowpass"
+    assert output.nqz.isHidden()
+    assert output.layout().indexOf(output.nqz) == -1
+    assert output.configured_spec().nqz == 2
+    saved_output = output.settings_dict()
+    assert saved_output["nqz"] == 2
+    output.load_settings(saved_output)
+    assert output.configured_spec().nqz == 2
+    assert output.nqz.isHidden()
+    assert hardware_updates[-1][1].nqz == 2
     assert len(hardware_updates) == 1
     assert hardware_updates[0][1].gen_ch == 0
     assert hardware_updates[0][1].att1_db == 5.25

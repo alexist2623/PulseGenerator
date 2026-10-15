@@ -32,6 +32,17 @@ def square_pulse_output_channels(configuration) -> frozenset:
     return frozenset(channels)
 
 
+def awg_tuning_output_channels(configuration) -> frozenset:
+    """Identify AWG generators even when an RF generator shares their DAC."""
+    channels = set(getattr(configuration, "awg_tuning_channels", ()))
+    for port in getattr(configuration, "outputs", ()):
+        channels.update(
+            channel for channel, path in zip(port.qick_channels, port.block_paths)
+            if "axis_awg_tuning_" in path.lower()
+        )
+    return frozenset(channels) - square_pulse_output_channels(configuration)
+
+
 def validate_awg_output_channels(configuration, channels) -> None:
     invalid = sorted(set(channels) & square_pulse_output_channels(configuration))
     if invalid:
@@ -228,7 +239,7 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         if 0 <= panel_index < 16:
             output_channels[panel_index].append(channel)
             output_paths[panel_index].append(str(gen.get("fullpath", gen.get("type", ""))))
-            if gen.get("output_sum_version") == 1:
+            if gen.get("output_sum_version") in (1, 2):
                 baseband_ports.add(panel_index)
                 if not gen.get("output_sum_bypass", True):
                     summed_ports.add(panel_index)
@@ -1182,17 +1193,17 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self._select_port("output", self._selected_output)
 
     def _update_awg_output_filter(self) -> None:
-        excluded = (square_pulse_output_channels(self._configuration)
-                    if self._awg_output_mode else frozenset())
-        if self._allowed_output_channels is not None:
-            excluded = excluded | frozenset(
-                channel for port in getattr(self._configuration, "outputs", ())
-                for channel in port.qick_channels
-                if channel not in self._allowed_output_channels
-            )
         self.canvas.set_disabled_outputs(
             port.panel_index for port in getattr(self._configuration, "outputs", ())
-            if port.qick_channels and set(port.qick_channels) <= excluded
+            if port.qick_channels and not any(
+                self._output_channel_allowed(channel) for channel in port.qick_channels)
+        )
+
+    def _output_channel_allowed(self, channel) -> bool:
+        return (
+            (self._allowed_output_channels is None or channel in self._allowed_output_channels)
+            and (not self._awg_output_mode
+                 or channel in awg_tuning_output_channels(self._configuration))
         )
 
     def set_output_channel_filter(self, channels=None) -> None:
@@ -1253,11 +1264,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(channel_combo):
             channel_combo.clear()
             for channel, path in zip(port.qick_channels, port.block_paths):
-                if (direction == "output" and self._allowed_output_channels is not None
-                        and channel not in self._allowed_output_channels):
-                    continue
-                if (direction == "output" and self._awg_output_mode
-                        and channel in square_pulse_output_channels(self._configuration)):
+                if direction == "output" and not self._output_channel_allowed(channel):
                     continue
                 channel_combo.addItem(f"{channel}  |  {path}", channel)
             match = channel_combo.findData(preferred)
@@ -1268,9 +1275,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self.output_sma.setText(port.label)
             self.output_board.setText(port.board_label)
             self.output_channel.setToolTip(
-                "SquarePulse outputs cannot be used as AWG outputs."
+                "This DAC has no AWG tuning generator. Select an AWG output."
                 if self._awg_output_mode and not channel_combo.count()
-                and set(port.qick_channels) & square_pulse_output_channels(self._configuration)
                 else ""
             )
             self.output_nqz.setEnabled(self._allowed_output_channels is None and not port.baseband_only)
@@ -1321,10 +1327,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             output_valid = bool(
                 output.board_type in OUTPUT_BOARD_TYPES
                 and self.output_channel.currentData() is not None
-                and (self._allowed_output_channels is None
-                     or self.output_channel.currentData() in self._allowed_output_channels)
-                and not (self._awg_output_mode and self.output_channel.currentData()
-                         in square_pulse_output_channels(self._configuration))
+                and self._output_channel_allowed(self.output_channel.currentData())
             )
         input_valid = False
         if self._selected_input is not None:

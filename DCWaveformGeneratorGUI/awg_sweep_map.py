@@ -130,6 +130,14 @@ def sweep_axis_label(axis: Any) -> str:
         return f"{output_name} / {segment_name} template N"
     if axis_kind == "rf_template_tau":
         return f"{output_name} / {segment_name} template tau"
+    if axis_kind == "rf_delay":
+        return f"{output_name} / {segment_name} RF delay {axis.parameter_name}"
+    if axis_kind == "rf_t2_duration":
+        return f"{output_name} / {segment_name} T2 pi duration"
+    if axis_kind == "rf_amplitude":
+        return f"{output_name} / {segment_name} RF amplitude {axis.parameter_name}"
+    if axis_kind == "rf_phase":
+        return f"{output_name} / {segment_name} RF phase {axis.parameter_name}"
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
@@ -153,8 +161,14 @@ def _axis_display_values(
         return np.asarray(coordinates, dtype=np.float64), {"square_frequency":"MHz", "square_amplitude":"mV", "square_phase":"deg"}[axis_kind]
     if axis_kind == "rf_template_n":
         return np.asarray(coordinates, dtype=np.float64), "count"
+    if axis_kind == "rf_amplitude":
+        return np.asarray(coordinates, dtype=np.float64), axis.coordinate_unit
+    if axis_kind == "rf_phase":
+        return np.asarray(coordinates, dtype=np.float64), "deg"
     if axis_kind in {
         "rf_template_tau",
+        "rf_delay",
+        "rf_t2_duration",
         "rf_duration",
         "ramp_duration",
         "hold_duration",
@@ -287,6 +301,14 @@ def _stored_axis_label(axis: Mapping[str, Any]) -> str:
         return f"{output_name} / {segment_name} template N"
     if axis_kind == "rf_template_tau":
         return f"{output_name} / {segment_name} template tau"
+    if axis_kind == "rf_delay":
+        return f"{output_name} / {segment_name} RF delay {axis.get('parameter_name', '')}"
+    if axis_kind == "rf_t2_duration":
+        return f"{output_name} / {segment_name} T2 pi duration"
+    if axis_kind == "rf_amplitude":
+        return f"{output_name} / {segment_name} RF amplitude {axis.get('parameter_name', '')}"
+    if axis_kind == "rf_phase":
+        return f"{output_name} / {segment_name} RF phase {axis.get('parameter_name', '')}"
     if axis_kind == "rf_duration":
         return f"{output_name} / {segment_name} RF duration"
     if axis_kind == "rf_frequency":
@@ -445,6 +467,14 @@ def _stored_axis_native_values(
     coordinates = np.asarray(values, dtype=np.float64)
     unit = str(axis.get("unit", "")).strip().lower()
     axis_kind = str(axis.get("axis_kind", "amplitude"))
+    if axis_kind == "rf_amplitude":
+        if unit in {"gain", "dbm"}:
+            return coordinates
+        raise ValueError(f"unsupported stored RF amplitude unit {axis.get('unit')!r}")
+    if axis_kind == "rf_phase":
+        if unit in {"deg", "degree", "degrees"}:
+            return coordinates
+        raise ValueError(f"unsupported stored RF phase unit {axis.get('unit')!r}")
     if axis_kind == "rf_template_n":
         if unit in {"", "count", "counts", "pulse", "pulses"}:
             return coordinates
@@ -453,6 +483,8 @@ def _stored_axis_native_values(
         )
     if axis_kind in {
         "rf_template_tau",
+        "rf_delay",
+        "rf_t2_duration",
         "rf_duration",
         "ramp_duration",
         "hold_duration",
@@ -567,6 +599,8 @@ def awg_sweep_result_from_stored_arrays(
                 output_name=str(axis.get("output_name", "")),
                 segment_name=str(axis.get("segment_name", "")),
                 axis_kind=str(axis.get("axis_kind", "amplitude")),
+                parameter_name=str(axis.get("parameter_name", "")),
+                coordinate_unit=str(axis.get("unit", "")),
                 start=float(np.min(native_values)),
                 stop=float(np.max(native_values)),
                 count=int(axis.get("count", np.unique(native_values).size)),

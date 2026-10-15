@@ -13,7 +13,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets, sip
 
 try:
     from .dc_waveform_core import PulseSequence
@@ -894,7 +894,7 @@ class RfPulseTimelineWidget(pg.PlotWidget):
         """Render an ordered RF sequence in one generator timeline.
 
         Delay entries are already represented by gaps between ``start_ns``
-        values. Pulse names are drawn over their corresponding envelopes, and
+        values. Pulse names are drawn inside their corresponding envelopes, and
         repeated names use the same color (for example, every ``X`` pulse).
         """
         self.clear_pulse()
@@ -911,8 +911,7 @@ class RfPulseTimelineWidget(pg.PlotWidget):
             1.0,
             *(abs(float(pulse["gain"])) for pulse in normalized),
         )
-        label_y = max_amplitude * 1.12
-        color_by_name = {}
+        color = _plot_color(6)
         modes = []
         names = []
 
@@ -921,9 +920,6 @@ class RfPulseTimelineWidget(pg.PlotWidget):
             if not name:
                 name = f"pulse_{pulse_index}"
             names.append(name)
-            if name not in color_by_name:
-                color_by_name[name] = _plot_color(6 + len(color_by_name))
-            color = color_by_name[name]
 
             start_ns = float(pulse["start_ns"])
             duration_ns = float(pulse["duration_ns"])
@@ -994,11 +990,12 @@ class RfPulseTimelineWidget(pg.PlotWidget):
             label = pg.TextItem(
                 text=name,
                 color=color,
-                anchor=(0.5, 1.0),
+                anchor=(0.5, 0.5),
                 fill=pg.mkBrush(255, 255, 255, 220),
                 border=pg.mkPen(color, width=1.0),
             )
-            label.setPos((start_ns + end_ns) / 2.0, label_y)
+            label.textItem.document().setDocumentMargin(1.0)
+            label.setPos((start_ns + end_ns) / 2.0, 0.0)
             label.setZValue(20)
             label.setToolTip(
                 f"{name}: {frequency_mhz:.6g} MHz, gain {gain}, "
@@ -1388,7 +1385,10 @@ class WaveformPlotWidget(pg.PlotWidget):
 
     def set_virtual_preview(self, time_ns=None, waveforms_mv=None) -> None:
         """Show a sweep point without changing the editable base waveform."""
-        self._drag_flat = self._drag_point = None
+        # Deferred physical-waveform updates call this during a base-waveform
+        # drag. Only a real preview transition should cancel that edit.
+        if time_ns is not None or self._virtual_preview is not None:
+            self._finish_drag()
         if time_ns is None:
             self._virtual_preview = None
         else:
@@ -1406,8 +1406,7 @@ class WaveformPlotWidget(pg.PlotWidget):
         if mode not in {"both", "virtual", "physical"}:
             raise ValueError("voltage view must be 'both', 'virtual', or 'physical'")
         self._voltage_view = mode
-        self._drag_flat = None
-        self._drag_point = None
+        self._finish_drag()
         for curve in self._line:
             curve.setVisible(mode in {"both", "virtual"})
         for curve in self._physical_line:
@@ -1610,6 +1609,7 @@ class WaveformPlotWidget(pg.PlotWidget):
                 self._line[pulse_index].setData(times, values[pulse_index])
 
     def add_pulse(self, pulse: PulseSequence) -> None:
+        self._finish_drag()
         self.set_virtual_preview()
         self._pulses.append(pulse)
         self._append_curve(pulse)
@@ -1623,12 +1623,14 @@ class WaveformPlotWidget(pg.PlotWidget):
     def set_selected_port_idx(self, index: int) -> None:
         if index < 0 or index >= len(self._pulses):
             raise IndexError("selected port index is out of range")
+        self._finish_drag()
         self._selected_port_idx = index
         self._update_highlight()
 
     def remove_pulse(self, index: int) -> None:
         if index < 0 or index >= len(self._pulses):
             raise IndexError("pulse index is out of range")
+        self._finish_drag()
         self.set_virtual_preview()
         curve = self._line.pop(index)
         self.removeItem(curve)
@@ -1680,7 +1682,35 @@ class WaveformPlotWidget(pg.PlotWidget):
                 return start_index, end_index
         return None
 
+    def _finish_drag(self) -> None:
+        self._drag_flat = self._drag_point = None
+        self._hide_annotation()
+        self.unsetCursor()
+
+    def _hide_annotation(self) -> None:
+        # Qt may send a final hide/leave while the scene is being destroyed.
+        if not sip.isdeleted(self._annotation):
+            self._annotation.hide()
+
+    def event(self, event):
+        # A tab change or loss of window activation can swallow the release.
+        if hasattr(self, "_annotation") and event.type() in (
+            QtCore.QEvent.Hide, QtCore.QEvent.WindowDeactivate,
+        ):
+            self._finish_drag()
+        return super().event(event)
+
     def eventFilter(self, watched, event):
+        if watched is self.viewport():
+            if event.type() == QtCore.QEvent.Leave:
+                self._hide_annotation()
+            elif event.type() == QtCore.QEvent.UngrabMouse:
+                self._finish_drag()
+            elif event.type() == QtCore.QEvent.MouseButtonRelease:
+                if self._drag_flat is not None or self._drag_point is not None:
+                    self.mouseReleaseEvent(event)
+                    return True
+                self._finish_drag()
         if self._voltage_view == "physical" or self._virtual_preview is not None:
             return super().eventFilter(watched, event)
         if watched is self.viewport():
@@ -1699,10 +1729,6 @@ class WaveformPlotWidget(pg.PlotWidget):
             elif event.type() == QtCore.QEvent.MouseMove:
                 if self._drag_flat is not None or self._drag_point is not None:
                     self.mouseMoveEvent(event)
-                    return True
-            elif event.type() == QtCore.QEvent.MouseButtonRelease:
-                if self._drag_flat is not None or self._drag_point is not None:
-                    self.mouseReleaseEvent(event)
                     return True
         return super().eventFilter(watched, event)
 
@@ -1726,6 +1752,10 @@ class WaveformPlotWidget(pg.PlotWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if not (event.buttons() & QtCore.Qt.LeftButton):
+            self._finish_drag()
+            super().mouseMoveEvent(event)
+            return
         if self._drag_flat is not None:
             pulse = self._pulses[self._selected_port_idx]
             position = self._view_position(event)
@@ -1733,13 +1763,13 @@ class WaveformPlotWidget(pg.PlotWidget):
             start_index, end_index = self._drag_flat
             pulse.update_flat(self._drag_flat, new_voltage)
             self.refresh(self._selected_port_idx)
-            self.flat_moved.emit(start_index, end_index, new_voltage)
             self._show_annotation(
                 float(pulse.t[start_index]),
                 new_voltage,
                 f"{pulse.t[start_index] * TIME_UNIT_SCALE[self._time_unit]:.6g} "
                 f"{self._time_unit}\n{new_voltage:.6g} mV",
             )
+            self.flat_moved.emit(start_index, end_index, new_voltage)
             event.accept()
             return
         if self._drag_point is not None:
@@ -1752,23 +1782,21 @@ class WaveformPlotWidget(pg.PlotWidget):
             pulse.update_point(self._drag_point, new_time)
             actual_time = float(pulse.t[start_index])
             self.refresh(self._selected_port_idx)
-            self.point_moved.emit(start_index, end_index, actual_time)
             self._show_annotation(
                 actual_time,
                 float(pulse.v[start_index]),
                 f"{actual_time * TIME_UNIT_SCALE[self._time_unit]:.6g} "
                 f"{self._time_unit}\n{pulse.v[start_index]:.6g} mV",
             )
+            self.point_moved.emit(start_index, end_index, actual_time)
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if self._drag_flat is not None or self._drag_point is not None:
-            self._drag_flat = None
-            self._drag_point = None
-            self.unsetCursor()
-            self._annotation.hide()
+        was_dragging = self._drag_flat is not None or self._drag_point is not None
+        self._finish_drag()
+        if was_dragging:
             event.accept()
             return
         super().mouseReleaseEvent(event)

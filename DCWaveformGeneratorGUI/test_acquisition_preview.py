@@ -100,6 +100,9 @@ def configure_window(window, *, samples=64):
 
 
 def test_gui_selected_hold_translates_rf_and_acquisition_without_mutating_settings(window):
+    # Linked ViewBoxes need realized screen geometry for zoom/unit assertions.
+    window.show()
+    QtWidgets.QApplication.processEvents()
     configure_window(window)
     settings = copy.deepcopy(window._settings_to_dict())
     waveform = window._pulse[0].t.copy()

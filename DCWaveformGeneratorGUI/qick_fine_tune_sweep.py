@@ -49,10 +49,12 @@ try:
     from .fir_ddr_profile import resolve_fir_ddr_profile
     from .qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from .qick_output_triggers import OutputTriggerProgramMixin
+    from .qick_rf_fine_duration import FineRfDurationProgramMixin
 except ImportError:
     from fir_ddr_profile import resolve_fir_ddr_profile
     from qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from qick_output_triggers import OutputTriggerProgramMixin
+    from qick_rf_fine_duration import FineRfDurationProgramMixin
 
 
 MAX_OUTPUTS = 8
@@ -754,10 +756,16 @@ class RfPulseConfig:
     frequency_parameter: str = ""
     duration_parameter: str = ""
     preceding_duration_parameters: Tuple[str, ...] = ()
+    fine_duration: bool = False
+    duration_samples: Optional[int] = None
 
     def __post_init__(self):
         _require_int(self.gen_ch, "gen_ch", 0)
         _require_int(self.length_cycles, "length_cycles", 1)
+        if not isinstance(self.fine_duration, bool):
+            raise TypeError("fine_duration must be bool")
+        if self.fine_duration:
+            _require_int(self.duration_samples, "duration_samples", 1)
         _require_int(self.gain, "gain")
         _require_int(self.nqz, "nqz", 1)
         _require_int(self.delay_tproc_cycles, "delay_tproc_cycles", 0)
@@ -2564,7 +2572,7 @@ def compile_sequence(
     return channels, tuple(compiled_points)
 
 
-class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgramMixin, RAveragerProgram):
+class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgramMixin, RAveragerProgram):
     """ASM v1 program generated from :class:`FineTuneSequence`.
 
     Sweep points and repetitions are both hardware loops.  Variable SET
@@ -5202,7 +5210,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
     def _build_aux_timing(self):
         f_time = self.tproc_mhz
 
-        # v4 sums RF samples into the AWG DAC. Schedule the existing DDS ahead
+        # Versioned sum stages route RF into the AWG DAC. Schedule the DDS ahead
         # of its requested physical boundary by its measured pipeline latency.
         # Legacy bitstreams retain their original RF timestamp convention.
         rf_latencies = [self._fabric_to_tproc(rf.gen_ch,
@@ -5325,8 +5333,9 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             occupied = occupied_by_port.setdefault(rf_port, set())
             latency = rf_latencies[rf_index]
             rf_start = int(requested_start) - latency
+            firmware = 'v5' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2 else 'v4'
             if latency and any(abs(rf_start - t) < 3 for t in occupied):
-                raise ValueError('The v4 RF command conflicts with another command on its shared '
+                raise ValueError(f'The {firmware} RF command conflicts with another command on its shared '
                                  'tProcessor port; adjust the RF delay or segment timing.')
             while rf_start in occupied:
                 rf_start += self.command_spacing_tproc_cycles
@@ -5339,7 +5348,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
             rf_end = int(requested_end)
             if periodic:
                 if latency and any(abs(rf_end - t) < 3 for t in occupied):
-                    raise ValueError('The v4 RF stop conflicts with another command on its shared '
+                    raise ValueError(f'The {firmware} RF stop conflicts with another command on its shared '
                                      'tProcessor port; adjust the RF duration.')
                 while rf_end in occupied:
                     rf_end += self.command_spacing_tproc_cycles
@@ -5602,6 +5611,9 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
 
         for rf_index, rf in enumerate(self.rf_pulse_configs):
             segment_index = self._segment_index(rf.at_segment)
+            if rf.fine_duration:
+                # Exact sample-width timing is supplied by the opt-in mixin.
+                continue
             start_deltas = list(
                 self._extension_axis_deltas(
                     segment_index,
@@ -5761,7 +5773,7 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     ("event_time", "rf_stop", rf_index),
                 )
         events.sort(key=lambda event: event[:3])
-        # v4 alignment must not be achieved by letting timed SETs slip. Check
+        # Summed-output alignment must not let timed SETs slip. Check
         # every integer point analytically; affine differences attain their
         # minimum at a box corner, including descending/nested sweeps.
         v4_ports = {int(self.soccfg['gens'][rf.gen_ch]['tproc_ch'])
@@ -5781,7 +5793,11 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                     min(0, (int(a)-int(b))*(axis.count-1))
                     for a,b,axis in zip(current_model['axis_deltas'],prev_model['axis_deltas'],self.sequence.sweep_axes))
                 if minimum < 3:
-                    raise ValueError('The v4 RF/AWG sweep requires commands less than 3 tProcessor '
+                    firmware = 'v5' if any(
+                        int(self.soccfg['gens'][rf.gen_ch]['tproc_ch']) == port
+                        and self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2
+                        for rf in self.rf_pulse_configs) else 'v4'
+                    raise ValueError(f'The {firmware} RF/AWG sweep requires commands less than 3 tProcessor '
                                      'clocks apart on a shared port; adjust the RF timing.')
             previous_v4[port] = event
         shape = tuple(axis.count for axis in self.sequence.sweep_axes)
@@ -7932,6 +7948,10 @@ class FineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTriggerProgra
                                        if self.ddr_readout_config is not None else None),
             "fir_dc_timing_first_point": self.fir_dc_timing_preview(0),
         }
+
+
+class FineTuneAmplitudeSweepProgram(FineRfDurationProgramMixin, _CoarseFineTuneAmplitudeSweepProgram):
+    """Existing hardware-loop compiler with opt-in sample-width RF pulses."""
 
 
 __all__ = [

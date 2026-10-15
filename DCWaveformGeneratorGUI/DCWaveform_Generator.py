@@ -208,6 +208,9 @@ try:
         QickRampRateSweepSpec,
         QickRfCompositeItemSpec,
         QickRfDurationParameterSpec,
+        QickRfDelayParameterSpec,
+        QickRfAmplitudeParameterSpec,
+        QickRfPhaseParameterSpec,
         QickRfFrequencyParameterSpec,
         QickRfPulseSpec,
         QickSweepAxisSpec,
@@ -240,6 +243,9 @@ except ImportError:
         QickRampRateSweepSpec,
         QickRfCompositeItemSpec,
         QickRfDurationParameterSpec,
+        QickRfDelayParameterSpec,
+        QickRfAmplitudeParameterSpec,
+        QickRfPhaseParameterSpec,
         QickRfFrequencyParameterSpec,
         QickRfPulseSpec,
         QickSweepAxisSpec,
@@ -494,6 +500,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "delay_us": 0.0,
     "duration_us": 1.0,
     "duration_sweep_enabled": False,
+    "fine_duration": False,
     "duration_sweep_start_us": 1.0,
     "duration_sweep_stop_us": 1.0,
     "duration_sweep_count": 1,
@@ -550,6 +557,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
             "duration_us": 1.0,
             "frequency_parameter": "f0",
             "duration_parameter": "d0",
+            "delay_parameter": "",
             "gain": 20000,
             "phase_degrees": 0.0,
             "power_calibration_enabled": False,
@@ -575,6 +583,27 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "predefined_tau_sweep_start_us": 1.0,
     "predefined_tau_sweep_stop_us": 10.0,
     "predefined_tau_sweep_count": 10,
+    "delay_parameters": [],
+    "t2_initial_pi2": False,
+    "t2_final_pi2": False,
+    "t2_frequency_parameter": "f0",
+    "t2_duration_parameter": "d0",
+    "t2_gain": 20000,
+    "t2_initial_phase_degrees": 0.0,
+    "t2_final_phase_degrees": 0.0,
+    "global_frequency_parameter": "",
+    "global_gain": None,
+    "amplitude_parameters": [],
+    "phase_parameters": [],
+    "global_amplitude_mode": "legacy",
+    "global_amplitude_parameter": "",
+    "global_calibration_database_path": "",
+    "global_calibration_run_id": 0,
+    "predefined_amplitude_parameter": "",
+    "predefined_phase_parameter": "",
+    "t2_amplitude_parameter": "",
+    "t2_initial_phase_parameter": "",
+    "t2_final_phase_parameter": "",
 }
 
 DEFAULT_RF_READOUT_SETTINGS = {
@@ -2559,7 +2588,7 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
     def __init__(self, output_count: int, matrix, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Virtual-to-physical cross-capacitance matrix")
-        self.resize(max(620, 115 * output_count), max(330, 62 * output_count))
+        self.resize(max(740, 160 + 135 * output_count), max(400, 100 + 62 * output_count))
         values = np.asarray(matrix, dtype=float)
         expected_shape = (output_count, output_count)
         if values.shape != expected_shape:
@@ -2569,17 +2598,33 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         equation = QtWidgets.QLabel(
-            "Vphysical = C x Vvirtual (rows: physical AWGs, columns: virtual gates)",
-            self,
+            "<b>Physical voltages = C &times; Virtual voltages</b>", self,
         )
         equation.setWordWrap(True)
         layout.addWidget(equation)
+        directions = QtWidgets.QLabel(
+            "Each coefficient maps its Virtual input column to its Physical output row. "
+            "Diagonal coefficients are fixed at 1.", self,
+        )
+        directions.setWordWrap(True)
+        layout.addWidget(directions)
+        matrix_layout = QtWidgets.QGridLayout()
+        virtual_axis = QtWidgets.QLabel(
+            "<b>Columns &rarr; Virtual gate inputs</b>", self,
+        )
+        virtual_axis.setAlignment(QtCore.Qt.AlignCenter)
+        physical_axis = QtWidgets.QLabel(
+            "<b>Rows &darr;<br>Physical<br>AWG outputs</b>", self,
+        )
+        physical_axis.setAlignment(QtCore.Qt.AlignCenter)
+        matrix_layout.addWidget(virtual_axis, 0, 1)
+        matrix_layout.addWidget(physical_axis, 1, 0)
         self.table = QtWidgets.QTableWidget(output_count, output_count, self)
         self.table.setHorizontalHeaderLabels(
-            [f"virtual awg_{index}" for index in range(output_count)]
+            [f"Virtual\nawg_{index}" for index in range(output_count)]
         )
         self.table.setVerticalHeaderLabels(
-            [f"physical awg_{index}" for index in range(output_count)]
+            [f"Physical\nawg_{index}" for index in range(output_count)]
         )
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
@@ -2592,6 +2637,12 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
                 editor.setDecimals(6)
                 editor.setSingleStep(0.01)
                 editor.setValue(float(values[row, column]))
+                editor.setToolTip(
+                    f"Virtual awg_{column} input -> Physical awg_{row} output\n"
+                    f"C[{row}, {column}]: physical awg_{row} receives this coefficient "
+                    f"times virtual awg_{column}."
+                    + ("\nDiagonal coefficient: fixed at 1." if row == column else "")
+                )
                 if row == column:
                     editor.setValue(1.0)
                     editor.setReadOnly(True)
@@ -2599,7 +2650,10 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
                 self.table.setCellWidget(row, column, editor)
                 editor_row.append(editor)
             self._editors.append(editor_row)
-        layout.addWidget(self.table)
+        matrix_layout.addWidget(self.table, 1, 1)
+        matrix_layout.setColumnStretch(1, 1)
+        matrix_layout.setRowStretch(1, 1)
+        layout.addLayout(matrix_layout, 1)
 
         button_row = QtWidgets.QHBoxLayout()
         reset_button = QtWidgets.QPushButton("Reset identity")
@@ -3176,6 +3230,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.duration_sweep_enabled = QtWidgets.QCheckBox(
             "Sweep RF pulse duration"
         )
+        self.fine_duration = QtWidgets.QCheckBox("Fine duration (DAC sample)")
+        self._rf_generator_timings = ()
+        self._update_fine_duration_controls()
         self.duration_sweep_start = QtWidgets.QDoubleSpinBox()
         self.duration_sweep_stop = QtWidgets.QDoubleSpinBox()
         for editor in (
@@ -3366,9 +3423,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.phase_degrees.setRange(-360.0, 360.0)
         self.phase_degrees.setDecimals(6)
         self.phase_degrees.setSuffix(" deg")
-        self.nqz = QtWidgets.QSpinBox()
+        # Front Panel owns the editable hardware path. Keep its value here for
+        # configuration serialization, calibration and program generation.
+        self.nqz = QtWidgets.QSpinBox(self)
         self.nqz.setRange(1, 2)
         self.nqz.setValue(1)
+        self.nqz.hide()
         self.require_within = QtWidgets.QCheckBox("Keep pulse inside anchor SET")
         self.require_within.setChecked(True)
         self._build_composite_editor()
@@ -3388,6 +3448,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow("Output board:", self.output_board_type)
         form.addRow("Anchor SET:", self.segment)
         form.addRow("Pulse mode:", mode_layout)
+        form.addRow(self.fine_duration)
         self._delay_label = QtWidgets.QLabel()
         self._duration_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
@@ -3415,13 +3476,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow(self.composite_group)
         form.addRow(self.power_calibration_group)
         shared_path_note = QtWidgets.QLabel(
-            "ATT and filter settings are edited from the HWH-backed Front Panel."
+            "Nyquist zone, ATT and filter settings are edited from the HWH-backed Front Panel."
         )
         shared_path_note.setWordWrap(True)
         shared_path_note.setStyleSheet("QLabel { color: #4f5b66; }")
         form.addRow(shared_path_note)
         form.addRow("Phase:", self.phase_degrees)
-        form.addRow("Nyquist zone:", self.nqz)
         form.addRow(self.require_within)
         remove_button = QtWidgets.QPushButton("Remove RF Port")
         remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
@@ -3437,6 +3497,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.delay,
             self.duration,
             self.duration_sweep_enabled,
+            self.fine_duration,
             self.duration_sweep_start,
             self.duration_sweep_stop,
             self.duration_sweep_count,
@@ -3553,13 +3614,51 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.power_calibration_group,
         )
         self._update_pulse_mode_controls()
+        self.gen_ch.valueChanged.connect(self._update_fine_duration_controls)
+        self.fine_duration.toggled.connect(self._update_fine_duration_controls)
         self.set_index(index)
+
+    def set_generator_timings(self, generators) -> None:
+        """Use already-fetched generator clocks without connecting to hardware."""
+        self._rf_generator_timings = tuple(generators or ())
+        self._update_fine_duration_controls()
+
+    def _update_fine_duration_controls(self, *_args) -> None:
+        sample_ns = None
+        channel = self.gen_ch.value()
+        generators = getattr(self, "_rf_generator_timings", ())
+        if 0 <= channel < len(generators):
+            generator = generators[channel]
+            if isinstance(generator, Mapping):
+                try:
+                    fabric_mhz = float(generator["f_fabric"])
+                    lanes = int(generator["samps_per_clk"])
+                    if np.isfinite(fabric_mhz) and fabric_mhz > 0 and lanes > 0:
+                        sample_ns = 1000.0 / (fabric_mhz * lanes)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    pass
+        grid = (f"Selected generator duration step: {sample_ns:.9g} ns. "
+                if sample_ns is not None else
+                "The duration step is resolved from the selected generator at run time. "
+                "Current firmware example: 300 MHz × 16 samples = 0.208333 ns. ")
+        self.fine_duration.setToolTip(
+            grid + "This changes RF pulse length resolution, not analog rise time or start-time resolution. "
+            "Applies to every pulse on this RF port, including T2 π/2 pulses. "
+            "SGv6 fine duration requires |gain| <= 16383 to preserve constant-pulse scale "
+            "with a doubled product gain. Calibrated gain is checked after calibration is resolved. "
+            "Duration sweeps remain hardware sweeps."
+        )
 
     def _build_composite_editor(self) -> None:
         """Create named duration/frequency and ordered pulse/delay editors."""
         self.composite_group = QtWidgets.QGroupBox("Composite RF sequence")
         layout = QtWidgets.QVBoxLayout(self.composite_group)
         self._rebuilding_predefined_template = False
+        self._loading_rf_settings = False
+        self._amplitude_mode = "manual"
+        self._global_rf_enabled = False
+        self._independent_preset_amplitudes = False
+        self._amplitude_values_by_mode = {}
 
         predefined_group = QtWidgets.QGroupBox("Pre-defined pulse sequence")
         predefined_form = QtWidgets.QFormLayout(predefined_group)
@@ -3567,6 +3666,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_template.addItem("Custom", "custom")
         self.predefined_template.addItem("CPMG", "cpmg")
         self.predefined_template.addItem("UDD", "udd")
+        self.predefined_template.addItem("Hahn echo", "hahn_echo")
         self.predefined_n = QtWidgets.QSpinBox()
         self.predefined_n.setRange(1, 100_000)
         self.predefined_n.setValue(4)
@@ -3580,6 +3680,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_phase.setRange(-360.0, 360.0)
         self.predefined_phase.setDecimals(6)
         self.predefined_phase.setSuffix(" deg")
+        self.predefined_amplitude_parameter = QtWidgets.QComboBox()
+        self.predefined_phase_parameter = QtWidgets.QComboBox()
 
         self.predefined_n_sweep_enabled = QtWidgets.QCheckBox(
             "Software sweep N"
@@ -3645,12 +3747,83 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.predefined_frequency_parameter,
         )
         predefined_form.addRow("Pulse gain:", self.predefined_gain)
-        predefined_form.addRow("Pulse phase:", self.predefined_phase)
+        predefined_form.addRow("Pulse amplitude:", self.predefined_amplitude_parameter)
+        predefined_form.addRow("Pulse phase:", self.predefined_phase_parameter)
+        self._predefined_form = predefined_form
         predefined_form.addRow(n_sweep_row)
         predefined_form.addRow(tau_sweep_row)
         predefined_form.addRow(self.predefined_description)
         predefined_form.addRow(self.apply_predefined_template)
         layout.addWidget(predefined_group)
+
+        self.global_rf_group = QtWidgets.QGroupBox("Global RF settings")
+        global_form = QtWidgets.QFormLayout(self.global_rf_group)
+        self.global_frequency_parameter = QtWidgets.QComboBox()
+        self.global_gain = QtWidgets.QSpinBox()
+        self.global_gain.setRange(-32768, 32767)
+        self.global_gain.setValue(20000)
+        global_form.addRow("Global frequency:", self.global_frequency_parameter)
+        global_form.addRow("Global gain:", self.global_gain)
+        self.common_amplitude_enabled = QtWidgets.QCheckBox("Use one amplitude parameter for all pulses")
+        self.common_amplitude_enabled.setChecked(False)
+        self.global_amplitude_parameter = QtWidgets.QComboBox()
+        global_form.addRow(self.common_amplitude_enabled)
+        global_form.addRow("Global amplitude:", self.global_amplitude_parameter)
+        self._global_form = global_form
+        layout.addWidget(self.global_rf_group)
+
+        self.amplitude_mode_group = QtWidgets.QGroupBox("Amplitude")
+        mode_form = QtWidgets.QFormLayout(self.amplitude_mode_group)
+        self.amplitude_calibration_enabled = QtWidgets.QCheckBox("Use power calibration (dBm)")
+        self.amplitude_legacy_notice = QtWidgets.QLabel(
+            "This saved sequence mixes amplitude modes or calibration sources. "
+            "Its original values are preserved. Choose calibration or manual gain "
+            "with the checkbox to use one mode for this sequence."
+        )
+        self.amplitude_legacy_notice.setWordWrap(True)
+        self.amplitude_legacy_notice.hide()
+        self.global_calibration_database_path = QtWidgets.QLineEdit()
+        calibration_path_row = QtWidgets.QHBoxLayout()
+        calibration_path_row.addWidget(self.global_calibration_database_path)
+        calibration_browse = self.global_calibration_browse = QtWidgets.QPushButton("Browse…")
+        calibration_path_row.addWidget(calibration_browse)
+        self.global_calibration_run_id = QtWidgets.QSpinBox()
+        self.global_calibration_run_id.setRange(0, 2_147_483_647)
+        self.global_calibration_run_id.setSpecialValueText("Latest compatible")
+        mode_form.addRow(self.amplitude_calibration_enabled)
+        mode_form.addRow(self.amplitude_legacy_notice)
+        mode_form.addRow("Calibration database:", calibration_path_row)
+        mode_form.addRow("Calibration run:", self.global_calibration_run_id)
+        layout.addWidget(self.amplitude_mode_group)
+        calibration_browse.clicked.connect(self._browse_global_calibration_database)
+
+        t2_group = QtWidgets.QGroupBox("T2 measurement")
+        t2_form = QtWidgets.QFormLayout(t2_group)
+        self.t2_initial_pi2 = QtWidgets.QCheckBox("Initial π/2 pulse")
+        self.t2_final_pi2 = QtWidgets.QCheckBox("Final π/2 pulse")
+        self.t2_frequency_parameter = QtWidgets.QComboBox()
+        self.t2_duration_parameter = QtWidgets.QComboBox()
+        self.t2_gain = QtWidgets.QSpinBox()
+        self.t2_gain.setRange(-32768, 32767)
+        self.t2_gain.setValue(20000)
+        self.t2_initial_phase = QtWidgets.QDoubleSpinBox()
+        self.t2_final_phase = QtWidgets.QDoubleSpinBox()
+        for editor in (self.t2_initial_phase, self.t2_final_phase):
+            editor.setRange(-360.0, 360.0)
+            editor.setDecimals(6)
+            editor.setSuffix(" deg")
+        self.t2_amplitude_parameter = QtWidgets.QComboBox()
+        self.t2_initial_phase_parameter = QtWidgets.QComboBox()
+        self.t2_final_phase_parameter = QtWidgets.QComboBox()
+        t2_form.addRow(self.t2_initial_pi2, self.t2_final_pi2)
+        t2_form.addRow("π/2 duration:", self.t2_duration_parameter)
+        t2_form.addRow("π/2 frequency parameter:", self.t2_frequency_parameter)
+        t2_form.addRow("π/2 gain:", self.t2_gain)
+        t2_form.addRow("π/2 amplitude:", self.t2_amplitude_parameter)
+        t2_form.addRow("Initial phase:", self.t2_initial_phase_parameter)
+        t2_form.addRow("Final phase:", self.t2_final_phase_parameter)
+        self._t2_form = t2_form
+        layout.addWidget(t2_group)
 
         duration_label = QtWidgets.QLabel(
             "Shared duration parameters (d0, d1, ...)"
@@ -3689,6 +3862,30 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         duration_buttons.addStretch(1)
         layout.addLayout(duration_buttons)
 
+        tau_label = QtWidgets.QLabel("Shared delay variables (tau, tau1, ...)")
+        tau_label.setStyleSheet("QLabel { font-weight: 600; }")
+        layout.addWidget(tau_label)
+        self.delay_parameter_table = QtWidgets.QTableWidget(0, 6)
+        self.delay_parameter_table.setHorizontalHeaderLabels(
+            ("Name", "Delay", "Sweep", "Start", "Stop", "Points")
+        )
+        self.delay_parameter_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.delay_parameter_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.delay_parameter_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.delay_parameter_table.setMinimumHeight(100)
+        self.delay_parameter_table.setToolTip(
+            "Assign the same variable to several Delay entries. "
+            "Each sweep point compiles and acquires one program on the host."
+        )
+        layout.addWidget(self.delay_parameter_table)
+        tau_buttons = QtWidgets.QHBoxLayout()
+        self.add_delay_parameter_button = QtWidgets.QPushButton("Add Tau")
+        self.remove_delay_parameter_button = QtWidgets.QPushButton("Remove Tau")
+        tau_buttons.addWidget(self.add_delay_parameter_button)
+        tau_buttons.addWidget(self.remove_delay_parameter_button)
+        tau_buttons.addStretch(1)
+        layout.addLayout(tau_buttons)
+
         frequency_label = QtWidgets.QLabel(
             "Shared frequency parameters (f0, f1, ...)"
         )
@@ -3726,12 +3923,37 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         frequency_buttons.addStretch(1)
         layout.addLayout(frequency_buttons)
 
+        for kind, title in (("amplitude", "Shared amplitude parameters (a0, a1, ...)"),
+                            ("phase", "Shared phase parameters (p0, p1, ...)")):
+            label = QtWidgets.QLabel(title)
+            label.setStyleSheet("QLabel { font-weight: 600; }")
+            layout.addWidget(label)
+            table = QtWidgets.QTableWidget(0, 6)
+            table.setHorizontalHeaderLabels(("Name", "Gain" if kind == "amplitude" else "Phase [deg]", "Sweep", "Start", "Stop", "Points"))
+            table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+            table.setMinimumHeight(118)
+            setattr(self, f"{kind}_parameter_table", table)
+            layout.addWidget(table)
+            buttons = QtWidgets.QHBoxLayout()
+            add_button = QtWidgets.QPushButton(f"Add {kind.title()}")
+            remove_button = QtWidgets.QPushButton(f"Remove {kind.title()}")
+            setattr(self, f"add_{kind}_parameter_button", add_button)
+            setattr(self, f"remove_{kind}_parameter_button", remove_button)
+            add_button.clicked.connect(lambda _checked=False, parameter_kind=kind: self._add_numeric_parameter(parameter_kind))
+            remove_button.clicked.connect(lambda _checked=False, parameter_kind=kind: self._remove_numeric_parameter(parameter_kind))
+            buttons.addWidget(add_button)
+            buttons.addWidget(remove_button)
+            buttons.addStretch(1)
+            layout.addLayout(buttons)
+
         sequence_label = QtWidgets.QLabel(
             "Ordered entries (Delay advances time and is not rendered)"
         )
         sequence_label.setStyleSheet("QLabel { font-weight: 600; }")
         layout.addWidget(sequence_label)
-        self.composite_item_table = QtWidgets.QTableWidget(0, 8)
+        self.composite_item_table = QtWidgets.QTableWidget(0, 9)
         self.composite_item_table.setHorizontalHeaderLabels(
             (
                 "Type",
@@ -3739,9 +3961,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 "Delay duration",
                 "Pulse duration",
                 "Frequency",
-                "Amplitude (gain code)",
+                "Amplitude parameter",
                 "Power / calibration",
-                "Phase [deg]",
+                "Phase parameter",
+                "Delay variable",
             )
         )
         self.composite_item_table.setSelectionBehavior(
@@ -3770,9 +3993,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         item_header = self.composite_item_table.horizontalHeader()
         item_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        for column in range(1, 8):
+        for column in range(1, 9):
             item_header.setSectionResizeMode(column, QtWidgets.QHeaderView.Stretch)
         self.composite_item_table.setMinimumHeight(150)
+        self.composite_item_table.setColumnHidden(2, True)
         layout.addWidget(self.composite_item_table)
         sequence_buttons = QtWidgets.QHBoxLayout()
         self.add_composite_pulse_button = QtWidgets.QPushButton("Add Pulse")
@@ -3790,6 +4014,25 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.remove_duration_parameter_button.clicked.connect(
             self._remove_duration_parameter
         )
+        self.add_delay_parameter_button.clicked.connect(lambda: self._add_delay_parameter())
+        self.remove_delay_parameter_button.clicked.connect(self._remove_delay_parameter)
+        for checkbox in (self.t2_initial_pi2, self.t2_final_pi2):
+            checkbox.toggled.connect(self._t2_selection_changed)
+        self._connect_composite_editor(self.global_frequency_parameter, item_parameter_kind="frequency")
+        self.global_gain.valueChanged.connect(self.changed.emit)
+        self.common_amplitude_enabled.toggled.connect(self._global_settings_changed)
+        self.amplitude_calibration_enabled.stateChanged.connect(self._amplitude_mode_changed)
+        self.global_calibration_database_path.textChanged.connect(self.changed.emit)
+        self.global_calibration_run_id.valueChanged.connect(self.changed.emit)
+        for selector in (self.global_amplitude_parameter, self.predefined_amplitude_parameter, self.t2_amplitude_parameter):
+            self._connect_composite_editor(selector, item_parameter_kind="amplitude")
+        self.global_amplitude_parameter.currentIndexChanged.connect(self._global_amplitude_selected)
+        for selector in (self.predefined_phase_parameter, self.t2_initial_phase_parameter, self.t2_final_phase_parameter):
+            self._connect_composite_editor(selector, item_parameter_kind="phase")
+        self._connect_composite_editor(self.t2_frequency_parameter, item_parameter_kind="frequency")
+        self._connect_composite_editor(self.t2_duration_parameter, item_parameter_kind="t2_duration")
+        for editor in (self.t2_gain, self.t2_initial_phase, self.t2_final_phase):
+            editor.valueChanged.connect(self.changed.emit)
         self.add_frequency_parameter_button.clicked.connect(
             lambda: self._add_frequency_parameter()
         )
@@ -3840,8 +4083,118 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self._add_duration_parameter(emit=False)
         self._add_frequency_parameter(emit=False)
+        self._add_numeric_parameter("phase", QickRfPhaseParameterSpec("p0", 0.0), emit=False)
         self._add_composite_item("pulse", emit=False)
+        self._migrate_amplitude_references()
         self._update_predefined_controls()
+        self._update_t2_controls()
+
+    def _update_t2_controls(self) -> None:
+        enabled = self.t2_initial_pi2.isChecked() or self.t2_final_pi2.isChecked()
+        for editor in (self.t2_frequency_parameter, self.t2_duration_parameter, self.t2_gain):
+            editor.setEnabled(enabled)
+        for editor, visible in (
+            (self.t2_frequency_parameter, not self._global_rf_enabled),
+            (self.t2_gain, False),
+            (self.t2_amplitude_parameter, self._amplitude_mode != "legacy" and not self.common_amplitude_enabled.isChecked()),
+        ):
+            editor.setVisible(visible)
+            self._t2_form.labelForField(editor).setVisible(visible)
+            editor.setEnabled(enabled and visible)
+        self.t2_initial_phase_parameter.setEnabled(self.t2_initial_pi2.isChecked())
+        self.t2_final_phase_parameter.setEnabled(self.t2_final_pi2.isChecked())
+
+    def _t2_selection_changed(self, *_args) -> None:
+        enabled = self.t2_initial_pi2.isChecked() or self.t2_final_pi2.isChecked()
+        if (enabled and not self._loading_rf_settings and not self._independent_preset_amplitudes
+                and self._amplitude_mode != "legacy"):
+            self._enable_global_defaults()
+        if enabled and not self.t2_duration_parameter.property("qstl_t2_initialized"):
+            self._set_t2_duration_parameter(self.predefined_duration_parameter.currentText())
+            self.t2_frequency_parameter.setCurrentText(self.predefined_frequency_parameter.currentText())
+            self.t2_duration_parameter.setProperty("qstl_t2_initialized", True)
+        self._update_t2_controls()
+        self._disable_orphan_composite_parameter_sweeps(
+            frequency_names=(self.t2_frequency_parameter.currentText(),),
+            duration_names=(str(self.t2_duration_parameter.currentData() or ""),),
+        )
+        self.changed.emit()
+
+    def _enable_global_defaults(self) -> None:
+        if self._predefined_template_name() == "custom":
+            if self._amplitude_mode == "legacy" and not self._loading_rf_settings:
+                self._amplitude_mode_changed()
+            with QtCore.QSignalBlocker(self.common_amplitude_enabled):
+                self._global_rf_enabled = False
+                self.common_amplitude_enabled.setChecked(False)
+            self._update_global_controls()
+            return
+        if not self._global_rf_enabled:
+            self.global_frequency_parameter.setCurrentText(self.predefined_frequency_parameter.currentText())
+            self.global_gain.setValue(self.predefined_gain.value())
+            self._global_rf_enabled = True
+        self.common_amplitude_enabled.setChecked(True)
+        self._independent_preset_amplitudes = False
+        self._migrate_amplitude_references()
+        self._update_global_controls()
+
+    def _global_settings_changed(self, *_args) -> None:
+        self._update_global_controls()
+        self.changed.emit()
+
+    def _global_amplitude_selected(self, *_args) -> None:
+        if (not self._loading_rf_settings and self._predefined_template_name() != "custom"
+                and self.global_amplitude_parameter.currentData()):
+            self._independent_preset_amplitudes = False
+            self.common_amplitude_enabled.setChecked(True)
+            self._update_global_controls()
+            self.changed.emit()
+
+    def _update_global_controls(self) -> None:
+        global_enabled = self._global_rf_enabled
+        custom = self._predefined_template_name() == "custom"
+        self.global_rf_group.setVisible(not custom)
+        self.amplitude_mode_group.setVisible(True)
+        for editor, visible in (
+            (self.predefined_frequency_parameter, not global_enabled),
+            (self.predefined_gain, False),
+            (self.predefined_amplitude_parameter, self._amplitude_mode != "legacy" and not self.common_amplitude_enabled.isChecked()),
+        ):
+            editor.setVisible(visible)
+            self._predefined_form.labelForField(editor).setVisible(visible)
+        self.global_gain.hide()
+        self._global_form.labelForField(self.global_gain).hide()
+        self.common_amplitude_enabled.hide()
+        self.global_amplitude_parameter.setVisible(self._amplitude_mode != "legacy")
+        self._global_form.labelForField(self.global_amplitude_parameter).setVisible(self._amplitude_mode != "legacy")
+        self._global_form.labelForField(self.global_amplitude_parameter).setText(
+            "Global power parameter [dBm]:" if self._amplitude_mode == "calibration" else "Global gain parameter:"
+        )
+        self.global_amplitude_parameter.setEnabled(not custom and self._amplitude_mode != "legacy")
+        self.global_amplitude_parameter.setPlaceholderText("Choose a shared parameter")
+        self.global_frequency_parameter.setVisible(global_enabled)
+        self._global_form.labelForField(self.global_frequency_parameter).setVisible(global_enabled)
+        self.amplitude_parameter_table.setEnabled(self._amplitude_mode != "legacy")
+        self.add_amplitude_parameter_button.setEnabled(self._amplitude_mode != "legacy")
+        self.remove_amplitude_parameter_button.setEnabled(self._amplitude_mode != "legacy")
+        self.composite_item_table.setColumnHidden(6, True)
+        if self._amplitude_mode == "legacy":
+            self.amplitude_legacy_notice.setText(
+                "This saved sequence mixes amplitude modes or calibration sources. Its original values are preserved. "
+                "Choose calibration or manual gain with the checkbox to use one mode for this sequence."
+            )
+        elif self._independent_preset_amplitudes:
+            self.amplitude_legacy_notice.setText(
+                "This saved preset has independent pulse amplitudes. They are preserved below. "
+                "Choose a Global amplitude parameter to apply one value to every pulse."
+            )
+        self.amplitude_legacy_notice.setVisible(self._amplitude_mode == "legacy" or self._independent_preset_amplitudes)
+        self.global_calibration_database_path.setEnabled(self._amplitude_mode == "calibration")
+        self.global_calibration_run_id.setEnabled(self._amplitude_mode == "calibration")
+        self.global_calibration_browse.setEnabled(self._amplitude_mode == "calibration")
+        self._update_t2_controls()
+        for row in range(self.composite_item_table.rowCount()):
+            self._update_composite_item_row(row)
 
     def _predefined_template_name(self) -> str:
         return str(self.predefined_template.currentData() or "custom")
@@ -3867,15 +4220,26 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             gain=self.predefined_gain.value(),
             phase_degrees=self.predefined_phase.value(),
+            amplitude_parameter=str(self.predefined_amplitude_parameter.currentData() or "") if self._amplitude_mode != "legacy" else "",
+            phase_parameter=str(self.predefined_phase_parameter.currentData() or ""),
         )
 
     def _predefined_template_changed(self, *_args) -> None:
+        if self._predefined_template_name() == "custom" and not self._loading_rf_settings:
+            self._bind_globals_to_custom_rows()
+        if self._predefined_template_name() != "custom" and not self._loading_rf_settings:
+            self._enable_global_defaults()
+        if self._predefined_template_name() == "hahn_echo":
+            with QtCore.QSignalBlocker(self.predefined_n), QtCore.QSignalBlocker(self.predefined_n_sweep_enabled):
+                self.predefined_n.setValue(1)
+                self.predefined_n_sweep_enabled.setChecked(False)
         self._update_predefined_controls()
         self._rebuild_predefined_items()
 
     def _update_predefined_controls(self, *_args) -> None:
         template = self._predefined_template_name()
         predefined = template != "custom"
+        hahn = template == "hahn_echo"
         for widget in (
             self.predefined_n,
             self.predefined_tau,
@@ -3883,18 +4247,22 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.predefined_duration_parameter,
             self.predefined_gain,
             self.predefined_phase,
+            self.predefined_amplitude_parameter,
+            self.predefined_phase_parameter,
             self.predefined_n_sweep_enabled,
             self.predefined_tau_sweep_enabled,
             self.apply_predefined_template,
         ):
             widget.setEnabled(predefined)
+        self.predefined_n.setEnabled(predefined and not hahn)
+        self.predefined_n_sweep_enabled.setEnabled(predefined and not hahn)
         for widget in (
             self.predefined_n_sweep_start,
             self.predefined_n_sweep_stop,
             self.predefined_n_sweep_count,
         ):
             widget.setEnabled(
-                predefined and self.predefined_n_sweep_enabled.isChecked()
+                predefined and not hahn and self.predefined_n_sweep_enabled.isChecked()
             )
         for widget in (
             self.predefined_tau_sweep_start,
@@ -3913,7 +4281,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             widget.setEnabled(not predefined)
         self.composite_row_header.setReorderingEnabled(not predefined)
         self._update_composite_remove_button()
-        if template == "cpmg":
+        if template == "hahn_echo":
+            text = "Hahn echo: tau/2 → one π pulse → tau/2. Tau is the total free-evolution time."
+        elif template == "cpmg":
             text = (
                 "CPMG: N X pulses; free evolution is tau/2 at both edges "
                 "and tau between pulses. N/tau sweeps compile and acquire "
@@ -3928,6 +4298,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         else:
             text = "Custom mode keeps the ordered pulse/delay list editable."
         self.predefined_description.setText(text)
+        self._update_global_controls()
 
     def _rebuild_predefined_items(self, *_args) -> None:
         if (
@@ -3956,6 +4327,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         *,
         frequency_name=False,
         duration_name=False,
+        delay_name=False,
+        numeric_name="",
         item_name=False,
         item_parameter_kind="",
     ) -> None:
@@ -3975,25 +4348,27 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         if item_parameter_kind:
             widget.setProperty(
                 "qstl_committed_composite_parameter",
-                widget.currentText(),
+                (widget.currentData() or "") if item_parameter_kind in {"delay", "t2_duration", "amplitude", "phase"} else widget.currentText(),
             )
-            widget.currentTextChanged.connect(
+            signal = widget.currentIndexChanged if item_parameter_kind in {"delay", "t2_duration", "amplitude", "phase"} else widget.currentTextChanged
+            signal.connect(
                 lambda _text, editor=widget, kind=item_parameter_kind: (
                     self._composite_item_parameter_changed(editor, kind)
                 )
             )
             return
-        if frequency_name or duration_name:
+        if frequency_name or duration_name or delay_name or numeric_name:
             widget.setProperty(
                 "qstl_committed_parameter_name",
                 widget.text().strip(),
             )
-            widget.textChanged.connect(self.changed.emit)
             widget.editingFinished.connect(
-                lambda editor=widget, is_frequency=frequency_name: (
+                lambda editor=widget, is_frequency=frequency_name, is_delay=delay_name, numeric_kind=numeric_name: (
                     self._commit_composite_parameter_name(
                         editor,
                         frequency=is_frequency,
+                        delay=is_delay,
+                        numeric_kind=numeric_kind,
                     )
                 )
             )
@@ -4020,6 +4395,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             duration_names.add(
                 self.composite_item_table.cellWidget(row, 3).currentText()
             )
+        if self.t2_initial_pi2.isChecked() or self.t2_final_pi2.isChecked():
+            frequency_names.add(self.t2_frequency_parameter.currentText())
+            duration_names.add(str(self.t2_duration_parameter.currentData() or ""))
+        if self._global_rf_enabled:
+            frequency_names.add(self.global_frequency_parameter.currentText())
         return frequency_names, duration_names
 
     def _disable_orphan_composite_parameter_sweeps(
@@ -4027,6 +4407,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         *,
         frequency_names: Sequence[str] = (),
         duration_names: Sequence[str] = (),
+        delay_names: Sequence[str] = (),
     ) -> None:
         """Disable sweeps whose last pulse reference was just removed."""
         referenced_frequencies, referenced_durations = (
@@ -4042,6 +4423,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 self.duration_parameter_table,
                 set(duration_names) - referenced_durations,
                 self._update_duration_parameter_row,
+            ),
+            (
+                self.delay_parameter_table,
+                set(delay_names) - {
+                    self.composite_item_table.cellWidget(row, 8).currentData()
+                    for row in range(self.composite_item_table.rowCount())
+                    if self.composite_item_table.cellWidget(row, 0).currentData() == "delay"
+                },
+                self._update_delay_parameter_row,
             ),
         )
         for table, orphan_names, update_row in candidates:
@@ -4063,17 +4453,33 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         previous = str(
             editor.property("qstl_committed_composite_parameter") or ""
         )
-        current = editor.currentText()
+        current = str(editor.currentData() or "") if kind in {"delay", "t2_duration", "amplitude", "phase"} else editor.currentText()
         editor.setProperty("qstl_committed_composite_parameter", current)
         if previous and previous != current:
-            if kind == "frequency":
+            if kind in {"amplitude", "phase"}:
+                referenced = {str(selector.currentData() or "") for selector in self._numeric_selectors(kind)}
+                if previous not in referenced:
+                    table = getattr(self, f"{kind}_parameter_table")
+                    for row in range(table.rowCount()):
+                        if self._committed_parameter_name(table.cellWidget(row, 0)) == previous:
+                            with QtCore.QSignalBlocker(table.cellWidget(row, 2)):
+                                table.cellWidget(row, 2).setChecked(False)
+                            self._update_numeric_parameter_row(kind, row)
+            elif kind == "frequency":
                 self._disable_orphan_composite_parameter_sweeps(
                     frequency_names=(previous,),
                 )
+            elif kind == "delay":
+                self._disable_orphan_composite_parameter_sweeps(delay_names=(previous,))
             else:
                 self._disable_orphan_composite_parameter_sweeps(
                     duration_names=(previous,),
                 )
+        if kind == "delay":
+            row = self._table_widget_row(self.composite_item_table, editor)
+            self._update_composite_item_row(row)
+        if editor in (self.predefined_amplitude_parameter, self.predefined_phase_parameter):
+            self._rebuild_predefined_items()
         self.changed.emit()
 
     def _commit_composite_item_name(
@@ -4131,6 +4537,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 for table in (
                     getattr(self, "duration_parameter_table", None),
                     getattr(self, "frequency_parameter_table", None),
+                    getattr(self, "delay_parameter_table", None),
+                    getattr(self, "amplitude_parameter_table", None),
+                    getattr(self, "phase_parameter_table", None),
                     getattr(self, "composite_item_table", None),
                 )
                 if table is not None
@@ -4164,12 +4573,16 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         editor: QtWidgets.QLineEdit,
         *,
         frequency: bool,
+        delay: bool = False,
+        numeric_kind: str = "",
     ) -> None:
         table = (
-            self.frequency_parameter_table
-            if frequency
+            self.delay_parameter_table if delay else self.frequency_parameter_table
+            if frequency or delay
             else self.duration_parameter_table
         )
+        if numeric_kind:
+            table = getattr(self, f"{numeric_kind}_parameter_table")
         row = self._table_widget_row(table, editor)
         if row < 0:
             return
@@ -4205,7 +4618,18 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         editor.setProperty("qstl_committed_parameter_name", requested)
         editor.setToolTip("")
         rename = (previous, requested)
-        if frequency:
+        if numeric_kind:
+            if numeric_kind == "amplitude":
+                self._amplitude_values_by_mode = {
+                    mode: tuple(replace(parameter, name=rename[1]) if parameter.name == rename[0] else parameter
+                                for parameter in bank)
+                    for mode, bank in self._amplitude_values_by_mode.items()
+                }
+            self._sync_numeric_parameter_choices(numeric_kind, rename=rename)
+            self._rebuild_predefined_items()
+        elif delay:
+            self._sync_composite_delay_choices(rename=rename)
+        elif frequency:
             self._sync_composite_frequency_choices(rename=rename)
         else:
             self._sync_composite_duration_choices(rename=rename)
@@ -4218,6 +4642,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 if table.cellWidget(row, column) is widget:
                     return row
         return -1
+
+    @staticmethod
+    def _committed_parameter_name(editor: QtWidgets.QLineEdit) -> str:
+        """Keep dependent controls valid while a parameter name is being typed."""
+        return str(editor.property("qstl_committed_parameter_name") or editor.text().strip())
 
     @staticmethod
     def _frequency_spin(value: float = 50.0) -> QtWidgets.QDoubleSpinBox:
@@ -4311,7 +4740,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _duration_parameter_names(self) -> Tuple[str, ...]:
         return tuple(
-            self.duration_parameter_table.cellWidget(row, 0).text().strip()
+            self._committed_parameter_name(self.duration_parameter_table.cellWidget(row, 0))
             for row in range(self.duration_parameter_table.rowCount())
         )
 
@@ -4322,6 +4751,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     ) -> None:
         names = tuple(name for name in self._duration_parameter_names() if name)
         fallback = names[0] if names else ""
+        self._sync_t2_parameter_choices(self.t2_duration_parameter, names, rename, half_duration=True)
         previous_predefined = self.predefined_duration_parameter.currentText()
         if rename is not None and previous_predefined == rename[0]:
             previous_predefined = rename[1]
@@ -4422,7 +4852,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _frequency_parameter_names(self) -> Tuple[str, ...]:
         return tuple(
-            self.frequency_parameter_table.cellWidget(row, 0).text().strip()
+            self._committed_parameter_name(self.frequency_parameter_table.cellWidget(row, 0))
             for row in range(self.frequency_parameter_table.rowCount())
         )
 
@@ -4433,6 +4863,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     ) -> None:
         names = tuple(name for name in self._frequency_parameter_names() if name)
         fallback = names[0] if names else ""
+        self._sync_t2_parameter_choices(self.t2_frequency_parameter, names, rename)
+        self._sync_t2_parameter_choices(self.global_frequency_parameter, names, rename)
         previous_predefined = self.predefined_frequency_parameter.currentText()
         if rename is not None and previous_predefined == rename[0]:
             previous_predefined = rename[1]
@@ -4463,6 +4895,145 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             selector.setEnabled(kind == "pulse")
         self._rebuild_predefined_items()
 
+    @staticmethod
+    def _sync_t2_parameter_choices(selector, names, rename=None, *, half_duration=False) -> None:
+        previous = (selector.currentData() or "") if half_duration else selector.currentText()
+        if rename is not None and previous == rename[0]:
+            previous = rename[1]
+        with QtCore.QSignalBlocker(selector):
+            selector.clear()
+            for name in names:
+                selector.addItem(f"{name}/2" if half_duration else name, name)
+            match = selector.findData(previous) if half_duration else selector.findText(previous)
+            selector.setCurrentIndex(match if match >= 0 else (0 if names else -1))
+        selector.setProperty("qstl_committed_composite_parameter", (selector.currentData() or "") if half_duration else selector.currentText())
+
+    def _set_t2_duration_parameter(self, name: str) -> None:
+        self.t2_duration_parameter.setCurrentIndex(max(0, self.t2_duration_parameter.findData(name)))
+
+    def _delay_parameter_names(self) -> Tuple[str, ...]:
+        return tuple(
+            self._committed_parameter_name(self.delay_parameter_table.cellWidget(row, 0))
+            for row in range(self.delay_parameter_table.rowCount())
+        )
+
+    def _add_delay_parameter(self, parameter=None, *, emit=True) -> None:
+        if parameter is None:
+            used = self._delay_parameter_names()
+            name, index = "tau", 1
+            while name in used:
+                name, index = f"tau{index}", index + 1
+            parameter = QickRfDelayParameterSpec(
+                name=name, duration_us=1.0, sweep_start_us=1.0, sweep_stop_us=10.0,
+                sweep_count=10,
+            )
+        table = self.delay_parameter_table
+        row = table.rowCount()
+        table.insertRow(row)
+        name = QtWidgets.QLineEdit(parameter.name)
+        duration = self._composite_duration_spin(parameter.duration_us)
+        duration.setMinimum(0.0)
+        duration.setValue(_time_from_ns(parameter.duration_us * 1000.0, self._time_unit))
+        sweep = QtWidgets.QCheckBox()
+        sweep.setChecked(parameter.sweep_enabled)
+        start = self._composite_duration_spin(parameter.sweep_start_us)
+        stop = self._composite_duration_spin(parameter.sweep_stop_us)
+        start.setMinimum(0.0)
+        stop.setMinimum(0.0)
+        start.setValue(_time_from_ns(parameter.sweep_start_us * 1000.0, self._time_unit))
+        stop.setValue(_time_from_ns(parameter.sweep_stop_us * 1000.0, self._time_unit))
+        points = QtWidgets.QSpinBox()
+        points.setRange(1, 1_000_000)
+        points.setValue(parameter.sweep_count)
+        for column, widget in enumerate((name, duration, sweep, start, stop, points)):
+            table.setCellWidget(row, column, widget)
+            self._connect_composite_editor(widget, delay_name=(column == 0))
+        sweep.toggled.connect(lambda _checked, editor=sweep: self._update_delay_parameter_row(
+            self._table_widget_row(table, editor)
+        ))
+        self._update_delay_parameter_row(row)
+        self._sync_composite_delay_choices()
+        if emit:
+            table.selectRow(row)
+            self.changed.emit()
+
+    def _update_delay_parameter_row(self, row: int) -> None:
+        if 0 <= row < self.delay_parameter_table.rowCount():
+            enabled = self.delay_parameter_table.cellWidget(row, 2).isChecked()
+            for column in (3, 4, 5):
+                self.delay_parameter_table.cellWidget(row, column).setEnabled(enabled)
+
+    def _remove_delay_parameter(self) -> None:
+        table = self.delay_parameter_table
+        if table.rowCount() <= 1:
+            return
+        row = table.currentRow()
+        if row < 0:
+            row = table.rowCount() - 1
+        name = self._committed_parameter_name(table.cellWidget(row, 0))
+        value = _time_to_ns(table.cellWidget(row, 1).value(), self._time_unit) / 1000.0
+        referenced_rows = []
+        # Preserve timing with a replacement named value for any referenced delay.
+        for item_row in range(self.composite_item_table.rowCount()):
+            if (self.composite_item_table.cellWidget(item_row, 0).currentData() == "delay"
+                    and self.composite_item_table.cellWidget(item_row, 8).currentData() == name):
+                referenced_rows.append(item_row)
+        table.removeRow(row)
+        self._sync_composite_delay_choices()
+        if referenced_rows:
+            replacement = self._ensure_delay_parameter(value, f"{name}_fixed")
+            for item_row in referenced_rows:
+                selector = self.composite_item_table.cellWidget(item_row, 8)
+                with QtCore.QSignalBlocker(selector):
+                    selector.setCurrentIndex(selector.findData(replacement))
+                selector.setProperty("qstl_committed_composite_parameter", replacement)
+        self.changed.emit()
+
+    def _sync_composite_delay_choices(self, *, rename=None) -> None:
+        names = self._delay_parameter_names()
+        for row in range(self.composite_item_table.rowCount()):
+            selector = self.composite_item_table.cellWidget(row, 8)
+            previous = selector.currentData() or ""
+            if rename is not None and previous == rename[0]:
+                previous = rename[1]
+            with QtCore.QSignalBlocker(selector):
+                selector.clear()
+                if not names:
+                    selector.addItem("—", "")
+                for name in names:
+                    selector.addItem(name, name)
+                selector.setCurrentIndex(max(0, selector.findData(previous)))
+            selector.setProperty("qstl_committed_composite_parameter", selector.currentData() or "")
+            self._update_composite_item_row(row)
+
+    def _ensure_delay_parameter(self, value: float, preferred_name: str) -> str:
+        base = re.sub(r"\W", "_", preferred_name, flags=re.ASCII)
+        name = base
+        names = self._delay_parameter_names()
+        rebuilding = self._rebuilding_predefined_template and not self._loading_rf_settings
+        if (self._loading_rf_settings and getattr(self, "_loading_template_name", "custom") != "custom"
+                and name in names):
+            parameter = self._composite_delay_parameters()[names.index(name)]
+            # UDD formulas carry more precision than the displayed spin box.
+            # Compare in its stored display units before inventing another name.
+            displayed = round(_time_from_ns(parameter.duration_us * 1000.0, self._time_unit), 9)
+            requested = round(_time_from_ns(value * 1000.0, self._time_unit), 9)
+            if displayed == requested and not parameter.sweep_enabled:
+                return name
+        suffix = 1
+        while name in names and not rebuilding:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        if name not in names:
+            self._add_delay_parameter(QickRfDelayParameterSpec(name, value, False, value, value, 1), emit=False)
+        elif rebuilding:
+            row = self._delay_parameter_names().index(name)
+            for column in (1, 3, 4):
+                widget = self.delay_parameter_table.cellWidget(row, column)
+                with QtCore.QSignalBlocker(widget):
+                    widget.setValue(_time_from_ns(value * 1000.0, self._time_unit))
+        return name
+
     def _next_composite_item_name(self, kind: str) -> str:
         prefix = "pulse" if kind == "pulse" else "delay"
         used = {
@@ -4473,6 +5044,301 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         while f"{prefix}_{index}" in used:
             index += 1
         return f"{prefix}_{index}"
+
+    def _numeric_parameter_names(self, kind: str) -> Tuple[str, ...]:
+        table = getattr(self, f"{kind}_parameter_table")
+        return tuple(self._committed_parameter_name(table.cellWidget(row, 0)) for row in range(table.rowCount()))
+
+    def _numeric_value_spin(self, kind: str, value: float):
+        editor = QtWidgets.QDoubleSpinBox()
+        if kind == "phase":
+            editor.setRange(-360000.0, 360000.0)
+            editor.setDecimals(6)
+            editor.setSuffix(" deg")
+        elif self._amplitude_mode == "calibration":
+            editor.setRange(-200.0, 100.0)
+            editor.setDecimals(6)
+            editor.setSuffix(" dBm")
+        else:
+            editor.setRange(-32768, 32767)
+            editor.setDecimals(0)
+        editor.setValue(float(value))
+        return editor
+
+    def _add_numeric_parameter(self, kind: str, parameter=None, *, emit=True) -> None:
+        table = getattr(self, f"{kind}_parameter_table")
+        if parameter is None:
+            prefix = "a" if kind == "amplitude" else "p"
+            index = 0
+            used = self._numeric_parameter_names(kind)
+            while f"{prefix}{index}" in used:
+                index += 1
+            if kind == "amplitude":
+                value = -20.0 if self._amplitude_mode == "calibration" else 20000.0
+                parameter = QickRfAmplitudeParameterSpec(f"{prefix}{index}", value, False, value, value, 1)
+            else:
+                parameter = QickRfPhaseParameterSpec(f"{prefix}{index}", 0.0)
+        row = table.rowCount()
+        table.insertRow(row)
+        name = QtWidgets.QLineEdit(parameter.name)
+        values = ((parameter.value, parameter.sweep_start, parameter.sweep_stop) if kind == "amplitude"
+                  else (parameter.phase_degrees, parameter.sweep_start_degrees, parameter.sweep_stop_degrees))
+        value, start, stop = (self._numeric_value_spin(kind, item) for item in values)
+        sweep = QtWidgets.QCheckBox()
+        sweep.setChecked(parameter.sweep_enabled)
+        count = QtWidgets.QSpinBox()
+        count.setRange(1, 1_000_000)
+        count.setValue(parameter.sweep_count)
+        for column, editor in enumerate((name, value, sweep, start, stop, count)):
+            table.setCellWidget(row, column, editor)
+            self._connect_composite_editor(editor, numeric_name=kind if column == 0 else "")
+        sweep.toggled.connect(lambda _checked, editor=sweep: self._update_numeric_parameter_row(kind, self._table_widget_row(table, editor)))
+        self._update_numeric_parameter_row(kind, row)
+        self._sync_numeric_parameter_choices(kind)
+        if emit:
+            table.selectRow(row)
+            self.changed.emit()
+
+    def _update_numeric_parameter_row(self, kind: str, row: int) -> None:
+        table = getattr(self, f"{kind}_parameter_table")
+        if 0 <= row < table.rowCount():
+            for column in (3, 4, 5):
+                table.cellWidget(row, column).setEnabled(table.cellWidget(row, 2).isChecked())
+
+    def _update_amplitude_parameter_row(self, row: int) -> None:
+        self._update_numeric_parameter_row("amplitude", row)
+
+    def _update_phase_parameter_row(self, row: int) -> None:
+        self._update_numeric_parameter_row("phase", row)
+
+    def _numeric_parameters(self, kind: str):
+        table = getattr(self, f"{kind}_parameter_table")
+        parameter_type = QickRfAmplitudeParameterSpec if kind == "amplitude" else QickRfPhaseParameterSpec
+        return tuple(parameter_type(
+            self._committed_parameter_name(table.cellWidget(row, 0)),
+            table.cellWidget(row, 1).value(), table.cellWidget(row, 2).isChecked(),
+            table.cellWidget(row, 3).value(), table.cellWidget(row, 4).value(), table.cellWidget(row, 5).value(),
+        ) for row in range(table.rowCount()))
+
+    def _ensure_numeric_parameter(self, kind: str, value: float, preferred_name: str) -> str:
+        names = self._numeric_parameter_names(kind)
+        name = re.sub(r"\W", "_", preferred_name, flags=re.ASCII)
+        if not name or name[0].isdigit():
+            name = f"{kind}_{name}"
+        base = name
+        suffix = 1
+        while name in names:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        parameter_type = QickRfAmplitudeParameterSpec if kind == "amplitude" else QickRfPhaseParameterSpec
+        self._add_numeric_parameter(kind, parameter_type(name, float(value), False, float(value), float(value), 1), emit=False)
+        return name
+
+    def _numeric_selectors(self, kind: str):
+        if kind == "amplitude":
+            selectors = [self.global_amplitude_parameter, self.predefined_amplitude_parameter, self.t2_amplitude_parameter]
+            column = 5
+        else:
+            selectors = [self.predefined_phase_parameter, self.t2_initial_phase_parameter, self.t2_final_phase_parameter]
+            column = 7
+        if hasattr(self, "composite_item_table"):
+            selectors.extend(self.composite_item_table.cellWidget(row, column) for row in range(self.composite_item_table.rowCount()))
+        return [selector for selector in selectors if isinstance(selector, QtWidgets.QComboBox)]
+
+    def _sync_numeric_parameter_choices(self, kind: str, *, rename=None) -> None:
+        names = self._numeric_parameter_names(kind)
+        for selector in self._numeric_selectors(kind):
+            previous = str(selector.currentData() or "")
+            if rename is not None and previous == rename[0]:
+                previous = rename[1]
+            legacy_label = selector.property("qstl_legacy_label")
+            with QtCore.QSignalBlocker(selector):
+                selector.clear()
+                if kind == "amplitude" and self._amplitude_mode == "legacy" and legacy_label:
+                    selector.addItem(str(legacy_label), "")
+                for name in names:
+                    selector.addItem(name, name)
+                match = selector.findData(previous)
+                selector.setCurrentIndex(match if match >= 0 else (-1 if kind == "amplitude" and not previous else (0 if selector.count() else -1)))
+            selector.setProperty("qstl_committed_composite_parameter", str(selector.currentData() or ""))
+
+    def _remove_numeric_parameter(self, kind: str) -> None:
+        table = getattr(self, f"{kind}_parameter_table")
+        if table.rowCount() <= 1:
+            return
+        row = table.currentRow() if table.currentRow() >= 0 else table.rowCount() - 1
+        removed = self._committed_parameter_name(table.cellWidget(row, 0))
+        table.removeRow(row)
+        if kind == "amplitude":
+            self._amplitude_values_by_mode = {
+                mode: tuple(parameter for parameter in bank if parameter.name != removed)
+                for mode, bank in self._amplitude_values_by_mode.items()
+            }
+        self._sync_numeric_parameter_choices(kind)
+        self._rebuild_predefined_items()
+        self.changed.emit()
+
+    def _bind_globals_to_custom_rows(self, *, frequency_override=True, gain_override=True) -> None:
+        """Keep the preset waveform when switching to independently editable rows."""
+        if self._global_rf_enabled:
+            frequency = self.global_frequency_parameter.currentText()
+            if frequency_override:
+                self.t2_frequency_parameter.setCurrentText(frequency)
+            for row in range(self.composite_item_table.rowCount()):
+                if self.composite_item_table.cellWidget(row, 0).currentData() == "pulse":
+                    if frequency_override:
+                        self.composite_item_table.cellWidget(row, 4).setCurrentText(frequency)
+                    if self._amplitude_mode == "legacy" and gain_override:
+                        amplitude = self.composite_item_table.cellWidget(row, 5)
+                        amplitude.setProperty("qstl_legacy_gain", self.global_gain.value())
+                        amplitude.setProperty("qstl_legacy_label", f"Legacy gain: {self.global_gain.value()}")
+                        power = self.composite_item_table.cellWidget(row, 6)
+                        power.power_calibration_enabled = False
+                        self._update_composite_power_button(power)
+            if self._amplitude_mode == "legacy" and gain_override:
+                self.t2_gain.setValue(self.global_gain.value())
+                with QtCore.QSignalBlocker(self.t2_amplitude_parameter):
+                    self.t2_amplitude_parameter.setCurrentIndex(-1)
+                self._sync_numeric_parameter_choices("amplitude")
+        if self.common_amplitude_enabled.isChecked() and self._amplitude_mode != "legacy":
+            amplitude = self.global_amplitude_parameter.currentData()
+            for selector in [self.t2_amplitude_parameter] + [self.composite_item_table.cellWidget(row, 5) for row in range(self.composite_item_table.rowCount()) if self.composite_item_table.cellWidget(row, 0).currentData() == "pulse"]:
+                with QtCore.QSignalBlocker(selector):
+                    selector.setCurrentIndex(selector.findData(amplitude))
+        with QtCore.QSignalBlocker(self.common_amplitude_enabled):
+            self._global_rf_enabled = False
+            self._independent_preset_amplitudes = False
+            self.common_amplitude_enabled.setChecked(False)
+        self._update_global_controls()
+        self.changed.emit()
+
+    def _browse_global_calibration_database(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select output calibration database", self.global_calibration_database_path.text(), "Database (*.db *.sqlite *.sqlite3);;All files (*)")
+        if path:
+            self.global_calibration_database_path.setText(path)
+
+    def _amplitude_mode_changed(self, *_args) -> None:
+        if self._loading_rf_settings:
+            return
+        state = self.amplitude_calibration_enabled.checkState()
+        if state == QtCore.Qt.PartiallyChecked:
+            return  # Preserve mixed legacy settings until the user chooses a mode.
+        previous = self._amplitude_mode
+        requested = "calibration" if state == QtCore.Qt.Checked else "manual"
+        self.amplitude_calibration_enabled.setTristate(False)
+        if previous != "legacy":
+            self._amplitude_values_by_mode[previous] = self._numeric_parameters("amplitude")
+        self._amplitude_mode = requested
+        if requested != "legacy":
+            bank = self._amplitude_values_by_mode.get(requested)
+            if previous != "legacy":
+                default = -20.0 if requested == "calibration" else 20000.0
+                saved = {parameter.name: parameter for parameter in bank or ()}
+                bank = tuple(saved.get(name, QickRfAmplitudeParameterSpec(name, default, False, default, default, 1))
+                             for name in self._numeric_parameter_names("amplitude"))
+            if bank is not None:
+                selections = [(selector, selector.currentData()) for selector in self._numeric_selectors("amplitude")]
+                self.amplitude_parameter_table.setRowCount(0)
+                for parameter in bank:
+                    self._add_numeric_parameter("amplitude", parameter, emit=False)
+                for selector, name in selections:
+                    with QtCore.QSignalBlocker(selector):
+                        selector.setCurrentIndex(selector.findData(name))
+            self._migrate_amplitude_references()
+        self.amplitude_parameter_table.horizontalHeaderItem(1).setText("Target [dBm]" if requested == "calibration" else "Gain")
+        self._sync_numeric_parameter_choices("amplitude")
+        self._update_global_controls()
+        self._rebuild_predefined_items()
+        self.changed.emit()
+
+    def _upgrade_loaded_amplitude_controls(self, spec: QickRfPulseSpec) -> None:
+        """Expose named amplitudes without changing legacy effective output values."""
+        # Single mode permits an empty/incomplete dormant composite editor.
+        # Inspect amplitude settings without constructing an active composite spec.
+        pulses = [item for item in spec.effective_composite_items if item.kind == "pulse"]
+        if spec.pulse_mode != "composite" and spec.global_gain is not None:
+            pulses = [replace(item, gain=spec.global_gain, power_calibration_enabled=False)
+                      for item in pulses]
+        profiles = {
+            (item.amplitude_parameter, item.power_calibration_enabled,
+             item.target_output_power_dbm if item.power_calibration_enabled else item.gain)
+            for item in pulses
+        }
+        modes = {
+            (True, item.power_calibration_database_path, item.power_calibration_run_id)
+            if item.power_calibration_enabled else (False, "", 0)
+            for item in pulses
+        }
+        if spec.pulse_mode != "composite" and (spec.t2_initial_pi2 or spec.t2_final_pi2):
+            profiles.add((spec.t2_amplitude_parameter, False,
+                          spec.t2_gain if spec.global_gain is None else spec.global_gain))
+            modes.add((False, "", 0))
+        self._independent_preset_amplitudes = False
+        if spec.predefined_template != "custom" and not spec.global_amplitude_parameter:
+            self._independent_preset_amplitudes = len(profiles) > 1
+        if self._amplitude_mode == "legacy":
+            if len(modes) > 1:
+                with QtCore.QSignalBlocker(self.amplitude_calibration_enabled):
+                    self.amplitude_calibration_enabled.setTristate(True)
+                    self.amplitude_calibration_enabled.setCheckState(QtCore.Qt.PartiallyChecked)
+                self._update_global_controls()
+                return
+            calibrated, database, run_id = next(iter(modes), (False, "", 0))
+            self._amplitude_mode = "calibration" if calibrated else "manual"
+            if calibrated:
+                self.global_calibration_database_path.setText(database)
+                self.global_calibration_run_id.setValue(run_id)
+            if spec.global_gain is not None:
+                # A legacy numeric override includes zero and overrides row calibration.
+                for row in range(self.composite_item_table.rowCount()):
+                    self.composite_item_table.cellWidget(row, 5).setProperty("qstl_legacy_gain", spec.global_gain)
+                self.t2_gain.setValue(spec.global_gain)
+                self.predefined_gain.setValue(spec.global_gain)
+                self.global_gain.setValue(spec.global_gain)
+        with QtCore.QSignalBlocker(self.amplitude_calibration_enabled):
+            self.amplitude_calibration_enabled.setTristate(False)
+            self.amplitude_calibration_enabled.setChecked(self._amplitude_mode == "calibration")
+        self._migrate_amplitude_references()
+        if self._predefined_template_name() != "custom":
+            if self._independent_preset_amplitudes:
+                self.global_amplitude_parameter.setCurrentIndex(-1)
+            elif not spec.global_amplitude_parameter:
+                reference = self.predefined_amplitude_parameter.currentData()
+                self.global_amplitude_parameter.setCurrentIndex(self.global_amplitude_parameter.findData(reference))
+            with QtCore.QSignalBlocker(self.common_amplitude_enabled):
+                self.common_amplitude_enabled.setChecked(not self._independent_preset_amplitudes)
+        self.amplitude_parameter_table.horizontalHeaderItem(1).setText(
+            "Target [dBm]" if self._amplitude_mode == "calibration" else "Gain"
+        )
+        self._sync_numeric_parameter_choices("amplitude")
+        self._update_global_controls()
+
+    def _migrate_amplitude_references(self) -> None:
+        calibration = self._amplitude_mode == "calibration"
+        for selector, value, name in (
+            (self.global_amplitude_parameter, -20.0 if calibration else self.global_gain.value(), "a_global"),
+            (self.predefined_amplitude_parameter, -20.0 if calibration else self.predefined_gain.value(), "a_pi"),
+            (self.t2_amplitude_parameter, -20.0 if calibration else self.t2_gain.value(), "a_pi2"),
+        ):
+            if selector is self.global_amplitude_parameter and self._independent_preset_amplitudes:
+                continue
+            if not selector.currentData():
+                # Custom does not serialize a global reference; reuse its dormant
+                # preset default instead of adding a parameter on every reload.
+                chosen = (name if selector is self.global_amplitude_parameter and name in self._numeric_parameter_names("amplitude")
+                          else self._ensure_numeric_parameter("amplitude", value, name))
+                with QtCore.QSignalBlocker(selector):
+                    selector.setCurrentIndex(selector.findData(chosen))
+        for row in range(self.composite_item_table.rowCount()):
+            if self.composite_item_table.cellWidget(row, 0).currentData() != "pulse":
+                continue
+            selector = self.composite_item_table.cellWidget(row, 5)
+            if not selector.currentData():
+                power = self.composite_item_table.cellWidget(row, 6)
+                value = power.target_output_power_dbm if calibration else selector.property("qstl_legacy_gain")
+                chosen = self._ensure_numeric_parameter("amplitude", float(value), f"a_{row}")
+                with QtCore.QSignalBlocker(selector):
+                    selector.setCurrentIndex(selector.findData(chosen))
 
     def _new_composite_power_button(
         self,
@@ -4674,9 +5540,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             power_button.target_output_power_dbm = target_power.value()
             power_button.resolved_power_calibration_run_id = resolved_run
             if resolved_gain is not None:
-                self.composite_item_table.cellWidget(row, 5).setValue(
-                    resolved_gain
-                )
+                self.composite_item_table.cellWidget(row, 5).setProperty("qstl_legacy_gain", resolved_gain)
             self._update_composite_power_button(power_button)
             self._update_composite_item_row(row)
             self.changed.emit()
@@ -4690,6 +5554,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         emit: bool = True,
     ) -> None:
         kind = str(kind).lower()
+        new_item = item is None
         if item is None:
             frequency_names = self._frequency_parameter_names()
             duration_names = self._duration_parameter_names()
@@ -4713,6 +5578,17 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     else ""
                 ),
             )
+        delay_name = item.delay_parameter
+        if item.kind == "delay" and not delay_name:
+            delay_name = self._ensure_delay_parameter(item.duration_us, f"tau_{item.name}")
+        phase_name = item.phase_parameter
+        if item.kind == "pulse" and not phase_name:
+            phase_name = (self._numeric_parameter_names("phase")[0] if new_item and self._numeric_parameter_names("phase")
+                          else self._ensure_numeric_parameter("phase", item.phase_degrees, f"phase_{item.name}"))
+        amplitude_name = item.amplitude_parameter
+        if item.kind == "pulse" and self._amplitude_mode != "legacy" and not amplitude_name:
+            value = item.target_output_power_dbm if self._amplitude_mode == "calibration" else item.gain
+            amplitude_name = self._ensure_numeric_parameter("amplitude", value, f"a_{item.name}")
         row = self.composite_item_table.rowCount()
         self.composite_item_table.insertRow(row)
         kind_editor = QtWidgets.QComboBox()
@@ -4722,21 +5598,37 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         kind_editor.setProperty("qstl_committed_composite_kind", item.kind)
         name = QtWidgets.QLineEdit(item.name)
         duration = self._composite_duration_spin(item.duration_us)
+        if item.kind == "delay":
+            duration.setMinimum(0.0)
+            duration.setValue(_time_from_ns(item.duration_us * 1000.0, self._time_unit))
         duration_parameter = QtWidgets.QComboBox()
         duration_parameter.addItems(self._duration_parameter_names())
         duration_parameter.setCurrentText(item.duration_parameter)
         frequency = QtWidgets.QComboBox()
         frequency.addItems(self._frequency_parameter_names())
         frequency.setCurrentText(item.frequency_parameter)
-        gain = QtWidgets.QSpinBox()
-        gain.setRange(-32768, 32767)
-        gain.setValue(item.gain)
+        gain = QtWidgets.QComboBox()
+        gain.setProperty("qstl_legacy_gain", int(item.gain))
+        legacy_label = f"Legacy {'dBm' if item.power_calibration_enabled else 'gain'}: {item.target_output_power_dbm if item.power_calibration_enabled else item.gain:g}"
+        gain.setProperty("qstl_legacy_label", legacy_label)
+        if self._amplitude_mode == "legacy":
+            gain.addItem(legacy_label, "")
+        for parameter_name in self._numeric_parameter_names("amplitude"):
+            gain.addItem(parameter_name, parameter_name)
+        gain.setCurrentIndex(max(0, gain.findData(amplitude_name)))
         power = self._new_composite_power_button(item)
         self._track_table_editor(power)
-        phase = QtWidgets.QDoubleSpinBox()
-        phase.setRange(-360.0, 360.0)
-        phase.setDecimals(6)
-        phase.setValue(item.phase_degrees)
+        phase = QtWidgets.QComboBox()
+        phase.setProperty("qstl_legacy_phase", float(item.phase_degrees))
+        for parameter_name in self._numeric_parameter_names("phase"):
+            phase.addItem(parameter_name, parameter_name)
+        phase.setCurrentIndex(max(0, phase.findData(phase_name)))
+        delay_parameter = QtWidgets.QComboBox()
+        if not self._delay_parameter_names():
+            delay_parameter.addItem("—", "")
+        for parameter_name in self._delay_parameter_names():
+            delay_parameter.addItem(parameter_name, parameter_name)
+        delay_parameter.setCurrentIndex(max(0, delay_parameter.findData(delay_name)))
         for column, widget in enumerate(
             (
                 kind_editor,
@@ -4747,6 +5639,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 gain,
                 power,
                 phase,
+                delay_parameter,
             )
         ):
             self.composite_item_table.setCellWidget(row, column, widget)
@@ -4757,7 +5650,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     item_parameter_kind=(
                         "duration"
                         if column == 3
-                        else "frequency" if column == 4 else ""
+                        else "frequency" if column == 4 else "delay" if column == 8 else "amplitude" if column == 5 else "phase" if column == 7 else ""
                     ),
                 )
         kind_editor.currentIndexChanged.connect(
@@ -4799,6 +5692,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             return
         editor.setProperty("qstl_committed_composite_kind", requested)
         editor.setToolTip("")
+        if requested == "delay" and not self.composite_item_table.cellWidget(row, 8).currentData():
+            value = _time_to_ns(self.composite_item_table.cellWidget(row, 2).value(), self._time_unit) / 1000.0
+            self._ensure_delay_parameter(value, f"tau_{row}")
         self._update_composite_item_row(row)
         if previous == "pulse" and requested == "delay":
             self._disable_orphan_composite_parameter_sweeps(
@@ -4809,6 +5705,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     self.composite_item_table.cellWidget(row, 3).currentText(),
                 ),
             )
+        elif previous == "delay" and requested == "pulse":
+            self._disable_orphan_composite_parameter_sweeps(
+                delay_names=(self.composite_item_table.cellWidget(row, 8).currentData(),),
+            )
         self.changed.emit()
 
     def _update_composite_item_row(self, row: int) -> None:
@@ -4818,11 +5718,17 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.composite_item_table.cellWidget(row, 0).currentData() == "pulse"
         )
         power = self.composite_item_table.cellWidget(row, 6)
-        self.composite_item_table.cellWidget(row, 2).setEnabled(not is_pulse)
+        self.composite_item_table.cellWidget(row, 2).setEnabled(
+            not is_pulse and not self.composite_item_table.cellWidget(row, 8).currentData()
+        )
+        self.composite_item_table.cellWidget(row, 8).setEnabled(not is_pulse)
         for column in (3, 4, 6, 7):
             self.composite_item_table.cellWidget(row, column).setEnabled(is_pulse)
+        global_enabled = self._global_rf_enabled
+        self.composite_item_table.cellWidget(row, 4).setEnabled(is_pulse and not global_enabled)
+        self.composite_item_table.cellWidget(row, 6).setEnabled(is_pulse and not global_enabled and self._amplitude_mode == "legacy")
         self.composite_item_table.cellWidget(row, 5).setEnabled(
-            is_pulse and not bool(power.power_calibration_enabled)
+            is_pulse and self._amplitude_mode != "legacy" and not self.common_amplitude_enabled.isChecked()
         )
         self._update_composite_remove_button()
 
@@ -4900,10 +5806,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if selected_kind == "pulse"
             else ""
         )
+        removed_delay = self.composite_item_table.cellWidget(row, 8).currentData() if selected_kind == "delay" else ""
         self.composite_item_table.removeRow(row)
         self._disable_orphan_composite_parameter_sweeps(
             frequency_names=(removed_frequency,),
             duration_names=(removed_duration,),
+            delay_names=(removed_delay,),
         )
         self._update_composite_remove_button()
         self.changed.emit()
@@ -4935,6 +5843,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _clear_composite_tables(self) -> None:
         self.duration_parameter_table.setRowCount(0)
+        self.delay_parameter_table.setRowCount(0)
+        self.amplitude_parameter_table.setRowCount(0)
+        self.phase_parameter_table.setRowCount(0)
         self.frequency_parameter_table.setRowCount(0)
         self.composite_item_table.setRowCount(0)
 
@@ -4943,7 +5854,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     ) -> Tuple[QickRfDurationParameterSpec, ...]:
         return tuple(
             QickRfDurationParameterSpec(
-                name=self.duration_parameter_table.cellWidget(row, 0).text(),
+                name=self._committed_parameter_name(self.duration_parameter_table.cellWidget(row, 0)),
                 duration_us=(
                     _time_to_ns(
                         self.duration_parameter_table.cellWidget(row, 1).value(),
@@ -4980,7 +5891,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     ) -> Tuple[QickRfFrequencyParameterSpec, ...]:
         return tuple(
             QickRfFrequencyParameterSpec(
-                name=self.frequency_parameter_table.cellWidget(row, 0).text(),
+                name=self._committed_parameter_name(self.frequency_parameter_table.cellWidget(row, 0)),
                 frequency_mhz=self.frequency_parameter_table.cellWidget(row, 1).value(),
                 sweep_enabled=self.frequency_parameter_table.cellWidget(row, 2).isChecked(),
                 sweep_start_mhz=self.frequency_parameter_table.cellWidget(row, 3).value(),
@@ -4988,6 +5899,20 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 sweep_count=self.frequency_parameter_table.cellWidget(row, 5).value(),
             )
             for row in range(self.frequency_parameter_table.rowCount())
+        )
+
+    def _composite_delay_parameters(self) -> Tuple[QickRfDelayParameterSpec, ...]:
+        table = self.delay_parameter_table
+        return tuple(
+            QickRfDelayParameterSpec(
+                name=self._committed_parameter_name(table.cellWidget(row, 0)),
+                duration_us=_time_to_ns(table.cellWidget(row, 1).value(), self._time_unit) / 1000.0,
+                sweep_enabled=table.cellWidget(row, 2).isChecked(),
+                sweep_start_us=_time_to_ns(table.cellWidget(row, 3).value(), self._time_unit) / 1000.0,
+                sweep_stop_us=_time_to_ns(table.cellWidget(row, 4).value(), self._time_unit) / 1000.0,
+                sweep_count=table.cellWidget(row, 5).value(),
+            )
+            for row in range(table.rowCount())
         )
 
     def _composite_items(
@@ -5029,21 +5954,28 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                         if kind == "pulse"
                         else ""
                     ),
+                    delay_parameter=(
+                        str(self.composite_item_table.cellWidget(row, 8).currentData() or "")
+                        if kind == "delay" else ""
+                    ),
                     frequency_parameter=(
                         self.composite_item_table.cellWidget(row, 4).currentText()
                         if kind == "pulse"
                         else ""
                     ),
                     gain=(
-                        self.composite_item_table.cellWidget(row, 5).value()
+                        int(self.composite_item_table.cellWidget(row, 5).property("qstl_legacy_gain") or 0)
                         if kind == "pulse"
                         else 0
                     ),
                     phase_degrees=(
-                        self.composite_item_table.cellWidget(row, 7).value()
+                        float(self.composite_item_table.cellWidget(row, 7).property("qstl_legacy_phase") or 0.0)
                         if kind == "pulse"
                         else 0.0
                     ),
+                    amplitude_parameter=(str(self.composite_item_table.cellWidget(row, 5).currentData() or "")
+                                         if kind == "pulse" and self._amplitude_mode != "legacy" else ""),
+                    phase_parameter=(str(self.composite_item_table.cellWidget(row, 7).currentData() or "") if kind == "pulse" else ""),
                     power_calibration_enabled=(
                         bool(
                             self.composite_item_table.cellWidget(
@@ -5086,6 +6018,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _update_pulse_mode_controls(self, *_args) -> None:
         composite = self.composite_mode.isChecked()
+        if composite and not self._loading_rf_settings:
+            self._enable_global_defaults()
         self.composite_group.setVisible(composite)
         self.segment_length_mode.setItemText(
             1,
@@ -5693,6 +6627,11 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             )
             for row in range(self.duration_parameter_table.rowCount())
         ]
+        delay_parameter_ns = [
+            tuple(_time_to_ns(self.delay_parameter_table.cellWidget(row, column).value(), old_unit)
+                  for column in (1, 3, 4))
+            for row in range(self.delay_parameter_table.rowCount())
+        ]
         predefined_tau_ns = _time_to_ns(
             self.predefined_tau.value(),
             old_unit,
@@ -5730,6 +6669,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         for row, values_ns in enumerate(duration_parameter_ns):
             for column, value_ns in zip((1, 3, 4), values_ns):
                 editor = self.duration_parameter_table.cellWidget(row, column)
+                with QtCore.QSignalBlocker(editor):
+                    editor.setValue(_time_from_ns(value_ns, unit))
+                    editor.setSuffix(f" {unit}")
+        for row, values_ns in enumerate(delay_parameter_ns):
+            for column, value_ns in zip((1, 3, 4), values_ns):
+                editor = self.delay_parameter_table.cellWidget(row, column)
                 with QtCore.QSignalBlocker(editor):
                     editor.setValue(_time_from_ns(value_ns, unit))
                     editor.setSuffix(f" {unit}")
@@ -5771,6 +6716,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             segment_name=str(self.segment.currentData()),
             delay_us=_time_to_ns(self.delay.value(), self._time_unit) / 1000.0,
             duration_us=_time_to_ns(self.duration.value(), self._time_unit) / 1000.0,
+            fine_duration=self.fine_duration.isChecked(),
             frequency_mhz=self.frequency_mhz.value(),
             gain=self.gain.value(),
             att1_db=self.att1_db.value(),
@@ -5833,8 +6779,29 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             pulse_name=self.pulse_name.text().strip(),
             frequency_parameters=self._composite_frequency_parameters(),
             duration_parameters=self._composite_duration_parameters(),
+            delay_parameters=self._composite_delay_parameters(),
+            amplitude_parameters=self._numeric_parameters("amplitude"),
+            phase_parameters=self._numeric_parameters("phase"),
+            t2_initial_pi2=composite and self.t2_initial_pi2.isChecked(),
+            t2_final_pi2=composite and self.t2_final_pi2.isChecked(),
+            t2_frequency_parameter=self.t2_frequency_parameter.currentText(),
+            t2_duration_parameter=str(self.t2_duration_parameter.currentData() or ""),
+            t2_gain=self.t2_gain.value(),
+            t2_initial_phase_degrees=self.t2_initial_phase.value(),
+            t2_final_phase_degrees=self.t2_final_phase.value(),
+            global_frequency_parameter=(self.global_frequency_parameter.currentText()
+                                        if composite and self._global_rf_enabled else ""),
+            global_gain=(self.global_gain.value()
+                         if composite and self._global_rf_enabled and self._amplitude_mode == "legacy" else None),
+            global_amplitude_mode=self._amplitude_mode,
+            global_amplitude_parameter=(str(self.global_amplitude_parameter.currentData() or "") if composite and self._amplitude_mode != "legacy" and self.common_amplitude_enabled.isChecked() else ""),
+            global_calibration_database_path=self.global_calibration_database_path.text().strip(),
+            global_calibration_run_id=self.global_calibration_run_id.value(),
+            t2_amplitude_parameter=(str(self.t2_amplitude_parameter.currentData() or "") if self._amplitude_mode != "legacy" else ""),
+            t2_initial_phase_parameter=str(self.t2_initial_phase_parameter.currentData() or ""),
+            t2_final_phase_parameter=str(self.t2_final_phase_parameter.currentData() or ""),
             composite_items=self._composite_items(),
-            predefined_template=self._predefined_template_name(),
+            predefined_template=self._predefined_template_name() if composite else "custom",
             predefined_n=self.predefined_n.value(),
             predefined_tau_us=(
                 _time_to_ns(self.predefined_tau.value(), self._time_unit)
@@ -5848,6 +6815,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             predefined_gain=self.predefined_gain.value(),
             predefined_phase_degrees=self.predefined_phase.value(),
+            predefined_amplitude_parameter=(str(self.predefined_amplitude_parameter.currentData() or "") if self._amplitude_mode != "legacy" else ""),
+            predefined_phase_parameter=str(self.predefined_phase_parameter.currentData() or ""),
             predefined_n_sweep_enabled=(
                 self.predefined_n_sweep_enabled.isChecked()
             ),
@@ -5886,8 +6855,40 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         settings = asdict(spec)
         settings["frequency_parameters"] = list(settings["frequency_parameters"])
         settings["duration_parameters"] = list(settings["duration_parameters"])
+        settings["delay_parameters"] = list(settings["delay_parameters"])
+        settings["amplitude_parameters"] = list(settings["amplitude_parameters"])
+        settings["phase_parameters"] = list(settings["phase_parameters"])
         settings["composite_items"] = list(settings["composite_items"])
+        banks = dict(self._amplitude_values_by_mode)
+        if self._amplitude_mode != "legacy":
+            banks[self._amplitude_mode] = self._numeric_parameters("amplitude")
+        names = set(self._numeric_parameter_names("amplitude"))
+        settings["amplitude_parameter_banks"] = {
+            mode: [asdict(parameter) for parameter in bank if parameter.name in names]
+            for mode, bank in banks.items()
+        }
         return {"enabled": self.isChecked(), **settings}
+
+    @staticmethod
+    def _decode_amplitude_parameter_banks(data: dict) -> dict:
+        banks = data.get("amplitude_parameter_banks", {})
+        if not isinstance(banks, dict) or set(banks) - {"manual", "calibration"}:
+            raise ValueError("amplitude parameter banks must contain manual/calibration lists")
+        decoded = {}
+        for mode, bank in banks.items():
+            if not isinstance(bank, list):
+                raise TypeError("amplitude parameter bank must be a list")
+            parameters = tuple(QickRfAmplitudeParameterSpec(**entry) for entry in bank)
+            if len({parameter.name for parameter in parameters}) != len(parameters):
+                raise ValueError("amplitude parameter bank names must be unique")
+            for parameter in parameters:
+                for value in (parameter.value, parameter.sweep_start, parameter.sweep_stop):
+                    if mode == "manual" and (not -32768 <= value <= 32767 or int(value) != value):
+                        raise ValueError("manual amplitude bank values must be integer gain codes")
+                    if mode == "calibration" and not -200 <= value <= 100:
+                        raise ValueError("calibration amplitude bank values must be between -200 and 100 dBm")
+            decoded[mode] = [asdict(parameter) for parameter in parameters]
+        return decoded
 
     def load_settings(self, data: dict) -> None:
         if not isinstance(data, dict):
@@ -6016,6 +7017,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             pulse_mode=pulse_mode,
             pulse_name=str(data.get("pulse_name", "RF pulse")),
+            fine_duration=data.get("fine_duration", False),
             frequency_parameters=tuple(
                 data.get(
                     "frequency_parameters",
@@ -6025,6 +7027,27 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             duration_parameters=tuple(
                 data.get("duration_parameters", ())
             ),
+            delay_parameters=tuple(data.get("delay_parameters", ())),
+            amplitude_parameters=tuple(data.get("amplitude_parameters", ())),
+            phase_parameters=tuple(data.get("phase_parameters", ())),
+            global_amplitude_mode=str(data.get("global_amplitude_mode", "legacy")),
+            global_amplitude_parameter=str(data.get("global_amplitude_parameter", "")),
+            global_calibration_database_path=str(data.get("global_calibration_database_path", "")),
+            global_calibration_run_id=int(data.get("global_calibration_run_id", 0)),
+            predefined_amplitude_parameter=str(data.get("predefined_amplitude_parameter", "")),
+            predefined_phase_parameter=str(data.get("predefined_phase_parameter", "")),
+            t2_amplitude_parameter=str(data.get("t2_amplitude_parameter", "")),
+            t2_initial_phase_parameter=str(data.get("t2_initial_phase_parameter", "")),
+            t2_final_phase_parameter=str(data.get("t2_final_phase_parameter", "")),
+            t2_initial_pi2=data.get("t2_initial_pi2", False),
+            t2_final_pi2=data.get("t2_final_pi2", False),
+            t2_frequency_parameter=str(data.get("t2_frequency_parameter", "f0")),
+            t2_duration_parameter=str(data.get("t2_duration_parameter", "d0")),
+            t2_gain=int(data.get("t2_gain", 20000)),
+            t2_initial_phase_degrees=float(data.get("t2_initial_phase_degrees", 0.0)),
+            t2_final_phase_degrees=float(data.get("t2_final_phase_degrees", 0.0)),
+            global_frequency_parameter=str(data.get("global_frequency_parameter", "")),
+            global_gain=(int(data["global_gain"]) if data.get("global_gain") is not None else None),
             composite_items=tuple(
                 data.get(
                     "composite_items",
@@ -6074,12 +7097,21 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         segment = self.segment.findData(spec.segment_name)
         if segment < 0:
             raise ValueError(f"unknown RF output anchor {spec.segment_name!r}")
+        amplitude_banks = self._decode_amplitude_parameter_banks(data)
+        self._loading_rf_settings = True
+        self._loading_template_name = spec.predefined_template
+        self._amplitude_mode = spec.global_amplitude_mode
+        self._amplitude_values_by_mode = {
+            mode: tuple(QickRfAmplitudeParameterSpec(**parameter) for parameter in bank)
+            for mode, bank in amplitude_banks.items()
+        }
         self.gen_ch.setValue(spec.gen_ch)
         self.segment.setCurrentIndex(segment)
         self.delay.setValue(_time_from_ns(spec.delay_us * 1000.0, self._time_unit))
         self.duration.setValue(
             _time_from_ns(spec.duration_us * 1000.0, self._time_unit)
         )
+        self.fine_duration.setChecked(spec.fine_duration)
         self.duration_sweep_enabled.setChecked(
             spec.duration_sweep_enabled
         )
@@ -6114,17 +7146,61 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.frequency_sweep_count.setValue(spec.frequency_sweep_count)
         self.gain.setValue(spec.gain)
         self.pulse_name.setText(spec.pulse_name)
+        self._rebuilding_predefined_template = True
         self._clear_composite_tables()
         for parameter in spec.duration_parameters:
             self._add_duration_parameter(parameter, emit=False)
         if not spec.duration_parameters:
             self._add_duration_parameter(emit=False)
+        for parameter in spec.delay_parameters:
+            self._add_delay_parameter(parameter, emit=False)
         for parameter in spec.frequency_parameters:
             self._add_frequency_parameter(parameter, emit=False)
+        for parameter in spec.amplitude_parameters:
+            self._add_numeric_parameter("amplitude", parameter, emit=False)
+        for parameter in spec.phase_parameters:
+            self._add_numeric_parameter("phase", parameter, emit=False)
+        initial_phase_name = spec.t2_initial_phase_parameter or self._ensure_numeric_parameter("phase", spec.t2_initial_phase_degrees, "phase_initial")
+        final_phase_name = spec.t2_final_phase_parameter or self._ensure_numeric_parameter("phase", spec.t2_final_phase_degrees, "phase_final")
+        predefined_phase_name = spec.predefined_phase_parameter or self._ensure_numeric_parameter("phase", spec.predefined_phase_degrees, "phase_pi")
         for item in spec.composite_items:
             self._add_composite_item(item.kind, item, emit=False)
         self._rebuilding_predefined_template = True
         try:
+            with QtCore.QSignalBlocker(self.t2_initial_pi2), QtCore.QSignalBlocker(self.t2_final_pi2):
+                self.t2_initial_pi2.setChecked(spec.t2_initial_pi2)
+                self.t2_final_pi2.setChecked(spec.t2_final_pi2)
+            self.t2_duration_parameter.setProperty(
+                "qstl_t2_initialized",
+                bool(spec.t2_initial_pi2 or spec.t2_final_pi2 or "t2_duration_parameter" in data),
+            )
+            self.t2_frequency_parameter.setCurrentText(spec.t2_frequency_parameter)
+            self._set_t2_duration_parameter(spec.t2_duration_parameter)
+            self.t2_gain.setValue(spec.t2_gain)
+            self.t2_initial_phase.setValue(spec.t2_initial_phase_degrees)
+            self.t2_final_phase.setValue(spec.t2_final_phase_degrees)
+            for selector, parameter_name in (
+                (self.t2_initial_phase_parameter, initial_phase_name),
+                (self.t2_final_phase_parameter, final_phase_name),
+                (self.predefined_phase_parameter, predefined_phase_name),
+                (self.t2_amplitude_parameter, spec.t2_amplitude_parameter),
+                (self.predefined_amplitude_parameter, spec.predefined_amplitude_parameter),
+                (self.global_amplitude_parameter, spec.global_amplitude_parameter),
+            ):
+                with QtCore.QSignalBlocker(selector):
+                    match = selector.findData(parameter_name)
+                    selector.setCurrentIndex(match if match >= 0 else (-1 if selector in (self.t2_amplitude_parameter, self.predefined_amplitude_parameter, self.global_amplitude_parameter) else (0 if selector.count() else -1)))
+            with QtCore.QSignalBlocker(self.amplitude_mode_group), QtCore.QSignalBlocker(self.amplitude_calibration_enabled), QtCore.QSignalBlocker(self.common_amplitude_enabled):
+                self.amplitude_calibration_enabled.setChecked(spec.global_amplitude_mode == "calibration")
+                self.common_amplitude_enabled.setChecked(bool(spec.global_amplitude_parameter) or spec.global_amplitude_mode == "legacy")
+            self.global_calibration_database_path.setText(spec.global_calibration_database_path)
+            self.global_calibration_run_id.setValue(spec.global_calibration_run_id)
+            self.amplitude_parameter_table.horizontalHeaderItem(1).setText("Target [dBm]" if self._amplitude_mode == "calibration" else "Gain")
+            with QtCore.QSignalBlocker(self.global_rf_group), QtCore.QSignalBlocker(self.global_frequency_parameter), QtCore.QSignalBlocker(self.global_gain):
+                self._global_rf_enabled = bool(spec.global_frequency_parameter or spec.global_gain is not None)
+                self.global_frequency_parameter.setCurrentText(spec.global_frequency_parameter or spec.predefined_frequency_parameter)
+                self.global_gain.setValue(spec.global_gain if spec.global_gain is not None else spec.predefined_gain)
+            self._update_t2_controls()
             template_index = self.predefined_template.findData(
                 spec.predefined_template
             )
@@ -6212,6 +7288,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_pulse_mode_controls()
         self._update_predefined_controls()
         self.setChecked(enabled)
+        if self._predefined_template_name() == "custom" and (
+            self._global_rf_enabled or self.common_amplitude_enabled.isChecked()
+        ):
+            self._bind_globals_to_custom_rows(
+                frequency_override=bool(spec.global_frequency_parameter),
+                gain_override=spec.global_gain is not None,
+            )
+        self._upgrade_loaded_amplitude_controls(spec)
+        self._loading_rf_settings = False
         self.changed.emit()
 
 
@@ -7768,6 +8853,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             if getattr(spec, "axis_kind", "") in {
                 "rf_template_n",
                 "rf_template_tau",
+                "rf_delay",
+                "rf_t2_duration",
+                "rf_amplitude",
+                "rf_phase",
             }
         )
         hardware_specs = tuple(
@@ -7926,6 +9015,14 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     def _sweep_axis_label(self, spec) -> str:
         axis_kind = getattr(spec, "axis_kind", "amplitude")
+        if axis_kind in {"rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}:
+            label = {"rf_delay": "delay tau", "rf_t2_duration": "T2 pi duration",
+                     "rf_amplitude": "amplitude", "rf_phase": "phase"}[axis_kind]
+            return (
+                f"RF gen {spec.gen_ch} / {spec.parameter_name} {label} "
+                f"(software) | {spec.start:.6g} to {spec.stop:.6g} {spec.coordinate_unit} | "
+                f"{spec.count} points"
+            )
         if axis_kind.startswith("square_"):
             return f"SquarePulse gen {spec.gen_ch} / {spec.parameter}: {spec.start:.6g} to {spec.stop:.6g} {spec.coordinate_unit} | {spec.count} points"
         if axis_kind == "rf_template_n":
@@ -7943,7 +9040,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         if axis_kind == "rf_duration":
             return (
                 f"RF gen {spec.gen_ch} / {spec.segment_name} duration | "
-                f"{spec.start:.6g} to {spec.stop:.6g} us | "
+                f"{spec.start:.12g} to {spec.stop:.12g} us | "
                 f"{spec.count} points"
             )
         if axis_kind == "rf_frequency":
@@ -7993,6 +9090,14 @@ class ExperimentPanel(QtWidgets.QWidget):
         spec,
     ) -> Tuple[str, str, float, float, str]:
         axis_kind = str(getattr(spec, "axis_kind", "amplitude"))
+        if axis_kind in {"rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}:
+            label = {"rf_delay": "RF delay tau", "rf_t2_duration": "T2 pi duration",
+                     "rf_amplitude": "RF amplitude", "rf_phase": "RF phase"}[axis_kind]
+            return (
+                f"{label} (software)",
+                f"RF gen {spec.gen_ch} / {spec.parameter_name}",
+                float(spec.start), float(spec.stop), spec.coordinate_unit,
+            )
         if axis_kind.startswith("square_"):
             return ("SquarePulse " + spec.parameter, f"Gen {spec.gen_ch}", float(spec.start), float(spec.stop), spec.coordinate_unit)
         if axis_kind == "rf_duration":
@@ -8146,8 +9251,14 @@ class ExperimentPanel(QtWidgets.QWidget):
             endpoint_limit = max(1.0, self.full_scale_mv.value())
             minimum, maximum = -endpoint_limit, endpoint_limit
             step = max(0.001, endpoint_limit / 1000.0)
+        elif unit == "gain":
+            minimum, maximum, step = -32768.0, 32767.0, 1.0
+        elif unit in {"deg", "dBm"}:
+            minimum, maximum = -1.0e12, 1.0e12
+            step = max(0.001, min(abs(stop - start) / 100.0, 1.0))
         else:
-            minimum, maximum = 1.0e-9, 1.0e12
+            minimum = 0.0 if getattr(spec, "axis_kind", "") == "rf_delay" else 1.0e-9
+            maximum = 1.0e12
             step = max(1.0e-6, min(abs(stop - start) / 100.0, 1.0))
         with QtCore.QSignalBlocker(self.sweep_parameter_start), \
                 QtCore.QSignalBlocker(self.sweep_parameter_stop), \
@@ -10878,17 +11989,42 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if hasattr(self, "_square_dds_panel"):
                 self._square_dds_panel.attach_to_sequence(
                     sequence, self._dac_current_state.scale, None)
+            # Host RF sweeps are the outer dimensions, matching execution.
+            # Resolve them before displaying point-specific SET extensions.
+            try:
+                from .qick_qcodes_experiment import (
+                    _rf_software_sweep_bindings, _rf_specs_at_software_coordinate,
+                    _sequence_at_rf_software_coordinate,
+                )
+            except ImportError:
+                from qick_qcodes_experiment import (
+                    _rf_software_sweep_bindings, _rf_specs_at_software_coordinate,
+                    _sequence_at_rf_software_coordinate,
+                )
+            rf_specs = tuple(self._rf_pulse_specs)
+            bindings = _rf_software_sweep_bindings(rf_specs)
+            host_shape = tuple(axis.count for _index, axis in bindings)
+            full_shape = host_shape + tuple(sequence.sweep_shape)
             if hasattr(self, "_waveform_point_index"):
-                count = sequence.sweep_point_count
+                count = prod(full_shape)
                 with QtCore.QSignalBlocker(self._waveform_point_index):
                     self._waveform_point_index.setRange(0, min(count - 1, 2_147_483_647))
                     self._waveform_point_index.setEnabled(count > 1)
                 point_index = self._waveform_point_index.value()
-                coordinates = tuple(int(i) for i in np.unravel_index(point_index, sequence.sweep_shape))
+                coordinates = tuple(int(i) for i in np.unravel_index(point_index, full_shape))
                 self._waveform_point_label.setText(
                     f"{count:,} points | axis indices {coordinates} | virtual / physical / RC / RF / acquisition")
+            if bindings:
+                host_index, point_index = divmod(point_index, sequence.sweep_point_count)
+                host_coordinate = np.unravel_index(host_index, host_shape)
+                values = tuple(axis.points[i] for (_owner, axis), i in zip(bindings, host_coordinate))
+                rf_specs = _rf_specs_at_software_coordinate(rf_specs, bindings, values)
+                sequence = _sequence_at_rf_software_coordinate(
+                    sequence, rf_specs, fabric_mhz=self._qick_fabric_mhz)
+            self._waveform_preview_rf_specs = rf_specs
+            self._waveform_preview_hardware_index = point_index
             self._waveform_preview_sequence = sequence
-            if sequence.sweep_axes:
+            if sequence.sweep_axes or bindings:
                 cycles, virtual, _ = sequence.waveform_vertices(point_index, space="virtual")
                 self._plot.set_virtual_preview(
                     np.asarray(cycles) * 1000.0 / self._qick_fabric_mhz,
@@ -10938,7 +12074,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._refresh_rf_timeline()
         if hasattr(self, "_waveform_preview_note"):
             self._waveform_preview_note.setText(preview_note or
-                f"Point {point_index}: solid virtual | dashed physical | dash-dot RC DAC estimate. "
+                f"Point {self._waveform_point_index.value()}: solid virtual | dashed physical | dash-dot RC DAC estimate. "
                 "Ideal timing / requested voltages; hardware quantization is not included.")
             self._waveform_preview_note.setStyleSheet("color: #b03020;" if preview_note else "")
         if fit_view:
@@ -11758,9 +12894,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             table = panel.frequency_parameter_table
             update_row = panel._update_frequency_parameter_row
             convert = float
-        elif axis_kind == "rf_duration":
-            table = panel.duration_parameter_table
-            update_row = panel._update_duration_parameter_row
+        elif axis_kind in {"rf_amplitude", "rf_phase"}:
+            table = (panel.amplitude_parameter_table if axis_kind == "rf_amplitude"
+                     else panel.phase_parameter_table)
+            update_row = (panel._update_amplitude_parameter_row if axis_kind == "rf_amplitude"
+                          else panel._update_phase_parameter_row)
+            convert = float
+        elif axis_kind in {"rf_duration", "rf_delay", "rf_t2_duration"}:
+            table = (panel.delay_parameter_table if axis_kind == "rf_delay"
+                     else panel.duration_parameter_table)
+            update_row = (panel._update_delay_parameter_row if axis_kind == "rf_delay"
+                          else panel._update_duration_parameter_row)
             convert = lambda value: _time_from_ns(
                 float(value) * 1000.0,
                 panel._time_unit,
@@ -11813,6 +12957,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "rf_power",
                 "rf_template_n",
                 "rf_template_tau",
+                "rf_delay",
+                "rf_t2_duration",
+                "rf_amplitude",
+                "rf_phase",
             }:
                 panel = next(
                     (
@@ -11837,7 +12985,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     if (
                         panel.composite_mode.isChecked()
                         and parameter_name
-                        and axis_kind in {"rf_duration", "rf_frequency"}
+                        and axis_kind in {"rf_duration", "rf_frequency", "rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}
                     ):
                         self._set_composite_rf_parameter_sweep(
                             panel,
@@ -11981,6 +13129,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "rf_power",
             "rf_template_n",
             "rf_template_tau",
+            "rf_delay",
+            "rf_t2_duration",
+            "rf_amplitude",
+            "rf_phase",
         }:
             panel = next(
                 (
@@ -12005,7 +13157,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 if (
                     panel.composite_mode.isChecked()
                     and parameter_name
-                    and key[0] in {"rf_duration", "rf_frequency"}
+                    and key[0] in {"rf_duration", "rf_frequency", "rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}
                 ):
                     self._set_composite_rf_parameter_sweep(
                         panel,
@@ -14251,7 +15403,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             if getattr(self, "_acquisition_profile_connection", None) != self._shared_qick_connection():
                 profile = None
             result = acquisition_window(
-                sequence, self._waveform_point_index.value(), self._ddr_readout_spec,
+                sequence, getattr(self, "_waveform_preview_hardware_index", 0), self._ddr_readout_spec,
                 profile,
                 self._qick_fabric_mhz, self._experiment_panel.tproc_mhz.value())
         except (ValueError, RuntimeError, IndexError, KeyError) as exc:
@@ -14264,7 +15416,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if RfPulseTimelineWidget is None:
             return
         valid_sequences = []
-        for spec in self._rf_pulse_specs:
+        calibration_errors = []
+        preview_sequence = getattr(self, "_waveform_preview_sequence", None)
+        rf_specs = (getattr(self, "_waveform_preview_rf_specs", self._rf_pulse_specs)
+                    if preview_sequence is not None else self._rf_pulse_specs)
+        for spec in rf_specs:
             try:
                 sequence = getattr(self, "_waveform_preview_sequence", None)
                 if sequence is None:
@@ -14275,12 +15431,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     except ImportError:
                         from acquisition_preview import selected_rf_events
                     events = selected_rf_events(
-                        sequence, self._waveform_point_index.value(), spec,
+                        sequence, getattr(self, "_waveform_preview_hardware_index", 0), spec,
                         self._qick_fabric_mhz)
-            except ValueError:
+                try:
+                    from .acquisition_preview import calibrated_rf_preview_events
+                except ImportError:
+                    from acquisition_preview import calibrated_rf_preview_events
+                events = calibrated_rf_preview_events(spec, events)
+            except ValueError as exc:
+                calibration_errors.append(f"RF gen {spec.gen_ch}: {exc}")
                 continue
             if events:
                 valid_sequences.append((spec, events))
+        if calibration_errors:
+            self.statusBar().showMessage("; ".join(calibration_errors))
         while len(self._rf_timelines) < len(valid_sequences):
             timeline = RfPulseTimelineWidget(self._rf_timeline_container)
             if hasattr(timeline, "set_time_unit"):
@@ -14927,6 +16091,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 target_output_power_dbm=target_output_power_dbm,
                 pulse_mode=pulse_mode,
                 pulse_name=str(entry.get("pulse_name", "RF pulse")),
+                fine_duration=self._json_bool(entry.get("fine_duration", False), f"{label} fine duration"),
                 frequency_parameters=tuple(
                     entry.get(
                         "frequency_parameters",
@@ -14936,6 +16101,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 duration_parameters=tuple(
                     entry.get("duration_parameters", ())
                 ),
+                delay_parameters=tuple(entry.get("delay_parameters", ())),
+                amplitude_parameters=tuple(entry.get("amplitude_parameters", ())),
+                phase_parameters=tuple(entry.get("phase_parameters", ())),
+                global_amplitude_mode=str(entry.get("global_amplitude_mode", "legacy")),
+                global_amplitude_parameter=str(entry.get("global_amplitude_parameter", "")),
+                predefined_amplitude_parameter=str(entry.get("predefined_amplitude_parameter", "")),
+                predefined_phase_parameter=str(entry.get("predefined_phase_parameter", "")),
+                global_calibration_database_path=str(entry.get("global_calibration_database_path", "")),
+                global_calibration_run_id=self._json_int(entry.get("global_calibration_run_id", 0), "Global calibration run ID", minimum=0),
+                t2_amplitude_parameter=str(entry.get("t2_amplitude_parameter", "")),
+                t2_initial_phase_parameter=str(entry.get("t2_initial_phase_parameter", "")),
+                t2_final_phase_parameter=str(entry.get("t2_final_phase_parameter", "")),
+                global_frequency_parameter=str(entry.get("global_frequency_parameter", "")),
+                global_gain=(None if entry.get("global_gain") is None else
+                             self._json_int(entry["global_gain"], "Global gain", minimum=-32768)),
+                t2_initial_pi2=self._json_bool(entry.get("t2_initial_pi2", False), "T2 initial pi/2"),
+                t2_final_pi2=self._json_bool(entry.get("t2_final_pi2", False), "T2 final pi/2"),
+                t2_frequency_parameter=str(entry.get("t2_frequency_parameter", "f0")),
+                t2_duration_parameter=str(entry.get("t2_duration_parameter", "d0")),
+                t2_gain=self._json_int(entry.get("t2_gain", 20000), "T2 gain", minimum=-32768),
+                t2_initial_phase_degrees=float(entry.get("t2_initial_phase_degrees", 0.0)),
+                t2_final_phase_degrees=float(entry.get("t2_final_phase_degrees", 0.0)),
                 composite_items=tuple(
                     entry.get(
                         "composite_items",
@@ -15005,6 +16192,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "nqz": spec.nqz,
                     "require_within_segment": spec.require_within_segment,
                     "duration_sweep_enabled": spec.duration_sweep_enabled,
+                    "fine_duration": spec.fine_duration,
                     "duration_sweep_start_us": spec.duration_sweep_start_us,
                     "duration_sweep_stop_us": spec.duration_sweep_stop_us,
                     "duration_sweep_count": spec.duration_sweep_count,
@@ -15045,6 +16233,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                         asdict(parameter)
                         for parameter in spec.duration_parameters
                     ],
+                    "delay_parameters": [asdict(parameter) for parameter in spec.delay_parameters],
+                    "global_frequency_parameter": spec.global_frequency_parameter,
+                    "amplitude_parameters": [asdict(parameter) for parameter in spec.amplitude_parameters],
+                    "amplitude_parameter_banks": RfPulsePortPanel._decode_amplitude_parameter_banks(entry),
+                    "phase_parameters": [asdict(parameter) for parameter in spec.phase_parameters],
+                    "global_amplitude_mode": spec.global_amplitude_mode,
+                    "global_amplitude_parameter": spec.global_amplitude_parameter,
+                    "predefined_amplitude_parameter": spec.predefined_amplitude_parameter,
+                    "predefined_phase_parameter": spec.predefined_phase_parameter,
+                    "global_calibration_database_path": spec.global_calibration_database_path,
+                    "global_calibration_run_id": spec.global_calibration_run_id,
+                    "t2_amplitude_parameter": spec.t2_amplitude_parameter,
+                    "t2_initial_phase_parameter": spec.t2_initial_phase_parameter,
+                    "t2_final_phase_parameter": spec.t2_final_phase_parameter,
+                    "global_gain": spec.global_gain,
+                    "t2_initial_pi2": spec.t2_initial_pi2,
+                    "t2_final_pi2": spec.t2_final_pi2,
+                    "t2_frequency_parameter": spec.t2_frequency_parameter,
+                    "t2_duration_parameter": spec.t2_duration_parameter,
+                    "t2_gain": spec.t2_gain,
+                    "t2_initial_phase_degrees": spec.t2_initial_phase_degrees,
+                    "t2_final_phase_degrees": spec.t2_final_phase_degrees,
                     "composite_items": [
                         asdict(item) for item in spec.composite_items
                     ],
@@ -16045,6 +17255,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 target_output_power_dbm=target_output_power_dbm,
                 pulse_mode=pulse_mode,
                 pulse_name=str(entry.get("pulse_name", "RF pulse")),
+                fine_duration=self._json_bool(entry.get("fine_duration", False), "RF fine duration"),
                 frequency_parameters=tuple(
                     entry.get(
                         "frequency_parameters",
@@ -16054,6 +17265,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 duration_parameters=tuple(
                     entry.get("duration_parameters", ())
                 ),
+                delay_parameters=tuple(entry.get("delay_parameters", ())),
+                amplitude_parameters=tuple(entry.get("amplitude_parameters", ())),
+                phase_parameters=tuple(entry.get("phase_parameters", ())),
+                global_amplitude_mode=str(entry.get("global_amplitude_mode", "legacy")),
+                global_amplitude_parameter=str(entry.get("global_amplitude_parameter", "")),
+                predefined_amplitude_parameter=str(entry.get("predefined_amplitude_parameter", "")),
+                predefined_phase_parameter=str(entry.get("predefined_phase_parameter", "")),
+                global_calibration_database_path=str(entry.get("global_calibration_database_path", "")),
+                global_calibration_run_id=self._json_int(entry.get("global_calibration_run_id", 0), "Global calibration run ID", minimum=0),
+                t2_amplitude_parameter=str(entry.get("t2_amplitude_parameter", "")),
+                t2_initial_phase_parameter=str(entry.get("t2_initial_phase_parameter", "")),
+                t2_final_phase_parameter=str(entry.get("t2_final_phase_parameter", "")),
+                global_frequency_parameter=str(entry.get("global_frequency_parameter", "")),
+                global_gain=(None if entry.get("global_gain") is None else
+                             self._json_int(entry["global_gain"], "Global gain", minimum=-32768)),
+                t2_initial_pi2=self._json_bool(entry.get("t2_initial_pi2", False), "T2 initial pi/2"),
+                t2_final_pi2=self._json_bool(entry.get("t2_final_pi2", False), "T2 final pi/2"),
+                t2_frequency_parameter=str(entry.get("t2_frequency_parameter", "f0")),
+                t2_duration_parameter=str(entry.get("t2_duration_parameter", "d0")),
+                t2_gain=self._json_int(entry.get("t2_gain", 20000), "T2 gain", minimum=-32768),
+                t2_initial_phase_degrees=float(entry.get("t2_initial_phase_degrees", 0.0)),
+                t2_final_phase_degrees=float(entry.get("t2_final_phase_degrees", 0.0)),
                 composite_items=tuple(
                     entry.get(
                         "composite_items",
@@ -16123,6 +17356,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "nqz": spec.nqz,
                 "require_within_segment": spec.require_within_segment,
                 "duration_sweep_enabled": spec.duration_sweep_enabled,
+                "fine_duration": spec.fine_duration,
                 "duration_sweep_start_us": spec.duration_sweep_start_us,
                 "duration_sweep_stop_us": spec.duration_sweep_stop_us,
                 "duration_sweep_count": spec.duration_sweep_count,
@@ -16161,6 +17395,28 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     asdict(parameter)
                     for parameter in spec.duration_parameters
                 ],
+                "delay_parameters": [asdict(parameter) for parameter in spec.delay_parameters],
+                "global_frequency_parameter": spec.global_frequency_parameter,
+                "amplitude_parameters": [asdict(parameter) for parameter in spec.amplitude_parameters],
+                "amplitude_parameter_banks": RfPulsePortPanel._decode_amplitude_parameter_banks(entry),
+                "phase_parameters": [asdict(parameter) for parameter in spec.phase_parameters],
+                "global_amplitude_mode": spec.global_amplitude_mode,
+                "global_amplitude_parameter": spec.global_amplitude_parameter,
+                "predefined_amplitude_parameter": spec.predefined_amplitude_parameter,
+                "predefined_phase_parameter": spec.predefined_phase_parameter,
+                "global_calibration_database_path": spec.global_calibration_database_path,
+                "global_calibration_run_id": spec.global_calibration_run_id,
+                "t2_amplitude_parameter": spec.t2_amplitude_parameter,
+                "t2_initial_phase_parameter": spec.t2_initial_phase_parameter,
+                "t2_final_phase_parameter": spec.t2_final_phase_parameter,
+                "global_gain": spec.global_gain,
+                "t2_initial_pi2": spec.t2_initial_pi2,
+                "t2_final_pi2": spec.t2_final_pi2,
+                "t2_frequency_parameter": spec.t2_frequency_parameter,
+                "t2_duration_parameter": spec.t2_duration_parameter,
+                "t2_gain": spec.t2_gain,
+                "t2_initial_phase_degrees": spec.t2_initial_phase_degrees,
+                "t2_final_phase_degrees": spec.t2_final_phase_degrees,
                 "composite_items": [
                     asdict(item) for item in spec.composite_items
                 ],

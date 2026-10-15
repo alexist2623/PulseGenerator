@@ -11,6 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
+from fractions import Fraction
 from itertools import product
 import json
 import os
@@ -647,17 +648,48 @@ def connect_qick(
 
 
 def _validate_summed_rf_spec(gen_cfg, spec):
-    """Prevent reuse of a dedicated RF connector's calibration on a v4 AWG DAC."""
+    """Prevent reuse of a dedicated RF connector's calibration on a summed AWG DAC."""
     if gen_cfg.get('output_sum_role') != 'rf':
         return
+    firmware = 'v5' if gen_cfg.get('output_sum_version') == 2 else 'v4'
     if (spec.power_calibration_enabled or spec.power_sweep_enabled
             or any(event.power_calibration_enabled for event in spec.pulse_events)):
-        raise ValueError('This v4 RF generator is summed into the AWG physical output. '
+        raise ValueError(f'This {firmware} RF generator is summed into the AWG physical output. '
                          'RF connector power calibration cannot be used on this path; '
                          'disable power calibration and use raw DDS gain.')
     if spec.att1_db or spec.att2_db or spec.filter_type != 'bypass':
-        raise ValueError('This v4 RF generator uses the AWG physical output, which has '
+        raise ValueError(f'This {firmware} RF generator uses the AWG physical output, which has '
                          'no RF attenuator/filter. Select zero attenuation and bypass.')
+
+
+def _validate_composite_rf_intervals(pulses, *, gen_mhz, tproc_mhz):
+    """Reject overlapping quantized pulses without changing their schedule.
+
+    Pulse lengths use generator cycles while starts use tProcessor cycles.
+    Decimal clock ratios are compared exactly; the tiny tolerance only absorbs
+    clock configuration roundoff, never a meaningful fraction of a clock tick.
+    """
+    generator_to_tproc = Fraction(str(tproc_mhz)) / Fraction(str(gen_mhz))
+    tolerance = Fraction(1, 1_000_000_000)
+    previous = None
+    previous_end = Fraction(0)
+    for pulse in pulses:
+        start = Fraction(int(pulse.delay_tproc_cycles))
+        if previous is not None and previous_end - start > tolerance:
+            raise ValueError(
+                f"Composite RF gen {pulse.gen_ch}: pulse {pulse.pulse_name!r} "
+                f"overlaps preceding pulse {previous.pulse_name!r} after clock "
+                f"quantization by {float(previous_end - start):.9g} tProcessor "
+                "cycle(s). Align pulse durations to the generator/tProcessor "
+                "clocks or add an inter-pulse delay."
+            )
+        previous = pulse
+        # The SGv6 envelope command occupies at least three fabric clocks,
+        # including zero padding after a sub-clock active waveform.
+        busy_cycles = int(pulse.length_cycles)
+        if getattr(pulse, "fine_duration", False):
+            busy_cycles = max(3, busy_cycles)
+        previous_end = start + busy_cycles * generator_to_tproc
 
 
 def build_runtime_rf_pulses(
@@ -671,8 +703,18 @@ def build_runtime_rf_pulses(
     tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     pulses = []
     for spec in specs:
+        first_pulse_index = len(pulses)
         gen_cfg = soccfg["gens"][spec.gen_ch]
         _validate_summed_rf_spec(gen_cfg, spec)
+        fine_duration = bool(getattr(spec, "fine_duration", False))
+        if fine_duration:
+            samples_per_clock = int(gen_cfg.get("samps_per_clk", 0))
+            if (gen_cfg.get("type") != "axis_signal_gen_v6"
+                    or samples_per_clock != 16):
+                raise ValueError(
+                    "Fine RF duration requires an axis_signal_gen_v6 "
+                    "generator with 16 samples per fabric clock."
+                )
         parameter_by_name = {
             parameter.name: parameter
             for parameter in spec.frequency_parameters
@@ -816,17 +858,40 @@ def build_runtime_rf_pulses(
                 if event.delay_us <= 0.0
                 else cycles_from_us(event.delay_us, tproc_mhz)
             )
+            fine_kwargs = {}
+            if fine_duration:
+                try:
+                    from .qick_rf_fine_duration import samples_from_us
+                except ImportError:
+                    from qick_rf_fine_duration import samples_from_us
+                if any(abs(int(value)) > 16383 for value in
+                       (runtime_gain, *sweep_gain_codes)):
+                    raise ValueError(
+                        "Fine RF duration preserves the DDS amplitude by "
+                        "doubling the envelope-path gain; the requested "
+                        "gain (including calibration points) must have "
+                        "absolute value at most 16383."
+                    )
+                fine_kwargs = {
+                    "fine_duration": True,
+                    "duration_samples": samples_from_us(
+                        spec.duration_sweep_start_us
+                        if spec.duration_sweep_enabled else event.duration_us,
+                        float(gen_cfg["f_fabric"]),
+                    ),
+                }
             pulses.append(rf_type(
                 gen_ch=spec.gen_ch,
                 at_segment=spec.segment_name,
-                length_cycles=cycles_from_us(
+                length_cycles=((fine_kwargs["duration_samples"] + 15) // 16
+                               if fine_duration else cycles_from_us(
                     (
                         spec.duration_sweep_start_us
                         if spec.duration_sweep_enabled
                         else event.duration_us
                     ),
                     float(gen_cfg["f_fabric"]),
-                ),
+                )),
                 gain=runtime_gain,
                 freq_mhz=float(frequency_points[0]),
                 phase_degrees=event.phase_degrees,
@@ -843,7 +908,14 @@ def build_runtime_rf_pulses(
                 preceding_duration_parameters=(
                     event.preceding_duration_parameters
                 ),
+                **fine_kwargs,
             ))
+        if spec.pulse_mode == "composite":
+            _validate_composite_rf_intervals(
+                pulses[first_pulse_index:],
+                gen_mhz=float(gen_cfg["f_fabric"]),
+                tproc_mhz=tproc_mhz,
+            )
     return tuple(pulses)
 
 
@@ -1324,22 +1396,43 @@ def _execute_qick_sequence_once(
 
 @dataclass(frozen=True)
 class SoftwareSweepProgramBundle:
-    """Programs compiled for a predefined composite RF software sweep."""
+    """Programs compiled for composite RF host parameter sweeps."""
 
     programs: Tuple[Any, ...]
     sweep_axes: Tuple[QickRfSoftwareSweepAxisSpec, ...]
     sweep_coordinates: np.ndarray
 
     def summary(self) -> Mapping[str, Any]:
-        base = dict(self.programs[-1].summary())
+        summaries = tuple(dict(program.summary()) for program in self.programs)
+        base = dict(summaries[-1])
         base.update({
             "software_sweep_program_count": len(self.programs),
             "software_sweep_axes": [asdict(axis) for axis in self.sweep_axes],
             "software_sweep_coordinates": self.sweep_coordinates.tolist(),
             "software_sweep_execution": (
-                "one tProcessor compile/acquisition per predefined RF point"
+                "one tProcessor compile/acquisition per RF software point"
             ),
         })
+        if any(summary.get("rf_fine_duration") for summary in summaries):
+            # T2 duration and other host axes compile distinct programs. Keep
+            # each point's realized sample widths instead of reporting only
+            # the last program's fine-duration settings for the entire run.
+            coordinates = self.sweep_coordinates.tolist()
+            base["rf_fine_duration_software_points"] = [
+                {
+                    "software_point_index": index,
+                    "software_coordinate": coordinates[index],
+                    "rf_fine_duration": summary.get("rf_fine_duration", ()),
+                }
+                for index, summary in enumerate(summaries)
+            ]
+            if "rf_fine_duration" in base:
+                base["rf_fine_duration_scope"] = {
+                    "scope": "last_software_point",
+                    "software_point_index": len(summaries) - 1,
+                    "software_coordinate": coordinates[-1],
+                    "all_points_key": "rf_fine_duration_software_points",
+                }
         return base
 
     def __getattr__(self, name: str) -> Any:
@@ -1371,22 +1464,42 @@ def _rf_specs_at_software_coordinate(
     coordinate: Sequence[float],
 ) -> Tuple[QickRfPulseSpec, ...]:
     updates = {}
+    delay_updates = {}
+    duration_updates = {}
+    amplitude_updates = {}
+    phase_updates = {}
     for (spec_index, axis), value in zip(bindings, coordinate):
         point = updates.setdefault(spec_index, {})
         if axis.axis_kind == "rf_template_n":
             point["n_pulses"] = int(round(float(value)))
         elif axis.axis_kind == "rf_template_tau":
             point["tau_us"] = float(value)
+        elif axis.axis_kind == "rf_delay":
+            delay_updates.setdefault(spec_index, {})[axis.parameter_name] = float(value)
+        elif axis.axis_kind == "rf_t2_duration":
+            duration_updates.setdefault(spec_index, {})[axis.parameter_name] = float(value)
+        elif axis.axis_kind == "rf_amplitude":
+            amplitude_updates.setdefault(spec_index, {})[axis.parameter_name] = float(value)
+        elif axis.axis_kind == "rf_phase":
+            phase_updates.setdefault(spec_index, {})[axis.parameter_name] = float(value)
         else:
             raise ValueError(
                 f"unsupported RF software sweep kind {axis.axis_kind!r}"
             )
-    return tuple(
-        spec.with_predefined_parameters(**updates[index])
-        if index in updates
-        else spec
-        for index, spec in enumerate(rf_specs)
-    )
+    concrete_specs = []
+    for index, spec in enumerate(rf_specs):
+        if updates.get(index):
+            spec = spec.with_predefined_parameters(**updates[index])
+        if index in delay_updates:
+            spec = spec.with_delay_parameters(delay_updates[index])
+        if index in duration_updates:
+            spec = spec.with_duration_parameters(duration_updates[index])
+        if index in amplitude_updates:
+            spec = spec.with_amplitude_parameters(amplitude_updates[index])
+        if index in phase_updates:
+            spec = spec.with_phase_parameters(phase_updates[index])
+        concrete_specs.append(spec)
+    return tuple(concrete_specs)
 
 
 def _sequence_at_rf_software_coordinate(
@@ -1516,7 +1629,7 @@ def execute_qick_sequence(
     event_callback: Optional[ExperimentEventCallback] = None,
     cancel_check: Optional[CancellationCheck] = None,
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
-    """Execute once, or recompile once per predefined CPMG/UDD point."""
+    """Execute once, or recompile per composite RF software coordinate."""
     rf_specs = tuple(rf_specs)
     bindings = _rf_software_sweep_bindings(rf_specs)
     if not bindings:
@@ -1610,14 +1723,15 @@ def execute_qick_sequence(
         sweep_axes=tuple(axis for _index, axis in bindings),
         sweep_coordinates=coordinates,
     )
-    first_rf_settings.update({
-        "predefined_software_sweep": {
-            "execution": "host software sweep",
-            "program_count": total,
-            "axes": [asdict(axis) for _index, axis in bindings],
-            "coordinates": coordinates.tolist(),
-        },
-    })
+    software_metadata = {
+        "execution": "host software sweep",
+        "program_count": total,
+        "axes": [asdict(axis) for _index, axis in bindings],
+        "coordinates": coordinates.tolist(),
+    }
+    first_rf_settings["software_sweep"] = software_metadata
+    # Retain the established key for readers of earlier saved results.
+    first_rf_settings["predefined_software_sweep"] = software_metadata
     return bundle, combined, first_rf_settings
 
 
@@ -1655,6 +1769,9 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
         suffix = {
             "rf_template_n": "pulse_count_n",
             "rf_template_tau": "tau_us",
+            "rf_delay": "delay_us",
+            "rf_t2_duration": "duration_us",
+            "rf_phase": "phase_deg",
             "rf_duration": "duration_us",
             "rf_frequency": "frequency_mhz",
             "rf_power": "output_power_dbm",
@@ -1664,6 +1781,8 @@ def _sweep_parameter_names(axes: Sequence[Any]) -> Tuple[str, ...]:
             "ramp_duration": "ramp_duration_us",
             "hold_duration": "hold_duration_us",
         }.get(axis_kind, "voltage_mv")
+        if axis_kind == "rf_amplitude":
+            suffix = "output_power_dbm" if axis.coordinate_unit == "dBm" else "gain"
         base = (
             f"{_qcodes_identifier(axis.output_name)}_"
             f"{_qcodes_identifier(axis.segment_name)}_{suffix}"
@@ -1686,6 +1805,15 @@ def _sweep_axis_display(axis: Any, full_scale_mv: float) -> Tuple[str, str, floa
         return "predefined RF pulse count N", "", 1.0
     if axis_kind == "rf_template_tau":
         return "predefined RF tau", "us", 1.0
+    if axis_kind == "rf_delay":
+        return f"RF delay {axis.parameter_name}", "us", 1.0
+    if axis_kind == "rf_t2_duration":
+        return f"T2 pi duration {axis.parameter_name} (pi/2 follows half)", "us", 1.0
+    if axis_kind == "rf_amplitude":
+        quantity = "Calibrated RF connector power" if axis.coordinate_unit == "dBm" else "RF gain"
+        return f"{quantity} {axis.parameter_name}", axis.coordinate_unit, 1.0
+    if axis_kind == "rf_phase":
+        return f"RF phase {axis.parameter_name}", "deg", 1.0
     if axis_kind == "rf_duration":
         return "RF pulse duration", "us", 1.0
     if axis_kind == "rf_frequency":
@@ -1713,6 +1841,31 @@ def _sweep_axis_meaning(axis: Any) -> str:
         meaning = (
             f"Predefined composite RF tau for {axis.output_name}/"
             f"{axis.segment_name}; each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_delay":
+        meaning = (
+            f"Composite RF delay variable {axis.parameter_name} for {axis.output_name}/"
+            f"{axis.segment_name}; all references share the coordinate; "
+            "each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_t2_duration":
+        meaning = (
+            f"T2 pi duration variable {axis.parameter_name} for {axis.output_name}/"
+            f"{axis.segment_name}; enabled pi/2 endpoints use half this duration; "
+            "each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_amplitude":
+        quantity = "calibrated connector power" if axis.coordinate_unit == "dBm" else "raw gain code"
+        meaning = (
+            f"Composite RF {quantity} variable {axis.parameter_name} for {axis.output_name}/"
+            f"{axis.segment_name}; all references share the coordinate; "
+            "each coordinate is a host software run"
+        )
+    elif axis_kind == "rf_phase":
+        meaning = (
+            f"Composite RF phase-offset variable {axis.parameter_name} for {axis.output_name}/"
+            f"{axis.segment_name}; phase in degrees against the time-referenced carrier; "
+            "each coordinate is a host software run"
         )
     elif axis_kind == "rf_duration":
         meaning = (
@@ -2356,7 +2509,7 @@ def store_qick_result(
         if axis_kind.startswith("square_"):
             axis_metadata.update({"gen_ch": int(axis.gen_ch), "square_parameter": axis.parameter,
                                   "execution": "tProcessor hardware sweep with exact DMEM words"})
-        elif axis_kind in {"rf_template_n", "rf_template_tau"}:
+        elif axis_kind in {"rf_template_n", "rf_template_tau", "rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}:
             axis_metadata.update({
                 "parameter_name": str(axis.parameter_name),
                 "execution": (
@@ -2883,12 +3036,14 @@ def run_qick_qcodes_experiment(
     software_bindings = _rf_software_sweep_bindings(rf_specs)
     software_coordinates = _software_sweep_coordinates(software_bindings)
     if software_bindings:
-        stored_gui_settings["rf_predefined_software_sweep"] = {
+        software_metadata = {
             "execution": "host software sweep",
             "axes": [asdict(axis) for _index, axis in software_bindings],
             "coordinates": software_coordinates.tolist(),
             "program_count": int(software_coordinates.shape[0]),
         }
+        stored_gui_settings["rf_software_sweep"] = software_metadata
+        stored_gui_settings["rf_predefined_software_sweep"] = software_metadata
     fabric_mhz = float(qick_settings.get("fabric_mhz", 300.0))
     if hasattr(sequence, "waveform_vertices"):
         _check_cancel(cancel_check)
@@ -2929,7 +3084,7 @@ def run_qick_qcodes_experiment(
                 awg_recipe["point_count"] * software_coordinates.shape[0]
             )
             awg_recipe["reconstruction"] += (
-                " Predefined RF N/tau axes are host software sweeps; RF-driven "
+                " RF count, tau, named delay, amplitude, phase and T2 pi-duration axes are host software sweeps; RF-driven "
                 "SET extension timing is rebuilt for each coordinate."
             )
         stored_gui_settings["awg_waveform_recipe"] = awg_recipe
@@ -2946,7 +3101,7 @@ def run_qick_qcodes_experiment(
             # recipe and make this storage downgrade explicit in metadata.
             stored_gui_settings["awg_waveform_vertices_omitted"] = {
                 "reason": (
-                    "expanded AWG vertices are omitted for predefined RF "
+                    "expanded AWG vertices are omitted for RF "
                     "software sweeps; reconstruct from the compact recipe"
                 ),
                 "requested_mode": AWG_METADATA_MODE_EXPANDED,

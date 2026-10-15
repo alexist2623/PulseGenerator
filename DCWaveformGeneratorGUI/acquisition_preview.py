@@ -58,8 +58,35 @@ def acquisition_window(sequence, point_index, spec, profile, fabric_mhz, tproc_m
     )
 
 
-def selected_rf_events(sequence, point_index, spec, fabric_mhz):
+def selected_rf_events(sequence, point_index, spec, fabric_mhz, *, software_values=None):
     """Resolve RF display timing onto the same selected AWG sweep point."""
+    # Software coordinates are resolved before looking up pulse events, just as
+    # execution recompiles one concrete RF sequence per host coordinate. The
+    # caller supplies the corresponding concrete AWG sequence for SET extension.
+    if software_values:
+        predefined = {}
+        if ("rf_template_n", "N") in software_values:
+            predefined["n_pulses"] = int(round(software_values[("rf_template_n", "N")]))
+        if ("rf_template_tau", "tau") in software_values:
+            predefined["tau_us"] = float(software_values[("rf_template_tau", "tau")])
+        if predefined:
+            spec = spec.with_predefined_parameters(**predefined)
+        delays = {name: float(value) for (kind, name), value in software_values.items()
+                  if kind == "rf_delay"}
+        if delays:
+            spec = spec.with_delay_parameters(delays)
+        durations = {name: float(value) for (kind, name), value in software_values.items()
+                     if kind == "rf_t2_duration"}
+        if durations:
+            spec = spec.with_duration_parameters(durations)
+        amplitudes = {name: float(value) for (kind, name), value in software_values.items()
+                      if kind == "rf_amplitude"}
+        if amplitudes:
+            spec = spec.with_amplitude_parameters(amplitudes)
+        phases = {name: float(value) for (kind, name), value in software_values.items()
+                  if kind == "rf_phase"}
+        if phases:
+            spec = spec.with_phase_parameters(phases)
     start, end = selected_segment_bounds_us(
         sequence, point_index, spec.segment_name, fabric_mhz)
     values = {
@@ -82,4 +109,51 @@ def selected_rf_events(sequence, point_index, spec, fabric_mhz):
         if spec.require_within_segment and event_end > end + 1e-12:
             raise ValueError(f"RF pulse {event.name!r} extends beyond {spec.segment_name}")
         resolved.append((event, event_start, event_end))
+    return tuple(resolved)
+
+
+def calibrated_rf_preview_events(spec, events):
+    """Map selected RF-event gains for display using the execution calibration.
+
+    ``events`` contains ``(event, start_us, end_us)`` tuples returned by
+    ``selected_rf_events``. Calibration is read-only; target power and source
+    metadata remain attached to each event. Invalid calibration raises instead
+    of displaying a stale manual gain as the calibrated output.
+    """
+    try:
+        from .power_calibration import CalibrationDatabase
+    except ImportError:
+        from power_calibration import CalibrationDatabase
+    import numpy as np
+    parameters = {parameter.name: parameter for parameter in spec.frequency_parameters}
+    resolved = []
+    for event, start, end in events:
+        if event.power_calibration_enabled:
+            try:
+                parameter = parameters.get(event.frequency_parameter)
+                if parameter is not None and parameter.sweep_enabled:
+                    frequencies = np.linspace(parameter.sweep_start_mhz, parameter.sweep_stop_mhz,
+                                              parameter.sweep_count, dtype=np.float64)
+                elif not event.frequency_parameter and spec.frequency_sweep_enabled:
+                    frequencies = np.linspace(spec.frequency_sweep_start_mhz, spec.frequency_sweep_stop_mhz,
+                                              spec.frequency_sweep_count, dtype=np.float64)
+                else:
+                    frequencies = np.asarray([event.frequency_mhz], dtype=np.float64)
+                selected = int(np.argmin(np.abs(frequencies - event.frequency_mhz)))
+                if abs(float(frequencies[selected]) - event.frequency_mhz) > 1e-5:
+                    raise ValueError('selected RF frequency is outside the configured sweep coordinates')
+                calibration = CalibrationDatabase(event.power_calibration_database_path).output_calibration(
+                    spec.output_board_type, frequencies,
+                    run_id=event.power_calibration_run_id or None, nqz=int(spec.nqz),
+                    output_filter_type=str(spec.filter_type),
+                    output_filter_cutoff_ghz=float(spec.filter_cutoff),
+                    output_filter_bandwidth_ghz=float(spec.filter_bandwidth))
+                schedule = calibration.build_gain_schedule(
+                    frequencies, event.target_output_power_dbm,
+                    output_att1_db=float(spec.effective_att1_db),
+                    output_att2_db=float(spec.effective_att2_db), max_entries=len(frequencies))
+                event = replace(event, gain=int(schedule.gain_codes[selected]))
+            except Exception as exc:
+                raise ValueError(f"RF preview calibration failed for {event.name!r}: {exc}") from exc
+        resolved.append((event, start, end))
     return tuple(resolved)

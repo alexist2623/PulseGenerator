@@ -12,3 +12,24 @@ DCWaveformGeneratorGUI/test_qick_update_transactions.py -text
 DCWaveformGeneratorGUI/test_qick_update_ui.py -text
 DCWaveformGeneratorGUI/requirements-updater.txt -text
 DCWaveformGeneratorGUI/QICK_UPDATE.md -text
+# Preserve the source bytes recorded by the v5 GUI/RTL validation reports.
+DCWaveformGeneratorGUI/acquisition_preview.py -text
+DCWaveformGeneratorGUI/awg_sweep_map.py -text
+DCWaveformGeneratorGUI/dc_waveform_core.py -text
+DCWaveformGeneratorGUI/dc_waveform_widgets.py -text
+DCWaveformGeneratorGUI/qick_rf_fine_duration.py -text
+DCWaveformGeneratorGUI/test_acquisition_preview.py -text
+DCWaveformGeneratorGUI/test_dc_waveform_gui_rf.py -text
+DCWaveformGeneratorGUI/test_qick_front_panel.py -text
+DCWaveformGeneratorGUI/test_output_sum_v5_gui.py -text
+DCWaveformGeneratorGUI/test_qick_update_v5.py -text
+DCWaveformGeneratorGUI/test_rf_amplitude_parameter_editor.py -text
+DCWaveformGeneratorGUI/test_rf_delay_software_sweep.py -text
+DCWaveformGeneratorGUI/test_rf_fine_duration_compiler.py -text
+DCWaveformGeneratorGUI/test_rf_fine_duration_editor.py -text
+DCWaveformGeneratorGUI/test_rf_fine_duration_runtime.py -text
+DCWaveformGeneratorGUI/test_rf_t2_delay_core.py -text
+DCWaveformGeneratorGUI/test_rf_t2_delay_editor.py -text
+DCWaveformGeneratorGUI/test_rf_t2_integration.py -text
+DCWaveformGeneratorGUI/test_shared_dac_awg_selection.py -text
+DCWaveformGeneratorGUI/test_waveform_plot_annotations.py -text

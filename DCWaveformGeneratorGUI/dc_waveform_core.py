@@ -10,7 +10,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from math import ceil, isfinite, pi, sin
 from numbers import Integral, Real
 import keyword
@@ -36,7 +36,7 @@ DEFAULT_BIAS_T_FILTER_TAU_US = 100.0
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter", "dc_rc")
 RF_SEGMENT_LENGTH_MODES = ("fixed", "extend_by_rf_duration")
-RF_PREDEFINED_COMPOSITE_TEMPLATES = ("custom", "cpmg", "udd")
+RF_PREDEFINED_COMPOSITE_TEMPLATES = ("custom", "cpmg", "udd", "hahn_echo")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -342,7 +342,7 @@ class QickRfSweepAxisSpec:
 
 @dataclass(frozen=True)
 class QickRfSoftwareSweepAxisSpec:
-    """RF template parameter varied by recompiling once per coordinate.
+    """RF template or named parameter varied by recompiling per coordinate.
 
     Unlike :class:`QickRfSweepAxisSpec`, this axis is intentionally excluded
     from the tProcessor Cartesian sweep.  CPMG/UDD pulse counts change the
@@ -362,6 +362,13 @@ class QickRfSoftwareSweepAxisSpec:
 
     @property
     def points(self) -> np.ndarray:
+        if self.axis_kind == "rf_amplitude" and self.coordinate_unit == "gain":
+            values = np.rint(
+                np.linspace(self.start, self.stop, self.count, dtype=np.float64)
+            ).astype(np.int64)
+            if np.unique(values).size != values.size:
+                raise ValueError("RF amplitude sweep points must map to unique integer gain codes")
+            return values
         if self.axis_kind == "rf_template_n":
             values = np.rint(
                 np.linspace(self.start, self.stop, self.count, dtype=np.float64)
@@ -390,19 +397,25 @@ def build_predefined_composite_items(
     duration_parameter: str,
     gain: int = 20000,
     phase_degrees: Real = 0.0,
+    amplitude_parameter: str = "",
+    phase_parameter: str = "",
 ) -> Tuple["QickRfCompositeItemSpec", ...]:
-    """Build CPMG or UDD pulse/delay entries.
+    """Build CPMG, UDD, or Hahn echo pulse/delay entries.
 
     CPMG ``tau_us`` is the free-evolution interval; the edge intervals are
     ``tau/2``.  UDD ``tau_us`` is the complete free-evolution window and uses
     ``t_j = tau * sin^2(pi*j/(2*N+2))``.  RF pulse widths are represented by
     the independent named duration parameter and therefore add to these free
     evolution intervals.
+    Hahn echo has one pi pulse between two ``tau/2`` delays, with ``tau_us``
+    specifying its total free-evolution time.
     """
     template = str(template).strip().lower()
-    if template not in {"cpmg", "udd"}:
-        raise ValueError("predefined RF template must be 'cpmg' or 'udd'")
+    if template not in {"cpmg", "udd", "hahn_echo"}:
+        raise ValueError("predefined RF template must be 'cpmg', 'udd', or 'hahn_echo'")
     n_pulses = _positive_int(n_pulses, "predefined RF pulse count N")
+    if template == "hahn_echo":
+        n_pulses = 1
     tau_us = _positive_real(tau_us, "predefined RF tau_us")
     frequency_parameter = str(frequency_parameter).strip()
     duration_parameter = str(duration_parameter).strip()
@@ -416,7 +429,10 @@ def build_predefined_composite_items(
         "predefined RF phase_degrees",
     )
 
-    if template == "cpmg":
+    if template == "hahn_echo":
+        free_intervals = [tau_us / 2.0, tau_us / 2.0]
+        prefix = "Hahn"
+    elif template == "cpmg":
         free_intervals = (
             [tau_us / 2.0]
             + [tau_us] * max(0, n_pulses - 1)
@@ -453,6 +469,8 @@ def build_predefined_composite_items(
             duration_parameter=duration_parameter,
             gain=gain,
             phase_degrees=phase_degrees,
+            amplitude_parameter=amplitude_parameter,
+            phase_parameter=phase_parameter,
         ))
     items.append(QickRfCompositeItemSpec(
         kind="delay",
@@ -494,7 +512,7 @@ class QickRfFrequencyParameterSpec:
 
 @dataclass(frozen=True)
 class QickRfDurationParameterSpec:
-    """Named RF pulse duration shared by composite pulses on one generator."""
+    """Named duration shared by RF pulses, or by delays in their own namespace."""
 
     name: str
     duration_us: float
@@ -523,6 +541,93 @@ class QickRfDurationParameterSpec:
         return float(self.sweep_start_us if self.sweep_enabled else self.duration_us)
 
 
+@dataclass(frozen=True, eq=False)
+class QickRfDelayParameterSpec(QickRfDurationParameterSpec):
+    """Named nonnegative delay; zero denotes no free-evolution gap."""
+
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError("RF delay parameter names must be Python-style identifiers")
+        object.__setattr__(self, "name", name)
+        _nonnegative_real(self.duration_us, f"RF delay parameter {name}")
+        if not isinstance(self.sweep_enabled, bool):
+            raise TypeError("RF delay parameter sweep_enabled must be bool")
+        _nonnegative_real(self.sweep_start_us, f"RF delay parameter {name} start")
+        _nonnegative_real(self.sweep_stop_us, f"RF delay parameter {name} stop")
+        _positive_int(self.sweep_count, f"RF delay parameter {name} count")
+
+    def __eq__(self, other):
+        if not isinstance(other, QickRfDurationParameterSpec):
+            return NotImplemented
+        return asdict(self) == asdict(other)
+
+    __hash__ = QickRfDurationParameterSpec.__hash__
+
+
+@dataclass(frozen=True)
+class QickRfAmplitudeParameterSpec:
+    """Named gain code or calibrated dBm value, interpreted by the RF mode."""
+
+    name: str
+    value: float
+    sweep_enabled: bool = False
+    sweep_start: float = 20000.0
+    sweep_stop: float = 20000.0
+    sweep_count: int = 1
+
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError("RF amplitude parameter names must be Python-style identifiers")
+        object.__setattr__(self, "name", name)
+        _finite_real(self.value, f"RF amplitude parameter {name}")
+        if not isinstance(self.sweep_enabled, bool):
+            raise TypeError("RF amplitude parameter sweep_enabled must be bool")
+        _finite_real(self.sweep_start, f"RF amplitude parameter {name} start")
+        _finite_real(self.sweep_stop, f"RF amplitude parameter {name} stop")
+        _positive_int(self.sweep_count, f"RF amplitude parameter {name} count")
+
+    @property
+    def initial_value(self) -> float:
+        return float(self.sweep_start if self.sweep_enabled else self.value)
+
+
+@dataclass(frozen=True)
+class QickRfPhaseParameterSpec:
+    """Named RF phase in degrees, optionally swept on the host."""
+
+    name: str
+    phase_degrees: float
+    sweep_enabled: bool = False
+    sweep_start_degrees: float = 0.0
+    sweep_stop_degrees: float = 0.0
+    sweep_count: int = 1
+
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError("RF phase parameter names must be Python-style identifiers")
+        object.__setattr__(self, "name", name)
+        _finite_real(self.phase_degrees, f"RF phase parameter {name}")
+        if not isinstance(self.sweep_enabled, bool):
+            raise TypeError("RF phase parameter sweep_enabled must be bool")
+        _finite_real(self.sweep_start_degrees, f"RF phase parameter {name} start")
+        _finite_real(self.sweep_stop_degrees, f"RF phase parameter {name} stop")
+        _positive_int(self.sweep_count, f"RF phase parameter {name} count")
+
+    @property
+    def initial_phase_degrees(self) -> float:
+        return float(self.sweep_start_degrees if self.sweep_enabled else self.phase_degrees)
+
+
+def _manual_rf_gain(value: Real, label: str) -> int:
+    value = _finite_real(value, label)
+    if not value.is_integer():
+        raise ValueError(f"{label} must be an integer gain code")
+    return _bounded_int(int(value), label, -32768, 32767)
+
+
 @dataclass(frozen=True)
 class QickRfCompositeItemSpec:
     """One ordered pulse or delay in a composite RF output sequence."""
@@ -538,6 +643,9 @@ class QickRfCompositeItemSpec:
     power_calibration_run_id: int = 0
     target_output_power_dbm: float = -20.0
     duration_parameter: str = ""
+    delay_parameter: str = ""
+    amplitude_parameter: str = ""
+    phase_parameter: str = ""
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
@@ -548,7 +656,8 @@ class QickRfCompositeItemSpec:
             raise ValueError("composite RF item name must not be empty")
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "name", name)
-        _positive_real(self.duration_us, f"composite RF {kind} duration_us")
+        (_nonnegative_real if kind == "delay" else _positive_real)(
+            self.duration_us, f"composite RF {kind} duration_us")
         _bounded_int(self.gain, "composite RF gain", -32768, 32767)
         _finite_real(self.phase_degrees, "composite RF phase_degrees")
         if not isinstance(self.power_calibration_enabled, bool):
@@ -569,6 +678,16 @@ class QickRfCompositeItemSpec:
             raise ValueError("composite RF pulse requires a frequency parameter")
         if self.duration_parameter and not str(self.duration_parameter).isidentifier():
             raise ValueError("composite RF duration_parameter must be an identifier")
+        if self.delay_parameter and not str(self.delay_parameter).isidentifier():
+            raise ValueError("composite RF delay_parameter must be an identifier")
+        if kind != "delay" and self.delay_parameter:
+            raise ValueError("composite RF delay_parameter is available only for delays")
+        for reference in ("amplitude_parameter", "phase_parameter"):
+            value = getattr(self, reference)
+            if value and not str(value).isidentifier():
+                raise ValueError(f"composite RF {reference} must be an identifier")
+            if value and kind != "pulse":
+                raise ValueError(f"composite RF {reference} is available only for pulses")
         if kind == "delay" and self.power_calibration_enabled:
             raise ValueError("composite RF delay cannot use power calibration")
         if (
@@ -606,7 +725,8 @@ class QickRfPulseSpec:
 
     ``delay_us`` is relative to the start of ``segment_name``.  Pulse duration
     is converted to the selected RF generator's fabric clock when the generated
-    module receives ``soccfg``.
+    module receives ``soccfg``. ``fine_duration`` opts this entire RF port into
+    DAC-sample duration resolution; the runtime derives that grid from ``soccfg``.
     """
 
     gen_ch: int
@@ -661,8 +781,32 @@ class QickRfPulseSpec:
     predefined_tau_sweep_start_us: float = 1.0
     predefined_tau_sweep_stop_us: float = 10.0
     predefined_tau_sweep_count: int = 10
+    delay_parameters: Tuple[QickRfDurationParameterSpec, ...] = ()
+    t2_initial_pi2: bool = False
+    t2_final_pi2: bool = False
+    t2_frequency_parameter: str = "f0"
+    t2_duration_parameter: str = "d0"
+    t2_gain: int = 20000
+    t2_initial_phase_degrees: float = 0.0
+    t2_final_phase_degrees: float = 0.0
+    global_frequency_parameter: str = ""
+    global_gain: Optional[int] = None
+    amplitude_parameters: Tuple[QickRfAmplitudeParameterSpec, ...] = ()
+    phase_parameters: Tuple[QickRfPhaseParameterSpec, ...] = ()
+    global_amplitude_mode: str = "legacy"
+    global_amplitude_parameter: str = ""
+    global_calibration_database_path: str = ""
+    global_calibration_run_id: int = 0
+    t2_amplitude_parameter: str = ""
+    t2_initial_phase_parameter: str = ""
+    t2_final_phase_parameter: str = ""
+    predefined_amplitude_parameter: str = ""
+    predefined_phase_parameter: str = ""
+    fine_duration: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.fine_duration, bool):
+            raise TypeError("RF fine_duration must be bool")
         pulse_mode = str(self.pulse_mode).strip().lower()
         if pulse_mode not in {"single", "composite"}:
             raise ValueError("RF pulse_mode must be 'single' or 'composite'")
@@ -679,9 +823,27 @@ class QickRfPulseSpec:
         )
         duration_parameters = tuple(
             item
-            if isinstance(item, QickRfDurationParameterSpec)
-            else QickRfDurationParameterSpec(**dict(item))
+            if isinstance(item, QickRfDurationParameterSpec) and not isinstance(item, QickRfDelayParameterSpec)
+            else QickRfDurationParameterSpec(**(
+                asdict(item) if isinstance(item, QickRfDelayParameterSpec) else dict(item)
+            ))
             for item in self.duration_parameters
+        )
+        delay_parameters = tuple(
+            item
+            if isinstance(item, QickRfDurationParameterSpec)
+            else QickRfDelayParameterSpec(**dict(item))
+            for item in self.delay_parameters
+        )
+        amplitude_parameters = tuple(
+            item if isinstance(item, QickRfAmplitudeParameterSpec)
+            else QickRfAmplitudeParameterSpec(**dict(item))
+            for item in self.amplitude_parameters
+        )
+        phase_parameters = tuple(
+            item if isinstance(item, QickRfPhaseParameterSpec)
+            else QickRfPhaseParameterSpec(**dict(item))
+            for item in self.phase_parameters
         )
         items = tuple(
             item
@@ -692,9 +854,12 @@ class QickRfPulseSpec:
         predefined_template = str(self.predefined_template).strip().lower()
         if predefined_template not in RF_PREDEFINED_COMPOSITE_TEMPLATES:
             raise ValueError(
-                "RF predefined_template must be custom, cpmg, or udd"
+                "RF predefined_template must be custom, cpmg, udd, or hahn_echo"
             )
         object.__setattr__(self, "predefined_template", predefined_template)
+        if predefined_template == "hahn_echo":
+            object.__setattr__(self, "predefined_n", 1)
+            object.__setattr__(self, "predefined_n_sweep_enabled", False)
         if pulse_mode == "composite" and any(
             item.kind == "pulse" and not item.duration_parameter
             for item in items
@@ -727,6 +892,57 @@ class QickRfPulseSpec:
             items = tuple(migrated_items)
         object.__setattr__(self, "frequency_parameters", parameters)
         object.__setattr__(self, "duration_parameters", duration_parameters)
+        object.__setattr__(self, "delay_parameters", delay_parameters)
+        object.__setattr__(self, "amplitude_parameters", amplitude_parameters)
+        object.__setattr__(self, "phase_parameters", phase_parameters)
+        amplitude_mode = str(self.global_amplitude_mode).strip().lower()
+        if amplitude_mode not in {"legacy", "manual", "calibration"}:
+            raise ValueError("global RF amplitude mode must be legacy, manual, or calibration")
+        object.__setattr__(self, "global_amplitude_mode", amplitude_mode)
+        for field_name in (
+            "global_amplitude_parameter", "t2_amplitude_parameter",
+            "t2_initial_phase_parameter", "t2_final_phase_parameter",
+            "predefined_amplitude_parameter", "predefined_phase_parameter",
+        ):
+            reference = str(getattr(self, field_name)).strip()
+            if reference and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", reference) is None:
+                raise ValueError(f"{field_name} must be an identifier")
+            object.__setattr__(self, field_name, reference)
+        _bounded_int(self.global_calibration_run_id, "global RF calibration run ID", 0, (1 << 31) - 1)
+        for collection, label in ((amplitude_parameters, "amplitude"), (phase_parameters, "phase")):
+            names = tuple(parameter.name for parameter in collection)
+            if len(set(names)) != len(names):
+                raise ValueError(f"composite RF {label} parameter names must be unique")
+        if amplitude_mode == "manual":
+            for parameter in amplitude_parameters:
+                _manual_rf_gain(parameter.value, f"RF amplitude parameter {parameter.name}")
+                if parameter.sweep_enabled:
+                    _manual_rf_gain(parameter.sweep_start, f"RF amplitude parameter {parameter.name} start")
+                    _manual_rf_gain(parameter.sweep_stop, f"RF amplitude parameter {parameter.name} stop")
+        global_frequency = str(self.global_frequency_parameter).strip()
+        object.__setattr__(self, "global_frequency_parameter", global_frequency)
+        if global_frequency and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", global_frequency) is None:
+            raise ValueError("global RF frequency parameter must be an identifier")
+        if pulse_mode == "composite" and global_frequency and global_frequency not in {item.name for item in parameters}:
+            raise ValueError("global RF frequency references an unknown frequency parameter")
+        if self.global_gain is not None:
+            _bounded_int(self.global_gain, "global RF gain", -32768, 32767)
+        for enabled, label in (
+            (self.t2_initial_pi2, "T2 initial pi/2"),
+            (self.t2_final_pi2, "T2 final pi/2"),
+        ):
+            if not isinstance(enabled, bool):
+                raise TypeError(f"{label} enabled must be bool")
+        _bounded_int(self.t2_gain, "T2 pi/2 gain", -32768, 32767)
+        _finite_real(self.t2_initial_phase_degrees, "T2 initial pi/2 phase")
+        _finite_real(self.t2_final_phase_degrees, "T2 final pi/2 phase")
+        if self.t2_initial_pi2 or self.t2_final_pi2:
+            if pulse_mode != "composite":
+                raise ValueError("T2 pi/2 pulses require composite pulse mode")
+            if not global_frequency and self.t2_frequency_parameter not in {item.name for item in parameters}:
+                raise ValueError("T2 pi/2 references an unknown frequency parameter")
+            if self.t2_duration_parameter not in {item.name for item in duration_parameters}:
+                raise ValueError("T2 pi/2 references an unknown duration parameter")
         _positive_int(self.predefined_n, "predefined RF pulse count N")
         _positive_real(self.predefined_tau_us, "predefined RF tau_us")
         _bounded_int(self.predefined_gain, "predefined RF gain", -32768, 32767)
@@ -762,7 +978,7 @@ class QickRfPulseSpec:
                 )
             frequency_names = {item.name for item in parameters}
             duration_names = {item.name for item in duration_parameters}
-            if self.predefined_frequency_parameter not in frequency_names:
+            if not global_frequency and self.predefined_frequency_parameter not in frequency_names:
                 raise ValueError(
                     "predefined RF template references an unknown frequency "
                     "parameter"
@@ -776,10 +992,12 @@ class QickRfPulseSpec:
                 predefined_template,
                 n_pulses=int(self.predefined_n),
                 tau_us=float(self.predefined_tau_us),
-                frequency_parameter=str(self.predefined_frequency_parameter),
+                frequency_parameter=str(self.predefined_frequency_parameter or global_frequency),
                 duration_parameter=str(self.predefined_duration_parameter),
                 gain=int(self.predefined_gain),
                 phase_degrees=float(self.predefined_phase_degrees),
+                amplitude_parameter=self.predefined_amplitude_parameter,
+                phase_parameter=self.predefined_phase_parameter,
             )
         object.__setattr__(self, "composite_items", items)
         _bounded_int(self.gen_ch, "RF generator channel", 0, 1_000_000)
@@ -868,6 +1086,7 @@ class QickRfPulseSpec:
                     "RF output-power calibration database path is required"
                 )
         if pulse_mode == "composite":
+            effective_items = self.effective_composite_items
             if not parameters:
                 raise ValueError(
                     "composite RF mode requires at least one frequency parameter"
@@ -875,14 +1094,14 @@ class QickRfPulseSpec:
             parameter_names = tuple(item.name for item in parameters)
             if len(set(parameter_names)) != len(parameter_names):
                 raise ValueError("composite RF frequency parameter names must be unique")
-            if not items or not any(item.kind == "pulse" for item in items):
+            if not effective_items or not any(item.kind == "pulse" for item in effective_items):
                 raise ValueError("composite RF mode requires at least one pulse item")
             item_names = tuple(item.name for item in items)
             if len(set(item_names)) != len(item_names):
                 raise ValueError("composite RF item names must be unique")
             unknown = sorted({
                 item.frequency_parameter
-                for item in items
+                for item in effective_items
                 if item.kind == "pulse"
                 and item.frequency_parameter not in parameter_names
             })
@@ -898,14 +1117,29 @@ class QickRfPulseSpec:
                 raise ValueError("composite RF duration parameter names must be unique")
             unknown_durations = sorted({
                 item.duration_parameter
-                for item in items
+                for item in effective_items
                 if item.kind == "pulse"
+                and item.duration_parameter
                 and item.duration_parameter not in duration_parameter_names
             })
             if unknown_durations:
                 raise ValueError(
                     "composite RF pulse references unknown duration parameter(s): "
                     + ", ".join(unknown_durations)
+                )
+            delay_names = tuple(item.name for item in delay_parameters)
+            if len(set(delay_names)) != len(delay_names):
+                raise ValueError("composite RF delay parameter names must be unique")
+            unknown_delays = sorted({
+                item.delay_parameter
+                for item in items
+                if item.kind == "delay" and item.delay_parameter
+                and item.delay_parameter not in delay_names
+            })
+            if unknown_delays:
+                raise ValueError(
+                    "composite RF delay references unknown delay parameter(s): "
+                    + ", ".join(unknown_delays)
                 )
             if self.duration_sweep_enabled:
                 raise ValueError(
@@ -922,7 +1156,7 @@ class QickRfPulseSpec:
                 )
             if (
                 self.output_board_type != "RF_Out"
-                and any(item.power_calibration_enabled for item in items)
+                and any(item.power_calibration_enabled for item in effective_items)
             ):
                 raise ValueError(
                     "composite RF output-power calibration requires an RF_Out board"
@@ -945,6 +1179,94 @@ class QickRfPulseSpec:
     def output_name(self) -> str:
         """Stable sweep-axis name used by QCoDeS and the 2-D map."""
         return f"rf_gen_{int(self.gen_ch)}"
+
+    @property
+    def effective_composite_items(self) -> Tuple[QickRfCompositeItemSpec, ...]:
+        """Body and T2 endpoints with global overrides; stored rows stay intact."""
+        items = tuple(self.composite_items)
+        if self.pulse_mode != "composite":
+            return items
+        used_names = {item.name for item in items}
+
+        def endpoint(name: str, phase: float, phase_parameter: str) -> QickRfCompositeItemSpec:
+            unique_name = name
+            suffix = 2
+            while unique_name in used_names:
+                unique_name = f"{name}_{suffix}"
+                suffix += 1
+            used_names.add(unique_name)
+            pi_duration = next(
+                parameter.initial_duration_us for parameter in self.duration_parameters
+                if parameter.name == self.t2_duration_parameter
+            )
+            return QickRfCompositeItemSpec(
+                kind="pulse", name=unique_name, duration_us=pi_duration / 2.0,
+                frequency_parameter=self.global_frequency_parameter or self.t2_frequency_parameter,
+                gain=self.t2_gain, phase_degrees=phase,
+                amplitude_parameter=self.t2_amplitude_parameter,
+                phase_parameter=phase_parameter,
+            )
+
+        initial = (endpoint("T2_initial_pi2", self.t2_initial_phase_degrees, self.t2_initial_phase_parameter),) if self.t2_initial_pi2 else ()
+        final = (endpoint("T2_final_pi2", self.t2_final_phase_degrees, self.t2_final_phase_parameter),) if self.t2_final_pi2 else ()
+        effective = initial + items + final
+        amplitudes = {parameter.name: parameter for parameter in self.amplitude_parameters}
+        phases = {parameter.name: parameter for parameter in self.phase_parameters}
+        resolved_items = []
+        for item in effective:
+            if item.kind != "pulse":
+                resolved_items.append(item)
+                continue
+            amplitude_name = self.global_amplitude_parameter or item.amplitude_parameter
+            if amplitude_name and self.global_amplitude_mode == "legacy":
+                raise ValueError("named RF amplitude parameters require manual or calibration amplitude mode")
+            if amplitude_name and amplitude_name not in amplitudes:
+                raise ValueError(f"composite RF pulse references unknown amplitude parameter: {amplitude_name}")
+            if item.phase_parameter and item.phase_parameter not in phases:
+                raise ValueError(f"composite RF pulse references unknown phase parameter: {item.phase_parameter}")
+            changes = dict(
+                frequency_parameter=self.global_frequency_parameter or item.frequency_parameter,
+                amplitude_parameter=amplitude_name,
+                phase_degrees=(phases[item.phase_parameter].initial_phase_degrees
+                               if item.phase_parameter else item.phase_degrees),
+            )
+            amplitude_value = amplitudes[amplitude_name].initial_value if amplitude_name else None
+            if self.global_amplitude_mode == "calibration":
+                if not str(self.global_calibration_database_path).strip():
+                    raise ValueError("global RF calibration database path is required")
+                changes.update(
+                    power_calibration_enabled=True,
+                    power_calibration_database_path=self.global_calibration_database_path,
+                    power_calibration_run_id=self.global_calibration_run_id,
+                    target_output_power_dbm=(item.target_output_power_dbm
+                                             if amplitude_value is None else amplitude_value),
+                )
+            elif self.global_amplitude_mode == "manual":
+                changes.update(
+                    gain=(_manual_rf_gain(amplitude_value, f"RF amplitude parameter {amplitude_name}")
+                          if amplitude_value is not None else
+                          item.gain if self.global_gain is None else self.global_gain),
+                    power_calibration_enabled=False,
+                )
+            elif self.global_gain is not None:
+                changes.update(gain=self.global_gain, power_calibration_enabled=False)
+            resolved_items.append(replace(item, **changes))
+        return tuple(resolved_items)
+
+    def _composite_delay_us(self, item: QickRfCompositeItemSpec) -> float:
+        if item.delay_parameter:
+            return next(
+                parameter.initial_duration_us for parameter in self.delay_parameters
+                if parameter.name == item.delay_parameter
+            )
+        return float(item.duration_us)
+
+    @property
+    def t2_host_duration_parameter(self) -> str:
+        """The pi duration is host-swept so both pi/2 widths follow exactly."""
+        if self.pulse_mode == "composite" and (self.t2_initial_pi2 or self.t2_final_pi2):
+            return self.t2_duration_parameter
+        return ""
 
     @property
     def pulse_events(self) -> Tuple[QickRfPulseEventSpec, ...]:
@@ -983,13 +1305,16 @@ class QickRfPulseSpec:
         pulse_index = 0
         preceding_duration_parameters = []
         events = []
-        for item in self.composite_items:
+        for item in self.effective_composite_items:
             if item.kind == "delay":
-                offset_us += float(item.duration_us)
+                offset_us += self._composite_delay_us(item)
                 continue
             parameter = parameters[item.frequency_parameter]
-            duration_parameter = durations[item.duration_parameter]
-            duration_us = duration_parameter.initial_duration_us
+            duration_parameter = durations.get(item.duration_parameter)
+            duration_us = (
+                duration_parameter.initial_duration_us
+                if duration_parameter is not None else float(item.duration_us)
+            )
             events.append(
                 QickRfPulseEventSpec(
                     event_id=(
@@ -1014,7 +1339,7 @@ class QickRfPulseSpec:
                     target_output_power_dbm=float(
                         item.target_output_power_dbm
                     ),
-                    duration_parameter=duration_parameter.name,
+                    duration_parameter=item.duration_parameter,
                     preceding_duration_parameters=tuple(
                         preceding_duration_parameters
                     ),
@@ -1022,7 +1347,8 @@ class QickRfPulseSpec:
             )
             pulse_index += 1
             offset_us += float(duration_us)
-            preceding_duration_parameters.append(duration_parameter.name)
+            if item.duration_parameter:
+                preceding_duration_parameters.append(item.duration_parameter)
         return tuple(events)
 
     @property
@@ -1041,14 +1367,15 @@ class QickRfPulseSpec:
         if self.delay_us > 0.0:
             components.append(float(self.delay_us))
         components.extend(
-            float(item.duration_us)
+            self._composite_delay_us(item)
             if item.kind == "delay"
             else float(
                 durations[item.duration_parameter].initial_duration_us
+                if item.duration_parameter else item.duration_us
             )
-            for item in self.composite_items
+            for item in self.effective_composite_items
         )
-        return tuple(components)
+        return tuple(component for component in components if component > 0.0)
 
     @property
     def segment_extension_duration_us(self) -> float:
@@ -1065,12 +1392,13 @@ class QickRfPulseSpec:
         counts = {
             parameter.name: sum(
                 1
-                for item in self.composite_items
+                for item in self.effective_composite_items
                 if item.kind == "pulse"
                 and item.duration_parameter == parameter.name
             )
             for parameter in self.duration_parameters
             if parameter.sweep_enabled
+            and parameter.name != self.t2_host_duration_parameter
         }
         return tuple(
             (parameter.name, counts[parameter.name])
@@ -1104,18 +1432,19 @@ class QickRfPulseSpec:
         if self.pulse_mode == "composite":
             referenced_durations = {
                 item.duration_parameter
-                for item in self.composite_items
+                for item in self.effective_composite_items
                 if item.kind == "pulse"
             }
             referenced_frequencies = {
                 item.frequency_parameter
-                for item in self.composite_items
+                for item in self.effective_composite_items
                 if item.kind == "pulse"
             }
             for parameter in self.duration_parameters:
                 if (
                     not parameter.sweep_enabled
                     or parameter.name not in referenced_durations
+                    or parameter.name == self.t2_host_duration_parameter
                 ):
                     continue
                 axes.append(
@@ -1198,14 +1527,11 @@ class QickRfPulseSpec:
 
     @property
     def software_sweep_axes(self) -> Tuple[QickRfSoftwareSweepAxisSpec, ...]:
-        """Return predefined-template axes executed outside the tProcessor."""
-        if (
-            self.pulse_mode != "composite"
-            or self.predefined_template == "custom"
-        ):
+        """Return template and named-parameter axes run outside the tProcessor."""
+        if self.pulse_mode != "composite":
             return ()
         axes = []
-        if self.predefined_n_sweep_enabled:
+        if self.predefined_template != "custom" and self.predefined_n_sweep_enabled:
             axes.append(QickRfSoftwareSweepAxisSpec(
                 segment_name=self.segment_name,
                 output_name=f"{self.output_name}_{self.predefined_template}_N",
@@ -1217,7 +1543,7 @@ class QickRfPulseSpec:
                 coordinate_unit="count",
                 parameter_name="N",
             ))
-        if self.predefined_tau_sweep_enabled:
+        if self.predefined_template != "custom" and self.predefined_tau_sweep_enabled:
             axes.append(QickRfSoftwareSweepAxisSpec(
                 segment_name=self.segment_name,
                 output_name=(
@@ -1231,7 +1557,121 @@ class QickRfPulseSpec:
                 coordinate_unit="us",
                 parameter_name="tau",
             ))
+        referenced_delays = {
+            item.delay_parameter for item in self.composite_items
+            if item.kind == "delay" and item.delay_parameter
+        }
+        for parameter in self.delay_parameters:
+            if parameter.sweep_enabled and parameter.name in referenced_delays:
+                axes.append(QickRfSoftwareSweepAxisSpec(
+                    segment_name=self.segment_name,
+                    output_name=f"{self.output_name}_{parameter.name}_delay",
+                    gen_ch=int(self.gen_ch),
+                    start=float(parameter.sweep_start_us),
+                    stop=float(parameter.sweep_stop_us),
+                    count=int(parameter.sweep_count),
+                    axis_kind="rf_delay",
+                    coordinate_unit="us",
+                    parameter_name=parameter.name,
+                ))
+        for parameter in self.duration_parameters:
+            if parameter.sweep_enabled and parameter.name == self.t2_host_duration_parameter:
+                axes.append(QickRfSoftwareSweepAxisSpec(
+                    segment_name=self.segment_name,
+                    output_name=f"{self.output_name}_{parameter.name}_duration",
+                    gen_ch=int(self.gen_ch),
+                    start=float(parameter.sweep_start_us),
+                    stop=float(parameter.sweep_stop_us),
+                    count=int(parameter.sweep_count),
+                    axis_kind="rf_t2_duration",
+                    coordinate_unit="us",
+                    parameter_name=parameter.name,
+                ))
+        effective_pulses = tuple(item for item in self.effective_composite_items if item.kind == "pulse")
+        referenced_amplitudes = {item.amplitude_parameter for item in effective_pulses}
+        for parameter in self.amplitude_parameters:
+            if parameter.sweep_enabled and parameter.name in referenced_amplitudes:
+                axes.append(QickRfSoftwareSweepAxisSpec(
+                    segment_name=self.segment_name,
+                    output_name=f"{self.output_name}_{parameter.name}_amplitude",
+                    gen_ch=int(self.gen_ch),
+                    start=float(parameter.sweep_start), stop=float(parameter.sweep_stop),
+                    count=int(parameter.sweep_count), axis_kind="rf_amplitude",
+                    coordinate_unit="gain" if self.global_amplitude_mode == "manual" else "dBm",
+                    parameter_name=parameter.name,
+                ))
+        referenced_phases = {item.phase_parameter for item in effective_pulses}
+        for parameter in self.phase_parameters:
+            if parameter.sweep_enabled and parameter.name in referenced_phases:
+                axes.append(QickRfSoftwareSweepAxisSpec(
+                    segment_name=self.segment_name,
+                    output_name=f"{self.output_name}_{parameter.name}_phase",
+                    gen_ch=int(self.gen_ch),
+                    start=float(parameter.sweep_start_degrees), stop=float(parameter.sweep_stop_degrees),
+                    count=int(parameter.sweep_count), axis_kind="rf_phase",
+                    coordinate_unit="deg", parameter_name=parameter.name,
+                ))
         return tuple(axes)
+
+    def with_duration_parameters(
+        self, values: Mapping[str, Real],
+    ) -> "QickRfPulseSpec":
+        """Resolve a host-swept pi duration and its derived pi/2 endpoints."""
+        unknown = set(values) - {parameter.name for parameter in self.duration_parameters}
+        if unknown:
+            raise ValueError("unknown RF duration parameter(s): " + ", ".join(sorted(unknown)))
+        resolved = {
+            name: _positive_real(value, f"RF duration parameter {name}")
+            for name, value in values.items()
+        }
+        return replace(self, duration_parameters=tuple(
+            replace(parameter, duration_us=resolved[parameter.name], sweep_enabled=False)
+            if parameter.name in resolved else parameter
+            for parameter in self.duration_parameters
+        ))
+
+    def with_delay_parameters(
+        self, values: Mapping[str, Real],
+    ) -> "QickRfPulseSpec":
+        """Resolve named host-delay coordinates without changing hardware axes."""
+        unknown = set(values) - {parameter.name for parameter in self.delay_parameters}
+        if unknown:
+            raise ValueError("unknown RF delay parameter(s): " + ", ".join(sorted(unknown)))
+        resolved = {
+            name: _nonnegative_real(value, f"RF delay parameter {name}")
+            for name, value in values.items()
+        }
+        return replace(self, delay_parameters=tuple(
+            QickRfDelayParameterSpec(**dict(asdict(parameter), duration_us=resolved[parameter.name], sweep_enabled=False))
+            if parameter.name in resolved else parameter
+            for parameter in self.delay_parameters
+        ))
+
+    def with_amplitude_parameters(
+        self, values: Mapping[str, Real],
+    ) -> "QickRfPulseSpec":
+        """Resolve host amplitude coordinates in the selected common mode."""
+        unknown = set(values) - {parameter.name for parameter in self.amplitude_parameters}
+        if unknown:
+            raise ValueError("unknown RF amplitude parameter(s): " + ", ".join(sorted(unknown)))
+        return replace(self, amplitude_parameters=tuple(
+            replace(parameter, value=_finite_real(values[parameter.name], f"RF amplitude parameter {parameter.name}"), sweep_enabled=False)
+            if parameter.name in values else parameter
+            for parameter in self.amplitude_parameters
+        ))
+
+    def with_phase_parameters(
+        self, values: Mapping[str, Real],
+    ) -> "QickRfPulseSpec":
+        """Resolve host phase coordinates without changing frequency sweeps."""
+        unknown = set(values) - {parameter.name for parameter in self.phase_parameters}
+        if unknown:
+            raise ValueError("unknown RF phase parameter(s): " + ", ".join(sorted(unknown)))
+        return replace(self, phase_parameters=tuple(
+            replace(parameter, phase_degrees=_finite_real(values[parameter.name], f"RF phase parameter {parameter.name}"), sweep_enabled=False)
+            if parameter.name in values else parameter
+            for parameter in self.phase_parameters
+        ))
 
     def with_predefined_parameters(
         self,
@@ -2238,144 +2678,8 @@ def generate_qick_program_code(
         }
         for item in sweep_specs
     )
-    rf_configs = tuple(
-        {
-            "gen_ch": int(spec.gen_ch),
-            "segment_name": str(spec.segment_name),
-            "delay_us": float(spec.delay_us),
-            "duration_us": float(spec.duration_us),
-            "frequency_mhz": float(spec.frequency_mhz),
-            "gain": int(spec.gain),
-            "att1_db": float(spec.att1_db),
-            "att2_db": float(spec.att2_db),
-            "phase_degrees": float(spec.phase_degrees),
-            "nqz": int(spec.nqz),
-            "require_within_segment": bool(spec.require_within_segment),
-            "filter_type": str(spec.filter_type),
-            "filter_cutoff": float(spec.filter_cutoff),
-            "filter_bandwidth": float(spec.filter_bandwidth),
-            "output_board_type": str(spec.output_board_type),
-            "duration_sweep_enabled": bool(spec.duration_sweep_enabled),
-            "duration_sweep_start_us": float(
-                spec.duration_sweep_start_us
-            ),
-            "duration_sweep_stop_us": float(
-                spec.duration_sweep_stop_us
-            ),
-            "duration_sweep_count": int(spec.duration_sweep_count),
-            "segment_length_mode": str(spec.segment_length_mode),
-            "frequency_sweep_enabled": bool(
-                spec.frequency_sweep_enabled
-            ),
-            "frequency_sweep_start_mhz": float(
-                spec.frequency_sweep_start_mhz
-            ),
-            "frequency_sweep_stop_mhz": float(
-                spec.frequency_sweep_stop_mhz
-            ),
-            "frequency_sweep_count": int(spec.frequency_sweep_count),
-            "power_sweep_enabled": bool(spec.power_sweep_enabled),
-            "power_sweep_start_dbm": float(spec.power_sweep_start_dbm),
-            "power_sweep_stop_dbm": float(spec.power_sweep_stop_dbm),
-            "power_sweep_count": int(spec.power_sweep_count),
-            "power_calibration_enabled": bool(
-                spec.power_calibration_enabled
-            ),
-            "power_calibration_database_path": str(
-                spec.power_calibration_database_path
-            ),
-            "power_calibration_run_id": int(
-                spec.power_calibration_run_id
-            ),
-            "target_output_power_dbm": float(
-                spec.target_output_power_dbm
-            ),
-            "pulse_mode": str(spec.pulse_mode),
-            "pulse_name": str(spec.pulse_name),
-            "frequency_parameters": tuple(
-                {
-                    "name": parameter.name,
-                    "frequency_mhz": float(parameter.frequency_mhz),
-                    "sweep_enabled": bool(parameter.sweep_enabled),
-                    "sweep_start_mhz": float(parameter.sweep_start_mhz),
-                    "sweep_stop_mhz": float(parameter.sweep_stop_mhz),
-                    "sweep_count": int(parameter.sweep_count),
-                }
-                for parameter in spec.frequency_parameters
-            ),
-            "duration_parameters": tuple(
-                {
-                    "name": parameter.name,
-                    "duration_us": float(parameter.duration_us),
-                    "sweep_enabled": bool(parameter.sweep_enabled),
-                    "sweep_start_us": float(parameter.sweep_start_us),
-                    "sweep_stop_us": float(parameter.sweep_stop_us),
-                    "sweep_count": int(parameter.sweep_count),
-                }
-                for parameter in spec.duration_parameters
-            ),
-            "composite_items": tuple(
-                {
-                    "kind": item.kind,
-                    "name": item.name,
-                    "duration_us": float(item.duration_us),
-                    "frequency_parameter": item.frequency_parameter,
-                    "gain": int(item.gain),
-                    "phase_degrees": float(item.phase_degrees),
-                    "power_calibration_enabled": bool(
-                        item.power_calibration_enabled
-                    ),
-                    "power_calibration_database_path": str(
-                        item.power_calibration_database_path
-                    ),
-                    "power_calibration_run_id": int(
-                        item.power_calibration_run_id
-                    ),
-                    "target_output_power_dbm": float(
-                        item.target_output_power_dbm
-                    ),
-                    "duration_parameter": item.duration_parameter,
-                }
-                for item in spec.composite_items
-            ),
-        }
-        for spec in normalized_rf_specs
-    )
-    ddr_config = None if ddr_readout_spec is None else {
-        "ro_ch": int(ddr_readout_spec.ro_ch),
-        "segment_name": str(ddr_readout_spec.segment_name),
-        "delay_us": float(ddr_readout_spec.delay_us),
-        "samples_per_trigger": int(ddr_readout_spec.samples_per_trigger),
-        "dc_compensation_timing": ddr_readout_spec.dc_compensation_timing,
-        "fpga_trigger_delay_samples": ddr_readout_spec.fpga_trigger_delay_samples,
-        "fpga_trigger_delay_us": ddr_readout_spec.fpga_trigger_delay_us,
-        "readout_frequency_mhz": float(ddr_readout_spec.readout_frequency_mhz),
-        "margin_input_samples": int(ddr_readout_spec.margin_input_samples),
-        "address": int(ddr_readout_spec.address),
-        "force_overwrite": bool(ddr_readout_spec.force_overwrite),
-        "post_run_read_delay_seconds": float(
-            ddr_readout_spec.post_run_read_delay_seconds
-        ),
-        "attenuation_db": float(ddr_readout_spec.attenuation_db),
-        "filter_type": str(ddr_readout_spec.filter_type),
-        "filter_cutoff": float(ddr_readout_spec.filter_cutoff),
-        "filter_bandwidth": float(ddr_readout_spec.filter_bandwidth),
-        "input_board_type": str(ddr_readout_spec.input_board_type),
-        "dc_gain_db": float(ddr_readout_spec.dc_gain_db),
-        "dc_measure_mode": bool(ddr_readout_spec.dc_measure_mode),
-        "dc_measure_gain_v_per_a": float(
-            ddr_readout_spec.dc_measure_gain_v_per_a
-        ),
-        "dc_voltage_calibration_enabled": bool(
-            ddr_readout_spec.dc_voltage_calibration_enabled
-        ),
-        "dc_voltage_calibration_database_path": str(
-            ddr_readout_spec.dc_voltage_calibration_database_path
-        ),
-        "dc_voltage_calibration_run_id": int(
-            ddr_readout_spec.dc_voltage_calibration_run_id
-        ),
-    }
+    rf_configs = tuple(asdict(spec) for spec in normalized_rf_specs)
+    ddr_config = None if ddr_readout_spec is None else asdict(ddr_readout_spec)
     lines = [
         '"""Generated QICK AWG-tuning, RF pulse, and HWH-rate DDR program."""',
         "",
@@ -2385,8 +2689,8 @@ def generate_qick_program_code(
         "    RfPulseConfig,",
         "    cycles_from_us,",
         ")",
-        "from dc_waveform_core import QickRfPulseSpec",
-        "from qick_qcodes_experiment import build_runtime_rf_pulses",
+        "from dc_waveform_core import QickDdrReadoutSpec, QickRfPulseSpec",
+        "from qick_qcodes_experiment import build_runtime_rf_pulses, execute_qick_sequence",
         "",
         f"OUTPUT_NAMES = {output_names!r}",
         f"AWG_CHANNELS = {channel_map!r}",
@@ -2575,6 +2879,22 @@ def generate_qick_program_code(
             "    )",
             "",
             "",
+            "def execute_sequence(soc, soccfg, *, progress=True, **execution_kwargs):",
+            "    \"\"\"Acquire all host and hardware sweep coordinates with generated settings.\"\"\"",
+            "    if FIR_DDR_CONFIG is None:",
+            "        raise ValueError('Host RF sweeps require a configured readout for acquisition')",
+            "    return execute_qick_sequence(",
+            "        soc, soccfg, build_sequence(),",
+            "        awg_channels=tuple(AWG_CHANNELS[name] for name in OUTPUT_NAMES),",
+            "        repetitions_per_sweep=REPETITIONS_PER_SWEEP,",
+            "        tproc_mhz=TPROC_MHZ,",
+            "        rf_specs=tuple(QickRfPulseSpec(**cfg) for cfg in RF_CONFIGS),",
+            "        readout_spec=QickDdrReadoutSpec(**FIR_DDR_CONFIG),",
+            "        sequence_fabric_mhz=FABRIC_MHZ,",
+            "        progress=progress, **execution_kwargs,",
+            "    )",
+            "",
+            "",
             "def build_rf_pulse(soccfg):",
             "    pulses = build_rf_pulses(soccfg)",
             "    return pulses[0] if len(pulses) == 1 else None",
@@ -2676,6 +2996,11 @@ def generate_qick_program_code(
             "",
             "",
             "def run_experiment(soc, soccfg, *, progress=True, configure_rf=True, **run_kwargs):",
+            "    specs = tuple(QickRfPulseSpec(**cfg) for cfg in RF_CONFIGS)",
+            "    if any(spec.software_sweep_axes for spec in specs):",
+            "        if not configure_rf:",
+            "            raise ValueError('Host RF sweeps configure the RF chain; use configure_rf=True')",
+            "        return execute_sequence(soc, soccfg, progress=progress, **run_kwargs)",
             "    actual_outputs = configure_rf_chain(soc) if configure_rf else None",
             "    actual_input = configure_readout_chain(soc) if configure_rf else None",
             "    program = build_program(soccfg)",
@@ -2725,9 +3050,12 @@ __all__ = [
     "QickDdrReadoutSpec",
     "QickHoldDurationSweepSpec",
     "QickRampRateSweepSpec",
+    "QickRfAmplitudeParameterSpec",
     "QickRfCompositeItemSpec",
+    "QickRfDelayParameterSpec",
     "QickRfDurationParameterSpec",
     "QickRfFrequencyParameterSpec",
+    "QickRfPhaseParameterSpec",
     "QickRfPulseEventSpec",
     "QickRfPulseSpec",
     "QickRfSoftwareSweepAxisSpec",

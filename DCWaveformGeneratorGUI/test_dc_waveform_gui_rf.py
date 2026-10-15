@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import asdict
 import json
 import os
@@ -682,6 +683,15 @@ def test_composite_editor_prevents_deleting_its_last_pulse():
     window.close()
 
 
+def _named_item_value_editor(panel, row, kind):
+    column = {"amplitude": 5, "phase": 7, "delay": 8}[kind]
+    reference = panel.composite_item_table.cellWidget(row, column).currentData()
+    table = getattr(panel, f"{kind}_parameter_table")
+    index = next(index for index in range(table.rowCount())
+                 if table.cellWidget(index, 0).text() == reference)
+    return table.cellWidget(index, 1)
+
+
 def test_composite_editor_repeated_mutation_and_load_leave_no_stale_rows():
     app = _application()
     window = gui.MainWindow()
@@ -730,25 +740,26 @@ def test_composite_editor_repeated_mutation_and_load_leave_no_stale_rows():
     new_pulse_row = panel.composite_item_table.rowCount() - 1
     new_power = panel.composite_item_table.cellWidget(new_pulse_row, 6)
     assert new_power.power_calibration_enabled is False
-    assert panel.composite_item_table.cellWidget(new_pulse_row, 5).value() == 20000
-    assert panel.composite_item_table.cellWidget(new_pulse_row, 7).value() == 0.0
+    panel.amplitude_calibration_enabled.setCheckState(QtCore.Qt.Unchecked)
+    assert _named_item_value_editor(panel, new_pulse_row, "amplitude").value() == 20000
+    assert _named_item_value_editor(panel, new_pulse_row, "phase").value() == 0.0
 
     panel.composite_item_table.cellWidget(new_pulse_row, 1).setText("fresh")
     panel.composite_item_table.cellWidget(new_pulse_row, 3).setCurrentText("d1")
     panel.composite_item_table.cellWidget(new_pulse_row, 4).setCurrentText("f1")
-    panel.composite_item_table.cellWidget(new_pulse_row, 5).setValue(-2345)
-    panel.composite_item_table.cellWidget(new_pulse_row, 7).setValue(45.0)
+    _named_item_value_editor(panel, new_pulse_row, "amplitude").setValue(-2345)
+    _named_item_value_editor(panel, new_pulse_row, "phase").setValue(45.0)
     panel.frequency_parameter_table.cellWidget(1, 1).setValue(333.0)
     panel.duration_parameter_table.cellWidget(1, 1).setValue(0.75)
     panel._add_composite_item("delay")
     new_delay_row = panel.composite_item_table.rowCount() - 1
     panel.composite_item_table.cellWidget(new_delay_row, 1).setText("fresh_wait")
-    panel.composite_item_table.cellWidget(new_delay_row, 2).setValue(0.125)
+    _named_item_value_editor(panel, new_delay_row, "delay").setValue(0.125)
 
     panel.composite_item_table.cellWidget(new_pulse_row, 0).setCurrentIndex(1)
     panel.composite_item_table.cellWidget(new_pulse_row, 0).setCurrentIndex(0)
-    assert panel.composite_item_table.cellWidget(new_pulse_row, 5).value() == -2345
-    assert panel.composite_item_table.cellWidget(new_pulse_row, 7).value() == 45.0
+    assert _named_item_value_editor(panel, new_pulse_row, "amplitude").value() == -2345
+    assert _named_item_value_editor(panel, new_pulse_row, "phase").value() == 45.0
 
     header = panel.composite_row_header
     header.moveSection(header.visualIndex(new_delay_row), 0)
@@ -1066,7 +1077,7 @@ def test_composite_editor_stress_round_trip_across_row_counts():
         panel.composite_item_table.cellWidget(added_row, 1).setText(
             f"added_wait_{pulse_count}"
         )
-        panel.composite_item_table.cellWidget(added_row, 2).setValue(0.007)
+        _named_item_value_editor(panel, added_row, "delay").setValue(0.007)
         panel.composite_row_header.moveSection(
             panel.composite_row_header.visualIndex(added_row),
             0,
@@ -1323,7 +1334,11 @@ def test_composite_editor_mutation_matrix_keeps_timeline_and_sweeps_attached():
         axis.parameter_name in {"f2", "d2"}
         for axis in recreated.sweep_axes
     )
-    assert "P1" not in json.dumps(panel.settings_dict())
+    # Shared parameter rows may outlive a removed pulse; the pulse itself and
+    # its sweep bindings must not remain in the executable sequence.
+    assert "P1" not in {item["name"] for item in panel.settings_dict()["composite_items"]}
+    assert "P1" not in {event.name for event in recreated.pulse_events}
+    assert not any(axis.parameter_name == "phase_P1" for axis in recreated.software_sweep_axes)
 
     window.close()
 
@@ -1833,10 +1848,15 @@ def test_composite_rf_power_calibration_is_independent_per_pulse():
 
     calibrated_button = panel.composite_item_table.cellWidget(0, 6)
     manual_button = panel.composite_item_table.cellWidget(1, 6)
-    assert calibrated_button.text() == "-31.5 dBm | Run 73"
-    assert manual_button.text() == "Manual gain"
+    assert panel.composite_item_table.isColumnHidden(6)
     assert panel.composite_item_table.cellWidget(0, 5).isEnabled() is False
-    assert panel.composite_item_table.cellWidget(1, 5).isEnabled() is True
+    # Legacy mixed-mode settings retain their literal amplitudes until the
+    # user explicitly enables the common named-amplitude mode.
+    assert not panel.amplitude_mode_group.isCheckable()
+    assert panel.amplitude_calibration_enabled.checkState() == QtCore.Qt.PartiallyChecked
+    assert not panel.amplitude_legacy_notice.isHidden()
+    assert panel.composite_item_table.cellWidget(1, 5).isEnabled() is False
+    assert [event.gain for event in spec.pulse_events] == [1234, 8000]
 
     decoded = window._decode_settings(window._settings_to_dict())
     decoded_items = decoded["rf_outputs"][0]["composite_items"]
@@ -3635,7 +3655,32 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
     assert window._control_tabs.currentWidget() is window._awg_tuning_page
     assert window._awg_tuning_tabs.currentWidget() is window._rf_readout_panel
     assert len(window._rf_ports_panel._panels) == 1
-    assert window._rf_ports_panel.settings()[0] == gui.DEFAULT_RF_OUTPUT_SETTINGS
+    restored_rf = window._rf_ports_panel.settings()[0]
+    expected_rf = copy.deepcopy(gui.DEFAULT_RF_OUTPUT_SETTINGS)
+    # Literal amplitudes and phases become named references, with their values
+    # and disabled sweep states preserved. Other defaults stay exact.
+    expected_rf["phase_parameters"] = [
+        dict(name=name, phase_degrees=0.0, sweep_enabled=False,
+             sweep_start_degrees=0.0, sweep_stop_degrees=0.0, sweep_count=1)
+        for name in ("phase_initial", "phase_final", "phase_pi", "phase_pulse_0")
+    ]
+    expected_rf.update(t2_initial_phase_parameter="phase_initial",
+                       t2_final_phase_parameter="phase_final",
+                       predefined_phase_parameter="phase_pi")
+    expected_rf["amplitude_parameters"] = [
+        dict(name=name, value=20000.0, sweep_enabled=False,
+             sweep_start=20000.0, sweep_stop=20000.0, sweep_count=1)
+        for name in ("a_global", "a_pi", "a_pi2", "a_0")
+    ]
+    expected_rf.update(global_amplitude_mode="manual",
+                       predefined_amplitude_parameter="a_pi",
+                       t2_amplitude_parameter="a_pi2",
+                       amplitude_parameter_banks={
+                           "manual": copy.deepcopy(expected_rf["amplitude_parameters"])
+                       })
+    expected_rf["composite_items"][0].update(
+        amplitude_parameter="a_0", phase_parameter="phase_pulse_0")
+    assert restored_rf == expected_rf
     assert (
         window._rf_readout_panel.settings_dict()
         == gui.DEFAULT_RF_READOUT_SETTINGS
@@ -3685,7 +3730,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
         "filter_tau_us": 100.0,
     }
     assert upgraded["experiment"]["notes"] == ""
-    assert upgraded["rf_outputs"] == [gui.DEFAULT_RF_OUTPUT_SETTINGS]
+    assert upgraded["rf_outputs"] == [expected_rf]
     assert upgraded["rf_readout"] == gui.DEFAULT_RF_READOUT_SETTINGS
     assert upgraded["rf_readout"]["dc_measure_mode"] is False
     assert upgraded["rf_readout"]["dc_measure_gain_v_per_a"] == 1.0
