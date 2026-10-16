@@ -2482,7 +2482,7 @@ def _resolve_awg_channels(sequence: FineTuneSequence, awg_channels) -> Tuple[int
 
 
 def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
-    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3") and gen_cfg.get("gen_type") != "awg_tuning":
+    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") and gen_cfg.get("gen_type") != "awg_tuning":
         raise ValueError(f"generator channel {gen_ch} is not an AWG tuning generator")
     required = ("tproc_ch", "f_fabric", "n_pts", "frac")
     missing = [name for name in required if name not in gen_cfg]
@@ -2491,7 +2491,7 @@ def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
 
 
 def _awg_step_width(gen_cfg: Mapping) -> int:
-    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3") else 24
+    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") else 24
     width = int(gen_cfg.get("step_width", expected))
     if width != expected:
         raise ValueError("AWG step width does not match the firmware IP version")
@@ -2853,6 +2853,10 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             )
             else 0
         )
+        self._v6_timing = any(self.soccfg["gens"][ch].get("type") == "axis_awg_tuning_v4" for ch in self.awg_channels)
+        self._dispatch_spacing = int(self.soccfg["tprocs"][0].get("timed_output_spacing_cycles", 3))
+        if self._v6_timing and self._dispatch_spacing != 1:
+            raise ValueError("AWG v6 requires the version 2 timed dispatcher metadata")
         self._channel_slots = self._build_channel_slots()
         self.aux_timing = {}
         self._rf_runtime = {}
@@ -5051,7 +5055,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         if rf.gen_ch >= len(self.soccfg["gens"]):
             raise IndexError("RF generator channel is out of range")
         gen_cfg = self.soccfg["gens"][rf.gen_ch]
-        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3") or gen_cfg.get("gen_type") == "awg_tuning":
+        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") or gen_cfg.get("gen_type") == "awg_tuning":
             raise ValueError("rf_pulse requires a normal QICK RF signal generator")
         self._segment_index(rf.at_segment, require_set=True)
 
@@ -5426,8 +5430,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             occupied = occupied_by_port.setdefault(rf_port, set())
             latency = rf_latencies[rf_index]
             rf_start = int(requested_start) - latency
-            firmware = 'v5' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2 else 'v4'
-            if latency and any(abs(rf_start - t) < 3 for t in occupied):
+            firmware = 'v6' if self._v6_timing else ('v5' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2 else 'v4')
+            if latency and any(abs(rf_start - t) < self._dispatch_spacing for t in occupied):
                 raise ValueError(f'The {firmware} RF command conflicts with another command on its shared '
                                  'tProcessor port; adjust the RF delay or segment timing.')
             while rf_start in occupied:
@@ -5440,7 +5444,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             periodic = bool(self._rf_runtime[rf_index]["periodic"])
             rf_end = int(requested_end)
             if periodic:
-                if latency and any(abs(rf_end - t) < 3 for t in occupied):
+                if latency and any(abs(rf_end - t) < self._dispatch_spacing for t in occupied):
                     raise ValueError(f'The {firmware} RF stop conflicts with another command on its shared '
                                      'tProcessor port; adjust the RF duration.')
                 while rf_end in occupied:
@@ -5817,7 +5821,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
 
     def _validate_dynamic_event_order(self) -> None:
         """Ensure one tProcessor port never receives decreasing timestamps."""
-        if not self._event_timing_models:
+        if not self._event_timing_models and not self._v6_timing:
             return
         model_by_key = {
             model["key"]: model for model in self._event_timing_models
@@ -5871,25 +5875,27 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         v4_ports = {int(self.soccfg['gens'][rf.gen_ch]['tproc_ch'])
                     for rf in self.rf_pulse_configs
                     if self.soccfg['gens'][rf.gen_ch].get('output_sum_role') == 'rf'}
+        if self._v6_timing:
+            v4_ports.update(int(self.soccfg['gens'][ch]['tproc_ch']) for ch in self.awg_channels)
         previous_v4 = {}
         for event in events:
             base, _, _, port, key = event
             if port not in v4_ports:
                 continue
             previous = previous_v4.get(port)
-            if previous is not None and (key[1].startswith('rf_') or previous[4][1].startswith('rf_')):
+            if previous is not None and (self._v6_timing or key[1].startswith('rf_') or previous[4][1].startswith('rf_')):
                 zero = (0,) * len(self.sequence.sweep_axes)
                 current_model = model_by_key.get(key, {'base':base, 'axis_deltas':zero})
                 prev_model = model_by_key.get(previous[4], {'base':previous[0], 'axis_deltas':zero})
                 minimum = int(current_model['base']) - int(prev_model['base']) + sum(
                     min(0, (int(a)-int(b))*(axis.count-1))
                     for a,b,axis in zip(current_model['axis_deltas'],prev_model['axis_deltas'],self.sequence.sweep_axes))
-                if minimum < 3:
-                    firmware = 'v5' if any(
+                if minimum < self._dispatch_spacing:
+                    firmware = 'v6' if self._v6_timing else 'v5' if any(
                         int(self.soccfg['gens'][rf.gen_ch]['tproc_ch']) == port
                         and self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2
                         for rf in self.rf_pulse_configs) else 'v4'
-                    raise ValueError(f'The {firmware} RF/AWG sweep requires commands less than 3 tProcessor '
+                    raise ValueError(f'The {firmware} RF/AWG sweep requires commands less than {self._dispatch_spacing} tProcessor '
                                      'clocks apart on a shared port; adjust the RF timing.')
             previous_v4[port] = event
         shape = self.sequence.model_shape
@@ -5933,6 +5939,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         for gen_ch in self.awg_channels:
             port = int(self.soccfg["gens"][gen_ch]["tproc_ch"])
             slot = next_slot.get(port, 0)
+            if slot and self._v6_timing:
+                raise ValueError("Selected AWGs share one tProcessor output; simultaneous requested times cannot be preserved")
             slots[gen_ch] = slot * self.command_spacing_tproc_cycles
             next_slot[port] = slot + 1
         return slots
@@ -5979,7 +5987,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     )
                     startup_tproc = self._fabric_to_tproc(
                         gen_ch, startup_cycles
-                    )
+                    ) if startup_cycles else 0
                     # Dispatch the RAMP before the logical segment boundary.
                     # Its pipeline then starts changing the DAC at the end of
                     # the preceding SET instead of extending that SET.

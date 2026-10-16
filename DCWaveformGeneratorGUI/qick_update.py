@@ -96,19 +96,22 @@ def firmware_versions(repo):
     return versions
 
 
-def _v5_hardware_review(hwh, topology, hwh_digest):
+def _v5_hardware_review(hwh, topology, hwh_digest, *, version=5):
     """Validate the fixed v5 output route from XML, without loading QICK/FPGA."""
     def fail(detail):
         raise ValueError('Invalid v5 firmware hardware: ' + detail)
 
+    sum_type = "axis_output_sum_v3" if version == 6 else "axis_output_sum_v2"
+    awg_type = "axis_awg_tuning_v4" if version == 6 else "axis_awg_tuning_v3"
+    sum_version, awg_delay = (3, 6) if version == 6 else (2, 13)
     modules = {}
     for module in hwh.iter('MODULE'):
         name = module.get('INSTANCE')
         if name in modules:
             fail('duplicate HWH module ' + str(name))
         modules[name] = module
-    if (sum(m.get('MODTYPE') == 'axis_output_sum_v2' for m in modules.values()) != 7
-            or any(m.get('MODTYPE') == 'axis_output_sum_v1' for m in modules.values())):
+    if (sum(m.get('MODTYPE') == sum_type for m in modules.values()) != 7
+            or any(m.get('MODTYPE', '').startswith('axis_output_sum_v') and m.get('MODTYPE') != sum_type for m in modules.values())):
         fail('expected seven v2 sum blocks and no v1 sum block')
 
     def module(name, kind):
@@ -151,6 +154,10 @@ def _v5_hardware_review(hwh, topology, hwh_digest):
             fail('invalid/duplicate topology pair')
         indexed[pair['awg']] = pair
 
+    if version == 6:
+        processors = [m for m in modules.values() if m.get('MODTYPE') == 'axis_tproc64x32_x8']
+        if len(processors) != 1 or processors[0].get('VLNV') != 'QICK:QICK:axis_tproc64x32_x8:2.0':
+            fail('v6 requires tProcessor 2.0')
     rfdc = module('usp_rf_data_converter_0', 'usp_rf_data_converter')
     zero = module('sum_zero_word', 'xlconstant')
     parameter(zero, 'CONST_WIDTH', 256)
@@ -159,16 +166,19 @@ def _v5_hardware_review(hwh, topology, hwh_digest):
               (8, 13, None, '20'), (9, 14, None, '21'),
               (10, 15, None, '22'), (11, 16, None, '23'))
     for awg_id, slice_id, rf_id, dac in routes:
-        awg_name, sum_name = 'axis_awg_tuning_v3_%s' % awg_id, 'axis_output_sum_%s' % awg_id
+        awg_name, sum_name = '%s_%s' % (awg_type, awg_id), 'axis_output_sum_%s' % awg_id
         slice_name = 'axis_register_slice_%s' % slice_id
         rf_name = 'axis_signal_gen_v6_%s' % rf_id if rf_id is not None else None
-        awg = module(awg_name, 'axis_awg_tuning_v3')
-        output = module(sum_name, 'axis_output_sum_v2')
+        awg = module(awg_name, awg_type)
+        output = module(sum_name, sum_type)
         register = module(slice_name, 'axis_register_slice_nb')
         for name, expected in (('N_PTS', 16), ('PIPELINE_CYCLES', 2),
-                               ('AWG_DELAY_CYCLES', 13), ('BYPASS', int(rf_id is None))):
+                               ('AWG_DELAY_CYCLES', awg_delay), ('BYPASS', int(rf_id is None))):
             parameter(output, name, expected)
         parameter(awg, 'DC_AREA_BITS', 48)
+        if version == 6:
+            parameter(awg, 'EXTRA_Y_PIPE_STAGES', 3)
+            parameter(awg, 'N_PTS', 16)
         clock_net = port(output, 'aclk').get('SIGNAME')
         clocked = [output, awg, register]
         if rf_name:
@@ -188,17 +198,17 @@ def _v5_hardware_review(hwh, topology, hwh_digest):
         link(rfdc, 's%s_axis_tdata' % dac, slice_name, 'm_axis_tdata')
         pair = indexed.get(awg_name, {})
         route = pair.get('route', {})
-        expected = {'output_sum_version': 2, 'output_sum_block': sum_name,
+        expected = {'output_sum_version': sum_version, 'output_sum_block': sum_name,
                     'output_sum_role': 'awg', 'output_sum_bypass': rf_name is None,
                     'output_sum_awg': awg_name, 'output_sum_rf': rf_name,
-                    'output_sum_awg_delay_cycles': 13,
+                    'output_sum_awg_delay_cycles': awg_delay,
                     'post_output_latency_cycles': 2}
         if (pair.get('rf') != rf_name or pair.get('dac') != dac or not isinstance(route, dict)
                 or any(route.get(k) != v for k, v in expected.items())
                 or type(route.get('output_sum_bypass')) is not bool):
             fail('manifest topology differs from HWH route ' + awg_name)
-    return {'passed': True, 'output_sum_blocks': 7, 'output_sum_version': 2,
-            'awg_delay_cycles': 13, 'pipeline_cycles': 2, 'clock_hz': 300000000,
+    return {'passed': True, 'output_sum_blocks': 7, 'output_sum_version': sum_version,
+            'awg_delay_cycles': awg_delay, 'pipeline_cycles': 2, 'clock_hz': 300000000,
             'dc_area_bits': 48, 'hwh_sha256': hwh_digest}
 
 
@@ -254,8 +264,10 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
     hwh = ET.parse(hwh_path).getroot()
     is_v5 = ('qstl_awg_v5' in relative.parts
              or any(m.get('MODTYPE') == 'axis_output_sum_v2' for m in hwh.iter('MODULE')))
+    is_v6 = ('qstl_awg_v6' in relative.parts
+             or any(m.get('MODTYPE') == 'axis_output_sum_v3' for m in hwh.iter('MODULE')))
     build = json.loads(manifest_path.read_text(encoding='utf-8-sig')) if manifest_path.is_file() else {}
-    if is_v5:
+    if is_v5 or is_v6:
         _v5_build_review(build, manifest_path)
     timing = build.get('timing', build.get('build_result', {}))
     if build and timing.get('timing_closed') != 'YES':
@@ -267,7 +279,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
         records = {PureWindowsPath(v['path']).name: v for v in build['artifacts']}
         for p in (bit, hwh_path, bit.with_suffix('.xsa')):
             expected = records.get(p.name, {})
-            if (not p.is_file() or (is_v5 and p.resolve() != p)
+            if (not p.is_file() or ((is_v5 or is_v6) and p.resolve() != p)
                     or p.stat().st_size != expected.get('bytes')
                     or sha(p) != str(expected.get('sha256', '')).lower()):
                 raise ValueError('Firmware does not match build_manifest.json: ' + p.name)
@@ -275,7 +287,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
             for p in (bit, hwh_path):
                 matched = False
                 members = z.namelist()
-                if is_v5:
+                if is_v5 or is_v6:
                     selected = build['xsa_members']['bit' if p == bit else 'hwh']
                     members = [name for name in members if name == selected]
                     if len(members) != 1:
@@ -290,7 +302,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
                     matched = matched or h.hexdigest() == records[p.name]['sha256'].lower()
                 if not matched:
                     raise ValueError('BIT/HWH are not the pair from the recorded XSA.')
-    v5_hardware = _v5_hardware_review(hwh, topology, sha(hwh_path)) if is_v5 else None
+    v5_hardware = _v5_hardware_review(hwh, topology, sha(hwh_path), version=6 if is_v6 else 5) if (is_v5 or is_v6) else None
     timestamp = hwh.attrib.get('TIMESTAMP')
     if not timestamp:
         raise ValueError('HWH firmware timestamp is missing.')
@@ -322,7 +334,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
     hashes = {name: {'bytes': p.stat().st_size, 'sha256': sha(p)} for name, p in files.items()}
     pairs = []
     for pair in topology.get('pairs', []):
-        pairs.append({'fullpath': pair['awg'], 'type': 'axis_awg_tuning_v3', 'dac': pair['dac'],
+        pairs.append({'fullpath': pair['awg'], 'type': 'axis_awg_tuning_v4' if is_v6 else 'axis_awg_tuning_v3', 'dac': pair['dac'],
                       'output_sum_block': pair['route']['output_sum_block'],
                       'output_sum_role': 'awg'})
         if pair['rf']:
@@ -340,7 +352,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
             'files': hashes,
             'library_source_hashes': local_sources}
     if v5_hardware:
-        data['v5_hardware_validation'] = v5_hardware
+        data['v6_hardware_validation' if is_v6 else 'v5_hardware_validation'] = v5_hardware
     identity = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return {'repo': str(repo), 'manifest_path': str(manifest_path), 'identity': identity,
             'manifest': data, 'files': {k: str(v) for k, v in files.items()},

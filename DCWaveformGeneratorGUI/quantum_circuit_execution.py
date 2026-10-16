@@ -143,6 +143,12 @@ def _rf_latencies(soccfg, awg_channels, timeline, rf_channel_map, explicit):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("Explicit RF output latency must be a nonnegative integer number of tProcessor clocks")
             result[ch], profiles[ch] = value, "caller_verified_digital_latency"
+        elif (all(gens[a].get("type") == "axis_awg_tuning_v4"
+                  and gens[a].get("output_sum_version") == 3
+                  and gens[a].get("output_latency_cycles") == 31 for a in awg_channels)
+              and cfg.get("output_sum_version") == 3 and cfg.get("output_sum_role") == "rf"
+              and cfg.get("output_latency_cycles") == 31):
+            result[ch], profiles[ch] = 31, "qstl_v6_common_native_latency"
         elif (awg_profile and cfg.get("type") == "axis_signal_gen_v6"
               and int(cfg.get("revision", -1)) == 6
               and int(cfg.get("samps_per_clk", 0)) == 16
@@ -233,6 +239,9 @@ def build_circuit_execution(document, soccfg, *, readout_template,
     if len(guard_values) != 1:
         raise ValueError("Circuit AWGs must have matching RAMP guard cycles")
     guard = guard_values.pop()
+    common_pipeline = all(gens[ch].get("type") == "axis_awg_tuning_v4" for ch in channels)
+    min_set_interval = (int(soccfg["tprocs"][0].get("timed_output_spacing_cycles", 3))
+                        if common_pipeline else 3)
     pre_roll = max(startup + 6, -acq_start - offset + 3)
     rf_latencies, rf_profiles = _rf_latencies(
         soccfg, channels, timeline, rf_channel_map, rf_output_latency_tproc_cycles)
@@ -270,8 +279,8 @@ def build_circuit_execution(document, soccfg, *, readout_template,
     def add_hold(name, end):
         nonlocal logical_cursor
         length = end - logical_cursor
-        if length < 3:
-            raise ValueError("Circuit AWG SET interval is shorter than the 3-clock minimum, including the existing RAMP guard; separate the transitions")
+        if length < min_set_interval:
+            raise ValueError(f"Circuit AWG SET interval is shorter than the {min_set_interval}-clock minimum, including the firmware RAMP guard; separate the transitions")
         for output, mv in enumerate(values):
             if abs(mv) > scales[output]:
                 raise ValueError(f"AWG {timeline['awg'][output]['channel']} target {mv:g} mV exceeds its calibrated full scale {scales[output]:g} mV")
@@ -294,7 +303,7 @@ def build_circuit_execution(document, soccfg, *, readout_template,
             logical_cursor += ramp + guard
         values = [float(targets.get(output, mv)) for output, mv in enumerate(values)]
         if index + 1 == len(actions):
-            next_boundary = max(next_boundary, logical_cursor + 3)
+            next_boundary = max(next_boundary, logical_cursor + min_set_interval)
         add_hold(f"circuit_set_{index}", next_boundary)
 
     templates = _rf_template_map(rf_templates)
@@ -336,9 +345,13 @@ def build_circuit_execution(document, soccfg, *, readout_template,
                                                 duration_us=duration, frequency_parameter=frequency_names[frequency],
                                                 gain=event["gain"], phase_degrees=event["phase_deg"]))
             cursor_us = event["end_us"]
+        # Summed v6 RF already receives its HWH latency correction in the
+        # backend. Do not subtract that same pipeline twice in this bridge.
+        backend_latency = (int(gens[gen_ch]['output_latency_cycles'])
+                           if common_pipeline and gens[gen_ch].get('output_sum_role') == 'rf' else 0)
         rf_specs.append(QickRfPulseSpec(
             gen_ch=gen_ch, segment_name=ANCHOR,
-            delay_us=(pre_roll + first_start - rf_latencies[gen_ch]) / tproc_mhz,
+            delay_us=(pre_roll + first_start - rf_latencies[gen_ch] + backend_latency) / tproc_mhz,
             duration_us=cursor_us - first_start / tproc_mhz,
             frequency_mhz=frequencies[0].frequency_mhz, gain=0,
             att1_db=template.att1_db, att2_db=template.att2_db, nqz=template.nqz,
@@ -394,8 +407,8 @@ def build_circuit_execution(document, soccfg, *, readout_template,
     by_port.setdefault(ro_port, []).append(program.aux_timing["ddr_readout_start"])
     for port, timestamps in by_port.items():
         timestamps.sort()
-        if any(b - a < 3 for a, b in zip(timestamps, timestamps[1:])):
-            raise ValueError(f"Circuit commands on tProcessor port {port} are less than 3 clocks apart; separate the transitions or use independent outputs")
+        if any(b - a < min_set_interval for a, b in zip(timestamps, timestamps[1:])):
+            raise ValueError(f"Circuit commands on tProcessor port {port} are less than {min_set_interval} clocks apart; separate the transitions or use independent outputs")
     preview = program.fir_dc_timing_preview()
     for field, expected in (("group_delay_referenced_input_start_us", acq["start_us"]),
                             ("group_delay_referenced_input_end_us", acq["end_us"])):
@@ -410,7 +423,9 @@ def build_circuit_execution(document, soccfg, *, readout_template,
                     rf_pulse_count=sum(len(spec.pulse_events) for spec in rf_specs), shots=document["shots"],
                     rf_output_latency_tproc_cycles=rf_latencies,
                     rf_output_latency_profiles=rf_profiles,
-                    rf_latency_evidence="analysis_results/awg_tuning_v3/hold_acquisition_20261007/HOLD_RTL_REPORT.md; prior RF output latency 42 clocks",
+                    rf_latency_evidence=("v6 AWG v4 / sum v3 native digital latency: 31 clocks"
+                                         if common_pipeline else
+                                         "analysis_results/awg_tuning_v3/hold_acquisition_20261007/HOLD_RTL_REPORT.md; prior RF output latency 42 clocks"),
                     rf_timing_scope="Profile-based RF digital-interface alignment; not a new hardware measurement, RFDC analog or cable-delay calibration.",
                     acquisition_samples=int(samples), sample_rate_hz=profile.sample_rate_hz,
                     acquisition_input_start_us=acq["start_us"], acquisition_input_end_us=acq["end_us"],

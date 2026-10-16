@@ -139,7 +139,7 @@ def test_settings_round_trip_preserves_existing_waveforms_sweeps_and_rf(window, 
     configure(window)
     window._control_tabs.setCurrentWidget(window._quantum_circuit_panel)
     saved = window._settings_to_dict()
-    assert saved["version"] == 45
+    assert saved["version"] == 46
     path = tmp_path / "circuit_settings.json"
     window._save_settings_json(path)
     window._quantum_circuit_panel.load_document(default_document())

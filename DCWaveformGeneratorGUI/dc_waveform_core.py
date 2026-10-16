@@ -11,7 +11,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from math import ceil, isfinite, pi, sin
+from math import ceil, isclose, isfinite, pi, sin
 from numbers import Integral, Real
 import keyword
 import re
@@ -2133,7 +2133,13 @@ def _normalize_mv(value_mv: Real, full_scale_mv: Real) -> float:
 def _cycles_from_ns(duration_ns: Real, fabric_mhz: Real) -> int:
     duration_ns = _positive_real(duration_ns, "duration_ns")
     fabric_mhz = _positive_real(fabric_mhz, "fabric_mhz")
-    return max(1, int(ceil(duration_ns * fabric_mhz / 1000.0)))
+    exact_cycles = duration_ns * fabric_mhz / 1000.0
+    nearest = round(exact_cycles)
+    # Subtracting adjacent GUI timestamps can put an exact clock boundary a
+    # few floating-point ULPs above its integer. Match the compiler conversion.
+    if isclose(exact_cycles, nearest, rel_tol=1e-12, abs_tol=1e-12):
+        return max(1, int(nearest))
+    return max(1, int(ceil(exact_cycles)))
 
 
 def _validate_aligned_pulses(pulses: Sequence[PulseSequence]) -> None:

@@ -93,10 +93,11 @@ def _selected_points(count, point_indices):
 
 def _single(program, cancel_check, point_indices=None):
     sequence = program.sequence
-    if any(program.soccfg["gens"][channel].get("type") != "axis_awg_tuning_v3"
-           or int(program.soccfg["gens"][channel].get("output_sum_version", 0)) != 2
+    if any((program.soccfg["gens"][channel].get("type"),
+            int(program.soccfg["gens"][channel].get("output_sum_version", 0)))
+           not in (("axis_awg_tuning_v3", 2), ("axis_awg_tuning_v4", 3))
            for channel in program.awg_channels):
-        raise ValueError("execution coordinate export requires v5 AWG v3/output-sum v2 metadata")
+        raise ValueError("execution coordinate export requires v5 or v6 AWG/output-sum metadata")
     if point_indices is None:
         cached = getattr(program, "_execution_coordinate_snapshot", None)
         if cached is not None:

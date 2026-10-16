@@ -654,7 +654,7 @@ def _validate_summed_rf_spec(gen_cfg, spec):
     """Prevent reuse of a dedicated RF connector's calibration on a summed AWG DAC."""
     if gen_cfg.get('output_sum_role') != 'rf':
         return
-    firmware = 'v5' if gen_cfg.get('output_sum_version') == 2 else 'v4'
+    firmware = {2: 'v5', 3: 'v6'}.get(gen_cfg.get('output_sum_version'), 'v4')
     if (spec.power_calibration_enabled or spec.power_sweep_enabled
             or any(event.power_calibration_enabled for event in spec.pulse_events)):
         raise ValueError(f'This {firmware} RF generator is summed into the AWG physical output. '
@@ -1228,8 +1228,8 @@ def _cache_execution_coordinates(program, cancel_check=None) -> None:
     """Snapshot v5 command coordinates before acquisition can start."""
     channels = tuple(getattr(program, "awg_channels", ()))
     if not channels or not all(
-        program.soccfg["gens"][channel].get("type") == "axis_awg_tuning_v3"
-        and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) == 2
+        program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4")
+        and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3)
         for channel in channels
     ):
         return

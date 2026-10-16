@@ -2482,7 +2482,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             port = self._front_panel_configuration.port("output", port_index)
             channel_position = port.qick_channels.index(channel)
             block_path = port.block_paths[channel_position].lower()
-            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3")):
+            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4")):
                 raise ValueError(
                     f"generator {channel} is not an AWG tuning channel"
                 )
@@ -10258,8 +10258,8 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         program = result.get("program")
         channels = tuple(getattr(program, "awg_channels", ()))
         if channels and all(
-            program.soccfg["gens"][channel].get("type") == "axis_awg_tuning_v3"
-            and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) == 2
+            program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4")
+            and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3)
             for channel in channels
         ):
             self._coordinate_program = program

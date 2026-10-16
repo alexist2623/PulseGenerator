@@ -512,9 +512,10 @@ class FineRfDurationProgramMixin:
                 previous_event = previous.get(port)
                 if previous_event is not None:
                     old_time, old_key = previous_event
-                    spacing = 3 if (key[1].startswith('rf_') or old_key[1].startswith('rf_')) else 0
+                    spacing = (getattr(self, '_dispatch_spacing', 3)
+                               if (getattr(self, '_v6_timing', False) or key[1].startswith('rf_') or old_key[1].startswith('rf_')) else 0)
                     if timestamp-old_time < spacing:
-                        raise ValueError("fine RF sweep changes shared-port command order or requires commands less than 3 clocks apart")
+                        raise ValueError(f"fine RF sweep changes shared-port command order or requires commands less than {spacing} clocks apart")
                 previous[port] = (timestamp, key)
 
     def _fine_load_row(self, index, rf):
