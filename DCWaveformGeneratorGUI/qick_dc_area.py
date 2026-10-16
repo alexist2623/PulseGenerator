@@ -124,12 +124,21 @@ def waveform_ledger(program, point_index, output):
 
 
 def validation_points(program):
-    """Endpoints of affine axes, conditioned on existing duration-coefficient rows."""
+    """Endpoints of affine axes and all shared duration coordinates.
+
+    A shared voltage/duration index can have a quadratic interior area maximum.
+    The FPGA computes the area, but its completion deadline and voltage bounds
+    must include that maximum before the next shot is scheduled.
+    """
     import numpy as np
     axes=program.sequence.sweep_axes
     conditioned=set(a for m in program._sweep_models.values()
                     for a in m.get('duration_axis_indices',()))
-    shape=tuple(axis.count for axis in axes)
+    for group in program.sequence.sweep_groups:
+        if len(group['member_indices']) > 1 and any(
+                'duration' in axes[i].axis_kind for i in group['member_indices']):
+            conditioned.add(int(group['representative_member_index']))
+    shape=program.sequence.model_shape
     if not shape: return (0,)
     return tuple(int(np.ravel_multi_index(index,shape)) for index in product(*(
         range(count) if a in conditioned else (0,) if count==1 else (0,count-1)

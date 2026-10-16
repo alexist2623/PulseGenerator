@@ -905,6 +905,8 @@ class FineTuneDdrResult:
     accumulation_repetitions: int = 1
     iq_scale_log2: int = 0
     iq_component_bits: int = 16
+    sweep_groups: Tuple[Mapping, ...] = ()
+    sweep_parameter_ids: Tuple[str, ...] = ()
 
     @property
     def analysis_iq(self) -> np.ndarray:
@@ -978,6 +980,7 @@ class FineTuneSequence:
         self.output_names = output_names
         self.segments = []
         self.sweeps = []
+        self._sweep_group_ids = {}
         self.rf_segment_length_extensions = []
         self._sweep_coordinate_cache: Optional[np.ndarray] = None
         self.cross_capacitance = np.eye(self.n_outputs, dtype=float)
@@ -996,7 +999,8 @@ class FineTuneSequence:
 
         Every SET and its dependent RAMP use ``physical = matrix @ virtual``.
         ``matrix[dst, src]`` is therefore the contribution of virtual gate
-        ``src`` to physical AWG output ``dst``.  Diagonal entries remain one.
+        ``src`` to physical AWG output ``dst``.  All finite coefficients,
+        including diagonal gains, are supported; physical output limits still apply.
         """
         values = np.asarray(matrix, dtype=float)
         expected_shape = (self.n_outputs, self.n_outputs)
@@ -1007,8 +1011,6 @@ class FineTuneSequence:
             )
         if not np.all(np.isfinite(values)):
             raise ValueError("cross-capacitance coefficients must be finite")
-        if not np.allclose(np.diag(values), 1.0, rtol=0.0, atol=1.0e-12):
-            raise ValueError("cross-capacitance diagonal entries must equal 1")
         self.cross_capacitance = values.copy()
         return self
 
@@ -1643,6 +1645,91 @@ class FineTuneSequence:
     ]:
         return tuple(self.sweeps)
 
+    @staticmethod
+    def sweep_axis_key(axis):
+        return (str(axis.axis_kind), str(axis.segment_name), str(axis.output_name))
+
+    def set_sweep_groups(self, groups):
+        """Bind member parameters to shared hardware indices.
+
+        Keys are ``(axis_kind, segment_name, output_name)``. Members retain
+        independent ranges; a group's members must already have equal counts.
+        The first member establishes the group's Cartesian position.
+        """
+        supplied = {tuple(key): str(value) for key, value in dict(groups or {}).items()
+                    if value is not None and str(value)}
+        known = {self.sweep_axis_key(axis) for axis in self.sweeps}
+        unknown = set(supplied) - known
+        if unknown:
+            raise ValueError(f"sweep group refers to missing parameters: {sorted(unknown)}")
+        counts = {}
+        for axis in self.sweeps:
+            group = supplied.get(self.sweep_axis_key(axis))
+            if group is not None:
+                if group in counts and counts[group] != axis.count:
+                    raise ValueError(f"sweep group {group!r} members must share one point count")
+                counts[group] = axis.count
+        self._sweep_group_ids = supplied
+        self._sweep_coordinate_cache = None
+        return self
+
+    def axis_representative(self, index):
+        index = int(index)
+        axis = self.sweeps[index]
+        group = self._sweep_group_ids.get(self.sweep_axis_key(axis))
+        if group is None:
+            return index
+        return next(i for i, member in enumerate(self.sweeps)
+                    if self._sweep_group_ids.get(self.sweep_axis_key(member)) == group)
+
+    def axis_members(self, index):
+        representative = self.axis_representative(index)
+        return tuple(i for i in range(len(self.sweeps))
+                     if self.axis_representative(i) == representative)
+
+    @property
+    def loop_axis_indices(self):
+        return tuple(i for i in range(len(self.sweeps)) if self.axis_representative(i) == i)
+
+    @property
+    def model_shape(self):
+        """Flat member slots, with singleton placeholders for grouped members."""
+        return tuple(axis.count if self.axis_representative(i) == i else 1
+                     for i, axis in enumerate(self.sweeps))
+
+    @property
+    def compiler_sweep_axes(self):
+        return tuple(axis if self.axis_representative(i) == i else replace(axis, count=1)
+                     for i, axis in enumerate(self.sweeps))
+
+    def model_indices(self, point_index):
+        return tuple(map(int, np.unravel_index(point_index, self.model_shape, order="C"))) if self.sweeps else ()
+
+    def point_indices(self, point_index):
+        indices = self.model_indices(point_index)
+        return tuple(indices[self.axis_representative(i)] for i in range(len(self.sweeps)))
+
+    def fold_axis_deltas(self, values):
+        result = [0] * len(self.sweeps)
+        for i, value in enumerate(values):
+            result[self.axis_representative(i)] += int(value)
+        return tuple(result)
+
+    @property
+    def sweep_groups(self):
+        return tuple({
+            "group_id": self._sweep_group_ids.get(self.sweep_axis_key(self.sweeps[i])),
+            "loop_axis_index": position,
+            "representative_member_index": i,
+            "member_indices": self.axis_members(i),
+            "count": int(self.sweeps[i].count),
+        } for position, i in enumerate(self.loop_axis_indices))
+
+    @property
+    def sweep_member_ids(self):
+        ids = getattr(self, "sweep_parameter_ids", {})
+        return tuple(str(ids.get(self.sweep_axis_key(axis), "")) for axis in self.sweeps)
+
     def segment_duration_cycles_at(
         self,
         point_index: int,
@@ -1665,22 +1752,14 @@ class FineTuneSequence:
                 and sweep.segment_name == self.segments[segment_index].name
             ):
                 duration = int(sweep.duration_cycles_points[
-                    np.unravel_index(
-                        point_index,
-                        self.sweep_shape,
-                        order="C",
-                    )[axis_index]
+                    self.point_indices(point_index)[axis_index]
                 ])
             elif (
                 isinstance(sweep, HoldDurationSweep)
                 and sweep.segment_name == self.segments[segment_index].name
             ):
                 duration = int(sweep.duration_cycles_points[
-                    np.unravel_index(
-                        point_index,
-                        self.sweep_shape,
-                        order="C",
-                    )[axis_index]
+                    self.point_indices(point_index)[axis_index]
                 ])
             elif (
                 isinstance(sweep, RfDurationSweep)
@@ -1718,7 +1797,7 @@ class FineTuneSequence:
 
     @property
     def sweep_shape(self) -> Tuple[int, ...]:
-        return tuple(item.count for item in self.sweeps) or (1,)
+        return tuple(self.sweeps[i].count for i in self.loop_axis_indices) or (1,)
 
     @property
     def sweep_coordinates(self) -> np.ndarray:
@@ -1727,18 +1806,19 @@ class FineTuneSequence:
             if not self.sweeps:
                 coordinates = np.empty((1, 0), dtype=float)
             else:
-                shape = tuple(int(item.count) for item in self.sweeps)
+                shape = self.sweep_shape
                 point_count = int(np.prod(shape, dtype=np.int64))
                 coordinates = np.empty(
                     (point_count, len(self.sweeps)),
                     dtype=float,
                 )
                 for axis_index, item in enumerate(self.sweeps):
+                    loop_index = self.loop_axis_indices.index(self.axis_representative(axis_index))
                     repeats = int(
-                        np.prod(shape[axis_index + 1:] or (1,), dtype=np.int64)
+                        np.prod(shape[loop_index + 1:] or (1,), dtype=np.int64)
                     )
                     tiles = int(
-                        np.prod(shape[:axis_index] or (1,), dtype=np.int64)
+                        np.prod(shape[:loop_index] or (1,), dtype=np.int64)
                     )
                     coordinates[:, axis_index] = np.tile(
                         np.repeat(np.asarray(item.points, dtype=float), repeats),
@@ -1757,11 +1837,7 @@ class FineTuneSequence:
             raise IndexError("point_index is out of range")
         if not self.sweeps:
             return ()
-        indices = np.unravel_index(
-            point_index,
-            self.sweep_shape,
-            order="C",
-        )
+        indices = self.point_indices(point_index)
         return tuple(
             float(axis.points[axis_index])
             for axis, axis_index in zip(self.sweeps, indices)
@@ -2691,7 +2767,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
 
     def _boundary_validation_indices(self) -> Tuple[int, ...]:
         """Return corners plus rows required by duration-conditioned tables."""
-        axes = self.sequence.sweep_axes
+        axes = self.sequence.compiler_sweep_axes
         if not axes:
             return (0,)
         shape = tuple(int(axis.count) for axis in axes)
@@ -3001,8 +3077,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     current[output_index] = target
         return tuple(area2)
 
-    @staticmethod
-    def _ramp_duration_axis_indices(sweep_axes) -> Tuple[int, ...]:
+    def _ramp_duration_axis_indices(self, sweep_axes) -> Tuple[int, ...]:
         matches = tuple(
             index
             for index, axis in enumerate(sweep_axes)
@@ -3017,10 +3092,9 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             raise RuntimeError(
                 "each RAMP segment may have only one duration sweep axis"
             )
-        return matches
+        return tuple(dict.fromkeys(self.sequence.axis_representative(i) for i in matches))
 
-    @staticmethod
-    def _duration_axis_indices(sweep_axes) -> Tuple[int, ...]:
+    def _duration_axis_indices(self, sweep_axes) -> Tuple[int, ...]:
         """Return all RAMP and SET-hold duration axes in outer-axis order."""
         matches = tuple(
             index
@@ -3032,7 +3106,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 "RAMP and SET hold duration sweeps must be the outermost "
                 "sweep axes"
             )
-        return matches
+        return tuple(dict.fromkeys(self.sequence.axis_representative(i) for i in matches))
 
     def _bias_t_conditioning_axis_indices(self, sweep_axes) -> Tuple[int, ...]:
         """Factor voltage * RF-extension area without a Cartesian point table.
@@ -3044,21 +3118,39 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         """
         selected = set(self._duration_axis_indices(sweep_axes))
         if self.sequence.bias_t_compensation is not None:
-            voltage_axes = [i for i, axis in enumerate(sweep_axes)
+            voltage_axes = [self.sequence.axis_representative(i)
+                            for i, axis in enumerate(self.sequence.sweep_axes)
                             if isinstance(axis, AmplitudeSweep) and axis.count > 1]
-            rf_extension_axes = [i for i, axis in enumerate(sweep_axes)
+            rf_extension_axes = [self.sequence.axis_representative(i)
+                for i, axis in enumerate(self.sequence.sweep_axes)
                 if isinstance(axis, RfDurationSweep) and axis.count > 1
                 and axis.segment_length_mode == "extend_by_rf_duration"]
             selected.update(min(voltage, duration)
                             for voltage in voltage_axes for duration in rf_extension_axes)
         return tuple(sorted(selected))
 
-    @classmethod
-    def _ramp_duration_axis_by_segment(cls, sweep_axes) -> Dict[str, int]:
+    def _ramp_duration_axis_by_segment(self, sweep_axes) -> Dict[str, int]:
         return {
-            str(sweep_axes[index].segment_name): int(index)
-            for index in cls._ramp_duration_axis_indices(sweep_axes)
+            str(axis.segment_name): self.sequence.axis_representative(index)
+            for index, axis in enumerate(self.sequence.sweep_axes)
+            if isinstance(axis, RampDurationSweep)
         }
+
+    def _group_point_table(self, table):
+        """Retain only actual correlated rows and advance each group once."""
+        original = tuple(map(int, table["axis_indices"]))
+        representatives = tuple(dict.fromkeys(self.sequence.axis_representative(i) for i in original))
+        if original == representatives:
+            return table
+        shape = tuple(self.sequence.sweep_axes[i].count for i in representatives)
+        width = int(table.get("row_width", 1))
+        source = np.asarray(table["values"], dtype=np.int64).reshape(*table["axis_shape"], width)
+        values = []
+        for coordinate in np.ndindex(shape):
+            by_axis = dict(zip(representatives, coordinate))
+            old_coordinate = tuple(by_axis[self.sequence.axis_representative(i)] for i in original)
+            values.extend(map(int, source[old_coordinate].reshape(-1)))
+        return dict(table, axis_indices=representatives, axis_shape=shape, values=tuple(values))
 
     def _duration_conditioned_values(
         self,
@@ -3927,7 +4019,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         return self._requested_points_cache[point_index]
 
     def _sweep_model_value(self, model, point_index):
-        shape = tuple(axis.count for axis in self.sequence.sweep_axes)
+        shape = self.sequence.model_shape
         indices = np.unravel_index(point_index, shape, order="C") if shape else ()
         if "duration_table_bases" not in model:
             return int(model['base']) + sum(int(i) * int(d) for i, d in zip(indices, model['axis_deltas']))
@@ -3949,7 +4041,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             values = self._bias_t_target_code_actual[:, int(model["output_index"])]
             bad = 0 if duration < TPROC_V1_MIN_SET_INTERVAL and np.any(values) else None
         else:
-            shape = tuple(axis.count for axis in self.sequence.sweep_axes)
+            shape = self.sequence.model_shape
             scale = 1 << int(model["duration_frac_bits"])
             # Sub-cycle durations round to zero and are already skipped.
             lo = scale // 2
@@ -4044,8 +4136,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     f"sweep point {point_index} changes the active AWG command set"
                 )
 
-        sweep_axes = self.sequence.sweep_axes
-        sweep_shape = tuple(axis.count for axis in sweep_axes)
+        sweep_axes = self.sequence.compiler_sweep_axes
+        sweep_shape = self.sequence.model_shape
         ramp_duration_axes = self._ramp_duration_axis_by_segment(sweep_axes)
         models = {}
         for key in command_order:
@@ -4390,8 +4482,9 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             if not model.get("timing_only")
         )
         fields.extend(self._build_capture_compensation_models(event_timing_models))
-        rf_point_tables = self._build_rf_point_table_models(sweep_axes)
-        rf_point_tables.extend(self._square_point_table_models(sweep_axes))
+        rf_point_tables = self._build_rf_point_table_models(self.sequence.sweep_axes)
+        rf_point_tables.extend(self._square_point_table_models(self.sequence.sweep_axes))
+        rf_point_tables = [self._group_point_table(table) for table in rf_point_tables]
 
         occupied = {page: {0} for page in range(8)}
         for register_map in (self._gen_regmap, self._ro_regmap):
@@ -5481,12 +5574,11 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 ):
                     delta = self._hold_axis_step_tproc(axis)
             deltas.append(int(delta))
-        return tuple(deltas)
+        return self.sequence.fold_axis_deltas(deltas)
 
-    @staticmethod
-    def _model_maximum(model: Mapping, axes: Sequence) -> int:
+    def _model_maximum(self, model: Mapping, axes: Sequence) -> int:
         value = int(model["base"])
-        for delta, axis in zip(model["axis_deltas"], axes):
+        for delta, axis in zip(self.sequence.fold_axis_deltas(model["axis_deltas"]), axes):
             value += max(0, int(delta) * (int(axis.count) - 1))
         return value
 
@@ -5628,13 +5720,13 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 )
                 if preceding_axis is None:
                     continue
-                axis_index = axes.index(preceding_axis)
+                axis_index = self.sequence.axis_representative(axes.index(preceding_axis))
                 axis_step = self._rf_axis_step_tproc(preceding_axis)
                 start_deltas[axis_index] += axis_step
                 end_deltas[axis_index] += axis_step
             duration_axis = self._rf_duration_axis(rf)
             if duration_axis is not None:
-                duration_axis_index = axes.index(duration_axis)
+                duration_axis_index = self.sequence.axis_representative(axes.index(duration_axis))
                 end_deltas[duration_axis_index] += self._rf_axis_step_tproc(
                     duration_axis
                 )
@@ -5800,7 +5892,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     raise ValueError(f'The {firmware} RF/AWG sweep requires commands less than 3 tProcessor '
                                      'clocks apart on a shared port; adjust the RF timing.')
             previous_v4[port] = event
-        shape = tuple(axis.count for axis in self.sequence.sweep_axes)
+        shape = self.sequence.model_shape
         point_indices = (
             range(self.sequence.sweep_point_count)
             if self.compile_validation_mode == COMPILE_VALIDATION_FULL
@@ -7562,6 +7654,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             reserved_physical_words=reserved,
             sweep_axes=self.sequence.sweep_axes,
             sweep_shape=self.sequence.sweep_shape,
+            sweep_groups=self.sequence.sweep_groups,
+            sweep_parameter_ids=self.sequence.sweep_member_ids,
             cross_capacitance=self.sequence.cross_capacitance.copy(),
             sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
             fir_rate_profile=self._fir_cfg["rate_profile"],
@@ -7635,6 +7729,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             reserved_physical_words=0,
             sweep_axes=self.sequence.sweep_axes,
             sweep_shape=self.sequence.sweep_shape,
+            sweep_groups=self.sequence.sweep_groups,
+            sweep_parameter_ids=self.sequence.sweep_member_ids,
             cross_capacitance=self.sequence.cross_capacitance.copy(),
             sample_rate_hz=sample_rate_hz,
             fir_rate_profile="avg_buffer",
@@ -7749,6 +7845,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             "sweep_points": self.get_expt_pts(),
             "sweep_axes": self.sequence.sweep_axes,
             "sweep_shape": self.sequence.sweep_shape,
+            "sweep_groups": self.sequence.sweep_groups,
+            "sweep_parameter_ids": self.sequence.sweep_member_ids,
             "cartesian_point_count": self.sequence.sweep_point_count,
             "compile_validation_mode": self.compile_validation_mode,
             "compile_validation_point_count": len(

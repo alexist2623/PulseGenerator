@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from itertools import product
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -327,7 +328,7 @@ def build_awg_waveform_recipe(
             "filter" if hasattr(compensation, "tau_cycles") else "dc"
         )
 
-    sweep_shape = [int(axis.count) for axis in sequence.sweep_axes]
+    sweep_shape = list(sequence.sweep_shape) if sequence.sweep_axes else []
     point_count = int(np.prod(sweep_shape or [1], dtype=np.int64))
     return {
         "schema": "qick-awg-waveform-recipe-v1",
@@ -341,6 +342,8 @@ def build_awg_waveform_recipe(
         "bias_t_compensation": compensation_data,
         "sweep_axes": sweep_axes,
         "sweep_shape": sweep_shape,
+        "sweep_groups": _json_ready(getattr(sequence, "sweep_groups", ())),
+        "sweep_parameter_ids": list(getattr(sequence, "sweep_member_ids", ())),
         "point_count": point_count,
         "fabric_mhz": fabric_mhz,
         "full_scale_mv": full_scale_mv,
@@ -1221,6 +1224,44 @@ def configure_rf_board(
     }
 
 
+def _cache_execution_coordinates(program, cancel_check=None) -> None:
+    """Snapshot v5 command coordinates before acquisition can start."""
+    channels = tuple(getattr(program, "awg_channels", ()))
+    if not channels or not all(
+        program.soccfg["gens"][channel].get("type") == "axis_awg_tuning_v3"
+        and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) == 2
+        for channel in channels
+    ):
+        return
+    try:
+        from .qick_execution_coordinates import build_execution_coordinates
+    except ImportError:
+        from qick_execution_coordinates import build_execution_coordinates
+    program._execution_coordinate_snapshot = build_execution_coordinates(
+        program, cancel_check=cancel_check)
+
+
+def _program_summary_with_coordinates(program) -> Mapping[str, Any]:
+    summary = dict(program.summary())
+    programs = getattr(program, "programs", None)
+    if programs is None:
+        snapshot = getattr(program, "_execution_coordinate_snapshot", None)
+    elif all(getattr(item, "_execution_coordinate_snapshot", None) is not None
+             for item in programs):
+        # Each hardware program was snapshotted before its acquisition. Never
+        # report only the final host-sweep program for the entire result.
+        try:
+            from .qick_execution_coordinates import build_execution_coordinates
+        except ImportError:
+            from qick_execution_coordinates import build_execution_coordinates
+        snapshot = build_execution_coordinates(program)
+    else:
+        snapshot = None
+    if snapshot is not None:
+        summary["execution_coordinates"] = snapshot
+    return summary
+
+
 def _execute_qick_sequence_once(
     soc,
     soccfg,
@@ -1294,6 +1335,7 @@ def _execute_qick_sequence_once(
         cancel_check=cancel_check,
     )
     _check_cancel(cancel_check)
+    _cache_execution_coordinates(program, cancel_check)
     _emit_experiment_event(
         event_callback,
         "compile",
@@ -1586,7 +1628,7 @@ def _combine_software_sweep_results(
         if len(final_axes) == 1
         else all_coordinates
     )
-    hardware_shape = tuple(int(axis.count) for axis in hardware_axes)
+    hardware_shape = tuple(first.sweep_shape) if hardware_axes else ()
     software_shape = tuple(int(axis.count) for _index, axis in bindings)
     reserved_values = [
         getattr(result, "reserved_physical_words", None)
@@ -1607,6 +1649,12 @@ def _combine_software_sweep_results(
         reserved_physical_words=reserved,
         sweep_axes=final_axes,
         sweep_shape=software_shape + hardware_shape,
+        sweep_groups=tuple({**group,
+            "loop_axis_index": int(group["loop_axis_index"]) + len(bindings),
+            "representative_member_index": int(group["representative_member_index"]) + len(bindings),
+            "member_indices": tuple(int(i) + len(bindings) for i in group["member_indices"]),
+        } for group in getattr(first, "sweep_groups", ())),
+        sweep_parameter_ids=("",) * len(bindings) + tuple(getattr(first, "sweep_parameter_ids", ())),
     )
 
 
@@ -1855,7 +1903,7 @@ def _sweep_axis_meaning(axis: Any) -> str:
             "each coordinate is a host software run"
         )
     elif axis_kind == "rf_amplitude":
-        quantity = "calibrated connector power" if axis.coordinate_unit == "dBm" else "raw gain code"
+        quantity = "requested calibrated connector power" if axis.coordinate_unit == "dBm" else "requested gain code"
         meaning = (
             f"Composite RF {quantity} variable {axis.parameter_name} for {axis.output_name}/"
             f"{axis.segment_name}; all references share the coordinate; "
@@ -1869,17 +1917,17 @@ def _sweep_axis_meaning(axis: Any) -> str:
         )
     elif axis_kind == "rf_duration":
         meaning = (
-            f"RF pulse duration for {axis.output_name}/"
+            f"Requested RF pulse duration for {axis.output_name}/"
             f"{axis.segment_name}"
         )
     elif axis_kind == "rf_frequency":
         meaning = (
-            f"RF generator frequency for {axis.output_name}/"
+            f"Requested RF generator frequency for {axis.output_name}/"
             f"{axis.segment_name}"
         )
     elif axis_kind == "rf_power":
         meaning = (
-            f"Calibrated RF connector power for {axis.output_name}/"
+            f"Requested calibrated RF connector power for {axis.output_name}/"
             f"{axis.segment_name}"
         )
     elif axis_kind == "ramp_duration":
@@ -1891,10 +1939,10 @@ def _sweep_axis_meaning(axis: Any) -> str:
         meaning = f"SET hold duration for {axis.segment_name}"
     else:
         meaning = (
-            f"Voltage applied to {axis.output_name}/"
+            f"Requested virtual voltage for {axis.output_name}/"
             f"{axis.segment_name}"
         )
-    return meaning + "; this is a directly selectable Cartesian sweep axis."
+    return meaning + "; group membership determines whether this parameter has an independent loop index."
 
 
 def _full_scale_mv(gui_settings: Mapping[str, Any]) -> float:
@@ -2109,6 +2157,11 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
             trace_data[parameter_name],
             trace_count,
         ).reshape(expected_shape[0], expected_shape[1])
+    group_indices = {
+        int(axis): _first_value_per_trace(trace_data[name], trace_count)
+        .astype(np.int64).reshape(expected_shape[0], expected_shape[1])
+        for axis, name in layout.get("group_index_parameters", {}).items()
+    }
     if "repetition_index" in trace_data:
         repetitions = _first_value_per_trace(
             trace_data["repetition_index"],
@@ -2127,6 +2180,9 @@ def load_qick_iq_arrays(dataset: Any) -> Mapping[str, Any]:
         "time_us": sample_index * sample_period_us,
         "repetition_index": repetitions,
         "sweep_coordinates": sweep_coordinates,
+        "sweep_group_indices": group_indices,
+        "sweep_groups": layout.get("sweep_groups", []),
+        "sweep_shape": tuple(layout.get("sweep_shape", ())),
         # Compatibility alias; inspect measurement_layout.sweep_axes[*].unit
         # before assuming every coordinate is a voltage.
         "sweep_coordinates_mv": sweep_coordinates,
@@ -2338,6 +2394,9 @@ def store_qick_result(
         raise ValueError(
             "multiple DDR sweep points require at least one named sweep axis"
         )
+    sweep_shape = tuple(int(n) for n in ddr_result.sweep_shape)
+    if any(n < 1 for n in sweep_shape) or math.prod(sweep_shape) != point_count:
+        raise ValueError("sweep shape must match the number of acquired points")
     full_scale_mv = _full_scale_mv(stored_gui_settings)
     coordinates_display = coordinates.copy()
     for axis_index, axis in enumerate(sweep_axes):
@@ -2362,6 +2421,11 @@ def store_qick_result(
     setpoint_parameters = []
     sweep_parameters = []
     sweep_parameter_names = _sweep_parameter_names(sweep_axes)
+    sweep_groups = tuple(getattr(ddr_result, "sweep_groups", ()))
+    group_index_parameters = []
+    group_coordinates = np.asarray(np.unravel_index(
+        np.arange(point_count), tuple(ddr_result.sweep_shape), order="C"
+    )).T
     for axis, parameter_name in zip(sweep_axes, sweep_parameter_names):
         quantity, unit, _scale = _sweep_axis_display(
             axis,
@@ -2373,6 +2437,14 @@ def store_qick_result(
             unit=unit,
         )
         sweep_parameters.append(parameter)
+        setpoint_parameters.append(parameter)
+    for group in sweep_groups:
+        if not group.get("group_id") or len(group["member_indices"]) < 2:
+            continue
+        loop_index = int(group["loop_axis_index"])
+        parameter = Parameter(f"sweep_group_{loop_index}_index",
+                              label=f"Sweep group {loop_index + 1} index", unit="")
+        group_index_parameters.append((loop_index, parameter))
         setpoint_parameters.append(parameter)
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
@@ -2462,7 +2534,7 @@ def store_qick_result(
                 paramtype="array",
             )
             # Keep time last so Plottr opens a waveform against time.
-            vertex_setpoints = (*sweep_parameters, time_parameter)
+            vertex_setpoints = (*setpoint_parameters, time_parameter)
             virtual_parameter = Parameter(
                 f"{prefix}_virtual_vertices_mv",
                 label=f"{output_name} virtual AWG waveform vertices",
@@ -2492,7 +2564,7 @@ def store_qick_result(
             })
 
     sweep_axis_metadata = []
-    for axis, parameter in zip(sweep_axes, sweep_parameters):
+    for axis_index, (axis, parameter) in enumerate(zip(sweep_axes, sweep_parameters)):
         quantity, unit, scale = _sweep_axis_display(axis, full_scale_mv)
         axis_metadata = {
             "parameter": parameter.name,
@@ -2505,6 +2577,14 @@ def store_qick_result(
             "stop": float(axis.stop) * scale,
             "count": int(axis.count),
         }
+        member_ids = tuple(getattr(ddr_result, "sweep_parameter_ids", ()))
+        if axis_index < len(member_ids):
+            axis_metadata["parameter_id"] = member_ids[axis_index]
+        for group in sweep_groups:
+            if axis_index in group["member_indices"]:
+                axis_metadata.update({"group_id": group.get("group_id"),
+                                      "loop_axis_index": int(group["loop_axis_index"])})
+                break
         axis_kind = getattr(axis, "axis_kind", "amplitude")
         if axis_kind.startswith("square_"):
             axis_metadata.update({"gen_ch": int(axis.gen_ch), "square_parameter": axis.parameter,
@@ -2566,6 +2646,17 @@ def store_qick_result(
         parameter.name: _sweep_axis_meaning(axis)
         for axis, parameter in zip(sweep_axes, sweep_parameters)
     }
+    for loop_index, parameter in group_index_parameters:
+        setpoint_meanings[parameter.name] = (
+            "Zero-based shared index; every parameter in this group advances together."
+        )
+        for group in sweep_groups:
+            if int(group["loop_axis_index"]) == loop_index:
+                for member in group["member_indices"]:
+                    setpoint_meanings[sweep_parameters[member].name] += (
+                        f" Correlated coordinate of sweep group {group['group_id']}; "
+                        f"shared index stored as {parameter.name}."
+                    )
     sample_period_us = 1_000_000.0 / run_config.sample_rate_hz
     mean_iq_values = None
     if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
@@ -2650,6 +2741,10 @@ def store_qick_result(
         "sample_rate_hz": run_config.sample_rate_hz,
         "sample_period_us": sample_period_us,
         "sweep_axes": sweep_axis_metadata,
+        "sweep_shape": list(ddr_result.sweep_shape),
+        "sweep_groups": _json_ready(sweep_groups),
+        "sweep_parameter_ids": list(getattr(ddr_result, "sweep_parameter_ids", ())),
+        "group_index_parameters": {str(i): parameter.name for i, parameter in group_index_parameters},
         "setpoint_meanings": setpoint_meanings,
     })
     metadata = {
@@ -2779,6 +2874,8 @@ def store_qick_result(
                     )
                     for axis_index, parameter in enumerate(sweep_parameters)
                 ]
+                coordinate_results.extend((parameter, int(group_coordinates[point_index, index]))
+                                          for index, parameter in group_index_parameters)
                 channel_results = []
                 for entry in vertex_parameters:
                     output_index = entry["output_index"]
@@ -2833,6 +2930,8 @@ def store_qick_result(
                     )
                     for axis_index, parameter in enumerate(sweep_parameters)
                 ]
+                coordinate_results.extend((parameter, int(group_coordinates[point_index, index]))
+                                          for index, parameter in group_index_parameters)
                 for repetition in range(repetition_count):
                     if cancellation_requested():
                         break
@@ -2888,6 +2987,8 @@ def store_qick_result(
                     )
                     for axis_index, parameter in enumerate(sweep_parameters)
                 ]
+                coordinate_results.extend((parameter, int(group_coordinates[point_index, index]))
+                                          for index, parameter in group_index_parameters)
                 datasaver.add_result(
                     *coordinate_results,
                     (i_mean, float(mean_iq_values[point_index, 0])),
@@ -3083,6 +3184,16 @@ def run_qick_qcodes_experiment(
             awg_recipe["point_count"] = int(
                 awg_recipe["point_count"] * software_coordinates.shape[0]
             )
+            prefix_count = len(software_bindings)
+            awg_recipe["sweep_groups"] = [{
+                **group,
+                "loop_axis_index": int(group["loop_axis_index"]) + prefix_count,
+                "representative_member_index": int(group["representative_member_index"]) + prefix_count,
+                "member_indices": [int(i) + prefix_count for i in group["member_indices"]],
+            } for group in awg_recipe["sweep_groups"]]
+            awg_recipe["sweep_parameter_ids"] = (
+                [""] * prefix_count + list(awg_recipe["sweep_parameter_ids"])
+            )
             awg_recipe["reconstruction"] += (
                 " RF count, tau, named delay, amplitude, phase and T2 pi-duration axes are host software sweeps; RF-driven "
                 "SET extension timing is rebuilt for each coordinate."
@@ -3153,7 +3264,7 @@ def run_qick_qcodes_experiment(
         ddr_result,
         run_config=effective_run_config,
         connection_config=connection_config,
-        program_summary=program.summary(),
+        program_summary=_program_summary_with_coordinates(program),
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
         iq_storage_mode=iq_storage_mode,

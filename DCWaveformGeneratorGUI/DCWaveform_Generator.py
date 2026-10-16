@@ -27,6 +27,10 @@ except ImportError:
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
+    from .sweep_grouping import SweepGroupingModel, HARDWARE_GROUP_KINDS
+except ImportError:
+    from sweep_grouping import SweepGroupingModel, HARDWARE_GROUP_KINDS
+try:
     from .quantum_circuit_model import default_document, validate_document
     from .quantum_circuit_widgets import QuantumCircuitPanel, QuantumCircuitView
 except ImportError:
@@ -481,7 +485,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 45
+SETTINGS_VERSION = 46
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -2595,6 +2599,8 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
             raise ValueError(
                 f"cross-capacitance matrix shape must be {expected_shape}"
             )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("cross-capacitance coefficients must be finite")
 
         layout = QtWidgets.QVBoxLayout(self)
         equation = QtWidgets.QLabel(
@@ -2604,7 +2610,7 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
         layout.addWidget(equation)
         directions = QtWidgets.QLabel(
             "Each coefficient maps its Virtual input column to its Physical output row. "
-            "Diagonal coefficients are fixed at 1.", self,
+            "Diagonal coefficients also set the gain and sign of that mapping.", self,
         )
         directions.setWordWrap(True)
         layout.addWidget(directions)
@@ -2633,20 +2639,16 @@ class CrossCapacitanceDialog(QtWidgets.QDialog):
             editor_row = []
             for column in range(output_count):
                 editor = QtWidgets.QDoubleSpinBox(self.table)
-                editor.setRange(-10.0, 10.0)
                 editor.setDecimals(6)
+                value = float(values[row, column])
+                editor.setRange(min(-10.0, value), max(10.0, value))
                 editor.setSingleStep(0.01)
-                editor.setValue(float(values[row, column]))
+                editor.setValue(value)
                 editor.setToolTip(
                     f"Virtual awg_{column} input -> Physical awg_{row} output\n"
                     f"C[{row}, {column}]: physical awg_{row} receives this coefficient "
                     f"times virtual awg_{column}."
-                    + ("\nDiagonal coefficient: fixed at 1." if row == column else "")
                 )
-                if row == column:
-                    editor.setValue(1.0)
-                    editor.setReadOnly(True)
-                    editor.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
                 self.table.setCellWidget(row, column, editor)
                 editor_row.append(editor)
             self._editors.append(editor_row)
@@ -3667,6 +3669,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_template.addItem("CPMG", "cpmg")
         self.predefined_template.addItem("UDD", "udd")
         self.predefined_template.addItem("Hahn echo", "hahn_echo")
+        self.predefined_template.addItem("Ramsey", "ramsey")
         self.predefined_n = QtWidgets.QSpinBox()
         self.predefined_n.setRange(1, 100_000)
         self.predefined_n.setValue(4)
@@ -3706,6 +3709,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         n_sweep_row.addWidget(self.predefined_n_sweep_stop)
         n_sweep_row.addWidget(QtWidgets.QLabel("Points"))
         n_sweep_row.addWidget(self.predefined_n_sweep_count)
+        self._predefined_n_sweep_row = n_sweep_row
 
         self.predefined_tau_sweep_enabled = QtWidgets.QCheckBox(
             "Software sweep tau"
@@ -4090,6 +4094,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._update_t2_controls()
 
     def _update_t2_controls(self) -> None:
+        ramsey = self._predefined_template_name() == "ramsey"
+        self.t2_initial_pi2.setEnabled(not ramsey)
+        self.t2_final_pi2.setEnabled(not ramsey)
         enabled = self.t2_initial_pi2.isChecked() or self.t2_final_pi2.isChecked()
         for editor in (self.t2_frequency_parameter, self.t2_duration_parameter, self.t2_gain):
             editor.setEnabled(enabled)
@@ -4153,12 +4160,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     def _update_global_controls(self) -> None:
         global_enabled = self._global_rf_enabled
         custom = self._predefined_template_name() == "custom"
+        ramsey = self._predefined_template_name() == "ramsey"
         self.global_rf_group.setVisible(not custom)
         self.amplitude_mode_group.setVisible(True)
         for editor, visible in (
-            (self.predefined_frequency_parameter, not global_enabled),
+            (self.predefined_frequency_parameter, not global_enabled and not ramsey),
             (self.predefined_gain, False),
-            (self.predefined_amplitude_parameter, self._amplitude_mode != "legacy" and not self.common_amplitude_enabled.isChecked()),
+            (self.predefined_amplitude_parameter, not ramsey and self._amplitude_mode != "legacy" and not self.common_amplitude_enabled.isChecked()),
+            (self.predefined_phase_parameter, not ramsey),
         ):
             editor.setVisible(visible)
             self._predefined_form.labelForField(editor).setVisible(visible)
@@ -4229,17 +4238,23 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self._bind_globals_to_custom_rows()
         if self._predefined_template_name() != "custom" and not self._loading_rf_settings:
             self._enable_global_defaults()
-        if self._predefined_template_name() == "hahn_echo":
+        if self._predefined_template_name() in {"hahn_echo", "ramsey"}:
             with QtCore.QSignalBlocker(self.predefined_n), QtCore.QSignalBlocker(self.predefined_n_sweep_enabled):
                 self.predefined_n.setValue(1)
                 self.predefined_n_sweep_enabled.setChecked(False)
+        if self._predefined_template_name() == "ramsey" and not self._loading_rf_settings:
+            with QtCore.QSignalBlocker(self.t2_initial_pi2), QtCore.QSignalBlocker(self.t2_final_pi2):
+                self.t2_initial_pi2.setChecked(True)
+                self.t2_final_pi2.setChecked(True)
+            self._t2_selection_changed()
         self._update_predefined_controls()
         self._rebuild_predefined_items()
 
     def _update_predefined_controls(self, *_args) -> None:
         template = self._predefined_template_name()
         predefined = template != "custom"
-        hahn = template == "hahn_echo"
+        ramsey = template == "ramsey"
+        fixed_count = template in {"hahn_echo", "ramsey"}
         for widget in (
             self.predefined_n,
             self.predefined_tau,
@@ -4254,15 +4269,20 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.apply_predefined_template,
         ):
             widget.setEnabled(predefined)
-        self.predefined_n.setEnabled(predefined and not hahn)
-        self.predefined_n_sweep_enabled.setEnabled(predefined and not hahn)
+        for editor in (self.predefined_n, self.predefined_duration_parameter):
+            editor.setVisible(not ramsey)
+            self._predefined_form.labelForField(editor).setVisible(not ramsey)
+        for index in range(self._predefined_n_sweep_row.count()):
+            self._predefined_n_sweep_row.itemAt(index).widget().setVisible(not ramsey)
+        self.predefined_n.setEnabled(predefined and not fixed_count)
+        self.predefined_n_sweep_enabled.setEnabled(predefined and not fixed_count)
         for widget in (
             self.predefined_n_sweep_start,
             self.predefined_n_sweep_stop,
             self.predefined_n_sweep_count,
         ):
             widget.setEnabled(
-                predefined and not hahn and self.predefined_n_sweep_enabled.isChecked()
+                predefined and not fixed_count and self.predefined_n_sweep_enabled.isChecked()
             )
         for widget in (
             self.predefined_tau_sweep_start,
@@ -4281,7 +4301,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             widget.setEnabled(not predefined)
         self.composite_row_header.setReorderingEnabled(not predefined)
         self._update_composite_remove_button()
-        if template == "hahn_echo":
+        if ramsey:
+            text = (
+                "Ramsey: π/2 → tau → π/2. Tau is the gap between the pulses. "
+                "Each π/2 duration is half the selected π duration parameter below."
+            )
+        elif template == "hahn_echo":
             text = "Hahn echo: tau/2 → one π pulse → tau/2. Tau is the total free-evolution time."
         elif template == "cpmg":
             text = (
@@ -5303,7 +5328,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if self._independent_preset_amplitudes:
                 self.global_amplitude_parameter.setCurrentIndex(-1)
             elif not spec.global_amplitude_parameter:
-                reference = self.predefined_amplitude_parameter.currentData()
+                reference = (self.t2_amplitude_parameter.currentData()
+                             if spec.predefined_template == "ramsey"
+                             else self.predefined_amplitude_parameter.currentData())
                 self.global_amplitude_parameter.setCurrentIndex(self.global_amplitude_parameter.findData(reference))
             with QtCore.QSignalBlocker(self.common_amplitude_enabled):
                 self.common_amplitude_enabled.setChecked(not self._independent_preset_amplitudes)
@@ -6708,9 +6735,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             if match >= 0:
                 self.segment.setCurrentIndex(match)
 
-    def configured_spec(self) -> QickRfPulseSpec:
+    def configured_spec(self, *, composite: Optional[bool] = None) -> QickRfPulseSpec:
         """Return the editor values even when this output is disabled."""
-        composite = self.composite_mode.isChecked()
+        if composite is None:
+            composite = self.composite_mode.isChecked()
         return QickRfPulseSpec(
             gen_ch=self.gen_ch.value(),
             segment_name=str(self.segment.currentData()),
@@ -6867,7 +6895,23 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             mode: [asdict(parameter) for parameter in bank if parameter.name in names]
             for mode, bank in banks.items()
         }
+        if spec.pulse_mode == "single" and self._predefined_template_name() == "ramsey":
+            # A Ramsey body contains only a delay. Preserve its dormant endpoints
+            # separately so Single still compiles as a single pulse after reload.
+            settings["inactive_composite_settings"] = asdict(self.configured_spec(composite=True))
         return {"enabled": self.isChecked(), **settings}
+
+    @staticmethod
+    def _decode_inactive_composite_settings(data: dict) -> dict:
+        if "inactive_composite_settings" not in data:
+            return {}
+        raw = data["inactive_composite_settings"]
+        if not isinstance(raw, dict) or data.get("pulse_mode") != "single":
+            raise ValueError("inactive composite settings require Single pulse mode and an object")
+        spec = QickRfPulseSpec(**raw)
+        if spec.pulse_mode != "composite" or spec.predefined_template != "ramsey":
+            raise ValueError("inactive composite settings must describe a Ramsey sequence")
+        return {"inactive_composite_settings": asdict(spec)}
 
     @staticmethod
     def _decode_amplitude_parameter_banks(data: dict) -> dict:
@@ -6893,6 +6937,27 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     def load_settings(self, data: dict) -> None:
         if not isinstance(data, dict):
             raise TypeError("each RF output setting must be a JSON object")
+        inactive = self._decode_inactive_composite_settings(data)
+        if inactive:
+            restored = {**data, **inactive["inactive_composite_settings"]}
+            restored.pop("inactive_composite_settings")
+            single_flags = (
+                ("duration_sweep_enabled", self.duration_sweep_enabled),
+                ("frequency_sweep_enabled", self.frequency_sweep_enabled),
+                ("power_calibration_enabled", self.power_calibration_group),
+                ("power_sweep_enabled", self.power_sweep_enabled),
+            )
+            for name, _ in single_flags:
+                if not isinstance(data.get(name, False), bool):
+                    raise TypeError(f"RF {name} must be boolean")
+            with QtCore.QSignalBlocker(self):
+                self.load_settings(restored)
+                self.single_mode.setChecked(True)
+                # Loading Composite deliberately disables the Single-only flags.
+                for name, checkbox in single_flags:
+                    checkbox.setChecked(data.get(name, False))
+            self.changed.emit()
+            return
         enabled = data.get("enabled", True)
         require_within = data.get("require_within_segment", True)
         duration_sweep_enabled = data.get(
@@ -8334,6 +8399,8 @@ class ExperimentPanel(QtWidgets.QWidget):
     sweep_axes_changed = QtCore.pyqtSignal()
     sweep_update_requested = QtCore.pyqtSignal(object, float, float, int)
     sweep_remove_requested = QtCore.pyqtSignal(object)
+    sweep_group_requested = QtCore.pyqtSignal(object)
+    sweep_ungroup_requested = QtCore.pyqtSignal(str)
     bias_t_changed = QtCore.pyqtSignal(bool, str, float, str, float, float)
     ddr_capacity_refresh_requested = QtCore.pyqtSignal()
 
@@ -8522,17 +8589,19 @@ class ExperimentPanel(QtWidgets.QWidget):
             "take a long time for large sweeps."
         )
         self._map_sweep_specs: Tuple[QickSweepAxisSpec, ...] = ()
+        self.sweep_grouping = SweepGroupingModel()
+        self._selected_group_members = set()
         self.sweep_parameter_group = QtWidgets.QGroupBox("Sweep parameters")
         sweep_parameter_layout = QtWidgets.QVBoxLayout(
             self.sweep_parameter_group
         )
-        self.sweep_parameter_table = QtWidgets.QTableWidget(0, 5)
+        self.sweep_parameter_table = QtWidgets.QTableWidget(0, 7)
         self.sweep_parameter_table.setHorizontalHeaderLabels(
-            ["Type", "Target", "Start", "Stop", "Points"]
+            ["Select / Type", "Target", "Start", "Stop", "Points", "Group", "Requested step"]
         )
         self.sweep_parameter_table.verticalHeader().setVisible(False)
         self.sweep_parameter_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
+            QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed
         )
         self.sweep_parameter_table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectRows
@@ -8541,18 +8610,36 @@ class ExperimentPanel(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SingleSelection
         )
         self.sweep_parameter_table.setMaximumHeight(180)
+        self.sweep_parameter_table.setWordWrap(False)
+        self.sweep_parameter_table.setHorizontalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollPerPixel
+        )
         sweep_parameter_header = self.sweep_parameter_table.horizontalHeader()
         sweep_parameter_header.setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeToContents
         )
         sweep_parameter_header.setSectionResizeMode(
-            1, QtWidgets.QHeaderView.Stretch
+            1, QtWidgets.QHeaderView.ResizeToContents
         )
-        for column in (2, 3, 4):
+        for column in (2, 3, 4, 5, 6):
             sweep_parameter_header.setSectionResizeMode(
                 column, QtWidgets.QHeaderView.ResizeToContents
             )
         sweep_parameter_layout.addWidget(self.sweep_parameter_table)
+        self.sweep_group_button = QtWidgets.QPushButton("Group sweep")
+        self.sweep_group_button.setEnabled(False)
+        self.sweep_group_hint = QtWidgets.QLabel(
+            "Select hardware parameters to advance together. The first selected row's point count is used; ranges remain independent."
+        )
+        self.sweep_group_hint.setWordWrap(True)
+        sweep_parameter_layout.addWidget(self.sweep_group_button)
+        sweep_parameter_layout.addWidget(self.sweep_group_hint)
+        self.sweep_group_button.clicked.connect(self._group_checked_sweep_parameters)
+        self.sweep_parameter_table.itemChanged.connect(self._sweep_table_item_changed)
+        self.sweep_parameter_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.sweep_parameter_table.customContextMenuRequested.connect(self._sweep_group_context_menu)
+        self.sweep_parameter_table.horizontalHeader().setSortIndicator(-1, QtCore.Qt.AscendingOrder)
+        self.sweep_parameter_table.setSortingEnabled(True)
 
         self.sweep_parameter_empty = QtWidgets.QLabel(
             "No sweep configured. Configure an AWG segment, RF duration, "
@@ -8863,10 +8950,10 @@ class ExperimentPanel(QtWidgets.QWidget):
             spec for spec in self._map_sweep_specs if spec not in software_specs
         )
         software_points = prod(spec.count for spec in software_specs)
-        sweep_points = prod(spec.count for spec in hardware_specs)
+        sweep_points = self.sweep_grouping.point_count(hardware_specs)
         total_sweep_points = sweep_points * software_points
         repetitions = self.repetitions.value()
-        sweep_axes = len(self._map_sweep_specs)
+        sweep_axes = len(self.sweep_grouping.loop_specs(self._map_sweep_specs))
         spec = self._ddr_readout_spec
 
         if spec is None:
@@ -9200,24 +9287,52 @@ class ExperimentPanel(QtWidgets.QWidget):
         if selected_key is None:
             selected_key = self._selected_sweep_parameter_key()
         selected_row = -1
+        live_ids = {self.sweep_grouping.member_id(spec) for spec in self._map_sweep_specs}
+        self._selected_group_members.intersection_update(live_ids)
+        sorting = self.sweep_parameter_table.isSortingEnabled()
         with QtCore.QSignalBlocker(self.sweep_parameter_table):
+            self.sweep_parameter_table.setSortingEnabled(False)
             self.sweep_parameter_table.setRowCount(len(self._map_sweep_specs))
             for row, spec in enumerate(self._map_sweep_specs):
                 sweep_type, target, start, stop, unit = (
                     self._sweep_parameter_values(spec)
                 )
                 key = self._sweep_parameter_key(spec)
+                member_id = self.sweep_grouping.member_id(spec)
+                group_id, group = self.sweep_grouping.group_for(spec)
+                step = (stop - start) / (int(spec.count) - 1) if int(spec.count) > 1 else 0.0
                 values = (
                     sweep_type,
                     target,
                     f"{start:.9g} {unit}",
                     f"{stop:.9g} {unit}",
                     str(spec.count),
+                    group["name"] if group else "Independent",
+                    f"{step:.9g} {unit}",
                 )
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
+                    minimum_width = {1: 180, 2: 95, 3: 95, 6: 120}.get(column)
+                    if minimum_width is not None:
+                        text_width = self.sweep_parameter_table.fontMetrics().horizontalAdvance(value) + 18
+                        item.setSizeHint(QtCore.QSize(max(minimum_width, text_width), 24))
+                    item.setData(QtCore.Qt.UserRole + 1, member_id)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                     if column == 0:
                         item.setData(QtCore.Qt.UserRole, key)
+                        if key[0] in HARDWARE_GROUP_KINDS:
+                            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                            item.setCheckState(QtCore.Qt.Checked if member_id in self._selected_group_members else QtCore.Qt.Unchecked)
+                        else:
+                            item.setToolTip("This parameter is a software sweep; hardware grouping is unavailable.")
+                    if column in (2, 3, 4):
+                        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+                    if group_id:
+                        palette = ("#e6f1fb", "#ebf6e7", "#fff3db", "#f2eafa", "#e4f5f2")
+                        color_index = list(self.sweep_grouping.groups).index(group_id) % len(palette)
+                        item.setBackground(QtGui.QColor(palette[color_index]))
+                    if column == 6:
+                        item.setToolTip("Requested range increment; hardware-quantized coordinates are shown by the waveform/compiler preview. N=1 uses the start value.")
                     if column >= 2:
                         item.setTextAlignment(
                             QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
@@ -9232,10 +9347,71 @@ class ExperimentPanel(QtWidgets.QWidget):
             else:
                 self.sweep_parameter_table.clearSelection()
                 self.sweep_parameter_table.setCurrentCell(-1, -1)
+            self.sweep_parameter_table.setSortingEnabled(sorting)
         has_sweeps = bool(self._map_sweep_specs)
         self.sweep_parameter_table.setVisible(has_sweeps)
         self.sweep_parameter_empty.setVisible(not has_sweeps)
         self._load_selected_sweep_parameter()
+        self.sweep_group_button.setEnabled(len(self._selected_group_members) >= 2)
+
+    def _sweep_spec_for_member(self, member_id):
+        return next((spec for spec in self._map_sweep_specs
+                     if self.sweep_grouping.member_id(spec) == member_id), None)
+
+    def _sweep_table_item_changed(self, item):
+        member_id = item.data(QtCore.Qt.UserRole + 1)
+        spec = self._sweep_spec_for_member(member_id)
+        if spec is None:
+            return
+        if item.column() == 0:
+            if item.checkState() == QtCore.Qt.Checked:
+                self._selected_group_members.add(member_id)
+            else:
+                self._selected_group_members.discard(member_id)
+            self.sweep_group_button.setEnabled(len(self._selected_group_members) >= 2)
+            return
+        if item.column() not in (2, 3, 4):
+            return
+        try:
+            _kind, _target, start, stop, _unit = self._sweep_parameter_values(spec)
+            count = int(spec.count)
+            value = float(item.text().strip().split()[0])
+            if not np.isfinite(value):
+                raise ValueError("Sweep values must be finite")
+            if item.column() == 2:
+                start = value
+            elif item.column() == 3:
+                stop = value
+            else:
+                if value != int(value) or not 1 <= value <= 1_000_000:
+                    raise ValueError("Point count must be an integer from 1 to 1,000,000")
+                count = int(value)
+            self.sweep_update_requested.emit(spec, start, stop, count)
+        except (TypeError, ValueError, IndexError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid sweep parameters", str(exc))
+            self._refresh_sweep_parameter_table()
+
+    def _group_checked_sweep_parameters(self):
+        members = [self.sweep_parameter_table.item(row, 0).data(QtCore.Qt.UserRole + 1)
+                   for row in range(self.sweep_parameter_table.rowCount())
+                   if self.sweep_parameter_table.item(row, 0).data(QtCore.Qt.UserRole + 1) in self._selected_group_members]
+        if len(members) >= 2:
+            self.sweep_group_requested.emit(members)
+            self._selected_group_members.clear()
+            self._refresh_sweep_parameter_table()
+
+    def _sweep_group_context_menu(self, position):
+        item = self.sweep_parameter_table.itemAt(position)
+        if item is None:
+            return
+        member_id = item.data(QtCore.Qt.UserRole + 1)
+        spec = self._sweep_spec_for_member(member_id)
+        if spec is None or not self.sweep_grouping.group_for(spec)[0]:
+            return
+        menu = QtWidgets.QMenu(self)
+        remove = menu.addAction("Remove from group")
+        if menu.exec_(self.sweep_parameter_table.viewport().mapToGlobal(position)) == remove:
+            self.sweep_ungroup_requested.emit(member_id)
 
     def _load_selected_sweep_parameter(self) -> None:
         spec = self._selected_sweep_parameter()
@@ -9340,9 +9516,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         previous = self.selected_sweep_axis_keys()
         selected_parameter_key = self._selected_sweep_parameter_key()
         self._map_sweep_specs = tuple(specs)
+        self.sweep_grouping.synchronize(self._map_sweep_specs, accept_count_edits=False)
+        loop_specs = self.sweep_grouping.loop_specs(self._map_sweep_specs)
         available = tuple(
             (str(spec.output_name), str(spec.segment_name))
-            for spec in self._map_sweep_specs
+            for spec in loop_specs
         )
         desired = selected_keys if selected_keys is not None else previous
         if desired is not None:
@@ -9363,8 +9541,11 @@ class ExperimentPanel(QtWidgets.QWidget):
         ):
             self.sweep_map_x.clear()
             self.sweep_map_y.clear()
-            for spec, key in zip(self._map_sweep_specs, available):
+            for spec, key in zip(loop_specs, available):
                 label = self._sweep_axis_label(spec)
+                _group_id, group = self.sweep_grouping.group_for(spec)
+                if group:
+                    label = f"{group['name']} | {label}"
                 self.sweep_map_x.addItem(label, key)
                 self.sweep_map_y.addItem(label, key)
             if desired is not None:
@@ -9413,8 +9594,8 @@ class ExperimentPanel(QtWidgets.QWidget):
                 "Add at least two AWG sweep variables to enable the map."
             )
             return
-        omitted = max(0, len(self._map_sweep_specs) - 2)
-        point_count = prod(spec.count for spec in self._map_sweep_specs)
+        omitted = max(0, len(self.sweep_grouping.loop_specs(self._map_sweep_specs)) - 2)
+        point_count = self.sweep_grouping.point_count(self._map_sweep_specs)
         suffix = (
             f" The other {omitted} sweep axis/axes will be coherently averaged."
             if omitted
@@ -10075,6 +10256,31 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.addTab(self.assembly_text, "Assembly")
         program = result.get("program")
+        channels = tuple(getattr(program, "awg_channels", ()))
+        if channels and all(
+            program.soccfg["gens"][channel].get("type") == "axis_awg_tuning_v3"
+            and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) == 2
+            for channel in channels
+        ):
+            self._coordinate_program = program
+            coordinate_page = QtWidgets.QWidget()
+            coordinate_layout = QtWidgets.QVBoxLayout(coordinate_page)
+            self.coordinate_point = QtWidgets.QSpinBox()
+            self.coordinate_point.setRange(0, program.sequence.sweep_point_count - 1)
+            self.coordinate_point.setPrefix("Sweep point (0-based): ")
+            coordinate_layout.addWidget(self.coordinate_point)
+            coordinate_note = QtWidgets.QLabel(
+                "Requested coordinates and compiled physical DAC/RF commands. "
+                "These are digital values before RC filtering, not measured voltages."
+            )
+            coordinate_note.setWordWrap(True)
+            coordinate_layout.addWidget(coordinate_note)
+            self.coordinate_text = QtWidgets.QPlainTextEdit()
+            self.coordinate_text.setReadOnly(True)
+            coordinate_layout.addWidget(self.coordinate_text)
+            self.coordinate_point.valueChanged.connect(self._update_execution_coordinates)
+            self._update_execution_coordinates(0)
+            self.tabs.addTab(coordinate_page, "Compiled coordinates")
         if program is not None and getattr(program, "ddr_readout_config", None) is not None:
             self._timing_program = program
             timing_page = QtWidgets.QWidget()
@@ -10107,6 +10313,49 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         self.save_button.clicked.connect(self._save_assembly)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_execution_coordinates(self, point):
+        from qick_execution_coordinates import build_execution_coordinates
+        # Expand one selected point only, even for very large sweeps.
+        snapshot = build_execution_coordinates(
+            self._coordinate_program, point_indices=(point,))
+        lines = [f"Sweep point: {point}", "", "Requested / sequence coordinates:"]
+        for member in snapshot["requested_members"]:
+            name = "/".join(map(str, member["key"]))
+            lines.append(f"  {name}: {member['coordinates']} {member['unit']}")
+        lines.append("Group indices: " + ", ".join(
+            f"{group['loop_axis_index']}: {group['coordinates']}"
+            for group in snapshot["group_indices"]))
+        lines.extend(["", "Physical AWG commands (pre-IIR):"])
+        for command in snapshot["awg_commands"]:
+            values = command["columns"]
+            voltage = (f", {values['target_mv']:.9g} mV"
+                       if "target_mv" in values else "")
+            lines.append(
+                f"  {command['output_name']} / {command['segment_name']} "
+                f"({command['kind']}): DAC code {values['target_code_14']}"
+                f"{voltage}; command cycle {values['command_cycle']}"
+            )
+            if command["kind"] == "ramp":
+                lines.append(f"    RAMP: {values['duration_samples']} samples, "
+                             f"{values['ramp_duration_us']:.9g} us")
+        lines.extend(["", "Compiled RF commands:"])
+        for event in snapshot["rf_events"]:
+            values = event["columns"]
+            lines.append(
+                f"  {event['event_id']} / generator {event['gen_ch']}: "
+                f"{values['frequency_mhz']:.9g} MHz, gain {values['logical_gain']}, "
+                f"phase word {values['phase_word']}; command cycle {values['command_start_cycle']}"
+            )
+            if values["active_samples"] is not None:
+                lines.append(f"    Active: {values['active_samples']} samples, "
+                             f"{values['active_duration_us']:.9g} us")
+            else:
+                lines.append(f"    Coarse periodic: scheduled stop interval "
+                             f"{values['scheduled_stop_duration_samples']} samples; "
+                             "actual stop is word-boundary aligned.")
+        lines.extend(["", snapshot["requested_coordinate_note"], snapshot["compensation_note"]])
+        self.coordinate_text.setPlainText("\n".join(lines))
 
     def _update_fir_dc_timing(self, point):
         # A bound Qt slot avoids retaining this dialog through a closure cycle.
@@ -10877,7 +11126,9 @@ class QickExportDialog(QtWidgets.QDialog):
         np.fill_diagonal(off_diagonal, 0.0)
         nonzero = int(np.count_nonzero(np.abs(off_diagonal) > 1.0e-15))
         self.cross_capacitance_summary.setText(
-            f"{self._pulse_count} x {self._pulse_count}, {nonzero} active terms"
+            f"{self._pulse_count} x {self._pulse_count}; "
+            "diagonal [" + ", ".join(f"{value:.6g}" for value in np.diag(self._cross_capacitance))
+            + f"]; {nonzero} cross terms"
         )
 
     def _parse_channels(self) -> Tuple[int, ...]:
@@ -10989,6 +11240,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_panel: Optional[RfPulseEditorPanel] = None
         self._dock_rf: Optional[QtWidgets.QDockWidget] = None
         self._sweep_specs: List[QickSweepAxisSpec] = []
+        self._sweep_grouping = SweepGroupingModel()
+        self._sweep_group_update_active = False
         self._cross_capacitance = np.eye(1, dtype=float)
         self._qick_fabric_mhz = float(DEFAULT_QICK_FABRIC_MHZ)
         self._qick_tproc_mhz = float(DEFAULT_QICK_TPROC_MHZ)
@@ -11150,6 +11403,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.sweep_remove_requested.connect(
             self._remove_sweep_parameter
         )
+        self._experiment_panel.sweep_grouping = self._sweep_grouping
+        self._experiment_panel.sweep_group_requested.connect(self._group_sweep_parameters)
+        self._experiment_panel.sweep_ungroup_requested.connect(self._ungroup_sweep_parameter)
         self._experiment_panel.bias_t_changed.connect(self._on_bias_t_changed)
         self._stability_panel.start_requested.connect(
             lambda: self._run_stability_diagram(continuous=True)
@@ -11555,6 +11811,16 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _delete_port(self, idx: int) -> None:
         """Completely remove pulse, plot line and control panel at index idx."""
+        group_remap = {}
+        for key in self._sweep_grouping.parameters:
+            kind, output, segment = key
+            match = re.fullmatch(r"awg_(\d+)", output)
+            if kind == "amplitude" and match:
+                port = int(match.group(1))
+                if port == idx:
+                    group_remap[key] = None
+                elif port > idx:
+                    group_remap[key] = (kind, f"awg_{port - 1}", segment)
         sweep_entries = [
             (spec, self._sweep_target_indices(spec)) for spec in self._sweep_specs
         ]
@@ -11617,6 +11883,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 )
             updated_sweeps.append(spec)
         self._sweep_specs = updated_sweeps
+        self._sweep_grouping.remap(group_remap)
         self._notify_sweep_state_changed(waveform_changed=True)
         self._refresh_rf_editor()
         if self._trace is not None:
@@ -11949,7 +12216,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         nonzero = int(np.count_nonzero(np.abs(off_diagonal) > 1.0e-15))
         self.statusBar().showMessage(
             "Virtual-to-physical matrix applied: "
-            f"{nonzero} nonzero cross-capacitance terms"
+            "diagonal [" + ", ".join(f"{value:.6g}" for value in np.diag(self._cross_capacitance))
+            + f"]; {nonzero} cross terms"
         )
 
     def _set_voltage_view(self, mode: str) -> None:
@@ -11976,6 +12244,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 full_scale_mv=self._qick_full_scale_mv,
                 **self._dac_scale_arguments(self._qick_awg_channels),
                 sweeps=tuple(self._sweep_specs),
+                sweep_groups=self._compiler_sweep_groups(),
+                sweep_parameter_ids=self._compiler_sweep_parameter_ids(),
                 rf_pulse_specs=tuple(self._rf_pulse_specs),
                 cross_capacitance=self._cross_capacitance,
                 bias_t_compensation_enabled=self._bias_t_compensation_enabled,
@@ -12131,7 +12401,52 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _sweep_cartesian_count(self) -> int:
         specs = self._active_map_sweep_specs()
-        return prod(spec.count for spec in specs) if specs else 1
+        return self._sweep_grouping.point_count(specs)
+
+    def _sync_sweep_grouping(self, *, accept_count_edits=True):
+        if self._sweep_group_update_active:
+            return
+        updates = self._sweep_grouping.synchronize(
+            self._active_map_sweep_specs(), accept_count_edits=accept_count_edits)
+        if not updates:
+            return
+        self._sweep_group_update_active = True
+        try:
+            for key, count in updates.items():
+                spec = next((item for item in self._active_map_sweep_specs()
+                             if ExperimentPanel._sweep_parameter_key(item) == key), None)
+                if spec is not None:
+                    _kind, _target, start, stop, _unit = self._experiment_panel._sweep_parameter_values(spec)
+                    self._update_single_sweep_parameter(spec, start, stop, count)
+        finally:
+            self._sweep_group_update_active = False
+        remaining = self._sweep_grouping.synchronize(self._active_map_sweep_specs(), accept_count_edits=False)
+        if remaining:
+            raise ValueError("Could not synchronize all grouped sweep counts")
+
+    def _group_sweep_parameters(self, member_ids):
+        self._sync_sweep_grouping()
+        try:
+            group_id = self._sweep_grouping.create_group(member_ids, self._active_map_sweep_specs())
+            self._sync_sweep_grouping(accept_count_edits=False)
+            self._notify_sweep_state_changed(fit_view=True)
+            group = self._sweep_grouping.groups[group_id]
+            self.statusBar().showMessage(
+                f"{group['name']}: {len(group['members'])} parameters advance together at {group['count']} points")
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot group sweeps", str(exc))
+
+    def _ungroup_sweep_parameter(self, member_id):
+        self._sweep_grouping.remove_member(member_id)
+        self._notify_sweep_state_changed(fit_view=True)
+
+    def _compiler_sweep_groups(self):
+        return self._sweep_grouping.compiler_mapping(self._active_map_sweep_specs())
+
+    def _compiler_sweep_parameter_ids(self):
+        return {(kind, segment, output): pid
+                for (kind, output, segment), pid in self._sweep_grouping.parameters.items()
+                if kind in HARDWARE_GROUP_KINDS}
 
     def _sync_sweep_rows(self) -> None:
         rows_by_port = {index: set() for index in range(len(self._pulse))}
@@ -12211,6 +12526,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         rf_changed: bool = False,
     ) -> None:
         """Emit one event after a sweep or its segment model changes."""
+        if self._sweep_group_update_active:
+            return
         self.sweep_state_changed.emit(
             {
                 "fit_view": bool(fit_view),
@@ -12226,6 +12543,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         """Synchronize the sweep model with every dependent AWG view."""
         options = request if isinstance(request, Mapping) else {}
         self._reconcile_sweep_specs()
+        self._sync_sweep_grouping()
         if options.get("waveform_changed", False):
             self._refresh_waveform_plot()
         self._refresh_sweep_overlay(
@@ -12247,6 +12565,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             Tuple[Tuple[str, str], Tuple[str, str]]
         ] = None,
     ) -> None:
+        self._sync_sweep_grouping()
         if hasattr(self, "_experiment_panel"):
             self._experiment_panel.set_sweep_specs(
                 self._active_map_sweep_specs(),
@@ -12643,6 +12962,13 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         operation: str,
         segment_index: int,
     ) -> None:
+        group_remap = {}
+        for key in self._sweep_grouping.parameters:
+            kind, output, segment = key
+            remap = _remap_ramp_segment_name if kind == "ramp_duration" else _remap_set_segment_name
+            destination = remap(segment, operation, segment_index)
+            group_remap[key] = None if destination is None else (kind, output, destination)
+        self._sweep_grouping.remap(group_remap)
         self._mirror_segment_structure_edit(
             int(port_index),
             operation,
@@ -12940,6 +13266,17 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         start: float,
         stop: float,
         count: int,
+    ) -> None:
+        self._sweep_group_update_active = True
+        try:
+            self._update_single_sweep_parameter(spec, start, stop, count)
+        finally:
+            self._sweep_group_update_active = False
+        self._sync_sweep_grouping()
+        self._notify_sweep_state_changed(fit_view=True)
+
+    def _update_single_sweep_parameter(
+        self, spec, start: float, stop: float, count: int,
     ) -> None:
         key = ExperimentPanel._sweep_parameter_key(spec)
         axis_kind = key[0]
@@ -13339,6 +13676,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             **self._dac_scale_arguments(self._qick_awg_channels),
             sweep=sweep,
             sweeps=sweeps,
+            sweep_groups=self._compiler_sweep_groups(),
+            sweep_parameter_ids=self._compiler_sweep_parameter_ids(),
             rf_pulse_specs=rf_specs,
             cross_capacitance=self._cross_capacitance.copy(),
             bias_t_compensation_enabled=self._bias_t_compensation_enabled,
@@ -15827,6 +16166,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _settings_to_dict(self) -> dict:
         """Return every user-editable experiment setting in canonical units."""
+        self._sync_sweep_grouping()
         experiment_values = self._experiment_panel.values(len(self._pulse))
         connection = experiment_values["connection"]
         run = experiment_values["run"]
@@ -15870,6 +16210,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         return {
             "schema": SETTINGS_SCHEMA,
             "version": SETTINGS_VERSION,
+            "sweep_grouping": self._sweep_grouping.to_dict(),
             "display": {
                 "time_unit": self._time_unit,
                 "voltage_view": self._plot.voltage_view,
@@ -16237,6 +16578,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "global_frequency_parameter": spec.global_frequency_parameter,
                     "amplitude_parameters": [asdict(parameter) for parameter in spec.amplitude_parameters],
                     "amplitude_parameter_banks": RfPulsePortPanel._decode_amplitude_parameter_banks(entry),
+                    **RfPulsePortPanel._decode_inactive_composite_settings(entry),
                     "phase_parameters": [asdict(parameter) for parameter in spec.phase_parameters],
                     "global_amplitude_mode": spec.global_amplitude_mode,
                     "global_amplitude_parameter": spec.global_amplitude_parameter,
@@ -16653,9 +16995,6 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             raise ValueError(
                 f"cross-capacitance matrix must be a finite {expected_shape} array"
             )
-        if not np.allclose(np.diag(matrix), 1.0, rtol=0.0, atol=1.0e-12):
-            raise ValueError("cross-capacitance diagonal entries must equal 1")
-
         raw_sweeps = awg.get("sweeps", [])
         if not isinstance(raw_sweeps, list):
             raise TypeError("AWG sweeps must be a JSON array")
@@ -17399,6 +17738,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "global_frequency_parameter": spec.global_frequency_parameter,
                 "amplitude_parameters": [asdict(parameter) for parameter in spec.amplitude_parameters],
                 "amplitude_parameter_banks": RfPulsePortPanel._decode_amplitude_parameter_banks(entry),
+                **RfPulsePortPanel._decode_inactive_composite_settings(entry),
                 "phase_parameters": [asdict(parameter) for parameter in spec.phase_parameters],
                 "global_amplitude_mode": spec.global_amplitude_mode,
                 "global_amplitude_parameter": spec.global_amplitude_parameter,
@@ -17669,6 +18009,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
         return {
             "pulses": pulses,
+            "sweep_grouping": SweepGroupingModel.from_dict(data.get("sweep_grouping")).to_dict(),
             "cross_capacitance": matrix,
             "sweeps": sweeps,
             "time_unit": time_unit,
@@ -17753,6 +18094,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         """Apply a fully validated settings object to all GUI panels."""
         validate_awg_output_channels(self._qick_configuration, settings["awg_channels"])
         self._bias_panel.prepare_for_settings_load()
+        self._sweep_grouping = SweepGroupingModel()
+        self._experiment_panel.sweep_grouping = self._sweep_grouping
         pulses = settings["pulses"]
         self._sweep_specs = []
         while len(self._pulse) > len(pulses):
@@ -17823,6 +18166,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._rf_pulse_spec = self._rf_pulse_specs[0] if self._rf_pulse_specs else None
         self._square_dds_panel.load_settings(settings.get("square_pulse", {}))
         self._sync_square_rc_settings()
+        self._sweep_grouping = SweepGroupingModel.from_dict(settings.get("sweep_grouping"))
+        self._experiment_panel.sweep_grouping = self._sweep_grouping
+        self._sync_sweep_grouping(accept_count_edits=False)
         self._experiment_panel.set_sweep_specs(
             self._active_map_sweep_specs(),
             selected_keys=settings["sweep_map_axes"],
@@ -18144,6 +18490,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._refresh_rf_timeline(fit_view=True)
         self._refresh_sweep_overlay(fit_view=True, sync_rows=True)
+        settings["sweep_groups"] = self._compiler_sweep_groups()
+        settings["sweep_parameter_ids"] = self._compiler_sweep_parameter_ids()
         return settings
 
     def _generate_qick_pulse(self) -> None:
@@ -18201,6 +18549,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse,
                 output_names=self._qick_output_names(),
                 **sequence_settings,
+                rf_pulse_specs=tuple(self._rf_pulse_specs),
+                sweep_groups=self._compiler_sweep_groups(),
+                sweep_parameter_ids=self._compiler_sweep_parameter_ids(),
                 **self._dac_scale_arguments(settings["awg_channels"]),
             )
             # FineTuneSequence defaults to first/middle/last sweep points,

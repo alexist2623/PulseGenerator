@@ -195,6 +195,22 @@ class AwgSweepMapSource:
     source_label: str = ""
     database_path: str = ""
     run_id: int = 0
+    sweep_groups: Tuple[Mapping[str, Any], ...] = ()
+
+
+def _correlated_members(groups, column):
+    for group in groups:
+        if column in group["member_indices"]:
+            return tuple(group["member_indices"])
+    return (column,)
+
+
+def _independent_axis_pair(count, groups):
+    first_members = _correlated_members(groups, 0)
+    for column in range(1, count):
+        if column not in first_members:
+            return 0, column
+    raise ValueError("a 2D map requires two independent sweep groups")
 
 
 @dataclass(frozen=True)
@@ -285,6 +301,7 @@ def _stored_sweep_axes(
     axes = tuple(axis for axis in raw_axes if isinstance(axis, Mapping))
     if len(axes) < 2:
         raise ValueError("a saved AWG 2D map requires at least two sweep axes")
+    _independent_axis_pair(len(axes), layout.get("sweep_groups", ()))
     return axes
 
 
@@ -327,7 +344,9 @@ def _stored_selected_axes(
 ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Resolve the X/Y axes selected when the QCoDeS run was saved."""
     axes = _stored_sweep_axes(metadata)
+    groups = metadata.get("measurement_layout", {}).get("sweep_groups", ())
     by_key = {_stored_axis_key(axis): axis for axis in axes}
+    by_index = {_stored_axis_key(axis): index for index, axis in enumerate(axes)}
     gui_settings = metadata.get("gui_settings", {})
     experiment_settings = (
         gui_settings.get("experiment", {})
@@ -358,9 +377,11 @@ def _stored_selected_axes(
         len(requested) == 2
         and requested[0] != requested[1]
         and all(key in by_key for key in requested)
+        and by_index[requested[1]] not in _correlated_members(groups, by_index[requested[0]])
     ):
         return by_key[requested[0]], by_key[requested[1]]
-    return axes[0], axes[1]
+    x_column, y_column = _independent_axis_pair(len(axes), groups)
+    return axes[x_column], axes[y_column]
 
 
 def _is_awg_sweep_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -616,6 +637,7 @@ def awg_sweep_result_from_stored_arrays(
     )
     ddr_result = SimpleNamespace(
         sweep_axes=tuple(axis_objects),
+        sweep_groups=tuple(layout.get("sweep_groups", ())),
         sweep_points=np.column_stack(coordinate_columns),
         iq=iq,
         sample_rate_hz=sample_rate_hz,
@@ -899,6 +921,13 @@ def reduce_awg_sweep_map(
             "selected AWG map axes are not present in the acquired sweep"
         ) from exc
 
+    groups = tuple(getattr(ddr_result, "sweep_groups", ()))
+    x_members = _correlated_members(groups, x_column)
+    y_members = _correlated_members(groups, y_column)
+    if y_column in x_members:
+        raise ValueError("X and Y must use independent sweep groups; these parameters share one index")
+    selected_members = set(x_members) | set(y_members)
+
     iq = np.asarray(result_iq_in_input_units(ddr_result) if iq_values is None else iq_values)
     if iq.ndim != 4 or iq.shape[-1] != 2:
         raise ValueError(
@@ -926,6 +955,8 @@ def reduce_awg_sweep_map(
                 raise ValueError("X and Y sweep axes cannot also be fixed")
             if key not in axis_keys:
                 raise ValueError(f"fixed AWG sweep axis {key!r} is not present")
+            if axis_keys.index(key) in selected_members:
+                raise ValueError("a member of the X/Y sweep group cannot also be fixed")
             value = float(raw_value)
             if not np.isfinite(value):
                 raise ValueError("fixed AWG sweep values must be finite")
@@ -934,6 +965,7 @@ def reduce_awg_sweep_map(
     if source is None:
         source = AwgSweepMapSource(
             sweep_axes=axes,
+            sweep_groups=groups,
             sweep_points=coordinates,
             iq_values=iq,
             full_scale_mv=full_scale_mv,
@@ -1013,8 +1045,10 @@ def reduce_awg_sweep_map(
         sweep_axis_label(axis)
         for index, axis in enumerate(axes)
         if (
-            index not in (x_column, y_column)
+            index not in selected_members
             and axis_keys[index] not in normalized_fixed
+            and index == _correlated_members(groups, index)[0]
+            and not any(axis_keys[i] in normalized_fixed for i in _correlated_members(groups, index))
         )
     )
     ordered_fixed_axis_values = tuple(
@@ -1075,6 +1109,7 @@ def reduce_awg_sweep_source(
     """Reproject one retained Cartesian acquisition without reacquiring it."""
     ddr_result = SimpleNamespace(
         sweep_axes=source.sweep_axes,
+        sweep_groups=source.sweep_groups,
         sweep_points=source.sweep_points,
         iq=source.iq_values,
         sample_rate_hz=source.sample_rate_hz,
@@ -1321,8 +1356,11 @@ if pg is not None:
                 desired[0] not in keys
                 or desired[1] not in keys
                 or desired[0] == desired[1]
+                or keys.index(desired[1]) in _correlated_members(
+                    self._source.sweep_groups, keys.index(desired[0]))
             ):
-                desired = (keys[0], keys[1])
+                first, second = _independent_axis_pair(len(keys), self._source.sweep_groups)
+                desired = (keys[first], keys[second])
 
             self._updating_axis_controls = True
             try:
@@ -1367,9 +1405,15 @@ if pg is not None:
                 self._source.sweep_points,
                 dtype=np.float64,
             )
+            keys = tuple(sweep_axis_key(axis) for axis in self._source.sweep_axes)
+            selected_members = set()
+            for key in selected:
+                if key in keys:
+                    selected_members.update(_correlated_members(self._source.sweep_groups, keys.index(key)))
             for column, axis in enumerate(self._source.sweep_axes):
                 key = sweep_axis_key(axis)
-                if key in selected:
+                if (column in selected_members or
+                        column != _correlated_members(self._source.sweep_groups, column)[0]):
                     continue
                 label = QtWidgets.QLabel(sweep_axis_label(axis), self.slice_widget)
                 combo = QtWidgets.QComboBox(self.slice_widget)

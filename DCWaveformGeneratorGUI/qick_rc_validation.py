@@ -6,12 +6,21 @@ import numpy as np
 
 
 def sweep_corners(sequence):
-    """Return only the Cartesian endpoints (four points for a 2-D sweep)."""
-    shape = tuple(int(axis.count) for axis in sequence.sweep_axes)
-    if not shape:
+    """Check independent endpoints and shared duration coordinates."""
+    if not sequence.sweep_axes:
         return (0,)
+    shape = sequence.sweep_shape
+    conditioned = set()
+    # Correlated duration/voltage changes can have an interior area extremum.
+    # Check each shared duration index rather than assuming independent corners.
+    for group in sequence.sweep_groups:
+        if len(group['member_indices']) > 1 and any(
+                'duration' in sequence.sweep_axes[i].axis_kind
+                for i in group['member_indices']):
+            conditioned.add(int(group['loop_axis_index']))
     return tuple(int(np.ravel_multi_index(index, shape)) for index in product(
-        *((0,) if count == 1 else (0, count - 1) for count in shape)))
+        *(range(count) if i in conditioned else (0,) if count == 1 else (0, count - 1)
+          for i, count in enumerate(shape))))
 
 
 def interval_extrema(intervals, inverse_tau):

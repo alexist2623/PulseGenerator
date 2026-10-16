@@ -84,7 +84,9 @@ def test_hardware_sweep_pattern_selection_and_outer_reset(first, last, count):
             cursor += commands
     assert cursor == len(decoded)
     table = [t for t in program._rf_point_tables if t.get('fine_row')]
-    assert len(table)==1 and len(table[0]['values'])==count*6
+    assert table == []
+    assert len(program._fine_accumulators) == 1
+    assert len(program._fine_axis_field_keys[1]) == 3
     assert len(program.envelopes[0]['envs'])==16
 
 
@@ -92,7 +94,7 @@ def test_no_pmem_unrolling_and_frequency_cross_axis():
     small, _ = execute(48000,48015,16, freq_sweep=True)
     large, _ = execute(48000,48099,100, freq_sweep=True)
     assert len(small.binprog) == len(large.binprog)
-    assert len(large._runtime_dmem_words) == 100*6+2
+    assert len(small._runtime_dmem_words) == len(large._runtime_dmem_words) == 2
 
 
 @pytest.mark.parametrize('gain', [16384,-16384,32766])
@@ -177,10 +179,11 @@ def test_many_composite_events_do_not_emit_unused_startup_register_writes():
 
 def test_short_family_emits_no_phantom_tail_instructions():
     program, _ = execute(81, 95, 15, reps=1)
-    assert not any('ending pattern' in item.get('comment', '')
-                   or 'tail complete' in item.get('comment', '')
-                   or 'no second command' in item.get('comment', '')
-                   for item in program.prog_list)
+    assert not any('ending pattern' in comment
+                   or 'tail complete' in comment
+                   or 'no second command' in comment
+                   for item in program.prog_list
+                   for comment in (item.get('comment') or '',))
 
 
 def test_long_hardware_sweep_tail_reuses_carrier_and_exact_row_registers():

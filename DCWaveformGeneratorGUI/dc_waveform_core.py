@@ -36,7 +36,7 @@ DEFAULT_BIAS_T_FILTER_TAU_US = 100.0
 BIAS_T_COMPENSATION_MODES = ("fixed_voltage", "fixed_time")
 BIAS_T_COMPENSATION_TYPES = ("dc", "filter", "dc_rc")
 RF_SEGMENT_LENGTH_MODES = ("fixed", "extend_by_rf_duration")
-RF_PREDEFINED_COMPOSITE_TEMPLATES = ("custom", "cpmg", "udd", "hahn_echo")
+RF_PREDEFINED_COMPOSITE_TEMPLATES = ("custom", "cpmg", "udd", "hahn_echo", "ramsey")
 MAX_QICK_OUTPUTS = 8
 QICK_OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
 QICK_INPUT_BOARD_TYPES = ("RF_In", "DC_In")
@@ -320,8 +320,6 @@ def _coerce_cross_capacitance(matrix, output_count: int) -> Tuple[Tuple[float, .
         )
     if not np.all(np.isfinite(values)):
         raise ValueError("cross-capacitance coefficients must be finite")
-    if not np.allclose(np.diag(values), 1.0, rtol=0.0, atol=1.0e-12):
-        raise ValueError("cross-capacitance diagonal entries must equal 1")
     return tuple(tuple(float(value) for value in row) for row in values)
 
 
@@ -400,7 +398,7 @@ def build_predefined_composite_items(
     amplitude_parameter: str = "",
     phase_parameter: str = "",
 ) -> Tuple["QickRfCompositeItemSpec", ...]:
-    """Build CPMG, UDD, or Hahn echo pulse/delay entries.
+    """Build the body of a CPMG, UDD, Hahn echo, or Ramsey sequence.
 
     CPMG ``tau_us`` is the free-evolution interval; the edge intervals are
     ``tau/2``.  UDD ``tau_us`` is the complete free-evolution window and uses
@@ -409,10 +407,12 @@ def build_predefined_composite_items(
     evolution intervals.
     Hahn echo has one pi pulse between two ``tau/2`` delays, with ``tau_us``
     specifying its total free-evolution time.
+    Ramsey has only the ``tau_us`` free-evolution delay here; its required
+    pi/2 endpoints are supplied by :class:`QickRfPulseSpec`.
     """
     template = str(template).strip().lower()
-    if template not in {"cpmg", "udd", "hahn_echo"}:
-        raise ValueError("predefined RF template must be 'cpmg', 'udd', or 'hahn_echo'")
+    if template not in {"cpmg", "udd", "hahn_echo", "ramsey"}:
+        raise ValueError("predefined RF template must be 'cpmg', 'udd', 'hahn_echo', or 'ramsey'")
     n_pulses = _positive_int(n_pulses, "predefined RF pulse count N")
     if template == "hahn_echo":
         n_pulses = 1
@@ -428,6 +428,11 @@ def build_predefined_composite_items(
         phase_degrees,
         "predefined RF phase_degrees",
     )
+
+    if template == "ramsey":
+        return (QickRfCompositeItemSpec(
+            kind="delay", name="Ramsey_delay", duration_us=float(tau_us),
+        ),)
 
     if template == "hahn_echo":
         free_intervals = [tau_us / 2.0, tau_us / 2.0]
@@ -854,12 +859,15 @@ class QickRfPulseSpec:
         predefined_template = str(self.predefined_template).strip().lower()
         if predefined_template not in RF_PREDEFINED_COMPOSITE_TEMPLATES:
             raise ValueError(
-                "RF predefined_template must be custom, cpmg, udd, or hahn_echo"
+                "RF predefined_template must be custom, cpmg, udd, hahn_echo, or ramsey"
             )
         object.__setattr__(self, "predefined_template", predefined_template)
-        if predefined_template == "hahn_echo":
+        if predefined_template in {"hahn_echo", "ramsey"}:
             object.__setattr__(self, "predefined_n", 1)
             object.__setattr__(self, "predefined_n_sweep_enabled", False)
+        if predefined_template == "ramsey":
+            object.__setattr__(self, "t2_initial_pi2", True)
+            object.__setattr__(self, "t2_final_pi2", True)
         if pulse_mode == "composite" and any(
             item.kind == "pulse" and not item.duration_parameter
             for item in items
@@ -2225,6 +2233,8 @@ def build_qick_sequence(
     dac_current_settings=None,
     sweep: Optional[QickSweepAxisSpec] = None,
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
+    sweep_groups=None,
+    sweep_parameter_ids=None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
@@ -2386,6 +2396,9 @@ def build_qick_sequence(
                 stop_dbm=rf_spec.power_sweep_stop_dbm,
                 count=rf_spec.power_sweep_count,
             )
+    if sweep_groups:
+        sequence.set_sweep_groups(sweep_groups)
+    sequence.sweep_parameter_ids = dict(sweep_parameter_ids or {})
     sequence._validate()
     from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges
     validate_channel_voltage_ranges(sequence)
@@ -2540,6 +2553,8 @@ def generate_qick_program_code(
     repetitions_per_sweep: Integral = 1,
     sweep: Optional[QickSweepAxisSpec] = None,
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
+    sweep_groups=None,
+    sweep_parameter_ids=None,
     cross_capacitance=None,
     rf_pulse_spec: Optional[QickRfPulseSpec] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
@@ -2852,6 +2867,10 @@ def generate_qick_program_code(
                     "    )",
                 ]
             )
+    if sweep_groups:
+        lines.append(f"    sequence.set_sweep_groups({dict(sweep_groups)!r})")
+    if sweep_parameter_ids:
+        lines.append(f"    sequence.sweep_parameter_ids = {dict(sweep_parameter_ids)!r}")
     if square_pulse_settings is not None or output_trigger_settings is not None:
         from qick_square_dds import OutputTriggerConfig
         OutputTriggerConfig(**(output_trigger_settings or {}))

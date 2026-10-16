@@ -1,11 +1,12 @@
 """Opt-in RF sample-width compiler using the existing SGv6 envelope memory.
 
-Sixteen reusable ending patterns are uploaded once. Hardware sweep pointers
-select command words and exact timestamps, never a host loop or PMEM unroll.
+Sixteen reusable ending patterns are uploaded once. Hardware registers derive
+sample counts, command words and timestamps without per-point duration tables.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from itertools import product
 from math import ceil, isclose
 from numbers import Integral
@@ -15,6 +16,9 @@ import numpy as np
 SAMPLES_PER_CLOCK = 16
 PATTERN_SAMPLES = 128
 MAX_FINE_GAIN = 16383
+FRACTION_BITS = 60
+FRACTION_LIMB_BITS = 30
+FRACTION_LIMB = 1 << FRACTION_LIMB_BITS
 
 
 def samples_from_us(duration_us, fabric_mhz):
@@ -74,7 +78,79 @@ def ending_patterns(maxv=32766):
     return tuple(result)
 
 
+@dataclass(frozen=True)
+class SampleAccumulator:
+    """Constant-size sample staircase, verified against the public quantizer.
+
+    N is the current output sample count. Two unsigned 30-bit limbs carry the
+    sub-sample remainder; every intermediate limb sum fits signed 32 bits.
+    The finite requested sweep is checked exhaustively before code emission,
+    so fractional rounding can never silently change a requested sample.
+    """
+    initial_samples: int
+    initial_low: int
+    initial_high: int
+    step_samples: int
+    step_low: int
+    step_high: int
+    count: int
+
+    def samples_at(self, index):
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        fraction = self.initial_low + (self.initial_high << FRACTION_LIMB_BITS)
+        step = self.step_low + (self.step_high << FRACTION_LIMB_BITS)
+        return self.initial_samples + index * self.step_samples + ((fraction + index * step) >> FRACTION_BITS)
+
+
+def sample_accumulator(duration_points, fabric_mhz):
+    """Represent the existing ceil/snap quantization, including descending axes.
+
+    A fixed-point slope is used only if a common initial remainder reproduces
+    *every* public quantizer result. The intersection calculation below is an
+    exact integer proof, not a tolerance comparison or per-point lookup table.
+    CPU validation data is not stored in FPGA PMEM/DMEM.
+    """
+    points = tuple(float(v) for v in duration_points)
+    if not points:
+        raise ValueError('fine RF duration sweep has no points')
+    values = tuple(samples_from_us(v, fabric_mhz) for v in points)
+    if max(values) >= 1 << 31:
+        raise ValueError('fine RF duration sample count must fit a positive signed 32-bit register')
+    scale = 1 << FRACTION_BITS
+    rate = Fraction.from_float(float(fabric_mhz) * SAMPLES_PER_CLOCK)
+    if len(points) == 1:
+        slope = 0
+    else:
+        delta = (Fraction.from_float(points[-1]) - Fraction.from_float(points[0])) * rate
+        slope = round(delta * scale / (len(points) - 1))
+    lower = max((n - 1) * scale - i * slope for i, n in enumerate(values))
+    upper = min(n * scale - 1 - i * slope for i, n in enumerate(values))
+    if lower > upper:
+        raise ValueError('fine RF duration quantization is not an exact affine sample staircase')
+    # Choosing the interval midpoint keeps the proof away from either boundary.
+    initial = (lower + upper) // 2
+    whole, fraction = divmod(initial, scale)
+    step_whole, step_fraction = divmod(slope, scale)
+    result = SampleAccumulator(whole + 1, fraction & (FRACTION_LIMB - 1),
+        fraction >> FRACTION_LIMB_BITS, step_whole,
+        step_fraction & (FRACTION_LIMB - 1), step_fraction >> FRACTION_LIMB_BITS, len(values))
+    assert tuple(result.samples_at(i) for i in range(len(values))) == values
+    return result
+
+
 class FineRfDurationProgramMixin:
+    def _fine_axis_representative(self, index):
+        helper = getattr(self.sequence, 'axis_representative', None)
+        return int(helper(index)) if helper is not None else int(index)
+
+    def _fine_expanded_coordinate(self, selected_axes, selected):
+        coordinates = [0] * len(self.sequence.sweep_axes)
+        chosen = dict(zip(selected_axes, selected))
+        for i in range(len(coordinates)):
+            coordinates[i] = chosen.get(self._fine_axis_representative(i), 0)
+        return coordinates
+
     def _configure_rf_pulse(self, rf_index, rf):
         if not rf.fine_duration:
             return super()._configure_rf_pulse(rf_index, rf)
@@ -113,6 +189,8 @@ class FineRfDurationProgramMixin:
         axis = self._rf_duration_axis(rf)
         samples = (tuple(samples_from_us(value, cfg['f_fabric']) for value in axis.points)
                    if axis is not None else (int(rf.duration_samples),))
+        if max(samples) >= 1 << 31:
+            raise ValueError('fine RF duration sample count must fit a positive signed 32-bit register')
         plans = tuple(plan_duration(value) for value in samples)
         frequency_axis = self._rf_frequency_axis(rf)
         frequency = rf.freq_mhz if frequency_axis is None else frequency_axis.points[0]
@@ -173,15 +251,16 @@ class FineRfDurationProgramMixin:
             extension = tuple(self._extension_axis_deltas(segment, include_current=False))
             preceding = [self._rf_duration_axis(rf.gen_ch, name) for name in rf.preceding_duration_parameters]
             preceding = [axis for axis in preceding if axis is not None]
-            relevant = sorted({i for i, delta in enumerate(extension) if delta and axes[i].count > 1}
+            dependent = ({i for i, delta in enumerate(extension) if delta and axes[i].count > 1}
                               | {axes.index(axis) for axis in preceding if axis.count > 1}
                               | ({axes.index(own_axis)} if own_axis is not None and own_axis.count > 1 else set()))
+            relevant = sorted({self._fine_axis_representative(i) for i in dependent})
             shape = tuple(int(axes[i].count) for i in relevant)
             base = int(self.aux_timing[f'rf_{index}_start'])
             rows, details = [], []
             manager = self._gen_mgrs[rf.gen_ch]
             for selected in product(*(range(count) for count in shape)):
-                coordinate = dict(zip(relevant, selected))
+                coordinate = dict(enumerate(self._fine_expanded_coordinate(relevant, selected)))
                 point = coordinate.get(axes.index(own_axis), 0) if own_axis is not None else 0
                 plan = runtime['plans'][point]
                 start = base + sum(coordinate.get(i, 0)*int(delta) for i, delta in enumerate(extension))
@@ -206,7 +285,10 @@ class FineRfDurationProgramMixin:
                 if rf.require_within_segment and start+plan.busy_cycles+latency > segment_end:
                     raise ValueError("fine RF padded waveform exceeds its HOLD segment at a hardware sweep point")
             self._fine_rf_rows[index] = dict(axis_indices=tuple(relevant), axis_shape=shape,
-                                            rows=tuple(rows), details=tuple(details))
+                                            rows=tuple(rows), details=tuple(details),
+                                            own_axis_index=axes.index(own_axis) if own_axis is not None else None,
+                                            preceding_axis_indices=tuple(axes.index(axis) for axis in preceding),
+                                            affine_start_base=base, affine_start_deltas=extension)
             self._dynamic_point_end = max(getattr(self, '_dynamic_point_end', self.timing['point_end']),
                 max(item['busy_end'] for item in details)+int(self.aux_timing.get(f'rf_{index}_output_latency', 0)))
             for kind, column in (('rf_start', 'start'), ('rf_stop', 'tail')):
@@ -216,20 +298,52 @@ class FineRfDurationProgramMixin:
         return tuple(models)
 
     def _build_rf_point_table_models(self, sweep_axes):
-        result = super()._build_rf_point_table_models(sweep_axes)
+        # Frequency/calibrated gain tables remain owned by the base compiler.
+        # Duration fields are derived from a constant-size accumulator instead.
+        return super()._build_rf_point_table_models(sweep_axes)
+
+    def _fine_register_fields(self):
+        fields = []
+        self._fine_accumulators = {}
+        self._fine_axis_field_keys = {}
+        axes = self.sequence.sweep_axes
+        zeros = tuple(0 for _ in axes)
         for index, info in getattr(self, '_fine_rf_rows', {}).items():
-            if not info['axis_indices']:
-                continue
             rf = self.rf_pulse_configs[index]
-            page, register = self._gen_regmap[(rf.gen_ch, 't')]
-            result.append(dict(key=('rf_point_table', index, 'fine_duration'), register_name='rf_fine_duration',
-                fine_row=True, row_width=6, gen_ch=rf.gen_ch, event_indices=(index,), page=int(page),
-                command_register=int(register), axis_indices=info['axis_indices'], axis_shape=info['axis_shape'],
-                values=tuple(value for row in info['rows'] for value in row)))
-        return result
+            page = int(self._gen_regmap[(rf.gen_ch, 't')][0])
+            members = set(info['preceding_axis_indices'])
+            if info['own_axis_index'] is not None:
+                members.add(info['own_axis_index'])
+            for member in sorted(members):
+                if axes[member].count <= 1 or member in self._fine_accumulators:
+                    continue
+                accumulator = sample_accumulator(axes[member].points, self.tproc_mhz)
+                self._fine_accumulators[member] = accumulator
+                keys = {}
+                for name, register_name, value in (
+                    ('samples', 'freq', accumulator.initial_samples),
+                    ('low', 'phase', accumulator.initial_low),
+                    ('high', 'gain', accumulator.initial_high),
+                ):
+                    key = ('fine_duration_state', member, name)
+                    keys[name] = key
+                    fields.append(dict(key=key, register_name='fine_duration_' + name,
+                        base=value, axis_deltas=zeros, page=page, gen_ch=rf.gen_ch,
+                        command_register=int(self._gen_regmap[(rf.gen_ch, register_name)][1])))
+                self._fine_axis_field_keys[member] = keys
+            deltas = info['affine_start_deltas']
+            fold = getattr(self.sequence, 'fold_axis_deltas', None)
+            if fold is not None:
+                deltas = tuple(fold(deltas))
+            if any(deltas):
+                fields.append(dict(key=('fine_start_affine', index), register_name='fine_start_affine',
+                    base=info['affine_start_base'], axis_deltas=deltas, page=page, gen_ch=rf.gen_ch,
+                    command_register=int(self._gen_regmap[(rf.gen_ch, 't')][1])))
+        return fields
 
     def _build_capture_compensation_models(self, event_models):
         fields = list(super()._build_capture_compensation_models(event_models))
+        fields.extend(self._fine_register_fields())
         fine = getattr(self, '_fine_rf_rows', {})
         if not fine or not self._overlap_dc_readout():
             return tuple(fields)
@@ -250,9 +364,53 @@ class FineRfDurationProgramMixin:
 
     def _build_sweep_register_plan(self):
         super()._build_sweep_register_plan()
-        for table in self._rf_point_tables:
-            if table.get('fine_row'):
-                table['axis_strides'] = {axis: stride*6 for axis, stride in table['axis_strides'].items()}
+
+    def _fine_load_state(self, key, destination):
+        field = self._sweep_field_by_key[key]
+        page = int(field['page'])
+        if field.get('storage') == 'dmem':
+            self.memri(page, destination, int(field['dmem_addr']), f'load fine arithmetic {key}')
+        else:
+            self.mathi(page, destination, int(field['state_register']), '+', 0, f'load fine arithmetic {key}')
+        return page
+
+    def _fine_store_state(self, key, source):
+        field = self._sweep_field_by_key[key]
+        page = int(field['page'])
+        if field.get('storage') == 'dmem':
+            self.memwi(page, source, int(field['dmem_addr']), f'store fine arithmetic {key}')
+        else:
+            self.mathi(page, int(field['state_register']), source, '+', 0, f'store fine arithmetic {key}')
+
+    def _emit_axis_adds(self, axis_index, *, reset=False):
+        super()._emit_axis_adds(axis_index, reset=reset)
+        for member, accumulator in getattr(self, '_fine_accumulators', {}).items():
+            if self._fine_axis_representative(member) != axis_index:
+                continue
+            keys = self._fine_axis_field_keys[member]
+            field = self._sweep_field_by_key[keys['samples']]
+            page, gen = int(field['page']), int(field['gen_ch'])
+            registers = [int(self._gen_regmap[(gen, name)][1]) for name in ('freq', 'phase', 'gain', 'mode')]
+            n, low, high, carry = registers
+            if reset:
+                for name, register, value in zip(('samples', 'low', 'high'), registers,
+                        (accumulator.initial_samples, accumulator.initial_low, accumulator.initial_high)):
+                    self.safe_regwi(page, register, value, 'reset fine duration accumulator')
+                    self._fine_store_state(keys[name], register)
+                continue
+            for name, register in zip(('samples', 'low', 'high'), registers):
+                self._fine_load_state(keys[name], register)
+            self.mathi(page, low, low, '+', accumulator.step_low, 'fine fractional low increment')
+            self.bitwi(page, carry, low, '>>', FRACTION_LIMB_BITS, 'fine low carry')
+            self.bitwi(page, low, low, '&', FRACTION_LIMB - 1, 'fine low remainder')
+            self.mathi(page, high, high, '+', accumulator.step_high, 'fine fractional high increment')
+            self.math(page, high, high, '+', carry, 'fine fractional carry propagation')
+            self.bitwi(page, carry, high, '>>', FRACTION_LIMB_BITS, 'fine sample carry')
+            self.bitwi(page, high, high, '&', FRACTION_LIMB - 1, 'fine high remainder')
+            self._emit_add_i32(page, n, accumulator.step_samples, 'fine whole-sample increment')
+            self.math(page, n, n, '+', carry, 'fine exact sample count')
+            for name, register in zip(('samples', 'low', 'high'), registers):
+                self._fine_store_state(keys[name], register)
 
     def _fine_details_at(self, index, coordinates):
         info = self._fine_rf_rows[index]
@@ -316,15 +474,14 @@ class FineRfDurationProgramMixin:
         events.sort(key=lambda event: event[:2])
         axes = self.sequence.sweep_axes
         relevant = set(i for info in self._fine_rf_rows.values() for i in info['axis_indices'])
-        relevant.update(i for model in models.values() for i, delta in enumerate(model['axis_deltas']) if delta)
+        relevant.update(self._fine_axis_representative(i) for model in models.values()
+                        for i, delta in enumerate(model['axis_deltas']) if delta)
         selected_axes = tuple(sorted(relevant))
         count = int(np.prod([axes[i].count for i in selected_axes], dtype=np.int64))
         if count > 1_000_000:
             raise ValueError("fine RF exact timing validation exceeds one million dependent coordinates")
         for selected in product(*(range(axes[i].count) for i in selected_axes)):
-            coordinates = [0]*len(axes)
-            for axis, value in zip(selected_axes, selected):
-                coordinates[axis] = value
+            coordinates = self._fine_expanded_coordinate(selected_axes, selected)
             previous = {}
             busy_by_gen = {}
             for base, _priority, channel, key, index in events:
@@ -361,19 +518,95 @@ class FineRfDurationProgramMixin:
                 previous[port] = (timestamp, key)
 
     def _fine_load_row(self, index, rf):
-        names = ('t', 'mode', 'addr', 'mode2', 'addr2', 'mode3')
         page = int(self._gen_regmap[(rf.gen_ch, 't')][0])
-        table = next((table for table in self._rf_point_tables_by_event[index] if table.get('fine_row')), None)
-        if table is None:
-            for name, value in zip(names[:3], self._fine_rf_rows[index]['rows'][0][:3]):
+        info = self._fine_rf_rows[index]
+        if not info['axis_indices']:
+            for name, value in zip(('t', 'mode', 'addr'), info['rows'][0][:3]):
                 self.safe_regwi(page, self._gen_regmap[(rf.gen_ch, name)][1], value, f'fine RF {name}')
+            return page
+        register = lambda name: int(self._gen_regmap[(rf.gen_ch, name)][1])
+        t, mode, addr, tail_mode, tail_t, n = map(register, ('t', 'mode', 'addr', 'mode2', 'addr2', 'mode3'))
+        temp, scratch = register('freq'), register('phase')
+        start_key = ('fine_start_affine', index)
+        if start_key in self._sweep_field_by_key:
+            self._fine_load_state(start_key, t)
         else:
-            pointer = int(table['pointer_register'])
-            for column, name in enumerate(names):
-                if column:
-                    self.mathi(page, pointer, pointer, '+', 1)
-                self.memr(page, self._gen_regmap[(rf.gen_ch, name)][1], pointer, f'load fine RF {name}')
-            self.mathi(page, pointer, pointer, '+', -5, 'restore fine RF row pointer')
+            self.safe_regwi(page, t, info['affine_start_base'], 'fine RF affine start')
+        axes = self.sequence.sweep_axes
+        for member in info['preceding_axis_indices']:
+            if axes[member].count <= 1:
+                continue
+            self._fine_load_state(self._fine_axis_field_keys[member]['samples'], temp)
+            self.mathi(page, temp, temp, '+', 15, 'preceding fine RF padded sample count')
+            self.bitwi(page, temp, temp, '>>', 4, 'preceding fine RF whole-clock span')
+            first = (samples_from_us(axes[member].points[0], self.tproc_mhz) + 15) // 16
+            self._emit_add_i32(page, temp, -first, 'preceding fine RF clock delta')
+            self.math(page, t, t, '+', temp, 'fine RF dependent start time')
+        member = info['own_axis_index']
+        if member in self._fine_axis_field_keys:
+            self._fine_load_state(self._fine_axis_field_keys[member]['samples'], n)
+        else:
+            self.safe_regwi(page, n, self._rf_runtime[index]['plans'][0].samples, 'fine RF constant sample count')
+        self.bitwi(page, mode, n, '>>', 4, 'fine RF q = N >> 4')
+        self.bitwi(page, addr, n, '&', 15, 'fine RF r = N & 15')
+        self.bitwi(page, addr, addr, '<<', 3, 'fine RF pattern word stride')
+        name = self._fine_rf_pattern_banks[rf.gen_ch][0]
+        bank = self.envelopes[rf.gen_ch]['envs'][name]['addr'] // 16
+        self._emit_add_i32(page, addr, int(bank) + 5, 'fine RF pattern base')
+        manager = self._gen_mgrs[rf.gen_ch]
+        product_mode = int(manager.get_mode_code(length=3, mode='oneshot', outsel='product', stdysel='zero', phrst=0)) & ~65535
+        dds_mode = int(manager.get_mode_code(length=3, mode='oneshot', outsel='dds', stdysel='zero', phrst=0)) & ~65535
+        periodic_mode = int(manager.get_mode_code(length=3, mode='periodic', outsel='dds', stdysel='zero', phrst=0))
+        prefix = f'FINE_RF_{index}_ARITH'
+        self.safe_regwi(page, temp, 6)
+        self.condj(page, mode, '>=', temp, prefix + '_LONG', 'q >= 6 uses DDS plateau')
+        # One padded product envelope for 1..95 active samples.
+        self.math(page, addr, addr, '-', mode, 'short fine RF address offset 5-q')
+        self.mathi(page, mode, n, '+', 15)
+        self.bitwi(page, mode, mode, '>>', 4)
+        self.safe_regwi(page, temp, 3)
+        self.condj(page, mode, '>=', temp, prefix + '_SHORT_LENGTH', 'short fine RF minimum three words')
+        self.safe_regwi(page, mode, 3)
+        self.label(prefix + '_SHORT_LENGTH')
+        self.bitwi(page, mode, mode, '|', product_mode, 'short fine RF product mode')
+        self.safe_regwi(page, tail_mode, product_mode | 3)
+        self.mathi(page, tail_t, t, '+', 0)
+        self.safe_regwi(page, n, 0, 'fine RF no tail flag')
+        self.condj(page, 0, '==', 0, prefix + '_DONE')
+        self.label(prefix + '_LONG')
+        self.mathi(page, mode, mode, '+', -3, 'fine RF plateau q-3')
+        self.safe_regwi(page, tail_mode, 3, 'fine RF normal tail word count')
+        self.safe_regwi(page, temp, 65535)
+        self.condj(page, mode, '<=', temp, prefix + '_ONESHOT', 'fine RF oneshot plateau limit')
+        # Modulo three without division or a point table. 2**even == 1 (mod3).
+        # For positive signed32 inputs these six folds leave a value in 0..4.
+        self.mathi(page, temp, mode, '+', 0)
+        for bits in (16, 8, 4, 2, 2, 2):
+            self.bitwi(page, scratch, temp, '>>', bits, 'fine RF modulo-three fold high')
+            self.bitwi(page, temp, temp, '&', (1 << bits) - 1, 'fine RF modulo-three fold low')
+            self.math(page, temp, temp, '+', scratch)
+        self.safe_regwi(page, scratch, 3)
+        self.condj(page, temp, '<', scratch, prefix + '_MOD3')
+        self.mathi(page, temp, temp, '+', -3)
+        self.label(prefix + '_MOD3')
+        self.math(page, mode, mode, '-', temp, 'fine RF periodic three-clock boundary')
+        self.math(page, tail_mode, tail_mode, '+', temp, 'fine RF remaining tail whole words')
+        self.math(page, tail_t, t, '+', mode, 'fine RF periodic tail timestamp')
+        self.safe_regwi(page, mode, periodic_mode, 'fine RF periodic DDS mode')
+        self.condj(page, 0, '==', 0, prefix + '_TAIL')
+        self.label(prefix + '_ONESHOT')
+        self.math(page, tail_t, t, '+', mode, 'fine RF oneshot tail timestamp')
+        self.bitwi(page, mode, mode, '|', dds_mode, 'fine RF oneshot DDS mode')
+        self.label(prefix + '_TAIL')
+        self.math(page, addr, addr, '-', tail_mode, 'fine RF address offset 5-tail words')
+        self.bitwi(page, temp, n, '&', 15, 'fine RF partial final word')
+        self.condj(page, temp, '==', 0, prefix + '_TAIL_LENGTH')
+        self.mathi(page, tail_mode, tail_mode, '+', 1)
+        self.label(prefix + '_TAIL_LENGTH')
+        self.bitwi(page, tail_mode, tail_mode, '|', product_mode, 'fine RF product tail mode')
+        self.safe_regwi(page, n, 1, 'fine RF active tail flag')
+        self.label(prefix + '_DONE')
+        self.mathi(page, n, n, '+', 0, 'fine RF arithmetic registers ready')
         return page
 
     def _fine_configure_event(self, index, rf):
@@ -462,6 +695,9 @@ class FineRfDurationProgramMixin:
                 amplitude_scaling='DDS plateau gain; product ending pattern uses twice gain with integer truncation',
                 timing_scope='sample-granular width; starts remain generator-fabric-clock aligned',
                 duration_quantization='ceil to sample; snap grid points within half 1e-9 us display precision plus floating-point ULPs',
+                duration_configuration='60-bit fractional register accumulator; q/r shifts and masks; no duration point table',
+                duration_state_fields=3 * len(self._fine_accumulators),
+                duration_table_words=0,
                 row_axis_indices=self._fine_rf_rows[index]['axis_indices']))
         if fine:
             result['rf_fine_duration'] = tuple(fine)

@@ -3692,7 +3692,7 @@ def test_older_settings_apply_defaults_and_resave_as_current(tmp_path):
 
     upgraded_path = window._save_settings_json(tmp_path / "settings_upgraded")
     upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
-    assert upgraded["version"] == gui.SETTINGS_VERSION == 45
+    assert upgraded["version"] == gui.SETTINGS_VERSION == 46
     assert upgraded["qick"]["awg_metadata_mode"] == "parametric"
     assert upgraded["qick"]["iq_storage_mode"] == IQ_STORAGE_FULL_TRACES
     assert upgraded["qick"]["compile_validation_mode"] == "boundary"
