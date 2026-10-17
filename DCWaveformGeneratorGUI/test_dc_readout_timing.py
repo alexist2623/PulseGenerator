@@ -67,13 +67,21 @@ def signed(word):
     return v - 2**32 if v >= 2**31 else v
 
 
+def measurement_readouts(p, m):
+    commands = [e for e in m.output_events if e.tproc_ch == 2]
+    assert p.readout_initialization['ro_ch'] == 0
+    assert commands[0].cycle < commands[1].cycle
+    assert (commands[0].word >> 64) & 0xffff == 3
+    return commands[1:]  # Initialization does not trigger an acquisition.
+
+
 @pytest.mark.parametrize('policy', ['after_readout', 'overlap_readout'])
 @pytest.mark.parametrize('mode', ['fixed_time', 'fixed_voltage'])
 @pytest.mark.parametrize('rc', [False, True])
 @pytest.mark.parametrize('samples', [1, 4, 6, 12])
 def test_capture_boundaries_and_repeats(policy, mode, rc, samples):
     p, m = execute(policy, mode=mode, rc=rc, samples=samples)
-    readouts = [e for e in m.output_events if e.tproc_ch == 2]
+    readouts = measurement_readouts(p, m)
     assert len(readouts) == 2
     capture_offset = p.aux_timing['ddr_capture_end']
     for index, ro in enumerate(readouts):
@@ -110,7 +118,7 @@ def test_capture_boundaries_and_repeats(policy, mode, rc, samples):
 @pytest.mark.parametrize('sweep', ['voltage', 'ramp', 'hold', 'rf'])
 def test_swept_end_and_capture_registers_follow_both_axes(mode, sweep):
     p, m = execute('overlap_readout', mode=mode, sweep=sweep)
-    readouts = [e for e in m.output_events if e.tproc_ch == 2]
+    readouts = measurement_readouts(p, m)
     assert len(readouts) == 24
     starts = []
     for shot, ro in enumerate(readouts):
@@ -137,7 +145,7 @@ def test_swept_end_and_capture_registers_follow_both_axes(mode, sweep):
 @pytest.mark.parametrize('mode', ['fixed_time', 'fixed_voltage'])
 def test_zero_area_still_waits_for_capture(mode):
     p, m = execute('overlap_readout', mode=mode, zero=True)
-    readouts = [e for e in m.output_events if e.tproc_ch == 2]
+    readouts = measurement_readouts(p, m)
     assert readouts[1].cycle-readouts[0].cycle >= p.aux_timing['ddr_capture_end']
     assert all(signed(e.word) == 0 for e in m.output_events
                if e.tproc_ch in (0, 1) and not e.word & (1 << 149))

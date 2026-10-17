@@ -103,6 +103,11 @@ except ImportError:
     from fir_ddr_profile import resolve_fir_ddr_profile
     from power_calibration import CalibrationDatabase, MAX_DMEM_GAIN_ENTRIES
 
+try:
+    from .qick_program_cache import build_cached_program, save_execution_snapshot
+except ImportError:
+    from qick_program_cache import build_cached_program, save_execution_snapshot
+
 
 def _runtime_types():
     try:
@@ -1040,7 +1045,7 @@ def build_qick_program(
     if cancel_check is not None:
         program_kwargs["cancel_check"] = cancel_check
     _check_cancel(cancel_check)
-    return sequence.make_program(soccfg, **program_kwargs)
+    return build_cached_program(soccfg, sequence, program_kwargs)
 
 
 def _rf_output_details(
@@ -1226,6 +1231,10 @@ def configure_rf_board(
 
 def _cache_execution_coordinates(program, cancel_check=None) -> None:
     """Snapshot v5 command coordinates before acquisition can start."""
+    if (getattr(program, "_compile_cache_coordinates_saved", False)
+            and getattr(program, "_execution_coordinate_snapshot", None) is not None):
+        _check_cancel(cancel_check)
+        return
     channels = tuple(getattr(program, "awg_channels", ()))
     if not channels or not all(
         program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4")
@@ -1243,6 +1252,9 @@ def _cache_execution_coordinates(program, cancel_check=None) -> None:
 
 def _program_summary_with_coordinates(program) -> Mapping[str, Any]:
     summary = dict(program.summary())
+    cache_info = getattr(program, "compile_cache_info", None)
+    if cache_info is not None:
+        summary["compile_cache"] = dict(cache_info)
     programs = getattr(program, "programs", None)
     if programs is None:
         snapshot = getattr(program, "_execution_coordinate_snapshot", None)
@@ -1336,11 +1348,13 @@ def _execute_qick_sequence_once(
     )
     _check_cancel(cancel_check)
     _cache_execution_coordinates(program, cancel_check)
+    save_execution_snapshot(program)
+    cache_hit = getattr(program, "compile_cache_info", {}).get("status") == "hit"
     _emit_experiment_event(
         event_callback,
         "compile",
         "completed",
-        "tProcessor program compiled",
+        "Reused cached tProcessor program" if cache_hit else "tProcessor program compiled",
     )
     sweep_point_count = int(getattr(
         sequence,

@@ -46,11 +46,13 @@ import numpy as np
 from qick.averager_program import RAveragerProgram
 
 try:
+    from .qick_readout_timing import configure_readout, initialize_readout, READOUT_COMMAND_CYCLES
     from .fir_ddr_profile import resolve_fir_ddr_profile
     from .qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from .qick_output_triggers import OutputTriggerProgramMixin
     from .qick_rf_fine_duration import FineRfDurationProgramMixin
 except ImportError:
+    from qick_readout_timing import configure_readout, initialize_readout, READOUT_COMMAND_CYCLES
     from fir_ddr_profile import resolve_fir_ddr_profile
     from qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from qick_output_triggers import OutputTriggerProgramMixin
@@ -840,7 +842,7 @@ class DdrFirReadoutConfig:
     readout_freq_mhz: float = 0.0
     trigger_delay_tproc_cycles: int = 0
     trigger_width_tproc_cycles: int = 12
-    readout_period_cycles: int = 65535
+    readout_period_cycles: int = READOUT_COMMAND_CYCLES
     margin_input_samples: int = 1024
     address: int = 0
     stride_bytes: Optional[int] = None
@@ -867,6 +869,9 @@ class DdrFirReadoutConfig:
         period = _require_int(self.readout_period_cycles, "readout_period_cycles", 1)
         if period > 65535:
             raise ValueError("readout_period_cycles must fit in 16 bits")
+        # Accept saved legacy settings, but no longer let command duration
+        # obstruct a later frequency change. Capture size is independent.
+        object.__setattr__(self, "readout_period_cycles", READOUT_COMMAND_CYCLES)
         _require_int(self.margin_input_samples, "margin_input_samples", 0)
         _require_int(self.address, "address", 0)
         if self.stride_bytes is not None:
@@ -2921,7 +2926,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                             / float(ro_cfg["f_dds"])
                         )
                     ) % (1 << b_dds)
-            self.set_readout_registers(
+            configure_readout(self,
                 ch=ro.ro_ch,
                 freq=freq_word,
                 length=ro.length,
@@ -5238,11 +5243,11 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 round(float(ddr.readout_freq_mhz) * (1 << b_dds) / float(ro_cfg["f_dds"]))
             )
             freq_word %= 1 << b_dds
-        self.set_readout_registers(
+        configure_readout(self,
             ch=ddr.ro_ch,
             freq=freq_word,
             length=ddr.readout_period_cycles,
-            mode="periodic",
+            mode="oneshot",
             phrst=0,
         )
         trigger_delay_samples = (
@@ -7248,6 +7253,9 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         rcount = 13
         rrep = 15
         self.initialize()
+        ro = self.ddr_readout_config or self.readout_config
+        if ro is not None:
+            initialize_readout(self, ro.ro_ch)
         if any(self.soccfg["gens"][ch].get("rc_precomp_version", 0) for ch in self.awg_channels):
             self.synci(200)
             self._initialize_rc_compensation()

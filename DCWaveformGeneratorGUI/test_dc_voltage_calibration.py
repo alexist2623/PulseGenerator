@@ -126,7 +126,7 @@ def test_dc_calibration_program_fixes_readout_frequency_to_zero():
     assert program.sequence.segments[-1].amplitudes == (0.0,)
 
 
-def test_dc_calibration_supports_long_periodic_fir_capture():
+def test_dc_calibration_supports_long_capture_with_minimum_readout_command():
     config = DcVoltageCalibrationConfig(
         database_path="calibration.db",
         output_ch=0,
@@ -140,7 +140,7 @@ def test_dc_calibration_supports_long_periodic_fir_capture():
     )
 
     assert program.ddr_readout_config.samples_per_trigger == 1_000_000
-    assert program.ddr_readout_config.readout_period_cycles == 65535
+    assert program.ddr_readout_config.readout_period_cycles == 3
     assert program.summary()["point_end_tproc_cycles"] < (1 << 31)
 
     with pytest.raises(ValueError, match="samples_per_point must be <="):

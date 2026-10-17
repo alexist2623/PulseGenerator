@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional, Tuple
 import numpy as np
 
 try:
+    from .qick_readout_timing import configure_readout, initialize_readout, READOUT_COMMAND_CYCLES
     from .dc_waveform_core import QickDdrReadoutSpec
     from .fir_ddr_profile import resolve_fir_ddr_profile
     from .qick_qcodes_experiment import (
@@ -25,6 +26,7 @@ try:
         connect_qick,
     )
 except ImportError:
+    from qick_readout_timing import configure_readout, initialize_readout, READOUT_COMMAND_CYCLES
     from dc_waveform_core import QickDdrReadoutSpec
     from fir_ddr_profile import resolve_fir_ddr_profile
     from qick_qcodes_experiment import (
@@ -229,13 +231,14 @@ def build_noise_fir_program(soccfg: Any, config: NoiseAcquisitionConfig):
                     * (1 << b_dds)
                     / float(readout_cfg["f_dds"])
                 )) % (1 << b_dds)
-            self.set_readout_registers(
+            configure_readout(self,
                 ch=config.ro_ch,
                 freq=freq_word,
-                length=65535,
-                mode="periodic",
+                length=READOUT_COMMAND_CYCLES,
+                mode="oneshot",
                 phrst=0,
             )
+            initialize_readout(self, config.ro_ch)
 
         def body(self):
             self.readout(ch=config.ro_ch, t=0)

@@ -2051,7 +2051,8 @@ def test_avg_buffer_cartesian_sweep_and_repetitions_are_tprocessor_loops():
     assert summary["avg_buffer_readout"] is True
     assert summary["acquisition_source"] == "avg_buffer"
     assert sum(event.tproc_ch == 0 for event in tproc.output_events) == 48
-    assert sum(event.tproc_ch == 1 for event in tproc.output_events) == 24
+    # One pre-loop initialization plus the 24 measurement readout commands.
+    assert sum(event.tproc_ch == 1 for event in tproc.output_events) == 25
     assert tproc.timing_conflicts == []
 
 

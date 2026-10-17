@@ -375,7 +375,6 @@ def build_dc_voltage_calibration_program(
         at_segment="dc_calibration",
         readout_freq_mhz=0.0,
         trigger_delay_tproc_cycles=trigger_delay,
-        readout_period_cycles=65535,
         margin_input_samples=int(config.margin_input_samples),
         fpga_trigger_delay_samples=(
             fpga_trigger_delay_value

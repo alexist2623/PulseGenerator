@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 try:
+    from .qick_readout_timing import configure_readout, initialize_readout
     from .power_calibration import (
         CalibrationDatabase,
         CalibrationRunSummary,
@@ -37,6 +38,7 @@ try:
     )
     from .fir_ddr_profile import resolve_fir_ddr_profile
 except ImportError:
+    from qick_readout_timing import configure_readout, initialize_readout
     from power_calibration import (
         CalibrationDatabase,
         CalibrationRunSummary,
@@ -1616,11 +1618,11 @@ class SParameterSweepProgram(RAveragerProgram):
             freq=self._gen_frequency_first,
             phase=0,
         )
-        self.set_readout_registers(
+        configure_readout(self,
             ch=self.sweep.readout_ch,
             freq=self._ro_frequency_first,
             length=self.READOUT_PERIOD_CYCLES,
-            mode="periodic",
+            mode="oneshot",
             phrst=0,
         )
 
@@ -1677,6 +1679,7 @@ class SParameterSweepProgram(RAveragerProgram):
                     "calibrated gain frequency-point count",
                 )
         self.synci(128, "allow RF/readout register initialization")
+        initialize_readout(self, self.sweep.readout_ch)
 
     def body(self) -> None:
         self.readout(self.sweep.readout_ch, t=self.readout_command_time)
