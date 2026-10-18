@@ -28,6 +28,7 @@ import logging
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 import tempfile
 import threading
@@ -260,6 +261,41 @@ def cache_directory():
 def clear_memory_cache():
     with _lock:
         _memory.clear()
+
+
+def clear_program_cache():
+    """Remove compiled artifacts and this process's memory copies.
+
+    Call while the GUI is idle. Only cache-key files in the configured schema
+    directory are removed; other files and subdirectories are left alone.
+    Report individual filesystem failures so the GUI cannot claim a full clear
+    when an entry is locked. Other running processes retain their own memory.
+    """
+    with _lock:
+        memory_entries = len(_memory)
+        _memory.clear()
+        directory = cache_directory()
+        result = {"directory": str(directory), "files_removed": 0,
+                  "memory_entries_removed": memory_entries, "errors": []}
+        try:
+            paths = list(directory.iterdir())
+        except FileNotFoundError:
+            return result
+        except OSError as exc:
+            result["errors"].append(f"{directory}: {exc}")
+            return result
+        for path in paths:
+            if re.fullmatch(r"[0-9a-f]{64}\.json\.gz", path.name) is None:
+                continue
+            try:
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                    result["files_removed"] += 1
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                result["errors"].append(f"{path}: {exc}")
+        return result
 
 
 def _remember(token, data):

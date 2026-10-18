@@ -8395,6 +8395,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     run_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
+    clear_cache_requested = QtCore.pyqtSignal()
     awg_metadata_requested = QtCore.pyqtSignal()
     sweep_axes_changed = QtCore.pyqtSignal()
     sweep_update_requested = QtCore.pyqtSignal(object, float, float, int)
@@ -8822,10 +8823,17 @@ class ExperimentPanel(QtWidgets.QWidget):
             "Compile the current settings and show the tProcessor assembly"
         )
         self.show_program_button.clicked.connect(self.show_program_requested.emit)
+        self.clear_cache_button = QtWidgets.QPushButton("Clear cache")
+        self.clear_cache_button.setToolTip(
+            "Delete saved compiled programs and this GUI's memory cache. "
+            "The next run will compile again; settings and measurements are kept."
+        )
+        self.clear_cache_button.clicked.connect(self.clear_cache_requested.emit)
         action_row = QtWidgets.QHBoxLayout()
         action_row.addWidget(self.run_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self.show_program_button)
+        action_row.addWidget(self.clear_cache_button)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -9854,6 +9862,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     ) -> None:
         self.run_button.setEnabled(not running)
         self.show_program_button.setEnabled(not running)
+        self.clear_cache_button.setEnabled(not running)
         self.stop_button.setEnabled(running and can_cancel)
         if running:
             self.progress.setValue(0)
@@ -11387,6 +11396,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._experiment_panel.show_program_requested.connect(
             self._show_qick_program
+        )
+        self._experiment_panel.clear_cache_requested.connect(
+            self._clear_qick_program_cache
         )
         self._experiment_panel.awg_metadata_requested.connect(
             self._show_awg_metadata
@@ -15467,6 +15479,36 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             parent=self,
         )
         dialog.exec_()
+
+    def _clear_qick_program_cache(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            self.statusBar().showMessage(
+                "Wait for the current QICK task to finish before clearing the cache."
+            )
+            return
+        try:
+            from .qick_program_cache import clear_program_cache
+        except ImportError:
+            from qick_program_cache import clear_program_cache
+        try:
+            result = clear_program_cache()
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot clear cache", str(exc))
+            return
+        message = (
+            f"Compilation cache: removed {result['files_removed']} files and "
+            f"{result['memory_entries_removed']} memory entries. "
+        )
+        if result["errors"]:
+            message += "Some cache files could not be removed."
+            QtWidgets.QMessageBox.warning(
+                self, "Cache partially cleared",
+                message + "\n\n" + "\n".join(result["errors"]),
+            )
+        else:
+            message += "The next run will compile again."
+        self._experiment_panel.run_status.setText(message)
+        self.statusBar().showMessage(message)
 
     def _show_qick_program(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():

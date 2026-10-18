@@ -77,6 +77,83 @@ def test_previously_evaluated_preview_has_same_semantic_key():
     assert build(seq).compile_cache_info['status'] == 'hit'
 
 
+def test_clear_removes_disk_and_memory_and_next_build_recompiles():
+    first = build()
+    assert build().compile_cache_info['status'] == 'hit'
+    directory = cache.cache_directory()
+    result = cache.clear_program_cache()
+    assert result == {'directory': str(directory), 'files_removed': 1,
+                      'memory_entries_removed': 1, 'errors': []}
+    assert not cache._memory
+    assert not list(directory.glob('*.json.gz'))
+    rebuilt = build()
+    assert rebuilt.compile_cache_info['status'] == 'miss'
+    assert rebuilt.compile_cache_info['saved']
+    assert rebuilt.asm() == first.asm()
+    assert execution(rebuilt) == execution(first)
+
+
+def test_clear_preserves_unrelated_files_and_does_not_recurse():
+    directory = cache.cache_directory()
+    directory.mkdir()
+    preserved = [directory / name for name in
+                 ('settings.json', 'measurements.db', 'waveform.json.gz', 'active.tmp')]
+    nested = directory / ('a' * 64 + '.json.gz')
+    nested.mkdir()
+    preserved.append(nested / ('b' * 64 + '.json.gz'))
+    for path in preserved:
+        path.write_bytes(b'keep')
+    # Even an unreadable/corrupt old artifact can be removed by its cache name.
+    (directory / ('c' * 64 + '.json.gz')).write_bytes(b'corrupt')
+    result = cache.clear_program_cache()
+    assert result['files_removed'] == 1
+    assert not result['errors']
+    assert all(path.read_bytes() == b'keep' for path in preserved)
+
+
+def test_clear_missing_directory_is_a_noop():
+    assert not cache.cache_directory().exists()
+    assert cache.clear_program_cache()['files_removed'] == 0
+    assert not cache.cache_directory().exists()
+
+
+def test_clear_reports_locked_entry_and_continues(monkeypatch):
+    build()
+    directory = cache.cache_directory()
+    locked = next(directory.glob('*.json.gz'))
+    removable = directory / ('f' * 64 + '.json.gz')
+    removable.write_bytes(b'old')
+    original = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == locked:
+            raise PermissionError('file locked')
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', unlink)
+    result = cache.clear_program_cache()
+    assert result['files_removed'] == 1
+    assert result['memory_entries_removed'] == 1
+    assert len(result['errors']) == 1
+    assert str(locked) in result['errors'][0]
+    assert locked.exists() and not removable.exists()
+    assert not cache._memory
+
+
+def test_clear_directory_error_still_clears_memory(monkeypatch):
+    build()
+
+    def denied(_path):
+        raise PermissionError('directory denied')
+
+    monkeypatch.setattr(Path, 'iterdir', denied)
+    result = cache.clear_program_cache()
+    assert result['files_removed'] == 0
+    assert result['memory_entries_removed'] == 1
+    assert 'directory denied' in result['errors'][0]
+    assert not cache._memory
+
+
 @pytest.mark.parametrize('field', ['voltage', 'hold', 'matrix', 'groups', 'dc', 'rc',
                                    'scales', 'dac_current', 'firmware', 'clock',
                                    'repetitions', 'validation', 'rf', 'readout'])
