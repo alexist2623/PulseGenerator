@@ -11,6 +11,8 @@ QSTL_QICK_COMPILE_CACHE=0 disables reuse. Older entries are evicted at 64
 files or 512 MiB; incomplete, corrupt and unsupported entries recompile.
 Inputs include firmware metadata, sequences, calibration-derived RF gains,
 sweep grouping, readout settings, repetitions and compiler source hashes.
+Generated sweep identifiers are metadata, not compiler inputs: group membership
+is keyed by axis, and cached metadata is rebound to the requesting GUI's IDs.
 """
 from __future__ import annotations
 
@@ -92,6 +94,16 @@ def _state(value, *, key=False):
             state.pop(name, None)
     if key:
         state.pop("_sweep_coordinate_cache", None)
+        if type(value) is _local("qick_fine_tune_sweep").FineTuneSequence:
+            state.pop("sweep_parameter_ids", None)
+            # Preserve which axes share a loop, without depending on randomly
+            # generated group names or dictionary insertion order.
+            groups = state.get("_sweep_group_ids", {})
+            labels = {}
+            state["_sweep_group_ids"] = {
+                axis: labels.setdefault(groups[axis], len(labels))
+                for axis in sorted(groups, key=lambda k: _json(_semantic(k)))
+            }
     return state
 
 
@@ -375,6 +387,28 @@ _CACHE_ERRORS = (OSError, ValueError, TypeError, KeyError, IndexError,
                  OverflowError, EOFError, RecursionError, AttributeError, zlib.error)
 
 
+def _bind_sweep_metadata(program, requested):
+    """Keep this hit's GUI/storage identities without changing compiled values.
+
+    _read returns an independent object graph. Modify that graph only, retaining
+    its already computed coordinate arrays and compiler/manager back-references.
+    """
+    sequence = program.sequence
+    sequence.sweep_parameter_ids = dict(getattr(requested, "sweep_parameter_ids", {}))
+    sequence._sweep_group_ids = dict(requested._sweep_group_ids)
+    snapshot = getattr(program, "_execution_coordinate_snapshot", None)
+    if snapshot is not None:
+        for member in snapshot.get("requested_members", ()):
+            index = member["member_index"]
+            if tuple(member["key"]) != sequence.sweep_axis_key(sequence.sweeps[index]):
+                raise Uncacheable("cached sweep coordinate axis mismatch")
+            member["parameter_id"] = sequence.sweep_member_ids[index]
+        group_ids = {g["representative_member_index"]: g["group_id"]
+                     for g in sequence.sweep_groups}
+        for group in snapshot.get("sweep_groups", ()):
+            group["group_id"] = group_ids[group["representative_member_index"]]
+
+
 def build_cached_program(soccfg, sequence, kwargs):
     """Cache only standard FineTuneSequence programs; custom builders still work."""
     cancel = kwargs.get("cancel_check")
@@ -388,6 +422,7 @@ def build_cached_program(soccfg, sequence, kwargs):
     try:
         key = _key(soccfg, sequence, kwargs)
         program, source = _read(key)
+        _bind_sweep_metadata(program, sequence)
     except FileNotFoundError:
         pass
     except _CACHE_ERRORS as exc:

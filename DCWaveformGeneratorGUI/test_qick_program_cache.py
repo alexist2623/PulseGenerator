@@ -77,6 +77,100 @@ def test_previously_evaluated_preview_has_same_semantic_key():
     assert build(seq).compile_cache_info['status'] == 'hit'
 
 
+def identified_grouped_sequence():
+    from uuid import uuid4
+    from test_grouped_sweep_compiler import grouped_sequence
+    seq = grouped_sequence(3)
+    seq.sweep_parameter_ids = {seq.sweep_axis_key(a): uuid4().hex for a in seq.sweeps}
+    names = {v: uuid4().hex for v in seq._sweep_group_ids.values()}
+    seq.set_sweep_groups({k: names[v] for k, v in seq._sweep_group_ids.items()})
+    return seq
+
+
+def identified_grouped_config():
+    from test_qick_dc_area import config
+    from qick.output_sum import apply_output_sum_config
+    cfg = config(2)
+    for gen in cfg['gens']:
+        apply_output_sum_config(gen, dict(output_sum_version=2, output_sum_role='awg',
+            post_output_latency_cycles=2, output_sum_awg_delay_cycles=13))
+    return cfg
+
+
+@pytest.mark.parametrize('disk', [False, True])
+def test_fresh_sweep_ids_reuse_binary_and_rebind_current_coordinate_metadata(disk, monkeypatch):
+    from qick_execution_coordinates import build_execution_coordinates
+    config = identified_grouped_config
+    first = build(identified_grouped_sequence(), config())
+    experiment._cache_execution_coordinates(first)
+    cache.save_execution_snapshot(first)
+    current = identified_grouped_sequence()
+    expected = current.make_program(config(), awg_channels=(0, 1), repetitions_per_sweep=1)
+    expected.compile()
+    expected_coordinates = build_execution_coordinates(expected)
+    if disk:
+        cache.clear_memory_cache()
+    def fail(*a, **k):
+        pytest.fail('A new parameter/group UUID must not cause recompilation')
+    monkeypatch.setattr(FineTuneSequence, 'make_program', fail)
+    reused = build(current, config())
+    assert reused.compile_cache_info['source'] == ('disk' if disk else 'memory')
+    assert reused.binprog == expected.binprog == first.binprog
+    assert reused._runtime_dmem_words == expected._runtime_dmem_words
+    assert execution(reused) == execution(expected)
+    assert reused.sequence.sweep_member_ids == current.sweep_member_ids
+    assert reused.sequence.sweep_groups == current.sweep_groups
+    assert reused._execution_coordinate_snapshot == expected_coordinates
+    assert build_execution_coordinates(reused) == expected_coordinates
+    assert reused.sequence is not current
+    assert first.sequence.sweep_member_ids != current.sweep_member_ids
+    expected_ids = current.sweep_member_ids
+    current.sweep_parameter_ids.clear()
+    assert reused.sequence.sweep_member_ids == expected_ids
+
+
+def test_changed_group_membership_and_axis_order_do_not_reuse_key():
+    from test_grouped_sweep_compiler import config
+    seq = identified_grouped_sequence()
+    original = cache._key(config(), seq, {})
+    # Same number and sizes of groups, but different correlated members.
+    changed = deepcopy(seq)
+    changed.set_sweep_groups({changed.sweep_axis_key(a): str(i % 2)
+                              for i, a in enumerate(changed.sweeps)})
+    assert cache._key(config(), changed, {}) != original
+    changed = deepcopy(seq)
+    changed.set_sweep_groups({})
+    assert cache._key(config(), changed, {}) != original
+    changed = deepcopy(seq)
+    changed.sweeps.reverse()
+    assert cache._key(config(), changed, {}) != original
+
+
+def test_generated_ids_reuse_disk_in_another_python_process():
+    config = identified_grouped_config
+    first = build(identified_grouped_sequence(), config())
+    experiment._cache_execution_coordinates(first)
+    cache.save_execution_snapshot(first)
+    code = '''
+import sys, json
+sys.path[:0] = json.loads(sys.argv[1])
+from test_qick_program_cache import build, identified_grouped_sequence, identified_grouped_config as config
+seq = identified_grouped_sequence()
+p = build(seq, config())
+assert p.sequence.sweep_member_ids == seq.sweep_member_ids
+assert p.sequence.sweep_groups == seq.sweep_groups
+assert [m['parameter_id'] for m in p._execution_coordinate_snapshot['requested_members']] == list(seq.sweep_member_ids)
+print(json.dumps({'cache': p.compile_cache_info, 'binary': p.binprog}))
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', code,
+                             json.dumps([str(Path(__file__).parent)] + sys.path)],
+                            cwd='C:/GIT_Workspace/PulseGenerator', capture_output=True,
+                            text=True, check=True, timeout=60)
+    doc = json.loads(result.stdout.splitlines()[-1])
+    assert doc['cache']['source'] == 'disk'
+    assert doc['binary'] == first.binprog
+
+
 def test_clear_removes_disk_and_memory_and_next_build_recompiles():
     first = build()
     assert build().compile_cache_info['status'] == 'hit'
