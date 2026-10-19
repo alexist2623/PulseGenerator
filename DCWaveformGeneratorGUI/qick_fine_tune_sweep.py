@@ -43,6 +43,11 @@ from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple,
 
 import numpy as np
 
+try:
+    from .clock_time import clock_cycles
+except ImportError:
+    from clock_time import clock_cycles
+
 from qick.averager_program import RAveragerProgram
 
 try:
@@ -129,28 +134,12 @@ def _require_amplitude(value, name: str = "amplitude") -> float:
 
 def cycles_from_ns(duration_ns: Real, fabric_mhz: Real) -> int:
     """Round a nanosecond duration up to whole fabric-clock cycles."""
-    duration_ns = float(duration_ns)
-    fabric_mhz = float(fabric_mhz)
-    if duration_ns <= 0 or fabric_mhz <= 0:
-        raise ValueError("duration_ns and fabric_mhz must be positive")
-    exact_cycles = duration_ns * fabric_mhz / 1000.0
-    nearest_cycle = round(exact_cycles)
-    if isclose(exact_cycles, nearest_cycle, rel_tol=1e-12, abs_tol=1e-12):
-        return max(1, int(nearest_cycle))
-    return max(1, int(ceil(exact_cycles)))
+    return clock_cycles(duration_ns, fabric_mhz, units_per_us=1000.)
 
 
 def cycles_from_us(duration_us: Real, fabric_mhz: Real) -> int:
     """Round a microsecond duration up to whole fabric-clock cycles."""
-    duration_us = float(duration_us)
-    fabric_mhz = float(fabric_mhz)
-    if duration_us <= 0 or fabric_mhz <= 0:
-        raise ValueError("duration_us and fabric_mhz must be positive")
-    exact_cycles = duration_us * fabric_mhz
-    nearest_cycle = round(exact_cycles)
-    if isclose(exact_cycles, nearest_cycle, rel_tol=1e-12, abs_tol=1e-12):
-        return max(1, int(nearest_cycle))
-    return max(1, int(ceil(exact_cycles)))
+    return clock_cycles(duration_us, fabric_mhz)
 
 
 def normalized_to_dac(

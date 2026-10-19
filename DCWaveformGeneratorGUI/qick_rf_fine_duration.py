@@ -13,6 +13,11 @@ from numbers import Integral
 
 import numpy as np
 
+try:
+    from .clock_time import clock_cycles
+except ImportError:
+    from clock_time import clock_cycles
+
 SAMPLES_PER_CLOCK = 16
 PATTERN_SAMPLES = 128
 MAX_FINE_GAIN = 16383
@@ -22,16 +27,7 @@ FRACTION_LIMB = 1 << FRACTION_LIMB_BITS
 
 
 def samples_from_us(duration_us, fabric_mhz):
-    rate = float(fabric_mhz) * SAMPLES_PER_CLOCK
-    value = float(duration_us) * rate
-    if not np.isfinite(value) or value <= 0:
-        raise ValueError("fine RF duration must be finite and positive")
-    nearest = round(value)
-    # GUI values use nine decimals in microseconds. Preserve an intended
-    # sample-grid point across that decimal serialization (half one display
-    # unit), plus a few floating-point ULPs. Other values still round upward.
-    tolerance = rate*0.5e-9 + 8*abs(float(np.spacing(value)))
-    return max(1, int(nearest if abs(value-nearest) <= tolerance else ceil(value)))
+    return clock_cycles(duration_us, float(fabric_mhz) * SAMPLES_PER_CLOCK)
 
 
 @dataclass(frozen=True)

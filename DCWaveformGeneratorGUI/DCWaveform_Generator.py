@@ -27,6 +27,12 @@ except ImportError:
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
+    from .clock_time import clock_time
+    from .clock_time_widgets import ClockTimeSpinBox
+except ImportError:
+    from clock_time import clock_time
+    from clock_time_widgets import ClockTimeSpinBox
+try:
     from .sweep_grouping import SweepGroupingModel, HARDWARE_GROUP_KINDS
 except ImportError:
     from sweep_grouping import SweepGroupingModel, HARDWARE_GROUP_KINDS
@@ -650,6 +656,27 @@ def _time_from_ns(value_ns: float, unit: str) -> float:
 
 def _time_to_ns(value: float, unit: str) -> float:
     return float(value) * TIME_UNIT_NS[unit]
+
+
+def _time_text(value: float) -> str:
+    """Round-trip precision for timing cells, without trailing .0 on integers."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
+def _widget_clock_mhz(widget, kind="fabric") -> float:
+    """Resolve the configured clock through dialog parents, without board I/O."""
+    while widget is not None:
+        value = getattr(widget, f"_qick_{kind}_mhz", None)
+        if value is not None:
+            return float(value)
+        widget = widget.parentWidget()
+    return float(DEFAULT_QICK_TPROC_MHZ if kind == "tproc" else DEFAULT_QICK_FABRIC_MHZ)
+
+
+def _clock_spin(owner, *, unit=lambda: "us", kind="fabric"):
+    return ClockTimeSpinBox(rate_mhz=lambda: _widget_clock_mhz(owner, kind),
+                            units_per_us=lambda: 1000.0 / TIME_UNIT_NS[unit()])
 
 
 def _remap_set_segment_name(
@@ -1732,8 +1759,8 @@ else:
     AcquisitionTimelineWidget = None
 
 
-def _trace_duration_spin(value_ns: float, unit: str) -> QtWidgets.QDoubleSpinBox:
-    editor = QtWidgets.QDoubleSpinBox()
+def _trace_duration_spin(value_ns: float, unit: str, owner=None) -> QtWidgets.QDoubleSpinBox:
+    editor = _clock_spin(owner, unit=lambda: unit)
     editor.setDecimals(9)
     editor.setRange(1.0e-9, 1.0e12)
     editor.setSuffix(f" {unit}")
@@ -1785,7 +1812,7 @@ class TraceHoldEditDialog(QtWidgets.QDialog):
         self.y_voltage.setEnabled(not self._same_output)
         form.addRow(f"Y virtual voltage (AWG {int(y_output)}):", self.y_voltage)
 
-        self.hold_duration = _trace_duration_spin(hold_ns, time_unit)
+        self.hold_duration = _trace_duration_spin(hold_ns, time_unit, self)
         form.addRow("Hold duration:", self.hold_duration)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -1831,7 +1858,7 @@ class TraceRampEditDialog(QtWidgets.QDialog):
             f"Edit Ramp P{int(segment_index) - 1} to P{int(segment_index)}"
         )
         form = QtWidgets.QFormLayout(self)
-        self.ramp_duration = _trace_duration_spin(ramp_ns, time_unit)
+        self.ramp_duration = _trace_duration_spin(ramp_ns, time_unit, self)
         form.addRow("Ramp duration:", self.ramp_duration)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Save
@@ -2182,6 +2209,14 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
 
         # Map table row
         flat_idx = row * 2              # because every table row is (i,i+1) with i even
+        if col in (2, 3) and val > 0:
+            try:
+                val = clock_time(val, _widget_clock_mhz(self),
+                                 units_per_us=1000.0 / TIME_UNIT_NS[self._time_unit])
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Invalid duration", str(exc))
+                self.refresh_table()
+                return
         if col == 2:
             ok = self._pulse.edit_ramp(flat_idx, _time_to_ns(val, self._time_unit))
         elif col == 3:
@@ -2210,6 +2245,8 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             ramp = float(self.edit_ramp.text())
             flat = float(self.edit_flat.text())
             v    = float(self.edit_v.text())
+            ramp = clock_time(_time_to_ns(ramp, self._time_unit), _widget_clock_mhz(self), units_per_us=1000.)
+            flat = clock_time(_time_to_ns(flat, self._time_unit), _widget_clock_mhz(self), units_per_us=1000.)
         except ValueError:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -2218,8 +2255,8 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
             )
             return
         self.add_requested.emit(
-            _time_to_ns(ramp, self._time_unit),
-            _time_to_ns(flat, self._time_unit),
+            ramp,
+            flat,
             v,
         )
 
@@ -2247,7 +2284,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                 value_ns = _time_to_ns(float(editor.text()), old_unit)
             except ValueError:
                 continue
-            editor.setText(f"{_time_from_ns(value_ns, unit):.6g}")
+            editor.setText(_time_text(_time_from_ns(value_ns, unit)))
         self._time_unit = unit
         self._refresh_time_labels()
         self.refresh_table()
@@ -2269,7 +2306,7 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                         v,
                     ]
                 ):
-                    text = str(val) if col == 1 else f"{val:.6g}"
+                    text = str(val) if col == 1 else (_time_text(val) if col in (2, 3) else f"{val:.6g}")
                     item = QtWidgets.QTableWidgetItem(text)
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     if row in self._sweep_rows:
@@ -2811,8 +2848,8 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
             default_start = float(initial.start)
             default_stop = float(initial.stop)
 
-        self.start = QtWidgets.QDoubleSpinBox()
-        self.stop = QtWidgets.QDoubleSpinBox()
+        self.start = _clock_spin(self)
+        self.stop = _clock_spin(self)
         for widget, value in ((self.start, default_start), (self.stop, default_stop)):
             widget.setRange(1.0e-6, 1.0e9)
             widget.setDecimals(9)
@@ -2898,8 +2935,8 @@ class HoldDurationSweepSettingsDialog(QtWidgets.QDialog):
             default_start = float(initial.start)
             default_stop = float(initial.stop)
 
-        self.start = QtWidgets.QDoubleSpinBox()
-        self.stop = QtWidgets.QDoubleSpinBox()
+        self.start = _clock_spin(self)
+        self.stop = _clock_spin(self)
         for widget, value in (
             (self.start, default_start),
             (self.stop, default_stop),
@@ -2964,13 +3001,13 @@ class RfPulseEditorPanel(QtWidgets.QWidget):
         self.gen_ch = QtWidgets.QSpinBox()
         self.gen_ch.setRange(0, 255)
         self.segment = QtWidgets.QComboBox()
-        self.delay_us = QtWidgets.QDoubleSpinBox()
+        self.delay_us = _clock_spin(self, kind="tproc")
         self.delay_us.setRange(0.0, 1.0e9)
-        self.delay_us.setDecimals(6)
+        self.delay_us.setDecimals(9)
         self.delay_us.setSuffix(" us")
-        self.duration_us = QtWidgets.QDoubleSpinBox()
+        self.duration_us = _clock_spin(self)
         self.duration_us.setRange(0.001, 1.0e9)
-        self.duration_us.setDecimals(6)
+        self.duration_us.setDecimals(9)
         self.duration_us.setValue(0.05)
         self.duration_us.setSuffix(" us")
         self.frequency_mhz = QtWidgets.QDoubleSpinBox()
@@ -3222,8 +3259,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         mode_layout.addWidget(self.composite_mode)
         mode_layout.addStretch(1)
         self.pulse_name = QtWidgets.QLineEdit("RF pulse")
-        self.delay = QtWidgets.QDoubleSpinBox()
-        self.duration = QtWidgets.QDoubleSpinBox()
+        self.delay = self._rf_time_spin(delay=True)
+        self.duration = self._rf_time_spin(fine=True)
         for editor in (self.delay, self.duration):
             editor.setRange(0.0, 1.0e12)
             editor.setDecimals(9)
@@ -3235,8 +3272,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.fine_duration = QtWidgets.QCheckBox("Fine duration (DAC sample)")
         self._rf_generator_timings = ()
         self._update_fine_duration_controls()
-        self.duration_sweep_start = QtWidgets.QDoubleSpinBox()
-        self.duration_sweep_stop = QtWidgets.QDoubleSpinBox()
+        self.duration_sweep_start = self._rf_time_spin(fine=True)
+        self.duration_sweep_stop = self._rf_time_spin(fine=True)
         for editor in (
             self.duration_sweep_start,
             self.duration_sweep_stop,
@@ -3620,12 +3657,29 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.fine_duration.toggled.connect(self._update_fine_duration_controls)
         self.set_index(index)
 
+    def _rf_time_spin(self, *, fine=False, delay=False):
+        def rate():
+            if delay:
+                return _widget_clock_mhz(self, "tproc")
+            generators = getattr(self, "_rf_generator_timings", ())
+            channel = self.gen_ch.value()
+            generator = generators[channel] if 0 <= channel < len(generators) else {}
+            mhz = float(generator.get("f_fabric", _widget_clock_mhz(self)))
+            enabled = getattr(self, "fine_duration", None)
+            if fine and enabled is not None and enabled.isChecked():
+                mhz *= int(generator.get("samps_per_clk", 16))
+            return mhz
+        return ClockTimeSpinBox(rate_mhz=rate,
+                                units_per_us=lambda: 1000.0 / TIME_UNIT_NS[self._time_unit])
+
     def set_generator_timings(self, generators) -> None:
         """Use already-fetched generator clocks without connecting to hardware."""
         self._rf_generator_timings = tuple(generators or ())
         self._update_fine_duration_controls()
 
     def _update_fine_duration_controls(self, *_args) -> None:
+        for editor in self.findChildren(ClockTimeSpinBox):
+            editor.refresh_clock_step()
         sample_ns = None
         channel = self.gen_ch.value()
         generators = getattr(self, "_rf_generator_timings", ())
@@ -3673,7 +3727,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_n = QtWidgets.QSpinBox()
         self.predefined_n.setRange(1, 100_000)
         self.predefined_n.setValue(4)
-        self.predefined_tau = self._composite_duration_spin(10.0)
+        self.predefined_tau = self._composite_duration_spin(10.0, fine=False)
         self.predefined_frequency_parameter = QtWidgets.QComboBox()
         self.predefined_duration_parameter = QtWidgets.QComboBox()
         self.predefined_gain = QtWidgets.QSpinBox()
@@ -3714,8 +3768,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_tau_sweep_enabled = QtWidgets.QCheckBox(
             "Software sweep tau"
         )
-        self.predefined_tau_sweep_start = self._composite_duration_spin(1.0)
-        self.predefined_tau_sweep_stop = self._composite_duration_spin(10.0)
+        self.predefined_tau_sweep_start = self._composite_duration_spin(1.0, fine=False)
+        self.predefined_tau_sweep_stop = self._composite_duration_spin(10.0, fine=False)
         self.predefined_tau_sweep_count = QtWidgets.QSpinBox()
         self.predefined_tau_sweep_count.setRange(1, 1_000_000)
         self.predefined_tau_sweep_count.setValue(10)
@@ -4685,8 +4739,9 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
     def _composite_duration_spin(
         self,
         duration_us: float = 1.0,
+        *, fine: bool = True,
     ) -> QtWidgets.QDoubleSpinBox:
-        editor = QtWidgets.QDoubleSpinBox()
+        editor = self._rf_time_spin(fine=fine, delay=not fine)
         editor.setRange(1.0e-9, 1.0e12)
         editor.setDecimals(9)
         editor.setSuffix(f" {self._time_unit}")
@@ -4956,13 +5011,13 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         row = table.rowCount()
         table.insertRow(row)
         name = QtWidgets.QLineEdit(parameter.name)
-        duration = self._composite_duration_spin(parameter.duration_us)
+        duration = self._composite_duration_spin(parameter.duration_us, fine=False)
         duration.setMinimum(0.0)
         duration.setValue(_time_from_ns(parameter.duration_us * 1000.0, self._time_unit))
         sweep = QtWidgets.QCheckBox()
         sweep.setChecked(parameter.sweep_enabled)
-        start = self._composite_duration_spin(parameter.sweep_start_us)
-        stop = self._composite_duration_spin(parameter.sweep_stop_us)
+        start = self._composite_duration_spin(parameter.sweep_start_us, fine=False)
+        stop = self._composite_duration_spin(parameter.sweep_stop_us, fine=False)
         start.setMinimum(0.0)
         stop.setMinimum(0.0)
         start.setValue(_time_from_ns(parameter.sweep_start_us * 1000.0, self._time_unit))
@@ -7586,7 +7641,7 @@ class RfReadoutPanel(QtWidgets.QGroupBox):
         self.input_board_type = QtWidgets.QComboBox()
         self.input_board_type.addItems(QICK_INPUT_BOARD_TYPES)
         self.segment = QtWidgets.QComboBox()
-        self.delay = QtWidgets.QDoubleSpinBox()
+        self.delay = _clock_spin(self, unit=lambda: self._time_unit, kind="tproc")
         self.delay.setRange(0.0, 1.0e12)
         self.delay.setDecimals(9)
         self.samples = QtWidgets.QSpinBox()
@@ -8746,9 +8801,9 @@ class ExperimentPanel(QtWidgets.QWidget):
                 else bias_t_compensation_mv
             )
         )
-        self.bias_t_duration_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_duration_us = ClockTimeSpinBox(rate_mhz=lambda: self.fabric_mhz.value())
         self.bias_t_duration_us.setRange(1.0e-6, 1.0e9)
-        self.bias_t_duration_us.setDecimals(6)
+        self.bias_t_duration_us.setDecimals(9)
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(bias_t_duration_us))
         self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()
@@ -10851,9 +10906,9 @@ class QickExportDialog(QtWidgets.QDialog):
             if initial_bias_t_compensation_mv is None
             else initial_bias_t_compensation_mv
         ))
-        self.bias_t_duration_us = QtWidgets.QDoubleSpinBox()
+        self.bias_t_duration_us = ClockTimeSpinBox(rate_mhz=lambda: self.fabric_mhz.value())
         self.bias_t_duration_us.setRange(1.0e-6, 1.0e9)
-        self.bias_t_duration_us.setDecimals(6)
+        self.bias_t_duration_us.setDecimals(9)
         self.bias_t_duration_us.setSuffix(" us")
         self.bias_t_duration_us.setValue(float(initial_bias_t_duration_us))
         self.bias_t_filter_tau_us = QtWidgets.QDoubleSpinBox()

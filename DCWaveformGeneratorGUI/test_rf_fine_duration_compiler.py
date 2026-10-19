@@ -123,7 +123,7 @@ def test_nine_decimal_gui_serialization_preserves_all_sample_endings():
 
 @pytest.mark.parametrize('swept', [False, True])
 def test_overlap_readout_dc_waits_for_masked_tail_after_hold(swept):
-    from test_dc_readout_timing import fixture, signed
+    from test_dc_readout_timing import fixture, measurement_readouts, signed
     cfg, seq, ddr, _ = fixture('overlap_readout', rc=False)
     if swept:
         seq.add_rf_duration_sweep('measure', 2, 97/4800., 160/4800., 2,
@@ -143,7 +143,9 @@ def test_overlap_readout_dc_waits_for_masked_tail_after_hold(swept):
     final_busy += program.aux_timing.get('rf_0_output_latency', 0)
     assert barrier['base'] == final_busy
     assert not any(barrier['axis_deltas'])
-    readouts = [event for event in model.output_events if event.tproc_ch == 2]
+    # The initial three-clock readout setup is not a measurement/compensation
+    # shot. The shared helper checks that setup before returning real shots.
+    readouts = measurement_readouts(program, model)
     for shot, readout in enumerate(readouts):
         stop = readouts[shot+1].cycle if shot+1 < len(readouts) else float('inf')
         comps = [event for event in model.output_events
