@@ -31,8 +31,8 @@ def verify_current_settings(soc, settings):
         if record.get('current_ua') != expected['current_ua']:
             raise RuntimeError(f'DAC {dac} current changed or cannot be read. '
                                'Refresh the front panel and compile again.')
-        if not record.get('dc_output'):
-            raise RuntimeError(f'DAC {dac} is no longer connected exclusively to DC generator IPs')
+        if bool(record.get('dc_output')) != bool(expected.get('dc_output')):
+            raise RuntimeError(f'DAC {dac} output-board type changed')
         if sorted(record.get('channels', ())) != sorted(expected.get('channels', ())):
             raise RuntimeError(f'DAC {dac} generator routing changed; identify QICK and compile again')
 
@@ -58,11 +58,11 @@ class DacCurrentState(QtCore.QObject):
             return full_scale_mv(record['current_ua'])
         return REFERENCE_FULL_SCALE_MV
 
-    def snapshot(self, channels):
+    def snapshot(self, channels, *, include_rf=False):
         wanted = set(map(int, channels))
         for record in self.records.values():
-            if wanted.intersection(record.get('channels', ())) and record.get('dc_output') and record.get('current_ua') is None:
+            if wanted.intersection(record.get('channels', ())) and (record.get('dc_output') or include_rf) and record.get('current_ua') is None:
                 raise ValueError('DAC current could not be read; identify QICK again before output')
         return {dac: deepcopy(record) for dac, record in self.records.items()
                 if wanted.intersection(record.get('channels', ()))
-                and record.get('dc_output') and record.get('current_ua') is not None}
+                and (record.get('dc_output') or include_rf) and record.get('current_ua') is not None}

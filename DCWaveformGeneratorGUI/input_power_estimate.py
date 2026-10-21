@@ -62,7 +62,7 @@ class OutputGainRegression:
 
     def _attenuation_delta(self, att1, att2):
         summary = self.calibration.summary
-        return float(att1) + float(att2) - summary.calibration_att1_db - summary.calibration_att2_db
+        return self.calibration._attenuation_delta(att1, att2)
 
     def output_power_dbm(self, frequencies, gains, *, output_att1_db=0.0, output_att2_db=0.0):
         frequencies, gains = np.broadcast_arrays(np.asarray(frequencies, float), np.asarray(gains, float))
@@ -70,6 +70,7 @@ class OutputGainRegression:
             raise ValueError(f"DAC gain must be in 1..{MAX_QICK_GAIN}")
         return (self._values(frequencies, "slope") * 20.0 * np.log10(gains / MAX_QICK_GAIN)
                 + self._values(frequencies, "intercept_dbm")
+                + self.calibration.current_correction_db
                 - self._attenuation_delta(output_att1_db, output_att2_db))
 
     def gains_for_power(self, frequencies, powers_dbm, **attenuation):
@@ -110,7 +111,9 @@ class OutputGainRegression:
     def metadata(self):
         return {
             "model": "gain_regression",
-            "formula": "output_dbm = slope(f)*20*log10(gain/32767) + intercept_dbm(f) - attenuation_delta_db",
+            "formula": "output_dbm = slope(f)*20*log10(gain/32767) + intercept_dbm(f) - attenuation_delta_db + 20*log10(output_current/calibration_current)",
+            "output_dac_current_ua": self.calibration.output_current_ua,
+            "calibration_dac_current_ua": self.calibration.summary.calibration_dac_current_ua,
             "fit_selection": "gain >= max_measured_gain/8; fall back to up to eight highest gains if fewer than three",
             "fits": self.fits,
         }

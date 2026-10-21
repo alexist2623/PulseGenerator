@@ -816,6 +816,13 @@ class QickRfPulseSpec:
     fine_duration: bool = False
 
     def __post_init__(self) -> None:
+        if self.output_board_type == "DC_Out":
+            # DC connectors have no RF attenuator/filter. Drop stale RF-board
+            # values from imported JSON before validation, caching or execution.
+            for name, value in (("att1_db", 0.), ("att2_db", 0.),
+                                ("filter_type", "bypass"),
+                                ("filter_cutoff", 2.5), ("filter_bandwidth", 1.)):
+                object.__setattr__(self, name, value)
         if not isinstance(self.fine_duration, bool):
             raise TypeError("RF fine_duration must be bool")
         pulse_mode = str(self.pulse_mode).strip().lower()
@@ -1097,10 +1104,6 @@ class QickRfPulseSpec:
                 "RF power sweep requires calibrated output power"
             )
         if self.power_calibration_enabled:
-            if self.output_board_type != "RF_Out":
-                raise ValueError(
-                    "RF output-power calibration requires an RF_Out board"
-                )
             if not str(self.power_calibration_database_path).strip():
                 raise ValueError(
                     "RF output-power calibration database path is required"
@@ -1173,13 +1176,6 @@ class QickRfPulseSpec:
                 raise ValueError(
                     "legacy calibrated RF power controls are available only "
                     "in single pulse mode; configure calibration per composite pulse"
-                )
-            if (
-                self.output_board_type != "RF_Out"
-                and any(item.power_calibration_enabled for item in effective_items)
-            ):
-                raise ValueError(
-                    "composite RF output-power calibration requires an RF_Out board"
                 )
 
         # Evaluate integer coordinates now so invalid duplicate N points fail
@@ -2926,7 +2922,8 @@ def generate_qick_program_code(
             "def build_rf_pulses(soccfg):",
             "    specs = tuple(QickRfPulseSpec(**cfg) for cfg in RF_CONFIGS)",
             "    return build_runtime_rf_pulses(",
-            "        soccfg, specs, tproc_mhz=TPROC_MHZ",
+            "        soccfg, specs, tproc_mhz=TPROC_MHZ,",
+            "        dac_current_settings=build_sequence().dac_current_settings",
             "    )",
             "",
             "",

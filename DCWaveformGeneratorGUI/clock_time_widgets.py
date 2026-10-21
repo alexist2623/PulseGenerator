@@ -1,9 +1,9 @@
 """Time spinbox: keep imported precision and commit user edits to clock ticks."""
 from PyQt5 import QtCore, QtWidgets
 try:
-    from .clock_time import clock_time
+    from .clock_time import clock_time, clock_time_text
 except ImportError:
-    from clock_time import clock_time
+    from clock_time import clock_time, clock_time_text
 
 
 class ClockTimeSpinBox(QtWidgets.QDoubleSpinBox):
@@ -19,6 +19,13 @@ class ClockTimeSpinBox(QtWidgets.QDoubleSpinBox):
         self.setKeyboardTracking(False)
         self.valueChanged.connect(self._edited)
         self.editingFinished.connect(self.commit_clock_value)
+
+    def textFromValue(self, value):
+        if not hasattr(self, '_rate_mhz'):
+            return super().textFromValue(value)
+        return clock_time_text(value, self._rate_mhz(),
+                               units_per_us=self._units_per_us(),
+                               display_quantum=10.0 ** -self.decimals())
 
     def _edited(self, _value):
         if not self._clock_commit:
@@ -76,3 +83,34 @@ class ClockTimeSpinBox(QtWidgets.QDoubleSpinBox):
         value = self.value() + steps * self.singleStep()
         self.setValue(value)
         self.commit_clock_value()
+
+
+class ClockTimeLineEdit(QtWidgets.QLineEdit):
+    """AWG add-segment input with exact storage and clock-aligned commit."""
+    def __init__(self, value, *, rate_mhz, units_per_us, parent=None):
+        super().__init__(parent)
+        self._rate_mhz = rate_mhz
+        self._units_per_us = units_per_us
+        self._exact_value = None
+        self._display_text = None
+        self.setValue(value)
+        self.editingFinished.connect(self.commit_clock_value)
+
+    def setValue(self, value):
+        self._exact_value = float(value)
+        self._display_text = clock_time_text(value, self._rate_mhz(),
+                                             units_per_us=self._units_per_us())
+        self.setText(self._display_text)
+
+    def value(self):
+        if self.text() == self._display_text:
+            return self._exact_value
+        return float(self.text())
+
+    def commit_clock_value(self):
+        try:
+            value = clock_time(self.value(), self._rate_mhz(),
+                               units_per_us=self._units_per_us())
+        except ValueError:
+            return
+        self.setValue(value)

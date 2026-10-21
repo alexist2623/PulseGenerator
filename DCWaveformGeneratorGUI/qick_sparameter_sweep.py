@@ -23,6 +23,11 @@ import warnings
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    from .calibration_current import normalize_dc_output, dac_current_ua, read_channel_current
+except ImportError:
+    from calibration_current import normalize_dc_output, dac_current_ua, read_channel_current
+
 
 try:
     from .qick_readout_timing import configure_readout, initialize_readout
@@ -343,7 +348,10 @@ class SParameterSweepConfig:
     save_to_qcodes: bool = True
     magnitude_display: str = "response_db"
 
+    output_dac_current_ua: float = 20000.0
+
     def __post_init__(self) -> None:
+        normalize_dc_output(self)
         if self.magnitude_display not in MAGNITUDE_DISPLAY_MODES:
             raise ValueError(f"magnitude_display must be one of {MAGNITUDE_DISPLAY_MODES}")
         if self.phase_display not in PHASE_DISPLAY_MODES:
@@ -2331,6 +2339,10 @@ def _prepare_power_calibration(
     output_calibration = catalog.output_calibration(
         config.output_board_type,
         probe.frequencies_mhz,
+        output_ch=config.output_ch, output_current_ua=config.output_dac_current_ua,
+        nqz=config.nqz, output_filter_type=config.output_filter_type,
+        output_filter_cutoff_ghz=config.output_filter_cutoff_ghz,
+        output_filter_bandwidth_ghz=config.output_filter_bandwidth_ghz,
     )
     try:
         if config.input_calibration_selection == "manual_run_id":
@@ -3201,6 +3213,8 @@ def run_sparameter_sweep(
     _emit_progress(progress_callback, 0, "Starting independent RF S-parameter sweep")
     _emit_progress(progress_callback, 2, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    sweep_config = replace(sweep_config, output_dac_current_ua=
+        read_channel_current(soc, sweep_config.output_ch)["dac_current_ua"])
     _emit_progress(progress_callback, 5, "Configuring RF output/readout chains")
     rf_settings = configure_sparameter_rf_board(soc, sweep_config)
     calibration_context = None

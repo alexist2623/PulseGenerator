@@ -25,6 +25,11 @@ import time
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 import numpy as np
+try:
+    from .calibration_current import normalize_dc_output, dac_current_ua, read_channel_current
+except ImportError:
+    from calibration_current import normalize_dc_output, dac_current_ua, read_channel_current
+
 
 try:
     from .input_power_estimate import OutputGainRegression
@@ -231,6 +236,7 @@ class OutputPowerCalibrationConfig:
     frequency_start_mhz: float = 400.0
     frequency_end_mhz: float = 500.0
     frequency_points: int = 11
+    frequency_values_mhz: Tuple[float, ...] = ()
     gain_start: int = 1000
     gain_end: int = MAX_QICK_GAIN
     gain_points: int = 16
@@ -248,6 +254,7 @@ class OutputPowerCalibrationConfig:
     oscilloscope: OscilloscopeConfig = OscilloscopeConfig()
 
     def __post_init__(self) -> None:
+        normalize_dc_output(self)
         if not str(self.database_path).strip():
             raise ValueError("calibration database path must not be empty")
         if self.output_board_type not in OUTPUT_BOARD_TYPES:
@@ -279,6 +286,12 @@ class OutputPowerCalibrationConfig:
 
     @property
     def frequencies_mhz(self) -> np.ndarray:
+        if len(self.frequency_values_mhz):
+            values = np.asarray(self.frequency_values_mhz, dtype=float)
+            if (values.ndim != 1 or not np.all(np.isfinite(values)) or np.any(values <= 0)
+                    or np.unique(values).size != values.size):
+                raise ValueError("Explicit frequencies must be distinct positive finite MHz values")
+            return values.copy()
         return _frequency_axis(
             self.frequency_start_mhz,
             self.frequency_end_mhz,
@@ -311,6 +324,7 @@ class InputPowerCalibrationConfig:
     output_board_type: str = "RF_Out"
     input_board_type: str = "RF_In"
     output_ch: int = 0
+    output_dac_current_ua: float = 20000.0
     readout_ch: int = 0
     frequency_start_mhz: float = 400.0
     frequency_end_mhz: float = 500.0
@@ -350,6 +364,7 @@ class InputPowerCalibrationConfig:
     use_gain_regression: bool = False
 
     def __post_init__(self) -> None:
+        normalize_dc_output(self)
         if not str(self.database_path).strip():
             raise ValueError("calibration database path must not be empty")
         if self.output_board_type not in OUTPUT_BOARD_TYPES:
@@ -537,9 +552,16 @@ class KeysightFftPowerMeter:
         commands = (
             f":FUNCtion{function}:DISPlay ON",
             f":FUNCtion{function}:OPERation FFT",
-            f":FUNCtion{function}:SOURce CHANnel{channel}",
+            f":FUNCtion{function}:SOURce1 CHANnel{channel}",
+            f":FUNCtion{function}:VTYPe DECibel",
+            f":FUNCtion{function}:WINDow FLATtop",
             f":FUNCtion{function}:CENTer {frequency_hz:.12g}",
             f":FUNCtion{function}:SPAN {span_hz:.12g}",
+            # The FFT marker is clipped to the math display, independently of
+            # the channel's voltage range. Set this after enabling the FFT,
+            # which can otherwise restore an old automatic vertical scale.
+            f":FUNCtion{function}:RANGe 100",
+            f":FUNCtion{function}:OFFSet -30",
             ":SYSTem:PRECision ON",
             ":MARKer:MODE WAVeform",
             f":MARKer:X1Y1Source MATH{function}",
@@ -592,6 +614,23 @@ class KeysightFftPowerMeter:
         if not _valid_oscilloscope_power_dbm(measured_power):
             raise InvalidOscilloscopePowerError(
                 _invalid_power_message(measured_power)
+            )
+        function = int(self.config.fft_function)
+        display_range = float(self.instrument.query(f":FUNCtion{function}:RANGe?"))
+        display_offset = float(self.instrument.query(f":FUNCtion{function}:OFFSet?"))
+        margin_db = 2.0
+        if (
+            not isfinite(display_range)
+            or not isfinite(display_offset)
+            or display_range <= 2 * margin_db
+        ):
+            raise InvalidOscilloscopePowerError("Invalid FFT vertical display readback")
+        lower = display_offset - display_range / 2
+        upper = display_offset + display_range / 2
+        if np.any(valid_values <= lower + margin_db) or np.any(valid_values >= upper - margin_db):
+            raise InvalidOscilloscopePowerError(
+                "FFT marker is near the vertical display boundary; "
+                "the calibration point may be clipped and cannot be saved"
             )
         return measured_power
 
@@ -666,10 +705,12 @@ def _configure_output_chain(
         )
     return {
         "output_ch": config.output_ch,
+        **read_channel_current(soc, config.output_ch),
         "board_type": config.output_board_type,
         "att1_db": float(actual_att1),
         "att2_db": float(actual_att2),
         "attenuators_present": config.output_board_type == "RF_Out",
+        "filter_present": config.output_board_type == "RF_Out",
         "filter_type": config.output_filter_type,
         "filter_cutoff_ghz": config.output_filter_cutoff_ghz,
         "filter_bandwidth_ghz": config.output_filter_bandwidth_ghz,
@@ -743,7 +784,7 @@ def _store_output_calibration(
             },
             "rf_settings_actual": dict(rf_settings),
             "oscilloscope_identity": scope_identity,
-            "formula": "P(f,g)=response(f)+20*log10(g/32766)-attenuation_delta",
+            "formula": "P(f,g,I)=response(f)+20*log10(g/32766)+20*log10(I/I_cal)-attenuation_delta",
             "measurement_validation": {
                 "minimum_power_dbm": MIN_VALID_OSCILLOSCOPE_POWER_DBM,
                 "maximum_power_dbm": MAX_VALID_OSCILLOSCOPE_POWER_DBM,
@@ -1141,6 +1182,7 @@ def prepare_input_power_plan(config, frequencies_mhz=None, *, calibration=None,
     if calibration is None:
         calibration = CalibrationDatabase(config.database_path).output_calibration(
             config.output_board_type, frequencies, nqz=config.nqz,
+            output_ch=config.output_ch, output_current_ua=config.output_dac_current_ua,
             output_filter_type=config.output_filter_type,
             output_filter_cutoff_ghz=config.output_filter_cutoff_ghz,
             output_filter_bandwidth_ghz=config.output_filter_bandwidth_ghz,
@@ -1189,6 +1231,8 @@ def run_input_power_calibration(
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 0, "Connecting to QICK")
     soc, soccfg = connect_qick(connection_config, connector=connector)
+    calibration_config = replace(calibration_config, output_dac_current_ua=
+        read_channel_current(soc, calibration_config.output_ch)["dac_current_ua"])
     _check_cancel(cancel_check)
     gains = (np.ones(calibration_config.power_points, dtype=np.int64)
              if calibration_config.power_sweep_enabled else calibration_config.gains)

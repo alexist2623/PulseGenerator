@@ -937,6 +937,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.output_frequency_start = self._frequency(400.0)
         self.output_frequency_end = self._frequency(500.0)
         self.output_frequency_points = self._points(11)
+        self.output_frequency_values = QtWidgets.QLineEdit()
+        self.output_frequency_values.setPlaceholderText("Optional MHz list: 1, 3, 10, 30, ...")
+        self.output_frequency_values.setToolTip("When filled, measure these exact frequencies instead of start/end/count.")
         self.output_gain_start = self._gain(1000)
         self.output_gain_end = self._gain(MAX_RF_OUTPUT_GAIN)
         self.output_gain_points = self._points(16)
@@ -961,6 +964,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             ("Start frequency:", self.output_frequency_start),
             ("End frequency:", self.output_frequency_end),
             ("Frequency points:", self.output_frequency_points),
+            ("Exact frequencies [MHz]:", self.output_frequency_values),
             ("Start gain:", self.output_gain_start),
             ("End gain:", self.output_gain_end),
             ("Gain points:", self.output_gain_points),
@@ -1469,9 +1473,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         output_rf = self.output_board.currentText() == "RF_Out"
         self.output_att1.setEnabled(output_rf)
         self.output_att2.setEnabled(output_rf)
+        for widget in (self.output_filter_type, self.output_filter_cutoff, self.output_filter_bandwidth):
+            widget.setEnabled(output_rf)
         input_output_rf = self.input_output_board.currentText() == "RF_Out"
         self.input_output_att1.setEnabled(input_output_rf)
         self.input_output_att2.setEnabled(input_output_rf)
+        for widget in (self.input_output_filter, self.input_output_cutoff, self.input_output_bandwidth):
+            widget.setEnabled(input_output_rf)
         input_rf = self.input_board.currentText() == "RF_In"
         self.input_attenuation.setEnabled(input_rf)
         self.input_dc_gain.setEnabled(not input_rf)
@@ -1498,6 +1506,10 @@ class CalibrationPanel(QtWidgets.QWidget):
             path = path.with_suffix(".db")
         return str(path)
 
+    def _current_for_output(self, channel):
+        from calibration_current import channel_current_ua
+        return channel_current_ua(getattr(self._dac_current_state, "records", None), channel)
+
     def output_config(self) -> OutputPowerCalibrationConfig:
         return OutputPowerCalibrationConfig(
             database_path=self.database_path_value(),
@@ -1506,6 +1518,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             frequency_start_mhz=self.output_frequency_start.value(),
             frequency_end_mhz=self.output_frequency_end.value(),
             frequency_points=self.output_frequency_points.value(),
+            frequency_values_mhz=tuple(float(value) for value in self.output_frequency_values.text().replace(",", " ").split()),
             gain_start=self.output_gain_start.value(),
             gain_end=self.output_gain_end.value(),
             gain_points=self.output_gain_points.value(),
@@ -1542,6 +1555,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             output_board_type=self.input_output_board.currentText(),
             input_board_type=self.input_board.currentText(),
             output_ch=self.input_output_ch.value(),
+            output_dac_current_ua=self._current_for_output(self.input_output_ch.value()),
             readout_ch=self.input_readout_ch.value(),
             frequency_start_mhz=self.input_frequency_start.value(),
             frequency_end_mhz=self.input_frequency_end.value(),
@@ -1946,6 +1960,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             dc_voltage,
         )
         self.database_path.setText(database_path)
+        self.output_frequency_values.setText(", ".join(f"{v:g}" for v in output.frequency_values_mhz))
         assignments = (
             (self.output_ch, output.output_ch),
             (self.output_frequency_start, output.frequency_start_mhz),

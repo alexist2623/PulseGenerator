@@ -42,3 +42,28 @@ def clock_time(value, rate_mhz, *, units_per_us=1.0, display_quantum=None):
     ticks = clock_cycles(value, rate_mhz, units_per_us=units_per_us,
                          display_quantum=display_quantum)
     return ticks / float(rate_mhz) * float(units_per_us)
+
+
+def clock_time_text(value, rate_mhz, *, units_per_us=1.0, display_quantum=None):
+    """Display 300 MHz ticks as 10n, 10n+3.3 or 10n+6.6 ns.
+
+    Only the label is shortened. Values and serialized times retain the exact
+    clock fraction. Imported times off this clock grid keep their precision.
+    """
+    value = float(value)
+    if value == 0:
+        return "0"
+    if value > 0 and float(rate_mhz) == 300.:
+        ticks = clock_cycles(value, rate_mhz, units_per_us=units_per_us,
+                             display_quantum=display_quantum)
+        canonical = ticks / 300. * float(units_per_us)
+        quantum = 1e-9 * float(units_per_us) if display_quantum is None else float(display_quantum)
+        if abs(value - canonical) <= max(quantum / 2, 2 * ulp(value)):
+            blocks, remainder = divmod(ticks, 3)
+            tenths_ns = blocks * 100 + (0, 33, 66)[remainder]
+            with localcontext() as context:
+                context.prec = 60
+                shown = Decimal(tenths_ns) * Decimal(str(units_per_us)) / Decimal(10000)
+                text = format(shown, 'f')
+            return text.rstrip('0').rstrip('.') if '.' in text else text
+    return str(int(value)) if value.is_integer() else repr(value)

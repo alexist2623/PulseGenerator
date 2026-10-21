@@ -325,8 +325,8 @@ class RfPathCorrectionWidget(QtWidgets.QGroupBox):
             "readout_nqz": self.readout_nqz.value(),
             "output_board_type": self.output_board_type.currentText(),
             "input_board_type": self.input_board_type.currentText(),
-            "output_att1_db": self.output_att1_db.value(),
-            "output_att2_db": self.output_att2_db.value(),
+            "output_att1_db": self.output_att1_db.value() if self.output_board_type.currentText() == "RF_Out" else 0.0,
+            "output_att2_db": self.output_att2_db.value() if self.output_board_type.currentText() == "RF_Out" else 0.0,
             "readout_attenuation_db": self.readout_attenuation_db.value(),
             "readout_dc_gain_db": self.readout_dc_gain_db.value(),
             "loss1_db": self.loss1_db.value(),
@@ -1068,9 +1068,12 @@ class SParameterSweepPanel(QtWidgets.QWidget):
                 point_count,
                 dtype=float,
             )
+            from calibration_current import channel_current_ua
+            current = channel_current_ua(getattr(getattr(self.window(), "_dac_current_state", None), "records", None), self.output_ch.value())
             calibration = CalibrationDatabase(database_path).output_calibration(
                 self.output_board_type.currentText(),
                 frequencies,
+                output_ch=self.output_ch.value(), output_current_ua=current,
             )
             if self.power_sweep_enabled.isChecked():
                 targets = (

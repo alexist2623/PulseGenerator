@@ -18,6 +18,10 @@ import sqlite3
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 import numpy as np
+try:
+    from .calibration_current import dac_current_ua, DEFAULT_DAC_CURRENT_UA
+except ImportError:
+    from calibration_current import dac_current_ua, DEFAULT_DAC_CURRENT_UA
 
 OUTPUT_BOARD_TYPES = ("DC_Out", "RF_Out")
 INPUT_BOARD_TYPES = ("DC_In", "RF_In")
@@ -96,6 +100,10 @@ class CalibrationRunSummary:
     output_filter_cutoff_ghz: Optional[float] = None
     output_filter_bandwidth_ghz: Optional[float] = None
 
+    calibration_dac_current_ua: float = DEFAULT_DAC_CURRENT_UA
+    calibration_current_source: str = "default_20mA"
+    output_ch: Optional[int] = None
+
     def as_dict(self) -> Mapping[str, Any]:
         return {
             "database_path": str(self.database_path),
@@ -115,6 +123,9 @@ class CalibrationRunSummary:
             "source_output_run_id": self.source_output_run_id,
             "path_loss_db": self.path_loss_db,
             "purpose": self.purpose,
+            "calibration_dac_current_ua": self.calibration_dac_current_ua,
+            "calibration_current_source": self.calibration_current_source,
+            "output_ch": self.output_ch,
             "output_nqz": self.output_nqz,
             "output_filter_type": self.output_filter_type,
             "output_filter_cutoff_ghz": self.output_filter_cutoff_ghz,
@@ -138,6 +149,13 @@ class OutputCalibrationCandidate:
     @property
     def display_label(self) -> str:
         summary = self.summary
+        if summary.board_type == "DC_Out":
+            channel = "legacy channel" if summary.output_ch is None else f"gen {summary.output_ch}"
+            match = "exact match" if self.exact_match else "candidate"
+            return (f"Run {summary.run_id} | PCB DC_Out {channel} | "
+                    f"{summary.calibration_dac_current_ua / 1000:g} mA "
+                    f"({summary.calibration_current_source}) | NQZ {summary.output_nqz} | "
+                    f"{summary.frequency_min_mhz:g}..{summary.frequency_max_mhz:g} MHz | {match}")
         nqz = "?" if summary.output_nqz is None else str(summary.output_nqz)
         filter_name = summary.output_filter_type or "unknown"
         cutoff = (
@@ -283,12 +301,14 @@ class GainPowerCalibration:
         self,
         summary: CalibrationRunSummary,
         curves: Mapping[float, Tuple[np.ndarray, np.ndarray]],
+        *, output_current_ua: Optional[float] = None,
     ):
         if summary.board_type not in OUTPUT_BOARD_TYPES:
             raise ValueError("frequency-response calibration requires an output board")
         if not curves:
             raise ValueError("calibration run contains no gain/power curves")
         self.summary = summary
+        self.output_current_ua = dac_current_ua(output_current_ua)
         self._curves = {
             float(frequency): (
                 np.ascontiguousarray(gains, dtype=float),
@@ -305,6 +325,17 @@ class GainPowerCalibration:
             ],
             dtype=float,
         )
+
+    @property
+    def current_correction_db(self) -> float:
+        return float(20.0 * np.log10(self.output_current_ua /
+                                    dac_current_ua(self.summary.calibration_dac_current_ua)))
+
+    def _attenuation_delta(self, att1, att2):
+        if self.summary.board_type == "DC_Out":
+            return 0.0
+        return (float(att1) + float(att2) - self.summary.calibration_att1_db
+                - self.summary.calibration_att2_db)
 
     def _estimate_frequency_response_dbm(
         self, gains: np.ndarray, measured_powers_dbm: np.ndarray
@@ -377,13 +408,8 @@ class GainPowerCalibration:
         This is a scalar conversion at the weakest frequency response.  The
         calibration's gain samples are not interpolated or inverted.
         """
-        attenuation_delta = (
-            float(output_att1_db)
-            + float(output_att2_db)
-            - self.summary.calibration_att1_db
-            - self.summary.calibration_att2_db
-        )
-        full_scale_output_power = float(reference_response_dbm) - attenuation_delta
+        attenuation_delta = self._attenuation_delta(output_att1_db, output_att2_db)
+        full_scale_output_power = float(reference_response_dbm) - attenuation_delta + self.current_correction_db
         minimum_output_power = full_scale_output_power + 20.0 * np.log10(
             1.0 / float(self.reference_gain)
         )
@@ -418,15 +444,11 @@ class GainPowerCalibration:
             raise ValueError("gain codes must be positive and finite")
         if np.any(gains > MAX_QICK_GAIN):
             raise ValueError("gain code exceeds the QICK generator limit")
-        attenuation_delta = (
-            float(output_att1_db)
-            + float(output_att2_db)
-            - self.summary.calibration_att1_db
-            - self.summary.calibration_att2_db
-        )
+        attenuation_delta = self._attenuation_delta(output_att1_db, output_att2_db)
         return np.asarray(
             self.frequency_response_dbm(frequencies)
             + 20.0 * np.log10(gains / float(self.reference_gain))
+            + self.current_correction_db
             - attenuation_delta,
             dtype=float,
         )
@@ -658,6 +680,16 @@ class CalibrationDatabase:
                     return metadata
         return {}
 
+    def _current_settings(self, row):
+        metadata = self._metadata(row, "Calibration_Config")
+        config = metadata.get("configuration", metadata)
+        actual = metadata.get("rf_settings_actual", {})
+        current = actual.get("dac_current_ua", config.get("output_dac_current_ua"))
+        channel = actual.get("output_ch", config.get("output_ch"))
+        return dict(calibration_dac_current_ua=dac_current_ua(current),
+                    calibration_current_source=actual.get("dac_current_source", "metadata" if current is not None else "default_20mA"),
+                    output_ch=None if channel is None else int(channel))
+
     def _output_path_settings(
         self,
         row: sqlite3.Row,
@@ -716,6 +748,7 @@ class CalibrationDatabase:
     def _output_setting_mismatches(
         actual: Tuple[Optional[int], str, Optional[float], Optional[float]],
         *,
+        board_type: str = "RF_Out",
         nqz: Optional[int],
         output_filter_type: Optional[str],
         output_filter_cutoff_ghz: Optional[float],
@@ -726,6 +759,8 @@ class CalibrationDatabase:
         if nqz is not None and actual_nqz != int(nqz):
             actual_text = "unknown" if actual_nqz is None else str(actual_nqz)
             mismatches.append(f"Nyquist zone {actual_text} != {int(nqz)}")
+        if board_type == "DC_Out":
+            return tuple(mismatches)
         if (
             output_filter_type is not None
             and actual_filter != str(output_filter_type)
@@ -767,6 +802,8 @@ class CalibrationDatabase:
         requested_frequencies_mhz: Any,
         *,
         nqz: Optional[int] = None,
+        output_ch: Optional[int] = None,
+        output_current_ua: Optional[float] = None,
         output_filter_type: Optional[str] = None,
         output_filter_cutoff_ghz: Optional[float] = None,
         output_filter_bandwidth_ghz: Optional[float] = None,
@@ -825,6 +862,7 @@ class CalibrationDatabase:
                         self._output_setting_mismatches(
                             output_settings,
                             nqz=nqz,
+                            board_type=candidate_board,
                             output_filter_type=output_filter_type,
                             output_filter_cutoff_ghz=(
                                 output_filter_cutoff_ghz
@@ -834,6 +872,9 @@ class CalibrationDatabase:
                             ),
                         )
                     )
+                    channel = self._current_settings(row)["output_ch"]
+                    if output_ch is not None and channel is not None and int(output_ch) != channel:
+                        mismatches.append(f"generator {channel} != {int(output_ch)}")
                     if not full_coverage:
                         mismatches.append(
                             f"frequency range {frequency_min:.6g}.."
@@ -855,6 +896,7 @@ class CalibrationDatabase:
                         calibration_att1_db=float(att1),
                         calibration_att2_db=float(att2),
                         purpose="output_power",
+                        **self._current_settings(row),
                         output_nqz=output_settings[0],
                         output_filter_type=output_settings[1],
                         output_filter_cutoff_ghz=output_settings[2],
@@ -888,6 +930,8 @@ class CalibrationDatabase:
         *,
         run_id: Optional[int] = None,
         nqz: Optional[int] = None,
+        output_ch: Optional[int] = None,
+        output_current_ua: Optional[float] = None,
         output_filter_type: Optional[str] = None,
         output_filter_cutoff_ghz: Optional[float] = None,
         output_filter_bandwidth_ghz: Optional[float] = None,
@@ -903,6 +947,8 @@ class CalibrationDatabase:
                 raise ValueError("run_id must be positive")
         if nqz is not None and int(nqz) not in (1, 2):
             raise ValueError("nqz must be 1 or 2")
+        if board_type == "DC_Out":
+            output_filter_type = output_filter_cutoff_ghz = output_filter_bandwidth_ghz = None
         if output_filter_type is not None and str(output_filter_type) not in {
             "bypass",
             "lowpass",
@@ -964,10 +1010,14 @@ class CalibrationDatabase:
                 setting_mismatches = self._output_setting_mismatches(
                     output_settings,
                     nqz=nqz,
+                    board_type=board_type,
                     output_filter_type=output_filter_type,
                     output_filter_cutoff_ghz=output_filter_cutoff_ghz,
                     output_filter_bandwidth_ghz=output_filter_bandwidth_ghz,
                 )
+                channel = self._current_settings(row)["output_ch"]
+                if output_ch is not None and channel is not None and int(output_ch) != channel:
+                    setting_mismatches += (f"generator {channel} != {int(output_ch)}",)
                 if setting_mismatches:
                     incompatible_settings.append(
                         (candidate_run_id, setting_mismatches)
@@ -1057,12 +1107,13 @@ class CalibrationDatabase:
             calibration_att1_db=float(att1),
             calibration_att2_db=float(att2),
             purpose="output_power",
+            **self._current_settings(row),
             output_nqz=output_settings[0],
             output_filter_type=output_settings[1],
             output_filter_cutoff_ghz=output_settings[2],
             output_filter_bandwidth_ghz=output_settings[3],
         )
-        return GainPowerCalibration(summary, curves)
+        return GainPowerCalibration(summary, curves, output_current_ua=output_current_ua)
 
     def input_calibration(
         self,

@@ -27,11 +27,11 @@ except ImportError:
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
-    from .clock_time import clock_time
-    from .clock_time_widgets import ClockTimeSpinBox
+    from .clock_time import clock_time, clock_time_text
+    from .clock_time_widgets import ClockTimeSpinBox, ClockTimeLineEdit
 except ImportError:
-    from clock_time import clock_time
-    from clock_time_widgets import ClockTimeSpinBox
+    from clock_time import clock_time, clock_time_text
+    from clock_time_widgets import ClockTimeSpinBox, ClockTimeLineEdit
 try:
     from .sweep_grouping import SweepGroupingModel, HARDWARE_GROUP_KINDS
 except ImportError:
@@ -1915,12 +1915,12 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         layout              = QtWidgets.QVBoxLayout(self)
 
         form                = QtWidgets.QFormLayout()
-        self.edit_ramp = QtWidgets.QLineEdit(
-            f"{_time_from_ns(DEFAULT_GUI_RAMP_NS, self._time_unit):.6g}"
-        )
-        self.edit_flat = QtWidgets.QLineEdit(
-            f"{_time_from_ns(DEFAULT_GUI_FLAT_NS, self._time_unit):.6g}"
-        )
+        time_input = dict(rate_mhz=lambda: _widget_clock_mhz(self),
+                          units_per_us=lambda: 1000. / TIME_UNIT_NS[self._time_unit])
+        self.edit_ramp = ClockTimeLineEdit(
+            _time_from_ns(DEFAULT_GUI_RAMP_NS, self._time_unit), **time_input)
+        self.edit_flat = ClockTimeLineEdit(
+            _time_from_ns(DEFAULT_GUI_FLAT_NS, self._time_unit), **time_input)
         self.edit_v = QtWidgets.QLineEdit(f"{DEFAULT_INITIAL_VOLTAGE_MV:.6g}")
 
         for w in (self.edit_ramp, self.edit_flat, self.edit_v):
@@ -2243,8 +2243,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     def _on_add(self):
         self.port_is_selected.emit(self.idx)
         try:
-            ramp = float(self.edit_ramp.text())
-            flat = float(self.edit_flat.text())
+            self.edit_ramp.commit_clock_value()
+            self.edit_flat.commit_clock_value()
+            ramp = self.edit_ramp.value()
+            flat = self.edit_flat.value()
             v    = float(self.edit_v.text())
             ramp = clock_time(_time_to_ns(ramp, self._time_unit), _widget_clock_mhz(self), units_per_us=1000.)
             flat = clock_time(_time_to_ns(flat, self._time_unit), _widget_clock_mhz(self), units_per_us=1000.)
@@ -2280,13 +2282,13 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         if unit == self._time_unit:
             return
         old_unit = self._time_unit
+        self._time_unit = unit
         for editor in (self.edit_ramp, self.edit_flat):
             try:
-                value_ns = _time_to_ns(float(editor.text()), old_unit)
+                value_ns = _time_to_ns(editor.value(), old_unit)
             except ValueError:
                 continue
-            editor.setText(_time_text(_time_from_ns(value_ns, unit)))
-        self._time_unit = unit
+            editor.setValue(_time_from_ns(value_ns, unit))
         self._refresh_time_labels()
         self.refresh_table()
 
@@ -2307,7 +2309,10 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
                         v,
                     ]
                 ):
-                    text = str(val) if col == 1 else (_time_text(val) if col in (2, 3) else f"{val:.6g}")
+                    text = str(val) if col == 1 else (
+                        clock_time_text(val, _widget_clock_mhz(self),
+                                        units_per_us=1000. / TIME_UNIT_NS[self._time_unit])
+                        if col in (2, 3) else f"{val:.6g}")
                     item = QtWidgets.QTableWidgetItem(text)
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     if row in self._sweep_rows:
@@ -5579,10 +5584,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             resolved_gain = None
             try:
                 if enabled.isChecked():
-                    if self.output_board_type.currentText() != "RF_Out":
-                        raise ValueError(
-                            "calibrated output power requires an RF_Out board"
-                        )
                     path = database_path.text().strip()
                     if not path:
                         raise ValueError("calibration database path is required")
@@ -5593,10 +5594,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                         parameter_name
                     )
                     calibration = CalibrationDatabase(path).output_calibration(
-                        "RF_Out",
+                        self.output_board_type.currentText(),
                         frequency_points,
                         run_id=(None if run_id.value() == 0 else run_id.value()),
                         nqz=self.nqz.value(),
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                         output_filter_type=self.filter_type.currentText(),
                         output_filter_cutoff_ghz=self.filter_cutoff.value(),
                         output_filter_bandwidth_ghz=(
@@ -6152,7 +6155,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         enabled = (
             self.power_calibration_group.isChecked()
             and self.power_sweep_enabled.isChecked()
-            and self.output_board_type.currentText() == "RF_Out"
+            and self.output_board_type.currentText() in QICK_OUTPUT_BOARD_TYPES
         )
         for widget in (
             self.power_sweep_start_dbm,
@@ -6179,7 +6182,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
 
     def _update_power_calibration_controls(self, *_args) -> None:
-        rf_output = self.output_board_type.currentText() == "RF_Out"
+        rf_output = self.output_board_type.currentText() in QICK_OUTPUT_BOARD_TYPES
         self.power_calibration_group.setEnabled(rf_output)
         self.apply_power_calibration.setEnabled(
             rf_output
@@ -6197,7 +6200,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         if not rf_output:
             self._set_power_calibration_status(
-                "Calibrated power selection requires an RF_Out board.",
+                "Select an output board.",
                 state="error",
             )
         elif not self.power_calibration_group.isChecked():
@@ -6210,7 +6213,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self._power_calibration_resolved_signature = None
         self._update_power_calibration_controls()
         if (
-            self.output_board_type.currentText() == "RF_Out"
+            self.output_board_type.currentText() in QICK_OUTPUT_BOARD_TYPES
             and self.power_calibration_group.isChecked()
         ):
             self._set_power_calibration_status(
@@ -6249,6 +6252,14 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 )
                 index = self.power_calibration_run.findData(run_id)
             self.power_calibration_run.setCurrentIndex(max(0, index))
+
+    def _output_current_ua(self):
+        from calibration_current import channel_current_ua
+        state = getattr(self.window(), "_dac_current_state", None)
+        records = getattr(state, "records", None)
+        if records is None:
+            records = getattr(self._front_panel_configuration, "dac_current_settings", None)
+        return channel_current_ua(records, self.gen_ch.value())
 
     def _calibration_frequency_points(self) -> np.ndarray:
         if not self.frequency_sweep_enabled.isChecked():
@@ -6303,6 +6314,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     self.output_board_type.currentText(),
                     self._calibration_frequency_points(),
                     nqz=self.nqz.value(),
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                     output_filter_type=self.filter_type.currentText(),
                     output_filter_cutoff_ghz=self.filter_cutoff.value(),
                     output_filter_bandwidth_ghz=(
@@ -6387,10 +6400,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _apply_calibrated_output_power(self) -> Optional[int]:
         try:
-            if self.output_board_type.currentText() != "RF_Out":
-                raise ValueError(
-                    "calibrated output power is available only for RF_Out"
-                )
             if not self.power_calibration_group.isChecked():
                 raise ValueError("enable Calibrated output power first")
             database_path = self.power_calibration_database_path.text().strip()
@@ -6445,18 +6454,28 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                         "to use a manual override"
                     )
                 selected_run_id = selected_candidate.summary.run_id
+            if manual_override and self.output_board_type.currentText() == "DC_Out" and (
+                selected_candidate.summary.board_type != self.output_board_type.currentText()
+                or (getattr(selected_candidate.summary, "output_ch", None) is not None
+                    and selected_candidate.summary.output_ch != self.gen_ch.value())
+            ):
+                raise ValueError("Select a calibration for the same output board and generator")
             if manual_override:
                 calibration = catalog.output_calibration(
                     selected_candidate.summary.board_type,
                     frequency_points,
                     run_id=selected_run_id,
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                 )
             else:
                 calibration = catalog.output_calibration(
-                    "RF_Out",
+                    self.output_board_type.currentText(),
                     frequency_points,
                     run_id=selected_run_id or None,
                     nqz=self.nqz.value(),
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                     output_filter_type=self.filter_type.currentText(),
                     output_filter_cutoff_ghz=self.filter_cutoff.value(),
                     output_filter_bandwidth_ghz=(
@@ -6535,10 +6554,12 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             float(power_points[-1]),
             int(power_points.size),
             int(gain),
+            self._output_current_ua(),
         )
         self._set_power_calibration_status(
             f"Run {calibration.summary.run_id}: gain {gain} gives "
             f"{predicted_power_dbm:.6g} dBm at {frequency_mhz:.6g} MHz. "
+            f"DAC current {self._output_current_ua()/1000:g} mA. "
             f"Current ATT1/ATT2 {self.att1_db.value():.2f}/"
             f"{self.att2_db.value():.2f} dB; Nyquist zone and "
             f"{self.filter_type.currentText()} filter "
@@ -6566,11 +6587,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             )
             if not calibrated_items:
                 return
-            if self.output_board_type.currentText() != "RF_Out":
-                raise ValueError(
-                    f"RF Output {self._index + 1} calibrated composite "
-                    "pulses require an RF_Out board"
-                )
             for item in calibrated_items:
                 frequency_points = self._composite_frequency_points(
                     item.frequency_parameter
@@ -6578,7 +6594,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 calibration = CalibrationDatabase(
                     item.power_calibration_database_path
                 ).output_calibration(
-                    "RF_Out",
+                    self.output_board_type.currentText(),
                     frequency_points,
                     run_id=(
                         None
@@ -6586,6 +6602,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                         else int(item.power_calibration_run_id)
                     ),
                     nqz=self.nqz.value(),
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                     output_filter_type=self.filter_type.currentText(),
                     output_filter_cutoff_ghz=self.filter_cutoff.value(),
                     output_filter_bandwidth_ghz=(
@@ -6602,11 +6620,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             return
         if not self.power_calibration_group.isChecked():
             return
-        if self.output_board_type.currentText() != "RF_Out":
-            raise ValueError(
-                f"RF Output {self._index + 1} calibrated power requires "
-                "an RF_Out board"
-            )
         if (
             self.frequency_sweep_enabled.isChecked()
             or self.power_sweep_enabled.isChecked()
@@ -6617,7 +6630,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     f"RF Output {self._index + 1} calibration database is missing"
                 )
             CalibrationDatabase(database_path).output_calibration(
-                "RF_Out",
+                self.output_board_type.currentText(),
                 self._calibration_frequency_points(),
                 run_id=(
                     None
@@ -6625,6 +6638,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                     else int(self.power_calibration_run_id.value())
                 ),
                 nqz=self.nqz.value(),
+                    output_ch=self.gen_ch.value(),
+                    output_current_ua=self._output_current_ua(),
                 output_filter_type=self.filter_type.currentText(),
                 output_filter_cutoff_ghz=self.filter_cutoff.value(),
                 output_filter_bandwidth_ghz=self.filter_bandwidth.value(),
@@ -6639,6 +6654,13 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
 
     def _update_board_controls(self, *_args) -> None:
         has_attenuators = self.output_board_type.currentText() == "RF_Out"
+        if not has_attenuators:
+            for editor, value in ((self.att1_db, 0.), (self.att2_db, 0.),
+                                  (self.filter_cutoff, 2.5), (self.filter_bandwidth, 1.)):
+                with QtCore.QSignalBlocker(editor):
+                    editor.setValue(value)
+            with QtCore.QSignalBlocker(self.filter_type):
+                self.filter_type.setCurrentText("bypass")
         self.att1_db.setEnabled(has_attenuators)
         self.att2_db.setEnabled(has_attenuators)
         self.filter_type.setEnabled(has_attenuators)
@@ -6647,7 +6669,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         if has_attenuators:
             tooltip = "RF_Out onboard attenuator"
         else:
-            tooltip = "DC_Out has no onboard ATT1/ATT2; these values are ignored"
+            tooltip = "DC_Out has no RF attenuator or filter; these settings do not apply"
         self.att1_db.setToolTip(tooltip)
         self.att2_db.setToolTip(tooltip)
         self.filter_type.setToolTip(tooltip)
@@ -13777,6 +13799,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         sequence.dac_current_settings.update(self._dac_current_state.snapshot(
             config.gen_ch for config in sequence.square_pulse_configs))
+        sequence.dac_current_settings.update(self._dac_current_state.snapshot(
+            (spec.gen_ch for spec in rf_specs), include_rf=True))
         gui_settings = self._settings_to_dict() if require_run_config else None
         return {
             "connection_config": values["connection"],
@@ -14127,6 +14151,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             with QtCore.QSignalBlocker(self._experiment_panel.full_scale_mv):
                 self._experiment_panel.full_scale_mv.setValue(reference)
             self._experiment_panel._update_bias_t_range(reference)
+        for panel in self._rf_ports_panel._panels:
+            panel._mark_power_calibration_stale()
         self._notify_sweep_state_changed(rf_changed=True)
 
     def _sync_awg_voltage_bounds(self):

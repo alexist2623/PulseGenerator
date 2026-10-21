@@ -660,11 +660,12 @@ def _validate_summed_rf_spec(gen_cfg, spec):
     if gen_cfg.get('output_sum_role') != 'rf':
         return
     firmware = {2: 'v5', 3: 'v6'}.get(gen_cfg.get('output_sum_version'), 'v4')
-    if (spec.power_calibration_enabled or spec.power_sweep_enabled
-            or any(event.power_calibration_enabled for event in spec.pulse_events)):
+    calibrated = (spec.power_calibration_enabled or spec.power_sweep_enabled
+                  or any(event.power_calibration_enabled for event in spec.pulse_events))
+    if calibrated and spec.output_board_type != 'DC_Out':
         raise ValueError(f'This {firmware} RF generator is summed into the AWG physical output. '
-                         'RF connector power calibration cannot be used on this path; '
-                         'disable power calibration and use raw DDS gain.')
+                         'Select DC_Out and a DC_Out calibration for this path; RF_Out '
+                         'connector calibration does not describe this output.')
     if spec.att1_db or spec.att2_db or spec.filter_type != 'bypass':
         raise ValueError(f'This {firmware} RF generator uses the AWG physical output, which has '
                          'no RF attenuator/filter. Select zero attenuation and bypass.')
@@ -705,6 +706,7 @@ def build_runtime_rf_pulses(
     specs: Sequence[QickRfPulseSpec],
     *,
     tproc_mhz: Optional[float] = None,
+    dac_current_settings=None,
 ) -> Tuple[Any, ...]:
     """Convert GUI RF timing in microseconds to actual QICK clock cycles."""
     _ddr_type, rf_type, cycles_from_us = _runtime_types()
@@ -826,9 +828,12 @@ def build_runtime_rf_pulses(
                 catalog = CalibrationDatabase(
                     calibration_database_path
                 )
+                from calibration_current import channel_current_ua
                 calibration = catalog.output_calibration(
                     spec.output_board_type,
                     frequency_points,
+                    output_ch=spec.gen_ch,
+                    output_current_ua=channel_current_ua(dac_current_settings, spec.gen_ch),
                     run_id=(
                         None
                         if requested_calibration_run_id == 0
@@ -1041,7 +1046,8 @@ def build_qick_program(
             compile_validation_mode
         ),
         "rf_pulses": build_runtime_rf_pulses(
-            soccfg, rf_specs, tproc_mhz=effective_tproc_mhz
+            soccfg, rf_specs, tproc_mhz=effective_tproc_mhz,
+            dac_current_settings=getattr(sequence, "dac_current_settings", None),
         ),
         "recovery_tproc_cycles": recovery_tproc_cycles,
     }
