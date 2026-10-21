@@ -787,6 +787,7 @@ class QickRfPulseSpec:
     predefined_n_sweep_start: int = 1
     predefined_n_sweep_stop: int = 4
     predefined_n_sweep_count: int = 4
+    predefined_n_sweep_execution: str = "software"
     predefined_tau_sweep_enabled: bool = False
     predefined_tau_sweep_start_us: float = 1.0
     predefined_tau_sweep_stop_us: float = 10.0
@@ -972,6 +973,12 @@ class QickRfPulseSpec:
         _positive_int(self.predefined_n_sweep_start, "predefined RF N start")
         _positive_int(self.predefined_n_sweep_stop, "predefined RF N stop")
         _positive_int(self.predefined_n_sweep_count, "predefined RF N count")
+        if self.predefined_n_sweep_execution not in {"software", "hardware"}:
+            raise ValueError("N sweep execution must be software or hardware")
+        if (self.predefined_n_sweep_enabled
+                and self.predefined_n_sweep_execution == "hardware"
+                and predefined_template != "cpmg"):
+            raise ValueError("Hardware N sweep is supported only for CPMG")
         _positive_real(
             self.predefined_tau_sweep_start_us,
             "predefined RF tau start",
@@ -1544,7 +1551,8 @@ class QickRfPulseSpec:
         if self.pulse_mode != "composite":
             return ()
         axes = []
-        if self.predefined_template != "custom" and self.predefined_n_sweep_enabled:
+        if (self.predefined_template != "custom" and self.predefined_n_sweep_enabled
+                and self.predefined_n_sweep_execution == "software"):
             axes.append(QickRfSoftwareSweepAxisSpec(
                 segment_name=self.segment_name,
                 output_name=f"{self.output_name}_{self.predefined_template}_N",
@@ -2348,6 +2356,9 @@ def build_qick_sequence(
     if any(not isinstance(spec, QickRfPulseSpec) for spec in normalized_rf_specs):
         raise TypeError("every RF pulse entry must be a QickRfPulseSpec")
     for rf_spec in normalized_rf_specs:
+        from qick_cpmg import enabled as cpmg_hw_enabled
+        if cpmg_hw_enabled(rf_spec):
+            continue
         if rf_spec.segment_length_mode != "extend_by_rf_duration":
             continue
         base_extension_cycles = sum(
@@ -2401,6 +2412,10 @@ def build_qick_sequence(
                 stop_dbm=rf_spec.power_sweep_stop_dbm,
                 count=rf_spec.power_sweep_count,
             )
+    from qick_cpmg import attach_axis, enabled as cpmg_hw_enabled
+    for rf_spec in normalized_rf_specs:
+        if cpmg_hw_enabled(rf_spec):
+            attach_axis(sequence, rf_spec, float(fabric_mhz))
     if sweep_groups:
         sequence.set_sweep_groups(sweep_groups)
     sequence.sweep_parameter_ids = dict(sweep_parameter_ids or {})
@@ -2806,6 +2821,9 @@ def generate_qick_program_code(
     for rf_spec in normalized_rf_specs:
         if rf_spec.segment_length_mode != "extend_by_rf_duration":
             continue
+        from qick_cpmg import enabled as cpmg_hw_enabled
+        if cpmg_hw_enabled(rf_spec):
+            continue
         base_extension_cycles = sum(
             _cycles_from_ns(duration_us * 1000.0, fabric_mhz)
             for duration_us in rf_spec.segment_extension_components_us
@@ -2872,6 +2890,15 @@ def generate_qick_program_code(
                     "    )",
                 ]
             )
+    from qick_cpmg import enabled as cpmg_hw_enabled
+    if any(cpmg_hw_enabled(spec) for spec in normalized_rf_specs):
+        lines.extend([
+            "    from qick_cpmg import attach_axis, enabled as cpmg_hw_enabled",
+            "    for config in RF_CONFIGS:",
+            "        spec = QickRfPulseSpec(**config)",
+            "        if cpmg_hw_enabled(spec):",
+            "            attach_axis(sequence, spec, FABRIC_MHZ)",
+        ])
     if sweep_groups:
         lines.append(f"    sequence.set_sweep_groups({dict(sweep_groups)!r})")
     if sweep_parameter_ids:

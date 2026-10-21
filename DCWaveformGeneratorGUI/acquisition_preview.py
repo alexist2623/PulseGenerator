@@ -96,6 +96,8 @@ def selected_rf_events(sequence, point_index, spec, fabric_mhz, *, software_valu
         and axis.segment_name == spec.segment_name
     }
     resolved = []
+    if ("rf_template_n", "N") in values:
+        spec = spec.with_predefined_parameters(n_pulses=int(values[("rf_template_n", "N")]))
     duration_deltas = {}
     for event in spec.pulse_events:
         duration = values.get(("rf_duration", event.duration_parameter), event.duration_us)

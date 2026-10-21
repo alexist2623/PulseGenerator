@@ -65,7 +65,7 @@ def _classes():
         _local("qick_fine_tune_sweep"): (
             "FineTuneSequence FineTuneAmplitudeSweepProgram PulseSegment "
             "AmplitudeSweep RfDurationSweep RfSegmentLengthExtension "
-            "RfFrequencySweep RfPowerSweep RampDurationSweep HoldDurationSweep "
+            "RfFrequencySweep RfPowerSweep RampDurationSweep HoldDurationSweep CpmgNSweep "
             "BiasTCompensationConfig RCCompensationConfig ReadoutConfig "
             "RfPulseConfig DdrFirReadoutConfig CompiledCommand CompiledPoint"
         ),

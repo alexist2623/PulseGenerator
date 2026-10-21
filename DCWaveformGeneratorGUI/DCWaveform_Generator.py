@@ -589,6 +589,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "predefined_n_sweep_start": 1,
     "predefined_n_sweep_stop": 4,
     "predefined_n_sweep_count": 4,
+    "predefined_n_sweep_execution": "software",
     "predefined_tau_sweep_enabled": False,
     "predefined_tau_sweep_start_us": 1.0,
     "predefined_tau_sweep_stop_us": 10.0,
@@ -3741,8 +3742,15 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.predefined_phase_parameter = QtWidgets.QComboBox()
 
         self.predefined_n_sweep_enabled = QtWidgets.QCheckBox(
-            "Software sweep N"
+            "Sweep N"
         )
+        self.predefined_n_sweep_execution = QtWidgets.QComboBox()
+        self.predefined_n_sweep_execution.addItem("Software", "software")
+        self.predefined_n_sweep_execution.addItem("Hardware (CPMG)", "hardware")
+        self.predefined_n_sweep_execution.setToolTip(
+            "Hardware: one uploaded program loops over N; fixed RF parameters, "
+            "initial/final pi/2 required. Extend by RF duration moves the AWG end.")
+        self.predefined_n_sweep_execution.currentIndexChanged.connect(self.changed.emit)
         self.predefined_n_sweep_start = QtWidgets.QSpinBox()
         self.predefined_n_sweep_stop = QtWidgets.QSpinBox()
         self.predefined_n_sweep_count = QtWidgets.QSpinBox()
@@ -3763,6 +3771,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         n_sweep_row.addWidget(self.predefined_n_sweep_stop)
         n_sweep_row.addWidget(QtWidgets.QLabel("Points"))
         n_sweep_row.addWidget(self.predefined_n_sweep_count)
+        n_sweep_row.addWidget(self.predefined_n_sweep_execution)
         self._predefined_n_sweep_row = n_sweep_row
 
         self.predefined_tau_sweep_enabled = QtWidgets.QCheckBox(
@@ -4309,6 +4318,10 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         predefined = template != "custom"
         ramsey = template == "ramsey"
         fixed_count = template in {"hahn_echo", "ramsey"}
+        self.predefined_n_sweep_execution.setEnabled(
+            template == "cpmg" and self.predefined_n_sweep_enabled.isChecked())
+        if template != "cpmg":
+            self.predefined_n_sweep_execution.setCurrentIndex(0)
         for widget in (
             self.predefined_n,
             self.predefined_tau,
@@ -6906,6 +6919,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             predefined_n_sweep_start=self.predefined_n_sweep_start.value(),
             predefined_n_sweep_stop=self.predefined_n_sweep_stop.value(),
             predefined_n_sweep_count=self.predefined_n_sweep_count.value(),
+            predefined_n_sweep_execution=self.predefined_n_sweep_execution.currentData(),
             predefined_tau_sweep_enabled=(
                 self.predefined_tau_sweep_enabled.isChecked()
             ),
@@ -7201,6 +7215,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             predefined_n_sweep_count=int(
                 data.get("predefined_n_sweep_count", 4)
             ),
+            predefined_n_sweep_execution=str(data.get("predefined_n_sweep_execution", "software")),
             predefined_tau_sweep_enabled=bool(
                 data.get("predefined_tau_sweep_enabled", False)
             ),
@@ -7352,6 +7367,8 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.predefined_n_sweep_count.setValue(
                 spec.predefined_n_sweep_count
             )
+            self.predefined_n_sweep_execution.setCurrentIndex(
+                self.predefined_n_sweep_execution.findData(spec.predefined_n_sweep_execution))
             self.predefined_tau_sweep_enabled.setChecked(
                 spec.predefined_tau_sweep_enabled
             )
@@ -16596,6 +16613,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 predefined_n_sweep_count=int(
                     entry.get("predefined_n_sweep_count", 4)
                 ),
+                predefined_n_sweep_execution=str(entry.get("predefined_n_sweep_execution", "software")),
                 predefined_tau_sweep_enabled=bool(
                     entry.get("predefined_tau_sweep_enabled", False)
                 ),
@@ -16720,6 +16738,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     "predefined_n_sweep_count": (
                         spec.predefined_n_sweep_count
                     ),
+                    "predefined_n_sweep_execution": spec.predefined_n_sweep_execution,
                     "predefined_tau_sweep_enabled": (
                         spec.predefined_tau_sweep_enabled
                     ),
@@ -17758,6 +17777,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 predefined_n_sweep_count=int(
                     entry.get("predefined_n_sweep_count", 4)
                 ),
+                predefined_n_sweep_execution=str(entry.get("predefined_n_sweep_execution", "software")),
                 predefined_tau_sweep_enabled=bool(
                     entry.get("predefined_tau_sweep_enabled", False)
                 ),
@@ -17876,6 +17896,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "predefined_n_sweep_start": spec.predefined_n_sweep_start,
                 "predefined_n_sweep_stop": spec.predefined_n_sweep_stop,
                 "predefined_n_sweep_count": spec.predefined_n_sweep_count,
+                "predefined_n_sweep_execution": spec.predefined_n_sweep_execution,
                 "predefined_tau_sweep_enabled": (
                     spec.predefined_tau_sweep_enabled
                 ),

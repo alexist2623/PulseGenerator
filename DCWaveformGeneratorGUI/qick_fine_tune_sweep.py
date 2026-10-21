@@ -606,6 +606,61 @@ class HoldDurationSweep:
 
 
 @dataclass(frozen=True)
+class CpmgNSweep(HoldDurationSweep):
+    """Integer CPMG pulse count; HOLD coordinates remain fabric-cycle lengths."""
+
+    n_start: int = 1
+    n_step: int = 1
+    gen_ch: int = 0
+    body_event_id: str = ""
+    final_event_id: str = ""
+    period_us: float = 0.4
+    hold_start_cycles: int = 1
+    hold_stop_cycles: int = 1
+
+    def __post_init__(self):
+        _require_int(self.count, "CPMG N count", 1)
+        _require_int(self.n_start, "CPMG N start", 1)
+        if not isinstance(self.n_step, int):
+            raise TypeError("CPMG N step must be an integer")
+        if self.count > 1 and self.n_step == 0:
+            raise ValueError("CPMG N step must be nonzero")
+        if min(self.points) < 1:
+            raise ValueError("CPMG N must be positive")
+        _require_positive_real(self.period_us, "CPMG pulse period")
+        if min(self.duration_cycles_points) < 1:
+            raise ValueError("CPMG anchor HOLD must be positive")
+
+    @property
+    def points(self):
+        return tuple(self.n_start + index * self.n_step for index in range(self.count))
+
+    @property
+    def start_cycles(self):
+        return self.hold_start_cycles
+
+    @property
+    def stop_cycles(self):
+        return self.hold_stop_cycles
+
+    @property
+    def axis_kind(self):
+        return "rf_template_n"
+
+    @property
+    def coordinate_unit(self):
+        return "count"
+
+    @property
+    def parameter_name(self):
+        return "N"
+
+    @property
+    def execution(self):
+        return "tProcessor hardware N loop; one uploaded program"
+
+
+@dataclass(frozen=True)
 class BiasTCompensationConfig:
     """Per-shot opposite-polarity area compensation settings.
 
@@ -4498,6 +4553,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             # The inherited trigger() helper writes page-zero register 16.
             # Keep new sweep state out of it even without an external marker.
             occupied[0].add(16)
+        from qick_cpmg import add_loop_count_fields
+        add_loop_count_fields(self, fields)
         for field in fields:
             page = int(field["page"])
             allocations = (
@@ -5191,6 +5248,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         next_pulse = self._gen_mgrs[gen_ch].next_pulse
         if next_pulse is None:
             raise RuntimeError(f"RF generator {gen_ch} has no configured pulse")
+        from qick_cpmg import emit_loop_start, emit_loop_end
+        loop = emit_loop_start(self, field_key, int(page), int(time_register))
         for registers in next_pulse["regs"]:
             self.set(
                 int(self.soccfg["gens"][gen_ch]["tproc_ch"]),
@@ -5199,6 +5258,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 int(time_register),
                 comment,
             )
+        emit_loop_end(self, loop, int(page), int(time_register))
 
     def _configure_ddr_readout(self):
         ddr = self.ddr_readout_config
@@ -5521,7 +5581,10 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             return 0
         converted = tuple(
             cycles_from_us(duration_us, self.tproc_mhz)
-            for duration_us in axis.points
+            for duration_us in (
+                value / axis.sequence_fabric_mhz
+                for value in axis.duration_cycles_points
+            )
         )
         step = converted[1] - converted[0]
         expected = tuple(
@@ -5711,6 +5774,11 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 )
             )
             end_deltas = list(start_deltas)
+            for axis_index, axis in enumerate(axes):
+                if isinstance(axis, CpmgNSweep) and rf.event_id == axis.final_event_id:
+                    step = cycles_from_us(axis.period_us, self.tproc_mhz) * axis.n_step
+                    start_deltas[axis_index] += step
+                    end_deltas[axis_index] += step
             for parameter_name in rf.preceding_duration_parameters:
                 preceding_axis = self._rf_duration_axis(
                     rf.gen_ch,
@@ -6888,6 +6956,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 ro,
             )
 
+        from qick_cpmg import validate_loop_event_order
+        validate_loop_event_order(self, scheduled_events)
         for event_time, _priority, _order, kind, payload in sorted(
             scheduled_events,
             key=lambda item: item[:3],
@@ -8075,6 +8145,7 @@ __all__ = [
     "FineTuneDdrResult",
     "FineTuneSequence",
     "HoldDurationSweep",
+    "CpmgNSweep",
     "MAX_OUTPUTS",
     "PulseSegment",
     "RampDurationSweep",

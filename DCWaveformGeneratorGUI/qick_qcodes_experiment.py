@@ -711,6 +711,9 @@ def build_runtime_rf_pulses(
     tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     pulses = []
     for spec in specs:
+        from qick_cpmg import enabled as cpmg_hw_enabled, runtime_spec, runtime_events
+        cpmg_hw = cpmg_hw_enabled(spec)
+        spec = runtime_spec(spec)
         first_pulse_index = len(pulses)
         gen_cfg = soccfg["gens"][spec.gen_ch]
         _validate_summed_rf_spec(gen_cfg, spec)
@@ -740,7 +743,7 @@ def build_runtime_rf_pulses(
             ),
             dtype=np.float64,
         ).reshape(-1)
-        for event in spec.pulse_events:
+        for event in (runtime_events(spec) if cpmg_hw else spec.pulse_events):
             if spec.pulse_mode == "composite":
                 calibration_enabled = bool(
                     event.power_calibration_enabled
@@ -1007,6 +1010,15 @@ def build_qick_program(
 ):
     """Build the tProcessor program without configuring or running hardware."""
     effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
+    from qick_cpmg import enabled as cpmg_hw_enabled
+    from qick_fine_tune_sweep import CpmgNSweep
+    for spec in rf_specs:
+        if cpmg_hw_enabled(spec) and not any(
+            isinstance(axis, CpmgNSweep) and axis.gen_ch == spec.gen_ch
+            and axis.segment_name == spec.segment_name
+            for axis in sequence.sweep_axes
+        ):
+            raise ValueError("Hardware CPMG N axis is missing; build the sequence with the same RF settings")
     acquisition_source = str(acquisition_source)
     if acquisition_source not in {"fir_ddr", "avg_buffer"}:
         raise ValueError(
@@ -1897,7 +1909,8 @@ def _sweep_axis_meaning(axis: Any) -> str:
     if axis_kind == "rf_template_n":
         meaning = (
             f"Predefined composite RF pulse count N for {axis.output_name}/"
-            f"{axis.segment_name}; each coordinate is a host software run"
+            f"{axis.segment_name}; "
+            + getattr(axis, "execution", "each coordinate is a host software run")
         )
     elif axis_kind == "rf_template_tau":
         meaning = (
@@ -2607,7 +2620,7 @@ def store_qick_result(
             axis_metadata.update({
                 "parameter_name": str(axis.parameter_name),
                 "execution": (
-                    "host software sweep; compile and acquire once per point"
+                    getattr(axis, "execution", "host software sweep; compile and acquire once per point")
                 ),
             })
         elif axis_kind == "rf_duration":
