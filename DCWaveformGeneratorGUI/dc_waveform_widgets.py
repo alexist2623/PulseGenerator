@@ -16,6 +16,11 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets, sip
 
 try:
+    from .time_display import set_plot_axis_units
+except ImportError:
+    from time_display import set_plot_axis_units
+
+try:
     from .dc_waveform_core import PulseSequence
 except ImportError:
     from dc_waveform_core import PulseSequence
@@ -734,7 +739,7 @@ class RfPulsePreviewWidget(pg.PlotWidget):
         super().__init__(parent=parent)
         self.setBackground("w")
         self.showGrid(x=True, y=True, alpha=0.25)
-        self.setLabel("bottom", "sequence time", units="us")
+        set_plot_axis_units(self.getAxis("bottom"), "sequence time", "us")
         self.setLabel("left", "DAC code (pre-attenuation)")
         self.getPlotItem().hideButtons()
         self.getPlotItem().setMenuEnabled(False)

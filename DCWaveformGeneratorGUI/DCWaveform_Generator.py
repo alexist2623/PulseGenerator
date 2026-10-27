@@ -26,6 +26,11 @@ except ImportError:
     from fir_ddr_profile import result_iq_in_input_units
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+try:
+    from .time_display import TIME_SECONDS, time_sweep_display, time_sweep_summary
+except ImportError:
+    from time_display import TIME_SECONDS, time_sweep_display, time_sweep_summary
 try:
     from .clock_time import clock_time, clock_time_text
     from .clock_time_widgets import ClockTimeSpinBox, ClockTimeLineEdit
@@ -2867,12 +2872,15 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
         self.count.setValue(initial.count if initial is not None else 9)
         self.rate_summary = QtWidgets.QLabel()
         self.rate_summary.setWordWrap(True)
+        self.time_summary = QtWidgets.QLabel()
+        self.time_summary.setWordWrap(True)
         self.cartesian_summary = QtWidgets.QLabel()
 
         form.addRow("Start duration:", self.start)
         form.addRow("Stop duration:", self.stop)
         form.addRow("Sweep point count:", self.count)
         form.addRow("Nominal RAMP rates:", self.rate_summary)
+        form.addRow("Applied time sweep:", self.time_summary)
         form.addRow("Cartesian total:", self.cartesian_summary)
         self.rate_summary.setToolTip(
             "The following SET remains the RAMP target. Voltage sweeps on "
@@ -2897,6 +2905,9 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
             f"{start_rate:.9g} to {stop_rate:.9g} mV/us "
             "(nominal endpoint levels)"
         )
+        self.time_summary.setText(time_sweep_summary(
+            self.start.value(), self.stop.value(), self.count.value(),
+            fabric_mhz=_widget_clock_mhz(self)))
         self.cartesian_summary.setText(
             f"{self._cartesian_base_count} x {self.count.value()} = "
             f"{self._cartesian_base_count * self.count.value()} points"
@@ -2958,10 +2969,13 @@ class HoldDurationSweepSettingsDialog(QtWidgets.QDialog):
         self.count.setRange(2, 1_000_000)
         self.count.setValue(initial.count if initial is not None else 9)
         self.cartesian_summary = QtWidgets.QLabel()
+        self.time_summary = QtWidgets.QLabel()
+        self.time_summary.setWordWrap(True)
 
         form.addRow("Start hold:", self.start)
         form.addRow("Stop hold:", self.stop)
         form.addRow("Sweep point count:", self.count)
+        form.addRow("Applied time sweep:", self.time_summary)
         form.addRow("Cartesian total:", self.cartesian_summary)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -2970,10 +2984,15 @@ class HoldDurationSweepSettingsDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self.start.valueChanged.connect(self._refresh_summary)
+        self.stop.valueChanged.connect(self._refresh_summary)
         self.count.valueChanged.connect(self._refresh_summary)
         self._refresh_summary()
 
     def _refresh_summary(self, *_args) -> None:
+        self.time_summary.setText(time_sweep_summary(
+            self.start.value(), self.stop.value(), self.count.value(),
+            fabric_mhz=_widget_clock_mhz(self)))
         self.cartesian_summary.setText(
             f"{self._cartesian_base_count} x {self.count.value()} = "
             f"{self._cartesian_base_count * self.count.value()} points"
@@ -8690,9 +8709,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         sweep_parameter_layout = QtWidgets.QVBoxLayout(
             self.sweep_parameter_group
         )
-        self.sweep_parameter_table = QtWidgets.QTableWidget(0, 7)
+        self.sweep_parameter_table = QtWidgets.QTableWidget(0, 8)
         self.sweep_parameter_table.setHorizontalHeaderLabels(
-            ["Select / Type", "Target", "Start", "Stop", "Points", "Group", "Requested step"]
+            ["Select / Type", "Target", "Start", "Requested stop", "Points", "Group", "Step", "Applied time stop"]
         )
         self.sweep_parameter_table.verticalHeader().setVisible(False)
         self.sweep_parameter_table.setEditTriggers(
@@ -8716,7 +8735,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         sweep_parameter_header.setSectionResizeMode(
             1, QtWidgets.QHeaderView.ResizeToContents
         )
-        for column in (2, 3, 4, 5, 6):
+        for column in (2, 3, 4, 5, 6, 7):
             sweep_parameter_header.setSectionResizeMode(
                 column, QtWidgets.QHeaderView.ResizeToContents
             )
@@ -9204,6 +9223,12 @@ class ExperimentPanel(QtWidgets.QWidget):
 
     def _sweep_axis_label(self, spec) -> str:
         axis_kind = getattr(spec, "axis_kind", "amplitude")
+        time_summary = self._sweep_time_summary(spec)
+        if time_summary is not None:
+            kind, target, *_ = self._sweep_parameter_values(spec)
+            if axis_kind == 'ramp_duration':
+                kind += ' (rate derived)'
+            return f'{target} / {kind} | {time_summary}'
         if axis_kind in {"rf_delay", "rf_t2_duration", "rf_amplitude", "rf_phase"}:
             label = {"rf_delay": "delay tau", "rf_t2_duration": "T2 pi duration",
                      "rf_amplitude": "amplitude", "rf_phase": "phase"}[axis_kind]
@@ -9273,6 +9298,19 @@ class ExperimentPanel(QtWidgets.QWidget):
             str(spec.output_name),
             str(spec.segment_name),
         )
+
+    def _sweep_time_display(self, spec):
+        _kind, _target, start, stop, unit = self._sweep_parameter_values(spec)
+        if unit not in TIME_SECONDS:
+            return None
+        scale = TIME_SECONDS[unit] / 1e-6
+        clock = (_widget_clock_mhz(self) if getattr(spec, 'axis_kind', '')
+                 in {'ramp_duration', 'hold_duration'} else None)
+        return time_sweep_display(start * scale, stop * scale, spec.count, fabric_mhz=clock)
+
+    def _sweep_time_summary(self, spec):
+        display = self._sweep_time_display(spec)
+        return display['summary'] if display is not None else None
 
     def _sweep_parameter_values(
         self,
@@ -9403,6 +9441,8 @@ class ExperimentPanel(QtWidgets.QWidget):
                 member_id = self.sweep_grouping.member_id(spec)
                 group_id, group = self.sweep_grouping.group_for(spec)
                 step = (stop - start) / (int(spec.count) - 1) if int(spec.count) > 1 else 0.0
+                time_display = self._sweep_time_display(spec)
+                time_summary = time_display['summary'] if time_display is not None else None
                 values = (
                     sweep_type,
                     target,
@@ -9410,11 +9450,14 @@ class ExperimentPanel(QtWidgets.QWidget):
                     f"{stop:.9g} {unit}",
                     str(spec.count),
                     group["name"] if group else "Independent",
-                    f"{step:.9g} {unit}",
+                    time_display['step'] if time_display else f"{step:.9g} {unit}",
+                    time_display['end'] if time_display else '-',
                 )
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
-                    minimum_width = {1: 180, 2: 95, 3: 95, 6: 120}.get(column)
+                    if time_summary is not None:
+                        item.setToolTip(time_summary)
+                    minimum_width = {1: 180, 2: 95, 3: 95, 6: 120, 7: 120}.get(column)
                     if minimum_width is not None:
                         text_width = self.sweep_parameter_table.fontMetrics().horizontalAdvance(value) + 18
                         item.setSizeHint(QtCore.QSize(max(minimum_width, text_width), 24))
@@ -9433,7 +9476,7 @@ class ExperimentPanel(QtWidgets.QWidget):
                         palette = ("#e6f1fb", "#ebf6e7", "#fff3db", "#f2eafa", "#e4f5f2")
                         color_index = list(self.sweep_grouping.groups).index(group_id) % len(palette)
                         item.setBackground(QtGui.QColor(palette[color_index]))
-                    if column == 6:
+                    if column == 6 and time_summary is None:
                         item.setToolTip("Requested range increment; hardware-quantized coordinates are shown by the waveform/compiler preview. N=1 uses the start value.")
                     if column >= 2:
                         item.setTextAlignment(
@@ -12029,6 +12072,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             repetitions=self._qick_repetitions_per_sweep,
         )
         self._noise_panel.set_connection_values(connection)
+        if self._dac_current_state.connection != connection:
+            self._dac_current_state.update({}, source='unavailable', connection=connection)
+            self._qick_configuration = None
         self._refresh_physical_waveforms()
 
     def _configure_qick_setup(self) -> None:
@@ -14132,6 +14178,14 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._identify_qick_configuration()
 
     def _apply_dac_current(self, dac, current_ua):
+        target = self._qick_front_panel_target
+        connection = (target.connection_config() if target is not None and hasattr(target, 'connection_config')
+                      else self._shared_qick_connection())
+        if (self._dac_current_state.source != 'hardware'
+                or self._dac_current_state.connection != connection):
+            self._qick_front_panel.identify_status.setText(
+                'Identify this QICK endpoint before applying DAC current')
+            return
         self._identify_qick_configuration(current_change=(dac, current_ua))
 
     def _dac_scale_arguments(self, channels):
@@ -14170,10 +14224,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             self._waveform_scale_label.setText("DAC limits (front panel): " + " | ".join(labels))
 
     def _on_qick_configuration_identified(self, configuration) -> None:
-        self._acquisition_profile_connection = getattr(
+        identified_connection = getattr(
             self, "_identifying_configuration_connection", self._shared_qick_connection())
+        target = self._qick_front_panel_target
+        current_connection = (target.connection_config() if target is not None and hasattr(target, 'connection_config')
+                              else self._shared_qick_connection())
+        if identified_connection != current_connection:
+            self._qick_front_panel.set_identifying(False, 'Endpoint changed; identify QICK again')
+            return
+        self._acquisition_profile_connection = identified_connection
         if configuration.dac_current_settings is not None:
-            self._dac_current_state.update(configuration.dac_current_settings)
+            self._dac_current_state.update(configuration.dac_current_settings,
+                                           connection=identified_connection)
+        else:
+            self._dac_current_state.update({}, source='unavailable', connection=identified_connection)
         self._qick_configuration = configuration
         self._experiment_panel.set_awg_front_panel_configuration(configuration)
         self._square_dds_panel.set_configuration(configuration)
@@ -14209,6 +14273,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _on_qick_configuration_failed(self, details: str) -> None:
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown QICK identification error"
+        self._dac_current_state.invalidate_readback()
         self._qick_front_panel.set_identifying(False, f"Failed: {summary}")
         self.statusBar().showMessage("QICK front-panel identification failed")
         dialog = DetailedErrorMessageBox(
@@ -18382,7 +18447,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._restore_trace_stability_overlay_settings(
             settings["trace_stability_overlay"]
         )
-        self._dac_current_state.update(settings.get('dac_current_settings', {}))
+        self._dac_current_state.load_snapshot(settings.get('dac_current_settings', {}),
+                                              connection=self._shared_qick_connection())
         self._square_wave_panel._refresh_current_scale()
 
 

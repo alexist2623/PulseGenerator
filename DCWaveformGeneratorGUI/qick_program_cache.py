@@ -19,7 +19,7 @@ from __future__ import annotations
 import base64
 from collections import OrderedDict
 from fractions import Fraction
-from functools import lru_cache
+from functools import cached_property, lru_cache
 import gzip
 import hashlib
 import importlib
@@ -93,6 +93,11 @@ def _state(value, *, key=False):
         if name in ("cancel_check", "compile_cache_info") or name.startswith("_compile_cache_"):
             state.pop(name, None)
     if key:
+        # Previewing an immutable axis may populate derived values. They are
+        # not new compiler inputs and must not turn an identical run into a miss.
+        for name in list(state):
+            if isinstance(getattr(type(value), name, None), cached_property):
+                state.pop(name)
         state.pop("_sweep_coordinate_cache", None)
         if type(value) is _local("qick_fine_tune_sweep").FineTuneSequence:
             state.pop("sweep_parameter_ids", None)

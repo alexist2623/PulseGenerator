@@ -7,6 +7,11 @@ from threading import Event
 import traceback
 
 from PyQt5 import QtCore, QtWidgets
+
+try:
+    from .time_display import set_plot_axis_units
+except ImportError:
+    from time_display import set_plot_axis_units
 import pyqtgraph as pg
 
 try:
@@ -331,7 +336,7 @@ class SquareWavePanel(QtWidgets.QWidget):
         self.output_note.setWordWrap(True)
         editor.addWidget(self.output_note)
         self.plot = pg.PlotWidget()
-        self.plot.setLabel("bottom", "Time", units="us")
+        set_plot_axis_units(self.plot.getAxis("bottom"), "Time", "us")
         self.plot.setLabel("left", "Requested voltage", units="mV")
         self.plot.setMinimumHeight(160)
         self.plot.setMaximumHeight(280)

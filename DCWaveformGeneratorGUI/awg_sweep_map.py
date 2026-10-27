@@ -27,6 +27,11 @@ except ImportError:
 from PyQt5 import QtCore, QtWidgets
 
 try:
+    from .time_display import set_plot_axis_units
+except ImportError:
+    from time_display import set_plot_axis_units
+
+try:
     import pyqtgraph as pg
 except ImportError:
     pg = None
@@ -1722,16 +1727,8 @@ if pg is not None:
         def _display_result(self, result: AwgSweepMapResult) -> None:
             self._result = result
             for plot in self.plots.values():
-                plot.setLabel(
-                    "bottom",
-                    result.x_axis_label,
-                    units=result.x_unit,
-                )
-                plot.setLabel(
-                    "left",
-                    result.y_axis_label,
-                    units=result.y_unit,
-                )
+                set_plot_axis_units(plot.getAxis("bottom"), result.x_axis_label, result.x_unit)
+                set_plot_axis_units(plot.getAxis("left"), result.y_axis_label, result.y_unit)
             self.plots["i"].setTitle(f"I [{result.value_unit}]")
             self.plots["q"].setTitle(f"Q [{result.value_unit}]")
             self.plots["magnitude"].setTitle(

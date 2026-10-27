@@ -937,6 +937,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self._awg_output_mode = False
         self._allowed_output_channels = None
         self._current_state = None
+        self._identifying = False
 
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
@@ -990,8 +991,11 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.output_current_apply.clicked.connect(self._request_current)
         self.output_full_scale = QtWidgets.QLabel("Identify QICK to read DAC current")
         self.output_full_scale.setWordWrap(True)
+        self.output_current_status = QtWidgets.QLabel("No hardware readback; use Identify QICK")
+        self.output_current_status.setWordWrap(True)
         self.output_current_ma.valueChanged.connect(self._preview_current)
-        output_form.addRow("DAC full-scale current:", self.output_current_ma)
+        output_form.addRow("Requested DAC current:", self.output_current_ma)
+        output_form.addRow("Last DAC readback:", self.output_current_status)
         output_form.addRow("Estimated full scale (+/-):", self.output_full_scale)
         output_form.addRow(self.output_current_apply)
         self.output_current_ma.setEnabled(False)
@@ -1091,17 +1095,30 @@ class QickFrontPanelControl(QtWidgets.QWidget):
     def _refresh_current(self, *_args):
         channel = self.output_channel.currentData()
         record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
-        allowed = bool(record and record.get('adjustable'))
+        known = bool(record and record.get('current_ua') is not None)
+        live = bool(self._current_state and self._current_state.source == 'hardware')
+        allowed = bool(known and live and record.get('adjustable') and not self._identifying)
         self.output_current_ma.setEnabled(allowed)
         self.output_current_apply.setEnabled(allowed)
-        if record and record.get('current_ua') is not None:
+        if known:
             with QtCore.QSignalBlocker(self.output_current_ma):
+                self.output_current_ma.setSpecialValueText('')
                 # A read-only RF channel can have a wider current range.
                 self.output_current_ma.setRange(min(6.425, record['current_ua']/1000),
                                                 max(32., record['current_ua']/1000))
                 self.output_current_ma.setValue(record['current_ua']/1000)
+            origin = (f'Cached hardware readback: {self._current_state.read_at}' if live
+                      else 'Saved snapshot; use Identify QICK to refresh')
+            self.output_current_status.setText(
+                f'DAC {record["converter_id"]} / gen {channel}: '
+                f'{record["current_ua"]/1000:.3f} mA. {origin}')
             self._preview_current()
         else:
+            with QtCore.QSignalBlocker(self.output_current_ma):
+                self.output_current_ma.setRange(0., 32.)
+                self.output_current_ma.setSpecialValueText('N/A')
+                self.output_current_ma.setValue(0.)
+            self.output_current_status.setText('Unavailable; use Identify QICK to read this DAC')
             self.output_full_scale.setText('Current unavailable; legacy +/-800 mV reference')
         reason = record.get('reason', '') if record else 'Update board QSTL_QICK and identify QICK'
         self.output_current_ma.setToolTip(reason)
@@ -1111,6 +1128,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         from qick_dac_current import full_scale_mv
         channel = self.output_channel.currentData()
         record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
+        if not record or record.get('current_ua') is None:
+            return
         if record and not record.get('dc_output'):
             self.output_full_scale.setText('RF IP: current read-only; RF power calibration applies')
             return
@@ -1123,7 +1142,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
     def _request_current(self):
         channel = self.output_channel.currentData()
         record = None if self._current_state is None or channel is None else self._current_state.for_channel(channel)
-        if record and record.get('adjustable'):
+        if (record and record.get('adjustable') and record.get('current_ua') is not None
+                and self._current_state.source == 'hardware' and not self._identifying):
             self._preferred_output_ch = int(channel)
             self.current_requested.emit(record['converter_id'], int(round(self.output_current_ma.value()*1000)))
 
@@ -1182,9 +1202,11 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self._update_summary()
 
     def set_identifying(self, identifying: bool, message: str) -> None:
+        self._identifying = bool(identifying)
         self.identify_button.setEnabled(not identifying)
         self.identify_status.setText(message)
         self.apply_button.setEnabled(not identifying and self._selection_is_valid())
+        self._refresh_current()
 
     def set_awg_output_mode(self, enabled: bool) -> None:
         self._awg_output_mode = bool(enabled)

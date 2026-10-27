@@ -1,5 +1,6 @@
 """Shared DAC current state, independent of the selected experiment tab."""
 from copy import deepcopy
+from datetime import datetime, timezone
 import math
 from PyQt5 import QtCore
 
@@ -29,7 +30,11 @@ def verify_current_settings(soc, settings):
     for dac, expected in settings.items():
         record = actual.get(str(dac), {})
         if record.get('current_ua') != expected['current_ua']:
-            raise RuntimeError(f'DAC {dac} current changed or cannot be read. '
+            measured = record.get('current_ua')
+            readback = 'unavailable' if measured is None else f'{measured} uA'
+            raise RuntimeError(f'DAC {dac} current changed or cannot be read '
+                               f'(generators {expected.get("channels", [])}; '
+                               f'compiled {expected["current_ua"]} uA, readback {readback}). '
                                'Refresh the front panel and compile again.')
         if bool(record.get('dc_output')) != bool(expected.get('dc_output')):
             raise RuntimeError(f'DAC {dac} output-board type changed')
@@ -43,10 +48,32 @@ class DacCurrentState(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.records = {}
+        self.source = 'unavailable'
+        self.read_at = None
+        self.connection = None
 
-    def update(self, records):
+    def update(self, records, *, source='hardware', connection=None):
         self.records = deepcopy(dict(records))
+        self.source = source
+        self.connection = connection
+        self.read_at = (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                        if source == 'hardware' else None)
         self.changed.emit()
+
+    def load_snapshot(self, records, *, connection=None):
+        """A settings file must not replace readback from the same endpoint."""
+        if self.source == 'hardware' and self.connection == connection:
+            # Notify after the other settings have loaded, restoring per-DAC scales.
+            self.changed.emit()
+            return
+        self.update(records, source='saved', connection=connection)
+
+    def invalidate_readback(self):
+        """Retain routing, but block output compilation for an unreadable DAC."""
+        records = deepcopy(self.records)
+        for record in records.values():
+            record['current_ua'] = None
+        self.update(records, source='unavailable', connection=self.connection)
 
     def for_channel(self, channel):
         return next((v for v in self.records.values()

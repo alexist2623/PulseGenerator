@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from functools import cached_property, lru_cache
 from itertools import product
 from math import ceil, isclose, isfinite
 from numbers import Integral, Real
@@ -187,6 +188,19 @@ def _round_div_nearest(numerator: int, denominator: int) -> int:
     return sign * ((abs(int(numerator)) + denominator // 2) // denominator)
 
 
+@lru_cache(maxsize=128)
+def _sweep_layout_for(signature):
+    """Bounded cache keyed by current counts/membership, never mutable sequence."""
+    first = {}
+    representatives = tuple(i if group is None else first.setdefault(group, i)
+                            for i, (_count, group) in enumerate(signature))
+    loops = tuple(i for i, representative in enumerate(representatives) if i == representative)
+    model_shape = tuple(count if i == representatives[i] else 1
+                        for i, (count, _group) in enumerate(signature))
+    shape = tuple(signature[i][0] for i in loops)
+    return representatives, loops, model_shape, shape
+
+
 @dataclass(frozen=True)
 class PulseSegment:
     name: str
@@ -203,7 +217,7 @@ class AmplitudeSweep:
     stop: float
     count: int
 
-    @property
+    @cached_property
     def points(self) -> Tuple[float, ...]:
         if self.count == 1:
             return (self.start,)
@@ -270,7 +284,7 @@ class RfDurationSweep:
                 "'fixed' or 'extend_by_rf_duration'"
             )
 
-    @property
+    @cached_property
     def points(self) -> Tuple[float, ...]:
         if self.count == 1:
             return (float(self.start),)
@@ -487,15 +501,15 @@ class RampDurationSweep:
     def output_name(self) -> str:
         return "all_awg_outputs"
 
-    @property
+    @cached_property
     def start_cycles(self) -> int:
         return cycles_from_us(self.start, self.sequence_fabric_mhz)
 
-    @property
+    @cached_property
     def stop_cycles(self) -> int:
         return cycles_from_us(self.stop, self.sequence_fabric_mhz)
 
-    @property
+    @cached_property
     def duration_step_cycles(self) -> int:
         if self.count <= 1:
             return 0
@@ -504,14 +518,17 @@ class RampDurationSweep:
             self.count - 1,
         )
 
-    @property
+    @cached_property
     def duration_cycles_points(self) -> Tuple[int, ...]:
+        # Frozen axes are replaced on edit. Keep the exact integer progression
+        # once, instead of re-quantizing the full axis for each safety-check point.
+        start, step = self.start_cycles, self.duration_step_cycles
         return tuple(
-            self.start_cycles + index * self.duration_step_cycles
+            start + index * step
             for index in range(self.count)
         )
 
-    @property
+    @cached_property
     def points(self) -> Tuple[float, ...]:
         return tuple(
             float(cycles) / float(self.sequence_fabric_mhz)
@@ -565,15 +582,15 @@ class HoldDurationSweep:
     def output_name(self) -> str:
         return "all_awg_outputs"
 
-    @property
+    @cached_property
     def start_cycles(self) -> int:
         return cycles_from_us(self.start, self.sequence_fabric_mhz)
 
-    @property
+    @cached_property
     def stop_cycles(self) -> int:
         return cycles_from_us(self.stop, self.sequence_fabric_mhz)
 
-    @property
+    @cached_property
     def duration_step_cycles(self) -> int:
         if self.count <= 1:
             return 0
@@ -582,14 +599,15 @@ class HoldDurationSweep:
             self.count - 1,
         )
 
-    @property
+    @cached_property
     def duration_cycles_points(self) -> Tuple[int, ...]:
+        start, step = self.start_cycles, self.duration_step_cycles
         return tuple(
-            self.start_cycles + index * self.duration_step_cycles
+            start + index * step
             for index in range(self.count)
         )
 
-    @property
+    @cached_property
     def points(self) -> Tuple[float, ...]:
         return tuple(
             float(cycles) / float(self.sequence_fabric_mhz)
@@ -1723,28 +1741,28 @@ class FineTuneSequence:
         return self
 
     def axis_representative(self, index):
-        index = int(index)
-        axis = self.sweeps[index]
-        group = self._sweep_group_ids.get(self.sweep_axis_key(axis))
-        if group is None:
-            return index
-        return next(i for i, member in enumerate(self.sweeps)
-                    if self._sweep_group_ids.get(self.sweep_axis_key(member)) == group)
+        return self._sweep_layout()[0][int(index)]
+
+    def _sweep_layout(self):
+        # Re-read the signature: adding/replacing/reordering axes or changing a
+        # group cannot leave stale shapes, even for direct public-list edits.
+        return _sweep_layout_for(tuple(
+            (axis.count, self._sweep_group_ids.get(self.sweep_axis_key(axis)))
+            for axis in self.sweeps))
 
     def axis_members(self, index):
-        representative = self.axis_representative(index)
-        return tuple(i for i in range(len(self.sweeps))
-                     if self.axis_representative(i) == representative)
+        representatives = self._sweep_layout()[0]
+        return tuple(i for i, representative in enumerate(representatives)
+                     if representative == representatives[int(index)])
 
     @property
     def loop_axis_indices(self):
-        return tuple(i for i in range(len(self.sweeps)) if self.axis_representative(i) == i)
+        return self._sweep_layout()[1]
 
     @property
     def model_shape(self):
         """Flat member slots, with singleton placeholders for grouped members."""
-        return tuple(axis.count if self.axis_representative(i) == i else 1
-                     for i, axis in enumerate(self.sweeps))
+        return self._sweep_layout()[2]
 
     @property
     def compiler_sweep_axes(self):
@@ -1755,8 +1773,9 @@ class FineTuneSequence:
         return tuple(map(int, np.unravel_index(point_index, self.model_shape, order="C"))) if self.sweeps else ()
 
     def point_indices(self, point_index):
-        indices = self.model_indices(point_index)
-        return tuple(indices[self.axis_representative(i)] for i in range(len(self.sweeps)))
+        representatives, _loops, model_shape, _shape = self._sweep_layout()
+        indices = tuple(map(int, np.unravel_index(point_index, model_shape, order="C"))) if self.sweeps else ()
+        return tuple(indices[i] for i in representatives)
 
     def fold_axis_deltas(self, values):
         result = [0] * len(self.sweeps)
@@ -1846,7 +1865,7 @@ class FineTuneSequence:
 
     @property
     def sweep_shape(self) -> Tuple[int, ...]:
-        return tuple(self.sweeps[i].count for i in self.loop_axis_indices) or (1,)
+        return self._sweep_layout()[3] or (1,)
 
     @property
     def sweep_coordinates(self) -> np.ndarray:
