@@ -10,6 +10,11 @@ HARDWARE_GROUP_KINDS = frozenset({
     "rf_frequency", "rf_power",
 })
 
+def is_software_sweep(spec):
+    # CPMG N can use either executor, so axis_kind alone is insufficient.
+    from dc_waveform_core import QickRfSoftwareSweepAxisSpec
+    return isinstance(spec, QickRfSoftwareSweepAxisSpec)
+
 
 def parameter_key(spec):
     return (str(getattr(spec, "axis_kind", "amplitude")),
@@ -28,6 +33,7 @@ class SweepGroupingModel:
         self.parameters = {}  # source key -> stable UUID
         self.groups = {}      # group UUID -> name/count/member UUIDs
         self.last_counts = {}
+        self.execution_order = []  # stable member IDs, slowest to fastest
 
     def _normalize(self):
         live = set(self.parameters.values())
@@ -36,6 +42,7 @@ class SweepGroupingModel:
             if len(group["members"]) < 2:
                 del self.groups[group_id]
         self.last_counts = {pid: count for pid, count in self.last_counts.items() if pid in live}
+        self.execution_order = [pid for pid in self.execution_order if pid in live]
 
     def synchronize(self, specs, *, accept_count_edits=True):
         specs = tuple(specs)
@@ -115,6 +122,71 @@ class SweepGroupingModel:
                 result.append(spec)
         return tuple(result)
 
+    def ordered_specs(self, specs):
+        """Display the execution nesting; correlated members stay together.
+
+        Host recompilation necessarily surrounds hardware loops. Within each
+        execution domain, an explicit order overrides the legacy duration-first
+        order. Old settings keep that legacy order until a member is moved.
+        """
+        specs = tuple(specs)
+        rank = {pid: i for i, pid in enumerate(self.execution_order)}
+        def order(item):
+            index, spec = item
+            kind = parameter_key(spec)[0]
+            host = is_software_sweep(spec)
+            legacy = {"ramp_duration": 0, "hold_duration": 1}.get(kind, 2)
+            pid = self.member_id(spec)
+            return (not host, rank.get(pid, len(rank)), legacy if not host else 0, index)
+        ordered = [spec for _, spec in sorted(enumerate(specs), key=order)]
+        blocks, seen = [], set()
+        for spec in ordered:
+            gid, _ = self.group_for(spec)
+            key = ("group", gid) if gid else ("parameter", parameter_key(spec))
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append([item for item in ordered if self.group_for(item)[0] == gid]
+                          if gid else [spec])
+        return tuple(spec for block in blocks for spec in block)
+
+    def _move_blocks(self, member_id, direction, specs):
+        if direction not in (-1, 1):
+            raise ValueError("Sweep movement must be -1 or +1")
+        ordered = self.ordered_specs(specs)
+        blocks = []
+        for spec in ordered:
+            gid, _ = self.group_for(spec)
+            if blocks and gid and self.group_for(blocks[-1][0])[0] == gid:
+                blocks[-1].append(spec)
+            else:
+                blocks.append([spec])
+        index = next((i for i, block in enumerate(blocks)
+                      if any(self.member_id(spec) == member_id for spec in block)), None)
+        if index is None or not 0 <= index + direction < len(blocks):
+            return None
+        other = index + direction
+        host = lambda block: is_software_sweep(block[0])
+        if host(blocks[index]) != host(blocks[other]):
+            return None  # A host coordinate owns a complete hardware sweep.
+        return blocks, index, other
+
+    def can_move(self, member_id, direction, specs):
+        return self._move_blocks(member_id, direction, specs) is not None
+
+    def move(self, member_id, direction, specs):
+        move = self._move_blocks(member_id, direction, specs)
+        if move is None:
+            return False
+        blocks, index, other = move
+        blocks[index], blocks[other] = blocks[other], blocks[index]
+        self.execution_order = [self.member_id(spec) for block in blocks for spec in block]
+        return True
+
+    def compiler_order(self, specs):
+        return tuple((kind, segment, output)
+                     for kind, output, segment in map(parameter_key, self.ordered_specs(specs)))
+
     def point_count(self, specs):
         return prod(int(spec.count) for spec in self.loop_specs(specs))
 
@@ -133,6 +205,7 @@ class SweepGroupingModel:
                            for key, pid in self.parameters.items()],
             "groups": [{"group_id": gid, **group, "members": list(group["members"])}
                        for gid, group in self.groups.items()],
+            "execution_order": list(self.execution_order),
         }
 
     @classmethod
@@ -153,6 +226,12 @@ class SweepGroupingModel:
             model.parameters[key] = pid
             used_ids.add(pid)
         assigned = set()
+        order = value.get("execution_order", [])
+        if not isinstance(order, list) or any(not isinstance(pid, str) for pid in order):
+            raise ValueError("Sweep execution order must be a list of parameter IDs")
+        if len(order) != len(set(order)) or any(pid not in used_ids for pid in order):
+            raise ValueError("Sweep execution order requires unique existing parameter IDs")
+        model.execution_order = list(order)
         for entry in value.get("groups", []):
             gid = str(entry["group_id"])
             count = entry["count"]

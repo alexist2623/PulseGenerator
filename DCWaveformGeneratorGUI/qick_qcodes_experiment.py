@@ -1255,8 +1255,8 @@ def _cache_execution_coordinates(program, cancel_check=None) -> None:
         return
     channels = tuple(getattr(program, "awg_channels", ()))
     if not channels or not all(
-        program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4")
-        and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3)
+        program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7")
+        and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3, 7)
         for channel in channels
     ):
         return
@@ -1515,12 +1515,16 @@ class SoftwareSweepProgramBundle:
 
 def _rf_software_sweep_bindings(
     rf_specs: Sequence[QickRfPulseSpec],
+    sweep_order=(),
 ) -> Tuple[Tuple[int, QickRfSoftwareSweepAxisSpec], ...]:
-    return tuple(
+    bindings = tuple(
         (spec_index, axis)
         for spec_index, spec in enumerate(rf_specs)
         for axis in spec.software_sweep_axes
     )
+    ranks = {tuple(key): i for i, key in enumerate(sweep_order)}
+    return tuple(sorted(bindings, key=lambda item: ranks.get(
+        (item[1].axis_kind, item[1].segment_name, item[1].output_name), len(ranks))))
 
 
 def _software_sweep_coordinates(
@@ -1711,7 +1715,7 @@ def execute_qick_sequence(
 ) -> Tuple[Any, Any, Mapping[str, Any]]:
     """Execute once, or recompile per composite RF software coordinate."""
     rf_specs = tuple(rf_specs)
-    bindings = _rf_software_sweep_bindings(rf_specs)
+    bindings = _rf_software_sweep_bindings(rf_specs, getattr(sequence, "sweep_execution_order", ()))
     if not bindings:
         return _execute_qick_sequence_once(
             soc,
@@ -3167,7 +3171,7 @@ def run_qick_qcodes_experiment(
         compile_validation_mode
     )
     stored_qick_settings["compile_validation_mode"] = compile_validation_mode
-    software_bindings = _rf_software_sweep_bindings(rf_specs)
+    software_bindings = _rf_software_sweep_bindings(rf_specs, getattr(sequence, "sweep_execution_order", ()))
     software_coordinates = _software_sweep_coordinates(software_bindings)
     if software_bindings:
         software_metadata = {

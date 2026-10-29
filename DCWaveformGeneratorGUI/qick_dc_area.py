@@ -86,6 +86,25 @@ def waveform_ledger(program, point_index, output):
             hold(current,start-cursor)
             count=int(command.duration_samples)
             if count <= 0: raise ValueError('RAMP needs a positive scalar duration')
+            from qick_fine_ramp import is_extended, scalar_runs
+            if is_extended(command):
+                for n, a, b, lower, upper in scalar_runs(command, current * 4):
+                    m = 1 << 20
+                    candidates = {0, n}
+                    if a:
+                        cross = (-b) // a
+                        candidates.update(max(0, min(n, cross+d)) for d in (-1, 0, 1, 2))
+                    sums = [area + clipped_floor_sum(k, m, a, b, lower, upper) for k in candidates]
+                    low = min(low, *sums); high = max(high, *sums)
+                    area += clipped_floor_sum(n, m, a, b, lower, upper)
+                    ideal_area += Fraction(n*b + a*n*(n-1)//2, m)
+                    ramp_samples += n if a else 0
+                    first = max(lower, min(upper, b/m))
+                    last = max(lower, min(upper, (b+a*(n-1))/m))
+                    intervals.append((first/8192, last/8192, n/rate, (1+abs(a)/m)/8192 if a else 0.0))
+                cursor = start + ((count + 15)//16)*16
+                current = int(command.target_code) >> 2
+                continue
             b=current*(1 << (int(gen['frac'])+2))
             a=int(command.step); m=1 << (int(gen['frac'])+2)
             # A monotone ramp can change area direction only at its zero cross.

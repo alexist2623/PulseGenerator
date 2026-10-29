@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import cached_property, lru_cache
 from itertools import product
-from math import ceil, isclose, isfinite
+from math import ceil, isclose, isfinite, prod
 from numbers import Integral, Real
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
@@ -1046,6 +1046,7 @@ class FineTuneSequence:
 
         self.output_names = output_names
         self.segments = []
+        self.fine_ramps = {}
         self.sweeps = []
         self._sweep_group_ids = {}
         self.rf_segment_length_extensions = []
@@ -1206,6 +1207,11 @@ class FineTuneSequence:
         updates the incoming RAMP target and the outgoing RAMP start value.
         """
         return self._add_segment("ramp", name, None, duration_cycles)
+
+    def set_fine_ramp(self, segment, specs):
+        """Set optional sample-position edges per output; amplitudes normalized."""
+        self.fine_ramps[str(segment)] = tuple(None if s is None else dict(s) for s in specs)
+        return self
 
     def set_amplitude_sweep(
         self,
@@ -1716,6 +1722,22 @@ class FineTuneSequence:
     def sweep_axis_key(axis):
         return (str(axis.axis_kind), str(axis.segment_name), str(axis.output_name))
 
+    def set_sweep_order(self, keys):
+        """Set execution nesting, slowest first, including subsequently attached axes.
+
+        The order can also contain host-only axes: those are consumed by the
+        software acquisition loop, not by this hardware sweep.
+        """
+        keys = tuple(tuple(key) for key in (keys or ()))
+        if any(len(key) != 3 or any(not isinstance(v, str) or not v for v in key)
+               for key in keys) or len(set(keys)) != len(keys):
+            raise ValueError("Sweep order requires unique kind/segment/output keys")
+        self.sweep_execution_order = keys
+        ranks = {key: i for i, key in enumerate(keys)}
+        self.sweeps.sort(key=lambda axis: ranks.get(self.sweep_axis_key(axis), len(ranks)))
+        self._sweep_coordinate_cache = None
+        return self
+
     def set_sweep_groups(self, groups):
         """Bind member parameters to shared hardware indices.
 
@@ -1920,6 +1942,8 @@ class FineTuneSequence:
         return self.sweep_coordinates.copy()
 
     def _validate(self):
+        from qick_fine_ramp import validate_sequence
+        validate_sequence(self)
         if not self.segments:
             raise ValueError("the sequence has no segments")
         ramp_duration_axes = [
@@ -1932,14 +1956,6 @@ class FineTuneSequence:
             raise ValueError(
                 "each RAMP segment may have only one duration/rate sweep"
             )
-        ramp_axis_count = len(ramp_duration_axes)
-        if any(
-            not isinstance(axis, RampDurationSweep)
-            for axis in self.sweeps[:ramp_axis_count]
-        ):
-            raise ValueError(
-                "RAMP duration/rate sweeps must be the outermost sweep axes"
-            )
         hold_duration_axes = [
             axis
             for axis in self.sweeps
@@ -1949,24 +1965,6 @@ class FineTuneSequence:
         if len(set(hold_targets)) != len(hold_targets):
             raise ValueError(
                 "each SET segment may have only one hold-duration sweep"
-            )
-        duration_axis_count = ramp_axis_count + len(hold_duration_axes)
-        if any(
-            not isinstance(axis, (RampDurationSweep, HoldDurationSweep))
-            for axis in self.sweeps[:duration_axis_count]
-        ):
-            raise ValueError(
-                "RAMP and SET hold duration sweeps must be the outermost "
-                "sweep axes"
-            )
-        if any(
-            isinstance(axis, RampDurationSweep)
-            for axis in self.sweeps[
-                ramp_axis_count:duration_axis_count
-            ]
-        ):
-            raise ValueError(
-                "RAMP duration axes must precede SET hold-duration axes"
             )
         segment_by_name = {
             segment.name: segment for segment in self.segments
@@ -2176,6 +2174,9 @@ class FineTuneSequence:
         else:
             raise ValueError("space must be 'physical' or 'virtual'")
 
+        if self.fine_ramps:
+            from qick_fine_ramp import sequence_vertices
+            return sequence_vertices(self, point_index, space)
         current = np.asarray(amplitude_getter(point_index, 0), dtype=float)
         times = []
         vertices = []
@@ -2270,6 +2271,9 @@ class FineTuneSequence:
                 )
                 current = next_values
 
+        if self.fine_ramps:
+            t, curves, _ = self.waveform_vertices(point_index)
+            areas = np.asarray([np.trapezoid(curves[name], t) for name in self.output_names])
         previews = []
         for output_index, area in enumerate(areas):
             if np.isclose(area, 0.0, rtol=0.0, atol=1.0e-15):
@@ -2395,6 +2399,8 @@ class FineTuneSequence:
             amplitude_getter = self.virtual_amplitudes_at
         else:
             raise ValueError("space must be 'physical' or 'virtual'")
+        if self.fine_ramps:
+            return self.waveform_vertices(point_index, space=space)
         current = list(amplitude_getter(point_index, 0))
         times = [0.0]
         values = {name: [float(current[index])] for index, name in enumerate(self.output_names)}
@@ -2550,7 +2556,7 @@ def _resolve_awg_channels(sequence: FineTuneSequence, awg_channels) -> Tuple[int
 
 
 def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
-    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") and gen_cfg.get("gen_type") != "awg_tuning":
+    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") and gen_cfg.get("gen_type") != "awg_tuning":
         raise ValueError(f"generator channel {gen_ch} is not an AWG tuning generator")
     required = ("tproc_ch", "f_fabric", "n_pts", "frac")
     missing = [name for name in required if name not in gen_cfg]
@@ -2559,7 +2565,7 @@ def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
 
 
 def _awg_step_width(gen_cfg: Mapping) -> int:
-    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") else 24
+    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") else 24
     width = int(gen_cfg.get("step_width", expected))
     if width != expected:
         raise ValueError("AWG step width does not match the firmware IP version")
@@ -2689,6 +2695,13 @@ def compile_sequence(
                     )
                     opcode = OP_RAMP
                 words = _pack_command_words(gen_cfg, target, duration_samples, step, opcode)
+                if segment.kind == 'ramp' and segment.name in sequence.fine_ramps:
+                    from qick_fine_ramp import packet
+                    fine = packet(sequence, segment_index, output_index, gen_cfg,
+                                  int(current_codes[output_index]), target)
+                    if fine is not None:
+                        words = tuple(fine['words'])
+                        duration_samples, step = fine['duration_samples'], fine['rise_step']
                 commands.append(
                     CompiledCommand(
                         point_index=point_index,
@@ -2921,7 +2934,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             )
             else 0
         )
-        self._v6_timing = any(self.soccfg["gens"][ch].get("type") == "axis_awg_tuning_v4" for ch in self.awg_channels)
+        self._v6_timing = any(self.soccfg["gens"][ch].get("type") in ("axis_awg_tuning_v4", "axis_awg_tuning_v7") for ch in self.awg_channels)
         self._dispatch_spacing = int(self.soccfg["tprocs"][0].get("timed_output_spacing_cycles", 3))
         if self._v6_timing and self._dispatch_spacing != 1:
             raise ValueError("AWG v6 requires the version 2 timed dispatcher metadata")
@@ -3155,10 +3168,6 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             for index, axis in enumerate(sweep_axes)
             if isinstance(axis, RampDurationSweep)
         )
-        if matches != tuple(range(len(matches))):
-            raise RuntimeError(
-                "RAMP duration sweeps must be the outermost sweep axes"
-            )
         segments = [sweep_axes[index].segment_name for index in matches]
         if len(set(segments)) != len(segments):
             raise RuntimeError(
@@ -3167,17 +3176,12 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         return tuple(dict.fromkeys(self.sequence.axis_representative(i) for i in matches))
 
     def _duration_axis_indices(self, sweep_axes) -> Tuple[int, ...]:
-        """Return all RAMP and SET-hold duration axes in outer-axis order."""
+        """Return duration table indices in the caller's execution order."""
         matches = tuple(
             index
             for index, axis in enumerate(sweep_axes)
             if isinstance(axis, (RampDurationSweep, HoldDurationSweep))
         )
-        if matches != tuple(range(len(matches))):
-            raise RuntimeError(
-                "RAMP and SET hold duration sweeps must be the outermost "
-                "sweep axes"
-            )
         return tuple(dict.fromkeys(self.sequence.axis_representative(i) for i in matches))
 
     def _bias_t_conditioning_axis_indices(self, sweep_axes) -> Tuple[int, ...]:
@@ -4178,6 +4182,50 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 "The compensation voltage and duration have not been changed automatically."
             )
 
+    def _condition_outer_table_axes(self, field, sweep_axes):
+        """Retain outer coordinates when an inner coefficient row is loaded.
+
+        A row load replaces the field state. Linear axes inside every table
+        axis are then at zero, but an outer/interleaved axis may be nonzero.
+        Include those coupled coordinates in the table instead of losing their
+        increments. The integer model is unchanged; only its storage changes.
+        """
+        if "duration_table_bases" not in field:
+            return
+        old_axes = tuple(field.get("duration_axis_indices", (field["duration_axis_index"],)))
+        deltas = field["duration_table_axis_deltas"]
+        added = tuple(i for i, values in deltas.items()
+                      if i not in old_axes and i < max(old_axes)
+                      and sweep_axes[i].count > 1 and any(values))
+        if not added:
+            return
+        axes = tuple(sorted((*old_axes, *added)))
+        shape = tuple(int(sweep_axes[i].count) for i in axes)
+        remaining = {i: values for i, values in deltas.items() if i not in added}
+        columns = 1 + 2 * sum(any(values) for values in remaining.values())
+        words = prod(shape) * columns
+        if words > int(self.tproccfg.get("dmem_size", 0)) - 16:
+            raise RuntimeError(
+                "reordered sweep coefficient table does not fit tProcessor DMEM: "
+                f"axes {axes} need {words} words; reduce counts or move coupled "
+                "voltage axes inside duration axes"
+            )
+        old_shape = tuple(field.get("duration_table_shape",
+                                    tuple(int(sweep_axes[i].count) for i in old_axes)))
+        positions = {axis: position for position, axis in enumerate(axes)}
+        bases, expanded = [], {i: [] for i in remaining}
+        for indices in product(*(range(count) for count in shape)):
+            self._check_cancel()
+            old_row = int(np.ravel_multi_index(
+                tuple(indices[positions[i]] for i in old_axes), old_shape))
+            bases.append(int(field["duration_table_bases"][old_row]) + sum(
+                indices[positions[i]] * int(deltas[i][old_row]) for i in added))
+            for i, values in remaining.items():
+                expanded[i].append(int(values[old_row]))
+        field.update(duration_axis_index=axes[0], duration_axis_indices=axes,
+                     duration_table_shape=shape, duration_table_bases=tuple(bases),
+                     duration_table_axis_deltas={i: tuple(values) for i, values in expanded.items()})
+
     def _build_sweep_register_plan(self):
         """Map Cartesian sweep axes to tProcessor register increments."""
         validation_indices = tuple(self._compile_validation_point_indices)
@@ -4214,6 +4262,11 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         models = {}
         for key in command_order:
             first_command = command_maps[0][key]
+            from qick_fine_ramp import is_extended
+            if is_extended(first_command):
+                if any(command_maps[int(i)][key].words != first_command.words for i in validation_indices):
+                    raise ValueError('Fine RAMP packet cannot change through legacy sweep registers')
+                continue
             selected_ramp_axis_index = (
                 ramp_duration_axes.get(first_command.segment_name)
                 if first_command.kind == "ramp"
@@ -4427,6 +4480,10 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 actual_commands = []
                 for command in commands:
                     command_key = self._command_key(command)
+                    from qick_fine_ramp import is_extended
+                    if is_extended(command):
+                        actual_commands.append(command)
+                        continue
                     target_model = models[(*command_key, "target")]
                     step_model = models[(*command_key, "step")]
                     duration_model = models.get((*command_key, "duration"))
@@ -4574,6 +4631,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             occupied[0].add(16)
         from qick_cpmg import add_loop_count_fields
         add_loop_count_fields(self, fields)
+        for field in fields:
+            self._condition_outer_table_axes(field, sweep_axes)
         for field in fields:
             page = int(field["page"])
             allocations = (
@@ -4757,12 +4816,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                         "duration_table_axis_deltas"
                     ][axis_index]
                 )
-                if axis_index < duration_axis_indices[0] and any(deltas):
-                    raise ValueError(
-                        "a RAMP-rate coefficient table depends on an outer "
-                        "RAMP duration axis; use independent RAMP segments "
-                        "without cross-duration coefficient coupling"
-                    )
+                if axis_index < max(duration_axis_indices) and any(deltas):
+                    raise RuntimeError("outer sweep coordinate missing from coefficient table")
                 group_info["columns"].append({
                     "kind": "delta",
                     "field": field,
@@ -5125,7 +5180,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         if rf.gen_ch >= len(self.soccfg["gens"]):
             raise IndexError("RF generator channel is out of range")
         gen_cfg = self.soccfg["gens"][rf.gen_ch]
-        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4") or gen_cfg.get("gen_type") == "awg_tuning":
+        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") or gen_cfg.get("gen_type") == "awg_tuning":
             raise ValueError("rf_pulse requires a normal QICK RF signal generator")
         self._segment_index(rf.at_segment, require_set=True)
 
@@ -7953,6 +8008,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             ),
             "cross_capacitance": self.sequence.cross_capacitance.copy(),
             "segments": tuple(segment.name for segment in self.sequence.segments),
+            "fine_ramps": self.sequence.fine_ramps,
             "repetitions_per_sweep": self.cfg["reps"],
             "repetitions_per_sweep_point": self.cfg["reps"],
             "total_acquisitions": (

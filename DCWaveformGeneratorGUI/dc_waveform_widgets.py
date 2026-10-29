@@ -67,12 +67,8 @@ def _trace_point_records(
                 f"Y {record['y_segment_name']}"
             )
         if point_index:
-            record["ramp_x_ns"] = float(
-                pulse_x.t[flat_index] - pulse_x.t[flat_index - 1]
-            )
-            record["ramp_y_ns"] = float(
-                pulse_y.t[flat_index] - pulse_y.t[flat_index - 1]
-            )
+            record["ramp_x_ns"] = pulse_x.ramp_duration_ns(point_index)
+            record["ramp_y_ns"] = pulse_y.ramp_duration_ns(point_index)
         records.append(record)
     return tuple(records)
 
@@ -700,9 +696,11 @@ class TracePlotWidget(pg.PlotWidget):
             return
         pulse_x = pulses[self.x_idx]
         pulse_y = pulses[self.y_idx]
-        time_union = np.union1d(pulse_x.t, pulse_y.t)
-        voltage_x = np.interp(time_union, pulse_x.t, pulse_x.v)
-        voltage_y = np.interp(time_union, pulse_y.t, pulse_y.v)
+        times_x, values_x = pulse_x.waveform_arrays()
+        times_y, values_y = pulse_y.waveform_arrays()
+        time_union = np.union1d(times_x, times_y)
+        voltage_x = np.interp(time_union, times_x, values_x)
+        voltage_y = np.interp(time_union, times_y, values_y)
         self._trace_shadow.setData(voltage_x, voltage_y)
         self._curve.setData(voltage_x, voltage_y)
         self._refresh_point_items(pulse_x, pulse_y)

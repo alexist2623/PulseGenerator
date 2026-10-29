@@ -143,6 +143,12 @@ def _rf_latencies(soccfg, awg_channels, timeline, rf_channel_map, explicit):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("Explicit RF output latency must be a nonnegative integer number of tProcessor clocks")
             result[ch], profiles[ch] = value, "caller_verified_digital_latency"
+        elif (all(gens[a].get("type") == "axis_awg_tuning_v7"
+                  and gens[a].get("output_sum_version") == 7
+                  and gens[a].get("output_latency_cycles") == 31 for a in awg_channels)
+              and cfg.get("output_sum_version") == 7 and cfg.get("output_sum_role") == "rf"
+              and cfg.get("output_latency_cycles") == 31):
+            result[ch], profiles[ch] = 31, "qstl_v7_common_native_latency"
         elif (all(gens[a].get("type") == "axis_awg_tuning_v4"
                   and gens[a].get("output_sum_version") == 3
                   and gens[a].get("output_latency_cycles") == 31 for a in awg_channels)
@@ -239,7 +245,7 @@ def build_circuit_execution(document, soccfg, *, readout_template,
     if len(guard_values) != 1:
         raise ValueError("Circuit AWGs must have matching RAMP guard cycles")
     guard = guard_values.pop()
-    common_pipeline = all(gens[ch].get("type") == "axis_awg_tuning_v4" for ch in channels)
+    common_pipeline = all(gens[ch].get("type") in ("axis_awg_tuning_v4", "axis_awg_tuning_v7") for ch in channels)
     min_set_interval = (int(soccfg["tprocs"][0].get("timed_output_spacing_cycles", 3))
                         if common_pipeline else 3)
     pre_roll = max(startup + 6, -acq_start - offset + 3)

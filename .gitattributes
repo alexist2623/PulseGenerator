@@ -33,3 +33,9 @@ DCWaveformGeneratorGUI/test_rf_t2_delay_editor.py -text
 DCWaveformGeneratorGUI/test_rf_t2_integration.py -text
 DCWaveformGeneratorGUI/test_shared_dac_awg_selection.py -text
 DCWaveformGeneratorGUI/test_waveform_plot_annotations.py -text
+
+# Keep relocated tests/docs and v7 helpers byte-identical to reviewed sources.
+DCWaveformGeneratorGUI/test/** -text
+DCWaveformGeneratorGUI/md/** -text
+DCWaveformGeneratorGUI/qick_fine_ramp.py -text
+DCWaveformGeneratorGUI/qick_fine_ramp_widgets.py -text

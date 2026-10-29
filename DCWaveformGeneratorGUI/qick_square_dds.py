@@ -139,6 +139,8 @@ def attach_square_settings(sequence, config=None, sweeps=(), trigger=None, *, fo
     if any(axis.gen_ch not in channels for axis in sweeps):
         raise ValueError("SquarePulse sweep generator differs from selected output")
     sequence.sweeps = [axis for axis in sequence.sweeps if not isinstance(axis, SquarePulseSweep)] + list(sweeps)
+    if getattr(sequence, "sweep_execution_order", ()):
+        sequence.set_sweep_order(sequence.sweep_execution_order)
     sequence._sweep_coordinate_cache = None
     sequence.square_pulse_configs = configs
     sequence.square_pulse_config = configs[0] if configs else None

@@ -95,7 +95,7 @@ def _single(program, cancel_check, point_indices=None):
     sequence = program.sequence
     if any((program.soccfg["gens"][channel].get("type"),
             int(program.soccfg["gens"][channel].get("output_sum_version", 0)))
-           not in (("axis_awg_tuning_v3", 2), ("axis_awg_tuning_v4", 3))
+           not in (("axis_awg_tuning_v3", 2), ("axis_awg_tuning_v4", 3), ("axis_awg_tuning_v7", 7))
            for channel in program.awg_channels):
         raise ValueError("execution coordinate export requires v5 or v6 AWG/output-sum metadata")
     if point_indices is None:
@@ -203,6 +203,12 @@ def _single(program, cancel_check, point_indices=None):
                     kind=command.kind, step_fraction_bits=int(cfg["frac"]),
                     scalar_sample_rate_mhz=float(cfg["f_fabric"]) * int(cfg["n_pts"]),
                     columns={name: _column(values) for name, values in columns.items()})
+        from qick_fine_ramp import is_extended
+        if is_extended(command):
+            item['extended_ramp_version'] = 1
+            item['command_words_u32'] = list(command.words)
+            item['edge_positions'] = dict(sequence.fine_ramps[command.segment_name][command.output_index])
+            item['duration_note'] = 'Sample count includes final endpoint; word padding holds terminal voltage.'
         if scales is not None:
             scale = float(scales[command.output_index])
             item["full_scale_mv"] = scale

@@ -1893,6 +1893,8 @@ class PulseSequence:
             DEFAULT_QICK_FULL_SCALE_MV,
         )
         self.segment_names = ["set_0"]
+        self.fine_ramps = {}
+        self.fine_fabric_mhz = DEFAULT_QICK_FABRIC_MHZ
 
     @property
     def duration_ns(self) -> float:
@@ -1957,6 +1959,8 @@ class PulseSequence:
         duplicate.v = self.v.copy()
         duplicate.v_bounds = tuple(self.v_bounds)
         duplicate.segment_names = list(self.segment_names)
+        duplicate.fine_ramps = {i: dict(s) for i, s in self.fine_ramps.items()}
+        duplicate.fine_fabric_mhz = self.fine_fabric_mhz
         return duplicate
 
     def validate(self) -> None:
@@ -1973,9 +1977,105 @@ class PulseSequence:
                 raise ValueError(f"SET interval {index // 2} is not flat")
         self._ensure_segment_names()
 
+    def set_fine_ramp(self, row, spec, fabric_mhz=DEFAULT_QICK_FABRIC_MHZ):
+        from qick_fine_ramp import validate_edges, vertices
+        row = int(row)
+        if not 0 < row < self.set_count:
+            raise ValueError('Select a noninitial segment with an incoming RAMP')
+        if spec is None:
+            self.fine_ramps.pop(row, None)
+            return
+        rate = _positive_real(fabric_mhz, 'fabric_mhz')
+        capacity = _cycles_from_ns(self.t[2*row] - self.t[2*row-1], rate) * 16
+        cleaned = validate_edges(spec, capacity)
+        vertices(cleaned, self.v[2*row-1], self.v[2*row], capacity)
+        if 'turn' in cleaned and not self.v_bounds[0] <= cleaned['turn'] <= self.v_bounds[1]:
+            raise ValueError('Fine RAMP turn voltage is outside this output voltage range')
+        self.fine_ramps[row] = cleaned
+        self.fine_fabric_mhz = rate
+
+    def waveform_arrays(self):
+        from qick_fine_ramp import vertices
+        t, v = [self.t[0]], [self.v[0]]
+        for i in range(len(self.t)-1):
+            spec = self.fine_ramps.get((i+1)//2) if i % 2 else None
+            if spec is not None:
+                dt = 1000. / (self.fine_fabric_mhz * 16)
+                capacity = _cycles_from_ns(self.t[i+1]-self.t[i], self.fine_fabric_mhz)*16
+                x, y = vertices(spec, self.v[i], self.v[i+1], capacity)
+                t.extend(self.t[i]+x*dt); v.extend(y)
+            else:
+                t.append(self.t[i+1]); v.append(self.v[i+1])
+        return np.asarray(t), np.asarray(v)
+
     def _clip_voltage(self, value: Real) -> float:
         value = _finite_real(value, "voltage")
         return float(np.clip(value, self.v_bounds[0], self.v_bounds[1]))
+
+    def ramp_duration_ns(self, row: int) -> float:
+        """Displayed first-edge duration, distinct from its command reservation."""
+        row = int(row)
+        if not 0 <= row < self.set_count:
+            raise ValueError("segment index is out of range")
+        if row == 0:
+            return 0.0
+        spec = self.fine_ramps.get(row)
+        if spec is not None:
+            return (spec['rise_end'] - spec['rise_start']) * 1000.0 / (16 * self.fine_fabric_mhz)
+        return float(self.t[2 * row] - self.t[2 * row - 1])
+
+    def set_ramp_duration_ns(self, row: int, duration_ns: Real,
+                             fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ) -> None:
+        """Edit the transition on the sample grid, reserving whole command words.
+
+        Ordinary whole-word durations retain the legacy RAMP. Fractional-word
+        durations automatically use v7. Existing offset/two-edge pulses keep
+        their other edge positions and reject an overlapping first edge.
+        Validation happens on a copy so a rejected edit changes nothing.
+        """
+        from clock_time import clock_cycles
+        row = int(row)
+        if not 0 < row < self.set_count:
+            raise ValueError("The initial SET has no incoming RAMP")
+        rate = _positive_real(fabric_mhz, "fabric_mhz")
+        duration = _positive_real(duration_ns, "ramp duration")
+        samples = clock_cycles(duration, rate * 16, units_per_us=1000.0)
+        old = self.fine_ramps.get(row)
+        if self.fine_ramps and not np.isclose(rate, self.fine_fabric_mhz, rtol=0, atol=1e-9):
+            raise ValueError("Fine RAMP sample clock differs from the selected fabric clock")
+        simple = old is None or (old['rise_start'] == 0 and 'fall_start' not in old)
+        spec = None
+        if simple and samples % 16 == 0:
+            words = samples // 16
+        else:
+            spec = dict(old or {'rise_start': 0})
+            spec['rise_end'] = spec['rise_start'] + samples
+            if 'fall_start' in spec and spec['rise_end'] > spec['fall_start']:
+                raise ValueError("First edge would overlap the second edge; edit the sample positions first")
+            final_sample = spec.get('fall_end', spec['rise_end'])
+            words = (final_sample + 16) // 16
+            if not simple:
+                words = max(words, _cycles_from_ns(self.t[2 * row] - self.t[2 * row - 1], rate))
+        candidate = self.copy()
+        candidate.fine_ramps.pop(row, None)
+        if not candidate.edit_ramp(2 * row, words * 1000.0 / rate):
+            raise ValueError("Invalid RAMP command reservation")
+        candidate.set_fine_ramp(row, spec, rate)
+        candidate.validate()
+        self.t = candidate.t
+        self.fine_ramps = candidate.fine_ramps
+        self.fine_fabric_mhz = candidate.fine_fabric_mhz
+
+    def add_flat_ramp_duration(self, ramp: Real, flat: Real, target_v: Real,
+                               fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ) -> None:
+        """Append through the same sample-grid edit used by the GUI table."""
+        candidate = self.copy()
+        candidate.add_flat_ramp(ramp, flat, target_v)
+        candidate.set_ramp_duration_ns(candidate.set_count - 1, ramp, fabric_mhz)
+        self.t, self.v = candidate.t, candidate.v
+        self.segment_names = candidate.segment_names
+        self.fine_ramps = candidate.fine_ramps
+        self.fine_fabric_mhz = candidate.fine_fabric_mhz
 
     def edit_ramp(self, flat_idx: int, new_ramp: Real) -> bool:
         """Change the incoming ramp duration for one SET interval."""
@@ -1985,6 +2085,12 @@ class PulseSequence:
             new_ramp = _positive_real(new_ramp, "ramp duration")
         except (TypeError, ValueError):
             return False
+        if flat_idx//2 in self.fine_ramps:
+            from qick_fine_ramp import validate_edges
+            try:
+                validate_edges(self.fine_ramps[flat_idx//2], _cycles_from_ns(new_ramp, self.fine_fabric_mhz)*16)
+            except ValueError:
+                return False
         old_ramp = self.t[flat_idx] - self.t[flat_idx - 1]
         self.t[flat_idx:] += new_ramp - old_ramp
         return True
@@ -2005,7 +2111,17 @@ class PulseSequence:
         """Change one SET level, preserving adjacent automatic ramps."""
         if flat_idx < 0 or flat_idx >= len(self.v) - 1 or flat_idx % 2:
             return False
-        self.v[flat_idx:flat_idx + 2] = self._clip_voltage(new_v)
+        from qick_fine_ramp import vertices
+        candidate = self.v.copy()
+        candidate[flat_idx:flat_idx+2] = self._clip_voltage(new_v)
+        for row in (flat_idx//2, flat_idx//2+1):
+            if row in self.fine_ramps:
+                capacity = _cycles_from_ns(self.t[2*row]-self.t[2*row-1], self.fine_fabric_mhz)*16
+                try:
+                    vertices(self.fine_ramps[row], candidate[2*row-1], candidate[2*row], capacity)
+                except ValueError:
+                    return False
+        self.v = candidate
         return True
 
     def add_flat_ramp(self, ramp: Real, flat: Real, target_v: Real) -> None:
@@ -2049,6 +2165,11 @@ class PulseSequence:
             return
         new_t = _finite_real(new_t, "time")
         new_t = max(new_t, float(self.t[i0 - 1]) + DEFAULT_MIN_DURATION_NS)
+        if i0//2 in self.fine_ramps:
+            spec = self.fine_ramps[i0//2]
+            count = spec.get('fall_end', spec['rise_end'])+1
+            words = (count+15)//16
+            new_t = max(new_t, self.t[i0-1]+words*1000/self.fine_fabric_mhz)
         delta = new_t - float(self.t[i0])
         self.t[i0:] += delta
 
@@ -2058,6 +2179,8 @@ class PulseSequence:
             return False
         self._ensure_segment_names()
         del self.segment_names[flat_idx // 2]
+        row = flat_idx // 2
+        self.fine_ramps = {i if i < row else i-1: s for i, s in self.fine_ramps.items() if i != row}
         shrink = self.t[flat_idx + 1] - self.t[flat_idx - 1]
         self.t = np.delete(self.t, [flat_idx, flat_idx + 1])
         self.v = np.delete(self.v, [flat_idx, flat_idx + 1])
@@ -2085,6 +2208,7 @@ class PulseSequence:
         self.t = np.insert(self.t, flat_idx, [t0 + ramp_ns, t0 + ramp_ns + flat_ns])
         self.v = np.insert(self.v, flat_idx, [target_v, target_v])
         self.segment_names.insert(segment_index, new_name)
+        self.fine_ramps = {i if i < segment_index else i+1: s for i, s in self.fine_ramps.items()}
         return True
 
     def to_dict(self) -> dict:
@@ -2094,6 +2218,8 @@ class PulseSequence:
             "voltage_mv": self.v.tolist(),
             "voltage_bounds_mv": list(self.v_bounds),
             "segment_names": list(self.segment_names),
+            "fine_ramps": {str(i): dict(s) for i, s in self.fine_ramps.items()},
+            "fine_fabric_mhz": self.fine_fabric_mhz,
         }
 
     @classmethod
@@ -2120,6 +2246,8 @@ class PulseSequence:
         else:
             pulse.segment_names = []
         pulse.validate()
+        for row, spec in data.get("fine_ramps", {}).items():
+            pulse.set_fine_ramp(int(row), spec, data.get("fine_fabric_mhz", DEFAULT_QICK_FABRIC_MHZ))
         return pulse
 
     def to_qcs_dcwaveform(self, ch_name: str) -> str:
@@ -2183,11 +2311,12 @@ def transform_virtual_waveforms(
         _coerce_cross_capacitance(cross_capacitance, len(pulses)),
         dtype=float,
     )
-    time_ns = np.unique(np.concatenate([pulse.t for pulse in pulses])).astype(
+    traces = [pulse.waveform_arrays() for pulse in pulses]
+    time_ns = np.unique(np.concatenate([t for t, v in traces])).astype(
         float, copy=False
     )
     virtual_mv = np.vstack(
-        [np.interp(time_ns, pulse.t, pulse.v) for pulse in pulses]
+        [np.interp(time_ns, t, v) for t, v in traces]
     )
     physical_mv = matrix @ virtual_mv
     return time_ns, virtual_mv, physical_mv
@@ -2244,6 +2373,7 @@ def build_qick_sequence(
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
     sweep_groups=None,
     sweep_parameter_ids=None,
+    sweep_order=None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
     cross_capacitance=None,
     bias_t_compensation_enabled: bool = False,
@@ -2323,6 +2453,16 @@ def build_qick_sequence(
             sequence.add_set(spec.name, spec.amplitudes, spec.duration_cycles)
         else:
             sequence.add_ramp(spec.name, spec.duration_cycles)
+    for row in range(1, pulses[0].set_count):
+        fine = tuple(None if row not in pulse.fine_ramps else dict(pulse.fine_ramps[row]) for pulse in pulses)
+        if any(s is not None for s in fine):
+            for pulse, s in zip(pulses, fine):
+                if s is not None:
+                    if not np.isclose(pulse.fine_fabric_mhz, fabric_mhz, rtol=0, atol=1e-9):
+                        raise ValueError('Fine RAMP sample clock differs from the selected fabric clock')
+                    if 'turn' in s:
+                        s['turn'] /= full_scale_mv
+            sequence.set_fine_ramp(f'ramp_{row-1}_to_{row}', fine)
     for sweep_spec in _coerce_sweep_specs(sweep, sweeps):
         if isinstance(sweep_spec, QickRampRateSweepSpec):
             sequence.add_ramp_duration_sweep(
@@ -2415,6 +2555,8 @@ def build_qick_sequence(
     if sweep_groups:
         sequence.set_sweep_groups(sweep_groups)
     sequence.sweep_parameter_ids = dict(sweep_parameter_ids or {})
+    if sweep_order:
+        sequence.set_sweep_order(sweep_order)
     sequence._validate()
     from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges
     validate_channel_voltage_ranges(sequence)
@@ -2427,6 +2569,8 @@ def build_qick_sequence(
 
 
 def _qcs_channel_code(pulse: PulseSequence, channel_name: str) -> str:
+    if pulse.fine_ramps:
+        raise ValueError('Sample-position RAMP is a QICK v7 feature; QCS export is not supported')
     pulse.validate()
     return _qcs_channel_samples_code(pulse.t, pulse.v, channel_name)
 
@@ -2571,6 +2715,7 @@ def generate_qick_program_code(
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
     sweep_groups=None,
     sweep_parameter_ids=None,
+    sweep_order=None,
     cross_capacitance=None,
     rf_pulse_spec: Optional[QickRfPulseSpec] = None,
     rf_pulse_specs: Optional[Sequence[QickRfPulseSpec]] = None,
@@ -2777,6 +2922,13 @@ def generate_qick_program_code(
             lines.append(
                 f"    sequence.add_ramp({spec.name!r}, duration_cycles={spec.duration_cycles})"
             )
+    for row in range(1, pulses[0].set_count):
+        fine = tuple(None if row not in p.fine_ramps else dict(p.fine_ramps[row]) for p in pulses)
+        if any(s is not None for s in fine):
+            for s in fine:
+                if s is not None and 'turn' in s:
+                    s['turn'] /= full_scale_mv
+            lines.append(f"    sequence.set_fine_ramp({'ramp_'+str(row-1)+'_to_'+str(row)!r}, {fine!r})")
     for sweep_spec in sweep_specs:
         if isinstance(sweep_spec, QickRampRateSweepSpec):
             lines.extend(
@@ -2907,6 +3059,8 @@ def generate_qick_program_code(
             f"    square_config, square_axes = decode_square_outputs({square_pulse_settings!r}, {square_full_scale_mv!r})",
             f"    attach_square_settings(sequence, square_config, square_axes, OutputTriggerConfig(**{output_trigger_settings or {}!r}), follow_experiment_rc=True)",
         ])
+    if sweep_order:
+        lines.append(f"    sequence.set_sweep_order({tuple(tuple(key) for key in sweep_order)!r})")
     lines.extend(
         [
             "    from qick_rc_validation import validate_sequence_rc_range, validate_channel_voltage_ranges",

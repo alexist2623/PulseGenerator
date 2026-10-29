@@ -155,6 +155,9 @@ def validate_program_rc_range(program):
                         error += abs(stepped_end - target)
                     intervals.append((current, target, duration, error))
                 current = target
+            if sequence.fine_ramps:
+                from qick_dc_area import waveform_ledger
+                intervals = waveform_ledger(program, point_index, output)['intervals']
             # User pulse returns to zero before DC compensation and RC reset.
             intervals.append((0.0, 0.0, 0.0, 0.0))
             if sequence.bias_t_compensation is not None:
