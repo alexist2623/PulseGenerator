@@ -734,9 +734,9 @@ class QickRfPulseSpec:
     """RF pulse and RF-board output attenuation/filter settings.
 
     ``delay_us`` is relative to the start of ``segment_name``.  Pulse duration
-    is converted to the selected RF generator's fabric clock when the generated
-    module receives ``soccfg``. ``fine_duration`` opts this entire RF port into
-    DAC-sample duration resolution; the runtime derives that grid from ``soccfg``.
+    uses the selected RF generator's DAC sample grid, resolved from ``soccfg``.
+    The legacy ``fine_duration`` JSON field is accepted and normalized to True;
+    every pulse on this port uses sample duration automatically.
     """
 
     gen_ch: int
@@ -813,7 +813,7 @@ class QickRfPulseSpec:
     t2_final_phase_parameter: str = ""
     predefined_amplitude_parameter: str = ""
     predefined_phase_parameter: str = ""
-    fine_duration: bool = False
+    fine_duration: bool = True
 
     def __post_init__(self) -> None:
         if self.output_board_type == "DC_Out":
@@ -825,6 +825,9 @@ class QickRfPulseSpec:
                 object.__setattr__(self, name, value)
         if not isinstance(self.fine_duration, bool):
             raise TypeError("RF fine_duration must be bool")
+        # Retain the serialized field for older files, but RF durations now
+        # always use the selected generator's sample grid.
+        object.__setattr__(self, 'fine_duration', True)
         pulse_mode = str(self.pulse_mode).strip().lower()
         if pulse_mode not in {"single", "composite"}:
             raise ValueError("RF pulse_mode must be 'single' or 'composite'")
@@ -2028,8 +2031,10 @@ class PulseSequence:
                              fabric_mhz: Real = DEFAULT_QICK_FABRIC_MHZ) -> None:
         """Edit the transition on the sample grid, reserving whole command words.
 
-        Ordinary whole-word durations retain the legacy RAMP. Fractional-word
-        durations automatically use v7. Existing offset/two-edge pulses keep
+        Durations up to one word and fractional-word durations use v7 sample
+        intervals. Once fine, an edge stays fine at whole-word boundaries.
+        Longer, previously coarse whole-word entries retain their legacy
+        reservation semantics. Existing offset/two-edge pulses keep
         their other edge positions and reject an overlapping first edge.
         Validation happens on a copy so a rejected edit changes nothing.
         """
@@ -2045,7 +2050,7 @@ class PulseSequence:
             raise ValueError("Fine RAMP sample clock differs from the selected fabric clock")
         simple = old is None or (old['rise_start'] == 0 and 'fall_start' not in old)
         spec = None
-        if simple and samples % 16 == 0:
+        if old is None and samples > 16 and samples % 16 == 0:
             words = samples // 16
         else:
             spec = dict(old or {'rise_start': 0})
@@ -2465,12 +2470,14 @@ def build_qick_sequence(
             sequence.set_fine_ramp(f'ramp_{row-1}_to_{row}', fine)
     for sweep_spec in _coerce_sweep_specs(sweep, sweeps):
         if isinstance(sweep_spec, QickRampRateSweepSpec):
+            from qick_fine_ramp import needs_sample_grid
             sequence.add_ramp_duration_sweep(
                 segment=sweep_spec.segment_name,
                 start_us=sweep_spec.start,
                 stop_us=sweep_spec.stop,
                 count=sweep_spec.count,
                 sequence_fabric_mhz=fabric_mhz,
+                sample_grid=needs_sample_grid(sweep_spec.start, sweep_spec.stop, sweep_spec.count, fabric_mhz),
             )
         elif isinstance(sweep_spec, QickHoldDurationSweepSpec):
             sequence.add_hold_duration_sweep(
@@ -2479,6 +2486,7 @@ def build_qick_sequence(
                 stop_us=sweep_spec.stop,
                 count=sweep_spec.count,
                 sequence_fabric_mhz=fabric_mhz,
+                sample_grid=True,
             )
         else:
             sequence.add_amplitude_sweep(
@@ -2815,7 +2823,8 @@ def generate_qick_program_code(
     valid_ramp_names = {spec.name for spec in specs if spec.kind == "ramp"}
     for sweep_spec in sweep_specs:
         if isinstance(sweep_spec, QickRampRateSweepSpec):
-            if sweep_spec.segment_name not in valid_ramp_names:
+            from qick_fine_ramp import sweep_target
+            if sweep_target(sweep_spec.segment_name)[0] not in valid_ramp_names:
                 raise ValueError(
                     f"unknown QICK RAMP segment {sweep_spec.segment_name!r}"
                 )
@@ -2931,6 +2940,7 @@ def generate_qick_program_code(
             lines.append(f"    sequence.set_fine_ramp({'ramp_'+str(row-1)+'_to_'+str(row)!r}, {fine!r})")
     for sweep_spec in sweep_specs:
         if isinstance(sweep_spec, QickRampRateSweepSpec):
+            from qick_fine_ramp import needs_sample_grid
             lines.extend(
                 [
                     "    sequence.add_ramp_duration_sweep(",
@@ -2939,6 +2949,7 @@ def generate_qick_program_code(
                     f"        stop_us={float(sweep_spec.stop)!r},",
                     f"        count={int(sweep_spec.count)},",
                     "        sequence_fabric_mhz=FABRIC_MHZ,",
+                    f"        sample_grid={needs_sample_grid(sweep_spec.start, sweep_spec.stop, sweep_spec.count, fabric_mhz)!r},",
                     "    )",
                 ]
             )
@@ -2951,6 +2962,7 @@ def generate_qick_program_code(
                     f"        stop_us={float(sweep_spec.stop)!r},",
                     f"        count={int(sweep_spec.count)},",
                     "        sequence_fabric_mhz=FABRIC_MHZ,",
+                    "        sample_grid=True,",
                     "    )",
                 ]
             )

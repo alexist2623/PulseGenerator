@@ -84,7 +84,7 @@ def test_gui_rf_delay_roundtrip_compiles_two_clocks(window):
     from test_awg_v6_timing import configuration
     panel = window._rf_ports_panel._panels[0]
     panel.load_settings({**gui.DEFAULT_RF_OUTPUT_SETTINGS, 'enabled': True,
-                         'gen_ch': 0, 'delay_us': 2/300, 'duration_us': .1})
+                         'gen_ch': 0, 'gain': 1000, 'delay_us': 2/300, 'duration_us': .1})
     for unit in ('ns', 'us') * 5:
         panel.set_time_unit(unit)
     saved = json.loads(json.dumps(panel.settings_dict()))
@@ -121,7 +121,7 @@ def test_fine_duration_uses_dac_samples_but_delay_stays_on_tproc(window):
     panel = window._rf_ports_panel._panels[0]
     panel.load_settings({**gui.DEFAULT_RF_OUTPUT_SETTINGS, 'enabled': True, 'gen_ch': 0})
     panel.set_time_unit('us')
-    panel.fine_duration.setChecked(True)
+    assert not hasattr(panel, 'fine_duration')
     enter(panel.duration, '0.000208333')
     enter(panel.delay, '0.000208333')
     assert panel.duration.value() == 1/4800

@@ -57,12 +57,14 @@ try:
     from .qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from .qick_output_triggers import OutputTriggerProgramMixin
     from .qick_rf_fine_duration import FineRfDurationProgramMixin
+    from .qick_sample_hold import SampleHoldProgramMixin
 except ImportError:
     from qick_readout_timing import configure_readout, initialize_readout, READOUT_COMMAND_CYCLES
     from fir_ddr_profile import resolve_fir_ddr_profile
     from qick_square_dds import SquarePulseProgramMixin, OutputTriggerConfig
     from qick_output_triggers import OutputTriggerProgramMixin
     from qick_rf_fine_duration import FineRfDurationProgramMixin
+    from qick_sample_hold import SampleHoldProgramMixin
 
 
 MAX_OUTPUTS = 8
@@ -286,15 +288,10 @@ class RfDurationSweep:
 
     @cached_property
     def points(self) -> Tuple[float, ...]:
-        if self.count == 1:
-            return (float(self.start),)
-        values = [
-            self.start + (self.stop - self.start) * index / (self.count - 1)
-            for index in range(self.count)
-        ]
-        values[0] = self.start
-        values[-1] = self.stop
-        return tuple(float(value) for value in values)
+        from clock_time import integer_sample_sweep
+        rate = self.sequence_fabric_mhz * 16
+        first, step, _ = integer_sample_sweep(self.start, self.stop, self.count, rate, allow_constant=True)
+        return tuple((first + i * step) / rate for i in range(self.count))
 
     @property
     def axis_kind(self) -> str:
@@ -467,10 +464,10 @@ class RfPowerSweep:
 class RampDurationSweep:
     """Sweep one AWG RAMP duration and derive every lane rate automatically.
 
-    User coordinates are microseconds.  They are quantized to an arithmetic
-    progression of fabric-clock cycles so the tProcessor can keep exact event
-    timing with one outer loop.  The selected RAMP target still comes from its
-    following SET, including all amplitude and cross-capacitance sweeps.
+    User coordinates are microseconds, quantized to an integer progression
+    on the selected clock or DAC-sample grid. Fine sweeps keep a fixed command
+    reservation and load exact v7 packet words. Legacy sweeps retain variable
+    command timing and support amplitude/cross-capacitance sweeps.
     """
 
     segment_name: str
@@ -478,6 +475,12 @@ class RampDurationSweep:
     stop: float
     count: int
     sequence_fabric_mhz: float
+    samples_per_clock: int = 1
+
+    @property
+    def ramp_segment_name(self) -> str:
+        from qick_fine_ramp import sweep_target
+        return sweep_target(self.segment_name)[0]
 
     def __post_init__(self):
         if not str(self.segment_name):
@@ -489,13 +492,39 @@ class RampDurationSweep:
             self.sequence_fabric_mhz,
             "RAMP duration sweep sequence_fabric_mhz",
         )
-        if self.count > 1 and self.duration_step_cycles == 0:
+        if self.samples_per_clock not in (1, 16):
+            raise ValueError('RAMP duration grid must be 1 clock or 16 DAC samples')
+        if self.count > 1 and self.duration_step_samples == 0:
             raise ValueError(
-                "RAMP duration sweep range is smaller than one fabric cycle "
+                "RAMP duration sweep range is smaller than one selected time unit "
                 "per requested point"
             )
-        if any(value < 1 for value in self.duration_cycles_points):
+        if self.samples_per_clock == 16 and self.count > 1:
+            last = cycles_from_us(self.stop, self.sequence_fabric_mhz * 16)
+            if abs(last - self.start_samples) < self.count - 1:
+                raise ValueError('RAMP duration sweep needs at least one selected time unit per point')
+        last_sample = (cycles_from_us(self.stop, self.sequence_fabric_mhz * 16)
+                       if self.samples_per_clock == 16 and self.count > 1
+                       else self.start_samples + (self.count - 1) * self.duration_step_samples)
+        if min(self.start_samples, last_sample) < 1:
             raise ValueError("every RAMP duration sweep point must be positive")
+
+    @cached_property
+    def start_samples(self) -> int:
+        return cycles_from_us(self.start, self.sequence_fabric_mhz * self.samples_per_clock)
+
+    @cached_property
+    def duration_step_samples(self) -> int:
+        last = cycles_from_us(self.stop, self.sequence_fabric_mhz * self.samples_per_clock)
+        return _round_div_nearest(last - self.start_samples, self.count - 1) if self.count > 1 else 0
+
+    @cached_property
+    def duration_sample_points(self) -> Tuple[int, ...]:
+        if self.samples_per_clock == 16 and self.count > 1:
+            last = cycles_from_us(self.stop, self.sequence_fabric_mhz * 16)
+            return tuple(self.start_samples + _round_div_nearest(
+                i * (last - self.start_samples), self.count - 1) for i in range(self.count))
+        return tuple(self.start_samples + i * self.duration_step_samples for i in range(self.count))
 
     @property
     def output_name(self) -> str:
@@ -531,8 +560,8 @@ class RampDurationSweep:
     @cached_property
     def points(self) -> Tuple[float, ...]:
         return tuple(
-            float(cycles) / float(self.sequence_fabric_mhz)
-            for cycles in self.duration_cycles_points
+            float(samples) / (float(self.sequence_fabric_mhz) * self.samples_per_clock)
+            for samples in self.duration_sample_points
         )
 
     @property
@@ -559,6 +588,7 @@ class HoldDurationSweep:
     stop: float
     count: int
     sequence_fabric_mhz: float
+    samples_per_clock: int = 1
 
     def __post_init__(self):
         if not str(self.segment_name):
@@ -570,42 +600,41 @@ class HoldDurationSweep:
             self.sequence_fabric_mhz,
             "SET hold sweep sequence_fabric_mhz",
         )
-        if self.count > 1 and self.duration_step_cycles == 0:
-            raise ValueError(
-                "SET hold sweep range is smaller than one fabric cycle "
-                "per requested point"
-            )
-        if any(value < 1 for value in self.duration_cycles_points):
-            raise ValueError("every SET hold sweep point must be positive")
+        if self.samples_per_clock not in (1, 16):
+            raise ValueError('HOLD grid must use 1 or 16 samples per clock')
+        _ = self.duration_sample_points
 
     @property
     def output_name(self) -> str:
         return "all_awg_outputs"
 
     @cached_property
-    def start_cycles(self) -> int:
-        return cycles_from_us(self.start, self.sequence_fabric_mhz)
+    def duration_sample_points(self):
+        from clock_time import integer_sample_sweep
+        first, step, _ = integer_sample_sweep(self.start, self.stop, self.count,
+                                              self.sequence_fabric_mhz * self.samples_per_clock)
+        return tuple(first + i * step for i in range(self.count))
 
     @cached_property
-    def stop_cycles(self) -> int:
+    def start_cycles(self):
+        return self.duration_sample_points[0] / self.samples_per_clock
+
+    @cached_property
+    def stop_cycles(self):
         return cycles_from_us(self.stop, self.sequence_fabric_mhz)
 
     @cached_property
-    def duration_step_cycles(self) -> int:
-        if self.count <= 1:
-            return 0
-        return _round_div_nearest(
-            self.stop_cycles - self.start_cycles,
-            self.count - 1,
-        )
+    def duration_step_samples(self):
+        values = self.duration_sample_points
+        return values[1] - values[0] if self.count > 1 else 0
 
     @cached_property
-    def duration_cycles_points(self) -> Tuple[int, ...]:
-        start, step = self.start_cycles, self.duration_step_cycles
-        return tuple(
-            start + index * step
-            for index in range(self.count)
-        )
+    def duration_step_cycles(self):
+        return self.duration_step_samples / self.samples_per_clock
+
+    @cached_property
+    def duration_cycles_points(self):
+        return tuple(v / self.samples_per_clock for v in self.duration_sample_points)
 
     @cached_property
     def points(self) -> Tuple[float, ...]:
@@ -1553,6 +1582,7 @@ class FineTuneSequence:
         count: int,
         *,
         sequence_fabric_mhz: Real = 300.0,
+        sample_grid: bool = False,
     ):
         """Add or replace one RAMP segment's duration/rate sweep axis.
 
@@ -1561,18 +1591,30 @@ class FineTuneSequence:
         never stores the full Cartesian point table.
         """
         segment_name = str(segment)
+        from qick_fine_ramp import sweep_target
+        base_name, component = sweep_target(segment_name)
         by_name = {item.name: item for item in self.segments}
-        if segment_name not in by_name:
+        if base_name not in by_name:
             raise KeyError(f"unknown segment name {segment_name!r}")
-        if by_name[segment_name].kind != "ramp":
+        if by_name[base_name].kind != "ramp":
             raise ValueError("RAMP duration sweep must select a RAMP segment")
+        if component != 'rise' and (base_name not in self.fine_ramps or any(
+                s is None or 'fall_start' not in s for s in self.fine_ramps[base_name])):
+            raise ValueError('Internal hold/falling sweeps require a two-edge fine RAMP on every output')
         new_sweep = RampDurationSweep(
             segment_name=segment_name,
             start=float(start_us),
             stop=float(stop_us),
             count=_require_int(count, "RAMP duration sweep count", 1),
             sequence_fabric_mhz=float(sequence_fabric_mhz),
+            samples_per_clock=16 if sample_grid or any(
+                s is not None for s in self.fine_ramps.get(base_name, ())) else 1,
         )
+        if new_sweep.samples_per_clock == 16:
+            self.fine_ramps.setdefault(base_name, (None,) * self.n_outputs)
+        elif base_name in self.fine_ramps:
+            # Remove only a placeholder created by a previous sample sweep.
+            self.fine_ramps.pop(base_name)
         ramp_axes = [
             sweep
             for sweep in self.sweeps
@@ -1600,6 +1642,7 @@ class FineTuneSequence:
         count: int,
         *,
         sequence_fabric_mhz: Real = 300.0,
+        sample_grid: bool = False,
     ):
         """Add or replace one SET segment's hold-duration sweep axis.
 
@@ -1619,6 +1662,7 @@ class FineTuneSequence:
             stop=float(stop_us),
             count=_require_int(count, "SET hold sweep count", 1),
             sequence_fabric_mhz=float(sequence_fabric_mhz),
+            samples_per_clock=16 if sample_grid else 1,
         )
         ramp_axes = [
             sweep
@@ -1658,6 +1702,9 @@ class FineTuneSequence:
                 and sweep.segment_name != segment_name
             )
         ]
+        for name, specs in tuple(self.fine_ramps.items()):
+            if (segment_name is None or name == segment_name) and all(s is None for s in specs):
+                self.fine_ramps.pop(name)
         self._sweep_coordinate_cache = None
         return self
 
@@ -1839,18 +1886,22 @@ class FineTuneSequence:
         for axis_index, sweep in enumerate(self.sweeps):
             if (
                 isinstance(sweep, RampDurationSweep)
-                and sweep.segment_name == self.segments[segment_index].name
+                and sweep.ramp_segment_name == self.segments[segment_index].name
             ):
-                duration = int(sweep.duration_cycles_points[
-                    self.point_indices(point_index)[axis_index]
-                ])
+                if sweep.samples_per_clock == 16:
+                    from qick_fine_ramp import sweep_reservation_cycles
+                    duration = sweep_reservation_cycles(self, segment, sweep)
+                else:
+                    duration = int(sweep.duration_cycles_points[
+                        self.point_indices(point_index)[axis_index]
+                    ])
             elif (
                 isinstance(sweep, HoldDurationSweep)
                 and sweep.segment_name == self.segments[segment_index].name
             ):
-                duration = int(sweep.duration_cycles_points[
+                duration = sweep.duration_cycles_points[
                     self.point_indices(point_index)[axis_index]
-                ])
+                ]
             elif (
                 isinstance(sweep, RfDurationSweep)
                 and sweep.segment_length_mode == "extend_by_rf_duration"
@@ -1878,7 +1929,7 @@ class FineTuneSequence:
                         duration += multiplier * (
                             current_cycles - initial_cycles
                         )
-        if duration < 1:
+        if duration < 1 / 16:
             raise ValueError(
                 f"RF-extended SET segment {segment.name!r} has invalid "
                 f"duration {duration} cycles"
@@ -2174,6 +2225,9 @@ class FineTuneSequence:
         else:
             raise ValueError("space must be 'physical' or 'virtual'")
 
+        from qick_sample_hold import active, preview
+        if active(self):
+            return preview(self, point_index, space)
         if self.fine_ramps:
             from qick_fine_ramp import sequence_vertices
             return sequence_vertices(self, point_index, space)
@@ -2698,7 +2752,7 @@ def compile_sequence(
                 if segment.kind == 'ramp' and segment.name in sequence.fine_ramps:
                     from qick_fine_ramp import packet
                     fine = packet(sequence, segment_index, output_index, gen_cfg,
-                                  int(current_codes[output_index]), target)
+                                  int(current_codes[output_index]), target, point_index)
                     if fine is not None:
                         words = tuple(fine['words'])
                         duration_samples, step = fine['duration_samples'], fine['rise_step']
@@ -4260,18 +4314,47 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         sweep_shape = self.sequence.model_shape
         ramp_duration_axes = self._ramp_duration_axis_by_segment(sweep_axes)
         models = {}
+        self._fine_packet_recipes = {}
         for key in command_order:
             first_command = command_maps[0][key]
             from qick_fine_ramp import is_extended
-            if is_extended(first_command):
-                if any(command_maps[int(i)][key].words != first_command.words for i in validation_indices):
-                    raise ValueError('Fine RAMP packet cannot change through legacy sweep registers')
-                continue
             selected_ramp_axis_index = (
                 ramp_duration_axes.get(first_command.segment_name)
                 if first_command.kind == "ramp"
                 else None
             )
+            if is_extended(first_command):
+                from qick_fine_ramp import component_axes
+                selected_axes = tuple(dict.fromkeys(self.sequence.axis_representative(i)
+                    for i, _, _ in component_axes(self.sequence, first_command.segment_name)))
+                if len(selected_axes) > 1:
+                    from qick_fine_packet_sweep import build_component_models
+                    component_models, recipe = build_component_models(self, key, first_command, command_maps)
+                    models.update(component_models)
+                    self._fine_packet_recipes[key] = recipe
+                    continue
+                if selected_axes:
+                    shape = tuple(sweep_axes[i].count for i in selected_axes)
+                    commands = []
+                    for coordinate in np.ndindex(shape):
+                        indices = [0] * len(sweep_axes)
+                        for index, value in zip(selected_axes, coordinate):
+                            indices[index] = value
+                        point = int(np.ravel_multi_index(tuple(indices), sweep_shape, order='C'))
+                        commands.append(command_maps[point][key])
+                    for word_index, register_name in enumerate(COMMAND_REGISTER_NAMES):
+                        values = tuple(int(cmd.words[word_index]) for cmd in commands)
+                        if len(set(values)) <= 1:
+                            continue
+                        models[(*key, register_name)] = dict(
+                            key=(*key, register_name), command_key=key,
+                            register_name=register_name, word_index=word_index,
+                            base=values[0], axis_deltas=tuple(0 for _ in sweep_axes),
+                            duration_table_bases=values, duration_table_axis_deltas={},
+                            duration_axis_index=selected_axes[0],
+                            duration_axis_indices=selected_axes,
+                            duration_table_shape=shape, packed_word=True)
+                continue
             field_specs = [("target", 0), ("step", 3)]
             if selected_ramp_axis_index is not None:
                 field_specs.append(("duration", 2))
@@ -4579,6 +4662,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     f"{int(np.max(values))}, allowed [{low}, {high}]"
                 )
             self._validate_bias_t_set_spacing(model)
+        self._fh_original_models = models
         event_timing_models = self._build_event_timing_models()
 
         fields = []
@@ -4590,7 +4674,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 continue
             first_command = command_maps[0][model["command_key"]]
             page, command_register = self._gen_regmap[
-                (first_command.gen_ch, model["register_name"])
+                (first_command.gen_ch, model.get('command_register_name', model["register_name"]))
             ]
             field = dict(model)
             field.update({
@@ -4874,8 +4958,15 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 if int(reg_page) == page and name == "reserved_start"
             ]
             if not scratch_candidates:
+                # Sample-boundary tables can also feed DDR/RF timestamps on
+                # a page without an AWG. Its command register is free between
+                # points, when coefficient rows are loaded.
+                scratch_candidates = [int(field['command_register']) for field in fields
+                                      if int(field['page']) == page
+                                      and field.get('command_register') not in (None, 0, pointer_register)]
+            if not scratch_candidates:
                 raise RuntimeError(
-                    f"register page {page} has no AWG scratch register for "
+                    f"register page {page} has no command scratch register for "
                     "RAMP-rate coefficient loading"
                 )
             table_page_resources[page] = {
@@ -5633,7 +5724,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
 
     def _ramp_axis_step_tproc(self, axis: RampDurationSweep) -> int:
         """Return the exact per-point RAMP duration increment in tProc cycles."""
-        if axis.count <= 1:
+        if axis.count <= 1 or axis.samples_per_clock == 16:
             return 0
         converted = tuple(
             cycles_from_us(duration_us, self.tproc_mhz)
@@ -5694,7 +5785,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                         * self.sequence.rf_duration_extension_multiplier(axis)
                     )
             elif isinstance(axis, RampDurationSweep):
-                ramp_index = self._segment_index(axis.segment_name)
+                ramp_index = self._segment_index(axis.ramp_segment_name)
                 if ramp_index < segment_index or (
                     include_current and ramp_index == segment_index
                 ):
@@ -6248,6 +6339,9 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     comment,
                 )
             regs.append(reg)
+        if self._command_key(command) in self._fine_packet_recipes:
+            from qick_fine_packet_sweep import emit_component_packet
+            emit_component_packet(self, command, regs)
         _, time_reg = self._gen_regmap[(gen_ch, "t")]
         if event_field_key is None:
             event_field_key = (
@@ -8198,8 +8292,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         }
 
 
-class FineTuneAmplitudeSweepProgram(FineRfDurationProgramMixin, _CoarseFineTuneAmplitudeSweepProgram):
-    """Existing hardware-loop compiler with opt-in sample-width RF pulses."""
+class FineTuneAmplitudeSweepProgram(SampleHoldProgramMixin, FineRfDurationProgramMixin, _CoarseFineTuneAmplitudeSweepProgram):
+    """Hardware-loop compiler with automatic RF and sample HOLD duration support."""
 
 
 __all__ = [

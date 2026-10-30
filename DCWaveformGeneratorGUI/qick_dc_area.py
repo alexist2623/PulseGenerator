@@ -33,8 +33,17 @@ def empty_legacy_models(program):
 
 def executed_commands(program, point_index):
     """Evaluate existing register-add models at one requested preview point."""
+    if getattr(program, '_sample_hold', False):
+        yield from program.sample_hold_commands(point_index)
+        return
     for commands in program.compiled_points[0].segment_commands:
         for command in commands:
+            from qick_fine_ramp import is_extended
+            if is_extended(command):
+                point = program._requested_awg_point_at(point_index)
+                yield next(c for c in point.segment_commands[command.segment_index]
+                           if c.output_index == command.output_index)
+                continue
             values = {}
             for register, attribute in (('target','target_code'), ('step','step'), ('duration','duration_samples')):
                 model = program._sweep_models.get((*program._command_key(command), register))
@@ -101,7 +110,13 @@ def waveform_ledger(program, point_index, output):
                     ramp_samples += n if a else 0
                     first = max(lower, min(upper, b/m))
                     last = max(lower, min(upper, (b+a*(n-1))/m))
-                    intervals.append((first/8192, last/8192, n/rate, (1+abs(a)/m)/8192 if a else 0.0))
+                    if n == 1:
+                        # One scalar interval is constant, even when its packet
+                        # step reaches full scale in the following sample.
+                        value = max(lower, min(upper, b // m)) / 8192
+                        intervals.append((value, value, 1/rate, 0.0))
+                    else:
+                        intervals.append((first/8192, last/8192, n/rate, (1+abs(a)/m)/8192 if a else 0.0))
                 cursor = start + ((count + 15)//16)*16
                 current = int(command.target_code) >> 2
                 continue

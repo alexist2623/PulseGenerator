@@ -107,10 +107,19 @@ def _single(program, cancel_check, point_indices=None):
     axes = tuple(sequence.sweep_axes)
     coordinates = np.asarray(sequence.sweep_coordinates)
     models = {model["key"]: model for model in program._event_timing_models}
+    sample_hold = bool(getattr(program, '_sample_hold', False))
     first_commands = tuple(executed_commands(program, 0))
+    if sample_hold:
+        # A long HOLD emits a separate falling packet. Keep its identity even
+        # when the first point uses the combined packet and omits that event.
+        first_commands = tuple(c for group in program.compiled_points[0].segment_commands
+                               for c in group if c.kind == 'ramp' or c.segment_index == 0)
     awg_columns = [{name: [] for name in (
         "target_code_16", "target_code_14", "step", "duration_samples",
         "command_cycle", "ramp_duration_us", "target_normalized")} for _ in first_commands]
+    if sample_hold:
+        for column in awg_columns:
+            column.update(emitted=[], command_words_u32=[])
     rf_columns = [{name: [] for name in (
         "frequency_word", "frequency_mhz", "phase_word", "logical_gain",
         "emitted_start_gain", "emitted_tail_gain", "active_samples",
@@ -124,9 +133,23 @@ def _single(program, cancel_check, point_indices=None):
         indices = sequence.model_indices(point)
         for column, representative in zip(group_columns, sequence.loop_axis_indices):
             column.append(int(indices[representative]))
+        if sample_hold:
+            from qick_sample_hold import segment_samples
+            lengths = segment_samples(sequence, point)
         for index, column in enumerate(segment_columns):
-            column.append(int(sequence.segment_duration_cycles_at(point, index)))
-        for command, column in zip(executed_commands(program, point), awg_columns):
+            column.append(lengths[index]/16 if sample_hold else sequence.segment_duration_cycles_at(point, index))
+        actual_commands = tuple(executed_commands(program, point))
+        if sample_hold:
+            actual_by_key = {program._command_key(c): c for c in actual_commands}
+            actual_commands = tuple(actual_by_key.get(program._command_key(c)) for c in first_commands)
+        for command, column in zip(actual_commands, awg_columns):
+            if sample_hold:
+                if command is None:
+                    for name, values in column.items():
+                        values.append(False if name == 'emitted' else None)
+                    continue
+                column['emitted'].append(True)
+                column['command_words_u32'].append(list(command.words))
             cfg = program.soccfg["gens"][command.gen_ch]
             target = int(command.target_code)
             column["target_code_16"].append(target)
@@ -202,23 +225,27 @@ def _single(program, cancel_check, point_indices=None):
                     segment_name=command.segment_name, segment_index=int(command.segment_index),
                     kind=command.kind, step_fraction_bits=int(cfg["frac"]),
                     scalar_sample_rate_mhz=float(cfg["f_fabric"]) * int(cfg["n_pts"]),
-                    columns={name: _column(values) for name, values in columns.items()})
+                    columns={name: values if name == 'command_words_u32' else _column(values)
+                             for name, values in columns.items()})
         from qick_fine_ramp import is_extended
-        if is_extended(command):
+        if is_extended(command) and not sample_hold:
             item['extended_ramp_version'] = 1
             item['command_words_u32'] = list(command.words)
-            item['edge_positions'] = dict(sequence.fine_ramps[command.segment_name][command.output_index])
+            from qick_fine_ramp import sweep_spec_at
+            item['edge_positions'] = dict(sweep_spec_at(sequence, command.segment_name, command.output_index, 0))
+            item['edge_positions_by_point'] = [dict(sweep_spec_at(sequence, command.segment_name, command.output_index, p)) for p in points]
             item['duration_note'] = 'Sample count includes final endpoint; word padding holds terminal voltage.'
         if scales is not None:
             scale = float(scales[command.output_index])
             item["full_scale_mv"] = scale
-            item["columns"]["target_mv"] = _column(value * scale for value in columns["target_normalized"])
+            item["columns"]["target_mv"] = _column(None if value is None else value * scale for value in columns["target_normalized"])
         awg.append(item)
     rf_events = [dict(event_index=index, event_id=str(rf.event_id), gen_ch=int(rf.gen_ch),
                       segment_name=str(rf.at_segment), fine_duration=bool(rf.fine_duration),
                       duration_parameter=str(rf.duration_parameter),
                       frequency_parameter=str(rf.frequency_parameter),
-                      columns={name: _column(values) for name, values in columns.items()})
+                      columns={name: values if name == 'command_words_u32' else _column(values)
+                             for name, values in columns.items()})
                  for index, (rf, columns) in enumerate(zip(program.rf_pulse_configs, rf_columns))]
     return dict(schema=SCHEMA, execution="hardware_program", point_count=len(points), total_point_count=count,
         column_encoding="A scalar broadcasts to every point; a list is indexed by point_index.",
@@ -228,7 +255,7 @@ def _single(program, cancel_check, point_indices=None):
         requested_members=[dict(member_index=index, key=list(sequence.sweep_axis_key(axis)),
             parameter_id=sequence.sweep_member_ids[index], unit=str(axis.coordinate_unit),
             coordinates=_column(coordinates[list(points), index])) for index, axis in enumerate(axes)],
-        requested_coordinate_note="Sequence coordinates are preserved: voltage/RF members retain requested values; AWG duration axes use the existing cycle-quantized grid.",
+        requested_coordinate_note="Sequence coordinates are preserved: voltage/RF members retain requested values; AWG duration axes use their selected clock or DAC-sample grid.",
         sweep_groups=_plain(sequence.sweep_groups),
         group_indices=[dict(loop_axis_index=index, coordinates=_column(values))
                        for index, values in enumerate(group_columns)],

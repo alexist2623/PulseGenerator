@@ -23,13 +23,13 @@ def waveform():
     return p
 
 
-@pytest.mark.parametrize('samples', range(1, 16))
+@pytest.mark.parametrize('samples', range(1, 18))
 @pytest.mark.parametrize('row', (1, 2))
 def test_every_sub_clock_duration_compiles_and_previews_both_directions(samples, row):
     p = waveform()
     p.set_ramp_duration_ns(row, samples * DT)
     assert p.ramp_duration_ns(row) == pytest.approx(samples * DT)
-    assert p.t[2 * row] - p.t[2 * row - 1] == pytest.approx(10 / 3)
+    assert p.t[2 * row] - p.t[2 * row - 1] == pytest.approx(((samples + 16) // 16) * 10 / 3)
     assert p.t[2 * row + 1] - p.t[2 * row] == pytest.approx(20 if row == 1 else 30)
     t, v = p.waveform_arrays()
     edge = p.t[2 * row - 1] + samples * DT
@@ -43,15 +43,42 @@ def test_every_sub_clock_duration_compiles_and_previews_both_directions(samples,
 
 
 @pytest.mark.parametrize('samples', (16, 17, 31, 32, 33, 48))
-def test_word_boundaries_and_return_to_legacy(samples):
+def test_fine_word_boundaries_do_not_return_to_legacy(samples):
     p = waveform()
     p.set_ramp_duration_ns(1, DT)
     p.set_ramp_duration_ns(1, samples * DT)
     assert p.ramp_duration_ns(1) == pytest.approx(samples * DT)
-    assert (1 in p.fine_ramps) == bool(samples % 16)
-    words = samples // 16 if samples % 16 == 0 else (samples + 16) // 16
+    assert p.fine_ramps[1] == dict(rise_start=0, rise_end=samples)
+    words = (samples + 16) // 16
     assert p.t[2] - p.t[1] == pytest.approx(words * 10 / 3)
     assert p.t[3] - p.t[2] == pytest.approx(20)
+
+
+def test_fresh_one_word_entry_has_16_intervals_and_a_distinct_endpoint():
+    from qick_fine_ramp import scalar_runs
+    traces = []
+    for samples in (15, 16, 17):
+        p = waveform()
+        p.set_ramp_duration_ns(1, samples * DT)
+        _, points = compile_sequence(build_qick_sequence((p,)), configuration(), (1,))
+        command = points[0].segment_commands[1][0]
+        assert is_extended(command)
+        trace = np.concatenate([
+            np.clip((np.arange(n, dtype=np.int64) * a + b) // (1 << 20), lo, hi) * 4
+            for n, a, b, lo, hi in scalar_runs(command, 0)
+        ])
+        assert trace[samples] == command.target_code
+        assert trace[samples - 1] < command.target_code
+        assert np.all(trace[samples:] == command.target_code)
+        traces.append(trace)
+    assert not np.array_equal(traces[0][:16], traces[1][:16])
+
+
+def test_untouched_long_coarse_entries_keep_legacy_compatibility():
+    p = waveform()
+    p.set_ramp_duration_ns(1, 48 * DT)
+    assert not p.fine_ramps
+    compile_sequence(build_qick_sequence((p,)), old_configuration(), (1,))
 
 
 def test_advanced_edge_positions_preserved_and_overlap_is_atomic():
@@ -106,7 +133,7 @@ def test_actual_table_add_controls_units_and_trace_dialog(app, monkeypatch):
         panel.set_time_unit(unit)
     assert p.ramp_duration_ns(1) == pytest.approx(4 * DT)
     panel.table.item(1, 2).setText('10')
-    assert 1 not in p.fine_ramps
+    assert p.fine_ramps[1] == dict(rise_start=0, rise_end=48)
     values = []
     panel.add_requested.connect(lambda *args: values.append(args))
     panel.edit_ramp.setText('0.208333333')
@@ -163,5 +190,46 @@ def test_main_window_add_save_compile_and_shared_edit(app, monkeypatch, tmp_path
     finally:
         window.close()
         window.deleteLater()
+        app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        app.processEvents()
+
+
+@pytest.mark.parametrize('legacy', (False, True))
+def test_real_json_load_restores_fine_metadata_and_clears_stale_edges(app, monkeypatch, tmp_path, legacy):
+    import DCWaveform_Generator as gui
+    def unexpected(*args, **kwargs):
+        pytest.fail('Unexpected device connection or warning: ' + str(args))
+    monkeypatch.setattr(socket.socket, 'connect', unexpected)
+    monkeypatch.setattr(QtWidgets.QMessageBox, 'warning', unexpected)
+    source, restored = gui.MainWindow(), gui.MainWindow()
+    try:
+        source._add_segment(10, 100, 100)
+        source._add_segment(10, 1000, 0)
+        source._pulse[0].set_fine_ramp(1, dict(rise_start=2, rise_end=17), 250)
+        source._pulse[0].set_fine_ramp(2, dict(rise_start=0, rise_end=16), 250)
+        path = tmp_path/'fine.json'
+        if legacy:
+            path.write_text(json.dumps(source._pulse[0].to_dict()), encoding='utf-8')
+        else:
+            source._save_settings_json(path)
+        restored._load_settings_json(path)
+        assert restored._pulse[0].fine_ramps == source._pulse[0].fine_ramps
+        assert restored._pulse[0].fine_fabric_mhz == 250
+        assert restored._pulse[0].fine_ramps is not source._pulse[0].fine_ramps
+        for row in (1, 2):
+            assert restored._pulse[0].ramp_duration_ns(row) == source._pulse[0].ramp_duration_ns(row)
+        # An older document without fine fields must not inherit the current edges.
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if legacy:
+            data.pop('fine_ramps');data.pop('fine_fabric_mhz')
+        else:
+            for output in data['awg']['outputs']:
+                output.pop('fine_ramps', None);output.pop('fine_fabric_mhz', None)
+        path.write_text(json.dumps(data), encoding='utf-8')
+        restored._load_settings_json(path)
+        assert not restored._pulse[0].fine_ramps
+    finally:
+        for w in (source, restored):
+            w.close();w.deleteLater()
         app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         app.processEvents()

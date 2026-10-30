@@ -79,7 +79,8 @@ def test_ramsey_uses_selected_pi_reference_initial_final_phase_and_global_parame
 @pytest.mark.parametrize("fine", [False, True])
 def test_ramsey_json_roundtrip_and_both_mainwindow_decoders(editor, fine):
     ramsey(editor)
-    editor.fine_duration.setChecked(fine)
+    editor.load_settings({**editor.settings_dict(), 'fine_duration': fine})
+    assert editor.configured_spec().fine_duration
     expected = editor.configured_spec()
     saved = json.loads(json.dumps(editor.settings_dict()))
     editor.load_settings(deepcopy(saved))

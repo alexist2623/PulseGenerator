@@ -86,7 +86,7 @@ def test_hardware_sweep_pattern_selection_and_outer_reset(first, last, count):
     table = [t for t in program._rf_point_tables if t.get('fine_row')]
     assert table == []
     assert len(program._fine_accumulators) == 1
-    assert len(program._fine_axis_field_keys[1]) == 3
+    assert set(program._fine_axis_field_keys[1]) == {'samples'}
     assert len(program.envelopes[0]['envs'])==16
 
 

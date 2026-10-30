@@ -24,7 +24,7 @@ def format_time_us(value):
     return f'{value * scale:.9g} {unit}'
 
 
-def time_sweep_display(start_us, stop_us, count, *, fabric_mhz=None):
+def time_sweep_display(start_us, stop_us, count, *, fabric_mhz=None, samples_per_clock=1, integer_step=False, allow_constant=False):
     """Describe requested points, and exact AWG clock steps when available."""
     start, stop, count = float(start_us), float(stop_us), int(count)
     if count < 1:
@@ -40,15 +40,29 @@ def time_sweep_display(start_us, stop_us, count, *, fabric_mhz=None):
         from .qick_fine_tune_sweep import cycles_from_us, _round_div_nearest
     except ImportError:
         from qick_fine_tune_sweep import cycles_from_us, _round_div_nearest
-    first = cycles_from_us(start, fabric_mhz)
-    last = cycles_from_us(stop, fabric_mhz)
+    rate = fabric_mhz * samples_per_clock
+    first = cycles_from_us(start, rate)
+    last = cycles_from_us(stop, rate)
     step = _round_div_nearest(last - first, count - 1) if count > 1 else 0
-    if first < 1 or first + (count - 1) * step < 1 or (count > 1 and step == 0):
+    applied_last = last if samples_per_clock == 16 and count > 1 and not integer_step else first + (count - 1) * step
+    if first < 1 or applied_last < 1 or (count > 1 and step == 0 and not allow_constant):
         return dict(summary='Invalid sweep: distinct positive clock steps required',
                     step='Invalid time sweep', end='Invalid time sweep')
-    end = (first + (count - 1) * step) / fabric_mhz
-    step_text = f'{format_time_us(step / fabric_mhz)} ({step} clock(s))'
-    return dict(summary=(f'Start {format_time_us(first / fabric_mhz)}; '
+    end = (first + (count - 1) * step) / rate
+    grid = 'DAC sample(s)' if samples_per_clock == 16 else 'clock(s)'
+    step_text = f'{format_time_us(step / rate)} ({step} {grid})'
+    if samples_per_clock == 16 and count > 1 and not integer_step:
+        import math
+        average = (last - first) / (count - 1)
+        if abs(last - first) < count - 1:
+            return dict(summary='Invalid sweep: distinct positive DAC samples required',
+                        step='Invalid time sweep', end='Invalid time sweep')
+        end = last / rate
+        lower, upper = math.floor(average), math.ceil(average)
+        if lower != upper:
+            step_text = (f'{format_time_us(lower/rate)} / {format_time_us(upper/rate)} '
+                         f'({lower}/{upper} DAC sample(s), rounded linear grid)')
+    return dict(summary=(f'Start {format_time_us(first / rate)}; '
                          f'requested end {format_time_us(stop)}; applied end {format_time_us(end)}; '
                          f'step {step_text}; {count} point(s)'),
                 step=step_text, end=format_time_us(end))

@@ -3,6 +3,23 @@ from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, localcontext
 from math import ceil, isfinite, ulp
 
 
+def integer_sample_sweep(start_us, stop_us, count, sample_mhz, *, allow_constant=False):
+    """Constant integer increment; report the applied endpoint, never drift it silently."""
+    count = int(count)
+    if count < 1:
+        raise ValueError('Sweep count must be positive')
+    first = clock_cycles(start_us, sample_mhz)
+    last = clock_cycles(stop_us, sample_mhz)
+    delta, divisor = last - first, max(1, count - 1)
+    step = (1 if delta >= 0 else -1) * ((2 * abs(delta) + divisor) // (2 * divisor)) if count > 1 else 0
+    applied = first + (count - 1) * step
+    if max(first, applied) >= 1 << 31:
+        raise ValueError('Sweep sample duration must fit a positive signed 32-bit register')
+    if applied < 1 or (count > 1 and step == 0 and not allow_constant):
+        raise ValueError('Sweep requires distinct positive DAC sample durations; adjust the range or point count')
+    return first, step, applied
+
+
 def clock_cycles(value, rate_mhz, *, units_per_us=1.0, display_quantum=None):
     """Ceil a positive time, recovering clock points rounded by GUI decimals.
 

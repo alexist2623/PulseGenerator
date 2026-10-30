@@ -47,11 +47,11 @@ def test_runtime_retains_sample_count_after_editor_decimal_roundtrip(samples):
     assert pulse.length_cycles == (samples + 15) // 16
 
 
-def test_nonfine_runtime_keeps_existing_clock_quantization():
+def test_old_false_flag_migrates_to_sample_duration():
     pulse, = runtime.build_runtime_rf_pulses(_shared_tmux_soccfg(),
                                            (spec(fine_duration=False),))
-    assert pulse.fine_duration is False
-    assert pulse.duration_samples is None
+    assert pulse.fine_duration is True
+    assert pulse.duration_samples == 49
     assert pulse.length_cycles == 4
 
 
@@ -202,13 +202,7 @@ def test_fine_host_t2_sample_metadata_survives_qcodes_json_storage(monkeypatch, 
         dataset.conn.close()
 
 
-def test_coarse_host_bundle_keeps_legacy_summary_exactly(monkeypatch):
+def test_old_coarse_host_bundle_migrates_to_automatic_fine(monkeypatch):
     _requested, bundle, _result, _settings = _compile_host_t2_bundle(monkeypatch, fine=False)
-    expected = dict(bundle.programs[-1].summary())
-    expected.update({
-        'software_sweep_program_count': len(bundle.programs),
-        'software_sweep_axes': [asdict(axis) for axis in bundle.sweep_axes],
-        'software_sweep_coordinates': bundle.sweep_coordinates.tolist(),
-        'software_sweep_execution': 'one tProcessor compile/acquisition per RF software point'})
-    assert bundle.summary() == expected
-    assert not any(key.startswith('rf_fine_duration') for key in bundle.summary())
+    assert len(bundle.summary()['rf_fine_duration_software_points']) == 6
+    assert all(program.summary()['rf_fine_duration'] for program in bundle.programs)

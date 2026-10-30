@@ -1,4 +1,4 @@
-"""Offline opt-in DAC-sample duration editor and persistence checks."""
+"""Offline automatic DAC-sample duration editor and persistence checks."""
 from copy import deepcopy
 from dataclasses import replace
 
@@ -27,13 +27,13 @@ def panel_for(window, **settings):
     return panel
 
 
-def test_old_settings_keep_coarse_behavior_and_nyquist_hidden(window):
+def test_old_settings_migrate_to_fine_and_nyquist_hidden(window):
     old = deepcopy(gui.DEFAULT_RF_OUTPUT_SETTINGS)
     old.pop("fine_duration")
     panel = panel_for(window, **old)
-    assert not panel.fine_duration.isChecked()
-    assert panel.configured_spec().fine_duration is False
-    assert panel.settings_dict()["fine_duration"] is False
+    assert not hasattr(panel, 'fine_duration')
+    assert panel.configured_spec().fine_duration is True
+    assert panel.settings_dict()["fine_duration"] is True
     assert panel.nqz.isHidden()
 
 
@@ -86,7 +86,6 @@ def test_duration_sweeps_remain_hardware_axes_without_new_host_loop(window, name
         panel.duration_sweep_count.setValue(16)
         panel.duration_sweep_enabled.setChecked(True)
     coarse = panel.configured_spec()
-    panel.fine_duration.setChecked(True)
     fine = panel.configured_spec()
     assert fine.sweep_axes == coarse.sweep_axes
     assert len(fine.sweep_axes) == 1
@@ -161,14 +160,14 @@ def test_duration_axis_label_preserves_distinct_sample_steps_on_long_pulses(wind
     panel.duration_sweep_count.setValue(2)
     panel.duration_sweep_enabled.setChecked(True)
     axis = panel.configured_spec().sweep_axes[0]
-    text = gui.ExperimentPanel._sweep_axis_label(None, axis)
-    assert "1000 to 1000.00020833 us" in text
-    assert "2 points" in text
+    text = window._experiment_panel._sweep_axis_label(axis)
+    assert "step 0.208333333 ns (1 DAC sample(s))" in text
+    assert "2 point(s)" in text
 
 
 def test_tooltip_derives_only_known_clock_and_does_not_claim_rise_time(window):
     panel = panel_for(window)
-    tooltip = panel.fine_duration.toolTip()
+    tooltip = panel.duration.toolTip()
     assert "Current firmware example" in tooltip and "0.208333 ns" in tooltip
     assert "not analog rise time or start-time resolution" in tooltip
     assert "|gain| <= 16383" in tooltip
@@ -176,9 +175,9 @@ def test_tooltip_derives_only_known_clock_and_does_not_claim_rise_time(window):
     generators = [{} for _ in range(panel.gen_ch.value() + 1)]
     generators[panel.gen_ch.value()] = {"f_fabric": 250.0, "samps_per_clk": 8}
     panel.set_generator_timings(generators)
-    assert "Selected generator duration step: 0.5 ns" in panel.fine_duration.toolTip()
+    assert "Selected generator duration step: 0.5 ns" in panel.duration.toolTip()
     panel.set_generator_timings([])
-    assert "Current firmware example" in panel.fine_duration.toolTip()
+    assert "Current firmware example" in panel.duration.toolTip()
 
 
 @pytest.mark.parametrize("invalid", [1, "true", None])

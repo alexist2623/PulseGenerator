@@ -120,14 +120,16 @@ def test_fractional_accumulator_matches_every_existing_quantizer_point(first, la
 @pytest.mark.parametrize('first,last,count,outer,reps', [
     (1, 4800, 4800, 1, 1), (1, 10000, 10000, 1, 1),
     (10000, 1, 10000, 1, 1), (1.2, 113.8, 137, 2, 3),
-    (113.8, 1.2, 137, 2, 2), (1048576, 1048660, 85, 2, 2),
+    (113.8, 20.2, 80, 2, 2), (1048576, 1048660, 85, 2, 2),
     (1048660, 1048576, 85, 2, 2),
 ])
 def test_actual_hardware_loop_exact_sample_counts(first, last, count, outer, reps):
     program = compile_sweep(first, last, count, outer=outer, reps=reps)
     model, events = execute(program)
     bursts = decode_bursts(program, events)
-    one_axis = [samples_from_us(v, 300.) for v in np.linspace(first / 4800., last / 4800., count)]
+    from clock_time import integer_sample_sweep
+    initial, step, _ = integer_sample_sweep(first/4800., last/4800., count, 4800.)
+    one_axis = [initial+i*step for i in range(count)]
     expected = [n for _ in range(outer) for n in one_axis for _ in range(reps)]
     assert [b['samples'] for b in bursts] == expected
     assert [b['periodic'] for b in bursts] == [plan_duration(n).periodic_plateau for n in expected]
@@ -210,7 +212,7 @@ def test_grouped_composite_durations_preserve_spilled_state_and_outer_reset():
     seq = FineTuneSequence(('awg_0',)).add_set('gate', .01, 4000)
     seq.add_amplitude_sweep('gate', 'awg_0', .01, .02, 2)
     ranges = ((1., 49.), (113., 81.), (1.2, 31.8), (97., 97.),
-              (49., 1.), (81., 113.), (31.8, 1.2), (112., 96.))
+              (49., 1.), (81., 113.), (33.8, 1.2), (112., 96.))*4
     pulses = []
     for index, (first, last) in enumerate(ranges):
         parameter = f'd{index}'
@@ -230,7 +232,7 @@ def test_grouped_composite_durations_preserve_spilled_state_and_outer_reset():
     fields = [field for field in program._sweep_fields if field['key'][0]=='fine_duration_state']
     assert any(field.get('storage')=='dmem' for field in fields)
     expected = []
-    values = [np.linspace(first/4800., last/4800., 17) for first,last in ranges]
+    values = [axis.points for axis in seq.sweep_axes[1:]]
     for _ in range(2):
         for point in range(17):
             for _ in range(2):

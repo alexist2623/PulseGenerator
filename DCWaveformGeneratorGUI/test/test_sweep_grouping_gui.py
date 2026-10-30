@@ -330,6 +330,6 @@ def test_sweep_columns_keep_readable_width_and_duration_step_in_narrow_panel(win
     assert table.columnWidth(6) >= 120
     assert table.horizontalHeader().sectionResizeMode(1) == QtWidgets.QHeaderView.ResizeToContents
     ramp_row = row_for(window._experiment_panel, parameter_key(specs[2]))
-    assert table.item(ramp_row, 6).text() == '10 ns (3 clock(s))'
-    assert table.item(ramp_row, 7).text() == '1.09 us'
+    assert table.item(ramp_row, 6).text() == '8.95833333 ns / 9.16666667 ns (43/44 DAC sample(s), rounded linear grid)'
+    assert table.item(ramp_row, 7).text() == '1 us'
     assert 'requested end 1 us' in table.item(ramp_row, 6).toolTip()

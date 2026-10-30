@@ -515,7 +515,7 @@ DEFAULT_RF_OUTPUT_SETTINGS = {
     "delay_us": 0.0,
     "duration_us": 1.0,
     "duration_sweep_enabled": False,
-    "fine_duration": False,
+    "fine_duration": True,
     "duration_sweep_start_us": 1.0,
     "duration_sweep_stop_us": 1.0,
     "duration_sweep_count": 1,
@@ -680,8 +680,8 @@ def _widget_clock_mhz(widget, kind="fabric") -> float:
     return float(DEFAULT_QICK_TPROC_MHZ if kind == "tproc" else DEFAULT_QICK_FABRIC_MHZ)
 
 
-def _clock_spin(owner, *, unit=lambda: "us", kind="fabric"):
-    return ClockTimeSpinBox(rate_mhz=lambda: _widget_clock_mhz(owner, kind),
+def _clock_spin(owner, *, unit=lambda: "us", kind="fabric", samples_per_clock=1):
+    return ClockTimeSpinBox(rate_mhz=lambda: _widget_clock_mhz(owner, kind) * samples_per_clock,
                             units_per_us=lambda: 1000.0 / TIME_UNIT_NS[unit()])
 
 
@@ -742,7 +742,8 @@ def _remap_ramp_segment_name(
     segment_index: int,
 ) -> Optional[str]:
     """Keep an incoming RAMP reference attached to its destination SET."""
-    match = re.fullmatch(r"ramp_(\d+)_to_(\d+)", str(segment_name))
+    base, _, component = str(segment_name).partition(':')
+    match = re.fullmatch(r"ramp_(\d+)_to_(\d+)", base)
     if match is None:
         return str(segment_name)
     source_index, destination_index = map(int, match.groups())
@@ -758,7 +759,7 @@ def _remap_ramp_segment_name(
     destination_index = int(remapped_destination.rsplit("_", 1)[1])
     if destination_index <= 0:
         return None
-    return f"ramp_{destination_index - 1}_to_{destination_index}"
+    return f"ramp_{destination_index - 1}_to_{destination_index}" + (f':{component}' if component else '')
 
 
 def _remap_segment_rows(
@@ -1895,6 +1896,8 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
     sweep_requested     = QtCore.pyqtSignal(int, int)
     sweep_remove_requested = QtCore.pyqtSignal(int, int)
     ramp_sweep_requested = QtCore.pyqtSignal(int, int)
+    fine_component_sweep_requested = QtCore.pyqtSignal(int, int, str)
+    fine_component_sweep_remove_requested = QtCore.pyqtSignal(int, int, str)
     ramp_sweep_remove_requested = QtCore.pyqtSignal(int, int)
     hold_sweep_requested = QtCore.pyqtSignal(int, int)
     hold_sweep_remove_requested = QtCore.pyqtSignal(int, int)
@@ -2008,6 +2011,12 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         act_ramp_sweep = ramp_sweep_menu.addAction("Configure sweep...")
         act_remove_ramp_sweep = ramp_sweep_menu.addAction("Remove sweep")
         act_remove_ramp_sweep.setEnabled(row in self._ramp_sweep_rows)
+        component_actions = {}
+        for component, label in (('fall', 'Falling duration sweep (v7)'), ('hold', 'Internal hold sweep (v7)')):
+            submenu = menu.addMenu(label)
+            submenu.setEnabled(row > 0 and 'fall_start' in self._pulse.fine_ramps.get(row, {}))
+            component_actions[submenu.addAction('Configure sweep...')] = (component, False)
+            component_actions[submenu.addAction('Remove sweep')] = (component, True)
         hold_sweep_menu = menu.addMenu("Hold time sweep")
         act_hold_sweep = hold_sweep_menu.addAction("Configure sweep...")
         act_remove_hold_sweep = hold_sweep_menu.addAction("Remove sweep")
@@ -2016,6 +2025,11 @@ class ControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-methods
         act_del       = menu.addAction("Delete segment")
 
         chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        if chosen in component_actions:
+            component, remove = component_actions[chosen]
+            signal = self.fine_component_sweep_remove_requested if remove else self.fine_component_sweep_requested
+            signal.emit(self.idx, row, component)
+            return
         if chosen == act_fine:
             self._edit_fine_ramp(row)
             return
@@ -2878,6 +2892,11 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("RAMP rate sweep settings")
+        from qick_fine_ramp import sweep_target
+        component = sweep_target(segment_name)[1]
+        component_label = {'rise': 'First edge', 'fall': 'Falling edge', 'hold': 'Internal hold'}[component]
+        if component != 'rise':
+            self.setWindowTitle(f'{component_label} duration sweep settings')
         self._segment_name = str(segment_name)
         self._voltage_delta_mv = float(voltage_delta_mv)
         self._cartesian_base_count = int(cartesian_base_count)
@@ -2899,8 +2918,8 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
             default_start = float(initial.start)
             default_stop = float(initial.stop)
 
-        self.start = _clock_spin(self)
-        self.stop = _clock_spin(self)
+        self.start = ClockTimeSpinBox(rate_mhz=lambda: _widget_clock_mhz(self) * 16)
+        self.stop = ClockTimeSpinBox(rate_mhz=lambda: _widget_clock_mhz(self) * 16)
         for widget, value in ((self.start, default_start), (self.stop, default_stop)):
             widget.setRange(1.0e-6, 1.0e9)
             widget.setDecimals(9)
@@ -2921,6 +2940,12 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
         form.addRow("Sweep point count:", self.count)
         form.addRow("Nominal RAMP rates:", self.rate_summary)
         form.addRow("Applied time sweep:", self.time_summary)
+        self.fine_sweep_note = QtWidgets.QLabel(
+            f"Fractional-clock sweeps require AWG v7. {component_label} duration is swept; "
+            "other component durations remain fixed unless they also have a sweep. "
+            "The command window covers the longest pulse.")
+        self.fine_sweep_note.setWordWrap(True)
+        form.addRow(self.fine_sweep_note)
         form.addRow("Cartesian total:", self.cartesian_summary)
         self.rate_summary.setToolTip(
             "The following SET remains the RAMP target. Voltage sweeps on "
@@ -2947,7 +2972,7 @@ class RampRateSweepSettingsDialog(QtWidgets.QDialog):
         )
         self.time_summary.setText(time_sweep_summary(
             self.start.value(), self.stop.value(), self.count.value(),
-            fabric_mhz=_widget_clock_mhz(self)))
+            fabric_mhz=_widget_clock_mhz(self), samples_per_clock=16))
         self.cartesian_summary.setText(
             f"{self._cartesian_base_count} x {self.count.value()} = "
             f"{self._cartesian_base_count * self.count.value()} points"
@@ -2992,8 +3017,8 @@ class HoldDurationSweepSettingsDialog(QtWidgets.QDialog):
             default_start = float(initial.start)
             default_stop = float(initial.stop)
 
-        self.start = _clock_spin(self)
-        self.stop = _clock_spin(self)
+        self.start = _clock_spin(self, samples_per_clock=16)
+        self.stop = _clock_spin(self, samples_per_clock=16)
         for widget, value in (
             (self.start, default_start),
             (self.stop, default_stop),
@@ -3032,7 +3057,7 @@ class HoldDurationSweepSettingsDialog(QtWidgets.QDialog):
     def _refresh_summary(self, *_args) -> None:
         self.time_summary.setText(time_sweep_summary(
             self.start.value(), self.stop.value(), self.count.value(),
-            fabric_mhz=_widget_clock_mhz(self)))
+            fabric_mhz=_widget_clock_mhz(self), samples_per_clock=16, integer_step=True))
         self.cartesian_summary.setText(
             f"{self._cartesian_base_count} x {self.count.value()} = "
             f"{self._cartesian_base_count * self.count.value()} points"
@@ -3334,7 +3359,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.duration_sweep_enabled = QtWidgets.QCheckBox(
             "Sweep RF pulse duration"
         )
-        self.fine_duration = QtWidgets.QCheckBox("Fine duration (DAC sample)")
         self._rf_generator_timings = ()
         self._update_fine_duration_controls()
         self.duration_sweep_start = self._rf_time_spin(fine=True)
@@ -3552,7 +3576,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         form.addRow("Output board:", self.output_board_type)
         form.addRow("Anchor SET:", self.segment)
         form.addRow("Pulse mode:", mode_layout)
-        form.addRow(self.fine_duration)
         self._delay_label = QtWidgets.QLabel()
         self._duration_label = QtWidgets.QLabel()
         form.addRow(self._delay_label, self.delay)
@@ -3601,7 +3624,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             self.delay,
             self.duration,
             self.duration_sweep_enabled,
-            self.fine_duration,
             self.duration_sweep_start,
             self.duration_sweep_stop,
             self.duration_sweep_count,
@@ -3719,7 +3741,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         )
         self._update_pulse_mode_controls()
         self.gen_ch.valueChanged.connect(self._update_fine_duration_controls)
-        self.fine_duration.toggled.connect(self._update_fine_duration_controls)
         self.set_index(index)
 
     def _rf_time_spin(self, *, fine=False, delay=False):
@@ -3730,8 +3751,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             channel = self.gen_ch.value()
             generator = generators[channel] if 0 <= channel < len(generators) else {}
             mhz = float(generator.get("f_fabric", _widget_clock_mhz(self)))
-            enabled = getattr(self, "fine_duration", None)
-            if fine and enabled is not None and enabled.isChecked():
+            if fine:
                 mhz *= int(generator.get("samps_per_clk", 16))
             return mhz
         return ClockTimeSpinBox(rate_mhz=rate,
@@ -3762,7 +3782,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
                 if sample_ns is not None else
                 "The duration step is resolved from the selected generator at run time. "
                 "Current firmware example: 300 MHz × 16 samples = 0.208333 ns. ")
-        self.fine_duration.setToolTip(
+        self.duration.setToolTip(
             grid + "This changes RF pulse length resolution, not analog rise time or start-time resolution. "
             "Applies to every pulse on this RF port, including T2 π/2 pulses. "
             "SGv6 fine duration requires |gain| <= 16383 to preserve constant-pulse scale "
@@ -6893,7 +6913,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             segment_name=str(self.segment.currentData()),
             delay_us=_time_to_ns(self.delay.value(), self._time_unit) / 1000.0,
             duration_us=_time_to_ns(self.duration.value(), self._time_unit) / 1000.0,
-            fine_duration=self.fine_duration.isChecked(),
+            fine_duration=True,
             frequency_mhz=self.frequency_mhz.value(),
             gain=self.gain.value(),
             att1_db=self.att1_db.value(),
@@ -7232,7 +7252,7 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
             ),
             pulse_mode=pulse_mode,
             pulse_name=str(data.get("pulse_name", "RF pulse")),
-            fine_duration=data.get("fine_duration", False),
+            fine_duration=data.get("fine_duration", True),
             frequency_parameters=tuple(
                 data.get(
                     "frequency_parameters",
@@ -7327,7 +7347,6 @@ class RfPulsePortPanel(QtWidgets.QGroupBox):
         self.duration.setValue(
             _time_from_ns(spec.duration_us * 1000.0, self._time_unit)
         )
-        self.fine_duration.setChecked(spec.fine_duration)
         self.duration_sweep_enabled.setChecked(
             spec.duration_sweep_enabled
         )
@@ -9369,9 +9388,12 @@ class ExperimentPanel(QtWidgets.QWidget):
         if unit not in TIME_SECONDS:
             return None
         scale = TIME_SECONDS[unit] / 1e-6
-        clock = (_widget_clock_mhz(self) if getattr(spec, 'axis_kind', '')
-                 in {'ramp_duration', 'hold_duration'} else None)
-        return time_sweep_display(start * scale, stop * scale, spec.count, fabric_mhz=clock)
+        kind = getattr(spec, 'axis_kind', '')
+        clock = (_widget_clock_mhz(self) if kind
+                 in {'ramp_duration', 'hold_duration', 'rf_duration'} else None)
+        return time_sweep_display(start * scale, stop * scale, spec.count, fabric_mhz=clock,
+                                 samples_per_clock=16 if clock is not None else 1,
+                                 integer_step=kind != 'ramp_duration', allow_constant=kind == 'rf_duration')
 
     def _sweep_time_summary(self, spec):
         display = self._sweep_time_display(spec)
@@ -9434,8 +9456,10 @@ class ExperimentPanel(QtWidgets.QWidget):
                 "us",
             )
         if axis_kind == "ramp_duration":
+            from qick_fine_ramp import sweep_target
+            component = sweep_target(spec.segment_name)[1]
             return (
-                "RAMP duration",
+                {'rise': 'RAMP duration', 'fall': 'Falling duration', 'hold': 'Internal hold duration'}[component],
                 f"All AWG outputs / {segment_label}",
                 float(spec.start),
                 float(spec.stop),
@@ -12014,6 +12038,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         control.sweep_requested.connect(self._configure_segment_sweep)
         control.sweep_remove_requested.connect(self._remove_segment_sweep)
         control.ramp_sweep_requested.connect(self._configure_ramp_rate_sweep)
+        control.fine_component_sweep_requested.connect(self._configure_ramp_rate_sweep)
+        control.fine_component_sweep_remove_requested.connect(self._remove_ramp_rate_sweep)
         control.ramp_sweep_remove_requested.connect(
             self._remove_ramp_rate_sweep
         )
@@ -12621,7 +12647,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     ) -> Optional[int]:
         if not isinstance(spec, QickRampRateSweepSpec):
             return None
-        match = re.fullmatch(r"ramp_(\d+)_to_(\d+)", spec.segment_name)
+        match = re.fullmatch(r"ramp_(\d+)_to_(\d+)(?::(?:fall|hold))?", spec.segment_name)
         if match is None:
             return None
         source_row, destination_row = map(int, match.groups())
@@ -12967,6 +12993,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self,
         port_index: int,
         segment_index: int,
+        component: str = 'rise',
     ) -> None:
         if not 0 <= int(port_index) < len(self._pulse):
             return
@@ -12981,15 +13008,25 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         if segment_index >= len(pulse.flat_segments()):
             return
         point_index = int(segment_index) * 2
-        current_duration_us = (
-            float(pulse.t[point_index] - pulse.t[point_index - 1]) / 1000.0
-        )
+        current_duration_us = pulse.ramp_duration_ns(segment_index) / 1000.0
         voltage_delta_mv = float(
-            pulse.v[point_index] - pulse.v[point_index - 2]
+            pulse.fine_ramps.get(segment_index, {}).get('turn', pulse.v[point_index])
+            - pulse.v[point_index - 2]
         )
         segment_name = (
             f"ramp_{int(segment_index) - 1}_to_{int(segment_index)}"
         )
+        if component not in ('rise', 'fall', 'hold'):
+            raise ValueError('Unknown fine RAMP component')
+        if component != 'rise':
+            fine = pulse.fine_ramps.get(segment_index, {})
+            if 'fall_start' not in fine:
+                return
+            samples = (fine['fall_end'] - fine['fall_start'] if component == 'fall'
+                       else fine['fall_start'] - fine['rise_end'])
+            current_duration_us = samples / (_widget_clock_mhz(self) * 16)
+            voltage_delta_mv = float(pulse.v[point_index] - fine['turn']) if component == 'fall' else 0.
+            segment_name += f':{component}'
         initial = next(
             (
                 spec
@@ -13044,8 +13081,11 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self,
         _port_index: int,
         segment_index: int,
+        component: str = 'rise',
     ) -> None:
         segment_name = f"ramp_{int(segment_index) - 1}_to_{int(segment_index)}"
+        if component != 'rise':
+            segment_name += f':{component}'
         remaining = [
             spec
             for spec in self._sweep_specs
@@ -16741,7 +16781,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 target_output_power_dbm=target_output_power_dbm,
                 pulse_mode=pulse_mode,
                 pulse_name=str(entry.get("pulse_name", "RF pulse")),
-                fine_duration=self._json_bool(entry.get("fine_duration", False), f"{label} fine duration"),
+                fine_duration=self._json_bool(entry.get("fine_duration", True), f"{label} fine duration"),
                 frequency_parameters=tuple(
                     entry.get(
                         "frequency_parameters",
@@ -17905,7 +17945,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 target_output_power_dbm=target_output_power_dbm,
                 pulse_mode=pulse_mode,
                 pulse_name=str(entry.get("pulse_name", "RF pulse")),
-                fine_duration=self._json_bool(entry.get("fine_duration", False), "RF fine duration"),
+                fine_duration=self._json_bool(entry.get("fine_duration", True), "RF fine duration"),
                 frequency_parameters=tuple(
                     entry.get(
                         "frequency_parameters",
@@ -18420,6 +18460,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             target.v = source.v.copy()
             target.v_bounds = tuple(source.v_bounds)
             target.segment_names = list(source.segment_names)
+            target.fine_ramps = {row: dict(spec) for row, spec in source.fine_ramps.items()}
+            target.fine_fabric_mhz = source.fine_fabric_mhz
         self._share_matching_port_timings(0)
         self._share_matching_segment_names(0)
 
@@ -18570,6 +18612,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._pulse[0].v = loaded.v.copy()
         self._pulse[0].v_bounds = tuple(loaded.v_bounds)
         self._pulse[0].segment_names = list(loaded.segment_names)
+        self._pulse[0].fine_ramps = {row: dict(spec) for row, spec in loaded.fine_ramps.items()}
+        self._pulse[0].fine_fabric_mhz = loaded.fine_fabric_mhz
         self._plot.refresh()
         self._multi_ctrl.refresh_table()
         self._refresh_trace_if_needed(force=True)

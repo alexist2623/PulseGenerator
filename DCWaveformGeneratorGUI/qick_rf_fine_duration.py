@@ -113,6 +113,9 @@ def sample_accumulator(duration_points, fabric_mhz):
     values = tuple(samples_from_us(v, fabric_mhz) for v in points)
     if max(values) >= 1 << 31:
         raise ValueError('fine RF duration sample count must fit a positive signed 32-bit register')
+    step = values[1] - values[0] if len(values) > 1 else 0
+    if values == tuple(values[0] + i * step for i in range(len(values))):
+        return SampleAccumulator(values[0], 0, 0, step, 0, 0, len(values))
     scale = 1 << FRACTION_BITS
     rate = Fraction.from_float(float(fabric_mhz) * SAMPLES_PER_CLOCK)
     if len(points) == 1:
@@ -250,6 +253,8 @@ class FineRfDurationProgramMixin:
             dependent = ({i for i, delta in enumerate(extension) if delta and axes[i].count > 1}
                               | {axes.index(axis) for axis in preceding if axis.count > 1}
                               | ({axes.index(own_axis)} if own_axis is not None and own_axis.count > 1 else set()))
+            if getattr(self, '_sample_hold', False):
+                dependent.update(self._fh_anchor_axes(segment + 1))
             relevant = sorted({self._fine_axis_representative(i) for i in dependent})
             shape = tuple(int(axes[i].count) for i in relevant)
             base = int(self.aux_timing[f'rf_{index}_start'])
@@ -260,6 +265,8 @@ class FineRfDurationProgramMixin:
                 point = coordinate.get(axes.index(own_axis), 0) if own_axis is not None else 0
                 plan = runtime['plans'][point]
                 start = base + sum(coordinate.get(i, 0)*int(delta) for i, delta in enumerate(extension))
+                if getattr(self, '_sample_hold', False):
+                    start += self._fh_anchor_delta(segment, coordinate)
                 for axis in preceding:
                     values = tuple((samples_from_us(v, self.tproc_mhz)+15)//16 for v in axis.points)
                     start += values[coordinate.get(axes.index(axis), 0)] - values[0]
@@ -278,6 +285,8 @@ class FineRfDurationProgramMixin:
                 end_deltas = self._extension_axis_deltas(segment, include_current=True)
                 segment_end = int(self.timing['segment_ends'][segment]) + sum(
                     coordinate.get(i, 0)*int(delta) for i, delta in enumerate(end_deltas))
+                if getattr(self, '_sample_hold', False):
+                    segment_end += self._fh_anchor_delta(segment + 1, coordinate)
                 if rf.require_within_segment and start+plan.busy_cycles+latency > segment_end:
                     raise ValueError("fine RF padded waveform exceeds its HOLD segment at a hardware sweep point")
             self._fine_rf_rows[index] = dict(axis_indices=tuple(relevant), axis_shape=shape,
@@ -321,6 +330,8 @@ class FineRfDurationProgramMixin:
                     ('low', 'phase', accumulator.initial_low),
                     ('high', 'gain', accumulator.initial_high),
                 ):
+                    if name != 'samples' and not (accumulator.step_low or accumulator.step_high):
+                        continue
                     key = ('fine_duration_state', member, name)
                     keys[name] = key
                     fields.append(dict(key=key, register_name='fine_duration_' + name,
@@ -388,6 +399,14 @@ class FineRfDurationProgramMixin:
             page, gen = int(field['page']), int(field['gen_ch'])
             registers = [int(self._gen_regmap[(gen, name)][1]) for name in ('freq', 'phase', 'gain', 'mode')]
             n, low, high, carry = registers
+            if not (accumulator.step_low or accumulator.step_high):
+                if reset:
+                    self.safe_regwi(page, n, accumulator.initial_samples, 'reset RF sample duration')
+                else:
+                    self._fine_load_state(keys['samples'], n)
+                    self._emit_add_i32(page, n, accumulator.step_samples, 'RF integer sample duration increment')
+                self._fine_store_state(keys['samples'], n)
+                continue
             if reset:
                 for name, register, value in zip(('samples', 'low', 'high'), registers,
                         (accumulator.initial_samples, accumulator.initial_low, accumulator.initial_high)):
@@ -525,7 +544,11 @@ class FineRfDurationProgramMixin:
         t, mode, addr, tail_mode, tail_t, n = map(register, ('t', 'mode', 'addr', 'mode2', 'addr2', 'mode3'))
         temp, scratch = register('freq'), register('phase')
         start_key = ('fine_start_affine', index)
-        if start_key in self._sweep_field_by_key:
+        if getattr(self, '_sample_hold', False):
+            sample_key = ('fine_start_sample', index)
+            self._fh_load(sample_key, page, t)
+            self.bitwi(page, t, t, '>>', 4, 'fine RF sample HOLD anchor')
+        elif start_key in self._sweep_field_by_key:
             self._fine_load_state(start_key, t)
         else:
             self.safe_regwi(page, t, info['affine_start_base'], 'fine RF affine start')
@@ -692,8 +715,8 @@ class FineRfDurationProgramMixin:
                 amplitude_scaling='DDS plateau gain; product ending pattern uses twice gain with integer truncation',
                 timing_scope='sample-granular width; starts remain generator-fabric-clock aligned',
                 duration_quantization='ceil to sample; snap grid points within half 1e-9 us display precision plus floating-point ULPs',
-                duration_configuration='60-bit fractional register accumulator; q/r shifts and masks; no duration point table',
-                duration_state_fields=3 * len(self._fine_accumulators),
+                duration_configuration='integer sample register add; q/r shifts and masks; no duration point table',
+                duration_state_fields=sum(len(keys) for keys in self._fine_axis_field_keys.values()),
                 duration_table_words=0,
                 row_axis_indices=self._fine_rf_rows[index]['axis_indices']))
         if fine:

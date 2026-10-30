@@ -132,7 +132,7 @@ def test_capability_and_unsupported_sweeps_fail_before_execution():
     with pytest.raises(ValueError, match='v7'):
         compile_sequence(seq, v6_configuration(), (1,))
     seq.add_amplitude_sweep('set_1', 'awg_0', .01, .02, 2)
-    with pytest.raises(ValueError, match='fixed edge'):
+    with pytest.raises(ValueError, match='fixed voltages'):
         compile_sequence(seq, configuration(), (1,))
 
 
