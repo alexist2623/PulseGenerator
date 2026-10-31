@@ -437,19 +437,15 @@ class FineRfDurationProgramMixin:
     def _validate_dynamic_event_order(self):
         if not getattr(self, '_fine_rf_rows', {}):
             return super()._validate_dynamic_event_order()
-        # Legacy validation has affine timing only. Validate its unchanged
-        # events first; then check every dependent coordinate with exact rows.
-        for index in self._fine_rf_rows:
-            self._rf_runtime[index]['periodic'] = False
-        try:
-            super()._validate_dynamic_event_order()
-        finally:
-            for index in self._fine_rf_rows:
-                self._rf_runtime[index]['periodic'] = True
+        # The affine validator skips fine RF placeholder timestamps; exact
+        # RF/AWG spacing and ordering are checked together below.
+        super()._validate_dynamic_event_order()
         models = {model['key']: model for model in self._event_timing_models}
         events = []
         for commands in self.compiled_points[0].segment_commands:
             for command in commands:
+                if not self._command_is_emitted(command):
+                    continue
                 key = ('event_time', 'awg', *self._command_key(command))
                 events.append((int(self.timing['command_times'][self._timing_key(command)]), 10,
                                command.gen_ch, key, None))

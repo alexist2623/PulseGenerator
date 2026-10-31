@@ -496,7 +496,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 47
+SETTINGS_VERSION = 48
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -18636,15 +18636,60 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
 
     def _load_settings_json(self, path) -> Path:
         input_path = Path(path)
-        data = json.loads(input_path.read_text(encoding="utf-8"))
+        data = json.loads(input_path.read_text(encoding="utf-8-sig"))
+        from settings_migration import RECIPE_SCHEMA, recipe_settings, migration_report
+        report = None
         if isinstance(data, dict) and data.get("schema") == SETTINGS_SCHEMA:
             self._apply_decoded_settings(self._decode_settings(data))
+            if data.get("version", 1) < SETTINGS_VERSION:
+                report = migration_report(SETTINGS_SCHEMA, data.get("version", 1), SETTINGS_VERSION)
+        elif isinstance(data, dict) and data.get("schema") == RECIPE_SCHEMA:
+            channels = list(self._qick_awg_channels)
+            channels.extend(ch for ch in DEFAULT_QSTL_AWG_CHANNELS if ch not in channels)
+            converted = recipe_settings(data, self._settings_to_dict(), schema=SETTINGS_SCHEMA,
+                                        version=SETTINGS_VERSION, awg_channels=channels)
+            self._apply_decoded_settings(self._decode_settings(converted))
+            report = migration_report(RECIPE_SCHEMA, 1, SETTINGS_VERSION, recipe=True)
         else:
             if not isinstance(data, dict):
                 raise TypeError("legacy settings JSON root must be an object")
+            if data.get("schema") or not any(key in data for key in ("time_ns", "initial_voltage", "voltage_bounds")):
+                raise ValueError(f"unsupported settings schema {data.get('schema')!r}")
             self._apply_legacy_settings(data)
+            report = migration_report('legacy-single-waveform', None, SETTINGS_VERSION)
         self._settings_path = input_path
+        self._last_settings_migration = report
+        previous = getattr(self, '_settings_migration_notice', None)
+        if previous is not None:
+            previous.close()
+            previous.deleteLater()
+        self._settings_migration_notice = None
+        if report is not None:
+            self._show_settings_migration(report)
         return input_path
+
+    def _show_settings_migration(self, report) -> None:
+        """Inform after successful import, without blocking scripts or requiring approval."""
+        box = QtWidgets.QDialog(self)
+        box.setWindowTitle('Settings updated')
+        source = report['source_version']
+        label = f"v{source}" if source is not None else 'legacy waveform'
+        layout = QtWidgets.QVBoxLayout(box)
+        heading = QtWidgets.QLabel(f"Imported {label} as settings v{report['target_version']}.")
+        layout.addWidget(heading)
+        details = QtWidgets.QLabel('\n\n'.join(report['changes']))
+        details.setObjectName('migrationDetails')
+        details.setWordWrap(True)
+        details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(details)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok)
+        buttons.accepted.connect(box.accept)
+        layout.addWidget(buttons)
+        box.resize(540, 340)
+        box.setModal(False)
+        self._settings_migration_notice = box
+        box.show()
+        self.statusBar().showMessage(f"Settings updated to v{report['target_version']}; source JSON unchanged")
 
     def _save_json(self) -> None:
         default_path = self._settings_path or (

@@ -38,6 +38,8 @@ def executed_commands(program, point_index):
         return
     for commands in program.compiled_points[0].segment_commands:
         for command in commands:
+            if not program._command_is_emitted(command):
+                continue
             from qick_fine_ramp import is_extended
             if is_extended(command):
                 point = program._requested_awg_point_at(point_index)

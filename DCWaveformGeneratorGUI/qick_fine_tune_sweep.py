@@ -5523,6 +5523,26 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         )
         self.timing["point_end"] += delta
 
+    def _command_is_emitted(self, command: CompiledCommand) -> bool:
+        """Keep semantic HOLD segments, but omit v7's redundant post-RAMP SET.
+
+        RAMP targets are compiled from the following SET's amplitudes, including
+        its sweep coordinates. v7 clamps to that target and holds it indefinitely.
+        Keep the semantic SET for timing, sweep fields and area accounting; only
+        its duplicate hardware command is removed. Initial/standalone SETs and
+        compensation commands still execute. Older firmware is unchanged.
+        """
+        index = command.segment_index
+        if (command.kind != "set" or index <= 0
+                or self.soccfg["gens"][command.gen_ch].get("type") != "axis_awg_tuning_v7"
+                or self.sequence.segments[index - 1].kind != "ramp"):
+            return True
+        previous = self.compiled_points[0].segment_commands[index - 1]
+        return not any(before.output_index == command.output_index
+                       and before.kind == "ramp"
+                       and before.target_code == command.target_code
+                       for before in previous)
+
     def _build_aux_timing(self):
         f_time = self.tproc_mhz
 
@@ -5629,11 +5649,13 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
 
         rf_timings = []
         occupied_by_port = {}
-        for timing_key, command_time in self.timing["command_times"].items():
-            output_index = int(timing_key[1])
-            awg_ch = self.awg_channels[output_index]
-            awg_port = int(self.soccfg["gens"][awg_ch]["tproc_ch"])
-            occupied_by_port.setdefault(awg_port, set()).add(int(command_time))
+        for commands in self.compiled_points[0].segment_commands:
+            for command in commands:
+                if not self._command_is_emitted(command):
+                    continue
+                command_time = self.timing["command_times"][self._timing_key(command)]
+                awg_port = int(self.soccfg["gens"][command.gen_ch]["tproc_ch"])
+                occupied_by_port.setdefault(awg_port, set()).add(int(command_time))
         if self.ddr_readout_config is not None:
             ro_cfg = self.soccfg["readouts"][self.ddr_readout_config.ro_ch]
             occupied_by_port.setdefault(int(ro_cfg["tproc_ctrl"]), set()).add(
@@ -5649,7 +5671,9 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             occupied = occupied_by_port.setdefault(rf_port, set())
             latency = rf_latencies[rf_index]
             rf_start = int(requested_start) - latency
-            firmware = 'v6' if self._v6_timing else ('v5' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2 else 'v4')
+            firmware = ('v7' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 7
+                        else 'v6' if self._v6_timing
+                        else 'v5' if self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2 else 'v4')
             if latency and any(abs(rf_start - t) < self._dispatch_spacing for t in occupied):
                 raise ValueError(f'The {firmware} RF command conflicts with another command on its shared '
                                  'tProcessor port; adjust the RF delay or segment timing.')
@@ -6069,6 +6093,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
 
         for commands in self.compiled_points[0].segment_commands:
             for command in commands:
+                if not self._command_is_emitted(command):
+                    continue
                 append(
                     self.timing["command_times"][
                         self._timing_key(command)
@@ -6082,6 +6108,10 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     ),
                 )
         for rf_index, rf in enumerate(self.rf_pulse_configs):
+            # Fine RF event models are placeholders, not affine timestamps.
+            # The fine-duration mixin validates their exact dependent rows.
+            if rf_index in getattr(self, '_fine_rf_rows', {}):
+                continue
             append(
                 self.aux_timing[f"rf_{rf_index}_start"],
                 10,
@@ -6118,7 +6148,10 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     min(0, (int(a)-int(b))*(axis.count-1))
                     for a,b,axis in zip(current_model['axis_deltas'],prev_model['axis_deltas'],self.sequence.sweep_axes))
                 if minimum < self._dispatch_spacing:
-                    firmware = 'v6' if self._v6_timing else 'v5' if any(
+                    firmware = 'v7' if any(
+                        int(self.soccfg['gens'][ch]['tproc_ch']) == port
+                        and self.soccfg['gens'][ch].get('type') == 'axis_awg_tuning_v7'
+                        for ch in self.awg_channels) else 'v6' if self._v6_timing else 'v5' if any(
                         int(self.soccfg['gens'][rf.gen_ch]['tproc_ch']) == port
                         and self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2
                         for rf in self.rf_pulse_configs) else 'v4'
@@ -6290,6 +6323,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         event_field_key: Optional[tuple] = None,
     ):
         """Emit one command, copying swept fields from tProcessor state regs."""
+        if not self._command_is_emitted(command):
+            return
         gen_ch = command.gen_ch
         step_width = _awg_step_width(self.soccfg["gens"][gen_ch])
         page = self._gen_regmap[(gen_ch, "target")][0]
@@ -7028,6 +7063,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         point = self.compiled_points[0]
         for segment_index, commands in enumerate(point.segment_commands):
             for command in commands:
+                if not self._command_is_emitted(command):
+                    continue
                 command_time = self.timing["command_times"][
                     self._timing_key(command)
                 ]
