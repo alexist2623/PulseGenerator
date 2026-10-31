@@ -18637,7 +18637,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
     def _load_settings_json(self, path) -> Path:
         input_path = Path(path)
         data = json.loads(input_path.read_text(encoding="utf-8-sig"))
-        from settings_migration import RECIPE_SCHEMA, recipe_settings, migration_report
+        try:
+            from .settings_migration import RECIPE_SCHEMA, recipe_settings, migration_report
+        except ImportError:
+            from settings_migration import RECIPE_SCHEMA, recipe_settings, migration_report
         report = None
         if isinstance(data, dict) and data.get("schema") == SETTINGS_SCHEMA:
             self._apply_decoded_settings(self._decode_settings(data))
