@@ -27,10 +27,31 @@ Validation for the received legacy corpus includes 12 source JSON files (the
 previously excluded error.json is omitted), 14 separate RF routing combinations,
 and 71,785 sweep coordinates in the strict tProcessor behavior model. All 14
 combinations compile and execute in that model without timestamp conflicts.
-Initial physical checks of all 14 combinations used the production GUI Run
-button, rep=1, DAC5 to oscilloscope CH1 at 50 ohms, with expected and raw measured
-waveforms stored outside this repository. CH1 is restored to 1 megohm after
-acquisition; CH4 remains at 1 megohm.
+Physical verification completed on 2026-10-30 using the production GUI Run
+button, rep=1, DAC5 to oscilloscope CH1 at 50 ohms. Each of the 14 combinations
+has 100 complete detailed waveform records: 1,400 records covering 1,043 unique
+source coordinates. Single-point files use 100 separate rep=1 runs; the
+40-point combination repeats selected blocks. Actual PMEM and runtime DMEM
+matched the compiled references for every acquisition.
+
+An additional 112 narrow RF acquisitions at a native 0.1 ns interval all match
+the requested carrier within max(0.6 MHz, two FFT bins). These include 100
+distinct coordinates across the 200-1,500 MHz sweep and one representative
+coordinate from each other RF combination. This is not a calibrated RF power
+test. Full-frame measurements use a wider voltage range and 0.4-4 ns sample
+intervals; they do not resolve every 0.208333 ns edge or every RF carrier.
+
+Stable-envelope RMSE medians range from 9.50 to 13.79 mV across the 14 cases;
+the largest individual RMSE is 28.23 mV. Successful execution is not a claim
+of exact analog agreement. The September 10 file was reacquired with a positive
+DC-edge trigger after its initial trigger selected the second pulse. The
+temporary-file case was reacquired at -75 mV after its low threshold produced
+a noisy time origin. Superseded records are excluded from the final counts.
+
+Expected and raw measured waveforms, settings, scope logs and the 701-page
+complete atlas remain outside this repository. Original source JSON hashes
+are unchanged. Final zero/reset completed, and independent readback confirmed
+unchanged DAC currents, CH1/CH2/CH4 at 1 megohm, and no scope error.
 
 Regression results: 731 passing compiler/migration tests and 10 passing GUI
 settings tests. Sixteen v3 DC-preview timing tests fail identically on the
