@@ -10621,6 +10621,7 @@ class QickAssemblyDialog(QtWidgets.QDialog):
 
     def _update_execution_coordinates(self, point):
         from qick_execution_coordinates import build_execution_coordinates
+        from qick_program_display import format_awg_commands
         # Expand one selected point only, even for very large sweeps.
         snapshot = build_execution_coordinates(
             self._coordinate_program, point_indices=(point,))
@@ -10631,19 +10632,8 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         lines.append("Group indices: " + ", ".join(
             f"{group['loop_axis_index']}: {group['coordinates']}"
             for group in snapshot["group_indices"]))
-        lines.extend(["", "Physical AWG commands (pre-IIR):"])
-        for command in snapshot["awg_commands"]:
-            values = command["columns"]
-            voltage = (f", {values['target_mv']:.9g} mV"
-                       if "target_mv" in values else "")
-            lines.append(
-                f"  {command['output_name']} / {command['segment_name']} "
-                f"({command['kind']}): DAC code {values['target_code_14']}"
-                f"{voltage}; command cycle {values['command_cycle']}"
-            )
-            if command["kind"] == "ramp":
-                lines.append(f"    RAMP: {values['duration_samples']} samples, "
-                             f"{values['ramp_duration_us']:.9g} us")
+        lines.append("")
+        lines.extend(format_awg_commands(self._coordinate_program, point))
         lines.extend(["", "Compiled RF commands:"])
         for event in snapshot["rf_events"]:
             values = event["columns"]
