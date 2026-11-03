@@ -127,13 +127,13 @@ def test_exact_area_matches_independent_scalar_reference(spec):
     assert ledger['area'] == sum(values) + end//4*(48-len(values)+48)
 
 
-def test_capability_and_unsupported_sweeps_fail_before_execution():
+def test_capability_and_voltage_sweeps():
     seq = build_qick_sequence((pulse(),))
     with pytest.raises(ValueError, match='v7'):
         compile_sequence(seq, v6_configuration(), (1,))
     seq.add_amplitude_sweep('set_1', 'awg_0', .01, .02, 2)
-    with pytest.raises(ValueError, match='fixed voltages'):
-        compile_sequence(seq, configuration(), (1,))
+    _, points = compile_sequence(seq, configuration(), (1,))
+    assert points[0].segment_commands[1][0].target_code != points[1].segment_commands[1][0].target_code
 
 
 def test_hold_sweep_and_rf_keep_common_latency():

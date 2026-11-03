@@ -96,9 +96,11 @@ Grouped axes share their existing loop index and tables rewind on outer
 loop boundaries. Table capacity is checked before execution. Waveform
 previews and execution metadata use each point's updated edge positions.
 
-Fine RAMP still requires fixed voltage endpoints and an identity virtual-gate
-matrix. Voltage sweep support is unchanged. The encoder validates positive
-sample intervals, the second-edge start limit and the total sample count.
+Fine RAMP supports voltage endpoints swept with independent or grouped duration
+axes. It still requires an identity virtual-gate matrix. The encoder validates
+positive sample intervals, the second-edge start limit and the total sample
+count. See [incremental fine voltage sweeps](AWG_V7_FINE_VOLTAGE_SWEEP.md) for
+register arithmetic, coefficient quantization, and memory limits.
 
 Regression coverage includes increasing/decreasing duration, sample-word
 boundaries, both voltage directions, nested/grouped loop reset, GUI text

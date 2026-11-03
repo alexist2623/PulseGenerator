@@ -164,7 +164,7 @@ print(json.dumps({'cache': p.compile_cache_info, 'binary': p.binprog}))
 '''
     result = subprocess.run([sys.executable, '-B', '-c', code,
                              json.dumps([str(Path(__file__).parent)] + sys.path)],
-                            cwd='C:/GIT_Workspace/PulseGenerator', capture_output=True,
+                            cwd=Path(__file__).resolve().parents[2], capture_output=True,
                             text=True, check=True, timeout=60)
     doc = json.loads(result.stdout.splitlines()[-1])
     assert doc['cache']['source'] == 'disk'
@@ -399,7 +399,7 @@ print(json.dumps({'cache': p.compile_cache_info, 'binary': p.binprog}))
 '''
     result = subprocess.run([sys.executable, '-B', '-c', code,
                              json.dumps([str(Path(__file__).parent)] + sys.path)],
-                            cwd='C:/GIT_Workspace/PulseGenerator', capture_output=True,
+                            cwd=Path(__file__).resolve().parents[2], capture_output=True,
                             text=True, check=True, timeout=60)
     doc = json.loads(result.stdout.splitlines()[-1])
     assert doc['cache']['source'] == 'disk'

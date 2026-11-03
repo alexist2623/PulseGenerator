@@ -7,6 +7,8 @@ Circuit time zero is a common, recorded origin after an AWG startup pre-roll.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace, asdict
+from datetime import datetime
+from pathlib import Path
 from math import ceil, isclose, isfinite
 from collections.abc import Mapping
 from copy import deepcopy
@@ -549,6 +551,9 @@ def run_quantum_circuit_experiment(**kwargs):
     sweep_id = uuid.uuid4().hex
     database = kwargs['run_config'].resolved_database_path
     manifest_path = database.with_name(f'{database.stem}.circuit-sweep-{sweep_id}.json')
+    if kwargs['run_config'].storage_format == 'hdf5':
+        root = Path(kwargs['run_config'].hdf5_directory).expanduser().resolve()
+        manifest_path = root / datetime.now().astimezone().strftime('%Y-%m-%d') / f'circuit-sweep-{sweep_id}.json'
     manifest = dict(version=1, sweep_id=sweep_id, loop_id=loop_id, n_values=values,
                     shots_per_point=document['shots'], status='running', points=[],
                     circuit=document, preflight_program_sha256=hashes)

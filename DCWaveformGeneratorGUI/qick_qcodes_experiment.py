@@ -44,9 +44,13 @@ Q_MEAN_PARAMETER = "q_mean"
 SAMPLE_INDEX_PARAMETER = "sample_index"
 IQ_STORAGE_FULL_TRACES = "full_traces"
 IQ_STORAGE_MEAN_IQ = "mean_iq"
+IQ_STORAGE_QICK_MEAN_TRACE = "qick_mean_trace"
+IQ_STORAGE_QICK_MEAN_IQ = "qick_mean_iq"
 IQ_STORAGE_MODES = (
     IQ_STORAGE_FULL_TRACES,
     IQ_STORAGE_MEAN_IQ,
+    IQ_STORAGE_QICK_MEAN_TRACE,
+    IQ_STORAGE_QICK_MEAN_IQ,
 )
 DEFAULT_IQ_STORAGE_MODE = IQ_STORAGE_FULL_TRACES
 AWG_METADATA_MODE_PARAMETRIC = "parametric"
@@ -164,16 +168,22 @@ class QickConnectionConfig:
 
 @dataclass(frozen=True)
 class QcodesRunConfig:
-    """QCoDeS database and experiment naming settings."""
+    """Experiment naming and selectable QCoDeS/HDF5 storage settings."""
 
     database_path: str
     experiment_name: str = "QICK pulse experiment"
     sample_name: str = "PulseGenerator"
     notes: str = ""
     sample_rate_hz: float = 1_000_000.0
+    storage_format: str = "qcodes"
+    hdf5_directory: str = ""
 
     def __post_init__(self) -> None:
-        if not str(self.database_path).strip():
+        if self.storage_format not in {"qcodes", "hdf5"}:
+            raise ValueError("storage_format must be qcodes or hdf5")
+        if self.storage_format == "hdf5" and not str(self.hdf5_directory).strip():
+            raise ValueError("HDF5 output directory must not be empty")
+        if self.storage_format == "qcodes" and not str(self.database_path).strip():
             raise ValueError("QCoDeS database path must not be empty")
         if not self.experiment_name.strip():
             raise ValueError("QCoDeS experiment name must not be empty")
@@ -203,6 +213,11 @@ class StoredQickExperiment:
     ddr_result: Any
     rf_settings: Mapping[str, Any]
     iq_storage_mode: str = DEFAULT_IQ_STORAGE_MODE
+    storage_format: str = "qcodes"
+
+    @property
+    def source_label(self) -> str:
+        return self.database_path.name if self.storage_format == "hdf5" else f"QCoDeS Run {self.run_id}"
 
     def detach_dataset(self) -> "StoredQickExperiment":
         """Close and discard the QCoDeS connection before crossing threads."""
@@ -1303,6 +1318,7 @@ def _execute_qick_sequence_once(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     acquisition_source: str = "fir_ddr",
+    repetition_mode: str = "raw",
     hardware_rep_delay_us: float = 0.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     progress: bool = False,
@@ -1316,6 +1332,15 @@ def _execute_qick_sequence_once(
         raise ValueError(
             "acquisition_source must be fir_ddr or avg_buffer"
         )
+    try:
+        from .qick_trace_average import normalize_repetition_mode, require_board_trace_average
+    except ImportError:
+        from qick_trace_average import normalize_repetition_mode, require_board_trace_average
+    repetition_mode = normalize_repetition_mode(repetition_mode)
+    if repetition_mode != "raw":
+        if acquisition_source != "fir_ddr":
+            raise ValueError("QICK trace averaging requires FIR DDR acquisition")
+        require_board_trace_average(soc)
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 5, "Configuring RF readout hardware")
     _emit_experiment_event(
@@ -1415,7 +1440,8 @@ def _execute_qick_sequence_once(
             progress_callback,
             percent,
             (
-                f"Reading FIR DDR traces {completed:,}/{total:,} "
+                (f"Averaging on QICK {completed:,}/{total:,} traces " if repetition_mode != "raw"
+                 else f"Reading FIR DDR traces {completed:,}/{total:,} ") +
                 f"({100.0 * fraction:.1f}% readback; "
                 f"{completed_samples:,}/{total_samples:,} I/Q sample pairs)"
             ),
@@ -1446,6 +1472,8 @@ def _execute_qick_sequence_once(
             )
             if event_callback is not None:
                 acquire_kwargs["phase_callback"] = event_callback
+            if repetition_mode != "raw":
+                acquire_kwargs["repetition_mode"] = repetition_mode
             ddr_result = program.acquire_fir_ddr(soc, **acquire_kwargs)
             completion_message = "FIR DDR acquisition and readback completed"
         else:
@@ -1705,6 +1733,7 @@ def execute_qick_sequence(
     rf_specs: Sequence[QickRfPulseSpec],
     readout_spec: QickDdrReadoutSpec,
     acquisition_source: str = "fir_ddr",
+    repetition_mode: str = "raw",
     hardware_rep_delay_us: float = 0.0,
     sequence_fabric_mhz: float = 300.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
@@ -1727,6 +1756,7 @@ def execute_qick_sequence(
             rf_specs=rf_specs,
             readout_spec=readout_spec,
             acquisition_source=acquisition_source,
+            repetition_mode=repetition_mode,
             hardware_rep_delay_us=hardware_rep_delay_us,
             compile_validation_mode=compile_validation_mode,
             progress=progress,
@@ -1785,6 +1815,7 @@ def execute_qick_sequence(
             rf_specs=concrete_specs,
             readout_spec=readout_spec,
             acquisition_source=acquisition_source,
+            repetition_mode=repetition_mode,
             hardware_rep_delay_us=hardware_rep_delay_us,
             compile_validation_mode=compile_validation_mode,
             progress=progress,
@@ -2367,8 +2398,37 @@ def store_qick_result(
     batch_rows: int = DEFAULT_QCODES_BATCH_ROWS,
     iq_storage_mode: str = DEFAULT_IQ_STORAGE_MODE,
     cancel_check: Optional[CancellationCheck] = None,
+    started_at: Optional[datetime] = None,
 ) -> Tuple[Any, int]:
     """Store full repetition traces or one mean I/Q pair per sweep point."""
+    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
+    kind = getattr(ddr_result, "data_kind", "raw")
+    expected_kind = {IQ_STORAGE_QICK_MEAN_TRACE: "repetition_mean", IQ_STORAGE_QICK_MEAN_IQ: "point_mean"}.get(iq_storage_mode)
+    if expected_kind is not None and kind != expected_kind:
+        raise ValueError("The selected QICK averaging mode does not match the acquired result")
+    if kind in {"repetition_mean", "point_mean"}:
+        received = np.asarray(ddr_result.iq)
+        if (received.ndim != 4 or received.shape[1] != 1 or received.shape[-1] != 2
+                or received.dtype != np.dtype("float64")
+                or int(getattr(ddr_result, "iq_scale_log2", 0)) != 0
+                or int(getattr(ddr_result, "accumulation_repetitions", 0)) < 1
+                or not getattr(ddr_result, "source_samples_per_trace", None)
+                or (kind == "point_mean" and received.shape[2] != 1)
+                or (kind == "repetition_mean" and received.shape[2] != ddr_result.source_samples_per_trace)):
+            raise ValueError("Invalid QICK averaged result shape, units or source counts")
+    if run_config.storage_format == "hdf5":
+        try:
+            from .qick_hdf5 import store_hdf5_result
+        except ImportError:
+            from qick_hdf5 import store_hdf5_result
+        return store_hdf5_result(
+            ddr_result, run_config=run_config, connection_config=connection_config,
+            program_summary=program_summary, gui_settings=gui_settings,
+            rf_settings=rf_settings, iq_storage_mode=iq_storage_mode,
+            started_at=started_at, progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+    stores_trace = iq_storage_mode in {IQ_STORAGE_FULL_TRACES, IQ_STORAGE_QICK_MEAN_TRACE}
     try:
         from qcodes import (
             Measurement,
@@ -2483,15 +2543,22 @@ def store_qick_result(
                               label=f"Sweep group {loop_index + 1} index", unit="")
         group_index_parameters.append((loop_index, parameter))
         setpoint_parameters.append(parameter)
+    # Plottr omits standalone parameters. A mean without a sweep still needs
+    # an independent coordinate so its single I/Q point appears in DB viewers.
+    mean_point_index = None
+    if not stores_trace and not setpoint_parameters:
+        mean_point_index = Parameter("point_index", label="Acquisition point", unit="")
     for parameter in setpoint_parameters:
         measurement.register_parameter(parameter)
+    if mean_point_index is not None:
+        measurement.register_parameter(mean_point_index)
     repetition_index = None
     sample_index = None
     i_trace = None
     q_trace = None
     i_mean = None
     q_mean = None
-    if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+    if stores_trace:
         repetition_index = Parameter(
             "repetition_index",
             label="Repetition",
@@ -2534,13 +2601,10 @@ def store_qick_result(
             unit=iq_unit,
         )
         for parameter in (i_mean, q_mean):
-            if setpoint_parameters:
-                measurement.register_parameter(
-                    parameter,
-                    setpoints=tuple(setpoint_parameters),
-                )
-            else:
-                measurement.register_parameter(parameter)
+            measurement.register_parameter(
+                parameter,
+                setpoints=(mean_point_index,) if mean_point_index is not None else tuple(setpoint_parameters),
+            )
 
     raw_parameters = []
     if store_raw_int64:
@@ -2683,6 +2747,10 @@ def store_qick_result(
         parameter.name: _sweep_axis_meaning(axis)
         for axis, parameter in zip(sweep_axes, sweep_parameters)
     }
+    if mean_point_index is not None:
+        setpoint_meanings[mean_point_index.name] = (
+            "Display coordinate for a single unswept mean I/Q acquisition; always zero."
+        )
     for loop_index, parameter in group_index_parameters:
         setpoint_meanings[parameter.name] = (
             "Zero-based shared index; every parameter in this group advances together."
@@ -2696,13 +2764,13 @@ def store_qick_result(
                     )
     sample_period_us = 1_000_000.0 / run_config.sample_rate_hz
     mean_iq_values = None
-    if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+    if stores_trace:
         setpoint_meanings.update({
             SAMPLE_INDEX_PARAMETER: (
                 "Zero-based index of each sample within the captured I/Q trace."
             ),
             "repetition_index": (
-                "Zero-based repetition within one sweep coordinate."
+                "Singleton axis for the QICK repetition mean." if kind != "raw" else "Zero-based repetition within one sweep coordinate."
             ),
         })
         sample_index_values = np.arange(sample_count, dtype=np.int32)
@@ -2761,14 +2829,20 @@ def store_qick_result(
     measurement_layout.update({
         "iq_storage_mode": iq_storage_mode,
         "source_iq_shape": list(iq.shape),
-        "source_repetition_count": repetition_count,
-        "source_sample_count": sample_count,
+        "source_repetition_count": (
+            int(ddr_result.accumulation_repetitions) if kind != "raw" else repetition_count
+        ),
+        "data_kind": kind,
+        "averaging_location": "qick_cpu" if kind != "raw" else "pc" if not stores_trace else "none",
+        "source_iq_scale_log2": getattr(ddr_result, "source_iq_scale_log2", None),
+        "source_iq_component_bits": getattr(ddr_result, "source_iq_component_bits", None),
+        "source_sample_count": getattr(ddr_result, "source_samples_per_trace", None) or sample_count,
         "raw_iq_dtype": str(raw_iq.dtype),
         "raw_iq_scale_log2": raw_scale_log2,
         "raw_iq_shape": list(raw_iq.shape),
         "raw_iq_parameters": [p.name for p in raw_parameters],
         "raw_iq_storage": (
-            "omitted_mean_iq" if iq_storage_mode == IQ_STORAGE_MEAN_IQ
+            "omitted_board_average" if kind != "raw" else "omitted_mean_iq" if not stores_trace
             else "exact_int64_arrays" if store_raw_int64 else "legacy"
         ),
         "iq_unit": iq_unit,
@@ -2784,6 +2858,8 @@ def store_qick_result(
         "group_index_parameters": {str(i): parameter.name for i, parameter in group_index_parameters},
         "setpoint_meanings": setpoint_meanings,
     })
+    if mean_point_index is not None:
+        measurement_layout["point_index_parameter"] = mean_point_index.name
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "qick_connection": asdict(connection_config),
@@ -2953,7 +3029,7 @@ def store_qick_result(
                 )
 
         data_progress_end = max(progress_start, progress_end - 4)
-        if iq_storage_mode == IQ_STORAGE_FULL_TRACES:
+        if stores_trace:
             trace_count = point_count * repetition_count
             traces_per_flush = max(1, batch_rows // sample_count)
             traces_written = 0
@@ -3026,6 +3102,8 @@ def store_qick_result(
                 ]
                 coordinate_results.extend((parameter, int(group_coordinates[point_index, index]))
                                           for index, parameter in group_index_parameters)
+                if mean_point_index is not None:
+                    coordinate_results.append((mean_point_index, point_index))
                 datasaver.add_result(
                     *coordinate_results,
                     (i_mean, float(mean_iq_values[point_index, 0])),
@@ -3107,7 +3185,19 @@ def run_qick_qcodes_experiment(
     event_callback: Optional[ExperimentEventCallback] = None,
     cancel_check: Optional[CancellationCheck] = None,
 ) -> StoredQickExperiment:
-    """Connect, execute, acquire FIR DDR IQ, and commit one QCoDeS run."""
+    """Connect, acquire FIR raw/mean data, and save a QCoDeS run or HDF5 file."""
+    started_at = datetime.now().astimezone()
+    iq_storage_mode = normalize_iq_storage_mode(iq_storage_mode)
+    repetition_mode = {
+        IQ_STORAGE_QICK_MEAN_TRACE: "qick_mean",
+        IQ_STORAGE_QICK_MEAN_IQ: "qick_mean_iq",
+    }.get(iq_storage_mode, "raw")
+    if run_config.storage_format == "hdf5":
+        try:
+            from .qick_hdf5 import prepare_hdf5_directory
+        except ImportError:
+            from qick_hdf5 import prepare_hdf5_directory
+        prepare_hdf5_directory(run_config.hdf5_directory)
     _check_cancel(cancel_check)
     _emit_progress(progress_callback, 0, "Starting QICK experiment")
     _emit_progress(progress_callback, 2, "Connecting to QICK Pyro server")
@@ -3280,6 +3370,7 @@ def run_qick_qcodes_experiment(
         sequence,
         awg_channels=awg_channels,
         repetitions_per_sweep=repetitions_per_sweep,
+        repetition_mode=repetition_mode,
         tproc_mhz=tproc_mhz,
         rf_specs=rf_specs,
         readout_spec=readout_spec,
@@ -3295,7 +3386,7 @@ def run_qick_qcodes_experiment(
         event_callback,
         "qcodes_save",
         "started",
-        "Saving acquisition data to QCoDeS",
+        f"Saving acquisition data to {effective_run_config.storage_format.upper()}",
     )
     dataset, row_count = store_qick_result(
         ddr_result,
@@ -3305,6 +3396,7 @@ def run_qick_qcodes_experiment(
         gui_settings=stored_gui_settings,
         rf_settings=rf_settings,
         iq_storage_mode=iq_storage_mode,
+        started_at=started_at,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
     )
@@ -3312,13 +3404,14 @@ def run_qick_qcodes_experiment(
         event_callback,
         "qcodes_save",
         "completed",
-        "QCoDeS database saved, checkpointed, and published",
+        "HDF5 experiment file saved" if effective_run_config.storage_format == "hdf5" else "QCoDeS database saved, checkpointed, and published",
     )
     _emit_progress(progress_callback, 100, "Experiment saved")
     return StoredQickExperiment(
         run_id=int(dataset.run_id),
         guid=str(dataset.guid),
-        database_path=effective_run_config.resolved_database_path,
+        database_path=dataset.path if effective_run_config.storage_format == "hdf5" else effective_run_config.resolved_database_path,
+        storage_format=effective_run_config.storage_format,
         row_count=row_count,
         dataset=dataset,
         program=program,
@@ -3347,6 +3440,8 @@ __all__ = [
     "IQ_TRACE_PARAMETER",
     "IQ_STORAGE_FULL_TRACES",
     "IQ_STORAGE_MEAN_IQ",
+    "IQ_STORAGE_QICK_MEAN_TRACE",
+    "IQ_STORAGE_QICK_MEAN_IQ",
     "IQ_STORAGE_MODES",
     "Q_TRACE_PARAMETER",
     "Q_MEAN_PARAMETER",

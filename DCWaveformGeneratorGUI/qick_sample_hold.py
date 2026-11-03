@@ -243,11 +243,12 @@ class SampleHoldProgramMixin:
 
     def _fh_param(self, point, segment, output, name):
         from qick.ramp_v7 import edge_step
+        from qick_fine_voltage import has_voltage
         duration=segment_samples(self.sequence,point)[segment]
         target=self._fh_target(point,segment,output)
         start=self._fh_target(point,segment-1,output)
         step=edge_step(start,target,duration)
-        return dict(target=target & 65535,low=step & 0xffffffff,
+        return dict(target=target if has_voltage(self.sequence) else target & 65535,low=step & 0xffffffff,
                     high=(step>>32)&7,length=duration)[name]
 
     def _build_event_timing_models(self):
@@ -264,9 +265,23 @@ class SampleHoldProgramMixin:
                 self._fh_fields[key]=model
                 models.append(model)
                 if segment.kind!='ramp':continue
-                for name in ('target','low','high','length'):
+                from qick_fine_voltage import has_voltage, step_models
+                incremental = has_voltage(self.sequence)
+                for name in (('target','length') if incremental else ('target','low','high','length')):
                     k=('sample_edge',i,o,name)
                     self._fh_fields[k]=self._fh_model(k,lambda p,i=i,o=o,n=name:self._fh_param(p,i,o,n),ch,'target')
+                if incremental:
+                    from qick.ramp_v7 import edge_step
+                    axis = next((self.sequence.axis_representative(a)
+                        for a, v in enumerate(self.sequence.sweep_axes)
+                        if v.axis_kind == 'ramp_duration' and v.segment_name == segment.name), None)
+                    fields = step_models(self, ('sample_edge',i,o,'step'),
+                        lambda p,i=i,o=o: edge_step(self._fh_target(p,i-1,o), self._fh_target(p,i,o),
+                                                   segment_samples(self.sequence,p)[i]), axis)
+                    for m in fields:
+                        m.update(register_name='sample_hold', page=int(self._gen_regmap[(ch,'target')][0]),
+                                 command_register=int(self._gen_regmap[(ch,'target')][1]), gen_ch=ch)
+                        self._fh_fields[m['key']] = m
                 if i in self._fh_pairs:
                     other=self._fh_pairs[i]
                     k=('sample_gap',i,o)
@@ -399,6 +414,21 @@ class SampleHoldProgramMixin:
         self.math(page,a,a,'+',b,'second edge sample position')
         self.safe_regwi(page,b,16383,'two-edge packet limit')
 
+    def _fh_load_step(self, segment, output, page, low, high, scratch):
+        from qick_fine_voltage import emit_step
+        key = ('sample_edge', segment, output, 'step')
+        if (*key, 'lo') in self._fh_fields:
+            emit_step(self, lambda part, reg: self._fh_load((*key, part), page, reg), low, high, scratch, page)
+        else:
+            self._fh_load(('sample_edge', segment, output, 'low'), page, low)
+            self._fh_load(('sample_edge', segment, output, 'high'), page, high)
+
+    def _fh_step_at(self, segment, output, point, default):
+        key = ('sample_edge', segment, output, 'step')
+        if (*key, 'lo') not in self._fh_fields:
+            return default
+        return (self._sweep_model_value(self._fh_fields[(*key,'hi')], point) << 8) + self._sweep_model_value(self._fh_fields[(*key,'lo')], point)
+
     def _fh_packet(self, segment, output, combined):
         ch=self.awg_channels[output];page=self._gen_regmap[(ch,'target')][0]
         w0,w1,w2,w3,w4,t=[self._gen_regmap[(ch,n)][1] for n in ('target','reserved_start','duration','step','control','t')]
@@ -431,26 +461,23 @@ class SampleHoldProgramMixin:
         self.bitwi(page,w4,w4,'|',control)
         self.bitwi(page,w0,w0,'<<',15)
         self.bitw(page,w3,w3,'|',w0)
-        load('target',w0)
         if combined:
-            load('target',t,second)
-            self.bitwi(page,t,t,'<<',16)
-            self.bitw(page,w0,w0,'|',t)
-            load('high',t,second)
-            # The second signed step crosses the word boundary at bit 29.
-            self.bitwi(page,t,t,'<<',3)
-            load('low',w2,second)
-            self.bitwi(page,w2,w2,'>>',29)
-            self.bitw(page,t,t,'|',w2)
-            self.bitw(page,w3,w3,'|',t)
-        else:
-            self.bitwi(page,t,w0,'<<',16,'single-edge terminal target')
-            self.bitw(page,w0,w0,'|',t)
-        load('low',w1);load('high',w2)
+            self._fh_load_step(second,output,page,w0,w1,t)
+            self.bitwi(page,w1,w1,'<<',3)
+            self.bitwi(page,t,w0,'>>',29)
+            self.bitw(page,w1,w1,'|',t)
+            self.bitw(page,w3,w3,'|',w1)
+            self.bitwi(page,w0,w0,'<<',3)
+            self.memwi(page,w0,0,'transient falling slope bits')
+        self._fh_load_step(segment,output,page,w1,w2,t)
         if combined:
-            load('low',t,second)
-            self.bitwi(page,t,t,'<<',3)
+            self.memri(page,t,0)
             self.bitw(page,w2,w2,'|',t)
+        load('target',w0)
+        self.bitwi(page,w0,w0,'&',65535,'pack signed target')
+        load('target',t,second if combined else segment)
+        self.bitwi(page,t,t,'<<',16,'terminal target')
+        self.bitw(page,w0,w0,'|',t)
         self._fh_load(('event_time','awg',segment,output,0),page,t)
         self.bitwi(page,t,t,'>>',4,'sample RAMP command timestamp')
         self.set(int(self.soccfg['gens'][ch]['tproc_ch']),page,w0,w1,w2,w3,w4,t,
@@ -507,6 +534,12 @@ class SampleHoldProgramMixin:
                     target=self._fh_target(point,other,o)
                     kw.update(fall_start=f0,fall_end=f0+lengths[other],end_target=target)
                 pack=ramp_packet(**kw)
+                up = self._fh_step_at(i,o,point,pack['rise_step'])
+                down = self._fh_step_at(other,o,point,pack['fall_step']) if combine else 0
+                mask = (1 << 35)-1
+                word = (pack['word'] & ~((mask << 32) | (mask << 67))) | ((up & mask) << 32) | ((down & mask) << 67)
+                pack['words'] = [(word >> (32*j)) & 0xffffffff for j in range(5)]
+                pack['rise_step'] = up
                 yield CompiledCommand(point,i,segment.name,o,self.sequence.output_names[o],ch,
                                       'ramp',target,pack['duration_samples'],pack['rise_step'],tuple(pack['words']))
 

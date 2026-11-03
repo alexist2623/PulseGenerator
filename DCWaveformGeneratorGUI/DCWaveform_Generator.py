@@ -283,6 +283,8 @@ try:
         DEFAULT_IQ_STORAGE_MODE,
         IQ_STORAGE_FULL_TRACES,
         IQ_STORAGE_MEAN_IQ,
+        IQ_STORAGE_QICK_MEAN_TRACE,
+        IQ_STORAGE_QICK_MEAN_IQ,
         ExperimentCancelled,
         QcodesRunConfig,
         QickConnectionConfig,
@@ -309,6 +311,8 @@ except ImportError:
         DEFAULT_IQ_STORAGE_MODE,
         IQ_STORAGE_FULL_TRACES,
         IQ_STORAGE_MEAN_IQ,
+        IQ_STORAGE_QICK_MEAN_TRACE,
+        IQ_STORAGE_QICK_MEAN_IQ,
         ExperimentCancelled,
         QcodesRunConfig,
         QickConnectionConfig,
@@ -496,7 +500,7 @@ DEFAULT_GUI_DURATION_NS = 1000.0
 DEFAULT_GUI_RAMP_NS = 1000.0
 DEFAULT_GUI_FLAT_NS = 1000.0
 SETTINGS_SCHEMA = "qstl-pulse-generator-gui"
-SETTINGS_VERSION = 48
+SETTINGS_VERSION = 49
 SUPPORTED_SETTINGS_VERSIONS = tuple(range(1, SETTINGS_VERSION + 1))
 DEFAULT_GUI_COMPILE_VALIDATION_MODE = COMPILE_VALIDATION_BOUNDARY
 DEFAULT_QICK_HOST = "192.168.2.99"
@@ -8615,7 +8619,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.proxy_name = QtWidgets.QLineEdit(DEFAULT_QICK_PROXY_NAME)
 
         self.database_path = QtWidgets.QLineEdit(DEFAULT_QCODES_DB_PATH)
-        browse_database = QtWidgets.QToolButton()
+        browse_database = self.database_browse_button = QtWidgets.QToolButton()
         browse_database.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
         )
@@ -8624,6 +8628,20 @@ class ExperimentPanel(QtWidgets.QWidget):
         database_row = QtWidgets.QHBoxLayout()
         database_row.addWidget(self.database_path, 1)
         database_row.addWidget(browse_database)
+
+        self.storage_format = QtWidgets.QComboBox()
+        self.storage_format.addItem("QCoDeS database (.db)", "qcodes")
+        self.storage_format.addItem("HDF5 file per experiment (.h5)", "hdf5")
+        self.hdf5_directory = QtWidgets.QLineEdit(str(Path.home() / "QICK_Data"))
+        self.hdf5_directory.setToolTip("Creates YYYY-MM-DD/YYYYMMDD_HHMMSS_ExperimentName.h5 using the local experiment start time.")
+        self.hdf5_browse_button = QtWidgets.QToolButton()
+        self.hdf5_browse_button.setText("…")
+        self.hdf5_browse_button.clicked.connect(self._browse_hdf5_directory)
+        hdf5_row = QtWidgets.QHBoxLayout()
+        hdf5_row.addWidget(self.hdf5_directory, 1)
+        hdf5_row.addWidget(self.hdf5_browse_button)
+        self.storage_format.currentIndexChanged.connect(self._update_storage_controls)
+        self._update_storage_controls()
 
         self.experiment_name = QtWidgets.QLineEdit("QICK pulse experiment")
         self.sample_name = QtWidgets.QLineEdit("PulseGenerator")
@@ -8654,16 +8672,19 @@ class ExperimentPanel(QtWidgets.QWidget):
             IQ_STORAGE_FULL_TRACES,
         )
         self.iq_storage_mode.addItem(
-            "Mean I/Q only for each sweep point",
+            "Mean I/Q (PC) — reps and time samples",
             IQ_STORAGE_MEAN_IQ,
         )
+        self.iq_storage_mode.addItem("Mean trace (QICK) — reps only, keep time axis", IQ_STORAGE_QICK_MEAN_TRACE)
+        self.iq_storage_mode.addItem("Mean I/Q (QICK) — reps and time samples", IQ_STORAGE_QICK_MEAN_IQ)
         self.iq_storage_mode.setCurrentIndex(
             self.iq_storage_mode.findData(DEFAULT_IQ_STORAGE_MODE)
         )
         self.iq_storage_mode.setToolTip(
-            "Full traces stores every acquired sample for every repetition. "
-            "Mean I/Q stores one I/Q pair per sweep point after averaging all "
-            "repetitions and samples, which greatly reduces database size."
+            "Full traces transfers all repetitions. Mean I/Q (PC) averages after transfer. "
+            "Mean trace (QICK) averages repetitions on the board and retains every time sample. "
+            "Mean I/Q (QICK) transfers one I/Q pair per sweep point. "
+            "QICK averaging requires the updated v7 Python driver and server restart; DDR usage is unchanged."
         )
         self._ddr_readout_spec: Optional[QickDdrReadoutSpec] = None
         self._ddr_capacity_words_32b: Optional[int] = None
@@ -8958,13 +8979,15 @@ class ExperimentPanel(QtWidgets.QWidget):
             repetitions=repetitions,
         )
 
+        form.addRow("Save format:", self.storage_format)
         form.addRow("QCoDeS DB file:", database_row)
+        form.addRow("HDF5 root directory:", hdf5_row)
         form.addRow("Experiment name:", self.experiment_name)
         form.addRow("Sample name:", self.sample_name)
         self.full_scale_mv.hide()
         form.addRow("DAC voltage range:", QtWidgets.QLabel("Per-channel current in the shared Front Panel"))
         form.addRow("Repetitions per sweep point:", self.repetitions)
-        form.addRow("QCoDeS I/Q storage:", self.iq_storage_mode)
+        form.addRow("I/Q and trace storage:", self.iq_storage_mode)
         form.addRow(self.ddr_usage_group)
         form.addRow("Compile validation:", self.compile_validation_mode)
         form.addRow("AWG waveform metadata:", self.awg_metadata_mode)
@@ -9276,6 +9299,18 @@ class ExperimentPanel(QtWidgets.QWidget):
     def _on_bias_t_mode_changed(self, *_args) -> None:
         self._update_bias_t_mode_controls()
         self._emit_bias_t_changed()
+
+    def _update_storage_controls(self) -> None:
+        hdf5 = self.storage_format.currentData() == "hdf5"
+        self.database_path.setEnabled(not hdf5)
+        self.database_browse_button.setEnabled(not hdf5)
+        self.hdf5_directory.setEnabled(hdf5)
+        self.hdf5_browse_button.setEnabled(hdf5)
+
+    def _browse_hdf5_directory(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select HDF5 root directory", self.hdf5_directory.text())
+        if path:
+            self.hdf5_directory.setText(path)
 
     def _browse_database(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -9947,6 +9982,8 @@ class ExperimentPanel(QtWidgets.QWidget):
                     if database_path is None
                     else str(database_path).strip()
                 ),
+                storage_format=str(self.storage_format.currentData()) if database_path is None else "qcodes",
+                hdf5_directory=self.hdf5_directory.text().strip(),
                 experiment_name=self.experiment_name.text().strip(),
                 sample_name=self.sample_name.text().strip(),
                 notes=self.notes.toPlainText(),
@@ -9965,6 +10002,8 @@ class ExperimentPanel(QtWidgets.QWidget):
             "ns_port": connection.ns_port,
             "proxy_name": connection.proxy_name,
             "database_path": run.database_path,
+            "storage_format": run.storage_format,
+            "hdf5_directory": run.hdf5_directory,
             "experiment_name": run.experiment_name,
             "sample_name": run.sample_name,
             "notes": run.notes,
@@ -10073,6 +10112,9 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.ns_port.setValue(connection.ns_port)
         self.proxy_name.setText(connection.proxy_name)
         self.database_path.setText(run.database_path)
+        self.storage_format.setCurrentIndex(self.storage_format.findData(run.storage_format))
+        self.hdf5_directory.setText(run.hdf5_directory or str(Path.home() / "QICK_Data"))
+        self._update_storage_controls()
         self.experiment_name.setText(run.experiment_name)
         self.sample_name.setText(run.sample_name)
         self.notes.setPlainText(run.notes)
@@ -10139,7 +10181,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             "acquisition": "Acquisition",
             "ddr_wait": "DDR read delay",
             "ddr_readback": "FIR DDR readback",
-            "qcodes_save": "QCoDeS save",
+            "qcodes_save": "Save experiment",
         }.get(str(key), str(key).replace("_", " ").title())
 
     def _current_run_elapsed_ms(self) -> int:
@@ -10290,7 +10332,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         sample_rate_hz = getattr(ddr_result, "sample_rate_hz", None)
         iq = getattr(ddr_result, "iq", None)
         if sample_rate_hz is not None and iq is not None:
-            samples_per_trace = int(np.asarray(iq).shape[-2])
+            samples_per_trace = int(getattr(ddr_result, "source_samples_per_trace", None) or np.asarray(iq).shape[-2])
             trace_time_us = (
                 samples_per_trace * 1_000_000.0 / float(sample_rate_hz)
             )
@@ -10299,6 +10341,10 @@ class ExperimentPanel(QtWidgets.QWidget):
                 f"{samples_per_trace:,} samples/trace = "
                 f"{trace_time_us:g} us"
             )
+        if ddr_result is not None and getattr(ddr_result, "data_kind", "raw") != "raw":
+            fir_summary += f"; QICK averaged {ddr_result.accumulation_repetitions:,} reps"
+            if ddr_result.data_kind == "point_mean":
+                fir_summary += " and time samples (one I/Q pair per point)"
         stored_mode = normalize_iq_storage_mode(
             getattr(
                 result,
@@ -10307,11 +10353,11 @@ class ExperimentPanel(QtWidgets.QWidget):
             )
         )
         storage_description = f"{result.row_count} IQ samples"
-        if stored_mode == IQ_STORAGE_MEAN_IQ:
+        if stored_mode in {IQ_STORAGE_MEAN_IQ, IQ_STORAGE_QICK_MEAN_IQ}:
             storage_description = f"{result.row_count} mean I/Q points"
         self.set_running(
             False,
-            f"Run {result.run_id}, {storage_description}\n"
+            f"{getattr(result, 'source_label', f'Run {result.run_id}')}, {storage_description}\n"
             f"{result.database_path}{fir_summary}{rf_summary}",
         )
 
@@ -15627,7 +15673,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._last_circuit_result = result
         self._experiment_panel.show_result(result)
         self._experiment_panel.finish_run_timeline(
-            f"Quantum Circuit QCoDeS Run {result.run_id} completed", success=True)
+            f"Quantum Circuit {getattr(result, 'source_label', f'Run {result.run_id}')} completed", success=True)
         sweep = getattr(result, 'circuit_loop_sweep', None)
         if sweep:
             first, last = sweep['points'][0], sweep['points'][-1]
@@ -15701,8 +15747,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             * software_sweep_points
         )
         repetitions = arguments["repetitions_per_sweep"]
-        if arguments["iq_storage_mode"] == IQ_STORAGE_MEAN_IQ:
+        if arguments["iq_storage_mode"] in {IQ_STORAGE_MEAN_IQ, IQ_STORAGE_QICK_MEAN_IQ}:
             storage_summary = f"{sweep_points:,} mean I/Q points"
+        elif arguments["iq_storage_mode"] == IQ_STORAGE_QICK_MEAN_TRACE:
+            storage_summary = f"{sweep_points:,} mean traces with {arguments['readout_spec'].samples_per_trigger:,} samples each"
         else:
             storage_summary = f"{expected_sample_rows:,} IQ sample rows"
         self._experiment_panel.set_running(
@@ -15994,7 +16042,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             )
             map_result = replace(
                 map_result,
-                source_label=f"QCoDeS Run {int(result.run_id)}",
+                source_label=getattr(result, "source_label", f"QCoDeS Run {int(result.run_id)}"),
                 database_path=str(result.database_path),
                 run_id=int(result.run_id),
                 source=(
@@ -16002,7 +16050,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                     if map_result.source is None
                     else replace(
                         map_result.source,
-                        source_label=f"QCoDeS Run {int(result.run_id)}",
+                        source_label=getattr(result, "source_label", f"QCoDeS Run {int(result.run_id)}"),
                         database_path=str(result.database_path),
                         run_id=int(result.run_id),
                     )
@@ -16026,12 +16074,12 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._experiment_panel.show_result(result)
         map_error = self._refresh_awg_sweep_map_from_last_result()
         message = (
-            f"QCoDeS run {result.run_id} saved to {result.database_path}"
+            f"{getattr(result, 'source_label', f'Run {result.run_id}')} saved to {result.database_path}"
         )
         if map_error:
             message += f"; AWG 2D map unavailable: {map_error}"
         self._experiment_panel.finish_run_timeline(
-            f"QCoDeS Run {result.run_id} completed",
+            f"{getattr(result, 'source_label', f'Run {result.run_id}')} completed",
             success=True,
         )
         self.statusBar().showMessage(message)
@@ -16622,6 +16670,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "ns_port": connection.ns_port,
                 "proxy_name": connection.proxy_name,
                 "database_path": run.database_path,
+                "storage_format": run.storage_format,
+                "hdf5_directory": run.hdf5_directory,
                 "experiment_name": run.experiment_name,
                 "sample_name": run.sample_name,
                 "notes": run.notes,
@@ -17680,6 +17730,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             database_path=str(
                 experiment.get("database_path", DEFAULT_QCODES_DB_PATH)
             ),
+            storage_format=str(experiment.get("storage_format", "qcodes")),
+            hdf5_directory=str(experiment.get("hdf5_directory", str(Path.home() / "QICK_Data"))),
             experiment_name=str(
                 experiment.get("experiment_name", "QICK pulse experiment")
             ),

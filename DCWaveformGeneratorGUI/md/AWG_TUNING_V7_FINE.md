@@ -76,10 +76,10 @@ ledger. DC/RC on/off combinations preserve the extended command words.
 
 ## Current limits
 
-- Fine edge positions and voltages are fixed within a hardware sweep. HOLD
-  duration sweeps, RF sweeps, and repetition counts remain available.
-- Voltage and RAMP-duration hardware sweeps with fine RAMP are rejected. Their
-  legacy register-add plan cannot update the new packed fields safely.
+- Fine RAMP supports duration and voltage sweeps, independently or grouped.
+  HOLD duration sweeps, RF sweeps, and repetition counts remain available.
+  The v7 compiler updates the packed targets and both signed 35-bit slopes;
+  see [incremental fine voltage sweeps](AWG_V7_FINE_VOLTAGE_SWEEP.md).
 - Fine RAMP requires an identity cross-capacitance matrix. Mixing differently
   positioned edges can require more than the two edges this command supports.
 - QCS export rejects fine RAMP. Use QICK v7 Python export or normal GUI Run.
@@ -92,7 +92,7 @@ The dedicated tests cover every first/second start-lane combination, word
 boundary crossings, one-interval full-scale 35-bit slopes, adjacent SET
 timestamps, exact DC area, compensation combinations, save/load, preview,
 generated Python, cache invalidation, and the offscreen editor. They also
-check old-firmware rejection and unsupported sweep rejection.
+check old-firmware rejection and unsupported virtual-gate mixing rejection.
 
 On 2026-10-27, **795 unique selected offline GUI/compiler/driver tests passed**.
 The dedicated v7 GUI suite passed 271 cases using the actual driver latency

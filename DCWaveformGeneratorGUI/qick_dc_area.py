@@ -42,6 +42,10 @@ def executed_commands(program, point_index):
                 continue
             from qick_fine_ramp import is_extended
             if is_extended(command):
+                if program._fine_packet_recipes.get(program._command_key(command), {}).get('voltage'):
+                    from qick_fine_voltage import command_at
+                    yield command_at(program, command, point_index)
+                    continue
                 point = program._requested_awg_point_at(point_index)
                 yield next(c for c in point.segment_commands[command.segment_index]
                            if c.output_index == command.output_index)

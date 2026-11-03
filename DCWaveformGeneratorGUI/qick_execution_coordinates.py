@@ -117,9 +117,12 @@ def _single(program, cancel_check, point_indices=None):
     awg_columns = [{name: [] for name in (
         "target_code_16", "target_code_14", "step", "duration_samples",
         "command_cycle", "ramp_duration_us", "target_normalized")} for _ in first_commands]
-    if sample_hold:
-        for column in awg_columns:
+    from qick_fine_ramp import is_extended
+    for command, column in zip(first_commands, awg_columns):
+        if sample_hold:
             column.update(emitted=[], command_words_u32=[])
+        elif is_extended(command):
+            column['command_words_u32'] = []
     rf_columns = [{name: [] for name in (
         "frequency_word", "frequency_mhz", "phase_word", "logical_gain",
         "emitted_start_gain", "emitted_tail_gain", "active_samples",
@@ -149,6 +152,7 @@ def _single(program, cancel_check, point_indices=None):
                         values.append(False if name == 'emitted' else None)
                     continue
                 column['emitted'].append(True)
+            if 'command_words_u32' in column:
                 column['command_words_u32'].append(list(command.words))
             cfg = program.soccfg["gens"][command.gen_ch]
             target = int(command.target_code)

@@ -139,11 +139,6 @@ def packet(sequence, segment_index, output, cfg, start, terminal, point_index=0)
 def validate_sequence(sequence):
     if not sequence.fine_ramps:
         return
-    from qick_fine_tune_sweep import AmplitudeSweep, RampDurationSweep
-    # Legacy register-add sweeps address different bit fields. Never reinterpret
-    # them as v7 packet words. HOLD/RF sweeps and repetitions remain supported.
-    if any(isinstance(axis, AmplitudeSweep) for axis in sequence.sweeps):
-        raise ValueError('Fine RAMP currently supports fixed voltages; remove voltage sweeps or disable fine RAMP')
     if not np.array_equal(sequence.cross_capacitance, np.eye(sequence.n_outputs)):
         raise ValueError('Fine RAMP requires an identity cross-capacitance matrix; mixing different edge positions needs more than two edges')
     by_name = {s.name: s for s in sequence.segments}

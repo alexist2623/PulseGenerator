@@ -122,6 +122,7 @@ def live(request, require=False):
             'pid': process.pid if process else None,
             'process_started': process.create_time() if process else None,
             'python_executable': process.exe() if process else None,
+            'runtime_capabilities': cfg.get('runtime_capabilities', {}),
             'generators': [{key: g.get(key) for key in (
                 'fullpath', 'type', 'dac', 'output_sum_block', 'output_sum_role')}
                 for g in cfg.get('gens', [])]}
@@ -305,6 +306,9 @@ def verify_runtime(request, manifest, installed_at):
         raise ValueError('Running QICK library version differs from the selected library.')
     if not cfg['process_started'] or cfg['process_started'] <= installed_at:
         raise ValueError('Restart the QICK Python process after the file update (including notebook kernels).')
+    for key, expected in manifest.get('required_runtime_capabilities', {}).items():
+        if cfg.get('runtime_capabilities', {}).get(key) != expected:
+            raise ValueError('Running QICK driver is missing ' + key + '. Update the selected v7 library and restart the QICK server and GUI.')
     if os.path.realpath(cfg['python_executable']) != os.path.realpath(sys.executable):
         raise ValueError('QICK server uses a different Python interpreter from Board Python.')
     actual = {g['fullpath']: g for g in cfg['generators']}

@@ -45,6 +45,11 @@ from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple,
 import numpy as np
 
 try:
+    from .qick_trace_average import normalize_repetition_mode, require_board_trace_average, read_board_mean
+except ImportError:
+    from qick_trace_average import normalize_repetition_mode, require_board_trace_average, read_board_mean
+
+try:
     from .clock_time import clock_cycles
 except ImportError:
     from clock_time import clock_cycles
@@ -977,7 +982,12 @@ class DdrFirReadoutConfig:
 
 @dataclass(frozen=True)
 class FineTuneDdrResult:
-    """I/Q samples grouped by Cartesian point and repetition."""
+    """I/Q grouped by point, repetition and sample.
+
+    Board means have a singleton repetition axis and explicit ``data_kind``.
+    ``accumulation_repetitions`` records the actual acquired count; point means
+    also have one sample and retain ``source_samples_per_trace``.
+    """
 
     sweep_points: np.ndarray
     iq: np.ndarray
@@ -1003,10 +1013,14 @@ class FineTuneDdrResult:
     iq_component_bits: int = 16
     sweep_groups: Tuple[Mapping, ...] = ()
     sweep_parameter_ids: Tuple[str, ...] = ()
+    data_kind: str = "raw"
+    source_iq_scale_log2: Optional[int] = None
+    source_iq_component_bits: Optional[int] = None
+    source_samples_per_trace: Optional[int] = None
 
     @property
     def analysis_iq(self) -> np.ndarray:
-        """Input-code units for plots/calibration; ``iq`` stays raw integer."""
+        """Input-code units; ``iq`` is raw integer or an explicit float mean."""
         return np.ldexp(self.iq.astype(np.float64), -self.iq_scale_log2)
 
     @property
@@ -4324,6 +4338,16 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 else None
             )
             if is_extended(first_command):
+                from qick_fine_voltage import has_voltage, affects_command, build_models
+                if has_voltage(self.sequence):
+                    # Sample-HOLD has its own packet emitter and edge models.
+                    if self._sample_hold:
+                        continue
+                    if affects_command(self, first_command):
+                        component_models, recipe = build_models(self, key, first_command)
+                        models.update(component_models)
+                        self._fine_packet_recipes[key] = recipe
+                        continue
                 from qick_fine_ramp import component_axes
                 selected_axes = tuple(dict.fromkeys(self.sequence.axis_representative(i)
                     for i, _, _ in component_axes(self.sequence, first_command.segment_name)))
@@ -4565,7 +4589,20 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     command_key = self._command_key(command)
                     from qick_fine_ramp import is_extended
                     if is_extended(command):
-                        actual_commands.append(command)
+                        recipe = self._fine_packet_recipes.get(command_key, {})
+                        if recipe.get('voltage'):
+                            from qick_fine_voltage import command_at
+                            actual = command_at(self, command, point_index, models, recipe)
+                            max_target_error = max(max_target_error, abs(actual.target_code-command.target_code))
+                            max_step_error = max(max_step_error, abs(actual.step-command.step))
+                            def falling_step(cmd):
+                                word = sum(int(w) << (32*i) for i,w in enumerate(cmd.words))
+                                value = (word >> 67) & ((1 << 35)-1)
+                                return value - (1 << 35) if value & (1 << 34) else value
+                            max_step_error = max(max_step_error, abs(falling_step(actual)-falling_step(command)))
+                            actual_commands.append(actual)
+                        else:
+                            actual_commands.append(command)
                         continue
                     target_model = models[(*command_key, "target")]
                     step_model = models[(*command_key, "step")]
@@ -6375,8 +6412,12 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 )
             regs.append(reg)
         if self._command_key(command) in self._fine_packet_recipes:
-            from qick_fine_packet_sweep import emit_component_packet
-            emit_component_packet(self, command, regs)
+            if self._fine_packet_recipes[self._command_key(command)].get('voltage'):
+                from qick_fine_voltage import emit_packet
+                emit_packet(self, command, regs)
+            else:
+                from qick_fine_packet_sweep import emit_component_packet
+                emit_component_packet(self, command, regs)
         _, time_reg = self._gen_regmap[(gen_ch, "t")]
         if event_field_key is None:
             event_field_key = (
@@ -7733,6 +7774,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         phase_callback=None,
         cancel_check: Optional[Callable[[], None]] = None,
         readback_chunk_triggers: int = DEFAULT_DDR_READBACK_TRIGGER_CHUNK,
+        repetition_mode: str = "raw",
         **run_kwargs,
     ):
         """Arm DDR and return IQ grouped at the HWH-selected FIR sample rate.
@@ -7741,9 +7783,15 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         repetition-minor, so the flat DDR stream is reshaped to
         ``(point_count, N, samples, I/Q)``.  ``result.iq_grid`` restores the
         independent sweep axes before the repetition dimension.
+        With repetition_mode="qick_mean", average reps on the QICK CPU before
+        transfer; "qick_mean_iq" also averages time samples. Both keep the
+        existing result rank with singleton reduced axes and explicit metadata.
         """
         if self.ddr_readout_config is None:
             raise RuntimeError("acquire_fir_ddr requires ddr_readout configuration")
+        repetition_mode = normalize_repetition_mode(repetition_mode)
+        if repetition_mode != "raw":
+            require_board_trace_average(soc)
         import time
 
         ddr = self.ddr_readout_config
@@ -7851,6 +7899,38 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             if ddr.stride_bytes % 4:
                 raise ValueError("DDR stride_bytes must be a multiple of 4")
             stride_words = ddr.stride_bytes // 4
+
+        if repetition_mode != "raw":
+            emit_phase("ddr_readback", "started", "Averaging repetition traces on QICK and reading mean traces")
+            iq = read_board_mean(
+                soc, n_points=n_points, repetitions=repetitions,
+                n_samples=ddr.samples_per_trigger, base_word=base_word,
+                stride_words=stride_words, stride_bytes=ddr.stride_bytes,
+                source_scale_log2=self._fir_cfg["iq_scale_log2"],
+                source_component_bits=self._fir_cfg["iq_component_bits"],
+                chunk_triggers=readback_chunk_triggers,
+                cancel_check=check_cancel, progress=readback_progress,
+                reduce_samples=repetition_mode == "qick_mean_iq",
+            )
+            emit_phase("ddr_readback", "completed", f"Read {n_points:,} mean traces ({repetitions:,} repetitions each)")
+            return FineTuneDdrResult(
+                sweep_points=self.get_expt_pts(), iq=iq,
+                reserved_physical_words=reserved,
+                sweep_axes=self.sequence.sweep_axes,
+                sweep_shape=self.sequence.sweep_shape,
+                sweep_groups=self.sequence.sweep_groups,
+                sweep_parameter_ids=self.sequence.sweep_member_ids,
+                cross_capacitance=self.sequence.cross_capacitance.copy(),
+                sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
+                fir_rate_profile=self._fir_cfg["rate_profile"],
+                iq_scale_log2=0, iq_component_bits=64,
+                acquisition_source="fir_ddr",
+                accumulation_repetitions=repetitions,
+                data_kind="point_mean" if repetition_mode == "qick_mean_iq" else "repetition_mean",
+                source_iq_scale_log2=self._fir_cfg["iq_scale_log2"],
+                source_iq_component_bits=self._fir_cfg["iq_component_bits"],
+                source_samples_per_trace=ddr.samples_per_trigger,
+            )
 
         expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
         raw = None

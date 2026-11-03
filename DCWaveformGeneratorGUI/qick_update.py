@@ -6,6 +6,7 @@ Paramiko is an optional dependency, imported only by an SSH action.
 from __future__ import annotations
 
 import base64
+import ast
 from dataclasses import dataclass, field
 import hashlib
 import importlib.util
@@ -23,6 +24,23 @@ try:
     from .qick_update_remote import installation_contract
 except ImportError:
     from qick_update_remote import installation_contract
+
+
+def library_runtime_capabilities(package):
+    """Derive optional runtime checks from source without importing board code."""
+    helper = Path(package) / 'trace_averaging.py'
+    if not helper.is_file():
+        return {}
+    tree = ast.parse(helper.read_text(encoding='utf-8'))
+    versions = [ast.literal_eval(node.value) for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'FIR_AVERAGE_API_VERSION' for t in node.targets)]
+    api_tree = ast.parse((Path(package) / 'qick.py').read_text(encoding='utf-8'))
+    methods = {node.name for cls in api_tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'QickSoc'
+               for node in cls.body if isinstance(node, ast.FunctionDef)}
+    if versions != [1] or not {'get_fir_average_capabilities', 'get_ddr4_fir_mean'}.issubset(methods):
+        raise ValueError('Incomplete QICK FIR averaging driver; update both qick.py and trace_averaging.py.')
+    return {'fir_average_api_version': 1}
 
 
 @dataclass(frozen=True)
@@ -369,6 +387,7 @@ def review_package(repo, manifest_path=None, *, active_firmware=None):
             'launcher_update': 'existing-pyro-cli-bitfile-only',
             'installation_contract': contract,
             'library_version': (package / 'VERSION').read_text().strip(),
+            'required_runtime_capabilities': library_runtime_capabilities(package),
             'firmware_timestamp': timestamp, 'generators': pairs,
             'build_manifest_sha256': sha(manifest_path) if build else None,
             'firmware_validation': 'build_manifest_and_xsa' if build else 'file_pair_only',
@@ -523,15 +542,30 @@ class BoardUpdater:
     def verify(self, release):
         # Optional read-only RPC uses the GUI's Pyro4, never the SSH account's site-packages.
         import Pyro4
+        previous_timeout = Pyro4.config.COMMTIMEOUT
         Pyro4.config.COMMTIMEOUT = 4
-        Pyro4.config.SERIALIZER = 'pickle'
-        Pyro4.config.PICKLE_PROTOCOL_VERSION = 4
-        with Pyro4.locateNS(host=self.connection.host, port=self.connection.ns_port) as ns:
-            uri = ns.lookup(self.connection.proxy_name)
-        with Pyro4.Proxy(uri) as soc:
-            cfg = soc.get_cfg()
+        try:
+            Pyro4.config.SERIALIZER = 'pickle'
+            Pyro4.config.PICKLE_PROTOCOL_VERSION = 4
+            with Pyro4.locateNS(host=self.connection.host, port=self.connection.ns_port) as ns:
+                uri = ns.lookup(self.connection.proxy_name)
+            with Pyro4.Proxy(uri) as soc:
+                cfg = soc.get_cfg()
+                capabilities = {}
+                capability_query = getattr(soc, 'get_fir_average_capabilities', None)
+                if callable(capability_query) and callable(getattr(soc, 'get_ddr4_fir_mean', None)):
+                    info = capability_query()
+                    if (isinstance(info, dict) and info.get('dtype') == 'float64'
+                            and info.get('units') == 'input_code'
+                            and {'repetition_mean', 'point_mean'}.issubset(info.get('modes', ()))):
+                        capabilities['fir_average_api_version'] = info.get('api_version')
+        finally:
+            # A read-only update check must not leave later long acquisitions
+            # or CPU averages with a four-second global RPC timeout.
+            Pyro4.config.COMMTIMEOUT = previous_timeout
         identity = {'host': uri.host, 'port': uri.port,
                     'config': {key: cfg.get(key) for key in ('board', 'sw_version', 'fw_timestamp')}}
+        identity['config']['runtime_capabilities'] = capabilities
         identity['config']['gens'] = [{key: g.get(key) for key in (
             'fullpath', 'type', 'dac', 'output_sum_block', 'output_sum_role')}
             for g in cfg.get('gens', [])]
