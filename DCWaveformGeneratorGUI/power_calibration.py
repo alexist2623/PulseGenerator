@@ -20,8 +20,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 import numpy as np
 try:
     from .calibration_current import dac_current_ua, DEFAULT_DAC_CURRENT_UA
+    from .qick_filter_settings import filter_request_from_mappings, resolve_filter_settings
 except ImportError:
     from calibration_current import dac_current_ua, DEFAULT_DAC_CURRENT_UA
+    from qick_filter_settings import filter_request_from_mappings, resolve_filter_settings
 
 OUTPUT_BOARD_TYPES = ("DC_Out", "RF_Out")
 INPUT_BOARD_TYPES = ("DC_In", "RF_In")
@@ -104,6 +106,18 @@ class CalibrationRunSummary:
     calibration_current_source: str = "default_20mA"
     output_ch: Optional[int] = None
 
+    @property
+    def output_filter_settings(self):
+        if self.board_type != "RF_Out":
+            return None
+        try:
+            return resolve_filter_settings(
+                self.output_filter_type, self.output_filter_cutoff_ghz,
+                self.output_filter_bandwidth_ghz,
+            )
+        except ValueError:
+            return None
+
     def as_dict(self) -> Mapping[str, Any]:
         return {
             "database_path": str(self.database_path),
@@ -130,6 +144,10 @@ class CalibrationRunSummary:
             "output_filter_type": self.output_filter_type,
             "output_filter_cutoff_ghz": self.output_filter_cutoff_ghz,
             "output_filter_bandwidth_ghz": self.output_filter_bandwidth_ghz,
+            "output_filter_registers": (
+                self.output_filter_settings.as_dict()
+                if self.output_filter_settings is not None else None
+            ),
         }
 
 
@@ -158,22 +176,14 @@ class OutputCalibrationCandidate:
                     f"{summary.frequency_min_mhz:g}..{summary.frequency_max_mhz:g} MHz | {match}")
         nqz = "?" if summary.output_nqz is None else str(summary.output_nqz)
         filter_name = summary.output_filter_type or "unknown"
-        cutoff = (
-            "?"
-            if summary.output_filter_cutoff_ghz is None
-            else f"{summary.output_filter_cutoff_ghz:.6g}"
-        )
-        bandwidth = (
-            "?"
-            if summary.output_filter_bandwidth_ghz is None
-            else f"{summary.output_filter_bandwidth_ghz:.6g}"
-        )
         match = "exact match" if self.exact_match else "candidate"
+        settings = summary.output_filter_settings
+        register_label = settings.label if settings else "filter settings unknown"
         return (
             f"Run {summary.run_id} | PCB {summary.board_type} "
             f"[{summary.sample_name}] | "
             f"NQZ {nqz} | {filter_name} "
-            f"(fc {cutoff} GHz, BW {bandwidth} GHz) | "
+            f"{register_label} | "
             f"{summary.frequency_min_mhz:.6g}.."
             f"{summary.frequency_max_mhz:.6g} MHz | {match}"
         )
@@ -181,7 +191,7 @@ class OutputCalibrationCandidate:
     @property
     def detail_text(self) -> str:
         if self.exact_match:
-            return "Exact PCB, frequency coverage, Nyquist zone, and filter match."
+            return "Exact PCB, frequency coverage, Nyquist zone, and HPF/LPF bank/state match."
         return "; ".join(self.mismatches)
 
 
@@ -715,13 +725,8 @@ class CalibrationDatabase:
             nqz = None if raw_nqz is None else int(raw_nqz)
         except (TypeError, ValueError):
             nqz = None
-        filter_type = str(
-            first(
-                actual.get("filter_type"),
-                actual.get("output_filter_type"),
-                configuration.get("output_filter_type"),
-            )
-            or ""
+        filter_type, raw_cutoff, raw_bandwidth = filter_request_from_mappings(
+            actual, configuration
         )
 
         def optional_float(*values):
@@ -732,16 +737,8 @@ class CalibrationDatabase:
                 return None
             return value if np.isfinite(value) else None
 
-        cutoff = optional_float(
-            actual.get("filter_cutoff_ghz"),
-            actual.get("output_filter_cutoff_ghz"),
-            configuration.get("output_filter_cutoff_ghz"),
-        )
-        bandwidth = optional_float(
-            actual.get("filter_bandwidth_ghz"),
-            actual.get("output_filter_bandwidth_ghz"),
-            configuration.get("output_filter_bandwidth_ghz"),
-        )
+        cutoff = optional_float(raw_cutoff)
+        bandwidth = optional_float(raw_bandwidth)
         return nqz, filter_type, cutoff, bandwidth
 
     @staticmethod
@@ -761,38 +758,31 @@ class CalibrationDatabase:
             mismatches.append(f"Nyquist zone {actual_text} != {int(nqz)}")
         if board_type == "DC_Out":
             return tuple(mismatches)
-        if (
-            output_filter_type is not None
-            and actual_filter != str(output_filter_type)
-        ):
-            mismatches.append(
-                f"filter {actual_filter or 'unknown'} != {output_filter_type}"
+        # No filter constraint remains useful for browsing old, metadata-free
+        # databases. Once a constraint is supplied, unknown is not a match.
+        if all(value is None for value in (
+            output_filter_type, output_filter_cutoff_ghz,
+            output_filter_bandwidth_ghz,
+        )):
+            return tuple(mismatches)
+        try:
+            recorded = resolve_filter_settings(
+                actual_filter, actual_cutoff, actual_bandwidth
             )
-        for label, actual_value, requested_value in (
-            (
-                "filter cutoff",
-                actual_cutoff,
-                output_filter_cutoff_ghz,
-            ),
-            (
-                "filter bandwidth",
-                actual_bandwidth,
+            requested = resolve_filter_settings(
+                output_filter_type, output_filter_cutoff_ghz,
                 output_filter_bandwidth_ghz,
-            ),
-        ):
-            if requested_value is None:
-                continue
-            if actual_value is None or not np.isclose(
-                actual_value,
-                float(requested_value),
-                rtol=0.0,
-                atol=1.0e-9,
-            ):
-                actual_text = (
-                    "unknown" if actual_value is None else f"{actual_value:.9g} GHz"
+            )
+        except ValueError as error:
+            mismatches.append(f"filter settings unresolved: {error}")
+        else:
+            if recorded != requested:
+                mode_text = (
+                    f"filter {actual_filter} != {output_filter_type}; "
+                    if actual_filter != output_filter_type else ""
                 )
                 mismatches.append(
-                    f"{label} {actual_text} != {float(requested_value):.9g} GHz"
+                    f"{mode_text}filter settings {recorded.label} != {requested.label}"
                 )
         return tuple(mismatches)
 
@@ -957,8 +947,10 @@ class CalibrationDatabase:
         }:
             raise ValueError("unsupported output filter type")
         for value, name in (
-            (output_filter_cutoff_ghz, "output filter cutoff"),
-            (output_filter_bandwidth_ghz, "output filter bandwidth"),
+            (output_filter_cutoff_ghz if output_filter_type != "bypass" else None,
+             "output filter cutoff"),
+            (output_filter_bandwidth_ghz if output_filter_type == "bandpass" else None,
+             "output filter bandwidth"),
         ):
             if value is not None and (
                 not np.isfinite(float(value)) or float(value) <= 0.0

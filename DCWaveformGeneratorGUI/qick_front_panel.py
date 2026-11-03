@@ -6,6 +6,7 @@ Authors: Jeonghyun Park (jeonghyun.park@ubc.ca or alexist@snu.ac.kr), Farbod
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 import re
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -13,8 +14,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
     from .fir_ddr_profile import resolve_fir_ddr_profile
+    from .qick_filter_editor import QickFilterEditor
 except ImportError:
     from fir_ddr_profile import resolve_fir_ddr_profile
+    from qick_filter_editor import QickFilterEditor
 
 
 OUTPUT_BOARD_TYPES = ("RF_Out", "DC_Out")
@@ -110,6 +113,8 @@ class QickFrontPanelConfiguration:
     # Retain the already-resolved HWH timing for the display-only acquisition
     # preview. Older callers/configurations can leave it unavailable.
     fir_profile: Optional[Any] = None
+    output_sample_rates_ghz: Tuple[Optional[float], ...] = ()
+    input_sample_rates_ghz: Tuple[Optional[float], ...] = ()
 
     def port(self, direction: str, panel_index: int) -> QickFrontPanelPort:
         ports = self.outputs if direction == "output" else self.inputs
@@ -325,11 +330,24 @@ def identify_qick_front_panel(soccfg: Any) -> QickFrontPanelConfiguration:
         if samples_per_axi_word > 0:
             ddr_values["ddr_samples_per_axi_word"] = samples_per_axi_word
             ddr_values["ddr_iq_sample_bytes"] = int(ddr_config.get("iq_sample_bytes", 4))
+    def sample_rates(channels):
+        values = []
+        for channel in channels:
+            try:
+                # QICK converter fs is MHz, unlike f_dds/f_output after rate changes.
+                rate = float(channel.get("fs")) / 1000
+            except (TypeError, ValueError):
+                rate = None
+            values.append(rate if rate is not None and isfinite(rate) and rate > 0 else None)
+        return tuple(values)
+
     return QickFrontPanelConfiguration(
         board=board,
         firmware_timestamp=str(config.get("fw_timestamp", "unknown")),
         outputs=outputs,
         inputs=inputs,
+        output_sample_rates_ghz=sample_rates(config.get("gens", ())),
+        input_sample_rates_ghz=sample_rates(config.get("readouts", ())),
         square_pulse_channels=tuple(i for i,gen in enumerate(config.get("gens",()))
                                    if gen.get("type")=="axis_square_pulse_v1"
                                    or gen.get("gen_type")=="square_pulse"),
@@ -975,9 +993,10 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.output_nqz = self._nyquist_spin()
         self.output_att1_db = self._attenuation_spin(10.0)
         self.output_att2_db = self._attenuation_spin(10.0)
-        self.output_filter_type = self._filter_combo()
-        self.output_filter_cutoff_ghz = self._filter_spin(2.5)
-        self.output_filter_bandwidth_ghz = self._filter_spin(1.0)
+        self.output_filter_editor = QickFilterEditor(self)
+        self.output_filter_type = self.output_filter_editor.mode_combo
+        self.output_filter_cutoff_ghz = self.output_filter_editor.cutoff
+        self.output_filter_bandwidth_ghz = self.output_filter_editor.bandwidth
         output_form.addRow("Front-panel connector:", self.output_sma)
         output_form.addRow("QICK generator channel:", self.output_channel)
         output_form.addRow("Detected board:", self.output_board)
@@ -1003,9 +1022,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         output_form.addRow("DAC Nyquist zone:", self.output_nqz)
         output_form.addRow("ATT1:", self.output_att1_db)
         output_form.addRow("ATT2:", self.output_att2_db)
-        output_form.addRow("Filter:", self.output_filter_type)
-        output_form.addRow("Cutoff/center:", self.output_filter_cutoff_ghz)
-        output_form.addRow("Bandwidth:", self.output_filter_bandwidth_ghz)
+        output_form.addRow(self.output_filter_editor)
         controls.addWidget(self.output_group)
 
         self.input_group = QtWidgets.QGroupBox("Selected Input SMA")
@@ -1022,9 +1039,10 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_dc_gain_db.setSingleStep(1.0)
         self.input_dc_gain_db.setSuffix(" dB")
         self.input_unknown = QtWidgets.QLabel("-")
-        self.input_filter_type = self._filter_combo()
-        self.input_filter_cutoff_ghz = self._filter_spin(2.5)
-        self.input_filter_bandwidth_ghz = self._filter_spin(1.0)
+        self.input_filter_editor = QickFilterEditor(self)
+        self.input_filter_type = self.input_filter_editor.mode_combo
+        self.input_filter_cutoff_ghz = self.input_filter_editor.cutoff
+        self.input_filter_bandwidth_ghz = self.input_filter_editor.bandwidth
         self.input_condition_stack.addWidget(self.input_attenuation_db)
         self.input_condition_stack.addWidget(self.input_dc_gain_db)
         self.input_condition_stack.addWidget(self.input_unknown)
@@ -1045,9 +1063,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         input_form.addRow("Detected board:", self.input_board)
         input_form.addRow("ADC Nyquist zone:", self.input_nqz)
         input_form.addRow(self.input_condition_label, self.input_condition_stack)
-        input_form.addRow("Filter:", self.input_filter_type)
-        input_form.addRow("Cutoff/center:", self.input_filter_cutoff_ghz)
-        input_form.addRow("Bandwidth:", self.input_filter_bandwidth_ghz)
+        input_form.addRow(self.input_filter_editor)
         controls.addWidget(self.input_group)
         layout.addLayout(controls)
 
@@ -1085,7 +1101,25 @@ class QickFrontPanelControl(QtWidgets.QWidget):
         self.input_filter_type.currentIndexChanged.connect(self._update_summary)
         self.input_filter_cutoff_ghz.valueChanged.connect(self._update_summary)
         self.input_filter_bandwidth_ghz.valueChanged.connect(self._update_summary)
+        self.output_filter_editor.settings_changed.connect(self._filter_edited)
+        self.input_filter_editor.settings_changed.connect(self._filter_edited)
+        self.output_channel.currentIndexChanged.connect(self._update_filter_sample_rates)
+        self.input_channel.currentIndexChanged.connect(self._update_filter_sample_rates)
         self.set_scope("path")
+
+    def _filter_edited(self):
+        self.apply_button.setEnabled(not self._identifying and self._selection_is_valid())
+        self._update_summary()
+
+    def _update_filter_sample_rates(self, *_args):
+        for direction, combo, editor in (
+            ("output", self.output_channel, self.output_filter_editor),
+            ("input", self.input_channel, self.input_filter_editor),
+        ):
+            rates = getattr(self._configuration, direction + "_sample_rates_ghz", ())
+            channel = combo.currentData()
+            rate = rates[channel] if channel is not None and 0 <= channel < len(rates) else None
+            editor.set_sample_rate(rate)
 
     def set_current_state(self, state):
         self._current_state = state
@@ -1317,6 +1351,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self.output_filter_type.setEnabled(rf_output)
             self.output_filter_cutoff_ghz.setEnabled(rf_output)
             self.output_filter_bandwidth_ghz.setEnabled(rf_output)
+            self.output_filter_editor.set_available(rf_output)
         else:
             self._selected_input = int(panel_index)
             self.input_sma.setText(port.label)
@@ -1334,7 +1369,9 @@ class QickFrontPanelControl(QtWidgets.QWidget):
             self.input_filter_type.setEnabled(rf_input)
             self.input_filter_cutoff_ghz.setEnabled(rf_input)
             self.input_filter_bandwidth_ghz.setEnabled(rf_input)
+            self.input_filter_editor.set_available(rf_input)
         self.canvas.set_selected(direction, int(panel_index))
+        self._update_filter_sample_rates()
         if direction == 'output':
             self._refresh_current()
         self.apply_button.setEnabled(self._selection_is_valid())
@@ -1351,6 +1388,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 and self.output_channel.currentData() is not None
                 and self._output_channel_allowed(self.output_channel.currentData())
             )
+            if self.output_filter_editor.available and self.output_filter_editor.error:
+                output_valid = False
         input_valid = False
         if self._selected_input is not None:
             input_port = self._configuration.port("input", self._selected_input)
@@ -1358,6 +1397,8 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                 input_port.board_type in INPUT_BOARD_TYPES
                 and self.input_channel.currentData() is not None
             )
+            if self.input_filter_editor.available and self.input_filter_editor.error:
+                input_valid = False
         if self._scope == "output":
             return output_valid
         if self._scope == "input":
@@ -1449,7 +1490,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                     "output_nqz": 1 if output.baseband_only else self.output_nqz.value(),
                     "output_att1_db": 0. if output.baseband_only else self.output_att1_db.value(),
                     "output_att2_db": 0. if output.baseband_only else self.output_att2_db.value(),
-                    "output_filter_type": "bypass" if output.baseband_only else self.output_filter_type.currentText(),
+                    "output_filter_type": self.output_filter_type.currentText() if self.output_filter_editor.available else "bypass",
                     "output_filter_cutoff_ghz": (
                         self.output_filter_cutoff_ghz.value()
                     ),
@@ -1469,7 +1510,7 @@ class QickFrontPanelControl(QtWidgets.QWidget):
                     "readout_nqz": self.input_nqz.value(),
                     "readout_attenuation_db": self.input_attenuation_db.value(),
                     "readout_dc_gain_db": self.input_dc_gain_db.value(),
-                    "readout_filter_type": self.input_filter_type.currentText(),
+                    "readout_filter_type": self.input_filter_type.currentText() if self.input_filter_editor.available else "bypass",
                     "readout_filter_cutoff_ghz": (
                         self.input_filter_cutoff_ghz.value()
                     ),

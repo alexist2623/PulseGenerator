@@ -11660,7 +11660,10 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._qick_front_panel = QickFrontPanelControl(
             self._qick_front_panel_dialog
         )
-        front_panel_layout.addWidget(self._qick_front_panel)
+        self._qick_front_panel_scroll = QtWidgets.QScrollArea(self._qick_front_panel_dialog)
+        self._qick_front_panel_scroll.setWidgetResizable(True)
+        self._qick_front_panel_scroll.setWidget(self._qick_front_panel)
+        front_panel_layout.addWidget(self._qick_front_panel_scroll)
         front_panel_buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Close,
             parent=self._qick_front_panel_dialog,
