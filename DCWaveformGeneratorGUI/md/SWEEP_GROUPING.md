@@ -72,6 +72,29 @@ can have an interior maximum even when both endpoints are small.
 
 ## Saved results and plots
 
+The Waveform Plot's **Select index** button opens a non-modal parameter selector.
+Each sweep parameter has a value box with up/down arrows and a drop-down list
+of its point indices and values. Typing a number and pressing Enter (or leaving
+the box) selects the nearest available value. Arrows move to the adjacent
+higher/lower value, including descending sweeps. Durations below 1 us use ns;
+voltage uses mV and RF axes retain their frequency, phase or power units.
+
+Grouped members have a shared label and light highlight. Selecting any member
+changes the group's index and updates every member's displayed value, preserving
+all other loop coordinates. Equal values in a constant member retain the current
+index when typed; the drop-down can select a specific duplicate index. The
+ordinary flat point-index control and parameter selector stay synchronized with
+virtual/physical/RC waveforms, RF and acquisition previews. Selection changes
+only the displayed point, not the experiment's ranges or base waveform.
+
+The selector follows hardware loop order and outer RF software sweep axes.
+An open selector refreshes after parameter edits, grouping/ungrouping, deletion
+from other tabs, or JSON loading. Removing and re-adding a parameter cannot
+retain an old group connection. Point lists are per parameter and formatted on
+demand; the selector does not materialize a Cartesian grid. The existing flat
+plot-index limit still applies. The existing `display.waveform_point_index`
+setting saves the selection without changing the settings schema.
+
 QCoDeS results retain every member coordinate, the shared group index, stable
 IDs, membership and the effective sweep shape. The virtual-gate matrix and
 waveform recipe remain in metadata. A member coordinate uses its existing

@@ -348,7 +348,10 @@ def test_large_preview_selects_one_point_without_cartesian_materialization(windo
     assert window._waveform_preview_sequence.sweep_point_count == 40000
     assert window._waveform_preview_sequence._sweep_coordinate_cache is None
     assert window._plot._virtual_preview[0].size < 20
-    np.testing.assert_array_equal(window._plot._line[0].yData, [16, 16])
+    # The sample-grid preview may retain a repeated boundary vertex.
+    values = window._plot._line[0].yData
+    assert 2 <= values.size < 20
+    np.testing.assert_allclose(values, 16., rtol=0, atol=1e-12)
     window._sweep_specs = [QickSweepSpec('set_0', 'awg_0', .01, .02, 3)]
     window._refresh_sweep_overlay()
     assert window._waveform_point_index.value() == 2

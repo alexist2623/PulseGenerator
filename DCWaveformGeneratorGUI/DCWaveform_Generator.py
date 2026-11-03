@@ -28,6 +28,11 @@ except ImportError:
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
+    from .sweep_point_selector import SweepPointDialog
+except ImportError:
+    from sweep_point_selector import SweepPointDialog
+
+try:
     from .time_display import TIME_SECONDS, time_sweep_display, time_sweep_summary
 except ImportError:
     from time_display import TIME_SECONDS, time_sweep_display, time_sweep_summary
@@ -11934,12 +11939,20 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         point_options.addWidget(QtWidgets.QLabel("Sweep point (0-based):"))
         self._waveform_point_index = QtWidgets.QSpinBox()
         self._waveform_point_index.setRange(0, 0)
+        self._waveform_point_index.setKeyboardTracking(False)
         self._waveform_point_index.setToolTip(
             "One common point for virtual, physical, RC, RF and acquisition previews. "
             "During a sweep, edit the base waveform in AWG Outputs; this preview does not change it.")
         self._waveform_point_index.valueChanged.connect(
             lambda _value: self._refresh_physical_waveforms())
         point_options.addWidget(self._waveform_point_index)
+        self._waveform_selection_context = None
+        self._waveform_sweep_dialog = None
+        self._waveform_select_index = QtWidgets.QPushButton("Select index")
+        self._waveform_select_index.setEnabled(False)
+        self._waveform_select_index.setToolTip("Select the plotted point by individual sweep parameter values.")
+        self._waveform_select_index.clicked.connect(self._show_waveform_index_selector)
+        point_options.addWidget(self._waveform_select_index)
         self._waveform_point_label = QtWidgets.QLabel("1 point")
         self._waveform_point_label.setWordWrap(True)
         point_options.addWidget(self._waveform_point_label, 1)
@@ -12540,12 +12553,39 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             }[mode]
         )
 
+    def _show_waveform_index_selector(self):
+        if self._waveform_selection_context is None:
+            return
+        if self._waveform_sweep_dialog is None:
+            self._waveform_sweep_dialog = SweepPointDialog(self)
+            self._waveform_sweep_dialog.pointSelected.connect(self._waveform_point_index.setValue)
+        self._sync_waveform_index_selector(self._waveform_selection_context)
+        self._waveform_sweep_dialog.show()
+        self._waveform_sweep_dialog.raise_()
+        self._waveform_sweep_dialog.activateWindow()
+
+    def _sync_waveform_index_selector(self, context):
+        self._waveform_selection_context = context
+        self._waveform_select_index.setEnabled(bool(context and (context[0].sweep_axes or context[1])))
+        if self._waveform_sweep_dialog is None:
+            return
+        if context is None:
+            self._waveform_sweep_dialog.clear_context()
+            return
+        sequence, bindings = context
+        self._waveform_sweep_dialog.set_context(
+            sequence, bindings, self._qick_full_scale_mv,
+            self._experiment_panel._sweep_parameter_values,
+            {key: value['name'] for key, value in self._sweep_grouping.groups.items()},
+            self._waveform_point_index.value(), self._waveform_point_index.maximum())
+
     def _refresh_physical_waveforms(self, *, fit_view: bool = False) -> None:
         self._sync_awg_voltage_bounds()
         rc_times = np.asarray([], dtype=float)
         rc_mv = np.empty((len(self._pulse), 0))
         preview_note = ""
         point_index = 0
+        selection_context = None
         try:
             sequence = build_qick_sequence(
                 self._pulse,
@@ -12586,6 +12626,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bindings = _rf_software_sweep_bindings(rf_specs, getattr(sequence, "sweep_execution_order", ()))
             host_shape = tuple(axis.count for _index, axis in bindings)
             full_shape = host_shape + tuple(sequence.sweep_shape)
+            selection_context = (sequence, bindings)
             if hasattr(self, "_waveform_point_index"):
                 count = prod(full_shape)
                 with QtCore.QSignalBlocker(self._waveform_point_index):
@@ -12650,6 +12691,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 self._pulse, self._cross_capacitance)
         self._plot.set_physical_waveforms(time_ns, physical_mv)
         self._plot.set_rc_waveforms(rc_times, rc_mv)
+        self._sync_waveform_index_selector(selection_context)
         self._refresh_acquisition_timeline()
         if hasattr(self, "_rf_timelines"):
             self._refresh_rf_timeline()
@@ -19418,6 +19460,8 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             return
         if hasattr(self, "_awg_sweep_plot"):
             self._awg_sweep_plot.close()
+        if self._waveform_sweep_dialog is not None:
+            self._waveform_sweep_dialog.close()
         super().closeEvent(event)
 
 def main():
