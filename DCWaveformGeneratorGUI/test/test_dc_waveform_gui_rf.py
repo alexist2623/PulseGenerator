@@ -2354,7 +2354,7 @@ def test_generated_qick_module_preserves_rf_duration_sweep_mode():
     assert axis.points == (1.0, 2.0, 3.0, 4.0)
     assert axis.segment_length_mode == "extend_by_rf_duration"
     runtime_rf = namespace["build_rf_pulses"]({
-        "gens": [{"f_fabric": 300.0}],
+        "gens": [{"f_fabric": 300.0, "type": "axis_signal_gen_v6", "samps_per_clk": 16}],
     })
     assert len(runtime_rf) == 1
     assert runtime_rf[0].length_cycles == 300
@@ -2416,7 +2416,7 @@ def test_generated_qick_module_preserves_composite_rf_sequence():
     ] == [3180, 3210, 3240]
     runtime = namespace["build_rf_pulses"]({
         "tprocs": [{"f_time": 300.0}],
-        "gens": [{"f_fabric": 300.0}],
+        "gens": [{"f_fabric": 300.0, "type": "axis_signal_gen_v6", "samps_per_clk": 16}],
     })
     assert [item.pulse_name for item in runtime] == ["prepare", "read"]
     assert [item.delay_tproc_cycles for item in runtime] == [30, 120]
@@ -2653,9 +2653,9 @@ def test_generated_module_supports_multiple_rf_outputs_and_readout_chain():
     stale_hwh_soccfg = {
         "tprocs": [{"f_time": 400.0}],
         "gens": [
+            {"f_fabric": 300.0, "type": "axis_signal_gen_v6", "samps_per_clk": 16},
             {"f_fabric": 300.0},
-            {"f_fabric": 300.0},
-            {"f_fabric": 300.0},
+            {"f_fabric": 300.0, "type": "axis_signal_gen_v6", "samps_per_clk": 16},
         ],
     }
     generated_rf = namespace["build_rf_pulses"](stale_hwh_soccfg)

@@ -1024,11 +1024,17 @@ def build_qick_program(
     rf_specs: Sequence[QickRfPulseSpec] = (),
     readout_spec: Optional[QickDdrReadoutSpec] = None,
     acquisition_source: str = "fir_ddr",
+    execution_mode: str = "finite",
     hardware_rep_delay_us: float = 0.0,
     compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
     cancel_check: Optional[CancellationCheck] = None,
 ):
     """Build the tProcessor program without configuring or running hardware."""
+    if execution_mode == "output_forever":
+        if readout_spec is not None:
+            raise ValueError("Run forever forbids RF Readout / ADC acquisition")
+        if any(spec.software_sweep_axes for spec in rf_specs):
+            raise ValueError("Run forever supports hardware sweep axes; host RF sweeps require finite execution")
     effective_tproc_mhz = _resolve_tproc_mhz(soccfg, tproc_mhz)
     from qick_cpmg import enabled as cpmg_hw_enabled
     from qick_fine_tune_sweep import CpmgNSweep
@@ -1054,6 +1060,7 @@ def build_qick_program(
         else cycles_from_us(hardware_rep_delay_us, effective_tproc_mhz)
     )
     program_kwargs = {
+        "execution_mode": execution_mode,
         "awg_channels": tuple(int(channel) for channel in awg_channels),
         "tproc_mhz": effective_tproc_mhz,
         "repetitions_per_sweep": int(repetitions_per_sweep),
@@ -1270,7 +1277,7 @@ def _cache_execution_coordinates(program, cancel_check=None) -> None:
         return
     channels = tuple(getattr(program, "awg_channels", ()))
     if not channels or not all(
-        program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7")
+        program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8")
         and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3, 7)
         for channel in channels
     ):

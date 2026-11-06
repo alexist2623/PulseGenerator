@@ -2208,6 +2208,14 @@ def test_fir_ddr_cancellation_stops_between_readback_chunks(monkeypatch):
         def __init__(self):
             self.cancelled = False
             self.read_calls = 0
+            self.cleanup_calls = []
+
+        def stop_tproc(self):
+            self.cleanup_calls.append('stop')
+
+        def abort_ddr4_capture(self, timeout):
+            self.cleanup_calls.append('abort')
+            return dict(acknowledged=True, pending=False, busy=False, armed=False)
 
         def arm_ddr4_fir_samples(self, **kwargs):
             return kwargs["n_triggers"] * 8
@@ -2237,6 +2245,7 @@ def test_fir_ddr_cancellation_stops_between_readback_chunks(monkeypatch):
         )
 
     assert soc.read_calls == 1
+    assert soc.cleanup_calls == ['stop', 'abort']
 
 
 def test_bias_t_preview_cancels_positive_and_negative_physical_area():

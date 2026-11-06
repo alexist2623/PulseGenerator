@@ -2718,6 +2718,8 @@ def generate_qick_program_code(
     dac_current_settings=None,
     square_full_scale_mv=None,
     square_current_settings=None,
+    output_clip_limits=None,
+    execution_mode="finite",
     repetitions_per_sweep: Integral = 1,
     sweep: Optional[QickSweepAxisSpec] = None,
     sweeps: Optional[Sequence[QickSweepAxisSpec]] = None,
@@ -2743,6 +2745,10 @@ def generate_qick_program_code(
     attenuators, executes the pulse program, and returns FIR-decimated
     DDR IQ data grouped by sweep point and repetition.
     """
+    if execution_mode not in ('finite', 'output_forever'):
+        raise ValueError('Unknown execution mode')
+    if execution_mode == 'output_forever' and ddr_readout_spec is not None:
+        raise ValueError('Run forever forbids RF Readout / ADC acquisition')
     pulses = tuple(pulses)
     if output_names is None:
         output_names = tuple(f"awg_{index}" for index in range(len(pulses)))
@@ -2759,6 +2765,8 @@ def generate_qick_program_code(
     tproc_mhz = _positive_real(tproc_mhz, "tproc_mhz")
     full_scale_mv = _positive_real(full_scale_mv, "full_scale_mv")
     square_full_scale_mv = full_scale_mv if square_full_scale_mv is None else square_full_scale_mv
+    from qick_output_limits import normalize_output_limits
+    output_clip_limits = normalize_output_limits(output_clip_limits)
     dac_current_settings = dict(dac_current_settings or {})
     from qick_square_dds import decode_square_outputs
     square_configs, _ = decode_square_outputs(square_pulse_settings, square_full_scale_mv)
@@ -2884,6 +2892,7 @@ def generate_qick_program_code(
         f"FULL_SCALE_MV = {float(full_scale_mv)!r}",
         f"OUTPUT_FULL_SCALES_MV = {output_full_scales_mv!r}",
         f"DAC_CURRENT_SETTINGS = {dict(dac_current_settings or {})!r}",
+        f"OUTPUT_CLIP_LIMITS = {output_clip_limits!r}",
         f"BIAS_T_COMPENSATION_ENABLED = {bool(bias_t_compensation_enabled)!r}",
         f"BIAS_T_COMPENSATION_TYPE = {bias_t_compensation_type!r}",
         f"BIAS_T_COMPENSATION_VOLTAGE_MV = {float(bias_t_compensation_voltage_mv)!r}",
@@ -2906,6 +2915,7 @@ def generate_qick_program_code(
         "    if OUTPUT_FULL_SCALES_MV is not None:",
         "        sequence.set_voltage_scales(FULL_SCALE_MV, OUTPUT_FULL_SCALES_MV)",
         "    sequence.dac_current_settings = DAC_CURRENT_SETTINGS",
+        "    sequence.output_clip_limits = OUTPUT_CLIP_LIMITS",
         "    sequence.set_cross_capacitance(CROSS_CAPACITANCE)",
         "    sequence.set_rc_compensation(",
         "        BIAS_T_FILTER_TAU_US,",
@@ -3144,12 +3154,18 @@ def generate_qick_program_code(
             "    *,",
             "    awg_channels=AWG_CHANNELS,",
             "    repetitions_per_sweep=REPETITIONS_PER_SWEEP,",
+            f"    execution_mode={execution_mode!r},",
             "    readout=None,",
             "    rf_pulse=None,",
             "    rf_pulses=None,",
             "    ddr_readout=None,",
             "    use_generated_aux=True,",
             "):",
+            "    if execution_mode == 'output_forever':",
+            "        if readout is not None or ddr_readout is not None or FIR_DDR_CONFIG is not None:",
+            "            raise ValueError('Run forever forbids acquisition')",
+            "        if any(QickRfPulseSpec(**cfg).software_sweep_axes for cfg in RF_CONFIGS):",
+            "            raise ValueError('Run forever forbids host RF sweeps')",
             "    if use_generated_aux:",
             "        if rf_pulse is None and rf_pulses is None:",
             "            rf_pulses = build_rf_pulses(soccfg)",
@@ -3160,6 +3176,7 @@ def generate_qick_program_code(
             "        awg_channels=awg_channels,",
             "        tproc_mhz=TPROC_MHZ,",
             "        repetitions_per_sweep=repetitions_per_sweep,",
+            "        execution_mode=execution_mode,",
             "        readout=readout,",
             "        rf_pulse=rf_pulse,",
             "        rf_pulses=rf_pulses,",
@@ -3210,6 +3227,17 @@ def generate_qick_program_code(
             "",
             "",
             "def run_experiment(soc, soccfg, *, progress=True, configure_rf=True, **run_kwargs):",
+            f"    execution_mode = {execution_mode!r}",
+            "    if execution_mode == 'output_forever':",
+            "        from qick_output_forever import execute_output_forever",
+            "        if FIR_DDR_CONFIG is not None:",
+            "            raise ValueError('Run forever forbids acquisition')",
+            "        program = build_program(soccfg)",
+            "        if configure_rf:",
+            "            configure_rf_chain(soc)",
+            "            for square in program.square_pulse_configs:",
+            "                soc.rfb_set_gen_dc(square.gen_ch)",
+            "        return execute_output_forever(soc, program, **run_kwargs)",
             "    specs = tuple(QickRfPulseSpec(**cfg) for cfg in RF_CONFIGS)",
             "    if any(spec.software_sweep_axes for spec in specs):",
             "        if not configure_rf:",

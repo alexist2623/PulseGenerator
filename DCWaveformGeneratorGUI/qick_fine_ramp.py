@@ -123,7 +123,7 @@ def packet(sequence, segment_index, output, cfg, start, terminal, point_index=0)
     spec = sweep_spec_at(sequence, segment.name, output, point_index)
     if spec is None:
         return None
-    if cfg.get('type') != 'axis_awg_tuning_v7' or cfg.get('extended_ramp_version') != 1:
+    if cfg.get('type') not in ('axis_awg_tuning_v7', 'axis_awg_tuning_v8') or cfg.get('extended_ramp_version') != 1:
         raise ValueError('Sample-position RAMP requires AWG v7 firmware and its matching driver')
     if int(cfg['n_pts']) != 16 or int(cfg['frac']) != 18:
         raise ValueError('Fine RAMP requires the v7 16-lane Q18 ABI')

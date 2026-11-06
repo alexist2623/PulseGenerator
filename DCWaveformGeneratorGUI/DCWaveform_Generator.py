@@ -28,6 +28,13 @@ except ImportError:
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
+    from .qick_output_limits import normalize_output_limits
+    from .qick_output_limits_widget import OutputLimitsWidget
+except ImportError:
+    from qick_output_limits import normalize_output_limits
+    from qick_output_limits_widget import OutputLimitsWidget
+
+try:
     from .sweep_point_selector import SweepPointDialog
 except ImportError:
     from sweep_point_selector import SweepPointDialog
@@ -2593,7 +2600,7 @@ class MultiControlPanel(QtWidgets.QWidget): # pylint: disable=too-few-public-met
             port = self._front_panel_configuration.port("output", port_index)
             channel_position = port.qick_channels.index(channel)
             block_path = port.block_paths[channel_position].lower()
-            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7")):
+            if not any(name in block_path for name in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8")):
                 raise ValueError(
                     f"generator {channel} is not an AWG tuning channel"
                 )
@@ -8574,6 +8581,7 @@ class ExperimentPanel(QtWidgets.QWidget):
     """QCoDeS database, AWG scale, and direct-run controls."""
 
     run_requested = QtCore.pyqtSignal()
+    forever_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
     show_program_requested = QtCore.pyqtSignal()
     clear_cache_requested = QtCore.pyqtSignal()
@@ -8667,6 +8675,8 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.full_scale_mv.setDecimals(6)
         self.full_scale_mv.setSuffix(" mV")
         self.awg_channels = QtWidgets.QLineEdit()
+        self.output_limits = OutputLimitsWidget()
+        self.awg_channels.textChanged.connect(self._update_output_limit_channels)
         self._awg_front_panel_configuration = None
         self.awg_channels.textChanged.connect(self._update_awg_channel_warning)
         self.repetitions = QtWidgets.QSpinBox()
@@ -9001,6 +9011,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         form.addRow(self.sweep_parameter_group)
         self.sweep_map_group.setVisible(False)
         form.addRow(self.bias_t_group)
+        form.addRow(self.output_limits)
         form.addRow("Notes:", self.notes)
 
         self.full_scale_mv.valueChanged.connect(self._update_bias_t_range)
@@ -9022,6 +9033,12 @@ class ExperimentPanel(QtWidgets.QWidget):
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         )
         self.run_button.clicked.connect(self.run_requested.emit)
+        self.forever_button = QtWidgets.QPushButton("Run forever")
+        self.forever_button.setToolTip(
+            "Repeat reps × the complete hardware sweep without measurement or saving. "
+            "Disable RF Readout first. Stop finishes the current shot then zeros the outputs. "
+            "A preparation gap is added between shots and grids; it is recorded in the program summary.")
+        self.forever_button.clicked.connect(self.forever_requested.emit)
         self.stop_button = QtWidgets.QPushButton("Stop Experiment")
         self.stop_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
@@ -9048,6 +9065,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self.clear_cache_button.clicked.connect(self.clear_cache_requested.emit)
         action_row = QtWidgets.QHBoxLayout()
         action_row.addWidget(self.run_button)
+        action_row.addWidget(self.forever_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self.show_program_button)
         action_row.addWidget(self.clear_cache_button)
@@ -9932,6 +9950,14 @@ class ExperimentPanel(QtWidgets.QWidget):
         validate_awg_output_channels(self._awg_front_panel_configuration, channels)
         return channels
 
+    def _update_output_limit_channels(self, text):
+        try:
+            channels = tuple(int(part.strip()) for part in text.split(",") if part.strip())
+        except ValueError:
+            return
+        if all(ch >= 0 for ch in channels):
+            self.output_limits.set_channels(channels)
+
     def values(
         self,
         output_count: int,
@@ -9950,6 +9976,7 @@ class ExperimentPanel(QtWidgets.QWidget):
             "tproc_mhz": self.tproc_mhz.value(),
             "full_scale_mv": self.full_scale_mv.value(),
             "awg_channels": self._parse_awg_channels(output_count),
+            "output_clip_limits": self.output_limits.settings(self._parse_awg_channels(output_count)),
             "repetitions_per_sweep": self.repetitions.value(),
             "iq_storage_mode": normalize_iq_storage_mode(
                 self.iq_storage_mode.currentData()
@@ -10153,6 +10180,7 @@ class ExperimentPanel(QtWidgets.QWidget):
         self._sweep_order_running = bool(running)
         self._load_selected_sweep_parameter()
         self.run_button.setEnabled(not running)
+        self.forever_button.setEnabled(not running)
         self.show_program_button.setEnabled(not running)
         self.clear_cache_button.setEnabled(not running)
         self.stop_button.setEnabled(running and can_cancel)
@@ -10407,6 +10435,22 @@ class QickExperimentWorker(QtCore.QObject):
         self.finished.emit(result)
 
 
+class QickOutputForeverWorker(QickExperimentWorker):
+    """Output-only worker, independent of QCoDeS and capture buffers."""
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            from qick_output_forever import run_output_forever
+            run_output_forever(**self._kwargs, cancel_check=self._check_cancel,
+                               progress_callback=self.progress_changed.emit,
+                               event_callback=self.event_changed.emit)
+        except ExperimentCancelled as exc:
+            self.cancelled.emit(str(exc))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class QuantumCircuitWorker(QickExperimentWorker):
     """Lower a saved circuit against live QICK metadata before running it."""
 
@@ -10563,7 +10607,7 @@ class QickAssemblyDialog(QtWidgets.QDialog):
         program = result.get("program")
         channels = tuple(getattr(program, "awg_channels", ()))
         if channels and all(
-            program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7")
+            program.soccfg["gens"][channel].get("type") in ("axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8")
             and int(program.soccfg["gens"][channel].get("output_sum_version", 0)) in (2, 3, 7)
             for channel in channels
         ):
@@ -11680,6 +11724,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self.sweep_state_changed.connect(self._synchronize_sweep_views)
         self._experiment_panel.run_requested.connect(self._run_qick_experiment)
+        self._experiment_panel.forever_requested.connect(self._run_output_forever)
         self._experiment_panel.stop_requested.connect(
             self._stop_qick_experiment
         )
@@ -14058,6 +14103,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             bias_t_compensation_duration_us=self._bias_t_compensation_duration_us,
             bias_t_filter_tau_us=self._bias_t_filter_tau_us,
         )
+        sequence.output_clip_limits = values["output_clip_limits"]
         self._square_dds_panel.attach_to_sequence(
             sequence, self._dac_current_state.scale,
             self._experiment_panel.triggering_panel.config(),
@@ -15730,6 +15776,41 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         self._quantum_circuit_panel.set_status(str(message))
         self._on_experiment_cancelled(message)
 
+    def _run_output_forever(self) -> None:
+        if self._experiment_thread is not None and self._experiment_thread.isRunning():
+            return
+        try:
+            if self._rf_readout_panel.spec() is not None:
+                raise ValueError("Disable RF Readout before Run forever; ADC acquisition is forbidden")
+            arguments = self._experiment_run_arguments(require_readout=False, require_run_config=False)
+            keys = ('connection_config', 'sequence', 'awg_channels', 'repetitions_per_sweep',
+                    'rf_specs', 'readout_spec', 'compile_validation_mode')
+            arguments = {key: arguments[key] for key in keys}
+            arguments['tproc_mhz'] = self._qick_tproc_mhz
+            if any(spec.software_sweep_axes for spec in arguments['rf_specs']):
+                raise ValueError("Run forever supports hardware sweeps; host RF sweeps require finite execution")
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Cannot run output only", str(exc))
+            return
+        self._experiment_panel.start_run_timeline("Output-only execution requested")
+        self._experiment_panel.set_running(True, "Preparing output-only hardware loop", show_progress=False, can_cancel=True)
+        thread = QtCore.QThread(self)
+        worker = QickOutputForeverWorker(arguments)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.failed.connect(self._on_experiment_failed)
+        worker.cancelled.connect(self._on_experiment_cancelled)
+        worker.progress_changed.connect(lambda _percent, text: self._experiment_panel.run_status.setText(text))
+        worker.event_changed.connect(self._on_experiment_event)
+        for signal in (worker.failed, worker.cancelled):
+            signal.connect(thread.quit)
+            signal.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_experiment_thread)
+        self._experiment_thread = thread
+        self._experiment_worker = worker
+        thread.start()
+
     def _run_qick_experiment(self) -> None:
         if self._experiment_thread is not None and self._experiment_thread.isRunning():
             QtWidgets.QMessageBox.information(
@@ -16123,6 +16204,9 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         lines = [line for line in details.rstrip().splitlines() if line.strip()]
         summary = lines[-1] if lines else "Unknown QICK experiment error"
         self._experiment_panel.set_running(False, f"Failed: {summary}")
+        if 'Output-only cleanup incomplete' in details:
+            self._experiment_panel.run_button.setEnabled(False)
+            self._experiment_panel.forever_button.setEnabled(False)
         self._experiment_panel.finish_run_timeline(
             f"Run failed: {summary}",
             success=False,
@@ -16685,6 +16769,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
                 "full_scale_mv": self._qick_full_scale_mv,
                 "awg_channels": list(self._qick_awg_channels),
                 "dac_current_settings": self._dac_current_state.records,
+                "output_clip_limits": experiment_values["output_clip_limits"],
                 "repetitions_per_sweep": self._qick_repetitions_per_sweep,
                 "iq_storage_mode": experiment_values["iq_storage_mode"],
                 "awg_metadata_mode": experiment_values["awg_metadata_mode"],
@@ -18489,6 +18574,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
             "tproc_mhz": tproc_mhz,
             "full_scale_mv": full_scale_mv,
             "dac_current_settings": dict(qick.get("dac_current_settings", {})),
+            "output_clip_limits": normalize_output_limits(qick.get("output_clip_limits", {})),
             "awg_channels": awg_channels,
             "repetitions": repetitions,
             "awg_metadata_mode": awg_metadata_mode,
@@ -18587,6 +18673,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         )
         self._multi_ctrl.set_awg_channels(self._qick_awg_channels)
         self._refresh_stability_targets()
+        self._experiment_panel.output_limits.load_settings(settings.get("output_clip_limits", {}))
         self._stability_panel.load_settings(settings["stability_diagram"])
 
         with QtCore.QSignalBlocker(self._time_unit_combo):
@@ -18986,6 +19073,7 @@ class MainWindow(QtWidgets.QMainWindow): # pylint: disable=too-few-public-method
         settings["sweep_groups"] = self._compiler_sweep_groups()
         settings["sweep_parameter_ids"] = self._compiler_sweep_parameter_ids()
         settings["sweep_order"] = self._compiler_sweep_order()
+        settings["output_clip_limits"] = self._experiment_panel.output_limits.settings(settings["awg_channels"])
         return settings
 
     def _generate_qick_pulse(self) -> None:

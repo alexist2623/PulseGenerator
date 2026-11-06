@@ -14,7 +14,7 @@ try:
 except ImportError:
     from qick_compensation_controls import CompensationGroup, CompensationSelector
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 import sqlite3
@@ -28,6 +28,13 @@ try:
 except ImportError:
     from fir_ddr_profile import result_iq_in_input_units
 from PyQt5 import QtCore, QtWidgets
+
+try:
+    from .qick_output_limits import normalize_output_limits
+    from .qick_output_limits_widget import OutputLimitsWidget
+except ImportError:
+    from qick_output_limits import normalize_output_limits
+    from qick_output_limits_widget import OutputLimitsWidget
 
 try:
     import pyqtgraph as pg
@@ -326,8 +333,10 @@ class StabilityDiagramConfig:
     bias_t_compensation_mode: str = "fixed_voltage"
     bias_t_compensation_duration_us: float = DEFAULT_BIAS_T_COMPENSATION_DURATION_US
     bias_t_filter_tau_us: float = DEFAULT_BIAS_T_FILTER_TAU_US
+    output_clip_limits: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "output_clip_limits", normalize_output_limits(self.output_clip_limits))
         if self.x_axis.output_name == self.y_axis.output_name:
             raise ValueError("X and Y stability axes must use different AWG outputs")
         _integer(
@@ -1062,6 +1071,7 @@ def default_stability_settings(
         "settle_time_us": DEFAULT_STABILITY_SETTLE_US,
         "fpga_trigger_delay_us": None,
         "acquisition_source": "fir_ddr",
+        "output_clip_limits": {},
         "sweep_mode": "hardware",
         "hardware_rep_delay_us": DEFAULT_STABILITY_HARDWARE_REP_DELAY_US,
         "modulation_frequency_mhz": DEFAULT_STABILITY_MODULATION_FREQUENCY_MHZ,
@@ -1334,6 +1344,7 @@ def normalize_stability_settings(
     if bias_t_enabled and bias_t_type in ("filter", "dc_rc") and not 10 <= normalized_bias_t["filter_tau_us"] <= 1_000_000:
         raise ValueError("RC tau must be between 10 us and 1000 ms")
     normalized["bias_t_compensation"] = normalized_bias_t
+    normalized["output_clip_limits"] = normalize_output_limits(settings.get("output_clip_limits", {}))
     raw_rf_path = settings.get("rf_path", defaults["rf_path"])
     if not isinstance(raw_rf_path, Mapping):
         raise TypeError("stability RF path must be a JSON object")
@@ -1522,7 +1533,7 @@ def build_stability_hold_sequence(
         )
         for axis in (config.x_axis, config.y_axis)
     )
-    return build_qick_sequence(
+    sequence = build_qick_sequence(
         pulses,
         output_names=names,
         fabric_mhz=fabric_mhz,
@@ -1544,6 +1555,8 @@ def build_stability_hold_sequence(
         bias_t_compensation_duration_us=config.bias_t_compensation_duration_us,
         bias_t_filter_tau_us=config.bias_t_filter_tau_us,
     )
+    sequence.output_clip_limits = deepcopy(config.output_clip_limits)
+    return sequence
 
 
 def _stability_sequence_at_point(sequence: Any, point_index: int) -> Any:
@@ -2948,6 +2961,8 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         )
         controls.addWidget(self.x_axis)
         controls.addWidget(self.y_axis)
+        self.output_limits = OutputLimitsWidget(self)
+        controls.addWidget(self.output_limits)
 
         acquisition = QtWidgets.QGroupBox("Acquisition", controls_content)
         acquisition_form = QtWidgets.QFormLayout(acquisition)
@@ -3838,6 +3853,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         # ``segment_names`` remains accepted for compatibility with older GUI
         # callers. Stability scans always use their own internal SET segment.
         self._awg_targets = (tuple(output_names), tuple(awg_channels))
+        self.output_limits.set_channels(awg_channels)
         excluded = square_pulse_output_channels(self._front_panel_configuration)
         available = set(getattr(self._front_panel_configuration, "awg_tuning_channels", ()))
         for port in getattr(self._front_panel_configuration, "outputs", ()):
@@ -4174,12 +4190,14 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
             bias_t_compensation_mode=str(self.bias_t_mode.currentData()),
             bias_t_compensation_duration_us=self.bias_t_duration_us.value(),
             bias_t_filter_tau_us=self.bias_t_filter_tau_us.value(),
+            output_clip_limits=self.output_limits.settings(self.run_output_mapping()[1]),
         )
         config.validate_full_scale(full_scale_mv)
         return config
 
     def settings_dict(self) -> dict:
         return {
+            "output_clip_limits": self.output_limits.settings(),
             "x_axis": self.x_axis.settings_dict(),
             "y_axis": self.y_axis.settings_dict(),
             "repetitions_per_point": self.repetitions.value(),
@@ -4246,6 +4264,7 @@ class StabilityDiagramPanel(QtWidgets.QWidget):
         }
 
     def load_settings(self, settings: Mapping[str, Any]) -> None:
+        self.output_limits.load_settings(settings.get("output_clip_limits", {}))
         self.x_axis.load_settings(settings["x_axis"])
         self.y_axis.load_settings(settings["y_axis"])
         self.refresh_targets(*self._awg_targets)

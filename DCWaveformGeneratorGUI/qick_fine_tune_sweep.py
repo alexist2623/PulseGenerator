@@ -1098,6 +1098,7 @@ class FineTuneSequence:
         self.voltage_scale_factors = np.ones(self.n_outputs, dtype=float)
         self.output_full_scales_mv = None
         self.dac_current_settings = {}
+        self.output_clip_limits = {}
         self.bias_t_compensation: Optional[BiasTCompensationConfig] = None
         self.rc_compensation = None
 
@@ -2579,6 +2580,7 @@ class FineTuneSequence:
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
+        execution_mode: str = "finite",
         compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
         cancel_check: Optional[Callable[[], None]] = None,
     ):
@@ -2596,6 +2598,7 @@ class FineTuneSequence:
             command_lead_tproc_cycles=command_lead_tproc_cycles,
             command_spacing_tproc_cycles=command_spacing_tproc_cycles,
             recovery_tproc_cycles=recovery_tproc_cycles,
+            execution_mode=execution_mode,
             compile_validation_mode=compile_validation_mode,
             cancel_check=cancel_check,
         )
@@ -2624,7 +2627,7 @@ def _resolve_awg_channels(sequence: FineTuneSequence, awg_channels) -> Tuple[int
 
 
 def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
-    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") and gen_cfg.get("gen_type") != "awg_tuning":
+    if gen_cfg.get("type") not in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8") and gen_cfg.get("gen_type") != "awg_tuning":
         raise ValueError(f"generator channel {gen_ch} is not an AWG tuning generator")
     required = ("tproc_ch", "f_fabric", "n_pts", "frac")
     missing = [name for name in required if name not in gen_cfg]
@@ -2633,7 +2636,7 @@ def _validate_gen_config(gen_ch: int, gen_cfg: Mapping) -> None:
 
 
 def _awg_step_width(gen_cfg: Mapping) -> int:
-    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") else 24
+    expected = 32 if gen_cfg.get("type") in ("axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8") else 24
     width = int(gen_cfg.get("step_width", expected))
     if width != expected:
         raise ValueError("AWG step width does not match the firmware IP version")
@@ -2825,9 +2828,15 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         command_lead_tproc_cycles: int = 128,
         command_spacing_tproc_cycles: int = 1,
         recovery_tproc_cycles: int = 20,
+        execution_mode: str = "finite",
         compile_validation_mode: str = DEFAULT_COMPILE_VALIDATION_MODE,
         cancel_check: Optional[Callable[[], None]] = None,
     ):
+        if execution_mode not in ("finite", "output_forever"):
+            raise ValueError("Unknown execution mode")
+        if execution_mode == "output_forever" and (readout is not None or ddr_readout is not None):
+            raise ValueError("Run forever forbids RF Readout / ADC acquisition")
+        self.execution_mode = execution_mode
         self.cancel_check = cancel_check
         self._check_cancel()
         sequence._validate()
@@ -2990,7 +2999,12 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             )
         else:
             self._compile_boundary_points()
+        if self.execution_mode == "output_forever":
+            if any(self.soccfg['gens'][ch].get('output_clip_version') != 1 for ch in self.awg_channels):
+                raise ValueError("Run forever requires v8 AWG firmware and driver")
         self._check_cancel()
+        from qick_output_limits import compile_output_limits
+        self.output_clip_config = compile_output_limits(self.soccfg, self.sequence, self.awg_channels)
         from qick_dc_area import supported
         self._hardware_dc_area = supported(self)
         self._validate_bias_t_tproc_ports()
@@ -3002,7 +3016,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             )
             else 0
         )
-        self._v6_timing = any(self.soccfg["gens"][ch].get("type") in ("axis_awg_tuning_v4", "axis_awg_tuning_v7") for ch in self.awg_channels)
+        self._v6_timing = any(self.soccfg["gens"][ch].get("type") in ("axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8") for ch in self.awg_channels)
         self._dispatch_spacing = int(self.soccfg["tprocs"][0].get("timed_output_spacing_cycles", 3))
         if self._v6_timing and self._dispatch_spacing != 1:
             raise ValueError("AWG v6 requires the version 2 timed dispatcher metadata")
@@ -5068,6 +5082,8 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             table["axis_strides"] = axis_strides
             runtime_table_words.extend(int(value) for value in table["values"])
             table_cursor += len(table["values"])
+        if self.execution_mode == "output_forever" and next_dmem_addr < 3:
+            raise RuntimeError("No DMEM space for Run forever stop/ack mailboxes")
         if runtime_table_words and table_cursor - 1 > next_dmem_addr:
             raise RuntimeError(
                 "runtime sweep tables do not fit tProcessor DMEM: "
@@ -5308,7 +5324,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         if rf.gen_ch >= len(self.soccfg["gens"]):
             raise IndexError("RF generator channel is out of range")
         gen_cfg = self.soccfg["gens"][rf.gen_ch]
-        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7") or gen_cfg.get("gen_type") == "awg_tuning":
+        if gen_cfg.get("type") in ("axis_awg_tuning_v1", "axis_awg_tuning_v2", "axis_awg_tuning_v3", "axis_awg_tuning_v4", "axis_awg_tuning_v7", "axis_awg_tuning_v8") or gen_cfg.get("gen_type") == "awg_tuning":
             raise ValueError("rf_pulse requires a normal QICK RF signal generator")
         self._segment_index(rf.at_segment, require_set=True)
 
@@ -5571,7 +5587,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         """
         index = command.segment_index
         if (command.kind != "set" or index <= 0
-                or self.soccfg["gens"][command.gen_ch].get("type") != "axis_awg_tuning_v7"
+                or self.soccfg["gens"][command.gen_ch].get("type") not in ("axis_awg_tuning_v7", "axis_awg_tuning_v8")
                 or self.sequence.segments[index - 1].kind != "ramp"):
             return True
         previous = self.compiled_points[0].segment_commands[index - 1]
@@ -6187,7 +6203,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 if minimum < self._dispatch_spacing:
                     firmware = 'v7' if any(
                         int(self.soccfg['gens'][ch]['tproc_ch']) == port
-                        and self.soccfg['gens'][ch].get('type') == 'axis_awg_tuning_v7'
+                        and self.soccfg['gens'][ch].get('type') in ('axis_awg_tuning_v7', 'axis_awg_tuning_v8')
                         for ch in self.awg_channels) else 'v6' if self._v6_timing else 'v5' if any(
                         int(self.soccfg['gens'][rf.gen_ch]['tproc_ch']) == port
                         and self.soccfg['gens'][rf.gen_ch].get('output_sum_version') == 2
@@ -7558,6 +7574,12 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         rcount = 13
         rrep = 15
         self.initialize()
+        forever = self.execution_mode == "output_forever"
+        forever_guards = []
+        if forever:
+            self.label("OUTPUT_FOREVER_GRID")
+            self.synci(0, "output-only grid preparation lookahead")
+            forever_guards.append(self.prog_list[-1])
         ro = self.ddr_readout_config or self.readout_config
         if ro is not None:
             initialize_readout(self, ro.ro_ch)
@@ -7571,6 +7593,7 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             or self.sequence.rc_compensation is not None
             or (self._hardware_dc_area and self.sequence.bias_t_compensation is not None)
         )
+        extended_epilogue = extended_epilogue and not forever
         if extended_epilogue:
             self.safe_regwi(0, 14, self.cfg["expts"] * self.cfg["reps"], "final acquisition count")
         for field in self._sweep_fields:
@@ -7626,9 +7649,16 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         self.label("FINE_TUNE_POINT")
         self.regwi(0, rrep, self.cfg["reps"] - 1)
         self.label("FINE_TUNE_REP")
+        if forever:
+            self.synci(0, "output-only shot preparation lookahead after stop check")
+            forever_guards.append(self.prog_list[-1])
         self._emit_square_update()
         self._emit_point()
         self._emit_end_marker("loop")
+        if forever:
+            self.waiti(0, 0, "complete shot and compensation before checking stop")
+            self.memri(0, 14, 2, "board-owned stop mailbox")
+            self.condj(0, 14, "!=", 0, "OUTPUT_FOREVER_STOP")
         self.mathi(0, rcount, rcount, "+", 1)
         if extended_epilogue:
             self.condj(0, rcount, "==", 14, "DEFER_FINAL_ACQUISITION_COUNT")
@@ -7653,18 +7683,62 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                     f"reload sweep axis {axis_index} counter",
                 )
                 self._emit_axis_adds(axis_index, reset=True)
-        if any(config.mute_on_finish for config in self.square_pulse_configs):
+        if forever:
+            self.condj(0, 0, "==", 0, "OUTPUT_FOREVER_GRID", "repeat the entire grid")
+            self.label("OUTPUT_FOREVER_STOP")
+            self._emit_output_forever_zero()
+        if forever:
+            self.synci(128 * (len(self.square_pulse_configs) + 1), "stop auxiliary output lookahead")
+            for config in self.square_pulse_configs:
+                self._emit_square_output_update(config, stop=True, reset_phase=False)
+        elif any(config.mute_on_finish for config in self.square_pulse_configs):
             self._emit_square_update(stop=True)
         self._emit_end_marker("experiment")
         if extended_epilogue:
             self.waiti(0, 0, "wait for experiment epilogue")
             self.memwi(0, rcount, self.COUNTER_ADDR)
+        if forever:
+            self.synci(256, "drain stop outputs and markers")
+            self.waiti(0, 0, "all output stop commands completed")
+            self.regwi(0, 14, 1)
+            self.memwi(0, 14, 3, "output-only stop epilogue acknowledged")
         self.end()
 
         for axis_index in active_axes:
             self.label(f"FINE_TUNE_ADVANCE_{axis_index}")
             self._emit_axis_adds(axis_index)
             self.condj(0, 0, "==", 0, "FINE_TUNE_POINT")
+
+        # WAIT consumes the finite program's instruction lookahead. Refill it
+        # at each new shot/grid so a short fine pulse is still queued on time.
+        # Reserve a conservative whole-program instruction budget, independent
+        # of which sweep-update branches were taken. This adds inter-shot idle
+        # time; it does not shift one edge relative to another inside a shot.
+        self.output_forever_guard_cycles = 0
+        if forever:
+            self.output_forever_guard_cycles = max(
+                self.command_lead_tproc_cycles, 16 * len(self.prog_list) + 256
+            )
+            for instruction in forever_guards:
+                instruction["args"] = (self.output_forever_guard_cycles,)
+
+    def _emit_output_forever_zero(self):
+        """Reached only at a completed shot boundary, with no pending waveform."""
+        channels = tuple(self.awg_channels)
+        rf_channels = tuple(dict.fromkeys(rf.gen_ch for rf in self.rf_pulse_configs))
+        lead = 256 * (len(channels) + len(rf_channels) + 1)
+        self.synci(lead, "stop epilogue instruction lookahead")
+        self.reset_timestamps()
+        for index, ch in enumerate(channels):
+            self.set_pulse_registers(ch=ch, style='awg_set', value=0, duration=1, clear=True)
+            self.pulse(ch=ch, t=8*index)
+        for index, ch in enumerate(rf_channels, len(channels)):
+            self.set_pulse_registers(ch=ch, style='const', freq=0, phase=0,
+                                    gain=0, length=3, mode='oneshot', stdysel='zero')
+            self.pulse(ch=ch, t=8*index)
+        self.sync_all(256)
+        self.waiti(0, 0, "wait for zero samples through output pipeline")
+        self.reset_timestamps()
 
     def body(self):
         raise RuntimeError(
@@ -7691,8 +7765,16 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         )
 
     def config_all(self, soc, *args, **kwargs):
+        check_idle = getattr(soc, 'check_output_forever_idle', None)
+        if callable(check_idle):
+            check_idle()
         from qick_dac_current import verify_current_settings
         verify_current_settings(soc, self.sequence.dac_current_settings)
+        from qick_output_limits import apply_output_limits
+        if self.output_clip_config:
+            soc.start_src("internal")
+            soc.stop_tproc()
+        self.output_clip_readback = apply_output_limits(soc, self.output_clip_config)
         return super().config_all(soc, *args, **kwargs)
 
     def load_runtime_dmem_into_model(self, model) -> None:
@@ -7828,93 +7910,192 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
             "started",
             f"Arming FIR DDR for {n_triggers:,} trigger(s)",
         )
-        reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
-        check_cancel()
-        emit_phase(
-            "ddr_arm",
-            "completed",
-            f"FIR DDR armed; reserved {reserved:,} physical 32-bit word(s)",
-        )
-        emit_phase(
-            "acquisition",
-            "started",
-            (
-                f"Starting {n_points:,} sweep point(s) x "
-                f"{repetitions:,} repetition(s)"
-            ),
-        )
-        if counter_progress is None and cancel_check is None:
-            self.run_rounds(soc, progress=progress, **run_kwargs)
-        else:
-            if run_kwargs:
-                unexpected = ", ".join(sorted(run_kwargs))
-                raise TypeError(
-                    "counter-progress execution does not support extra run "
-                    f"arguments: {unexpected}"
-                )
-            self._run_rounds_with_counter_progress(
-                soc,
-                counter_progress or (lambda _completed, _total: None),
-                cancel_check=cancel_check,
-            )
-        check_cancel()
-        emit_phase(
-            "acquisition",
-            "completed",
-            f"All {n_triggers:,} acquisition trigger(s) completed",
-        )
-        if ddr.settle_seconds:
+        from qick_capture_lifecycle import ddr_capture_guard
+        with ddr_capture_guard(soc, phase_callback) as capture:
+            reserved = soc.arm_ddr4_fir_samples(**arm_kwargs)
+            capture.armed = True
+            check_cancel()
             emit_phase(
-                "ddr_wait",
+                "ddr_arm",
+                "completed",
+                f"FIR DDR armed; reserved {reserved:,} physical 32-bit word(s)",
+            )
+            emit_phase(
+                "acquisition",
                 "started",
                 (
-                    "Waiting before DDR readback "
-                    f"({float(ddr.settle_seconds):g} s)"
+                    f"Starting {n_points:,} sweep point(s) x "
+                    f"{repetitions:,} repetition(s)"
                 ),
             )
-            deadline = time.monotonic() + float(ddr.settle_seconds)
-            while True:
-                check_cancel()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    break
-                time.sleep(min(0.05, remaining))
+            if counter_progress is None and cancel_check is None:
+                self.run_rounds(soc, progress=progress, **run_kwargs)
+            else:
+                if run_kwargs:
+                    unexpected = ", ".join(sorted(run_kwargs))
+                    raise TypeError(
+                        "counter-progress execution does not support extra run "
+                        f"arguments: {unexpected}"
+                    )
+                self._run_rounds_with_counter_progress(
+                    soc,
+                    counter_progress or (lambda _completed, _total: None),
+                    cancel_check=cancel_check,
+                )
+            check_cancel()
             emit_phase(
-                "ddr_wait",
+                "acquisition",
                 "completed",
-                "Post-acquisition DDR read delay completed",
+                f"All {n_triggers:,} acquisition trigger(s) completed",
             )
+            if ddr.settle_seconds:
+                emit_phase(
+                    "ddr_wait",
+                    "started",
+                    (
+                        "Waiting before DDR readback "
+                        f"({float(ddr.settle_seconds):g} s)"
+                    ),
+                )
+                deadline = time.monotonic() + float(ddr.settle_seconds)
+                while True:
+                    check_cancel()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    time.sleep(min(0.05, remaining))
+                emit_phase(
+                    "ddr_wait",
+                    "completed",
+                    "Post-acquisition DDR read delay completed",
+                )
 
-        if reserved % n_triggers:
-            raise RuntimeError(
-                "reserved DDR words are not divisible by the trigger count"
-            )
-        physical_words_per_trigger = reserved // n_triggers
-        if ddr.address % 4:
-            raise ValueError("DDR byte address must be aligned to a 32-bit word")
-        base_word = ddr.address // 4
-        if ddr.stride_bytes is None:
-            stride_words = physical_words_per_trigger
-        else:
-            if ddr.stride_bytes % 4:
-                raise ValueError("DDR stride_bytes must be a multiple of 4")
-            stride_words = ddr.stride_bytes // 4
+            if reserved % n_triggers:
+                raise RuntimeError(
+                    "reserved DDR words are not divisible by the trigger count"
+                )
+            physical_words_per_trigger = reserved // n_triggers
+            if ddr.address % 4:
+                raise ValueError("DDR byte address must be aligned to a 32-bit word")
+            base_word = ddr.address // 4
+            if ddr.stride_bytes is None:
+                stride_words = physical_words_per_trigger
+            else:
+                if ddr.stride_bytes % 4:
+                    raise ValueError("DDR stride_bytes must be a multiple of 4")
+                stride_words = ddr.stride_bytes // 4
 
-        if repetition_mode != "raw":
-            emit_phase("ddr_readback", "started", "Averaging repetition traces on QICK and reading mean traces")
-            iq = read_board_mean(
-                soc, n_points=n_points, repetitions=repetitions,
-                n_samples=ddr.samples_per_trigger, base_word=base_word,
-                stride_words=stride_words, stride_bytes=ddr.stride_bytes,
-                source_scale_log2=self._fir_cfg["iq_scale_log2"],
-                source_component_bits=self._fir_cfg["iq_component_bits"],
-                chunk_triggers=readback_chunk_triggers,
-                cancel_check=check_cancel, progress=readback_progress,
-                reduce_samples=repetition_mode == "qick_mean_iq",
+            if repetition_mode != "raw":
+                emit_phase("ddr_readback", "started", "Averaging repetition traces on QICK and reading mean traces")
+                iq = read_board_mean(
+                    soc, n_points=n_points, repetitions=repetitions,
+                    n_samples=ddr.samples_per_trigger, base_word=base_word,
+                    stride_words=stride_words, stride_bytes=ddr.stride_bytes,
+                    source_scale_log2=self._fir_cfg["iq_scale_log2"],
+                    source_component_bits=self._fir_cfg["iq_component_bits"],
+                    chunk_triggers=readback_chunk_triggers,
+                    cancel_check=check_cancel, progress=readback_progress,
+                    reduce_samples=repetition_mode == "qick_mean_iq",
+                )
+                emit_phase("ddr_readback", "completed", f"Read {n_points:,} mean traces ({repetitions:,} repetitions each)")
+                return FineTuneDdrResult(
+                    sweep_points=self.get_expt_pts(), iq=iq,
+                    reserved_physical_words=reserved,
+                    sweep_axes=self.sequence.sweep_axes,
+                    sweep_shape=self.sequence.sweep_shape,
+                    sweep_groups=self.sequence.sweep_groups,
+                    sweep_parameter_ids=self.sequence.sweep_member_ids,
+                    cross_capacitance=self.sequence.cross_capacitance.copy(),
+                    sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
+                    fir_rate_profile=self._fir_cfg["rate_profile"],
+                    iq_scale_log2=0, iq_component_bits=64,
+                    acquisition_source="fir_ddr",
+                    accumulation_repetitions=repetitions,
+                    data_kind="point_mean" if repetition_mode == "qick_mean_iq" else "repetition_mean",
+                    source_iq_scale_log2=self._fir_cfg["iq_scale_log2"],
+                    source_iq_component_bits=self._fir_cfg["iq_component_bits"],
+                    source_samples_per_trace=ddr.samples_per_trigger,
+                )
+
+            expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
+            raw = None
+            readback_chunks = (
+                n_triggers + readback_chunk_triggers - 1
+            ) // readback_chunk_triggers
+            emit_phase(
+                "ddr_readback",
+                "started",
+                (
+                    f"Reading {n_triggers:,} DDR trace(s) in "
+                    f"{readback_chunks:,} chunk(s)"
+                ),
             )
-            emit_phase("ddr_readback", "completed", f"Read {n_points:,} mean traces ({repetitions:,} repetitions each)")
+            if readback_progress is not None:
+                readback_progress(0, n_triggers)
+            for first_trigger in range(
+                0,
+                n_triggers,
+                readback_chunk_triggers,
+            ):
+                check_cancel()
+                chunk_trigger_count = min(
+                    readback_chunk_triggers,
+                    n_triggers - first_trigger,
+                )
+                chunk_start_word = base_word + first_trigger * stride_words
+                chunk = np.asarray(soc.get_ddr4_fir_samples(
+                    n_samples=ddr.samples_per_trigger,
+                    n_triggers=chunk_trigger_count,
+                    start=chunk_start_word,
+                    stride_bytes=ddr.stride_bytes,
+                ))
+                check_cancel()
+                expected_chunk_shape = (
+                    chunk_trigger_count * ddr.samples_per_trigger,
+                    2,
+                )
+                if self._fir_cfg["iq_component_bits"] == 64 and chunk.dtype != np.dtype("int64"):
+                    raise RuntimeError("IQ64 firmware did not return raw signed-int64 samples")
+                if chunk.shape != expected_chunk_shape:
+                    raise RuntimeError(
+                        f"unexpected DDR IQ chunk shape {chunk.shape}; expected "
+                        f"{expected_chunk_shape} for triggers "
+                        f"{first_trigger}.."
+                        f"{first_trigger + chunk_trigger_count - 1}"
+                    )
+                if raw is None:
+                    raw = np.empty(expected_shape, dtype=chunk.dtype)
+                first_sample = first_trigger * ddr.samples_per_trigger
+                last_sample = (
+                    first_trigger + chunk_trigger_count
+                ) * ddr.samples_per_trigger
+                raw[first_sample:last_sample] = chunk
+                if readback_progress is not None:
+                    readback_progress(
+                        first_trigger + chunk_trigger_count,
+                        n_triggers,
+                    )
+
+            if raw is None:
+                raise RuntimeError("DDR readback produced no chunks")
+            check_cancel()
+            emit_phase(
+                "ddr_readback",
+                "completed",
+                (
+                    f"FIR DDR readback completed: "
+                    f"{expected_shape[0]:,} I/Q sample pair(s)"
+                ),
+            )
+            iq = raw.reshape(
+                n_points,
+                repetitions,
+                ddr.samples_per_trigger,
+                2,
+            )
             return FineTuneDdrResult(
-                sweep_points=self.get_expt_pts(), iq=iq,
+                sweep_points=self.get_expt_pts(),
+                iq=iq,
                 reserved_physical_words=reserved,
                 sweep_axes=self.sequence.sweep_axes,
                 sweep_shape=self.sequence.sweep_shape,
@@ -7923,107 +8104,11 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
                 cross_capacitance=self.sequence.cross_capacitance.copy(),
                 sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
                 fir_rate_profile=self._fir_cfg["rate_profile"],
-                iq_scale_log2=0, iq_component_bits=64,
+                iq_scale_log2=self._fir_cfg["iq_scale_log2"],
+                iq_component_bits=self._fir_cfg["iq_component_bits"],
                 acquisition_source="fir_ddr",
                 accumulation_repetitions=repetitions,
-                data_kind="point_mean" if repetition_mode == "qick_mean_iq" else "repetition_mean",
-                source_iq_scale_log2=self._fir_cfg["iq_scale_log2"],
-                source_iq_component_bits=self._fir_cfg["iq_component_bits"],
-                source_samples_per_trace=ddr.samples_per_trigger,
             )
-
-        expected_shape = (n_triggers * ddr.samples_per_trigger, 2)
-        raw = None
-        readback_chunks = (
-            n_triggers + readback_chunk_triggers - 1
-        ) // readback_chunk_triggers
-        emit_phase(
-            "ddr_readback",
-            "started",
-            (
-                f"Reading {n_triggers:,} DDR trace(s) in "
-                f"{readback_chunks:,} chunk(s)"
-            ),
-        )
-        if readback_progress is not None:
-            readback_progress(0, n_triggers)
-        for first_trigger in range(
-            0,
-            n_triggers,
-            readback_chunk_triggers,
-        ):
-            check_cancel()
-            chunk_trigger_count = min(
-                readback_chunk_triggers,
-                n_triggers - first_trigger,
-            )
-            chunk_start_word = base_word + first_trigger * stride_words
-            chunk = np.asarray(soc.get_ddr4_fir_samples(
-                n_samples=ddr.samples_per_trigger,
-                n_triggers=chunk_trigger_count,
-                start=chunk_start_word,
-                stride_bytes=ddr.stride_bytes,
-            ))
-            check_cancel()
-            expected_chunk_shape = (
-                chunk_trigger_count * ddr.samples_per_trigger,
-                2,
-            )
-            if self._fir_cfg["iq_component_bits"] == 64 and chunk.dtype != np.dtype("int64"):
-                raise RuntimeError("IQ64 firmware did not return raw signed-int64 samples")
-            if chunk.shape != expected_chunk_shape:
-                raise RuntimeError(
-                    f"unexpected DDR IQ chunk shape {chunk.shape}; expected "
-                    f"{expected_chunk_shape} for triggers "
-                    f"{first_trigger}.."
-                    f"{first_trigger + chunk_trigger_count - 1}"
-                )
-            if raw is None:
-                raw = np.empty(expected_shape, dtype=chunk.dtype)
-            first_sample = first_trigger * ddr.samples_per_trigger
-            last_sample = (
-                first_trigger + chunk_trigger_count
-            ) * ddr.samples_per_trigger
-            raw[first_sample:last_sample] = chunk
-            if readback_progress is not None:
-                readback_progress(
-                    first_trigger + chunk_trigger_count,
-                    n_triggers,
-                )
-
-        if raw is None:
-            raise RuntimeError("DDR readback produced no chunks")
-        check_cancel()
-        emit_phase(
-            "ddr_readback",
-            "completed",
-            (
-                f"FIR DDR readback completed: "
-                f"{expected_shape[0]:,} I/Q sample pair(s)"
-            ),
-        )
-        iq = raw.reshape(
-            n_points,
-            repetitions,
-            ddr.samples_per_trigger,
-            2,
-        )
-        return FineTuneDdrResult(
-            sweep_points=self.get_expt_pts(),
-            iq=iq,
-            reserved_physical_words=reserved,
-            sweep_axes=self.sequence.sweep_axes,
-            sweep_shape=self.sequence.sweep_shape,
-            sweep_groups=self.sequence.sweep_groups,
-            sweep_parameter_ids=self.sequence.sweep_member_ids,
-            cross_capacitance=self.sequence.cross_capacitance.copy(),
-            sample_rate_hz=self._fir_cfg["output_sample_rate_hz"],
-            fir_rate_profile=self._fir_cfg["rate_profile"],
-            iq_scale_log2=self._fir_cfg["iq_scale_log2"],
-            iq_component_bits=self._fir_cfg["iq_component_bits"],
-            acquisition_source="fir_ddr",
-            accumulation_repetitions=repetitions,
-        )
 
     def acquire_avg_buffer(
         self,
@@ -8200,8 +8285,13 @@ class _CoarseFineTuneAmplitudeSweepProgram(SquarePulseProgramMixin, OutputTrigge
         )
         pmem_words = len(self.prog_list)
         return {
+            "execution_mode": self.execution_mode,
+            "output_forever_preparation_guard_cycles": self.output_forever_guard_cycles,
+            "output_forever_preparation_guard_us": self.output_forever_guard_cycles / self.tproc_mhz,
             "outputs": self.sequence.output_names,
             "awg_channels": self.awg_channels,
+            "output_clip_limits": self.output_clip_config,
+            "output_clip_readback": getattr(self, "output_clip_readback", []),
             "sweep_points": self.get_expt_pts(),
             "sweep_axes": self.sequence.sweep_axes,
             "sweep_shape": self.sequence.sweep_shape,

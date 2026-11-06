@@ -107,7 +107,7 @@ class SampleHoldProgramMixin:
             return super()._build_timing()
         for ch in self.awg_channels:
             cfg = self.soccfg['gens'][ch]
-            if cfg.get('type') != 'axis_awg_tuning_v7' or cfg.get('extended_ramp_version') != 1:
+            if cfg.get('type') not in ('axis_awg_tuning_v7', 'axis_awg_tuning_v8') or cfg.get('extended_ramp_version') != 1:
                 raise ValueError('DAC-sample SET hold sweep requires AWG v7')
             if float(cfg['f_fabric']) != self.tproc_mhz:
                 raise ValueError('DAC-sample SET hold requires matching AWG and tProcessor clocks')

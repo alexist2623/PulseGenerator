@@ -95,7 +95,7 @@ def _single(program, cancel_check, point_indices=None):
     sequence = program.sequence
     if any((program.soccfg["gens"][channel].get("type"),
             int(program.soccfg["gens"][channel].get("output_sum_version", 0)))
-           not in (("axis_awg_tuning_v3", 2), ("axis_awg_tuning_v4", 3), ("axis_awg_tuning_v7", 7))
+           not in (("axis_awg_tuning_v3", 2), ("axis_awg_tuning_v4", 3), ("axis_awg_tuning_v7", 7), ("axis_awg_tuning_v8", 7))
            for channel in program.awg_channels):
         raise ValueError("execution coordinate export requires v5 or v6 AWG/output-sum metadata")
     if point_indices is None:
